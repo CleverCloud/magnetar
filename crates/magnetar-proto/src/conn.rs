@@ -1193,6 +1193,25 @@ impl Connection {
         self.producers.get(&handle).map_or(0, |p| p.pending.len())
     }
 
+    /// Last sequence id this client has pushed onto the wire. `-1` if the producer has
+    /// never sent. Mirrors Java's `Producer#getLastSequenceId` (which counts pushes,
+    /// not broker acknowledgements).
+    #[must_use]
+    pub fn producer_last_sequence_id_pushed(&self, handle: ProducerHandle) -> i64 {
+        self.producers
+            .get(&handle)
+            .map_or(-1, |p| p.last_sequence_id_pushed)
+    }
+
+    /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. `-1` if the
+    /// producer has no acknowledged sends yet. Useful for at-least-once resume-on-restart.
+    #[must_use]
+    pub fn producer_last_sequence_id_published(&self, handle: ProducerHandle) -> i64 {
+        self.producers
+            .get(&handle)
+            .map_or(-1, |p| p.last_sequence_id_published)
+    }
+
     fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.

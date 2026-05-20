@@ -38,6 +38,24 @@ impl Producer {
         self.handle
     }
 
+    /// Last sequence id this client has pushed onto the wire. Returns `-1` if the producer
+    /// has never sent. Mirrors `org.apache.pulsar.client.api.Producer#getLastSequenceId`.
+    pub fn last_sequence_id(&self) -> i64 {
+        self.shared
+            .inner
+            .lock()
+            .producer_last_sequence_id_pushed(self.handle)
+    }
+
+    /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. Returns `-1`
+    /// if no sends have been acked yet. Useful for resume-from-checkpoint flows.
+    pub fn last_sequence_id_published(&self) -> i64 {
+        self.shared
+            .inner
+            .lock()
+            .producer_last_sequence_id_published(self.handle)
+    }
+
     /// Enqueue a send. The returned future resolves when the broker acknowledges the publish
     /// (a `CommandSendReceipt`) or rejects it (a `CommandSendError`).
     pub fn send(&self, mut msg: OutgoingMessage) -> SendFut {
