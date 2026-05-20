@@ -322,6 +322,73 @@ impl Consumer {
             .unwrap_or("")
             .to_owned()
     }
+
+    /// Receive up to `max_messages` messages in one call. Mirrors Java
+    /// `Consumer#batchReceive`. Waits up to `max_wait` for the first message, then drains any
+    /// additional already-buffered messages without further waiting.
+    ///
+    /// Returns an empty `Vec` if the timeout elapses with no messages.
+    pub async fn receive_batch(
+        &self,
+        max_messages: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<IncomingMessage>, ClientError> {
+        if max_messages == 0 {
+            return Ok(Vec::new());
+        }
+        let first = tokio::time::timeout(max_wait, self.receive()).await;
+        let first = match first {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::with_capacity(max_messages.min(64));
+        out.push(first);
+        while out.len() < max_messages {
+            let msg = {
+                let mut conn = self.shared.inner.lock();
+                conn.pop_message(self.handle)
+            };
+            let Some(mut msg) = msg else { break };
+            post_process_message(&mut msg, self.decryptor.as_ref())?;
+            out.push(msg);
+        }
+        Ok(out)
+    }
+}
+
+/// Apply the consumer-side decompression + PIP-4 decryption pipeline to a message popped
+/// straight from the sans-io state machine. Mirrors the inline logic in [`ReceiveFut::poll`].
+fn post_process_message(
+    msg: &mut IncomingMessage,
+    decryptor: Option<&Arc<dyn crate::crypto::MessageDecryptor>>,
+) -> Result<(), ClientError> {
+    if let Some(kind_i32) = msg.metadata.compression {
+        let pb_kind = magnetar_proto::pb::CompressionType::try_from(kind_i32)
+            .map_err(|_| ClientError::Other(format!("unknown compression code {kind_i32}")))?;
+        let kind = crate::compress::kind_from_pb(pb_kind);
+        if kind != magnetar_proto::types::CompressionKind::None {
+            let expected = msg
+                .metadata
+                .uncompressed_size
+                .map_or(msg.payload.len(), |s| s as usize);
+            let plain = crate::compress::decompress(kind, &msg.payload, expected)
+                .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
+            msg.payload = plain;
+        }
+    }
+    if !msg.metadata.encryption_keys.is_empty() {
+        let Some(d) = decryptor else {
+            return Err(ClientError::Other(
+                "received encrypted message but consumer has no decryptor configured".to_owned(),
+            ));
+        };
+        let plain = d
+            .decrypt(&msg.payload, &msg.metadata)
+            .map_err(|err| ClientError::Other(format!("decrypt: {err}")))?;
+        msg.payload = plain;
+    }
+    Ok(())
 }
 
 /// Future returned by [`Consumer::receive`].
