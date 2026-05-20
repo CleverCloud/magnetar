@@ -7,7 +7,7 @@
 //! `Arc<dyn MessageEncryptor>` / `Arc<dyn MessageDecryptor>` populated from the magnetar
 //! façade (which CAN depend on magnetar-messagecrypto behind the `encryption` feature).
 //!
-//! `magnetar_messagecrypto::MessageCrypto` implements both traits via the [`Arc`]-based
+//! `magnetar_messagecrypto::MessageCrypto` implements both traits via the `Arc`-based
 //! blanket impls in the façade's `crypto` module.
 
 use bytes::Bytes;
