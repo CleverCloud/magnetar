@@ -18,6 +18,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use magnetar::proto::TokenAuth;
+use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::runtime_tokio::ClientError;
+use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -63,9 +67,18 @@ pub(crate) enum Cmd {
     Produce {
         /// Topic (e.g. `persistent://public/default/orders`).
         topic: String,
-        /// Inline message payload.
+        /// Inline message payload. Reads from stdin if absent.
         #[arg(long)]
         message: Option<String>,
+        /// Optional routing key (sets `partition_key`).
+        #[arg(long)]
+        key: Option<String>,
+        /// Optional property in `key=value` form. Repeatable.
+        #[arg(long = "property", value_parser = parse_property)]
+        properties: Vec<(String, String)>,
+        /// Send N copies of the same payload (useful for smoke tests).
+        #[arg(long, default_value_t = 1)]
+        count: usize,
     },
     /// Consume from a topic.
     Consume {
@@ -74,9 +87,15 @@ pub(crate) enum Cmd {
         /// Subscription name.
         #[arg(long)]
         subscription: String,
+        /// Subscription type: `exclusive`, `shared`, `failover`, `key-shared`.
+        #[arg(long, default_value = "exclusive", value_parser = parse_sub_type)]
+        sub_type: SubType,
         /// Number of messages to receive before exiting.
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value_t = 1)]
         count: usize,
+        /// Acknowledge each received message before printing the next.
+        #[arg(long, default_value_t = true)]
+        ack: bool,
     },
     /// Admin commands (`/admin/v2/...`).
     Admin {
@@ -191,18 +210,44 @@ fn init_tracing(verbose: u8) {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
+    let service_url = cli.service_url.clone();
+    let token_for_data = cli.token.clone();
     match cli.cmd {
-        Cmd::Produce { topic, message: _ } => {
-            println!("produce {topic}: not yet wired (M9)");
-            Ok(())
+        Cmd::Produce {
+            topic,
+            message,
+            key,
+            properties,
+            count,
+        } => {
+            run_produce(
+                &service_url,
+                token_for_data,
+                &topic,
+                message,
+                key,
+                properties,
+                count,
+            )
+            .await
         }
         Cmd::Consume {
             topic,
             subscription,
+            sub_type,
             count,
+            ack,
         } => {
-            println!("consume {topic} sub={subscription} count={count}: not yet wired (M9)");
-            Ok(())
+            run_consume(
+                &service_url,
+                token_for_data,
+                &topic,
+                &subscription,
+                sub_type,
+                count,
+                ack,
+            )
+            .await
         }
         Cmd::Admin { sub } => {
             run_admin(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
@@ -309,4 +354,123 @@ pub(crate) enum CliError {
     /// JSON serialization failure (for stdout output).
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// Underlying magnetar (data-plane) façade failure.
+    #[error("{0}")]
+    Pulsar(#[from] magnetar::PulsarError),
+    /// Underlying tokio engine failure (producer/consumer ops).
+    #[error("{0}")]
+    Client(#[from] ClientError),
+    /// I/O error while reading stdin or writing stdout.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+fn parse_property(spec: &str) -> Result<(String, String), String> {
+    let (k, v) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("expected key=value, got `{spec}`"))?;
+    Ok((k.to_owned(), v.to_owned()))
+}
+
+fn parse_sub_type(s: &str) -> Result<SubType, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "exclusive" => Ok(SubType::Exclusive),
+        "shared" => Ok(SubType::Shared),
+        "failover" => Ok(SubType::Failover),
+        "key-shared" | "keyshared" | "key_shared" => Ok(SubType::KeyShared),
+        other => Err(format!(
+            "unknown subscription type `{other}` (expected: exclusive | shared | failover | key-shared)"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_produce(
+    service_url: &str,
+    token: Option<String>,
+    topic: &str,
+    message: Option<String>,
+    key: Option<String>,
+    properties: Vec<(String, String)>,
+    count: usize,
+) -> Result<(), CliError> {
+    let payload = if let Some(s) = message {
+        s.into_bytes()
+    } else {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    };
+
+    let client = build_data_client(service_url, token.as_deref()).await?;
+    let producer = client.producer(topic).create().await?;
+
+    for idx in 0..count {
+        let mut msg = OutgoingMessage::with_payload(payload.clone());
+        if let Some(k) = key.as_deref() {
+            msg = msg.key(k);
+        }
+        for (k, v) in &properties {
+            msg = msg.property(k, v);
+        }
+        let receipt = producer.send(msg.into()).await?;
+        println!(
+            "produced #{idx} -> ledger={} entry={} partition={} batch_index={}",
+            receipt.ledger_id, receipt.entry_id, receipt.partition, receipt.batch_index,
+        );
+    }
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_consume(
+    service_url: &str,
+    token: Option<String>,
+    topic: &str,
+    subscription: &str,
+    sub_type: SubType,
+    count: usize,
+    ack: bool,
+) -> Result<(), CliError> {
+    let client = build_data_client(service_url, token.as_deref()).await?;
+    let consumer = client
+        .consumer(topic)
+        .subscription(subscription)
+        .subscription_type(sub_type)
+        .subscribe()
+        .await?;
+
+    for idx in 0..count {
+        let msg = consumer.receive().await?;
+        let payload = String::from_utf8_lossy(&msg.payload);
+        println!(
+            "received #{idx} id=(ledger={} entry={} partition={} batch_index={}) payload={}",
+            msg.message_id.ledger_id,
+            msg.message_id.entry_id,
+            msg.message_id.partition,
+            msg.message_id.batch_index,
+            payload,
+        );
+        if ack {
+            consumer.ack(msg.message_id).await?;
+        }
+    }
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+async fn build_data_client(
+    service_url: &str,
+    token: Option<&str>,
+) -> Result<PulsarClient, CliError> {
+    let mut builder = PulsarClient::builder().service_url(service_url);
+    if let Some(t) = token {
+        let provider = TokenAuth::from_string(t.to_owned());
+        builder = builder.auth(&provider);
+    }
+    Ok(builder.build().await?)
 }

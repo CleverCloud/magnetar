@@ -25,7 +25,7 @@ fn parse(args: &[&str]) -> Cli {
 fn produce_minimal() {
     let cli = parse(&["magnetar", "produce", "persistent://public/default/x"]);
     match cli.cmd {
-        Cmd::Produce { topic, message } => {
+        Cmd::Produce { topic, message, .. } => {
             assert_eq!(topic, "persistent://public/default/x");
             assert!(message.is_none());
         }
@@ -44,8 +44,7 @@ fn produce_with_message() {
     ]);
     match cli.cmd {
         Cmd::Produce {
-            topic: _,
-            message: Some(m),
+            message: Some(m), ..
         } => assert_eq!(m, "hello"),
         other => panic!("unexpected cmd: {other:?}"),
     }
@@ -65,6 +64,7 @@ fn consume_with_defaults() {
             topic,
             subscription,
             count,
+            ..
         } => {
             assert_eq!(topic, "persistent://public/default/x");
             assert_eq!(subscription, "s");
