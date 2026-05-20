@@ -99,6 +99,7 @@ anyhow             = "1"
 testcontainers = "0.27"
 rstest         = "0.21"
 proptest       = "1"
+tempfile       = "3"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
@@ -117,6 +118,10 @@ module_name_repetitions   = "allow"
 must_use_candidate        = "allow"
 missing_errors_doc        = "allow"
 missing_panics_doc        = "allow"
+# Trait method `fn method(&self) -> &str` returns a literal in every impl, but the
+# trait signature is borrow-bound to `&self` so clippy wants us to narrow to
+# `&'static str`. Changing the trait signature is more disruptive than the lint payoff.
+unnecessary_literal_bound = "allow"
 
 [profile.release]
 lto           = "thin"

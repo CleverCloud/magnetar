@@ -30,3 +30,4 @@ apache-avro = { workspace = true }
 [dev-dependencies]
 proptest  = { workspace = true }
 rstest    = { workspace = true }
+tempfile  = { workspace = true }

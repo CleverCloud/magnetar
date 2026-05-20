@@ -16,6 +16,13 @@ categories    = { workspace = true }
 workspace = true
 
 [dependencies]
+bytes          = { workspace = true }
 magnetar-proto = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
+
+[features]
+# Kerberos/GSSAPI support is feature-gated. Disabled by default so the crate stays
+# easy to build on systems without `libkrb5`. When enabled, the implementation will
+# wire `SaslKerberos` to a GSSAPI library (not in M6).
+kerberos = []

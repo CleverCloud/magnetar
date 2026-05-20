@@ -58,6 +58,7 @@
     dead_code
 )]
 
+pub mod auth;
 pub mod backoff;
 pub mod conn;
 pub mod consumer;
@@ -85,6 +86,7 @@ pub mod pb {
     include!("pb/pulsar.proto.rs");
 }
 
+pub use crate::auth::{AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth};
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, HandshakeState, OpOutcome,
     PendingOpKey, SeekTarget, SubscribeRequest,

@@ -1028,9 +1028,12 @@ dependencies = [
 name = "magnetar-auth-athenz"
 version = "0.1.0-dev.0"
 dependencies = [
+ "bytes",
  "magnetar-proto",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
@@ -1052,6 +1055,7 @@ dependencies = [
 name = "magnetar-auth-sasl"
 version = "0.1.0-dev.0"
 dependencies = [
+ "bytes",
  "magnetar-proto",
  "thiserror",
  "tracing",
@@ -1107,6 +1111,7 @@ dependencies = [
  "serde",
  "serde_json",
  "slab",
+ "tempfile",
  "thiserror",
  "tracing",
  "uuid",
