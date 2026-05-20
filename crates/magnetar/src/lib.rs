@@ -11,12 +11,15 @@
 //!
 //! - `tokio` (default): pull in the tokio engine.
 //! - `moonpool`: pull in the moonpool engine.
+//! - `admin`: re-export [`magnetar_admin`] under [`admin`] for the REST admin client.
 //! - `auth-oauth2`, `auth-sasl`, `auth-athenz`: pluggable auth providers.
 //! - `encryption`: PIP-4 end-to-end encryption.
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "admin")]
+pub use magnetar_admin as admin;
 pub use magnetar_proto as proto;
 #[cfg(feature = "moonpool")]
 pub use magnetar_runtime_moonpool as runtime_moonpool;

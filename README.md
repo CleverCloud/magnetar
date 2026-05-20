@@ -27,6 +27,18 @@ A sans-io Apache Pulsar client driver for Rust, with multiple swappable I/O engi
 | `magnetar-messagecrypto` | PIP-4 end-to-end encryption (AES-GCM via `aws-lc-rs`). |
 | `xtask` | Build helpers — `protoc` codegen, e2e driver. Not published. |
 
+## CLI quickstart
+
+```sh
+cargo build -p magnetar-cli --release
+./target/release/magnetar admin tenant-list
+./target/release/magnetar admin namespace-create public/scratch
+./target/release/magnetar admin topic-create public/scratch/events --partitions 3
+./target/release/magnetar admin topic-stats public/scratch/events | jq '.msgInCounter'
+```
+
+See [`crates/magnetar-cli/README.md`](crates/magnetar-cli/README.md) for the full subcommand list and global flags. `produce` / `consume` are M9 stubs until the data-plane façade lands.
+
 ## Validation
 
 ```
