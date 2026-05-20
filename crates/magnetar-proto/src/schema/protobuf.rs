@@ -24,7 +24,7 @@ use crate::pb;
 /// Protobuf schema parametrised by a `prost::Message` type.
 ///
 /// `schema_data()` returns the package-qualified message name (e.g. `"com.example.MyMessage"`).
-/// See the [module docs](self) for the broader canonicalisation contract.
+/// See the [module docs](crate::schema) for the broader canonicalisation contract.
 pub struct ProtobufSchema<T> {
     fully_qualified_name: Bytes,
     _marker: PhantomData<fn() -> T>,

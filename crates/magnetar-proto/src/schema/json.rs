@@ -21,7 +21,7 @@ use crate::pb;
 
 /// Schema that encodes `T` as JSON using `serde_json`.
 ///
-/// `schema_data` returns the literal `{}` placeholder. See the [module docs](self) for the
+/// `schema_data` returns the literal `{}` placeholder. See the [module docs](crate::schema) for the
 /// rationale.
 pub struct JsonSchema<T> {
     _marker: PhantomData<fn() -> T>,

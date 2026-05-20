@@ -31,7 +31,7 @@ impl ProtobufNativeSchema {
     /// Construct a [`ProtobufNativeSchema`] from a serialised `FileDescriptorSet`.
     ///
     /// The caller is responsible for emitting byte-identical output to the Java client — see the
-    /// [module docs](self) and `ARCHITECTURE.md` (Schema-registry parity).
+    /// [module docs](crate::schema) and `ARCHITECTURE.md` (Schema-registry parity).
     pub fn new(file_descriptor_set: impl Into<Bytes>) -> Self {
         Self {
             file_descriptor_set: file_descriptor_set.into(),
