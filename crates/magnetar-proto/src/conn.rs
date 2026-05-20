@@ -301,6 +301,14 @@ pub struct SubscribeRequest {
     /// Mirrors `CommandSubscribe.start_message_rollback_duration_sec`. Rolls the subscription
     /// cursor back by N seconds at subscribe time, so the consumer re-reads recent history.
     pub start_message_rollback_duration_sec: Option<u64>,
+    /// Mirrors Java `DeadLetterPolicy#maxRedeliverCount`. When a message has been redelivered
+    /// more than this many times, the consumer routes it into the dead-letter queue instead
+    /// of the user-facing queue. `0` disables DLQ routing.
+    pub max_redeliver_count: u32,
+    /// Mirrors Java `DeadLetterPolicy#deadLetterTopic`. Where the consumer republishes
+    /// messages that exceeded `max_redeliver_count`. Convention if `None`:
+    /// `<topic>-<subscription>-DLQ` (matches the Java client default).
+    pub dead_letter_topic: Option<String>,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -345,6 +353,8 @@ impl Default for SubscribeRequest {
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
+            max_redeliver_count: 0,
+            dead_letter_topic: None,
         }
     }
 }
@@ -1251,12 +1261,13 @@ impl Connection {
         let handle = ConsumerHandle(self.next_consumer_id);
         self.next_consumer_id = self.next_consumer_id.wrapping_add(1);
         let request_id = self.alloc_request_id();
-        let state = ConsumerState::new(
+        let mut state = ConsumerState::new(
             handle,
             req.topic.clone(),
             req.subscription.clone(),
             req.receiver_queue_size,
         );
+        state.max_redeliver_count = req.max_redeliver_count;
         self.consumers.insert(handle, state);
 
         let subscription_properties: Vec<pb::KeyValue> = req
@@ -1467,6 +1478,18 @@ impl Connection {
         if let Some(c) = self.consumers.get_mut(&handle) {
             c.paused = paused;
         }
+    }
+
+    /// Drain every message the consumer has classified as dead-letter (redelivery count
+    /// strictly greater than `max_redeliver_count` at subscribe time). Returns an empty
+    /// vec when the consumer is unknown or has no DLQ-flagged messages. Mirrors Java
+    /// `ConsumerImpl#getDeadLetterMessages` behavior — the caller is responsible for
+    /// republishing them to the configured DLQ topic.
+    pub fn drain_dead_letter(&mut self, handle: ConsumerHandle) -> Vec<IncomingMessage> {
+        self.consumers
+            .get_mut(&handle)
+            .map(|c| std::mem::take(&mut c.dead_letter_pending))
+            .unwrap_or_default()
     }
 
     /// Returns the per-consumer pause flag, or `None` if the consumer handle is unknown.

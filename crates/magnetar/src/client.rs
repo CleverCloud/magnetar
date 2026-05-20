@@ -738,6 +738,24 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#deadLetterPolicy`. After `max_redeliver_count`
+    /// redeliveries, the consumer flags the message as dead-letter — drain via
+    /// [`magnetar_runtime_tokio::Consumer::drain_dead_letter`] and republish to
+    /// `dead_letter_topic` (or to the Java-default `<topic>-<subscription>-DLQ` when
+    /// `dead_letter_topic` is `None`).
+    ///
+    /// `0` disables DLQ routing (the default).
+    #[must_use]
+    pub fn dead_letter_policy(
+        mut self,
+        max_redeliver_count: u32,
+        dead_letter_topic: Option<String>,
+    ) -> Self {
+        self.req.max_redeliver_count = max_redeliver_count;
+        self.req.dead_letter_topic = dead_letter_topic;
+        self
+    }
+
     /// Subscribe.
     pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
         Ok(self

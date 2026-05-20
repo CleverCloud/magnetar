@@ -323,6 +323,15 @@ impl Consumer {
             .to_owned()
     }
 
+    /// Drain every message the state machine has flagged as dead-letter (redelivery count
+    /// greater than the configured `max_redeliver_count`). The caller is responsible for
+    /// republishing them to the configured DLQ topic. Returns an empty `Vec` when DLQ
+    /// routing is disabled or no messages have been flagged.
+    pub fn drain_dead_letter(&self) -> Vec<IncomingMessage> {
+        let mut conn = self.shared.inner.lock();
+        conn.drain_dead_letter(self.handle)
+    }
+
     /// Receive up to `max_messages` messages in one call. Mirrors Java
     /// `Consumer#batchReceive`. Waits up to `max_wait` for the first message, then drains any
     /// additional already-buffered messages without further waiting.
