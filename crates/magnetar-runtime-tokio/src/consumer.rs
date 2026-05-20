@@ -180,6 +180,19 @@ impl Consumer {
             .await
     }
 
+    /// Seek to the earliest available message in the topic. Mirrors Java
+    /// `Consumer#seek(MessageId.earliest)`. After this resolves, the next `receive()`
+    /// returns the oldest message the broker still has.
+    pub async fn seek_to_earliest(&self) -> Result<(), ClientError> {
+        self.seek_to_message(MessageId::EARLIEST).await
+    }
+
+    /// Seek to the latest position (i.e. the broker's current head — skip any pending
+    /// backlog). Mirrors Java `Consumer#seek(MessageId.latest)`.
+    pub async fn seek_to_latest(&self) -> Result<(), ClientError> {
+        self.seek_to_message(MessageId::LATEST).await
+    }
+
     async fn seek_inner(&self, target: SeekTarget) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();

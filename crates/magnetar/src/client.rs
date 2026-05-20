@@ -848,6 +848,45 @@ impl Reader {
         self.consumer.close().await.map_err(PulsarError::Client)
     }
 
+    /// Seek the reader to the earliest available message. Mirrors Java
+    /// `Reader#seek(MessageId.earliest)`.
+    pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
+        self.consumer
+            .seek_to_earliest()
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek the reader to the latest (head) position. Mirrors Java
+    /// `Reader#seek(MessageId.latest)`.
+    pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
+        self.consumer
+            .seek_to_latest()
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek the reader to a specific message id. Mirrors Java
+    /// `Reader#seek(MessageId)`.
+    pub async fn seek_to_message(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Result<(), PulsarError> {
+        self.consumer
+            .seek_to_message(message_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek the reader to a publish-time deadline (millis since UNIX epoch). Mirrors Java
+    /// `Reader#seek(long)`.
+    pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
+        self.consumer
+            .seek_to_timestamp(publish_time_ms)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Mirrors `org.apache.pulsar.client.api.Reader#isConnected`.
     #[must_use]
     pub fn is_connected(&self) -> bool {
