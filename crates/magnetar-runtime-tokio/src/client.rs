@@ -187,6 +187,115 @@ impl Client {
         })
     }
 
+    /// Open a new Pulsar transaction at the broker-side transaction coordinator (PIP-31).
+    /// Mirrors Java `PulsarClient#newTransaction()`. Returns the new [`magnetar_proto::TxnId`]
+    /// once the TC acknowledges.
+    pub async fn new_txn(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<magnetar_proto::TxnId, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.new_txn(timeout)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            magnetar_proto::OpOutcome::NewTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
+            }
+            other => Err(ClientError::Other(format!(
+                "unexpected new_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Register `topic` as a partition this transaction will write to (PIP-31).
+    /// Mirrors `Transaction#registerProducedTopic`.
+    pub async fn add_partition_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.add_partition_to_txn(txn, topic.into())
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            magnetar_proto::OpOutcome::AddPartitionToTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
+            }
+            other => Err(ClientError::Other(format!(
+                "unexpected add_partition_to_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Register a subscription this transaction will acknowledge on (PIP-31).
+    /// Mirrors `Transaction#registerSubscriptionToTxn`.
+    pub async fn add_subscription_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: impl Into<String>,
+        subscription: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.add_subscription_to_txn(txn, subscription.into(), topic.into())
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            magnetar_proto::OpOutcome::AddSubscriptionToTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
+            }
+            other => Err(ClientError::Other(format!(
+                "unexpected add_subscription_to_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Commit or abort an open transaction (PIP-31). Returns the final transaction state
+    /// reported by the TC. Mirrors `Transaction#commit` / `#abort`.
+    pub async fn end_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Result<magnetar_proto::TxnState, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.end_txn(txn, action)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            magnetar_proto::OpOutcome::EndTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
+            }
+            other => Err(ClientError::Other(format!(
+                "unexpected end_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
     /// Subscribe to a topic-list watcher (PIP-145) and return the initial topic snapshot
     /// for the given namespace + regex. Subsequent updates are emitted as
     /// `ConnectionEvent::TopicListChanged` events; this snapshot helper does not stream
