@@ -526,4 +526,10 @@ impl Reader {
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         self.consumer.last_disconnected_timestamp()
     }
+
+    /// Mirrors `org.apache.pulsar.client.api.Reader#getStats`.
+    #[must_use]
+    pub fn stats(&self) -> magnetar_proto::ConsumerStats {
+        self.consumer.stats()
+    }
 }

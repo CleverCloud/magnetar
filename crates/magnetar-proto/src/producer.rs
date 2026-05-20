@@ -133,6 +133,34 @@ pub struct ProducerState {
     outbound: VecDeque<OutboundFrame>,
     /// Closed flag — once set, all subsequent sends fail with [`ProducerError::Closed`].
     pub closed: bool,
+    /// Cumulative count of logical messages handed to the wire (sum of `num_messages` per
+    /// emitted SEND, including each chunk of a chunked publish). Mirrors Java
+    /// `ProducerStats#getTotalMsgsSent`.
+    pub total_msgs_sent: u64,
+    /// Cumulative bytes of payload handed to the wire (concatenated batch payloads counted as
+    /// the concatenated size, chunked publishes count each chunk's payload).
+    pub total_bytes_sent: u64,
+    /// Cumulative count of `CommandSendError` responses correlated against this producer.
+    pub total_send_failed: u64,
+    /// Cumulative count of `CommandSendReceipt` responses correlated against this producer.
+    pub total_acks_received: u64,
+}
+
+/// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
+/// for the totals; rates are derived above this layer.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_field_names)]
+pub struct ProducerStats {
+    /// Cumulative count of logical messages handed to the wire.
+    pub total_msgs_sent: u64,
+    /// Cumulative payload bytes handed to the wire.
+    pub total_bytes_sent: u64,
+    /// Cumulative count of `CommandSendError` responses.
+    pub total_send_failed: u64,
+    /// Cumulative count of `CommandSendReceipt` responses.
+    pub total_acks_received: u64,
+    /// Number of in-flight publishes (queued but not yet acked by the broker).
+    pub pending_queue_size: u64,
 }
 
 /// In-memory batch container.
@@ -239,6 +267,21 @@ impl ProducerState {
             batch: BatchContainer::default(),
             outbound: VecDeque::new(),
             closed: false,
+            total_msgs_sent: 0,
+            total_bytes_sent: 0,
+            total_send_failed: 0,
+            total_acks_received: 0,
+        }
+    }
+
+    /// Snapshot of cumulative counters. Mirrors Java `ProducerStats`.
+    pub fn stats(&self) -> ProducerStats {
+        ProducerStats {
+            total_msgs_sent: self.total_msgs_sent,
+            total_bytes_sent: self.total_bytes_sent,
+            total_send_failed: self.total_send_failed,
+            total_acks_received: self.total_acks_received,
+            pending_queue_size: self.pending.len() as u64,
         }
     }
 
@@ -377,6 +420,11 @@ impl ProducerState {
             send: Some(send),
             ..Default::default()
         };
+        let num_messages = msg.num_messages.max(1);
+        self.total_msgs_sent = self.total_msgs_sent.saturating_add(num_messages as u64);
+        self.total_bytes_sent = self
+            .total_bytes_sent
+            .saturating_add(msg.payload.len() as u64);
         self.outbound.push_back(OutboundFrame {
             command: cmd,
             metadata: msg.metadata,
@@ -385,7 +433,7 @@ impl ProducerState {
         });
         let op = OpSend {
             sequence_id: seq,
-            num_messages: msg.num_messages.max(1),
+            num_messages,
             waker: None,
             receipt: None,
             error: None,
@@ -507,12 +555,15 @@ impl ProducerState {
             send: Some(send),
             ..Default::default()
         };
+        let payload_len = payload.len();
         self.outbound.push_back(OutboundFrame {
             command: cmd,
             metadata,
             payload,
             sequence_id: lowest_seq,
         });
+        self.total_msgs_sent = self.total_msgs_sent.saturating_add(num_messages as u64);
+        self.total_bytes_sent = self.total_bytes_sent.saturating_add(payload_len as u64);
         let op = OpSend {
             sequence_id: lowest_seq,
             num_messages,
@@ -593,12 +644,17 @@ impl ProducerState {
                 send: Some(send),
                 ..Default::default()
             };
+            let chunk_payload_len = chunk_payload.len();
             self.outbound.push_back(OutboundFrame {
                 command: cmd,
                 metadata: chunk_meta,
                 payload: chunk_payload,
                 sequence_id: ctx.sequence_id,
             });
+            self.total_msgs_sent = self.total_msgs_sent.saturating_add(1);
+            self.total_bytes_sent = self
+                .total_bytes_sent
+                .saturating_add(chunk_payload_len as u64);
             emitted += 1;
         }
 
@@ -839,5 +895,58 @@ mod tests {
         assert_eq!(mid.ledger_id, 5);
         assert_eq!(p.pending.len(), 0);
         assert_eq!(p.last_sequence_id_published, 0);
+    }
+
+    #[test]
+    fn producer_stats_track_bytes_and_msgs() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        assert_eq!(p.stats().total_msgs_sent, 0);
+        assert_eq!(p.stats().total_bytes_sent, 0);
+
+        let _ = p.queue_send(small_message(b"hello"), 100).unwrap();
+        let _ = p.queue_send(small_message(b"world!"), 100).unwrap();
+        let stats = p.stats();
+        assert_eq!(stats.total_msgs_sent, 2);
+        assert_eq!(stats.total_bytes_sent, 5 + 6);
+        assert_eq!(stats.pending_queue_size, 2);
+    }
+
+    #[test]
+    fn chunked_send_counts_each_chunk() {
+        let mut p =
+            ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 10);
+        p.chunking_enabled = true;
+        let payload = vec![b'a'; 25];
+        let _ = p.queue_send(small_message(&payload), 100).unwrap();
+        let stats = p.stats();
+        assert_eq!(stats.total_msgs_sent, 3);
+        // 25 bytes split as 10 + 10 + 5
+        assert_eq!(stats.total_bytes_sent, 25);
+    }
+
+    #[test]
+    fn batched_send_counts_logical_msgs_and_concatenated_bytes() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        p.max_batch_size_bytes = 1024;
+        p.max_messages_in_batch = 10;
+        for _ in 0..3 {
+            let _ = p.queue_send(small_message(b"x"), 100).unwrap();
+        }
+        assert_eq!(p.stats().total_msgs_sent, 0); // not flushed yet
+        let _ = p.flush_batch(101);
+        let stats = p.stats();
+        assert_eq!(stats.total_msgs_sent, 3);
+        assert!(stats.total_bytes_sent > 0);
     }
 }

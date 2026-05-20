@@ -569,6 +569,8 @@ impl Connection {
                 if let Some(producer) = self.producers.get_mut(&ProducerHandle(receipt.producer_id))
                 {
                     if let Some((seq, mid, waker)) = producer.apply_receipt(&receipt) {
+                        producer.total_acks_received =
+                            producer.total_acks_received.saturating_add(1);
                         let handle = producer.handle;
                         let key = PendingOpKey::Send(handle, seq);
                         self.outcomes.insert(
@@ -597,6 +599,7 @@ impl Connection {
                 ))?;
                 if let Some(producer) = self.producers.get_mut(&ProducerHandle(err.producer_id)) {
                     if let Some((seq, waker, code, message)) = producer.apply_send_error(&err) {
+                        producer.total_send_failed = producer.total_send_failed.saturating_add(1);
                         let handle = producer.handle;
                         let key = PendingOpKey::Send(handle, seq);
                         self.outcomes.insert(
@@ -725,7 +728,15 @@ impl Connection {
                 };
                 let request_id = ack.request_id.map(RequestId);
                 if let Some(rid) = request_id {
-                    self.pending_requests.remove(&rid);
+                    let kind = self.pending_requests.remove(&rid);
+                    if result.is_err() {
+                        if let Some(PendingRequestKind::Ack { handle }) = kind {
+                            if let Some(consumer) = self.consumers.get_mut(&handle) {
+                                consumer.total_acks_failed =
+                                    consumer.total_acks_failed.saturating_add(1);
+                            }
+                        }
+                    }
                     self.outcomes.insert(
                         PendingOpKey::Request(rid),
                         match &result {
@@ -1283,6 +1294,18 @@ impl Connection {
             .map_or(-1, |p| p.last_sequence_id_published)
     }
 
+    /// Cumulative producer counters snapshot. Returns `None` if the producer handle is unknown.
+    #[must_use]
+    pub fn producer_stats(&self, handle: ProducerHandle) -> Option<crate::producer::ProducerStats> {
+        self.producers.get(&handle).map(ProducerState::stats)
+    }
+
+    /// Cumulative consumer counters snapshot. Returns `None` if the consumer handle is unknown.
+    #[must_use]
+    pub fn consumer_stats(&self, handle: ConsumerHandle) -> Option<crate::consumer::ConsumerStats> {
+        self.consumers.get(&handle).map(ConsumerState::stats)
+    }
+
     fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.
@@ -1306,6 +1329,7 @@ impl Connection {
     /// Acknowledge messages.
     pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest) -> RequestId {
         let request_id = self.alloc_request_id();
+        let n_ids = ack.message_ids.len() as u64;
         let cmd = pb::CommandAck {
             consumer_id: handle.0,
             ack_type: ack.ack_type as i32,
@@ -1324,6 +1348,9 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::Ack { handle });
+        if let Some(consumer) = self.consumers.get_mut(&handle) {
+            consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
+        }
         request_id
     }
 

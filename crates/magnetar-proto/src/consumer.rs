@@ -65,6 +65,30 @@ pub struct ConsumerState {
     pub max_redeliver_count: u32,
     /// Messages flagged for DLQ routing. The runtime crate drains this and republishes.
     pub dead_letter_pending: Vec<IncomingMessage>,
+    /// Cumulative count of logical messages delivered to the user-facing queue. Mirrors
+    /// Java `ConsumerStats#getTotalMsgsReceived`.
+    pub total_msgs_received: u64,
+    /// Cumulative payload bytes delivered (each message counts its `payload.len()`).
+    pub total_bytes_received: u64,
+    /// Cumulative count of ACK requests issued (broker may not yet have acknowledged them).
+    pub total_acks_sent: u64,
+    /// Cumulative count of broker-reported ACK failures (CommandAckResponse with error).
+    pub total_acks_failed: u64,
+}
+
+/// Snapshot of cumulative consumer counters. Mirrors `org.apache.pulsar.client.api.ConsumerStats`
+/// for the totals; rates are derived above this layer.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_field_names)]
+pub struct ConsumerStats {
+    /// Cumulative count of logical messages delivered.
+    pub total_msgs_received: u64,
+    /// Cumulative payload bytes delivered.
+    pub total_bytes_received: u64,
+    /// Cumulative count of ACK requests issued.
+    pub total_acks_sent: u64,
+    /// Cumulative count of broker-reported ACK failures.
+    pub total_acks_failed: u64,
 }
 
 #[derive(Debug)]
@@ -117,6 +141,20 @@ impl ConsumerState {
             closed: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
+            total_msgs_received: 0,
+            total_bytes_received: 0,
+            total_acks_sent: 0,
+            total_acks_failed: 0,
+        }
+    }
+
+    /// Snapshot of cumulative counters. Mirrors Java `ConsumerStats`.
+    pub fn stats(&self) -> ConsumerStats {
+        ConsumerStats {
+            total_msgs_received: self.total_msgs_received,
+            total_bytes_received: self.total_bytes_received,
+            total_acks_sent: self.total_acks_sent,
+            total_acks_failed: self.total_acks_failed,
         }
     }
 
@@ -305,10 +343,14 @@ impl ConsumerState {
     /// Route an [`IncomingMessage`] to the queue or the DLQ pending list. Returns the
     /// `DeliverOutcome::Delivered` count.
     fn classify_and_queue(&mut self, msg: IncomingMessage, redelivery: u32) -> DeliverOutcome {
+        let payload_len = msg.payload.len();
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
             self.dead_letter_pending.push(msg);
             DeliverOutcome::Buffered
         } else {
+            self.total_msgs_received = self.total_msgs_received.saturating_add(1);
+            self.total_bytes_received =
+                self.total_bytes_received.saturating_add(payload_len as u64);
             self.queue.push_back(msg);
             DeliverOutcome::Delivered {
                 count: self.queue.len(),
@@ -501,5 +543,42 @@ mod tests {
             .unwrap();
         assert!(c.queue.is_empty());
         assert_eq!(c.dead_letter_pending.len(), 1);
+    }
+
+    #[test]
+    fn consumer_stats_count_delivered_messages_only() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let _ = c
+            .deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"hi"),
+            )
+            .unwrap();
+        let _ = c
+            .deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"hello"),
+            )
+            .unwrap();
+        let stats = c.stats();
+        assert_eq!(stats.total_msgs_received, 2);
+        assert_eq!(stats.total_bytes_received, 2 + 5);
+
+        // DLQ-routed messages should not bump the received counter.
+        c.max_redeliver_count = 2;
+        let _ = c
+            .deliver(
+                &message_cmd(5),
+                metadata(1),
+                None,
+                Bytes::from_static(b"DROPPED"),
+            )
+            .unwrap();
+        assert_eq!(c.stats().total_msgs_received, 2);
     }
 }

@@ -181,6 +181,17 @@ impl Producer {
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         self.shared.inner.lock().last_disconnected_timestamp()
     }
+
+    /// Snapshot of this producer's cumulative counters. Mirrors Java
+    /// `org.apache.pulsar.client.api.Producer#getStats`. Returns a zeroed snapshot if the
+    /// producer handle is no longer registered (closed).
+    pub fn stats(&self) -> magnetar_proto::ProducerStats {
+        self.shared
+            .inner
+            .lock()
+            .producer_stats(self.handle)
+            .unwrap_or_default()
+    }
 }
 
 async fn wait_request(

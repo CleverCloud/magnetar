@@ -262,6 +262,17 @@ impl Consumer {
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         self.shared.inner.lock().last_disconnected_timestamp()
     }
+
+    /// Snapshot of this consumer's cumulative counters. Mirrors Java
+    /// `org.apache.pulsar.client.api.Consumer#getStats`. Returns a zeroed snapshot if the
+    /// consumer handle is no longer registered (closed).
+    pub fn stats(&self) -> magnetar_proto::ConsumerStats {
+        self.shared
+            .inner
+            .lock()
+            .consumer_stats(self.handle)
+            .unwrap_or_default()
+    }
 }
 
 /// Future returned by [`Consumer::receive`].

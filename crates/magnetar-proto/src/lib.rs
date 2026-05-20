@@ -92,11 +92,13 @@ pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, HandshakeState, OpOutcome,
     PendingOpKey, SeekTarget, SubscribeRequest,
 };
+pub use crate::consumer::ConsumerStats;
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
 pub use crate::event::{ConnectionEvent, IncomingMessage};
 pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
 };
+pub use crate::producer::ProducerStats;
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
