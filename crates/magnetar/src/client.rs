@@ -159,6 +159,13 @@ impl PulsarClient {
         ConsumerBuilder::new(self, topic.into())
     }
 
+    /// Open a [`ReaderBuilder`] for the given topic. A reader is a non-durable, exclusive
+    /// consumer with an auto-generated subscription — useful for log inspection and replay.
+    #[must_use]
+    pub fn reader(&self, topic: impl Into<String>) -> ReaderBuilder<'_> {
+        ReaderBuilder::new(self, topic.into())
+    }
+
     /// Close the underlying connection.
     pub async fn close(self) {
         self.inner.close().await;
@@ -344,8 +351,106 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Choose between a durable subscription (cursor persisted broker-side, the default)
+    /// and a non-durable one (used by [`Reader`] / streaming use cases).
+    #[must_use]
+    pub fn durable(mut self, durable: bool) -> Self {
+        self.req.durable = durable;
+        self
+    }
+
+    /// Set the initial position the broker dispatches from when the subscription is new.
+    #[must_use]
+    pub fn initial_position(mut self, position: pb::command_subscribe::InitialPosition) -> Self {
+        self.req.initial_position = position;
+        self
+    }
+
     /// Subscribe.
     pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
         Ok(self.client.inner.subscribe(self.req).await?)
+    }
+}
+
+/// Builder for a [`Reader`].
+///
+/// Mirrors `org.apache.pulsar.client.api.ReaderBuilder`. Internally a `Reader` is just a
+/// non-durable `Exclusive` consumer with an auto-generated subscription name — there's no
+/// dedicated wire command, so the protocol layer doesn't need any extra plumbing.
+#[derive(Debug)]
+pub struct ReaderBuilder<'a> {
+    inner: ConsumerBuilder<'a>,
+}
+
+impl<'a> ReaderBuilder<'a> {
+    fn new(client: &'a PulsarClient, topic: String) -> Self {
+        let subscription = format!("reader-{}", uuid::Uuid::new_v4().simple());
+        let inner = ConsumerBuilder::new(client, topic)
+            .subscription(subscription)
+            .subscription_type(pb::command_subscribe::SubType::Exclusive)
+            .durable(false);
+        Self { inner }
+    }
+
+    /// Override the auto-generated subscription name. Rarely needed — Reader subscriptions
+    /// are not visible on the broker dashboard anyway.
+    #[must_use]
+    pub fn subscription_name(mut self, name: impl Into<String>) -> Self {
+        self.inner = self.inner.subscription(name);
+        self
+    }
+
+    /// Set the receiver queue size.
+    #[must_use]
+    pub fn receiver_queue_size(mut self, size: usize) -> Self {
+        self.inner = self.inner.receiver_queue_size(size);
+        self
+    }
+
+    /// Set the consumer name advertised to the broker.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.inner = self.inner.name(name);
+        self
+    }
+
+    /// Choose where the reader starts when its non-durable subscription is fresh.
+    /// Defaults to [`pb::command_subscribe::InitialPosition::Latest`].
+    #[must_use]
+    pub fn start_position(mut self, position: pb::command_subscribe::InitialPosition) -> Self {
+        self.inner = self.inner.initial_position(position);
+        self
+    }
+
+    /// Create the reader.
+    pub async fn create(self) -> Result<Reader> {
+        let consumer = self.inner.subscribe().await?;
+        Ok(Reader { consumer })
+    }
+}
+
+/// Reader handle — a non-durable consumer that reads from a topic without persisting an
+/// acknowledgement cursor. Use a reader for: log replay, message inspection, batch ETL, or
+/// anywhere you want at-most-once delivery semantics that the broker doesn't track.
+#[derive(Debug)]
+pub struct Reader {
+    consumer: magnetar_runtime_tokio::Consumer,
+}
+
+impl Reader {
+    /// Block until the next message arrives.
+    pub fn read_next(&self) -> magnetar_runtime_tokio::ReceiveFut {
+        self.consumer.receive()
+    }
+
+    /// Borrow the underlying consumer (for advanced operations like `flow()`).
+    #[must_use]
+    pub fn consumer(&self) -> &magnetar_runtime_tokio::Consumer {
+        &self.consumer
+    }
+
+    /// Close the reader.
+    pub async fn close(self) -> Result<(), PulsarError> {
+        self.consumer.close().await.map_err(PulsarError::Client)
     }
 }

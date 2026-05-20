@@ -62,7 +62,7 @@ mod client;
 #[cfg(feature = "tokio")]
 pub use client::{
     ClientBuilder, ConsumerBuilder, IncomingMessage, OutgoingMessage, ProducerBuilder,
-    PulsarClient, PulsarError,
+    PulsarClient, PulsarError, Reader, ReaderBuilder,
 };
 
 #[cfg(test)]
