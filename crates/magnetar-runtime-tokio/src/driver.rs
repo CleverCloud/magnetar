@@ -22,11 +22,49 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::BytesMut;
+use magnetar_proto::ConnectionEvent;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use crate::ConnectionShared;
 use crate::error::ClientError;
+
+/// Drain the connection's semantic event queue and react to events that need
+/// runtime-layer work (currently only `AuthChallenge` — every other event is
+/// handled inline by the sans-io layer's per-future Waker dispatch).
+fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientError> {
+    loop {
+        let event = shared.inner.lock().poll_event();
+        let Some(event) = event else {
+            return Ok(());
+        };
+        if let ConnectionEvent::AuthChallenge {
+            method: _,
+            challenge,
+        } = event
+        {
+            let Some(provider) = shared.auth_provider.clone() else {
+                tracing::warn!(
+                    "broker requested in-band auth refresh but no AuthProvider configured; \
+                     the connection will be reset"
+                );
+                return Err(ClientError::Other(
+                    "broker requested AUTH_CHALLENGE but client has no auth provider".to_owned(),
+                ));
+            };
+            let bytes = challenge.unwrap_or_default();
+            let refreshed = provider
+                .respond_to_challenge(&bytes)
+                .map_err(|err| ClientError::Other(format!("auth refresh failed: {err}")))?;
+            let method = provider.method().to_owned();
+            shared
+                .inner
+                .lock()
+                .submit_auth_response(refreshed.to_vec(), Some(method));
+            shared.driver_waker.notify_one();
+        }
+    }
+}
 
 /// Default size of the per-connection read buffer. Reads are non-blocking and append-style, so
 /// this is just the high-water mark before allocation grows.
@@ -152,9 +190,11 @@ where
                 let bytes = read_buf.split().freeze();
                 let now = Instant::now();
                 shared.inner.lock().handle_bytes(now, &bytes)?;
-                // After handling bytes, opportunistically signal user futures via wakers
-                // already registered inside the state machine. Nothing to do here — the sans-io
-                // layer dispatches them inline.
+                // After handling bytes, drain semantic events. Most go to per-future Wakers
+                // already (the sans-io layer wakes them inline), but `AuthChallenge` requires
+                // the runtime to invoke the configured AuthProvider and submit the response.
+                // PIP-30 / PIP-292.
+                handle_pending_events(&shared)?;
             }
 
             // Timer fired.

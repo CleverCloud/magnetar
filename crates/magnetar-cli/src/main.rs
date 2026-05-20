@@ -469,8 +469,8 @@ async fn build_data_client(
 ) -> Result<PulsarClient, CliError> {
     let mut builder = PulsarClient::builder().service_url(service_url);
     if let Some(t) = token {
-        let provider = TokenAuth::from_string(t.to_owned());
-        builder = builder.auth(&provider);
+        let provider = std::sync::Arc::new(TokenAuth::from_string(t.to_owned()));
+        builder = builder.auth(provider);
     }
     Ok(builder.build().await?)
 }

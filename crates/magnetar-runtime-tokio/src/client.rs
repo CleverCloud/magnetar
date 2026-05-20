@@ -46,12 +46,22 @@ impl Client {
     ///
     /// Surfaces socket I/O, TLS, and protocol errors via [`ClientError`].
     pub async fn connect(url: &str, config: ConnectionConfig) -> Result<Self, ClientError> {
+        Self::connect_auth(url, config, None).await
+    }
+
+    /// Connect with an in-band auth provider used to answer broker
+    /// `CommandAuthChallenge` (PIP-30 / PIP-292) for in-band token refresh.
+    pub async fn connect_auth(
+        url: &str,
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+    ) -> Result<Self, ClientError> {
         let parsed = ParsedUrl::parse(url)?;
         let tls_config = match parsed.scheme {
             crate::url_parse::Scheme::Tls => Some(default_tls_config()?),
             crate::url_parse::Scheme::Plain => None,
         };
-        Self::connect_with(parsed, tls_config, config).await
+        Self::connect_with(parsed, tls_config, config, auth_provider).await
     }
 
     /// Connect using a pre-parsed URL and an explicit TLS configuration. Intended for advanced
@@ -64,9 +74,10 @@ impl Client {
         url: ParsedUrl,
         tls_config: Option<Arc<rustls::ClientConfig>>,
         config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     ) -> Result<Self, ClientError> {
         let socket = Transport::connect(&url, tls_config).await?;
-        Self::start_handshake(socket, config).await
+        Self::start_handshake(socket, config, auth_provider).await
     }
 
     /// Drive the handshake against an already-connected socket. Useful for tests and for
@@ -75,14 +86,18 @@ impl Client {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        Self::start_handshake(socket, config).await
+        Self::start_handshake(socket, config, None).await
     }
 
-    async fn start_handshake<S>(socket: S, config: ConnectionConfig) -> Result<Self, ClientError>
+    async fn start_handshake<S>(
+        socket: S,
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+    ) -> Result<Self, ClientError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let shared = ConnectionShared::new(config);
+        let shared = ConnectionShared::with_auth(config, auth_provider);
 
         // Queue the CONNECT frame BEFORE spawning the driver — otherwise the driver might block
         // on a read before we have anything to flush.

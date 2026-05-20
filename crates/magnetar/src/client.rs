@@ -174,6 +174,7 @@ pub struct ClientBuilder {
     operation_timeout: Option<Duration>,
     auth_method_name: Option<String>,
     auth_data: Option<Vec<u8>>,
+    auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
 }
 
 impl ClientBuilder {
@@ -205,11 +206,14 @@ impl ClientBuilder {
         self
     }
 
-    /// Use the supplied auth provider to populate the initial CONNECT auth data.
+    /// Use the supplied auth provider to populate the initial CONNECT auth data,
+    /// and keep the provider for in-band `CommandAuthChallenge` refresh
+    /// (PIP-30 / PIP-292).
     #[must_use]
-    pub fn auth(mut self, provider: &dyn magnetar_proto::AuthProvider) -> Self {
+    pub fn auth(mut self, provider: std::sync::Arc<dyn magnetar_proto::AuthProvider>) -> Self {
         self.auth_method_name = Some(provider.method().to_owned());
         self.auth_data = provider.initial().ok().map(|bytes| bytes.to_vec());
+        self.auth_provider = Some(provider);
         self
     }
 
@@ -239,7 +243,7 @@ impl ClientBuilder {
         if let Some(data) = self.auth_data {
             config.auth_data = Some(data);
         }
-        let inner = Client::connect(&service_url, config).await?;
+        let inner = Client::connect_auth(&service_url, config, self.auth_provider).await?;
         Ok(PulsarClient { inner })
     }
 }

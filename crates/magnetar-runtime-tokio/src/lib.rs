@@ -85,20 +85,42 @@ pub use crate::url_parse::{ParsedUrl, Scheme};
 ///
 /// Cheap to share via `Arc`. The mutex is `parking_lot::Mutex` (not async), held only for the
 /// duration of a sans-io call (no `.await` inside the critical section).
-#[derive(Debug)]
 pub struct ConnectionShared {
     /// The sans-io state machine, guarded by a non-async mutex.
     pub inner: Mutex<magnetar_proto::Connection>,
     /// Single-cell wakeup for the driver loop. Not a channel.
     pub driver_waker: Notify,
+    /// Optional auth provider that the driver consults when the broker emits
+    /// [`CommandAuthChallenge`](magnetar_proto::pb::CommandAuthChallenge).
+    /// `None` means no in-band token refresh — the connection will drop if the
+    /// broker challenges. PIP-30 / PIP-292.
+    pub auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+}
+
+impl std::fmt::Debug for ConnectionShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionShared")
+            .field("inner", &"<Connection>")
+            .field("has_auth_provider", &self.auth_provider.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConnectionShared {
     /// Construct shared state from the given protocol-layer config.
     pub fn new(config: magnetar_proto::ConnectionConfig) -> Arc<Self> {
+        Self::with_auth(config, None)
+    }
+
+    /// Construct with an auth provider for in-band challenge refresh.
+    pub fn with_auth(
+        config: magnetar_proto::ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(magnetar_proto::Connection::new(config)),
             driver_waker: Notify::new(),
+            auth_provider,
         })
     }
 }
