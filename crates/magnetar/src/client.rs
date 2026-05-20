@@ -58,6 +58,9 @@ pub struct OutgoingMessage {
     /// default"; pass `vec!["__local__".to_owned()]` to opt out of replication entirely
     /// (Java's `disableReplication()` writes the same sentinel).
     pub replication_clusters: Vec<String>,
+    /// Optional transaction id (PIP-31). When set, the broker treats this publish as part
+    /// of the open transaction. Mirrors Java `Producer#newMessage(Transaction)`.
+    pub txn_id: Option<magnetar_proto::TxnId>,
 }
 
 impl OutgoingMessage {
@@ -131,6 +134,14 @@ impl OutgoingMessage {
         self.replication_clusters = vec!["__local__".to_owned()];
         self
     }
+
+    /// Mirrors Java `Producer#newMessage(Transaction)`. Stamps the supplied transaction id
+    /// on the publish so the broker treats it as part of the open transaction (PIP-31).
+    #[must_use]
+    pub fn txn(mut self, txn_id: magnetar_proto::TxnId) -> Self {
+        self.txn_id = Some(txn_id);
+        self
+    }
 }
 
 impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
@@ -161,6 +172,7 @@ impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
             metadata,
             uncompressed_size,
             num_messages: 1,
+            txn_id: msg.txn_id,
         }
     }
 }

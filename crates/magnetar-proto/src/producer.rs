@@ -51,6 +51,10 @@ pub struct OutgoingMessage {
     pub uncompressed_size: u32,
     /// Number of single messages this OutgoingMessage represents (1 unless caller bundled).
     pub num_messages: i32,
+    /// Optional transaction id. When set, the producer stamps it on `CommandSend` for
+    /// transactional publish semantics (PIP-31). Mirrors Java
+    /// `Producer#newMessage(Transaction).send()`.
+    pub txn_id: Option<crate::txn::TxnId>,
 }
 
 /// Result of [`ProducerState::queue_send`] — one or more frames the connection should emit.
@@ -423,8 +427,8 @@ impl ProducerState {
             producer_id: self.handle.0,
             sequence_id: seq.0,
             num_messages: Some(msg.num_messages.max(1)),
-            txnid_least_bits: None,
-            txnid_most_bits: None,
+            txnid_least_bits: msg.txn_id.map(|t| t.least_sig_bits),
+            txnid_most_bits: msg.txn_id.map(|t| t.most_sig_bits),
             highest_sequence_id: None,
             is_chunk: None,
             marker: None,
@@ -599,6 +603,7 @@ impl ProducerState {
         msg: OutgoingMessage,
         publish_time_ms: u64,
     ) -> Result<SendDecision, ProducerError> {
+        let txn_id = msg.txn_id;
         let payload = msg.payload;
         let uuid = uuid::Uuid::new_v4().to_string();
         let total_chunks =
@@ -647,8 +652,8 @@ impl ProducerState {
                 producer_id: self.handle.0,
                 sequence_id: ctx.sequence_id.0,
                 num_messages: Some(1),
-                txnid_least_bits: None,
-                txnid_most_bits: None,
+                txnid_least_bits: txn_id.map(|t| t.least_sig_bits),
+                txnid_most_bits: txn_id.map(|t| t.most_sig_bits),
                 highest_sequence_id: None,
                 is_chunk: Some(true),
                 marker: None,
@@ -779,6 +784,7 @@ mod tests {
             },
             uncompressed_size: payload.len() as u32,
             num_messages: 1,
+            txn_id: None,
         }
     }
 

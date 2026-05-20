@@ -67,6 +67,7 @@ impl<S: Schema> TypedProducer<S> {
             metadata,
             uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
             num_messages: 1,
+            txn_id: None,
         };
         let id = self.inner.send(msg).await?;
         Ok(id)
