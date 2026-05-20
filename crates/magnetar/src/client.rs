@@ -260,6 +260,7 @@ impl ClientBuilder {
 pub struct ProducerBuilder<'a> {
     client: &'a PulsarClient,
     req: CreateProducerRequest,
+    encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
 
 impl<'a> ProducerBuilder<'a> {
@@ -268,7 +269,11 @@ impl<'a> ProducerBuilder<'a> {
             topic,
             ..CreateProducerRequest::default()
         };
-        Self { client, req }
+        Self {
+            client,
+            req,
+            encryptor: None,
+        }
     }
 
     /// Set the optional producer name.
@@ -301,9 +306,26 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
+    /// `send()` to wrap the (post-compression) payload. Pass an
+    /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the
+    /// `encryption` feature.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        encryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>,
+    ) -> Self {
+        self.encryptor = Some(encryptor);
+        self
+    }
+
     /// Open the producer.
     pub async fn create(self) -> Result<magnetar_runtime_tokio::Producer> {
-        Ok(self.client.inner.open_producer(self.req).await?)
+        Ok(self
+            .client
+            .inner
+            .open_producer_with(self.req, self.encryptor)
+            .await?)
     }
 }
 
@@ -312,6 +334,7 @@ impl<'a> ProducerBuilder<'a> {
 pub struct ConsumerBuilder<'a> {
     client: &'a PulsarClient,
     req: SubscribeRequest,
+    decryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
 }
 
 impl<'a> ConsumerBuilder<'a> {
@@ -320,7 +343,11 @@ impl<'a> ConsumerBuilder<'a> {
             topic,
             ..SubscribeRequest::default()
         };
-        Self { client, req }
+        Self {
+            client,
+            req,
+            decryptor: None,
+        }
     }
 
     /// Required: set the subscription name.
@@ -366,9 +393,24 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Configure PIP-4 end-to-end decryption. The decryptor is consulted on every received
+    /// message whose `MessageMetadata.encryption_keys` is non-empty.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.decryptor = Some(decryptor);
+        self
+    }
+
     /// Subscribe.
     pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
-        Ok(self.client.inner.subscribe(self.req).await?)
+        Ok(self
+            .client
+            .inner
+            .subscribe_with(self.req, self.decryptor)
+            .await?)
     }
 }
 
