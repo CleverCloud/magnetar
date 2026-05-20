@@ -230,6 +230,10 @@ pub struct CreateProducerRequest {
     /// allocating sequence ids from `n` instead of `0`. Useful for at-least-once
     /// resume-on-restart from a known checkpoint.
     pub initial_sequence_id: Option<u64>,
+    /// Producer access mode. Mirrors `CommandProducer.producer_access_mode`. Defaults to
+    /// `Shared`; switch to `Exclusive` / `WaitForExclusive` / `ExclusiveWithFencing` for
+    /// single-writer-per-topic patterns.
+    pub access_mode: pb::ProducerAccessMode,
 }
 
 impl Default for CreateProducerRequest {
@@ -244,6 +248,7 @@ impl Default for CreateProducerRequest {
             max_messages_in_batch: 1000,
             schema: None,
             initial_sequence_id: None,
+            access_mode: pb::ProducerAccessMode::Shared,
         }
     }
 }
@@ -1168,7 +1173,7 @@ impl Connection {
             schema: req.schema,
             epoch: None,
             user_provided_producer_name: Some(req.producer_name.is_some()),
-            producer_access_mode: None,
+            producer_access_mode: Some(req.access_mode as i32),
             topic_epoch: None,
             txn_enabled: None,
             initial_subscription_name: None,

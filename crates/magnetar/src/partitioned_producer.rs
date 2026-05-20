@@ -148,6 +148,7 @@ pub struct PartitionedProducerBuilder<'a> {
     max_messages_in_batch: usize,
     routing: MessageRoutingMode,
     initial_sequence_id: Option<u64>,
+    access_mode: pb::ProducerAccessMode,
     schema: Option<pb::Schema>,
     encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
@@ -175,6 +176,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
             max_messages_in_batch: 1000,
             routing: MessageRoutingMode::default(),
             initial_sequence_id: None,
+            access_mode: pb::ProducerAccessMode::Shared,
             schema: None,
             encryptor: None,
         }
@@ -224,6 +226,14 @@ impl<'a> PartitionedProducerBuilder<'a> {
         self
     }
 
+    /// Producer access mode (`Shared` / `Exclusive` / `WaitForExclusive` /
+    /// `ExclusiveWithFencing`) — applied to every per-partition child producer.
+    #[must_use]
+    pub fn access_mode(mut self, mode: pb::ProducerAccessMode) -> Self {
+        self.access_mode = mode;
+        self
+    }
+
     /// Advertise a schema on every per-partition `CommandProducer`.
     #[must_use]
     pub fn schema(mut self, schema: pb::Schema) -> Self {
@@ -270,6 +280,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
                 max_messages_in_batch: self.max_messages_in_batch,
                 schema: self.schema.clone(),
                 initial_sequence_id: self.initial_sequence_id,
+                access_mode: self.access_mode,
             };
             let result = self
                 .client

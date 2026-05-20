@@ -534,6 +534,15 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#accessMode`. Defaults to `Shared`; switch to
+    /// `Exclusive` for single-writer-per-topic patterns, `WaitForExclusive` to queue
+    /// behind the current writer, or `ExclusiveWithFencing` to evict it.
+    #[must_use]
+    pub fn access_mode(mut self, mode: pb::ProducerAccessMode) -> Self {
+        self.req.access_mode = mode;
+        self
+    }
+
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload. Pass an
     /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the
