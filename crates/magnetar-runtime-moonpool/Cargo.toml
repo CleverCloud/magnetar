@@ -21,5 +21,6 @@ bytes          = { workspace = true }
 moonpool-core  = { workspace = true }
 parking_lot    = { workspace = true }
 rustls         = { workspace = true }
+tokio          = { workspace = true, features = ["io-util"] }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
