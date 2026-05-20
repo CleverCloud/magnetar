@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use magnetar_proto::{
-    AckRequest, ConsumerHandle, IncomingMessage, MessageId, OpOutcome, PendingOpKey, pb,
+    AckRequest, ConsumerHandle, IncomingMessage, MessageId, OpOutcome, PendingOpKey, SeekTarget, pb,
 };
 
 use crate::ConnectionShared;
@@ -129,6 +129,39 @@ impl Consumer {
     /// consumer detects it has lost local state and wants the broker to replay.
     pub fn redeliver_unacked(&self) {
         self.negative_ack_many(Vec::new());
+    }
+
+    /// Seek this consumer to a specific message id. The broker replays from there.
+    ///
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#seek(MessageId)`.
+    pub async fn seek_to_message(&self, message_id: MessageId) -> Result<(), ClientError> {
+        self.seek_inner(SeekTarget::MessageId(message_id)).await
+    }
+
+    /// Seek this consumer to a specific publish timestamp (millis since the UNIX epoch).
+    pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), ClientError> {
+        self.seek_inner(SeekTarget::PublishTime(publish_time_ms))
+            .await
+    }
+
+    async fn seek_inner(&self, target: SeekTarget) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.seek(self.handle, target)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected seek outcome: {other:?}"
+            ))),
+        }
     }
 
     /// Close this consumer. Resolves when the broker acks the close.
