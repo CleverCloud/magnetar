@@ -1,0 +1,11 @@
+Magnetar
+Copyright 2026 Florentin Dubois
+
+This product includes software developed by Florentin Dubois
+(https://github.com/FlorentinDUBOIS/magnetar).
+
+This product vendors and depends on a redacted copy of the
+Apache Pulsar wire protocol definition (PulsarApi.proto,
+PulsarMarkers.proto) under the Apache License, Version 2.0.
+The original is maintained by the Apache Software Foundation
+at https://github.com/apache/pulsar.

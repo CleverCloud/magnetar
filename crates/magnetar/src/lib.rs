@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Apache Pulsar client driver for Rust.
+//!
+//! Public façade for the magnetar workspace. Re-exports the sans-io core
+//! ([`magnetar_proto`]) plus the selected runtime engine. See the workspace
+//! [README](https://github.com/FlorentinDUBOIS/magnetar/blob/main/README.md) for
+//! the bigger picture.
+//!
+//! ## Feature flags
+//!
+//! - `tokio` (default): pull in the tokio engine.
+//! - `moonpool`: pull in the moonpool engine.
+//! - `auth-oauth2`, `auth-sasl`, `auth-athenz`: pluggable auth providers.
+//! - `encryption`: PIP-4 end-to-end encryption.
+
+#![warn(unreachable_pub)]
+#![forbid(unsafe_code)]
+
+pub use magnetar_proto as proto;
+#[cfg(feature = "moonpool")]
+pub use magnetar_runtime_moonpool as runtime_moonpool;
+#[cfg(feature = "tokio")]
+pub use magnetar_runtime_tokio as runtime_tokio;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn proto_reexport_compiles() {
+        let _conn = crate::proto::Connection::new();
+    }
+}

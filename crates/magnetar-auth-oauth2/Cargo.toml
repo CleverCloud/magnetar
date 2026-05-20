@@ -1,0 +1,25 @@
+[package]
+name        = "magnetar-auth-oauth2"
+description = "OAuth2 ClientCredentialsFlow auth provider for magnetar."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "../../README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+magnetar-proto = { workspace = true }
+reqwest        = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+url            = { workspace = true }

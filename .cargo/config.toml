@@ -1,0 +1,13 @@
+# Workspace cargo configuration.
+#
+# `--cfg tokio_unstable` is required by moonpool-core 0.6.0 (which calls
+# `tokio::task::Builder` — a tokio API gated behind this cfg). See moonpool's
+# own build setup at https://github.com/PierreZ/moonpool.
+#
+# This cfg also surfaces other tokio "unstable" APIs (`task_locals_wrapper`,
+# `runtime::Handle::dump`, etc.). magnetar itself does NOT rely on them; the
+# flag is here solely to satisfy moonpool-core. CI runs the build with this
+# flag too — keep them in sync.
+
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

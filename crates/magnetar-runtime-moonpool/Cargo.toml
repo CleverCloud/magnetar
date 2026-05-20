@@ -1,0 +1,25 @@
+[package]
+name        = "magnetar-runtime-moonpool"
+description = "moonpool runtime engine for magnetar — deterministic-sim friendly. Custom rustls-over-bytepipe TLS adapter. No channels."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "../../README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+magnetar-proto = { workspace = true }
+bytes          = { workspace = true }
+moonpool-core  = { workspace = true }
+parking_lot    = { workspace = true }
+rustls         = { workspace = true }
+tracing        = { workspace = true }
+thiserror      = { workspace = true }

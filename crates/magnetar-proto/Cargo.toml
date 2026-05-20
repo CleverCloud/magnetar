@@ -1,0 +1,29 @@
+[package]
+name        = "magnetar-proto"
+description = "Sans-io Apache Pulsar wire protocol — encode/decode, framing, state machines. No I/O dependencies. No channels."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes     = { workspace = true }
+crc32c    = { workspace = true }
+prost     = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+slab      = { workspace = true }
+uuid      = { workspace = true }
+
+[dev-dependencies]
+proptest  = { workspace = true }
+rstest    = { workspace = true }

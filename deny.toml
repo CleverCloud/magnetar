@@ -1,0 +1,56 @@
+# cargo-deny configuration for magnetar.
+# See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+]
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+highlight         = "all"
+workspace-default-features = "allow"
+
+deny = [
+    # Magnetar bans channels of any flavour. See ../GUIDELINES.md for the rationale and
+    # the Arc<Mutex<State>> + Notify + Waker-slab replacement pattern.
+    { name = "crossbeam-channel", reason = "magnetar bans channels" },
+    { name = "flume",             reason = "magnetar bans channels" },
+    { name = "async-channel",     reason = "magnetar bans channels" },
+    { name = "kanal",             reason = "magnetar bans channels" },
+    { name = "postage",           reason = "magnetar bans channels" },
+    { name = "tachyonix",         reason = "magnetar bans channels" },
+    { name = "thingbuf",          reason = "magnetar bans channels" },
+    # No native-tls / openssl-sys — rustls is the only TLS implementation we ship.
+    { name = "native-tls",        reason = "magnetar uses rustls only" },
+    { name = "openssl",           reason = "magnetar uses rustls only" },
+    { name = "openssl-sys",       reason = "magnetar uses rustls only" },
+]
+skip       = []
+skip-tree  = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

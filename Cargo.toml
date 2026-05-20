@@ -1,0 +1,132 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/magnetar",
+    "crates/magnetar-admin",
+    "crates/magnetar-auth-athenz",
+    "crates/magnetar-auth-oauth2",
+    "crates/magnetar-auth-sasl",
+    "crates/magnetar-cli",
+    "crates/magnetar-fakes",
+    "crates/magnetar-messagecrypto",
+    "crates/magnetar-proto",
+    "crates/magnetar-runtime-moonpool",
+    "crates/magnetar-runtime-tokio",
+    "xtask",
+]
+
+[workspace.package]
+version       = "0.1.0-dev.0"
+edition       = "2024"
+rust-version  = "1.85"
+license       = "Apache-2.0"
+authors       = ["Florentin Dubois <florentin.dubois@clever-cloud.com>"]
+repository    = "https://github.com/FlorentinDUBOIS/magnetar"
+homepage      = "https://github.com/FlorentinDUBOIS/magnetar"
+readme        = "README.md"
+keywords      = ["pulsar", "apache-pulsar", "messaging", "streaming", "sans-io"]
+categories    = ["asynchronous", "network-programming"]
+
+[workspace.dependencies]
+# Internal crates
+magnetar                 = { version = "0.1.0-dev.0", path = "crates/magnetar" }
+magnetar-admin           = { version = "0.1.0-dev.0", path = "crates/magnetar-admin" }
+magnetar-auth-athenz     = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-athenz" }
+magnetar-auth-oauth2     = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-oauth2" }
+magnetar-auth-sasl       = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-sasl" }
+magnetar-fakes           = { version = "0.1.0-dev.0", path = "crates/magnetar-fakes" }
+magnetar-messagecrypto   = { version = "0.1.0-dev.0", path = "crates/magnetar-messagecrypto" }
+magnetar-proto           = { version = "0.1.0-dev.0", path = "crates/magnetar-proto" }
+magnetar-runtime-moonpool = { version = "0.1.0-dev.0", path = "crates/magnetar-runtime-moonpool" }
+magnetar-runtime-tokio   = { version = "0.1.0-dev.0", path = "crates/magnetar-runtime-tokio" }
+
+# Codec
+prost           = "0.13"
+prost-build     = "0.13"
+prost-types     = "0.13"
+bytes           = "1"
+crc32c          = "0.6"
+
+# Async runtime (engines only, NEVER magnetar-proto)
+tokio           = { version = "1", default-features = false }
+tokio-util      = { version = "0.7", default-features = false }
+futures         = { version = "0.3", default-features = false }
+futures-util    = { version = "0.3", default-features = false }
+pin-project-lite = "0.2"
+parking_lot     = "0.12"
+arc-swap        = "1"
+slab            = "0.4"
+
+# TLS — rustls everywhere, no native-tls
+rustls               = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile       = "2"
+rustls-native-certs  = "0.7"
+tokio-rustls         = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Compression — Pulsar's four codecs
+lz4_flex   = { version = "0.11", default-features = false, features = ["std"] }
+zstd       = { version = "0.13", default-features = false }
+snap       = "1"
+flate2     = { version = "1", default-features = false, features = ["zlib"] }
+
+# Schemas
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+apache-avro = "0.21"
+
+# PIP-37 chunking + identifiers
+uuid       = { version = "1", default-features = false, features = ["v4", "fast-rng", "std"] }
+
+# PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly)
+aws-lc-rs  = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+
+# moonpool engine
+moonpool-core = "=0.6"
+
+# Admin REST + CLI
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url     = "2"
+http    = "1"
+clap    = { version = "4", features = ["derive"] }
+
+# Telemetry + errors
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+thiserror          = "2"
+anyhow             = "1"
+
+# Test infrastructure
+testcontainers = "0.27"
+rstest         = "0.21"
+proptest       = "1"
+
+[workspace.lints.rust]
+unsafe_code                   = "forbid"
+unreachable_pub               = "warn"
+missing_debug_implementations = "warn"
+rust_2024_compatibility       = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pulsar identifiers, sequence ids, and timestamps regularly require explicit casts.
+cast_possible_truncation = "allow"
+cast_sign_loss            = "allow"
+cast_possible_wrap        = "allow"
+module_name_repetitions   = "allow"
+must_use_candidate        = "allow"
+missing_errors_doc        = "allow"
+missing_panics_doc        = "allow"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+overflow-checks = true
+panic         = "abort"
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 1   # tests still need to be quick under the sans-io harness

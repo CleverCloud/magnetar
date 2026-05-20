@@ -1,0 +1,25 @@
+avoid-breaking-exported-api = false
+msrv                        = "1.85"
+disallowed-types = [
+    { path = "tokio::sync::mpsc::Sender",         reason = "magnetar bans channels — use Arc<Mutex<State>> + Notify + Waker slabs" },
+    { path = "tokio::sync::mpsc::Receiver",       reason = "magnetar bans channels — use Arc<Mutex<State>> + Notify + Waker slabs" },
+    { path = "tokio::sync::mpsc::UnboundedSender",   reason = "magnetar bans channels" },
+    { path = "tokio::sync::mpsc::UnboundedReceiver", reason = "magnetar bans channels" },
+    { path = "tokio::sync::broadcast::Sender",    reason = "magnetar bans channels" },
+    { path = "tokio::sync::broadcast::Receiver",  reason = "magnetar bans channels" },
+    { path = "tokio::sync::watch::Sender",        reason = "magnetar bans channels — use Arc<Mutex<State>>" },
+    { path = "tokio::sync::watch::Receiver",      reason = "magnetar bans channels — use Arc<Mutex<State>>" },
+    { path = "tokio::sync::oneshot::Sender",      reason = "magnetar bans channels — register a Waker inside the sans-io state machine" },
+    { path = "tokio::sync::oneshot::Receiver",    reason = "magnetar bans channels — register a Waker inside the sans-io state machine" },
+    { path = "std::sync::mpsc::Sender",           reason = "magnetar bans channels" },
+    { path = "std::sync::mpsc::Receiver",         reason = "magnetar bans channels" },
+]
+disallowed-methods = [
+    { path = "tokio::sync::mpsc::channel",            reason = "magnetar bans channels" },
+    { path = "tokio::sync::mpsc::unbounded_channel",  reason = "magnetar bans channels" },
+    { path = "tokio::sync::broadcast::channel",       reason = "magnetar bans channels" },
+    { path = "tokio::sync::oneshot::channel",         reason = "magnetar bans channels" },
+    { path = "tokio::sync::watch::channel",           reason = "magnetar bans channels" },
+    { path = "std::sync::mpsc::channel",              reason = "magnetar bans channels" },
+    { path = "std::sync::mpsc::sync_channel",         reason = "magnetar bans channels" },
+]

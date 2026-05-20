@@ -1,0 +1,23 @@
+[package]
+name        = "magnetar-messagecrypto"
+description = "PIP-4 end-to-end message encryption for magnetar — AES-GCM data-key wrap via aws-lc-rs."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "../../README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+magnetar-proto = { workspace = true }
+aws-lc-rs      = { workspace = true }
+bytes          = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }

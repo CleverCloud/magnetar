@@ -1,0 +1,29 @@
+[package]
+name        = "magnetar-cli"
+description = "magnetar CLI — produce, consume, inspect, and admin against an Apache Pulsar broker."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "../../README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+publish     = true
+
+[[bin]]
+name = "magnetar"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+magnetar           = { workspace = true, features = ["tokio"] }
+magnetar-admin     = { workspace = true }
+clap               = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

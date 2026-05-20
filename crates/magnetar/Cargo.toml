@@ -1,0 +1,37 @@
+[package]
+name        = "magnetar"
+description = "Apache Pulsar client driver for Rust. Public façade — re-exports the sans-io core plus the selected runtime engine."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "../../README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default  = ["tokio"]
+tokio    = ["dep:magnetar-runtime-tokio"]
+moonpool = ["dep:magnetar-runtime-moonpool"]
+auth-oauth2 = ["dep:magnetar-auth-oauth2"]
+auth-sasl   = ["dep:magnetar-auth-sasl"]
+auth-athenz = ["dep:magnetar-auth-athenz"]
+encryption  = ["dep:magnetar-messagecrypto"]
+
+[dependencies]
+magnetar-proto             = { workspace = true }
+magnetar-runtime-tokio     = { workspace = true, optional = true }
+magnetar-runtime-moonpool  = { workspace = true, optional = true }
+magnetar-auth-oauth2       = { workspace = true, optional = true }
+magnetar-auth-sasl         = { workspace = true, optional = true }
+magnetar-auth-athenz       = { workspace = true, optional = true }
+magnetar-messagecrypto     = { workspace = true, optional = true }
+thiserror                  = { workspace = true }
+tracing                    = { workspace = true }
+url                        = { workspace = true }
