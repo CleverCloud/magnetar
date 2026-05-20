@@ -66,6 +66,7 @@ pub mod event;
 pub mod frame;
 pub mod lookup;
 pub mod producer;
+pub mod schema;
 pub mod topic_watcher;
 pub mod trackers;
 pub mod types;
