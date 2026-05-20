@@ -81,6 +81,23 @@ impl Consumer {
             vec![message_id],
             pb::command_ack::AckType::Individual,
             properties,
+            None,
+        )
+    }
+
+    /// Acknowledge a single message as part of a Pulsar transaction (PIP-31). The ack only
+    /// takes effect once the transaction commits. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Transaction)`.
+    pub fn ack_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with(
+            vec![message_id],
+            pb::command_ack::AckType::Individual,
+            Vec::new(),
+            Some(txn_id),
         )
     }
 
@@ -89,7 +106,7 @@ impl Consumer {
         message_ids: Vec<MessageId>,
         ack_type: pb::command_ack::AckType,
     ) -> impl Future<Output = Result<(), ClientError>> {
-        self.ack_many_with(message_ids, ack_type, Vec::new())
+        self.ack_many_with(message_ids, ack_type, Vec::new(), None)
     }
 
     fn ack_many_with(
@@ -97,6 +114,7 @@ impl Consumer {
         message_ids: Vec<MessageId>,
         ack_type: pb::command_ack::AckType,
         properties: Vec<(String, i64)>,
+        txn_id: Option<magnetar_proto::TxnId>,
     ) -> impl Future<Output = Result<(), ClientError>> {
         let shared = self.shared.clone();
         let request_id = {
@@ -107,6 +125,7 @@ impl Consumer {
                     message_ids,
                     ack_type,
                     properties,
+                    txn_id,
                 },
             )
         };

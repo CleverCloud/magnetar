@@ -396,6 +396,10 @@ pub struct AckRequest {
     /// `Consumer#acknowledgeAsync(MessageId, Map<String, Long>)`. The broker stores them
     /// alongside the cursor for diagnostic / replay tooling.
     pub properties: Vec<(String, i64)>,
+    /// Optional transaction id (PIP-31). When set, the ack participates in the open
+    /// transaction — it only takes effect when the transaction commits. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Transaction)`.
+    pub txn_id: Option<crate::txn::TxnId>,
 }
 
 /// Seek target — either to a message id or to a publish-time.
@@ -1559,8 +1563,8 @@ impl Connection {
             message_id: ack.message_ids.iter().map(|m| m.to_pb()).collect(),
             validation_error: None,
             properties,
-            txnid_least_bits: None,
-            txnid_most_bits: None,
+            txnid_least_bits: ack.txn_id.map(|t| t.least_sig_bits),
+            txnid_most_bits: ack.txn_id.map(|t| t.most_sig_bits),
             request_id: Some(request_id.0),
         };
         let base = pb::BaseCommand {
