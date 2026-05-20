@@ -62,6 +62,8 @@ mod client;
 #[cfg(feature = "tokio")]
 mod multi_topics;
 #[cfg(feature = "tokio")]
+mod partitioned_consumer;
+#[cfg(feature = "tokio")]
 mod partitioned_producer;
 #[cfg(feature = "tokio")]
 mod table_view;
@@ -74,6 +76,8 @@ pub use client::{
 };
 #[cfg(feature = "tokio")]
 pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};
+#[cfg(feature = "tokio")]
+pub use partitioned_consumer::{PartitionedConsumer, PartitionedConsumerBuilder};
 #[cfg(feature = "tokio")]
 pub use partitioned_producer::{
     MessageRoutingMode, PartitionedProducer, PartitionedProducerBuilder,

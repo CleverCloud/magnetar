@@ -334,6 +334,18 @@ impl PulsarClient {
         crate::PartitionedProducerBuilder::new(self, topic.into())
     }
 
+    /// Open a [`crate::PartitionedConsumerBuilder`] for the given topic. The builder
+    /// auto-discovers the partition count and subscribes to every partition under a single
+    /// subscription name. Mirrors Java's `PulsarClient#newConsumer()` against a partitioned
+    /// topic.
+    #[must_use]
+    pub fn partitioned_consumer(
+        &self,
+        topic: impl Into<String>,
+    ) -> crate::PartitionedConsumerBuilder<'_> {
+        crate::PartitionedConsumerBuilder::new(self, topic.into())
+    }
+
     /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
     /// `PulsarClient#newProducer(Schema<T>)`.
     #[must_use]
