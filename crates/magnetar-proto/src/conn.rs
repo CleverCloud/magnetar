@@ -1185,6 +1185,13 @@ impl Connection {
         n
     }
 
+    /// Number of in-flight sends on a producer (i.e. sends with no `CommandSendReceipt` yet).
+    /// Used by the runtime engines' `Producer::flush` to know when it's safe to return.
+    #[must_use]
+    pub fn producer_pending_count(&self, handle: ProducerHandle) -> usize {
+        self.producers.get(&handle).map_or(0, |p| p.pending.len())
+    }
+
     fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.

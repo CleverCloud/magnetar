@@ -105,6 +105,37 @@ impl Producer {
         }
     }
 
+    /// Flush this producer: force any pending batch to flush and wait for every in-flight
+    /// send to be acknowledged by the broker. Idempotent — calling `flush()` on a quiescent
+    /// producer returns immediately.
+    ///
+    /// Mirrors `org.apache.pulsar.client.api.Producer#flushAsync`. Use before `close()` if
+    /// you want at-least-once semantics on the trailing sends.
+    pub async fn flush(&self) -> Result<(), ClientError> {
+        let publish_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.flush_producer(self.handle, publish_time_ms);
+        }
+        self.shared.driver_waker.notify_one();
+
+        // Drain by waiting on the driver waker until the producer's pending queue is empty.
+        // The driver task notifies all parked tasks after every inbound packet, so each
+        // `CommandSendReceipt` wakes us; we re-check the count and re-park if needed.
+        loop {
+            let pending = self.shared.inner.lock().producer_pending_count(self.handle);
+            if pending == 0 {
+                return Ok(());
+            }
+            let notified = self.shared.driver_waker.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            notified.await;
+        }
+    }
+
     /// Close this producer. The returned future resolves when the broker acknowledges the close.
     ///
     /// # Errors
