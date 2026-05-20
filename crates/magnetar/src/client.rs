@@ -28,6 +28,9 @@ pub enum PulsarError {
     /// Configuration error before any I/O happened.
     #[error("configuration error: {0}")]
     Config(String),
+    /// Schema encode / decode error from a [`crate::TypedProducer`] / [`crate::TypedConsumer`].
+    #[error("schema error: {0}")]
+    Schema(#[from] magnetar_proto::schema::SchemaError),
 }
 
 /// Convenience alias for outgoing application messages.
@@ -173,6 +176,28 @@ impl PulsarClient {
     #[must_use]
     pub fn table_view(&self, topic: impl Into<String>) -> crate::TableViewBuilder<'_> {
         crate::TableViewBuilder::new(self, topic.into())
+    }
+
+    /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
+    /// `PulsarClient#newProducer(Schema<T>)`.
+    #[must_use]
+    pub fn typed_producer<S: magnetar_proto::schema::Schema>(
+        &self,
+        topic: impl Into<String>,
+        schema: std::sync::Arc<S>,
+    ) -> crate::TypedProducerBuilder<'_, S> {
+        crate::TypedProducerBuilder::new(self, topic.into(), schema)
+    }
+
+    /// Open a schema-aware [`crate::TypedConsumerBuilder`] for the given topic. Mirrors Java's
+    /// `PulsarClient#newConsumer(Schema<T>)`.
+    #[must_use]
+    pub fn typed_consumer<S: magnetar_proto::schema::Schema>(
+        &self,
+        topic: impl Into<String>,
+        schema: std::sync::Arc<S>,
+    ) -> crate::TypedConsumerBuilder<'_, S> {
+        crate::TypedConsumerBuilder::new(self, topic.into(), schema)
     }
 
     /// Close the underlying connection.
@@ -334,6 +359,15 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Advertise the given Pulsar schema on `CommandProducer.schema`. The broker stores it
+    /// and surfaces it on the dashboard; magnetar does not enforce serialisation on its own
+    /// — pair with a [`crate::TypedProducer`] for that.
+    #[must_use]
+    pub fn schema(mut self, schema: pb::Schema) -> Self {
+        self.req.schema = Some(schema);
+        self
+    }
+
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload. Pass an
     /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the
@@ -437,6 +471,15 @@ impl<'a> ConsumerBuilder<'a> {
     #[must_use]
     pub fn read_compacted(mut self, on: bool) -> Self {
         self.req.read_compacted = on;
+        self
+    }
+
+    /// Advertise the given Pulsar schema on `CommandSubscribe.schema`. The broker uses it
+    /// for schema-version negotiation; magnetar does not enforce deserialisation on its own
+    /// — pair with a [`crate::TypedConsumer`] for that.
+    #[must_use]
+    pub fn schema(mut self, schema: pb::Schema) -> Self {
+        self.req.schema = Some(schema);
         self
     }
 

@@ -62,12 +62,18 @@ mod client;
 #[cfg(feature = "tokio")]
 mod table_view;
 #[cfg(feature = "tokio")]
+mod typed;
+#[cfg(feature = "tokio")]
 pub use client::{
     ClientBuilder, ConsumerBuilder, IncomingMessage, OutgoingMessage, ProducerBuilder,
     PulsarClient, PulsarError, Reader, ReaderBuilder,
 };
 #[cfg(feature = "tokio")]
 pub use table_view::{TableView, TableViewBuilder, TableViewListener};
+#[cfg(feature = "tokio")]
+pub use typed::{
+    TypedConsumer, TypedConsumerBuilder, TypedMessage, TypedProducer, TypedProducerBuilder,
+};
 
 // PIP-4 encryption bridge: implement the runtime's MessageEncryptor / MessageDecryptor traits
 // for magnetar-messagecrypto::MessageCrypto. Behind the `encryption` feature so the heavy
