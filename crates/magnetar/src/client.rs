@@ -174,6 +174,87 @@ pub struct IncomingMessage {
     pub metadata: pb::MessageMetadata,
     /// Application payload bytes (post-decompression / post-decryption).
     pub payload: Bytes,
+    /// Broker-supplied redelivery count.
+    pub redelivery_count: u32,
+}
+
+impl IncomingMessage {
+    /// Mirrors Java `Message#getKey`. Returns `None` for keyless messages.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.metadata.partition_key.as_deref()
+    }
+
+    /// Mirrors Java `Message#hasKey`.
+    #[must_use]
+    pub fn has_key(&self) -> bool {
+        self.metadata.partition_key.is_some()
+    }
+
+    /// Mirrors Java `Message#getOrderingKey`. Returns `None` if unset.
+    #[must_use]
+    pub fn ordering_key(&self) -> Option<&Bytes> {
+        self.metadata.ordering_key.as_ref()
+    }
+
+    /// Mirrors Java `Message#getPublishTime` — millis since the UNIX epoch as stamped by
+    /// the producer's state machine at queue time.
+    #[must_use]
+    pub fn publish_time_ms(&self) -> u64 {
+        self.metadata.publish_time
+    }
+
+    /// Mirrors Java `Message#getEventTime`. Returns `0` if the producer didn't stamp one
+    /// (Java returns `0` in the same situation).
+    #[must_use]
+    pub fn event_time_ms(&self) -> u64 {
+        self.metadata.event_time.unwrap_or(0)
+    }
+
+    /// Mirrors Java `Message#getSequenceId`. The sequence id assigned by the producer's
+    /// state machine (visible alongside the broker-assigned message id).
+    #[must_use]
+    pub fn sequence_id(&self) -> u64 {
+        self.metadata.sequence_id
+    }
+
+    /// Mirrors Java `Message#getProducerName`.
+    #[must_use]
+    pub fn producer_name(&self) -> &str {
+        &self.metadata.producer_name
+    }
+
+    /// Mirrors Java `Message#getProperty(String)`. Returns the value for the first matching
+    /// property entry, or `None` if absent.
+    #[must_use]
+    pub fn property(&self, key: &str) -> Option<&str> {
+        self.metadata
+            .properties
+            .iter()
+            .find(|kv| kv.key == key)
+            .map(|kv| kv.value.as_str())
+    }
+
+    /// Mirrors Java `Message#getProperties` — every (key, value) pair on the message.
+    pub fn properties(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.metadata
+            .properties
+            .iter()
+            .map(|kv| (kv.key.as_str(), kv.value.as_str()))
+    }
+
+    /// Mirrors Java `Message#getRedeliveryCount`. The broker-side count of how many times
+    /// this message has been redelivered.
+    #[must_use]
+    pub fn redelivery_count(&self) -> u32 {
+        self.redelivery_count
+    }
+
+    /// Mirrors Java `Message#getReplicatedFrom`. `None` if the message wasn't replicated.
+    #[must_use]
+    pub fn replicated_from(&self) -> Option<&str> {
+        self.metadata.replicated_from.as_deref()
+    }
 }
 
 impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
@@ -182,6 +263,7 @@ impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
             id: msg.message_id,
             metadata: msg.metadata,
             payload: msg.payload,
+            redelivery_count: msg.redelivery_count,
         }
     }
 }
