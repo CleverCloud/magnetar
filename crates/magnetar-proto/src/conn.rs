@@ -1243,6 +1243,27 @@ impl Connection {
         let _ = self.encode_command(&base);
     }
 
+    /// Negatively acknowledge messages — request the broker to redeliver them.
+    /// Mirrors `ConsumerImpl#negativeAcknowledge`.
+    ///
+    /// Empty `message_ids` means "redeliver every unacked message on this consumer"
+    /// (Java's `consumer.redeliverUnacknowledgedMessages()`). Otherwise only the supplied
+    /// ids are re-pushed.
+    pub fn negative_ack(&mut self, handle: ConsumerHandle, message_ids: Vec<MessageId>) {
+        let pb_ids = message_ids.into_iter().map(MessageId::to_pb).collect();
+        let cmd = pb::CommandRedeliverUnacknowledgedMessages {
+            consumer_id: handle.0,
+            message_ids: pb_ids,
+            consumer_epoch: None,
+        };
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::RedeliverUnacknowledgedMessages as i32,
+            redeliver_unacknowledged_messages: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+    }
+
     /// Issue a seek.
     pub fn seek(&mut self, handle: ConsumerHandle, target: SeekTarget) -> RequestId {
         let request_id = self.alloc_request_id();
