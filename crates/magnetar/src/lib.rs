@@ -68,6 +68,8 @@ mod partitioned_producer;
 #[cfg(feature = "tokio")]
 mod table_view;
 #[cfg(feature = "tokio")]
+mod transaction;
+#[cfg(feature = "tokio")]
 mod typed;
 #[cfg(feature = "tokio")]
 pub use client::{
@@ -84,6 +86,8 @@ pub use partitioned_producer::{
 };
 #[cfg(feature = "tokio")]
 pub use table_view::{TableView, TableViewBuilder, TableViewListener};
+#[cfg(feature = "tokio")]
+pub use transaction::{Transaction, TxnState};
 #[cfg(feature = "tokio")]
 pub use typed::{
     TypedConsumer, TypedConsumerBuilder, TypedMessage, TypedProducer, TypedProducerBuilder,
