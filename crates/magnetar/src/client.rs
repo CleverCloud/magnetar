@@ -843,6 +843,41 @@ impl Reader {
         &self.consumer
     }
 
+    /// Topic this reader is bound to. Mirrors Java `Reader#getTopic`.
+    #[must_use]
+    pub fn topic(&self) -> String {
+        self.consumer.topic()
+    }
+
+    /// Auto-generated subscription name behind this reader. Mirrors Java
+    /// `Reader#getSubscriptionName`.
+    #[must_use]
+    pub fn subscription(&self) -> String {
+        self.consumer.subscription()
+    }
+
+    /// Ask the broker for the topic's last-published message id. Mirrors Java
+    /// `Reader#getLastMessageId`.
+    pub async fn last_message_id(&self) -> Result<magnetar_proto::MessageId, PulsarError> {
+        self.consumer
+            .last_message_id()
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// `true` if the broker has at least one message strictly past the supplied cursor.
+    /// Mirrors Java `Reader#hasMessageAvailable` (the Reader form takes no cursor; pass
+    /// the last id you received).
+    pub async fn has_message_after(
+        &self,
+        cursor: magnetar_proto::MessageId,
+    ) -> Result<bool, PulsarError> {
+        self.consumer
+            .has_message_after(cursor)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Close the reader.
     pub async fn close(self) -> Result<(), PulsarError> {
         self.consumer.close().await.map_err(PulsarError::Client)
