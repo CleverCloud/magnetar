@@ -89,8 +89,8 @@ pub mod pb {
 
 pub use crate::auth::{AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth};
 pub use crate::conn::{
-    AckRequest, Connection, ConnectionConfig, CreateProducerRequest, HandshakeState, OpOutcome,
-    PendingOpKey, SeekTarget, SubscribeRequest,
+    AckRequest, Connection, ConnectionConfig, CreateProducerRequest, HandshakeState,
+    KeySharedConfig, OpOutcome, PendingOpKey, SeekTarget, SubscribeRequest,
 };
 pub use crate::consumer::ConsumerStats;
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};

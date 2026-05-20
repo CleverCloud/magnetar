@@ -282,6 +282,32 @@ pub struct SubscribeRequest {
     /// Mirrors `CommandSubscribe.subscription_properties` — per-subscription key/value
     /// metadata visible to the broker dashboard.
     pub subscription_properties: Vec<(String, String)>,
+    /// Optional [`KeySharedConfig`] for `Key_Shared` subscriptions. Ignored for other
+    /// subscription types.
+    pub key_shared: Option<KeySharedConfig>,
+}
+
+/// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
+/// messages with the same partition key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySharedConfig {
+    /// Routing mode — broker-managed `AutoSplit` or client-pinned `Sticky`.
+    pub mode: pb::KeySharedMode,
+    /// For `Sticky` mode: the hash ranges this consumer claims. Ignored for `AutoSplit`.
+    pub sticky_hash_ranges: Vec<(i32, i32)>,
+    /// Tolerate out-of-order delivery within the same key group. Mirrors
+    /// `KeySharedMeta.allow_out_of_order_delivery`.
+    pub allow_out_of_order_delivery: bool,
+}
+
+impl Default for KeySharedConfig {
+    fn default() -> Self {
+        Self {
+            mode: pb::KeySharedMode::AutoSplit,
+            sticky_hash_ranges: Vec::new(),
+            allow_out_of_order_delivery: false,
+        }
+    }
 }
 
 impl Default for SubscribeRequest {
@@ -298,6 +324,7 @@ impl Default for SubscribeRequest {
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
+            key_shared: None,
         }
     }
 }
@@ -1217,6 +1244,18 @@ impl Connection {
             .into_iter()
             .map(|(key, value)| pb::KeyValue { key, value })
             .collect();
+        let key_shared_meta = req.key_shared.as_ref().map(|cfg| pb::KeySharedMeta {
+            key_shared_mode: cfg.mode as i32,
+            hash_ranges: cfg
+                .sticky_hash_ranges
+                .iter()
+                .map(|(start, end)| pb::IntRange {
+                    start: *start,
+                    end: *end,
+                })
+                .collect(),
+            allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
+        });
         let cmd = pb::CommandSubscribe {
             topic: req.topic,
             subscription: req.subscription,
@@ -1234,7 +1273,7 @@ impl Connection {
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
-            key_shared_meta: None,
+            key_shared_meta,
             subscription_properties,
             consumer_epoch: None,
         };

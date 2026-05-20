@@ -681,6 +681,16 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#keySharedPolicy`. Only meaningful when
+    /// [`Self::subscription_type`] is `Key_Shared`. The broker rejects the subscribe if
+    /// the config is invalid (e.g. overlapping sticky ranges across consumers in the same
+    /// subscription).
+    #[must_use]
+    pub fn key_shared_policy(mut self, cfg: magnetar_proto::KeySharedConfig) -> Self {
+        self.req.key_shared = Some(cfg);
+        self
+    }
+
     /// Subscribe.
     pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
         Ok(self
