@@ -328,6 +328,10 @@ pub struct SubscribeRequest {
     /// messages stay locally tracked for `d` before the redelivery command goes out. `None`
     /// means the redelivery is sent immediately (the default).
     pub negative_ack_redelivery_delay: Option<Duration>,
+    /// Mirrors Java `ConsumerBuilder#ackTimeout`. When `Some(d)`, every delivered message
+    /// is tracked client-side; if no positive ack arrives within `d`, the consumer forces a
+    /// redelivery. `None` disables the tracker (the default).
+    pub ack_timeout: Option<Duration>,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -376,6 +380,7 @@ impl Default for SubscribeRequest {
             dead_letter_topic: None,
             consumer_metadata: Vec::new(),
             negative_ack_redelivery_delay: None,
+            ack_timeout: None,
         }
     }
 }
@@ -1190,18 +1195,26 @@ impl Connection {
     }
 
     /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
-    /// per-consumer tracker deadline (e.g. the negative-ack redelivery timer).
+    /// per-consumer tracker deadline (negative-ack delay + unacked-message timeout).
     pub fn poll_timeout(&self) -> Option<Instant> {
         let mut next = self
             .last_activity
             .map(|t| t + self.config.keepalive_interval);
+        let mut consider = |deadline: Instant| {
+            next = Some(match next {
+                Some(current) => current.min(deadline),
+                None => deadline,
+            });
+        };
         for consumer in self.consumers.values() {
-            if let Some(tracker) = consumer.nack_tracker.as_ref() {
-                if let Some(deadline) = tracker.next_deadline() {
-                    next = Some(match next {
-                        Some(current) => current.min(deadline),
-                        None => deadline,
-                    });
+            if let Some(t) = consumer.nack_tracker.as_ref() {
+                if let Some(d) = t.next_deadline() {
+                    consider(d);
+                }
+            }
+            if let Some(t) = consumer.unacked_tracker.as_ref() {
+                if let Some(d) = t.next_deadline() {
+                    consider(d);
                 }
             }
         }
@@ -1227,14 +1240,21 @@ impl Connection {
             self.last_activity = Some(now);
         }
 
-        // Negative-ack redelivery. Drain due ids per consumer and emit the redelivery
-        // command via the standard path.
+        // Tracker-driven redeliveries — both negative-ack delay and unacked-message timeout
+        // produce the same CommandRedeliverUnacknowledgedMessages payload, so we collect
+        // then emit through the shared helper.
         let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         for (handle, consumer) in &mut self.consumers {
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
-                let actions = tracker.poll(now);
-                for action in actions {
+                for action in tracker.poll(now) {
                     let crate::trackers::NackAction::RedeliverUnacked { message_ids, .. } = action;
+                    redeliveries.push((*handle, message_ids));
+                }
+            }
+            if let Some(tracker) = consumer.unacked_tracker.as_mut() {
+                for action in tracker.poll(now) {
+                    let crate::trackers::UnackedAction::RedeliverExpired { message_ids, .. } =
+                        action;
                     redeliveries.push((*handle, message_ids));
                 }
             }
@@ -1339,6 +1359,10 @@ impl Connection {
         state.max_redeliver_count = req.max_redeliver_count;
         if let Some(delay) = req.negative_ack_redelivery_delay {
             state.nack_tracker = Some(crate::trackers::NegativeAcksTracker::new(handle, delay));
+        }
+        if let Some(timeout) = req.ack_timeout {
+            state.unacked_tracker =
+                Some(crate::trackers::UnackedMessageTracker::new(handle, timeout));
         }
         self.consumers.insert(handle, state);
 
@@ -1509,6 +1533,18 @@ impl Connection {
     pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest) -> RequestId {
         let request_id = self.alloc_request_id();
         let n_ids = ack.message_ids.len() as u64;
+        // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
+        // (caller may have nacked then acked the same id).
+        if let Some(consumer) = self.consumers.get_mut(&handle) {
+            for id in &ack.message_ids {
+                if let Some(t) = consumer.unacked_tracker.as_mut() {
+                    t.remove(id);
+                }
+                if let Some(t) = consumer.nack_tracker.as_mut() {
+                    t.remove(id);
+                }
+            }
+        }
         let properties: Vec<pb::KeyLongValue> = ack
             .properties
             .iter()

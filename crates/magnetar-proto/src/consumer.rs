@@ -30,7 +30,7 @@ use prost::Message as _;
 use crate::error::ConsumerError;
 use crate::event::IncomingMessage;
 use crate::pb;
-use crate::trackers::NegativeAcksTracker;
+use crate::trackers::{NegativeAcksTracker, UnackedMessageTracker};
 use crate::types::{ConsumerHandle, MessageId, RequestId};
 
 /// Per-consumer state.
@@ -84,6 +84,11 @@ pub struct ConsumerState {
     /// stage the ids here and the redelivery fires on the next `handle_timeout` once the
     /// delay has elapsed. `None` means immediate redelivery (the default).
     pub nack_tracker: Option<NegativeAcksTracker>,
+    /// Optional unacked-message tracker. When configured via
+    /// `SubscribeRequest::ack_timeout`, every delivered message is recorded into a
+    /// sliding-window bucket and re-delivered if no positive ack arrives within the
+    /// configured window. Mirrors Java's `UnAckedMessageTracker`.
+    pub unacked_tracker: Option<UnackedMessageTracker>,
 }
 
 /// Snapshot of cumulative consumer counters. Mirrors `org.apache.pulsar.client.api.ConsumerStats`
@@ -157,6 +162,7 @@ impl ConsumerState {
             total_acks_sent: 0,
             total_acks_failed: 0,
             nack_tracker: None,
+            unacked_tracker: None,
         }
     }
 
@@ -364,6 +370,10 @@ impl ConsumerState {
             self.total_msgs_received = self.total_msgs_received.saturating_add(1);
             self.total_bytes_received =
                 self.total_bytes_received.saturating_add(payload_len as u64);
+            // Track for ack-timeout-driven redelivery.
+            if let Some(tracker) = self.unacked_tracker.as_mut() {
+                tracker.add(msg.message_id, std::time::Instant::now());
+            }
             self.queue.push_back(msg);
             DeliverOutcome::Delivered {
                 count: self.queue.len(),

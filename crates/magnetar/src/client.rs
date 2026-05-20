@@ -812,6 +812,15 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#ackTimeout`. The consumer client-tracks every
+    /// delivered message and forces a redelivery if no positive ack arrives within
+    /// `timeout`. The state machine drives the tracker on its existing tick.
+    #[must_use]
+    pub fn ack_timeout(mut self, timeout: Duration) -> Self {
+        self.req.ack_timeout = Some(timeout);
+        self
+    }
+
     /// Mirrors Java `ConsumerBuilder#deadLetterPolicy`. After `max_redeliver_count`
     /// redeliveries, the consumer flags the message as dead-letter — drain via
     /// [`magnetar_runtime_tokio::Consumer::drain_dead_letter`] and republish to
