@@ -249,6 +249,19 @@ impl Consumer {
             ))),
         }
     }
+
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#isConnected`. Returns `true` while the
+    /// underlying broker connection is up.
+    pub fn is_connected(&self) -> bool {
+        self.shared.inner.lock().is_connected()
+    }
+
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#getLastDisconnectedTimestamp`: wall-clock
+    /// time at which the underlying connection most recently went down. `None` while the
+    /// connection has never been disconnected.
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.shared.inner.lock().last_disconnected_timestamp()
+    }
 }
 
 /// Future returned by [`Consumer::receive`].

@@ -167,6 +167,20 @@ impl Producer {
         self.shared.driver_waker.notify_one();
         wait_request(&self.shared, request_id).await
     }
+
+    /// Mirrors `org.apache.pulsar.client.api.Producer#isConnected`. Returns `true` while the
+    /// underlying broker connection is up (the producer itself does not maintain a separate
+    /// session — it lives on the shared client connection).
+    pub fn is_connected(&self) -> bool {
+        self.shared.inner.lock().is_connected()
+    }
+
+    /// Mirrors `org.apache.pulsar.client.api.Producer#getLastDisconnectedTimestamp`: wall-clock
+    /// time at which the underlying connection most recently went down. `None` if the
+    /// connection has never been disconnected.
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.shared.inner.lock().last_disconnected_timestamp()
+    }
 }
 
 async fn wait_request(

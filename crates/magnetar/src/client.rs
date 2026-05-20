@@ -170,6 +170,25 @@ impl PulsarClient {
     pub async fn close(self) {
         self.inner.close().await;
     }
+
+    /// Returns `true` while the underlying broker connection is up. Mirrors Java's
+    /// `org.apache.pulsar.client.api.Producer#isConnected` and
+    /// `Consumer#isConnected` at the client scope.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    /// Wall-clock time the underlying broker connection was most recently torn down (peer
+    /// EOF, I/O error, or an explicit `close()`). `None` while it has never been torn down.
+    ///
+    /// Mirrors `org.apache.pulsar.client.api.Producer#getLastDisconnectedTimestamp` /
+    /// `Consumer#getLastDisconnectedTimestamp`. Convert with
+    /// [`std::time::SystemTime::duration_since`] for Java-style millis-since-epoch.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.inner.last_disconnected_timestamp()
+    }
 }
 
 /// Builder for [`PulsarClient`].
@@ -494,5 +513,17 @@ impl Reader {
     /// Close the reader.
     pub async fn close(self) -> Result<(), PulsarError> {
         self.consumer.close().await.map_err(PulsarError::Client)
+    }
+
+    /// Mirrors `org.apache.pulsar.client.api.Reader#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.consumer.is_connected()
+    }
+
+    /// Mirrors `org.apache.pulsar.client.api.Reader#getLastDisconnectedTimestamp`.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.consumer.last_disconnected_timestamp()
     }
 }

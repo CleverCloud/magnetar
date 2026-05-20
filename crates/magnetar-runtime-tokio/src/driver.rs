@@ -151,8 +151,14 @@ where
         // Flush whatever the state machine produced. This happens *outside* the lock so user
         // futures can keep enqueuing while we hold the network handle.
         if !write_buf.is_empty() {
-            socket.write_all(&write_buf).await?;
-            socket.flush().await?;
+            if let Err(err) = socket.write_all(&write_buf).await {
+                shared.inner.lock().mark_disconnected();
+                return Err(err.into());
+            }
+            if let Err(err) = socket.flush().await {
+                shared.inner.lock().mark_disconnected();
+                return Err(err.into());
+            }
             write_buf.clear();
         }
 
@@ -181,15 +187,25 @@ where
 
             // Inbound bytes.
             r = socket.read_buf(&mut read_buf) => {
-                let n = r?;
+                let n = match r {
+                    Ok(n) => n,
+                    Err(err) => {
+                        shared.inner.lock().mark_disconnected();
+                        return Err(err.into());
+                    }
+                };
                 if n == 0 {
-                    // Peer closed cleanly. Surface as a typed error so the producer/consumer
-                    // futures wake up with something actionable.
+                    // Peer closed cleanly. Mark the state machine as disconnected so user
+                    // futures see is_connected() flip and the disconnect timestamp records.
+                    shared.inner.lock().mark_disconnected();
                     return Err(ClientError::PeerClosed);
                 }
                 let bytes = read_buf.split().freeze();
                 let now = Instant::now();
-                shared.inner.lock().handle_bytes(now, &bytes)?;
+                if let Err(err) = shared.inner.lock().handle_bytes(now, &bytes) {
+                    shared.inner.lock().mark_disconnected();
+                    return Err(err.into());
+                }
                 // After handling bytes, drain semantic events. Most go to per-future Wakers
                 // already (the sans-io layer wakes them inline), but `AuthChallenge` requires
                 // the runtime to invoke the configured AuthProvider and submit the response.

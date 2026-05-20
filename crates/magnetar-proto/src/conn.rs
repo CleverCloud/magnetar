@@ -27,7 +27,7 @@
 use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
 use std::task::Waker;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use bytes::{Buf, Bytes, BytesMut};
 
@@ -337,6 +337,16 @@ pub struct Connection {
     next_watcher_id: u64,
     /// Time of last outbound or inbound traffic (for keepalive).
     last_activity: Option<Instant>,
+    /// Wall-clock time of the most recent transition to [`HandshakeState::Connected`].
+    /// Mirrors Java's `Producer/Consumer#getLastDisconnectedTimestamp` companion: useful
+    /// for application-level health probes and reconnect diagnostics.
+    last_connected_at: Option<SystemTime>,
+    /// Wall-clock time of the most recent transition out of [`HandshakeState::Connected`]
+    /// (to `Closing`, `Closed`, or `Failed`). Mirrors
+    /// `org.apache.pulsar.client.api.Producer#getLastDisconnectedTimestamp` (millis since
+    /// the UNIX epoch in Java; an [`Option<SystemTime>`] here so the caller picks its own
+    /// epoch conversion).
+    last_disconnected_at: Option<SystemTime>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -396,6 +406,8 @@ impl Connection {
             next_consumer_id: 0,
             next_watcher_id: 0,
             last_activity: None,
+            last_connected_at: None,
+            last_disconnected_at: None,
         }
     }
 
@@ -407,6 +419,32 @@ impl Connection {
     /// Returns whether the connection is ready to accept producer / consumer opens.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, HandshakeState::Connected)
+    }
+
+    /// Wall-clock time the connection last reached [`HandshakeState::Connected`], if ever.
+    /// Returns `None` before the first successful handshake.
+    pub fn last_connected_timestamp(&self) -> Option<SystemTime> {
+        self.last_connected_at
+    }
+
+    /// Wall-clock time the connection most recently left [`HandshakeState::Connected`] (to
+    /// `Closing`, `Closed`, or `Failed`), if ever. Mirrors Java's
+    /// `Producer/Consumer#getLastDisconnectedTimestamp`.
+    pub fn last_disconnected_timestamp(&self) -> Option<SystemTime> {
+        self.last_disconnected_at
+    }
+
+    /// Mark the connection as failed (e.g. peer EOF, I/O error) and record the disconnect
+    /// timestamp. Called by the runtime driver when the underlying socket dies before a
+    /// graceful close has been initiated.
+    pub fn mark_disconnected(&mut self) {
+        if !matches!(
+            self.state,
+            HandshakeState::Closed | HandshakeState::Failed | HandshakeState::Closing
+        ) {
+            self.last_disconnected_at = Some(SystemTime::now());
+        }
+        self.state = HandshakeState::Failed;
     }
 
     /// Returns the feature flags negotiated with the broker (empty until `Connected`).
@@ -487,6 +525,7 @@ impl Connection {
                     .connected
                     .ok_or(ProtocolError::Handshake("missing CommandConnected"))?;
                 self.state = HandshakeState::Connected;
+                self.last_connected_at = Some(SystemTime::now());
                 self.broker_max_message_size = connected.max_message_size.map(|v| v as usize);
                 self.broker_protocol_version = connected.protocol_version.unwrap_or(0);
                 self.feature_flags = connected.feature_flags.unwrap_or_default();
@@ -1638,6 +1677,12 @@ impl Connection {
 
     /// Close the whole connection.
     pub fn close(&mut self) {
+        if matches!(
+            self.state,
+            HandshakeState::Connected | HandshakeState::AuthChallenging
+        ) {
+            self.last_disconnected_at = Some(SystemTime::now());
+        }
         self.state = HandshakeState::Closing;
         self.events
             .push_back(ConnectionEvent::Closed { reason: None });
@@ -1726,5 +1771,69 @@ impl ConsumerState {
         let msg = self.queue.pop_front()?;
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
         Some(msg)
+    }
+}
+
+#[cfg(test)]
+mod conn_state_tests {
+    use super::*;
+    use crate::frame::encode_command;
+
+    fn handshake_response_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    #[test]
+    fn timestamps_track_connect_and_disconnect() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        assert!(conn.last_connected_timestamp().is_none());
+        assert!(conn.last_disconnected_timestamp().is_none());
+        assert!(!conn.is_connected());
+
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame).expect("handle");
+        assert!(conn.is_connected());
+        let connected_at = conn
+            .last_connected_timestamp()
+            .expect("connected timestamp set");
+        assert!(conn.last_disconnected_timestamp().is_none());
+
+        conn.mark_disconnected();
+        assert!(!conn.is_connected());
+        let disconnected_at = conn
+            .last_disconnected_timestamp()
+            .expect("disconnected timestamp set");
+        assert!(disconnected_at >= connected_at);
+
+        // Marking disconnected again should not bump the timestamp now that we're already in
+        // a terminal state (idempotency for repeated mark_disconnected calls on Failed).
+        let pinned = disconnected_at;
+        conn.mark_disconnected();
+        assert_eq!(conn.last_disconnected_timestamp(), Some(pinned));
+    }
+
+    #[test]
+    fn local_close_records_disconnect() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame).expect("handle");
+        assert!(conn.is_connected());
+
+        conn.close();
+        assert!(conn.last_disconnected_timestamp().is_some());
     }
 }

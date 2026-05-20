@@ -227,6 +227,25 @@ impl Client {
     pub fn take_driver(&self) -> Option<DriverHandle> {
         self.driver.lock().take()
     }
+
+    /// Returns `true` while the underlying broker connection is in
+    /// [`HandshakeState::Connected`]. Mirrors `org.apache.pulsar.client.api.Producer#isConnected`
+    /// at the connection scope (Java exposes it on `Producer`/`Consumer`; magnetar's runtime
+    /// keeps all producers/consumers from a single `Client` on one shared connection, so the
+    /// same predicate answers both).
+    pub fn is_connected(&self) -> bool {
+        self.shared.inner.lock().is_connected()
+    }
+
+    /// Wall-clock time the broker connection was most recently torn down (peer close, I/O
+    /// error, local `close()`). `None` while the connection has never been disconnected.
+    ///
+    /// Mirrors Java's `Producer/Consumer#getLastDisconnectedTimestamp`. Convert with
+    /// [`std::time::SystemTime::duration_since`] if the Java-style millis-since-epoch number
+    /// is needed.
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.shared.inner.lock().last_disconnected_timestamp()
+    }
 }
 
 async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), ClientError> {
