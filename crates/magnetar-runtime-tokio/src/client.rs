@@ -187,6 +187,36 @@ impl Client {
         })
     }
 
+    /// Subscribe to a topic-list watcher (PIP-145) and return the initial topic snapshot
+    /// for the given namespace + regex. Subsequent updates are emitted as
+    /// `ConnectionEvent::TopicListChanged` events; this snapshot helper does not stream
+    /// them — pair with a follow-up event-poll API for that.
+    pub async fn watch_topic_list(
+        &self,
+        namespace: &str,
+        pattern: &str,
+    ) -> Result<Vec<String>, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.watch_topic_list(namespace, pattern)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            magnetar_proto::OpOutcome::TopicListSnapshot { topics, .. } => Ok(topics),
+            magnetar_proto::OpOutcome::Error { code, message, .. } => {
+                Err(ClientError::Broker { code, message })
+            }
+            other => Err(ClientError::Other(format!(
+                "unexpected topic-list snapshot outcome: {other:?}"
+            ))),
+        }
+    }
+
     /// Query the broker for the number of partitions a topic has. Returns `0` for
     /// non-partitioned topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
     pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {

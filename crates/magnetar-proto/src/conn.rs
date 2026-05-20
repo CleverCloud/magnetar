@@ -205,6 +205,14 @@ pub enum OpOutcome {
         /// cursor is).
         consumer_mark_delete_position: Option<MessageId>,
     },
+    /// `CommandWatchTopicListSuccess` correlated with a `watch_topic_list` call —
+    /// the initial snapshot for a topic-list watcher (PIP-145).
+    TopicListSnapshot {
+        /// Request id of the originating request.
+        request_id: RequestId,
+        /// Topics currently matching the watcher's namespace + pattern.
+        topics: Vec<String>,
+    },
 }
 
 /// Parameters for opening a producer.
@@ -1010,9 +1018,18 @@ impl Connection {
                     watcher.initialised = true;
                 }
                 self.pending_requests.remove(&rid);
+                let topics = ok.topic.clone();
+                self.outcomes.insert(
+                    PendingOpKey::Request(rid),
+                    OpOutcome::TopicListSnapshot {
+                        request_id: rid,
+                        topics: topics.clone(),
+                    },
+                );
+                self.wake_for_request(rid);
                 self.events.push_back(ConnectionEvent::TopicListSnapshot {
                     request_id: rid,
-                    topics: ok.topic,
+                    topics,
                 });
             }
             pb::base_command::Type::WatchTopicUpdate => {

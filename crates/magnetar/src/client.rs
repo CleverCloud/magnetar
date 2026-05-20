@@ -346,6 +346,21 @@ impl PulsarClient {
         crate::PartitionedConsumerBuilder::new(self, topic.into())
     }
 
+    /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
+    /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
+    /// this pattern right now" workflows. Live updates are emitted by the connection as
+    /// `TopicListChanged` events but are not yet streamed by this helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulsarError::Client`] if the broker refuses the watch.
+    pub async fn topic_list_snapshot(&self, namespace: &str, pattern: &str) -> Result<Vec<String>> {
+        self.inner
+            .watch_topic_list(namespace, pattern)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
     /// `PulsarClient#newProducer(Schema<T>)`.
     #[must_use]
