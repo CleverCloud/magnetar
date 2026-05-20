@@ -70,6 +70,7 @@ pub mod producer;
 pub mod schema;
 pub mod topic_watcher;
 pub mod trackers;
+pub mod txn;
 pub mod types;
 
 /// Protobuf-generated Pulsar wire types.
@@ -97,4 +98,5 @@ pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
 };
+pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};

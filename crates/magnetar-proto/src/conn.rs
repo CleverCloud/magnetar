@@ -33,12 +33,13 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::consumer::ConsumerState;
 use crate::error::ProtocolError;
-use crate::event::{ConnectionEvent, IncomingMessage, LookupOutcome};
+use crate::event::{ConnectionEvent, IncomingMessage, LookupOutcome, TxnRoundTrip};
 use crate::frame::{Frame, decode_one, encode_command, encode_payload};
 use crate::lookup::{LookupRegistry, LookupRequest, PartitionedMetadataRequest};
 use crate::pb;
 use crate::producer::{ProducerState, SendDecision};
 use crate::topic_watcher::{TopicWatcher, TopicWatcherRegistry};
+use crate::txn::{TxnAction, TxnClient, TxnError, TxnId, TxnState};
 use crate::types::{
     CompressionKind, ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId,
 };
@@ -166,6 +167,34 @@ pub enum OpOutcome {
         /// Optional error if the request failed.
         error: Option<(i32, String)>,
     },
+    /// `CommandNewTxnResponse` correlated with a `new_txn` call.
+    NewTxn {
+        /// Request id of the originating request.
+        request_id: RequestId,
+        /// Resulting transaction id on success, or the [`TxnError`] on failure.
+        result: Result<TxnId, TxnError>,
+    },
+    /// `CommandAddPartitionToTxnResponse` correlated with an `add_partition_to_txn` call.
+    AddPartitionToTxn {
+        /// Request id of the originating request.
+        request_id: RequestId,
+        /// `Ok(())` on success.
+        result: Result<(), TxnError>,
+    },
+    /// `CommandAddSubscriptionToTxnResponse` correlated with an `add_subscription_to_txn` call.
+    AddSubscriptionToTxn {
+        /// Request id of the originating request.
+        request_id: RequestId,
+        /// `Ok(())` on success.
+        result: Result<(), TxnError>,
+    },
+    /// `CommandEndTxnResponse` correlated with an `end_txn` call.
+    EndTxn {
+        /// Request id of the originating request.
+        request_id: RequestId,
+        /// Final transaction state on success.
+        result: Result<TxnState, TxnError>,
+    },
 }
 
 /// Parameters for opening a producer.
@@ -285,6 +314,9 @@ pub struct Connection {
     lookup: LookupRegistry,
     /// Topic watcher registry.
     topic_watchers: TopicWatcherRegistry,
+    /// Transaction-coordinator client (PIP-31). One per connection — the connection only opens
+    /// transactions against the TC that lives behind it.
+    txn_client: TxnClient,
     /// Next request id.
     next_request_id: u64,
     /// Next producer id.
@@ -321,6 +353,10 @@ enum PendingRequestKind {
     ProducerClose { handle: ProducerHandle },
     ConsumerClose { handle: ConsumerHandle },
     TopicWatcher { watcher_id: u64 },
+    NewTxn,
+    AddPartitionToTxn,
+    AddSubscriptionToTxn,
+    EndTxn,
 }
 
 impl Connection {
@@ -342,6 +378,7 @@ impl Connection {
             consumers: HashMap::new(),
             lookup: LookupRegistry::default(),
             topic_watchers: TopicWatcherRegistry::default(),
+            txn_client: TxnClient::new(0),
             next_request_id: 0,
             next_producer_id: 0,
             next_consumer_id: 0,
@@ -825,6 +862,100 @@ impl Connection {
                     removed: upd.deleted_topics,
                 });
             }
+            pb::base_command::Type::NewTxnResponse => {
+                let resp = command
+                    .new_txn_response
+                    .ok_or(ProtocolError::InvariantViolation(
+                        "missing CommandNewTxnResponse",
+                    ))?;
+                let request_id = RequestId(resp.request_id);
+                self.pending_requests.remove(&request_id);
+                let result = match self.txn_client.handle_new_txn_response(resp) {
+                    Ok(Some(id)) => Ok(id),
+                    Ok(None) => {
+                        // Unknown request id — drop the outcome silently. The driver will not
+                        // surface a future for a request we never enqueued.
+                        return Ok(());
+                    }
+                    Err(err) => Err(err),
+                };
+                self.outcomes.insert(
+                    PendingOpKey::Request(request_id),
+                    OpOutcome::NewTxn {
+                        request_id,
+                        result: result.clone(),
+                    },
+                );
+                self.wake_for_request(request_id);
+                self.events.push_back(ConnectionEvent::TxnResponse {
+                    request_id,
+                    outcome: TxnRoundTrip::NewTxn(result),
+                });
+            }
+            pb::base_command::Type::AddPartitionToTxnResponse => {
+                let resp = command.add_partition_to_txn_response.ok_or(
+                    ProtocolError::InvariantViolation("missing CommandAddPartitionToTxnResponse"),
+                )?;
+                let request_id = RequestId(resp.request_id);
+                self.pending_requests.remove(&request_id);
+                let result = self.txn_client.handle_add_partition_response(resp);
+                self.outcomes.insert(
+                    PendingOpKey::Request(request_id),
+                    OpOutcome::AddPartitionToTxn {
+                        request_id,
+                        result: result.clone(),
+                    },
+                );
+                self.wake_for_request(request_id);
+                self.events.push_back(ConnectionEvent::TxnResponse {
+                    request_id,
+                    outcome: TxnRoundTrip::AddPartition(result),
+                });
+            }
+            pb::base_command::Type::AddSubscriptionToTxnResponse => {
+                let resp = command.add_subscription_to_txn_response.ok_or(
+                    ProtocolError::InvariantViolation(
+                        "missing CommandAddSubscriptionToTxnResponse",
+                    ),
+                )?;
+                let request_id = RequestId(resp.request_id);
+                self.pending_requests.remove(&request_id);
+                let result = self.txn_client.handle_add_subscription_response(resp);
+                self.outcomes.insert(
+                    PendingOpKey::Request(request_id),
+                    OpOutcome::AddSubscriptionToTxn {
+                        request_id,
+                        result: result.clone(),
+                    },
+                );
+                self.wake_for_request(request_id);
+                self.events.push_back(ConnectionEvent::TxnResponse {
+                    request_id,
+                    outcome: TxnRoundTrip::AddSubscription(result),
+                });
+            }
+            pb::base_command::Type::EndTxnResponse => {
+                let resp = command
+                    .end_txn_response
+                    .ok_or(ProtocolError::InvariantViolation(
+                        "missing CommandEndTxnResponse",
+                    ))?;
+                let request_id = RequestId(resp.request_id);
+                self.pending_requests.remove(&request_id);
+                let result = self.txn_client.handle_end_txn_response(resp);
+                self.outcomes.insert(
+                    PendingOpKey::Request(request_id),
+                    OpOutcome::EndTxn {
+                        request_id,
+                        result: result.clone(),
+                    },
+                );
+                self.wake_for_request(request_id);
+                self.events.push_back(ConnectionEvent::TxnResponse {
+                    request_id,
+                    outcome: TxnRoundTrip::EndTxn(result),
+                });
+            }
             _ => {
                 // Unhandled command — we tolerate them silently for forward compatibility, but
                 // we DO push an event for the driver to log.
@@ -1282,6 +1413,93 @@ impl Connection {
         }
         self.pending_requests
             .insert(request_id, PendingRequestKind::ConsumerClose { handle });
+        request_id
+    }
+
+    /// Mutable accessor for the embedded [`TxnClient`].
+    ///
+    /// Drivers needing to register a waker against a pending TC request (`new_txn`,
+    /// `add_partition_to_txn`, …) reach in via this accessor — the [`Connection`] otherwise
+    /// owns and drives the client.
+    pub fn txn_client_mut(&mut self) -> &mut TxnClient {
+        &mut self.txn_client
+    }
+
+    /// Read-only accessor for the embedded [`TxnClient`].
+    pub fn txn_client(&self) -> &TxnClient {
+        &self.txn_client
+    }
+
+    /// Open a new transaction at the broker-side transaction coordinator. Returns the request
+    /// id; the matching [`OpOutcome::NewTxn`] is consumed via [`Self::take_outcome`].
+    pub fn new_txn(&mut self, timeout: Duration) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let cmd = self.txn_client.new_txn(request_id.0, timeout_ms);
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::NewTxn as i32,
+            new_txn: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::NewTxn);
+        request_id
+    }
+
+    /// Register `topic` as a partition that the transaction will write to. Returns the request
+    /// id; the matching [`OpOutcome::AddPartitionToTxn`] is consumed via [`Self::take_outcome`].
+    pub fn add_partition_to_txn(&mut self, txn: TxnId, topic: String) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = self.txn_client.add_partition(request_id.0, txn, topic);
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::AddPartitionToTxn as i32,
+            add_partition_to_txn: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::AddPartitionToTxn);
+        request_id
+    }
+
+    /// Register `(subscription, topic)` as a subscription the transaction will acknowledge on.
+    /// Returns the request id; the matching [`OpOutcome::AddSubscriptionToTxn`] is consumed via
+    /// [`Self::take_outcome`].
+    pub fn add_subscription_to_txn(
+        &mut self,
+        txn: TxnId,
+        subscription: String,
+        topic: String,
+    ) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = self
+            .txn_client
+            .add_subscription(request_id.0, txn, subscription, topic);
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::AddSubscriptionToTxn as i32,
+            add_subscription_to_txn: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::AddSubscriptionToTxn);
+        request_id
+    }
+
+    /// Commit or abort the transaction. Returns the request id; the matching
+    /// [`OpOutcome::EndTxn`] is consumed via [`Self::take_outcome`] once the broker replies.
+    pub fn end_txn(&mut self, txn: TxnId, action: TxnAction) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = self.txn_client.end_txn(request_id.0, txn, action);
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::EndTxn as i32,
+            end_txn: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::EndTxn);
         request_id
     }
 

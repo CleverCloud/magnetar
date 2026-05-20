@@ -14,7 +14,24 @@
 use bytes::Bytes;
 
 use crate::pb;
+use crate::txn::{TxnError, TxnId, TxnState};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
+
+/// Result variants of one round-trip against the Transaction Coordinator.
+///
+/// Mirrors PIP-31's response set. The `Result` shape carries either the
+/// expected payload (e.g. a fresh [`TxnId`]) or the broker's [`TxnError`].
+#[derive(Debug, Clone)]
+pub enum TxnRoundTrip {
+    /// `CommandNewTxnResponse` — broker minted a new transaction.
+    NewTxn(Result<TxnId, TxnError>),
+    /// `CommandAddPartitionToTxnResponse` — partition registered with the txn.
+    AddPartition(Result<(), TxnError>),
+    /// `CommandAddSubscriptionToTxnResponse` — subscription registered with the txn.
+    AddSubscription(Result<(), TxnError>),
+    /// `CommandEndTxnResponse` — txn committed or aborted; carries the final state.
+    EndTxn(Result<TxnState, TxnError>),
+}
 
 /// A semantic event surfaced by the state machine.
 #[derive(Debug, Clone)]
@@ -187,6 +204,17 @@ pub enum ConnectionEvent {
     Closed {
         /// Optional close reason for diagnostics.
         reason: Option<String>,
+    },
+
+    /// A Transaction Coordinator round-trip completed.
+    ///
+    /// Carries the outcome for one of: `new_txn`, `add_partition_to_txn`,
+    /// `add_subscription_to_txn`, `end_txn`.
+    TxnResponse {
+        /// Request id correlating the response to the originating request.
+        request_id: RequestId,
+        /// The transactional outcome.
+        outcome: TxnRoundTrip,
     },
 }
 
