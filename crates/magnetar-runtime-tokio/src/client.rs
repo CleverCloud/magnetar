@@ -64,6 +64,35 @@ impl Client {
         Self::connect_with(parsed, tls_config, config, auth_provider).await
     }
 
+    /// Build a [`rustls::ClientConfig`] whose trust anchors are the PEM-encoded certificate
+    /// chain in `pem_bytes` (the system trust store is NOT loaded). Mirrors Java
+    /// `ClientBuilder#tlsTrustCertsFilePath` — useful when the broker uses a self-signed cert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Other`] if no valid certificate is parsed from the PEM.
+    pub fn tls_config_from_pem(pem_bytes: &[u8]) -> Result<Arc<rustls::ClientConfig>, ClientError> {
+        let mut roots = rustls::RootCertStore::empty();
+        let mut cursor = std::io::Cursor::new(pem_bytes);
+        for cert in rustls_pemfile::certs(&mut cursor) {
+            let cert = cert.map_err(|e| {
+                ClientError::Other(format!("failed to parse a trust certificate from PEM: {e}"))
+            })?;
+            roots.add(cert).map_err(|e| {
+                ClientError::Other(format!("rustls rejected a trust certificate: {e}"))
+            })?;
+        }
+        if roots.is_empty() {
+            return Err(ClientError::Other(
+                "no trust certificates were parsed from the provided PEM".to_owned(),
+            ));
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
+
     /// Connect using a pre-parsed URL and an explicit TLS configuration. Intended for advanced
     /// callers that need to customise trust anchors / client certificates / ALPN.
     ///

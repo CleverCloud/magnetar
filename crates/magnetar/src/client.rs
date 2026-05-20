@@ -403,6 +403,7 @@ pub struct ClientBuilder {
     auth_method_name: Option<String>,
     auth_data: Option<Vec<u8>>,
     auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
+    tls_trust_certs_pem: Option<Vec<u8>>,
 }
 
 impl ClientBuilder {
@@ -445,6 +446,28 @@ impl ClientBuilder {
         self
     }
 
+    /// Mirrors Java `ClientBuilder#tlsTrustCertsFilePath`. Supplies a PEM-encoded chain
+    /// (typically a self-signed CA used by the broker). When set, the connection's TLS
+    /// handshake validates the broker against this chain INSTEAD OF the system trust
+    /// store. Only honoured for `pulsar+ssl://` URLs.
+    #[must_use]
+    pub fn tls_trust_certs_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.tls_trust_certs_pem = Some(pem.into());
+        self
+    }
+
+    /// Convenience: read a PEM file from `path` and apply it via [`Self::tls_trust_certs_pem`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulsarError::Config`] if the file cannot be read.
+    pub fn tls_trust_certs_file_path(mut self, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let bytes = std::fs::read(path.as_ref())
+            .map_err(|e| PulsarError::Config(format!("read tls trust certs file: {e}")))?;
+        self.tls_trust_certs_pem = Some(bytes);
+        Ok(self)
+    }
+
     /// Build and connect the client.
     ///
     /// # Errors
@@ -471,7 +494,16 @@ impl ClientBuilder {
         if let Some(data) = self.auth_data {
             config.auth_data = Some(data);
         }
-        let inner = Client::connect_auth(&service_url, config, self.auth_provider).await?;
+        let inner = if let Some(pem) = self.tls_trust_certs_pem {
+            let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
+            let tls_config = match parsed.scheme {
+                magnetar_runtime_tokio::Scheme::Tls => Some(Client::tls_config_from_pem(&pem)?),
+                magnetar_runtime_tokio::Scheme::Plain => None,
+            };
+            Client::connect_with(parsed, tls_config, config, self.auth_provider).await?
+        } else {
+            Client::connect_auth(&service_url, config, self.auth_provider).await?
+        };
         Ok(PulsarClient { inner })
     }
 }
