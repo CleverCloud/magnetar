@@ -17,7 +17,7 @@ workspace = true
 
 [features]
 default  = ["tokio"]
-tokio    = ["dep:magnetar-runtime-tokio", "dep:tokio"]
+tokio    = ["dep:magnetar-runtime-tokio", "dep:tokio", "dep:futures-util"]
 moonpool = ["dep:magnetar-runtime-moonpool"]
 admin    = ["dep:magnetar-admin"]
 auth-oauth2 = ["dep:magnetar-auth-oauth2"]
@@ -39,6 +39,7 @@ magnetar-auth-sasl         = { workspace = true, optional = true }
 magnetar-auth-athenz       = { workspace = true, optional = true }
 magnetar-messagecrypto     = { workspace = true, optional = true }
 bytes                      = { workspace = true }
+futures-util               = { workspace = true, optional = true, features = ["std", "async-await"] }
 parking_lot                = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, optional = true, features = ["rt", "sync"] }

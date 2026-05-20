@@ -1406,6 +1406,7 @@ name = "magnetar"
 version = "0.1.0-dev.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "magnetar-admin",
  "magnetar-auth-athenz",
  "magnetar-auth-oauth2",

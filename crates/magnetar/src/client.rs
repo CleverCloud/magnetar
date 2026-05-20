@@ -178,6 +178,13 @@ impl PulsarClient {
         crate::TableViewBuilder::new(self, topic.into())
     }
 
+    /// Open a [`crate::MultiTopicsConsumerBuilder`] that subscribes to many topics at once.
+    /// Mirrors Java's `PulsarClient#newConsumer().topics(...)`.
+    #[must_use]
+    pub fn multi_topics_consumer(&self) -> crate::MultiTopicsConsumerBuilder<'_> {
+        crate::MultiTopicsConsumerBuilder::new(self)
+    }
+
     /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
     /// `PulsarClient#newProducer(Schema<T>)`.
     #[must_use]

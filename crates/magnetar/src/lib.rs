@@ -60,6 +60,8 @@ pub use magnetar_runtime_tokio as runtime_tokio;
 #[cfg(feature = "tokio")]
 mod client;
 #[cfg(feature = "tokio")]
+mod multi_topics;
+#[cfg(feature = "tokio")]
 mod table_view;
 #[cfg(feature = "tokio")]
 mod typed;
@@ -68,6 +70,8 @@ pub use client::{
     ClientBuilder, ConsumerBuilder, IncomingMessage, OutgoingMessage, ProducerBuilder,
     PulsarClient, PulsarError, Reader, ReaderBuilder,
 };
+#[cfg(feature = "tokio")]
+pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};
 #[cfg(feature = "tokio")]
 pub use table_view::{TableView, TableViewBuilder, TableViewListener};
 #[cfg(feature = "tokio")]
