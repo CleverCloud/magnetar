@@ -424,6 +424,16 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#initialSequenceId`. The producer's first publish gets
+    /// the supplied sequence id; the next one gets `id + 1`, and so on. Useful for resuming
+    /// at-least-once delivery from a checkpoint (where the caller knows the last sequence
+    /// id the broker acknowledged for this producer name).
+    #[must_use]
+    pub fn initial_sequence_id(mut self, id: u64) -> Self {
+        self.req.initial_sequence_id = Some(id);
+        self
+    }
+
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload. Pass an
     /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the

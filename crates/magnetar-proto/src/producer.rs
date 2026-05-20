@@ -274,6 +274,21 @@ impl ProducerState {
         }
     }
 
+    /// Mirrors Java `ProducerBuilder#initialSequenceId`. Resets the next sequence id allocated
+    /// by the internal `assign_sequence_id` helper to `next`. Must be called BEFORE the first
+    /// publish; the state machine does not validate this — callers should set it through
+    /// [`crate::CreateProducerRequest::initial_sequence_id`] which guarantees the ordering.
+    pub fn set_initial_sequence_id(&mut self, next: u64) {
+        self.next_sequence_id = next;
+        // For at-least-once resume-on-restart: stamp the lastSequenceIdPublished to (next-1)
+        // when the caller resumes from a known checkpoint, so producer_last_sequence_id_published()
+        // returns the resume point until the first ack lands.
+        if next > 0 {
+            self.last_sequence_id_published = (next as i64).saturating_sub(1);
+            self.last_sequence_id_pushed = self.last_sequence_id_published;
+        }
+    }
+
     /// Snapshot of cumulative counters. Mirrors Java `ProducerStats`.
     pub fn stats(&self) -> ProducerStats {
         ProducerStats {
@@ -948,5 +963,27 @@ mod tests {
         let stats = p.stats();
         assert_eq!(stats.total_msgs_sent, 3);
         assert!(stats.total_bytes_sent > 0);
+    }
+
+    #[test]
+    fn initial_sequence_id_resumes_from_checkpoint() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.set_initial_sequence_id(42);
+        assert_eq!(p.last_sequence_id_pushed, 41);
+        assert_eq!(p.last_sequence_id_published, 41);
+
+        let _ = p.queue_send(small_message(b"first"), 100).unwrap();
+        let frame = p.next_outbound_frame().expect("frame");
+        assert_eq!(frame.metadata.sequence_id, 42);
+        assert_eq!(frame.sequence_id.0, 42);
+
+        let _ = p.queue_send(small_message(b"second"), 100).unwrap();
+        let frame = p.next_outbound_frame().expect("frame");
+        assert_eq!(frame.metadata.sequence_id, 43);
     }
 }

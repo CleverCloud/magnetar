@@ -226,6 +226,10 @@ pub struct CreateProducerRequest {
     pub max_messages_in_batch: usize,
     /// Optional schema to advertise.
     pub schema: Option<pb::Schema>,
+    /// Mirrors Java `ProducerBuilder#initialSequenceId`. When `Some(n)`, the producer starts
+    /// allocating sequence ids from `n` instead of `0`. Useful for at-least-once
+    /// resume-on-restart from a known checkpoint.
+    pub initial_sequence_id: Option<u64>,
 }
 
 impl Default for CreateProducerRequest {
@@ -239,6 +243,7 @@ impl Default for CreateProducerRequest {
             max_batch_size_bytes: 128 * 1024,
             max_messages_in_batch: 1000,
             schema: None,
+            initial_sequence_id: None,
         }
     }
 }
@@ -1148,6 +1153,9 @@ impl Connection {
         state.max_batch_size_bytes = req.max_batch_size_bytes;
         state.max_messages_in_batch = req.max_messages_in_batch;
         state.name = req.producer_name.clone();
+        if let Some(initial) = req.initial_sequence_id {
+            state.set_initial_sequence_id(initial);
+        }
         self.producers.insert(handle, state);
 
         let cmd = pb::CommandProducer {
