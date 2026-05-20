@@ -18,6 +18,7 @@ use magnetar_proto::types::CompressionKind;
 use magnetar_proto::{MessageId, OpOutcome, PendingOpKey, ProducerHandle, SequenceId};
 
 use crate::ConnectionShared;
+use crate::crypto::MessageEncryptor;
 use crate::error::ClientError;
 
 /// User-facing producer handle.
@@ -26,6 +27,9 @@ pub struct Producer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ProducerHandle,
     pub(crate) compression: CompressionKind,
+    /// Optional encryption hook (PIP-4). When present, the producer encrypts every
+    /// outbound payload after compression but before handing it to the sans-io layer.
+    pub(crate) encryptor: Option<Arc<dyn MessageEncryptor>>,
 }
 
 impl Producer {
@@ -57,6 +61,24 @@ impl Producer {
                         handle: self.handle,
                         state: SendState::Failed {
                             error: Some(ClientError::Other(format!("compress: {err}"))),
+                        },
+                    };
+                }
+            }
+        }
+
+        // Encrypt the (compressed) payload if a PIP-4 encryptor is wired. Mirrors the Java
+        // `ProducerImpl.java:986-1003` ordering — compression first, encryption second so the
+        // broker sees ciphertext and the consumer reverses the order on receive.
+        if let Some(encryptor) = self.encryptor.as_ref() {
+            match encryptor.encrypt(&msg.payload, &mut msg.metadata) {
+                Ok(ciphertext) => msg.payload = ciphertext,
+                Err(err) => {
+                    return SendFut {
+                        shared: self.shared.clone(),
+                        handle: self.handle,
+                        state: SendState::Failed {
+                            error: Some(ClientError::Other(format!("encrypt: {err}"))),
                         },
                     };
                 }

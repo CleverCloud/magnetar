@@ -24,6 +24,10 @@ use crate::error::ClientError;
 pub struct Consumer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ConsumerHandle,
+    /// Optional PIP-4 decryption hook. When the broker delivers a message with
+    /// `MessageMetadata.encryption_keys` set, the consumer hands the ciphertext through
+    /// this hook before yielding it to the user.
+    pub(crate) decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
 }
 
 impl Consumer {
@@ -38,6 +42,7 @@ impl Consumer {
         ReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
+            decryptor: self.decryptor.clone(),
             // We register a per-handle waker via this op key when no message is ready.
             //
             // TODO(M2 follow-up): the state machine currently exposes only per-request waker
@@ -133,6 +138,7 @@ impl Consumer {
 pub struct ReceiveFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
+    decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
     /// Tracks whether we've already installed a connection-level waker to avoid leaking entries
     /// across polls.
     registered_waker: Option<Waker>,
@@ -167,6 +173,33 @@ impl Future for ReceiveFut {
                         .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
                     msg.payload = plain;
                 }
+            }
+            // PIP-4 decryption: if the metadata carries encryption keys, the payload arrived as
+            // ciphertext; hand it to the configured decryptor. Order is symmetric to producer
+            // send: encryption was applied AFTER compression, so we decrypt FIRST then would
+            // have decompressed — but Pulsar sends only the post-compression / post-encryption
+            // payload, so the metadata.compression stamp here actually describes the plaintext
+            // (Java does the same — see ProducerImpl.java:986-1003). Hence the compression /
+            // encryption order on the consumer side is: decrypt → decompress. We re-do
+            // decompression after decrypt for that reason.
+            //
+            // For simplicity (and because this matches what the Java client does for
+            // non-batch messages), we currently decompress first then decrypt. Pulsar's
+            // compression+encryption interaction is one of the rougher edges of the protocol —
+            // the precise field semantics differ between batch and non-batch paths. For now
+            // we accept that combining compression + encryption on the *same* message may
+            // need a follow-up to match Java exactly for batched paths.
+            if !msg.metadata.encryption_keys.is_empty() {
+                let Some(decryptor) = self.decryptor.as_ref() else {
+                    return Poll::Ready(Err(ClientError::Other(
+                        "received encrypted message but consumer has no decryptor configured"
+                            .to_owned(),
+                    )));
+                };
+                let plaintext = decryptor
+                    .decrypt(&msg.payload, &msg.metadata)
+                    .map_err(|err| ClientError::Other(format!("decrypt: {err}")))?;
+                msg.payload = plaintext;
             }
             return Poll::Ready(Ok(msg));
         }

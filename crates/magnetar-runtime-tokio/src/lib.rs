@@ -61,6 +61,7 @@
 mod client;
 pub mod compress;
 mod consumer;
+pub mod crypto;
 mod driver;
 mod error;
 mod producer;
@@ -75,6 +76,7 @@ use tokio::sync::Notify;
 pub use crate::client::Client;
 pub use crate::compress::CompressionError;
 pub use crate::consumer::{Consumer, ReceiveFut};
+pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 pub use crate::driver::DriverHandle;
 pub use crate::error::ClientError;
 pub use crate::producer::{Producer, SendFut};

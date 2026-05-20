@@ -134,6 +134,15 @@ impl Client {
     ///
     /// Returns [`ClientError::Broker`] if the broker refuses the producer.
     pub async fn open_producer(&self, req: CreateProducerRequest) -> Result<Producer, ClientError> {
+        self.open_producer_with(req, None).await
+    }
+
+    /// Same as [`Self::open_producer`] but with an optional encryption hook.
+    pub async fn open_producer_with(
+        &self,
+        req: CreateProducerRequest,
+        encryptor: Option<Arc<dyn crate::crypto::MessageEncryptor>>,
+    ) -> Result<Producer, ClientError> {
         let compression = req.compression;
         let handle = {
             let mut conn = self.shared.inner.lock();
@@ -145,6 +154,7 @@ impl Client {
             shared: self.shared.clone(),
             handle,
             compression,
+            encryptor,
         })
     }
 
@@ -157,6 +167,15 @@ impl Client {
     ///
     /// Returns [`ClientError::Broker`] if the broker refuses the subscribe.
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer, ClientError> {
+        self.subscribe_with(req, None).await
+    }
+
+    /// Same as [`Self::subscribe`] but with an optional decryption hook (PIP-4).
+    pub async fn subscribe_with(
+        &self,
+        req: SubscribeRequest,
+        decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
+    ) -> Result<Consumer, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
         let handle = {
             let mut conn = self.shared.inner.lock();
@@ -181,6 +200,7 @@ impl Client {
         Ok(Consumer {
             shared: self.shared.clone(),
             handle,
+            decryptor,
         })
     }
 

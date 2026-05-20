@@ -65,6 +65,14 @@ pub use client::{
     PulsarClient, PulsarError, Reader, ReaderBuilder,
 };
 
+// PIP-4 encryption bridge: implement the runtime's MessageEncryptor / MessageDecryptor traits
+// for magnetar-messagecrypto::MessageCrypto. Behind the `encryption` feature so the heavy
+// `aws-lc-rs` dep is opt-in.
+#[cfg(all(feature = "tokio", feature = "encryption"))]
+mod crypto_bridge;
+#[cfg(all(feature = "tokio", feature = "encryption"))]
+pub use crypto_bridge::MessageCryptoBridge;
+
 #[cfg(test)]
 mod tests {
     #[test]
