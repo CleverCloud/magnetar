@@ -111,6 +111,26 @@ impl Consumer {
         self.shared.driver_waker.notify_one();
     }
 
+    /// Negatively acknowledge a single message. The broker will redeliver it (subject to
+    /// `maxRedeliverCount` and any DLQ policy configured server-side). Fire-and-forget.
+    pub fn negative_ack(&self, message_id: MessageId) {
+        self.negative_ack_many(vec![message_id]);
+    }
+
+    /// Negatively acknowledge a batch of messages.
+    pub fn negative_ack_many(&self, message_ids: Vec<MessageId>) {
+        let mut conn = self.shared.inner.lock();
+        conn.negative_ack(self.handle, message_ids);
+        drop(conn);
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// Ask the broker to redeliver *every* unacked message on this consumer. Useful when a
+    /// consumer detects it has lost local state and wants the broker to replay.
+    pub fn redeliver_unacked(&self) {
+        self.negative_ack_many(Vec::new());
+    }
+
     /// Close this consumer. Resolves when the broker acks the close.
     pub async fn close(self) -> Result<(), ClientError> {
         let request_id = {
