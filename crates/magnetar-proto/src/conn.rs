@@ -324,6 +324,10 @@ pub struct SubscribeRequest {
     /// Mirrors `CommandSubscribe.metadata` — broker-side KV metadata advertised at
     /// subscribe time. Surfaces on the broker dashboard alongside the consumer.
     pub consumer_metadata: Vec<(String, String)>,
+    /// Mirrors Java `ConsumerBuilder#negativeAckRedeliveryDelay`. When `Some(d)`, nacked
+    /// messages stay locally tracked for `d` before the redelivery command goes out. `None`
+    /// means the redelivery is sent immediately (the default).
+    pub negative_ack_redelivery_delay: Option<Duration>,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -371,6 +375,7 @@ impl Default for SubscribeRequest {
             max_redeliver_count: 0,
             dead_letter_topic: None,
             consumer_metadata: Vec::new(),
+            negative_ack_redelivery_delay: None,
         }
     }
 }
@@ -1184,18 +1189,29 @@ impl Connection {
         self.events.pop_front()
     }
 
-    /// Time of the next scheduled wake-up (keepalive, ack-group flush, etc.).
+    /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
+    /// per-consumer tracker deadline (e.g. the negative-ack redelivery timer).
     pub fn poll_timeout(&self) -> Option<Instant> {
-        // The minimal viable implementation: keepalive only. Tracker deadlines live inside
-        // ConsumerState; the runtime crate is expected to call `handle_timeout` once per
-        // tracker tick. The connection itself only schedules pings.
-        let last = self.last_activity?;
-        Some(last + self.config.keepalive_interval)
+        let mut next = self
+            .last_activity
+            .map(|t| t + self.config.keepalive_interval);
+        for consumer in self.consumers.values() {
+            if let Some(tracker) = consumer.nack_tracker.as_ref() {
+                if let Some(deadline) = tracker.next_deadline() {
+                    next = Some(match next {
+                        Some(current) => current.min(deadline),
+                        None => deadline,
+                    });
+                }
+            }
+        }
+        next
     }
 
-    /// Tick the state machine.
+    /// Tick the state machine — fires keepalive pings + any per-consumer tracker actions
+    /// whose deadlines have elapsed.
     pub fn handle_timeout(&mut self, now: Instant) {
-        // Keepalive
+        // Keepalive.
         let due = match self.last_activity {
             Some(last) if now >= last + self.config.keepalive_interval => true,
             None => false,
@@ -1209,6 +1225,22 @@ impl Connection {
             };
             let _ = self.encode_command(&ping);
             self.last_activity = Some(now);
+        }
+
+        // Negative-ack redelivery. Drain due ids per consumer and emit the redelivery
+        // command via the standard path.
+        let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
+        for (handle, consumer) in &mut self.consumers {
+            if let Some(tracker) = consumer.nack_tracker.as_mut() {
+                let actions = tracker.poll(now);
+                for action in actions {
+                    let crate::trackers::NackAction::RedeliverUnacked { message_ids, .. } = action;
+                    redeliveries.push((*handle, message_ids));
+                }
+            }
+        }
+        for (handle, ids) in redeliveries {
+            self.emit_redeliver_unacked(handle, ids);
         }
     }
 
@@ -1305,6 +1337,9 @@ impl Connection {
             req.receiver_queue_size,
         );
         state.max_redeliver_count = req.max_redeliver_count;
+        if let Some(delay) = req.negative_ack_redelivery_delay {
+            state.nack_tracker = Some(crate::trackers::NegativeAcksTracker::new(handle, delay));
+        }
         self.consumers.insert(handle, state);
 
         let subscription_properties: Vec<pb::KeyValue> = req
@@ -1580,9 +1615,27 @@ impl Connection {
     /// Mirrors `ConsumerImpl#negativeAcknowledge`.
     ///
     /// Empty `message_ids` means "redeliver every unacked message on this consumer"
-    /// (Java's `consumer.redeliverUnacknowledgedMessages()`). Otherwise only the supplied
-    /// ids are re-pushed.
+    /// (Java's `consumer.redeliverUnacknowledgedMessages()`) and is always sent immediately.
+    /// Otherwise, if the consumer has a negative-ack tracker configured (via
+    /// [`SubscribeRequest::negative_ack_redelivery_delay`]), the supplied ids are deferred
+    /// until [`Self::handle_timeout`] notices the delay has elapsed. With no tracker the
+    /// redelivery is sent immediately.
     pub fn negative_ack(&mut self, handle: ConsumerHandle, message_ids: Vec<MessageId>) {
+        if !message_ids.is_empty() {
+            if let Some(consumer) = self.consumers.get_mut(&handle) {
+                if let Some(tracker) = consumer.nack_tracker.as_mut() {
+                    let now = Instant::now();
+                    for id in &message_ids {
+                        tracker.add(*id, now);
+                    }
+                    return;
+                }
+            }
+        }
+        self.emit_redeliver_unacked(handle, message_ids);
+    }
+
+    fn emit_redeliver_unacked(&mut self, handle: ConsumerHandle, message_ids: Vec<MessageId>) {
         let pb_ids = message_ids.into_iter().map(MessageId::to_pb).collect();
         let cmd = pb::CommandRedeliverUnacknowledgedMessages {
             consumer_id: handle.0,

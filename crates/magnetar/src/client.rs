@@ -803,6 +803,15 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#negativeAckRedeliveryDelay`. When set, the consumer
+    /// keeps nacked ids locally and defers the redelivery command until the delay has
+    /// elapsed. The state machine drives the timer on its existing keepalive tick.
+    #[must_use]
+    pub fn negative_ack_redelivery_delay(mut self, delay: Duration) -> Self {
+        self.req.negative_ack_redelivery_delay = Some(delay);
+        self
+    }
+
     /// Mirrors Java `ConsumerBuilder#deadLetterPolicy`. After `max_redeliver_count`
     /// redeliveries, the consumer flags the message as dead-letter — drain via
     /// [`magnetar_runtime_tokio::Consumer::drain_dead_letter`] and republish to

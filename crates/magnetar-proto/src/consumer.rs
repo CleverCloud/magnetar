@@ -30,6 +30,7 @@ use prost::Message as _;
 use crate::error::ConsumerError;
 use crate::event::IncomingMessage;
 use crate::pb;
+use crate::trackers::NegativeAcksTracker;
 use crate::types::{ConsumerHandle, MessageId, RequestId};
 
 /// Per-consumer state.
@@ -78,6 +79,11 @@ pub struct ConsumerState {
     pub total_acks_sent: u64,
     /// Cumulative count of broker-reported ACK failures (CommandAckResponse with error).
     pub total_acks_failed: u64,
+    /// Optional negative-ack tracker. When configured via
+    /// `SubscribeRequest::negative_ack_redelivery_delay`, calls to `Connection::negative_ack`
+    /// stage the ids here and the redelivery fires on the next `handle_timeout` once the
+    /// delay has elapsed. `None` means immediate redelivery (the default).
+    pub nack_tracker: Option<NegativeAcksTracker>,
 }
 
 /// Snapshot of cumulative consumer counters. Mirrors `org.apache.pulsar.client.api.ConsumerStats`
@@ -150,6 +156,7 @@ impl ConsumerState {
             total_bytes_received: 0,
             total_acks_sent: 0,
             total_acks_failed: 0,
+            nack_tracker: None,
         }
     }
 
