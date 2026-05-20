@@ -19,5 +19,6 @@ workspace = true
 magnetar-proto = { workspace = true }
 aws-lc-rs      = { workspace = true }
 bytes          = { workspace = true }
+parking_lot    = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }

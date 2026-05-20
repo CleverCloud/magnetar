@@ -17,13 +17,13 @@
 //! let mut adapter = RustlsByteAdapter::new(session);
 //!
 //! // From the moonpool engine driver loop, on each iteration:
-//! adapter.push_encrypted(&from_wire)?;
+//! adapter.push_encrypted(&from_wire);
 //! adapter.step()?;
 //! let plaintext = adapter.take_plaintext();
 //! // ... feed plaintext into magnetar_proto::Connection::handle_bytes ...
 //!
 //! // Going the other way:
-//! adapter.push_plaintext(&from_magnetar_proto)?;
+//! adapter.push_plaintext(&from_magnetar_proto);
 //! adapter.step()?;
 //! let encrypted_to_wire = adapter.take_encrypted_outbound();
 //! ```
@@ -82,22 +82,14 @@ impl RustlsByteAdapter {
 
     /// Push encrypted bytes received from the wire into the adapter. Call
     /// [`Self::step`] afterwards to advance the TLS state machine.
-    ///
-    /// # Errors
-    /// Returns `io::Error` from the underlying buffer copy (should not happen).
-    pub fn push_encrypted(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub fn push_encrypted(&mut self, bytes: &[u8]) {
         self.inbox_encrypted.extend_from_slice(bytes);
-        Ok(())
     }
 
     /// Push plaintext bytes (e.g. from `Connection::poll_transmit`) into the
     /// adapter. Call [`Self::step`] afterwards.
-    ///
-    /// # Errors
-    /// Returns `io::Error` from the underlying buffer copy (should not happen).
-    pub fn push_plaintext(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub fn push_plaintext(&mut self, bytes: &[u8]) {
         self.outbox_plaintext.extend_from_slice(bytes);
-        Ok(())
     }
 
     /// Drive the TLS state machine: consume queued encrypted bytes via
@@ -123,8 +115,8 @@ impl RustlsByteAdapter {
             let _state = self.session.process_new_packets()?;
         }
 
-        // 2. Drain decrypted plaintext into inbox_plaintext.
-        //    The session's `reader()` yields decrypted application data.
+        // 2. Drain decrypted plaintext into inbox_plaintext. The session's `reader()` yields
+        //    decrypted application data.
         let mut buf = [0u8; 8192];
         loop {
             match self.session.reader().read(&mut buf) {
@@ -196,7 +188,7 @@ mod tests {
         let mut adapter = RustlsByteAdapter::new(session);
         assert!(adapter.is_handshaking());
         // Pushing zero encrypted bytes should be a no-op.
-        adapter.push_encrypted(&[]).unwrap();
+        adapter.push_encrypted(&[]);
         adapter.step().unwrap();
         // The client should have queued ClientHello bytes for the wire.
         let outbound = adapter.take_encrypted_outbound();
@@ -212,7 +204,7 @@ mod tests {
         let mut adapter = RustlsByteAdapter::new(session);
         // Before handshake completes, plaintext writes accumulate but won't
         // surface decrypted bytes — we just verify buffer accounting.
-        adapter.push_plaintext(b"hello").unwrap();
+        adapter.push_plaintext(b"hello");
         adapter.step().unwrap();
         let taken = adapter.take_plaintext();
         assert!(

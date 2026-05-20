@@ -1094,6 +1094,7 @@ dependencies = [
  "aws-lc-rs",
  "bytes",
  "magnetar-proto",
+ "parking_lot",
  "thiserror",
  "tracing",
 ]
