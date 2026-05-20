@@ -158,6 +158,35 @@ impl Client {
         })
     }
 
+    /// Query the broker for the number of partitions a topic has. Returns `0` for
+    /// non-partitioned topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
+    pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_partitioned_topic_metadata(topic)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            magnetar_proto::OpOutcome::PartitionedMetadata {
+                partitions, error, ..
+            } => {
+                if let Some((code, message)) = error {
+                    Err(ClientError::Broker { code, message })
+                } else {
+                    Ok(partitions)
+                }
+            }
+            other => Err(ClientError::Other(format!(
+                "unexpected partitioned metadata outcome: {other:?}"
+            ))),
+        }
+    }
+
     /// Subscribe to a topic.
     ///
     /// Returns once the broker has acked the subscribe (`CommandSuccess` correlated with the
@@ -295,6 +324,25 @@ impl Future for ConnectedFut {
                 Poll::Pending
             }
         }
+    }
+}
+
+struct PartitionedMetadataFut {
+    shared: Arc<ConnectionShared>,
+    request_id: magnetar_proto::RequestId,
+}
+
+impl Future for PartitionedMetadataFut {
+    type Output = magnetar_proto::OpOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let key = magnetar_proto::PendingOpKey::Request(self.request_id);
+        let mut conn = self.shared.inner.lock();
+        if let Some(outcome) = conn.take_outcome(key) {
+            return Poll::Ready(outcome);
+        }
+        conn.register_waker(key, cx.waker().clone());
+        Poll::Pending
     }
 }
 

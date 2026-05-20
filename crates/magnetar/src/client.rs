@@ -193,6 +193,13 @@ pub struct PulsarClient {
 }
 
 impl PulsarClient {
+    /// Borrow the underlying runtime client. Re-exported for sibling modules
+    /// ([`crate::PartitionedProducer`]) that need to call lower-level methods like
+    /// `partitioned_topic_metadata` without going through a builder.
+    pub(crate) fn runtime_client(&self) -> &Client {
+        &self.inner
+    }
+
     /// Start building a client.
     #[must_use]
     pub fn builder() -> ClientBuilder {
@@ -232,6 +239,17 @@ impl PulsarClient {
     #[must_use]
     pub fn multi_topics_consumer(&self) -> crate::MultiTopicsConsumerBuilder<'_> {
         crate::MultiTopicsConsumerBuilder::new(self)
+    }
+
+    /// Open a [`crate::PartitionedProducerBuilder`] for the given topic. The builder queries
+    /// the broker for the partition count and opens one child producer per partition.
+    /// Mirrors Java's `PulsarClient#newProducer()` against a partitioned topic.
+    #[must_use]
+    pub fn partitioned_producer(
+        &self,
+        topic: impl Into<String>,
+    ) -> crate::PartitionedProducerBuilder<'_> {
+        crate::PartitionedProducerBuilder::new(self, topic.into())
     }
 
     /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
