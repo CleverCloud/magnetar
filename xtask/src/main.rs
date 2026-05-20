@@ -8,13 +8,46 @@
 //! - `check-no-io-deps`: assert `magnetar-proto` has zero I/O dependencies.
 //! - `vendor-proto --rev <sha>`: refresh vendored `PulsarApi.proto`.
 //!
-//! Real subcommand bodies arrive in M1+. M0 stubs return success so CI is green.
+//! Codegen drives `prost-build` against `crates/magnetar-proto/proto/`, writes
+//! the generated Rust into `crates/magnetar-proto/src/pb/`, and (with `--check`)
+//! diffs the generated output against what is committed so CI catches drift.
 
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, ExitCode};
+use std::{env, fs};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+
+/// Crates that, if present in `magnetar-proto`'s feature-resolved dep graph,
+/// indicate a leaked I/O dependency. The list mirrors GUIDELINES.md
+/// ("I/O isolation") and the M1 plan.
+const FORBIDDEN_IO_DEPS: &[&str] = &[
+    "tokio",
+    "mio",
+    "socket2",
+    "async-std",
+    "smol",
+    "async-io",
+    "polling",
+    "reqwest",
+    "hyper",
+    "surf",
+];
+
+/// Proto files we compile. Order matches the natural import graph; prost-build
+/// does not care, but stable order keeps the generated module deterministic.
+const PROTO_FILES: &[&str] = &["PulsarApi.proto", "PulsarMarkers.proto"];
+
+/// Protobuf fully-qualified message paths whose `bytes` fields should be
+/// generated as `bytes::Bytes` instead of `Vec<u8>`. These are the payload-
+/// bearing messages on the hot path — zero-copy decode matters here.
+const BYTES_MESSAGES: &[&str] = &[
+    ".pulsar.proto.MessageMetadata",
+    ".pulsar.proto.SingleMessageMetadata",
+    ".pulsar.proto.CommandSend",
+    ".pulsar.proto.CommandMessage",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask", version, about = "magnetar build helpers", long_about = None)]
@@ -59,36 +92,237 @@ fn main() -> ExitCode {
 fn dispatch() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Codegen { check } => {
-            if check {
-                eprintln!("xtask codegen --check: M0 stub — drift check arrives in M1.");
-            } else {
-                eprintln!("xtask codegen: M0 stub — regen arrives in M1.");
-            }
-            Ok(())
-        }
+        Cmd::Codegen { check } => codegen(check),
         Cmd::CheckNoChannels => check_no_channels(),
-        Cmd::CheckNoIoDeps => {
-            // M1 expands this to a real cargo-tree based check.
-            eprintln!("xtask check-no-io-deps: M0 stub — assertion arrives in M1.");
-            Ok(())
-        }
+        Cmd::CheckNoIoDeps => check_no_io_deps(),
         Cmd::VendorProto { rev, source: _ } => {
             bail!("xtask vendor-proto: not implemented yet (lands in M1). Requested rev: {rev}");
         }
     }
 }
 
-fn check_no_channels() -> Result<()> {
-    // Minimal M0 implementation: grep the workspace for the banned channel
-    // module paths in non-test Rust files. The clippy `disallowed-types`
-    // config + cargo-deny `bans deny` provide deeper coverage; this is a
-    // belt-and-braces lint for paths clippy doesn't catch (e.g. plain string
-    // matches that look like channel use in macros or comments).
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// Returns the absolute path to the workspace root, derived from this crate's
+/// manifest dir at compile time.
+fn workspace_root() -> Result<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("xtask should have a workspace parent"))?
-        .to_path_buf();
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("xtask should have a workspace parent"))
+}
+
+fn proto_dir() -> Result<PathBuf> {
+    Ok(workspace_root()?.join("crates/magnetar-proto/proto"))
+}
+
+fn pb_out_dir() -> Result<PathBuf> {
+    Ok(workspace_root()?.join("crates/magnetar-proto/src/pb"))
+}
+
+/// Build the configured `prost_build::Config` shared by both real codegen and
+/// the `--check` variant.
+fn build_config(out_dir: &Path) -> prost_build::Config {
+    let mut config = prost_build::Config::new();
+    config.out_dir(out_dir);
+    config.bytes(BYTES_MESSAGES);
+    // Pulsar's proto comments are doxygen-style and don't survive rustdoc's
+    // markdown linter cleanly; disable to keep `cargo doc -D warnings` quiet.
+    config.disable_comments(["."]);
+    config
+}
+
+/// Compile the proto files into `out_dir`. `out_dir` must exist.
+fn run_prost(out_dir: &Path) -> Result<()> {
+    let proto_dir = proto_dir()?;
+    let inputs: Vec<PathBuf> = PROTO_FILES
+        .iter()
+        .map(|name| proto_dir.join(name))
+        .collect();
+    for input in &inputs {
+        if !input.exists() {
+            bail!("missing vendored proto file: {}", input.display());
+        }
+    }
+
+    // `prost_build::Config::compile_protos` shells out to `protoc` (or the
+    // bundled `protoc` if the `vendored` feature is on). We respect the
+    // `PROTOC` env var if the operator has pointed us at a specific binary.
+    let mut config = build_config(out_dir);
+    let include_paths = std::slice::from_ref(&proto_dir);
+    config
+        .compile_protos(&inputs, include_paths)
+        .context("prost-build failed to compile Pulsar proto definitions")?;
+    Ok(())
+}
+
+fn codegen(check: bool) -> Result<()> {
+    let committed = pb_out_dir()?;
+
+    if check {
+        let scratch = tempdir(&workspace_root()?.join("target/xtask-codegen-check"))?;
+        run_prost(&scratch)?;
+        let diff = diff_dirs(&scratch, &committed)?;
+        if diff.is_empty() {
+            eprintln!("xtask codegen --check: pb/ is up to date.");
+            return Ok(());
+        }
+        for entry in &diff {
+            eprintln!("drift: {entry}");
+        }
+        bail!(
+            "xtask codegen --check: generated pb/ differs from committed pb/ ({} entry/entries). \
+             Run `cargo run -p xtask -- codegen` and commit the result.",
+            diff.len()
+        );
+    }
+
+    if committed.exists() {
+        // Clear stale files before regenerating so deletions in the proto
+        // surface as missing modules.
+        for entry in
+            fs::read_dir(&committed).with_context(|| format!("reading {}", committed.display()))?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+            }
+        }
+    } else {
+        fs::create_dir_all(&committed)
+            .with_context(|| format!("creating {}", committed.display()))?;
+    }
+    run_prost(&committed)?;
+    eprintln!("xtask codegen: wrote pb/ at {}.", committed.display());
+    Ok(())
+}
+
+/// Create a fresh empty directory at `base`, removing any prior contents.
+fn tempdir(base: &Path) -> Result<PathBuf> {
+    if base.exists() {
+        fs::remove_dir_all(base)
+            .with_context(|| format!("clearing scratch dir {}", base.display()))?;
+    }
+    fs::create_dir_all(base).with_context(|| format!("creating scratch dir {}", base.display()))?;
+    Ok(base.to_path_buf())
+}
+
+/// Compare files in `lhs` against `rhs`. Returns a list of human-readable
+/// difference descriptions. An empty Vec means the two trees are identical.
+fn diff_dirs(lhs: &Path, rhs: &Path) -> Result<Vec<String>> {
+    use std::collections::BTreeMap;
+
+    fn collect(dir: &Path, into: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| anyhow!("non-utf8 filename in {}", dir.display()))?
+                .to_owned();
+            let bytes = fs::read(entry.path())?;
+            into.insert(name, bytes);
+        }
+        Ok(())
+    }
+
+    let mut lhs_files = BTreeMap::new();
+    let mut rhs_files = BTreeMap::new();
+    collect(lhs, &mut lhs_files)?;
+    collect(rhs, &mut rhs_files)?;
+
+    let mut diffs = Vec::new();
+    for (name, lhs_bytes) in &lhs_files {
+        match rhs_files.get(name) {
+            None => diffs.push(format!(
+                "{name}: present in generated, missing in committed"
+            )),
+            Some(rhs_bytes) if rhs_bytes != lhs_bytes => {
+                diffs.push(format!(
+                    "{name}: contents differ ({} -> {} bytes)",
+                    rhs_bytes.len(),
+                    lhs_bytes.len()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for name in rhs_files.keys() {
+        if !lhs_files.contains_key(name) {
+            diffs.push(format!(
+                "{name}: present in committed, missing in generated"
+            ));
+        }
+    }
+    Ok(diffs)
+}
+
+fn check_no_io_deps() -> Result<()> {
+    // Run `cargo tree -p magnetar-proto -e features --prefix none --no-dedupe`
+    // and scan the rendered output for forbidden crate names. We deliberately
+    // do not use `--format` because older cargo versions on stable have
+    // different placeholder support; the default human-readable format is
+    // stable across MSRV.
+    let workspace_root = workspace_root()?;
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = StdCommand::new(cargo)
+        .current_dir(&workspace_root)
+        .args([
+            "tree",
+            "-p",
+            "magnetar-proto",
+            "-e",
+            "features",
+            "--prefix",
+            "none",
+            "--no-dedupe",
+        ])
+        .output()
+        .context("failed to invoke `cargo tree`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("cargo tree failed (status {}):\n{stderr}", output.status);
+    }
+    let stdout = String::from_utf8(output.stdout).context("cargo tree produced non-utf8 output")?;
+
+    let mut offenders: Vec<&str> = Vec::new();
+    for line in stdout.lines() {
+        // Each line looks like `crate vX.Y.Z` or `crate vX.Y.Z (proc-macro)`
+        // possibly with feature suffixes. Extract the leading crate name.
+        let crate_name = line.split_whitespace().next().unwrap_or("");
+        if crate_name.is_empty() {
+            continue;
+        }
+        if FORBIDDEN_IO_DEPS.contains(&crate_name) {
+            offenders.push(crate_name);
+        }
+    }
+    offenders.sort_unstable();
+    offenders.dedup();
+
+    if !offenders.is_empty() {
+        for crate_name in &offenders {
+            eprintln!("forbidden I/O dependency in magnetar-proto: {crate_name}");
+        }
+        bail!(
+            "magnetar-proto pulled in {} forbidden I/O crate(s). See GUIDELINES.md#i-o-isolation.",
+            offenders.len()
+        );
+    }
+    Ok(())
+}
+
+fn check_no_channels() -> Result<()> {
+    // Minimal lint: grep the workspace for the banned channel module paths in
+    // non-test Rust files. The clippy `disallowed-types` config + cargo-deny
+    // `bans deny` provide deeper coverage; this is a belt-and-braces lint for
+    // paths clippy doesn't catch (e.g. plain string matches that look like
+    // channel use in macros or comments).
+    let workspace_root = workspace_root()?;
 
     let banned: &[&str] = &[
         "tokio::sync::mpsc::",
@@ -132,9 +366,7 @@ fn check_no_channels() -> Result<()> {
     Ok(())
 }
 
-fn visit(root: &std::path::Path, callback: &mut dyn FnMut(&std::path::Path, &str)) -> Result<()> {
-    use std::fs;
-
+fn visit(root: &Path, callback: &mut dyn FnMut(&Path, &str)) -> Result<()> {
     let skip = |name: &str| {
         matches!(
             name,

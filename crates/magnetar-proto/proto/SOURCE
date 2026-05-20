@@ -1,0 +1,14 @@
+Vendored from apache/pulsar:
+
+  Repository: https://github.com/apache/pulsar
+  Commit:     7735851329088d0e9ca1553989c503cde47dfb76
+  Date:       2026-05-04
+  Files:      pulsar-common/src/main/proto/PulsarApi.proto
+              pulsar-common/src/main/proto/PulsarMarkers.proto
+
+Refresh by running:
+
+  cargo run -p xtask -- vendor-proto --rev <sha>
+  cargo run -p xtask -- codegen
+
+Do not hand-edit. Upstream license: Apache-2.0.

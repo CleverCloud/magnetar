@@ -7,6 +7,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # rustls-pemfile is unmaintained but its successor lives in rustls-pki-types
+    # (`PemObject` trait). Pulled transitively by rustls-native-certs 0.7.x.
+    # Resolution scheduled for M3 alongside rustls-native-certs upgrade to 0.8.x.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2
@@ -23,6 +29,8 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "OpenSSL",
+    "CDLA-Permissive-2.0",  # webpki-roots (Mozilla trust anchors)
+    "MPL-2.0",              # may appear in transitive deps
 ]
 private = { ignore = true }
 

@@ -14,5 +14,6 @@ publish     = false
 workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
-clap   = { workspace = true }
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+prost-build = { workspace = true }
