@@ -108,8 +108,8 @@ pub trait Schema: Send + Sync + std::fmt::Debug {
     fn schema_type(&self) -> pb::schema::Type;
 
     /// Canonical wire bytes for this schema, byte-identical to the Java client output for the
-    /// purpose of broker-side de-duplication. See the [module docs](crate::schema) for the canonicalisation
-    /// requirements per schema family.
+    /// purpose of broker-side de-duplication. See the [module docs](crate::schema) for the
+    /// canonicalisation requirements per schema family.
     fn schema_data(&self) -> Bytes;
 
     /// Encode `value` into the schema's wire form.
