@@ -68,10 +68,35 @@ impl Consumer {
         self.ack_many(vec![message_id], pb::command_ack::AckType::Cumulative)
     }
 
+    /// Acknowledge a single message with caller-supplied properties. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Map<String, Long>)`. The broker stores the
+    /// properties alongside the cursor (no semantic effect at the dispatch layer; useful
+    /// for diagnostics and replay tooling).
+    pub fn ack_with_properties(
+        &self,
+        message_id: MessageId,
+        properties: Vec<(String, i64)>,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with(
+            vec![message_id],
+            pb::command_ack::AckType::Individual,
+            properties,
+        )
+    }
+
     fn ack_many(
         &self,
         message_ids: Vec<MessageId>,
         ack_type: pb::command_ack::AckType,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with(message_ids, ack_type, Vec::new())
+    }
+
+    fn ack_many_with(
+        &self,
+        message_ids: Vec<MessageId>,
+        ack_type: pb::command_ack::AckType,
+        properties: Vec<(String, i64)>,
     ) -> impl Future<Output = Result<(), ClientError>> {
         let shared = self.shared.clone();
         let request_id = {
@@ -81,6 +106,7 @@ impl Consumer {
                 AckRequest {
                     message_ids,
                     ack_type,
+                    properties,
                 },
             )
         };

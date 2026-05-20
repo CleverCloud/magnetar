@@ -366,6 +366,10 @@ pub struct AckRequest {
     pub message_ids: Vec<MessageId>,
     /// Whether this is an `Individual` or `Cumulative` ack.
     pub ack_type: pb::command_ack::AckType,
+    /// Optional ack-time properties. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Map<String, Long>)`. The broker stores them
+    /// alongside the cursor for diagnostic / replay tooling.
+    pub properties: Vec<(String, i64)>,
 }
 
 /// Seek target — either to a message id or to a publish-time.
@@ -1432,12 +1436,20 @@ impl Connection {
     pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest) -> RequestId {
         let request_id = self.alloc_request_id();
         let n_ids = ack.message_ids.len() as u64;
+        let properties: Vec<pb::KeyLongValue> = ack
+            .properties
+            .iter()
+            .map(|(k, v)| pb::KeyLongValue {
+                key: k.clone(),
+                value: *v as u64,
+            })
+            .collect();
         let cmd = pb::CommandAck {
             consumer_id: handle.0,
             ack_type: ack.ack_type as i32,
             message_id: ack.message_ids.iter().map(|m| m.to_pb()).collect(),
             validation_error: None,
-            properties: Vec::new(),
+            properties,
             txnid_least_bits: None,
             txnid_most_bits: None,
             request_id: Some(request_id.0),
