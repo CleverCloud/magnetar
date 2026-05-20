@@ -195,6 +195,16 @@ pub enum OpOutcome {
         /// Final transaction state on success.
         result: Result<TxnState, TxnError>,
     },
+    /// `CommandGetLastMessageIdResponse` correlated with a `get_last_message_id` call.
+    LastMessageId {
+        /// Request id of the originating request.
+        request_id: RequestId,
+        /// Broker's view of the last published message id on the topic.
+        last_message_id: MessageId,
+        /// Optional consumer mark-delete position (where the broker thinks this consumer's
+        /// cursor is).
+        consumer_mark_delete_position: Option<MessageId>,
+    },
 }
 
 /// Parameters for opening a producer.
@@ -350,6 +360,7 @@ enum PendingRequestKind {
     ConsumerSubscribe { handle: ConsumerHandle },
     ConsumerSeek { handle: ConsumerHandle },
     ConsumerUnsubscribe { handle: ConsumerHandle },
+    ConsumerGetLastMessageId { handle: ConsumerHandle },
     Ack { handle: ConsumerHandle },
     ProducerClose { handle: ProducerHandle },
     ConsumerClose { handle: ConsumerHandle },
@@ -750,6 +761,27 @@ impl Connection {
                             error,
                         });
                 }
+            }
+            pb::base_command::Type::GetLastMessageIdResponse => {
+                let resp = command.get_last_message_id_response.ok_or(
+                    ProtocolError::InvariantViolation("missing CommandGetLastMessageIdResponse"),
+                )?;
+                let rid = RequestId(resp.request_id);
+                self.pending_requests.remove(&rid);
+                let last_message_id = MessageId::from_pb(&resp.last_message_id);
+                let consumer_mark_delete_position = resp
+                    .consumer_mark_delete_position
+                    .as_ref()
+                    .map(MessageId::from_pb);
+                self.outcomes.insert(
+                    PendingOpKey::Request(rid),
+                    OpOutcome::LastMessageId {
+                        request_id: rid,
+                        last_message_id,
+                        consumer_mark_delete_position,
+                    },
+                );
+                self.wake_for_request(rid);
             }
             pb::base_command::Type::CloseProducer => {
                 let close = command
@@ -1289,6 +1321,29 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
+    }
+
+    /// Request the broker's last-published message id for the topic this consumer is
+    /// subscribed to. Java equivalent: `consumer.getLastMessageId()`. Useful for
+    /// "more messages?" checks against the consumer's most-recently-received id (or for
+    /// Reader's `hasMessageAvailable()` semantics).
+    pub fn get_last_message_id(&mut self, handle: ConsumerHandle) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = pb::CommandGetLastMessageId {
+            consumer_id: handle.0,
+            request_id: request_id.0,
+        };
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetLastMessageId as i32,
+            get_last_message_id: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::ConsumerGetLastMessageId { handle },
+        );
+        request_id
     }
 
     /// Issue a seek.

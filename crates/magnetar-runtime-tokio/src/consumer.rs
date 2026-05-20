@@ -131,6 +131,42 @@ impl Consumer {
         self.negative_ack_many(Vec::new());
     }
 
+    /// Ask the broker for the topic's last-published message id. Mirrors
+    /// `org.apache.pulsar.client.api.Consumer#getLastMessageId`. Useful for "more messages
+    /// available?" checks against the consumer's most-recently-received id.
+    pub async fn last_message_id(&self) -> Result<MessageId, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_last_message_id(self.handle)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::LastMessageId {
+                last_message_id, ..
+            } => Ok(last_message_id),
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected last_message_id outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Convenience: returns `true` if the broker has a message strictly past `cursor`
+    /// (i.e. there is at least one more message to receive). `cursor` is typically the
+    /// last [`MessageId`] this consumer received.
+    ///
+    /// Returns `false` if the broker reports an equal or earlier last-id (the comparison
+    /// is `>` not `>=` — exact equality means "you've consumed up to here").
+    pub async fn has_message_after(&self, cursor: MessageId) -> Result<bool, ClientError> {
+        let last = self.last_message_id().await?;
+        Ok(message_id_greater(&last, &cursor))
+    }
+
     /// Seek this consumer to a specific message id. The broker replays from there.
     ///
     /// Mirrors `org.apache.pulsar.client.api.Consumer#seek(MessageId)`.
@@ -327,4 +363,12 @@ impl Future for RequestFut {
         conn.register_waker(self.key, cx.waker().clone());
         Poll::Pending
     }
+}
+
+/// Compare two message ids lexicographically by `(ledger_id, entry_id, partition, batch_index)`.
+/// Returns `true` iff `lhs` is strictly greater than `rhs` (i.e. is from a later position in the
+/// log). Matches Java's `MessageId#compareTo` semantics.
+fn message_id_greater(lhs: &MessageId, rhs: &MessageId) -> bool {
+    (lhs.ledger_id, lhs.entry_id, lhs.partition, lhs.batch_index)
+        > (rhs.ledger_id, rhs.entry_id, rhs.partition, rhs.batch_index)
 }
