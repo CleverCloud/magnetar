@@ -3,9 +3,33 @@
 //! Apache Pulsar client driver for Rust.
 //!
 //! Public façade for the magnetar workspace. Re-exports the sans-io core
-//! ([`magnetar_proto`]) plus the selected runtime engine. See the workspace
-//! [README](https://github.com/FlorentinDUBOIS/magnetar/blob/main/README.md) for
-//! the bigger picture.
+//! ([`magnetar_proto`]) plus the selected runtime engine, and provides an
+//! ergonomic [`PulsarClient`] entry point that wires the protocol layer to
+//! the tokio engine by default.
+//!
+//! ```no_run
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! use magnetar::{OutgoingMessage, PulsarClient};
+//!
+//! let client = PulsarClient::builder()
+//!     .service_url("pulsar://localhost:6650")
+//!     .build()
+//!     .await?;
+//!
+//! let producer = client.producer("persistent://public/default/orders").create().await?;
+//! producer
+//!     .send(OutgoingMessage::with_payload(b"hello".as_slice()).into())
+//!     .await?;
+//!
+//! let consumer = client
+//!     .consumer("persistent://public/default/orders")
+//!     .subscription("worker")
+//!     .subscribe()
+//!     .await?;
+//! let msg = consumer.receive().await?;
+//! consumer.ack(msg.message_id).await?;
+//! # Ok(()) }
+//! ```
 //!
 //! ## Feature flags
 //!
@@ -21,15 +45,36 @@
 #[cfg(feature = "admin")]
 pub use magnetar_admin as admin;
 pub use magnetar_proto as proto;
+pub use magnetar_proto::conn::{ConnectionConfig, OpOutcome};
+// Re-export the most commonly used protocol types at the top level so users
+// don't have to remember which crate they live in.
+pub use magnetar_proto::{
+    AuthProvider, ConnectionEvent, ConsumerHandle, MessageId, ProducerHandle, ProtocolError,
+    RequestId, SequenceId,
+};
 #[cfg(feature = "moonpool")]
 pub use magnetar_runtime_moonpool as runtime_moonpool;
 #[cfg(feature = "tokio")]
 pub use magnetar_runtime_tokio as runtime_tokio;
+
+#[cfg(feature = "tokio")]
+mod client;
+#[cfg(feature = "tokio")]
+pub use client::{
+    ClientBuilder, ConsumerBuilder, IncomingMessage, OutgoingMessage, ProducerBuilder,
+    PulsarClient, PulsarError,
+};
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn proto_reexport_compiles() {
         let _conn = crate::proto::Connection::new(crate::proto::ConnectionConfig::default());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn builder_compiles() {
+        let _ = crate::PulsarClient::builder().service_url("pulsar://localhost:6650");
     }
 }

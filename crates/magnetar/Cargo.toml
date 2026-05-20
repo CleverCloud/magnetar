@@ -34,6 +34,7 @@ magnetar-auth-oauth2       = { workspace = true, optional = true }
 magnetar-auth-sasl         = { workspace = true, optional = true }
 magnetar-auth-athenz       = { workspace = true, optional = true }
 magnetar-messagecrypto     = { workspace = true, optional = true }
+bytes                      = { workspace = true }
 thiserror                  = { workspace = true }
 tracing                    = { workspace = true }
 url                        = { workspace = true }
