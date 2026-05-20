@@ -1,31 +1,74 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sans-io Apache Pulsar wire protocol.
+//! Sans-io Apache Pulsar wire protocol — Rust implementation.
 //!
-//! `magnetar-proto` is the protocol heart of the magnetar workspace. It contains:
-//! - Pulsar binary-protocol framing (`0x0e01` payload frames, `0x0e02` broker-entry metadata).
-//! - CRC32C (Castagnoli) checksums.
-//! - The full `BaseCommand` codec, generated from the vendored `PulsarApi.proto`.
-//! - State machines for `Connection`, `Producer`, `Consumer`, lookup, trackers, batching, chunking
-//!   (state-machine work lands incrementally — see the milestone plan).
+//! `magnetar-proto` is the protocol heart of the magnetar workspace. It contains the wire codec
+//! (framing + CRC32C + protobuf), the connection state machine, per-producer / per-consumer state
+//! machines, lookup, topic-list watcher, acknowledgement trackers, and backoff. The crate has
+//! **zero I/O dependencies** and **zero channels** — see [`GUIDELINES.md`] for the rationale and
+//! the `Arc<Mutex<…>> + Notify + Waker-slab` pattern that engines (`magnetar-runtime-tokio`,
+//! `magnetar-runtime-moonpool`) use to drive it.
 //!
-//! It has **zero I/O dependencies** and **zero channels**. The public API uses the `quinn-proto`
-//! shape — see [`Connection`].
+//! # API shape
 //!
-//! # Modules
+//! [`Connection`] follows the `quinn-proto` sans-io shape: feed bytes in via
+//! [`Connection::handle_bytes`], pull bytes out via [`Connection::poll_transmit`], observe events
+//! via [`Connection::poll_event`], drive timers via [`Connection::poll_timeout`] and
+//! [`Connection::handle_timeout`]. A typed-handle façade ([`Connection::create_producer`],
+//! [`Connection::subscribe`], [`Connection::send`], [`Connection::ack`], …) lets callers operate
+//! the protocol without touching raw [`pb::BaseCommand`] frames.
 //!
-//! - [`frame`]: encoding and decoding of magnetar wire frames (command + optional payload).
-//! - [`pb`]: protobuf-generated Pulsar wire types. Regenerate via `cargo run -p xtask -- codegen`.
-//!
-//! # Architecture
-//!
-//! See [`ARCHITECTURE.md`](https://github.com/FlorentinDUBOIS/magnetar/blob/main/ARCHITECTURE.md)
-//! for the layered diagram and the no-channels rationale.
+//! [`GUIDELINES.md`]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
+// M2 scaffolding: connection / producer / consumer dispatch loops are long by nature; we'll
+// refactor and tighten as M3/M5/M7 wire up. Until then, keep the cosmetic lints quiet so the
+// real bugs surface.
+#![allow(
+    clippy::too_many_lines,
+    clippy::match_same_arms,
+    clippy::large_enum_variant,
+    clippy::should_implement_trait,
+    clippy::redundant_closure,
+    clippy::needless_pass_by_value,
+    clippy::manual_let_else,
+    clippy::needless_continue,
+    clippy::similar_names,
+    clippy::if_same_then_else,
+    clippy::items_after_statements,
+    clippy::redundant_pattern_matching,
+    clippy::single_match_else,
+    clippy::implicit_hasher,
+    clippy::needless_collect,
+    clippy::unnecessary_wraps,
+    clippy::option_if_let_else,
+    clippy::unused_self,
+    clippy::map_unwrap_or,
+    clippy::clone_on_copy,
+    clippy::doc_markdown,
+    clippy::needless_borrow,
+    clippy::cast_lossless,
+    clippy::default_trait_access,
+    clippy::derive_partial_eq_without_eq,
+    clippy::missing_const_for_fn,
+    clippy::field_reassign_with_default,
+    clippy::assigning_clones,
+    clippy::match_wildcard_for_single_variants,
+    dead_code
+)]
 
+pub mod backoff;
+pub mod conn;
+pub mod consumer;
+pub mod error;
+pub mod event;
 pub mod frame;
+pub mod lookup;
+pub mod producer;
+pub mod topic_watcher;
+pub mod trackers;
+pub mod types;
 
 /// Protobuf-generated Pulsar wire types.
 ///
@@ -41,37 +84,14 @@ pub mod pb {
     include!("pb/pulsar.proto.rs");
 }
 
+pub use crate::conn::{
+    AckRequest, Connection, ConnectionConfig, CreateProducerRequest, HandshakeState, OpOutcome,
+    PendingOpKey, SeekTarget, SubscribeRequest,
+};
+pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
+pub use crate::event::{ConnectionEvent, IncomingMessage};
 pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
 };
-
-/// Placeholder for the connection state machine.
-///
-/// The real sans-io [`Connection`] lands in M2. For now it exists so other workspace crates
-/// (notably the runtime engines) can keep referencing the public type. M2 will replace this with
-/// the full state machine (handshake, lookup, producer/consumer dispatchers, waker slabs, etc.).
-#[derive(Debug, Default)]
-pub struct Connection {
-    _private: (),
-}
-
-impl Connection {
-    /// Construct a fresh, unconnected sans-io `Connection`.
-    ///
-    /// This will become the entry point that the runtime engines (`magnetar-runtime-tokio`,
-    /// `magnetar-runtime-moonpool`) drive byte-for-byte. For now it is intentionally inert.
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Connection;
-
-    #[test]
-    fn connection_can_be_constructed() {
-        let _ = Connection::new();
-    }
-}
+pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};

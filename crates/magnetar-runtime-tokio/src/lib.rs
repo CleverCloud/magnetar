@@ -17,13 +17,16 @@
 
 use std::sync::Arc;
 
+use magnetar_proto::ConnectionConfig;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 /// Placeholder shared state for the tokio engine.
 ///
-/// Real wiring lands in M3. For M0 this is a marker so the workspace compiles.
-#[derive(Debug, Default)]
+/// Real driver wiring (TCP + rustls + select loop + waker dispatch) lands in M3.
+/// For now this exists so M2's `Connection` can be exercised under the lock + notify
+/// pattern that the engine will adopt.
+#[derive(Debug)]
 pub struct ConnectionShared {
     /// The sans-io state machine, guarded by a non-async mutex.
     pub inner: Mutex<magnetar_proto::Connection>,
@@ -32,10 +35,10 @@ pub struct ConnectionShared {
 }
 
 impl ConnectionShared {
-    /// Construct empty shared state.
-    pub fn new() -> Arc<Self> {
+    /// Construct shared state from the given protocol-layer config.
+    pub fn new(config: ConnectionConfig) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(magnetar_proto::Connection::new()),
+            inner: Mutex::new(magnetar_proto::Connection::new(config)),
             driver_waker: Notify::new(),
         })
     }
@@ -43,11 +46,13 @@ impl ConnectionShared {
 
 #[cfg(test)]
 mod tests {
+    use magnetar_proto::ConnectionConfig;
+
     use super::ConnectionShared;
 
     #[test]
     fn shared_state_can_be_constructed() {
-        let s = ConnectionShared::new();
+        let s = ConnectionShared::new(ConnectionConfig::default());
         // Lock-unlock smoke test.
         let _g = s.inner.lock();
     }

@@ -27,6 +27,6 @@ pub use magnetar_runtime_tokio as runtime_tokio;
 mod tests {
     #[test]
     fn proto_reexport_compiles() {
-        let _conn = crate::proto::Connection::new();
+        let _conn = crate::proto::Connection::new(crate::proto::ConnectionConfig::default());
     }
 }
