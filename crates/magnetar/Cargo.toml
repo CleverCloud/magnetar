@@ -24,6 +24,10 @@ auth-oauth2 = ["dep:magnetar-auth-oauth2"]
 auth-sasl   = ["dep:magnetar-auth-sasl"]
 auth-athenz = ["dep:magnetar-auth-athenz"]
 encryption  = ["dep:magnetar-messagecrypto"]
+# End-to-end tests against a real Pulsar 4.x standalone broker via
+# `testcontainers-rs`. Requires Docker on the host. CI runs these in
+# the `e2e` job (workflow_dispatch + release branches only).
+e2e         = ["tokio", "admin"]
 
 [dependencies]
 magnetar-proto             = { workspace = true }
@@ -38,3 +42,8 @@ bytes                      = { workspace = true }
 thiserror                  = { workspace = true }
 tracing                    = { workspace = true }
 url                        = { workspace = true }
+
+[dev-dependencies]
+testcontainers     = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = { workspace = true }
