@@ -691,6 +691,41 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#startMessageId`. Overrides the initial position with a
+    /// specific message id. Only honoured for fresh subscriptions — has no effect if the
+    /// subscription already has a persisted cursor.
+    #[must_use]
+    pub fn start_message_id(mut self, id: magnetar_proto::MessageId) -> Self {
+        self.req.start_message_id = Some(id);
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#replicateSubscriptionState`. When `true`, the broker
+    /// replicates this subscription's cursor across geo-replicated clusters.
+    #[must_use]
+    pub fn replicate_subscription_state(mut self, on: bool) -> Self {
+        self.req.replicate_subscription_state = Some(on);
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#enableTopicCreation`. When `false`, the broker fails
+    /// the subscribe if the topic doesn't already exist. Defaults to the broker default
+    /// (which is `true`).
+    #[must_use]
+    pub fn force_topic_creation(mut self, on: bool) -> Self {
+        self.req.force_topic_creation = Some(on);
+        self
+    }
+
+    /// Mirrors Java's `startMessageRollbackDuration` knob — rolls the subscription cursor
+    /// back by `seconds` at subscribe time so the consumer re-reads recent history. Useful
+    /// for "catch up on the last hour" patterns.
+    #[must_use]
+    pub fn start_message_rollback_duration(mut self, seconds: u64) -> Self {
+        self.req.start_message_rollback_duration_sec = Some(seconds);
+        self
+    }
+
     /// Subscribe.
     pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
         Ok(self

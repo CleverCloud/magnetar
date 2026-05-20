@@ -285,6 +285,22 @@ pub struct SubscribeRequest {
     /// Optional [`KeySharedConfig`] for `Key_Shared` subscriptions. Ignored for other
     /// subscription types.
     pub key_shared: Option<KeySharedConfig>,
+    /// Optional starting message id for a fresh subscription. Mirrors Java
+    /// `ReaderBuilder#startMessageId` / `ConsumerBuilder#startMessageId` and the
+    /// `CommandSubscribe.start_message_id` wire field. Has no effect on a subscription
+    /// that already has a persisted cursor.
+    pub start_message_id: Option<MessageId>,
+    /// Mirrors `CommandSubscribe.replicate_subscription_state`. When `Some(true)`, the broker
+    /// replicates this subscription's cursor across geo-replicated clusters. Defaults to
+    /// `None` (broker decision).
+    pub replicate_subscription_state: Option<bool>,
+    /// Mirrors `CommandSubscribe.force_topic_creation`. When `Some(false)` the broker fails
+    /// the subscribe if the topic doesn't already exist. Defaults to `None` (broker default,
+    /// which is `true`).
+    pub force_topic_creation: Option<bool>,
+    /// Mirrors `CommandSubscribe.start_message_rollback_duration_sec`. Rolls the subscription
+    /// cursor back by N seconds at subscribe time, so the consumer re-reads recent history.
+    pub start_message_rollback_duration_sec: Option<u64>,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -325,6 +341,10 @@ impl Default for SubscribeRequest {
             priority_level: None,
             subscription_properties: Vec::new(),
             key_shared: None,
+            start_message_id: None,
+            replicate_subscription_state: None,
+            force_topic_creation: None,
+            start_message_rollback_duration_sec: None,
         }
     }
 }
@@ -1256,6 +1276,7 @@ impl Connection {
                 .collect(),
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
         });
+        let start_message_id = req.start_message_id.map(MessageId::to_pb);
         let cmd = pb::CommandSubscribe {
             topic: req.topic,
             subscription: req.subscription,
@@ -1265,14 +1286,14 @@ impl Connection {
             consumer_name: req.consumer_name,
             priority_level: req.priority_level,
             durable: Some(req.durable),
-            start_message_id: None,
+            start_message_id,
             metadata: Vec::new(),
             read_compacted: if req.read_compacted { Some(true) } else { None },
             schema: req.schema,
             initial_position: Some(req.initial_position as i32),
-            replicate_subscription_state: None,
-            force_topic_creation: None,
-            start_message_rollback_duration_sec: None,
+            replicate_subscription_state: req.replicate_subscription_state,
+            force_topic_creation: req.force_topic_creation,
+            start_message_rollback_duration_sec: req.start_message_rollback_duration_sec,
             key_shared_meta,
             subscription_properties,
             consumer_epoch: None,
