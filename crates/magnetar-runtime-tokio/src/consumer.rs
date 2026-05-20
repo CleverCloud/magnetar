@@ -273,6 +273,55 @@ impl Consumer {
             .consumer_stats(self.handle)
             .unwrap_or_default()
     }
+
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#pause`. Stops automatic flow refills so
+    /// the broker stops dispatching new messages once already-issued permits drain. Buffered
+    /// messages remain receivable.
+    pub fn pause(&self) {
+        let mut conn = self.shared.inner.lock();
+        conn.set_paused(self.handle, true);
+    }
+
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#resume`. Re-enables automatic flow
+    /// refills.
+    pub fn resume(&self) {
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.set_paused(self.handle, false);
+        }
+        // Nudge the driver — it may have a flow to emit now that we're un-paused.
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// Returns `true` if the consumer is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.shared
+            .inner
+            .lock()
+            .is_paused(self.handle)
+            .unwrap_or(false)
+    }
+
+    /// Topic name this consumer is bound to. Returns an empty string if the consumer is
+    /// no longer registered (closed).
+    pub fn topic(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .consumer_topic(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// Subscription name. Empty string if the consumer is no longer registered.
+    pub fn subscription(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .consumer_subscription(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
 }
 
 /// Future returned by [`Consumer::receive`].

@@ -1373,6 +1373,50 @@ impl Connection {
         let _ = self.encode_command(&base);
     }
 
+    /// Mark a consumer as paused / resumed. Mirrors Java `Consumer#pause` / `#resume`. While
+    /// paused the consumer skips automatic flow refills, so the broker stops dispatching new
+    /// messages once already-issued permits drain. Buffered messages remain available via
+    /// [`Self::pop_message`].
+    pub fn set_paused(&mut self, handle: ConsumerHandle, paused: bool) {
+        if let Some(c) = self.consumers.get_mut(&handle) {
+            c.paused = paused;
+        }
+    }
+
+    /// Returns the per-consumer pause flag, or `None` if the consumer handle is unknown.
+    #[must_use]
+    pub fn is_paused(&self, handle: ConsumerHandle) -> Option<bool> {
+        self.consumers.get(&handle).map(|c| c.paused)
+    }
+
+    /// Topic name this consumer is bound to. Returns `None` if the consumer handle is
+    /// unknown.
+    #[must_use]
+    pub fn consumer_topic(&self, handle: ConsumerHandle) -> Option<&str> {
+        self.consumers.get(&handle).map(|c| c.topic.as_str())
+    }
+
+    /// Subscription name of this consumer. Returns `None` if the consumer handle is unknown.
+    #[must_use]
+    pub fn consumer_subscription(&self, handle: ConsumerHandle) -> Option<&str> {
+        self.consumers.get(&handle).map(|c| c.subscription.as_str())
+    }
+
+    /// Topic name this producer is bound to. Returns `None` if the producer handle is
+    /// unknown.
+    #[must_use]
+    pub fn producer_topic(&self, handle: ProducerHandle) -> Option<&str> {
+        self.producers.get(&handle).map(|p| p.topic.as_str())
+    }
+
+    /// Broker-assigned producer name (set after the CommandProducer / CommandProducerSuccess
+    /// round-trip). Returns `None` if the producer handle is unknown or the name has not
+    /// arrived yet.
+    #[must_use]
+    pub fn producer_name(&self, handle: ProducerHandle) -> Option<&str> {
+        self.producers.get(&handle).and_then(|p| p.name.as_deref())
+    }
+
     /// Negatively acknowledge messages — request the broker to redeliver them.
     /// Mirrors `ConsumerImpl#negativeAcknowledge`.
     ///

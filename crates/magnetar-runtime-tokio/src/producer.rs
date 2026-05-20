@@ -192,6 +192,29 @@ impl Producer {
             .producer_stats(self.handle)
             .unwrap_or_default()
     }
+
+    /// Topic name this producer is bound to. Returns an empty string if the producer is no
+    /// longer registered (closed).
+    pub fn topic(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .producer_topic(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// Broker-assigned producer name. Returns an empty string until the broker assigns one
+    /// (typically right after the ProducerSuccess round-trip) or if the producer is no
+    /// longer registered.
+    pub fn name(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .producer_name(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
 }
 
 async fn wait_request(

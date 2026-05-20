@@ -65,6 +65,10 @@ pub struct ConsumerState {
     pub max_redeliver_count: u32,
     /// Messages flagged for DLQ routing. The runtime crate drains this and republishes.
     pub dead_letter_pending: Vec<IncomingMessage>,
+    /// Mirrors Java `Consumer#pause` / `Consumer#resume`. When `true`, [`Self::maybe_flow`]
+    /// stops emitting flow commands so the broker stops dispatching new messages. Already
+    /// buffered messages can still be popped via [`Self::pop_message`].
+    pub paused: bool,
     /// Cumulative count of logical messages delivered to the user-facing queue. Mirrors
     /// Java `ConsumerStats#getTotalMsgsReceived`.
     pub total_msgs_received: u64,
@@ -141,6 +145,7 @@ impl ConsumerState {
             closed: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
+            paused: false,
             total_msgs_received: 0,
             total_bytes_received: 0,
             total_acks_sent: 0,
@@ -159,9 +164,10 @@ impl ConsumerState {
     }
 
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
-    /// a frozen state. Resets the consumed counter.
+    /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
+    /// is emitted — the broker stops dispatching once permits drain.
     pub fn maybe_flow(&mut self) -> Option<pb::CommandFlow> {
-        if self.closed || self.pending_seek.is_some() {
+        if self.closed || self.pending_seek.is_some() || self.paused {
             return None;
         }
         let threshold = (self.receiver_queue_size / 2).max(1) as u32;
