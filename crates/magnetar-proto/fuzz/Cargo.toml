@@ -1,0 +1,35 @@
+[package]
+name        = "magnetar-proto-fuzz"
+version     = "0.0.0"
+publish     = false
+edition     = "2024"
+description = "cargo-fuzz harnesses for magnetar-proto (decode_one, encode_roundtrip)."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys  = "0.4"
+arbitrary      = { version = "1", features = ["derive"] }
+bytes          = "1"
+magnetar-proto = { path = ".." }
+prost          = "0.13"
+
+[[bin]]
+name = "decode_one"
+path = "fuzz_targets/decode_one.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc  = false
+bench = false
+
+# The fuzz harnesses live outside the main workspace because cargo-fuzz
+# requires nightly + libfuzzer-sys, and we do not want that dependency
+# leaking into the published workspace dep graph.
+[workspace]
