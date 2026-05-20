@@ -119,6 +119,7 @@ impl Client {
     ///
     /// Returns [`ClientError::Broker`] if the broker refuses the producer.
     pub async fn open_producer(&self, req: CreateProducerRequest) -> Result<Producer, ClientError> {
+        let compression = req.compression;
         let handle = {
             let mut conn = self.shared.inner.lock();
             conn.create_producer(req)
@@ -128,6 +129,7 @@ impl Client {
         Ok(Producer {
             shared: self.shared.clone(),
             handle,
+            compression,
         })
     }
 

@@ -59,6 +59,7 @@
 )]
 
 mod client;
+pub mod compress;
 mod consumer;
 mod driver;
 mod error;
@@ -72,6 +73,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 pub use crate::client::Client;
+pub use crate::compress::CompressionError;
 pub use crate::consumer::{Consumer, ReceiveFut};
 pub use crate::driver::DriverHandle;
 pub use crate::error::ClientError;

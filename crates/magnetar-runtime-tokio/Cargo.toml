@@ -26,6 +26,11 @@ tokio-rustls        = { workspace = true }
 rustls              = { workspace = true }
 rustls-pemfile      = { workspace = true }
 rustls-native-certs = { workspace = true }
+# Compression codecs — Pulsar's `CompressionType` enum maps 1:1 to these crates.
+lz4_flex            = { workspace = true }
+flate2              = { workspace = true }
+zstd                = { workspace = true }
+snap                = { workspace = true }
 tracing             = { workspace = true }
 thiserror           = { workspace = true }
 url                 = { workspace = true }

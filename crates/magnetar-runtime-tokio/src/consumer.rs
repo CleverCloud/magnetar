@@ -143,7 +143,31 @@ impl Future for ReceiveFut {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut conn = self.shared.inner.lock();
-        if let Some(msg) = conn.pop_message(self.handle) {
+        if let Some(mut msg) = conn.pop_message(self.handle) {
+            drop(conn);
+            // Decompress the payload if the broker stamped a compression kind on it. Producer-
+            // side compression lives in `producer::Producer::send`; this is the symmetric
+            // consumer-side step. `uncompressed_size` is mandatory when `compression` is set
+            // (per `MessageMetadata` semantics); if it is absent we treat the payload as
+            // already-plain bytes.
+            if let Some(kind_i32) = msg.metadata.compression {
+                let pb_kind =
+                    magnetar_proto::pb::CompressionType::try_from(kind_i32).map_err(|_| {
+                        ClientError::Other(format!(
+                            "unknown compression code {kind_i32} on inbound message"
+                        ))
+                    })?;
+                let kind = crate::compress::kind_from_pb(pb_kind);
+                if kind != magnetar_proto::types::CompressionKind::None {
+                    let expected_size = msg
+                        .metadata
+                        .uncompressed_size
+                        .map_or(msg.payload.len(), |s| s as usize);
+                    let plain = crate::compress::decompress(kind, &msg.payload, expected_size)
+                        .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
+                    msg.payload = plain;
+                }
+            }
             return Poll::Ready(Ok(msg));
         }
         // Drain any state-machine events that may have arrived; we keep events queued but no

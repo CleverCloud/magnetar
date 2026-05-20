@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use magnetar_proto::producer::OutgoingMessage;
+use magnetar_proto::types::CompressionKind;
 use magnetar_proto::{MessageId, OpOutcome, PendingOpKey, ProducerHandle, SequenceId};
 
 use crate::ConnectionShared;
@@ -24,6 +25,7 @@ use crate::error::ClientError;
 pub struct Producer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ProducerHandle,
+    pub(crate) compression: CompressionKind,
 }
 
 impl Producer {
@@ -34,10 +36,32 @@ impl Producer {
 
     /// Enqueue a send. The returned future resolves when the broker acknowledges the publish
     /// (a `CommandSendReceipt`) or rejects it (a `CommandSendError`).
-    pub fn send(&self, msg: OutgoingMessage) -> SendFut {
+    pub fn send(&self, mut msg: OutgoingMessage) -> SendFut {
         let publish_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
+
+        // Compress the payload before handing it to the sans-io state machine. The producer
+        // state machine stamps `metadata.compression` based on its configured CompressionKind
+        // (per ProducerImpl.java:581-608); here we run the actual codec. Compression failure
+        // bubbles up as a SendError so the caller can retry or surface to the user.
+        if self.compression != CompressionKind::None {
+            match crate::compress::compress(self.compression, &msg.payload) {
+                Ok(compressed) => {
+                    msg.uncompressed_size = u32::try_from(msg.payload.len()).unwrap_or(u32::MAX);
+                    msg.payload = compressed;
+                }
+                Err(err) => {
+                    return SendFut {
+                        shared: self.shared.clone(),
+                        handle: self.handle,
+                        state: SendState::Failed {
+                            error: Some(ClientError::Other(format!("compress: {err}"))),
+                        },
+                    };
+                }
+            }
+        }
 
         let result = {
             let mut conn = self.shared.inner.lock();
