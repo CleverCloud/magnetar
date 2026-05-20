@@ -1414,6 +1414,7 @@ dependencies = [
  "magnetar-proto",
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
+ "parking_lot",
  "testcontainers",
  "thiserror",
  "tokio",

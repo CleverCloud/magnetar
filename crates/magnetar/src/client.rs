@@ -166,6 +166,15 @@ impl PulsarClient {
         ReaderBuilder::new(self, topic.into())
     }
 
+    /// Open a [`crate::TableViewBuilder`] for the given topic. A [`crate::TableView`] is a
+    /// key/value snapshot built from a compacted topic — useful for config snapshots and
+    /// similar "latest value wins per key" patterns. Mirrors
+    /// `PulsarClient#newTableViewBuilder`.
+    #[must_use]
+    pub fn table_view(&self, topic: impl Into<String>) -> crate::TableViewBuilder<'_> {
+        crate::TableViewBuilder::new(self, topic.into())
+    }
+
     /// Close the underlying connection.
     pub async fn close(self) {
         self.inner.close().await;
@@ -420,6 +429,14 @@ impl<'a> ConsumerBuilder<'a> {
         decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
     ) -> Self {
         self.decryptor = Some(decryptor);
+        self
+    }
+
+    /// Read from the compacted (key-deduplicated) view of the topic. Required by
+    /// [`crate::TableView`] and by any "latest-value-per-key" workflow against compacted topics.
+    #[must_use]
+    pub fn read_compacted(mut self, on: bool) -> Self {
+        self.req.read_compacted = on;
         self
     }
 

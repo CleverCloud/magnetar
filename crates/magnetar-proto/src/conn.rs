@@ -262,6 +262,10 @@ pub struct SubscribeRequest {
     pub schema: Option<pb::Schema>,
     /// Whether the subscription is durable.
     pub durable: bool,
+    /// Read from the compacted (key-deduplicated) view of the topic. Required by TableView and
+    /// by any "latest-value-per-key" workflow against compacted topics. Mirrors
+    /// `CommandSubscribe.read_compacted`.
+    pub read_compacted: bool,
 }
 
 impl Default for SubscribeRequest {
@@ -275,6 +279,7 @@ impl Default for SubscribeRequest {
             consumer_name: None,
             schema: None,
             durable: true,
+            read_compacted: false,
         }
     }
 }
@@ -1197,7 +1202,7 @@ impl Connection {
             durable: Some(req.durable),
             start_message_id: None,
             metadata: Vec::new(),
-            read_compacted: None,
+            read_compacted: if req.read_compacted { Some(true) } else { None },
             schema: req.schema,
             initial_position: Some(req.initial_position as i32),
             replicate_subscription_state: None,
