@@ -50,6 +50,14 @@ pub struct OutgoingMessage {
     pub event_time_ms: Option<u64>,
     /// Optional per-message properties.
     pub properties: Vec<(String, String)>,
+    /// Optional absolute deliver-at time (millis since epoch). Mirrors Java's
+    /// `TypedMessageBuilder#deliverAt`; the broker holds the message until the deadline.
+    pub deliver_at_ms: Option<i64>,
+    /// Optional explicit replication cluster list. Mirrors Java's
+    /// `TypedMessageBuilder#replicationClusters`. An empty vector means "use the namespace
+    /// default"; pass `vec!["__local__".to_owned()]` to opt out of replication entirely
+    /// (Java's `disableReplication()` writes the same sentinel).
+    pub replication_clusters: Vec<String>,
 }
 
 impl OutgoingMessage {
@@ -88,6 +96,41 @@ impl OutgoingMessage {
         self.properties.push((key.into(), value.into()));
         self
     }
+
+    /// Mirrors `TypedMessageBuilder#deliverAt`. The broker holds the message until the
+    /// supplied UNIX-epoch millisecond deadline before dispatching it.
+    #[must_use]
+    pub fn deliver_at_ms(mut self, ts_ms: i64) -> Self {
+        self.deliver_at_ms = Some(ts_ms);
+        self
+    }
+
+    /// Mirrors `TypedMessageBuilder#deliverAfter`. Adds `delay_ms` to the current wall-clock
+    /// time and stamps the resulting absolute deadline on the message.
+    #[must_use]
+    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        self.deliver_at_ms = Some(now.saturating_add(delay_ms));
+        self
+    }
+
+    /// Mirrors `TypedMessageBuilder#replicationClusters`. Overrides the namespace-default
+    /// replication list with the given clusters for this message only.
+    #[must_use]
+    pub fn replication_clusters(mut self, clusters: Vec<String>) -> Self {
+        self.replication_clusters = clusters;
+        self
+    }
+
+    /// Mirrors `TypedMessageBuilder#disableReplication`. Sentinel for "do not replicate this
+    /// message to any other cluster" — the broker recognises the `__local__` cluster id.
+    #[must_use]
+    pub fn disable_replication(mut self) -> Self {
+        self.replication_clusters = vec!["__local__".to_owned()];
+        self
+    }
 }
 
 impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
@@ -102,6 +145,12 @@ impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
         }
         if let Some(ts) = msg.event_time_ms {
             metadata.event_time = Some(ts);
+        }
+        if let Some(ts) = msg.deliver_at_ms {
+            metadata.deliver_at_time = Some(ts);
+        }
+        if !msg.replication_clusters.is_empty() {
+            metadata.replicate_to = msg.replication_clusters;
         }
         for (k, v) in msg.properties {
             metadata.properties.push(pb::KeyValue { key: k, value: v });
