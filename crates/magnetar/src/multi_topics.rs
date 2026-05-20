@@ -170,6 +170,11 @@ pub struct MultiTopicsConsumerBuilder<'a> {
     receiver_queue_size: usize,
     initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
     durable: bool,
+    properties: Vec<(String, String)>,
+    negative_ack_redelivery_delay: Option<std::time::Duration>,
+    ack_timeout: Option<std::time::Duration>,
+    dlq_policy: Option<(u32, Option<String>)>,
+    read_compacted: bool,
 }
 
 impl<'a> MultiTopicsConsumerBuilder<'a> {
@@ -182,6 +187,11 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             receiver_queue_size: 1000,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
             durable: true,
+            properties: Vec::new(),
+            negative_ack_redelivery_delay: None,
+            ack_timeout: None,
+            dlq_policy: None,
+            read_compacted: false,
         }
     }
 
@@ -241,6 +251,45 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors `ConsumerBuilder::property` — forwarded onto every per-topic child.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::negative_ack_redelivery_delay`.
+    #[must_use]
+    pub fn negative_ack_redelivery_delay(mut self, delay: std::time::Duration) -> Self {
+        self.negative_ack_redelivery_delay = Some(delay);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::ack_timeout`.
+    #[must_use]
+    pub fn ack_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ack_timeout = Some(timeout);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::dead_letter_policy`.
+    #[must_use]
+    pub fn dead_letter_policy(
+        mut self,
+        max_redeliver_count: u32,
+        dead_letter_topic: Option<String>,
+    ) -> Self {
+        self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::read_compacted`.
+    #[must_use]
+    pub fn read_compacted(mut self, on: bool) -> Self {
+        self.read_compacted = on;
+        self
+    }
+
     /// Open every per-topic subscription concurrently. If any subscribe fails the others
     /// that already succeeded are torn down before the error is returned.
     pub async fn subscribe(self) -> Result<MultiTopicsConsumer, PulsarError> {
@@ -257,7 +306,7 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
         // the consumers we already opened.
         let mut consumers: Vec<NamedConsumer> = Vec::with_capacity(self.topics.len());
         for topic in &self.topics {
-            let result = self
+            let mut builder = self
                 .client
                 .consumer(topic.clone())
                 .subscription(subscription.clone())
@@ -265,8 +314,20 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
                 .durable(self.durable)
                 .initial_position(self.initial_position)
                 .receiver_queue_size(self.receiver_queue_size)
-                .subscribe()
-                .await;
+                .read_compacted(self.read_compacted);
+            for (k, v) in &self.properties {
+                builder = builder.property(k.clone(), v.clone());
+            }
+            if let Some(d) = self.negative_ack_redelivery_delay {
+                builder = builder.negative_ack_redelivery_delay(d);
+            }
+            if let Some(t) = self.ack_timeout {
+                builder = builder.ack_timeout(t);
+            }
+            if let Some((max, topic_opt)) = &self.dlq_policy {
+                builder = builder.dead_letter_policy(*max, topic_opt.clone());
+            }
+            let result = builder.subscribe().await;
             match result {
                 Ok(c) => consumers.push(NamedConsumer {
                     topic: topic.clone(),
