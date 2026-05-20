@@ -276,6 +276,12 @@ pub struct SubscribeRequest {
     /// by any "latest-value-per-key" workflow against compacted topics. Mirrors
     /// `CommandSubscribe.read_compacted`.
     pub read_compacted: bool,
+    /// Mirrors `CommandSubscribe.priority_level`. The broker uses it for Shared / Failover
+    /// dispatch ordering. `None` means default (broker treats as 0).
+    pub priority_level: Option<i32>,
+    /// Mirrors `CommandSubscribe.subscription_properties` — per-subscription key/value
+    /// metadata visible to the broker dashboard.
+    pub subscription_properties: Vec<(String, String)>,
 }
 
 impl Default for SubscribeRequest {
@@ -290,6 +296,8 @@ impl Default for SubscribeRequest {
             schema: None,
             durable: true,
             read_compacted: false,
+            priority_level: None,
+            subscription_properties: Vec::new(),
         }
     }
 }
@@ -1204,6 +1212,11 @@ impl Connection {
         );
         self.consumers.insert(handle, state);
 
+        let subscription_properties: Vec<pb::KeyValue> = req
+            .subscription_properties
+            .into_iter()
+            .map(|(key, value)| pb::KeyValue { key, value })
+            .collect();
         let cmd = pb::CommandSubscribe {
             topic: req.topic,
             subscription: req.subscription,
@@ -1211,7 +1224,7 @@ impl Connection {
             consumer_id: handle.0,
             request_id: request_id.0,
             consumer_name: req.consumer_name,
-            priority_level: None,
+            priority_level: req.priority_level,
             durable: Some(req.durable),
             start_message_id: None,
             metadata: Vec::new(),
@@ -1222,7 +1235,7 @@ impl Connection {
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
             key_shared_meta: None,
-            subscription_properties: Vec::new(),
+            subscription_properties,
             consumer_epoch: None,
         };
         let base = pb::BaseCommand {

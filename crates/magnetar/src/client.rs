@@ -658,6 +658,29 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#priorityLevel`. The broker uses the value for Shared
+    /// / Failover dispatch ordering — higher-priority consumers receive messages first.
+    #[must_use]
+    pub fn priority_level(mut self, level: i32) -> Self {
+        self.req.priority_level = Some(level);
+        self
+    }
+
+    /// Append a (key, value) entry to the subscription properties advertised on
+    /// `CommandSubscribe.subscription_properties`. Mirrors Java
+    /// `ConsumerBuilder#subscriptionProperties` (one entry at a time).
+    #[must_use]
+    pub fn subscription_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.req
+            .subscription_properties
+            .push((key.into(), value.into()));
+        self
+    }
+
     /// Subscribe.
     pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
         Ok(self
