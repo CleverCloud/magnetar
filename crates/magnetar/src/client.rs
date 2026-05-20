@@ -602,6 +602,15 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#property`. Appends a `(key, value)` entry to the
+    /// producer metadata advertised on `CommandProducer.metadata`. Visible on the broker
+    /// dashboard alongside the producer.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.req.producer_metadata.push((key.into(), value.into()));
+        self
+    }
+
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload. Pass an
     /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the
@@ -782,6 +791,15 @@ impl<'a> ConsumerBuilder<'a> {
     #[must_use]
     pub fn start_message_rollback_duration(mut self, seconds: u64) -> Self {
         self.req.start_message_rollback_duration_sec = Some(seconds);
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#property`. Appends a `(key, value)` entry to the
+    /// consumer metadata advertised on `CommandSubscribe.metadata`. Visible on the broker
+    /// dashboard alongside the consumer.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.req.consumer_metadata.push((key.into(), value.into()));
         self
     }
 

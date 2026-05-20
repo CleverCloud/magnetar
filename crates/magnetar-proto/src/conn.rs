@@ -242,6 +242,9 @@ pub struct CreateProducerRequest {
     /// `Shared`; switch to `Exclusive` / `WaitForExclusive` / `ExclusiveWithFencing` for
     /// single-writer-per-topic patterns.
     pub access_mode: pb::ProducerAccessMode,
+    /// Mirrors `CommandProducer.metadata` — broker-side KV metadata advertised at producer
+    /// open. Surfaces on the broker dashboard alongside the producer.
+    pub producer_metadata: Vec<(String, String)>,
 }
 
 impl Default for CreateProducerRequest {
@@ -257,6 +260,7 @@ impl Default for CreateProducerRequest {
             schema: None,
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
+            producer_metadata: Vec::new(),
         }
     }
 }
@@ -317,6 +321,9 @@ pub struct SubscribeRequest {
     /// messages that exceeded `max_redeliver_count`. Convention if `None`:
     /// `<topic>-<subscription>-DLQ` (matches the Java client default).
     pub dead_letter_topic: Option<String>,
+    /// Mirrors `CommandSubscribe.metadata` — broker-side KV metadata advertised at
+    /// subscribe time. Surfaces on the broker dashboard alongside the consumer.
+    pub consumer_metadata: Vec<(String, String)>,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -363,6 +370,7 @@ impl Default for SubscribeRequest {
             start_message_rollback_duration_sec: None,
             max_redeliver_count: 0,
             dead_letter_topic: None,
+            consumer_metadata: Vec::new(),
         }
     }
 }
@@ -1249,13 +1257,21 @@ impl Connection {
         }
         self.producers.insert(handle, state);
 
+        let producer_metadata: Vec<pb::KeyValue> = req
+            .producer_metadata
+            .iter()
+            .map(|(k, v)| pb::KeyValue {
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect();
         let cmd = pb::CommandProducer {
             topic: req.topic,
             producer_id: handle.0,
             request_id: request_id.0,
             producer_name: req.producer_name.clone(),
             encrypted: None,
-            metadata: Vec::new(),
+            metadata: producer_metadata,
             schema: req.schema,
             epoch: None,
             user_provided_producer_name: Some(req.producer_name.is_some()),
@@ -1309,6 +1325,11 @@ impl Connection {
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
         });
         let start_message_id = req.start_message_id.map(MessageId::to_pb);
+        let consumer_metadata: Vec<pb::KeyValue> = req
+            .consumer_metadata
+            .into_iter()
+            .map(|(key, value)| pb::KeyValue { key, value })
+            .collect();
         let cmd = pb::CommandSubscribe {
             topic: req.topic,
             subscription: req.subscription,
@@ -1319,7 +1340,7 @@ impl Connection {
             priority_level: req.priority_level,
             durable: Some(req.durable),
             start_message_id,
-            metadata: Vec::new(),
+            metadata: consumer_metadata,
             read_compacted: if req.read_compacted { Some(true) } else { None },
             schema: req.schema,
             initial_position: Some(req.initial_position as i32),

@@ -281,6 +281,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
                 schema: self.schema.clone(),
                 initial_sequence_id: self.initial_sequence_id,
                 access_mode: self.access_mode,
+                producer_metadata: Vec::new(),
             };
             let result = self
                 .client
