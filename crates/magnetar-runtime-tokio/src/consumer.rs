@@ -164,6 +164,35 @@ impl Consumer {
         }
     }
 
+    /// Unsubscribe this consumer's subscription from the broker. Unlike
+    /// [`close`](Self::close) which only tears down the consumer instance,
+    /// `unsubscribe` deletes the subscription cursor entirely.
+    ///
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#unsubscribe`. After this
+    /// call the consumer is unusable; callers typically follow with `close()`.
+    ///
+    /// `force=true` (PIP-313) drops the subscription even if other consumers
+    /// are still attached to the same subscription name.
+    pub async fn unsubscribe(&self, force: bool) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.unsubscribe(self.handle, force)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected unsubscribe outcome: {other:?}"
+            ))),
+        }
+    }
+
     /// Close this consumer. Resolves when the broker acks the close.
     pub async fn close(self) -> Result<(), ClientError> {
         let request_id = {

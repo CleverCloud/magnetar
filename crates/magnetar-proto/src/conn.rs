@@ -349,6 +349,7 @@ enum PendingRequestKind {
     ProducerOpen { handle: ProducerHandle },
     ConsumerSubscribe { handle: ConsumerHandle },
     ConsumerSeek { handle: ConsumerHandle },
+    ConsumerUnsubscribe { handle: ConsumerHandle },
     Ack { handle: ConsumerHandle },
     ProducerClose { handle: ProducerHandle },
     ConsumerClose { handle: ConsumerHandle },
@@ -1441,6 +1442,36 @@ impl Connection {
         }
         self.pending_requests
             .insert(request_id, PendingRequestKind::ConsumerClose { handle });
+        request_id
+    }
+
+    /// Unsubscribe — remove this consumer's subscription from the broker.
+    ///
+    /// Mirrors `org.apache.pulsar.client.api.Consumer#unsubscribe`. Unlike
+    /// [`close_consumer`](Self::close_consumer) which keeps the subscription
+    /// cursor alive on the broker, `unsubscribe` deletes the subscription
+    /// entirely — useful for tear-down + cleanup. The runtime should call
+    /// `close_consumer` afterwards.
+    ///
+    /// `force=true` (PIP-313) drops the subscription even if other consumers
+    /// are still attached.
+    pub fn unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = pb::CommandUnsubscribe {
+            consumer_id: handle.0,
+            request_id: request_id.0,
+            force: Some(force),
+        };
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::Unsubscribe as i32,
+            unsubscribe: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::ConsumerUnsubscribe { handle },
+        );
         request_id
     }
 
