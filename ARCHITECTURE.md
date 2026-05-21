@@ -1283,8 +1283,9 @@ The schema is advertised on `CommandProducer.schema` /
 | PIP-68 | Exclusive producer access mode | ✅ | `ProducerBuilder::access_mode` |
 | PIP-90 | Broker-entry metadata envelope | ✅ | `crates/magnetar-proto/src/frame.rs:30-48`; consumer getters: `IncomingMessage::broker_publish_time_ms` / `broker_index` |
 | PIP-124 | Multi-DLQ topics for KeyShared | ✅ | DLQ policy infra (shared with PIP-22) |
+| PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `crates/magnetar-proto/src/service_url.rs`, `crates/magnetar-proto/src/cluster_failover.rs`, `crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs` (see [ADR-0016](specs/adr/0016-pip-121-cluster-failover.md)) |
 | PIP-145 | Topic list watcher (regex pattern) | ✅ | `crates/magnetar-proto/src/topic_watcher.rs`; consumer façade: `crates/magnetar/src/pattern_consumer.rs` |
-| PIP-188 | `TOPIC_MIGRATED` | 🟡 | Wire opcode decoded; engine-level reconnect-on-migrate pending |
+| PIP-188 | `TOPIC_MIGRATED` → reconnect-on-migrate | ✅ | Driver event arm in `crates/magnetar-runtime-tokio/src/driver.rs` returns `ClientError` to trigger supervised reset + reconnect; see [ADR-0018](specs/adr/0018-pip-188-reconnect-on-migrate.md) |
 | PIP-292 | Better in-band auth refresh ergonomics | ✅ | `crates/magnetar-runtime-tokio/src/driver.rs:42-66` |
 | PIP-313 | Force unsubscribe | ✅ | `CommandUnsubscribe.force` field plumbed |
 | PIP-34 / 119 / 282 / 379 | Key_Shared family | ✅ | `magnetar_proto::KeySharedConfig` + builder routing |
@@ -1293,9 +1294,8 @@ The schema is advertised on `CommandProducer.schema` /
 | PIP-460 | Scalable topics | ❌ | M9 scope (experimental) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim |
 | PIP-180 | Shadow topic | ❌ | M9 |
-| PIP-415 | `getMessageIdByIndex` | ❌ | M9 |
+| PIP-415 | `getMessageIdByIndex` | ❌ | M9 (blocked on vendored proto bump) |
 | PIP-33 | Replicated subscriptions | ❌ | M9 |
-| PIP-121 | Cluster failover (Auto + Controlled) | ❌ | M9 |
 
 ---
 
