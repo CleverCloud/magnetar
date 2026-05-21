@@ -1106,4 +1106,206 @@ mod tests {
         let _ = p.flush_batch(101);
         assert!(p.next_batch_deadline().is_none());
     }
+
+    // ---------------------------------------------------------------------
+    // BatchContainer behavioral tests — backported from Java
+    // `BatchMessageContainerImplTest.java`.
+    //
+    // The Java tests rely on Mockito + Netty `ByteBufAllocator` to drive
+    // `BatchMessageContainerImpl.add` / `createOpSendMsg`. Our `BatchContainer`
+    // is the equivalent state holder, so we exercise the same invariants by
+    // mutating the container directly (the type derives `Default`).
+    // ---------------------------------------------------------------------
+
+    /// Build a `SingleMessageMetadata` whose `sequence_id` is set, as the Java
+    /// fixture does (`messageMetadata.setSequenceId(i)` in
+    /// `addMessagesAndCreateOpSendMsg`).
+    fn single_with_seq(seq: u64, payload_size: i32) -> pb::SingleMessageMetadata {
+        pb::SingleMessageMetadata {
+            payload_size,
+            sequence_id: Some(seq),
+            ..Default::default()
+        }
+    }
+
+    /// Helper to push a single message + payload into a batch container and
+    /// update its bookkeeping the same way `add_to_batch` would.
+    fn push_into_batch(batch: &mut BatchContainer, seq: u64, payload: &[u8]) {
+        let single = single_with_seq(seq, payload.len() as i32);
+        batch.current_size_bytes = batch.current_size_bytes.saturating_add(payload.len());
+        if batch.lowest_sequence_id.is_none() {
+            batch.lowest_sequence_id = Some(seq);
+        }
+        batch.highest_sequence_id = Some(seq);
+        if batch.first_added_at.is_none() {
+            batch.first_added_at = Some(std::time::Instant::now());
+        }
+        batch
+            .messages
+            .push((single, Bytes::copy_from_slice(payload)));
+    }
+
+    /// Mirrors the size-bookkeeping facet of Java `testMessagesSize`: pushing
+    /// payloads into the batch grows `current_size_bytes` in lock-step with
+    /// the concatenated payload total, and the configured size threshold
+    /// rejects further `can_add_to_batch` calls.
+    #[test]
+    fn batch_size_threshold_flush() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        p.max_batch_size_bytes = 8;
+        p.max_messages_in_batch = 100;
+
+        // Three 2-byte payloads fit (6 / 8).
+        push_into_batch(&mut p.batch, 0, b"aa");
+        push_into_batch(&mut p.batch, 1, b"bb");
+        push_into_batch(&mut p.batch, 2, b"cc");
+        assert_eq!(p.batch.current_size_bytes, 6);
+        assert!(p.can_add_to_batch(2, 1), "1 more 2-byte payload fits (8/8)");
+
+        // 3 more bytes would overflow the 8-byte budget.
+        assert!(!p.can_add_to_batch(3, 1));
+
+        let flushed = p.flush_batch(101);
+        assert_eq!(flushed, 1, "non-empty batch always flushes one frame");
+        // Flush drains the messages vec but keeps the SEND frame queued.
+        assert!(p.batch.is_empty());
+        assert_eq!(p.outbound_len(), 1);
+    }
+
+    /// Mirrors the count-threshold facet of Java `testMessagesSize`: once
+    /// `max_messages_in_batch` is reached, `can_add_to_batch` refuses any
+    /// further additions even though there's space in the byte budget.
+    #[test]
+    fn batch_count_threshold_flush() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        p.max_batch_size_bytes = 8 * 1024;
+        p.max_messages_in_batch = 3;
+
+        for i in 0..3 {
+            push_into_batch(&mut p.batch, i, b"x");
+        }
+        assert_eq!(p.batch.len(), 3);
+        assert!(
+            !p.can_add_to_batch(1, 1),
+            "count cap should refuse additions"
+        );
+
+        // After flush the cap should reset and new sends fit again.
+        let flushed = p.flush_batch(101);
+        assert_eq!(flushed, 1);
+        assert_eq!(p.batch.len(), 0);
+        assert!(p.can_add_to_batch(1, 1));
+    }
+
+    /// Java `BatchMessageContainerImpl.createOpSendMsg` returns `null` for an
+    /// empty container; we return 0 frames. Calling on a closed producer is
+    /// also a no-op.
+    #[test]
+    fn empty_batch_returns_nothing_on_flush() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        assert!(p.batch.is_empty());
+        assert_eq!(p.flush_batch(100), 0, "empty batch flushes nothing");
+        assert_eq!(p.outbound_len(), 0);
+
+        // Closed producer also flushes nothing even when messages remain
+        // (mirrors Java behaviour where a closed producer drops the batch).
+        push_into_batch(&mut p.batch, 0, b"x");
+        p.closed = true;
+        assert_eq!(p.flush_batch(100), 0);
+    }
+
+    /// Java tests assign `messageMetadata.setSequenceId(i)` while building
+    /// each batch, then the produced `OpSendMsg` exposes the lowest as
+    /// `sequenceId` and the highest as `highestSequenceId`. We assert the
+    /// container tracks both monotonically in insertion order.
+    #[test]
+    fn batch_tracks_lowest_and_highest_sequence_id() {
+        let mut batch = BatchContainer::default();
+        assert!(batch.lowest_sequence_id.is_none());
+        assert!(batch.highest_sequence_id.is_none());
+
+        push_into_batch(&mut batch, 7, b"a");
+        push_into_batch(&mut batch, 8, b"b");
+        push_into_batch(&mut batch, 9, b"c");
+        assert_eq!(batch.lowest_sequence_id, Some(7));
+        assert_eq!(batch.highest_sequence_id, Some(9));
+        assert_eq!(batch.len(), 3);
+
+        batch.clear();
+        assert!(batch.is_empty());
+        assert!(batch.lowest_sequence_id.is_none());
+        assert!(batch.highest_sequence_id.is_none());
+        assert!(batch.first_added_at.is_none());
+        assert_eq!(batch.current_size_bytes, 0);
+    }
+
+    /// `first_added_at` should be stamped only on the very first add and stay
+    /// pinned until flush — that's what feeds the
+    /// `batching_max_publish_delay` deadline.
+    #[test]
+    fn first_added_at_pinned_to_first_message() {
+        let mut batch = BatchContainer::default();
+        assert!(batch.first_added_at.is_none());
+
+        push_into_batch(&mut batch, 0, b"first");
+        let t0 = batch.first_added_at.expect("stamped on first add");
+        // Sleep a hair so a wrongly re-stamped timestamp would differ.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        push_into_batch(&mut batch, 1, b"second");
+        let t1 = batch.first_added_at.expect("still present");
+        assert_eq!(t0, t1, "first_added_at must not be overwritten");
+
+        batch.clear();
+        assert!(batch.first_added_at.is_none());
+    }
+
+    /// Mirrors the Java practice of computing `batchingMaxPublishDelayMicros`
+    /// against the first-added timestamp: deadline = first_added_at +
+    /// batching_max_publish_delay. Independent of `queue_send`, we drive
+    /// `BatchContainer` directly to verify the math.
+    #[test]
+    fn batching_max_publish_delay_uses_first_added_at() {
+        use std::time::{Duration, Instant};
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 100;
+        p.batching_max_publish_delay = Some(Duration::from_millis(20));
+
+        let anchor = Instant::now();
+        p.batch.first_added_at = Some(anchor);
+        p.batch
+            .messages
+            .push((single_with_seq(0, 1), Bytes::from_static(b"x")));
+        p.batch.lowest_sequence_id = Some(0);
+        p.batch.highest_sequence_id = Some(0);
+
+        let deadline = p.next_batch_deadline().expect("deadline");
+        assert_eq!(deadline, anchor + Duration::from_millis(20));
+        assert!(!p.batch_deadline_elapsed(anchor + Duration::from_millis(19)));
+        assert!(p.batch_deadline_elapsed(anchor + Duration::from_millis(20)));
+        assert!(p.batch_deadline_elapsed(anchor + Duration::from_millis(50)));
+    }
 }
