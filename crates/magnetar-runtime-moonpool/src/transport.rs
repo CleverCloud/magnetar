@@ -18,6 +18,7 @@ use std::io;
 use moonpool_core::{NetworkProvider, Providers};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::dns::DnsResolver;
 use crate::EngineError;
 
 /// A plaintext TCP stream produced by the configured
@@ -37,6 +38,48 @@ impl<P: Providers> Transport<P> {
     pub(crate) async fn connect(network: &P::Network, addr: &str) -> Result<Self, EngineError> {
         let stream = network.connect(addr).await.map_err(EngineError::Io)?;
         Ok(Self { stream })
+    }
+
+    /// Establish a plaintext connection, routing host resolution through
+    /// `resolver` when `Some`. Mirrors the tokio engine's
+    /// `Transport::connect_with_resolver` — the resolver returns one or
+    /// more candidate [`std::net::SocketAddr`]s and we dial each in order,
+    /// returning the first that connects. If every candidate fails, the
+    /// last [`std::io::Error`] is surfaced.
+    ///
+    /// `addr` must parse as `host:port`. When `resolver` is `None`, falls
+    /// back to [`Self::connect`] (which routes through the moonpool
+    /// [`NetworkProvider`] directly).
+    ///
+    /// # Errors
+    /// - [`EngineError::Config`] when `addr` does not parse as `host:port`.
+    /// - [`EngineError::Io`] when every resolved candidate fails to connect.
+    pub(crate) async fn connect_with_resolver(
+        network: &P::Network,
+        addr: &str,
+        resolver: Option<&dyn DnsResolver>,
+    ) -> Result<Self, EngineError> {
+        let Some(resolver) = resolver else {
+            return Self::connect(network, addr).await;
+        };
+        let (host, port) = split_host_port(addr)?;
+        let addrs = resolver.resolve(host, port).await?;
+        if addrs.is_empty() {
+            return Err(EngineError::Config(format!(
+                "dns resolver returned no addresses for {host}:{port}"
+            )));
+        }
+        let mut last_err: Option<io::Error> = None;
+        for sa in addrs {
+            let formatted = sa.to_string();
+            match network.connect(&formatted).await {
+                Ok(stream) => return Ok(Self { stream }),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(EngineError::Io(
+            last_err.expect("at least one connect attempt was made"),
+        ))
     }
 
     /// Wrap an already-established stream (used by tests and by the future
@@ -95,6 +138,21 @@ impl<P: Providers> Transport<P> {
     pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
         self.stream.shutdown().await
     }
+}
+
+/// Split a `host:port` literal into its components. Mirrors the trivial
+/// parsing that moonpool's [`NetworkProvider::connect`] does internally but
+/// surfaces a typed error so the resolver path can report a friendlier
+/// configuration mistake. Brackets around IPv6 hosts are stripped.
+fn split_host_port(addr: &str) -> Result<(&str, u16), EngineError> {
+    let (host, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| EngineError::Config(format!("invalid host:port literal {addr:?}")))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port: u16 = port
+        .parse()
+        .map_err(|e| EngineError::Config(format!("invalid port in {addr:?}: {e}")))?;
+    Ok((host, port))
 }
 
 impl<P: Providers> std::fmt::Debug for Transport<P> {

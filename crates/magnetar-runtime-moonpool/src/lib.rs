@@ -61,12 +61,14 @@
 
 mod client;
 mod consumer;
+pub mod dns;
 mod driver;
 mod producer;
 pub mod tls;
 mod transport;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::BytesMut;
@@ -77,6 +79,7 @@ use tokio::sync::Notify;
 
 pub use crate::client::{Client, ClientError, LookupTopicResult};
 pub use crate::consumer::Consumer;
+pub use crate::dns::{arc_dns_resolver, DnsResolveFuture, DnsResolver, StaticDnsResolver};
 pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
 use crate::transport::Transport;
@@ -100,6 +103,28 @@ pub struct ConnectionShared {
     /// Wakeup for `next_topic_list_change` futures. Notified after every
     /// push to [`Self::topic_list_changes`].
     pub topic_list_notify: Notify,
+    /// Set by the supervised-reconnect path between
+    /// [`magnetar_proto::Connection::reset`] and the new socket's
+    /// handshake. When `true`, the driver loop runs
+    /// [`magnetar_proto::Connection::rebuild_producers`] +
+    /// [`magnetar_proto::Connection::rebuild_consumers`] the first time it
+    /// observes the new session transitioning to
+    /// [`magnetar_proto::HandshakeState::Connected`], then clears the flag
+    /// so the rebuild fires exactly once per reconnect. Stage 3 of the
+    /// supervisor work (transparent producer / consumer replay).
+    pub pending_rebuild: AtomicBool,
+    /// Configured global publish memory budget in bytes. `0` disables the
+    /// limit (matches `ConnectionConfig::memory_limit_bytes` default).
+    /// Mirrors the tokio engine's identically-named field and Java's
+    /// `ClientBuilder#memoryLimit`. See
+    /// [ADR-0017](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
+    pub memory_limit_bytes: u64,
+    /// Current in-flight publish bytes reserved by [`Producer::send`]
+    /// calls that have not yet seen their
+    /// [`magnetar_proto::OpOutcome::SendReceipt`] / `SendError`. Bumped on
+    /// reserve (CAS against `memory_limit_bytes`); decremented on
+    /// [`SendFut`] completion.
+    pub memory_used: AtomicU64,
 }
 
 impl std::fmt::Debug for ConnectionShared {
@@ -124,13 +149,78 @@ impl ConnectionShared {
         config: ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     ) -> Arc<Self> {
+        let memory_limit_bytes = config.memory_limit_bytes;
         Arc::new(Self {
             inner: Mutex::new(Connection::new(config)),
             driver_waker: Notify::new(),
             auth_provider,
             topic_list_changes: Mutex::new(std::collections::VecDeque::new()),
             topic_list_notify: Notify::new(),
+            pending_rebuild: AtomicBool::new(false),
+            memory_limit_bytes,
+            memory_used: AtomicU64::new(0),
         })
+    }
+
+    /// Try to reserve `bytes` against the configured memory budget.
+    ///
+    /// Returns `Ok(())` when the reservation succeeds (or no limit is
+    /// configured — `memory_limit_bytes = 0`); returns
+    /// [`EngineError::MemoryLimitExceeded`] when the reservation would
+    /// push `memory_used` past `memory_limit_bytes`.
+    ///
+    /// Lock-free: a CAS loop on `memory_used`. Mirrors Java's
+    /// `MemoryLimitController` in `MemoryLimitPolicy.FailImmediately` mode
+    /// and the tokio engine's identically-shaped helper.
+    ///
+    /// `AtomicU64` is not a channel; see
+    /// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
+    ///
+    /// # Errors
+    /// Surfaces [`EngineError::MemoryLimitExceeded`] when the reservation
+    /// would overflow the configured budget.
+    pub fn try_reserve_memory(&self, bytes: u64) -> Result<(), EngineError> {
+        if self.memory_limit_bytes == 0 {
+            return Ok(());
+        }
+        loop {
+            let current = self.memory_used.load(Ordering::Acquire);
+            let next = current.saturating_add(bytes);
+            if next > self.memory_limit_bytes {
+                return Err(EngineError::MemoryLimitExceeded {
+                    current,
+                    limit: self.memory_limit_bytes,
+                    requested: bytes,
+                });
+            }
+            if self
+                .memory_used
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Release a previous reservation. Called by [`SendFut`] on completion
+    /// (success or error). Saturating sub so a buggy over-release can't
+    /// underflow the counter.
+    pub fn release_memory(&self, bytes: u64) {
+        if bytes == 0 || self.memory_limit_bytes == 0 {
+            return;
+        }
+        loop {
+            let current = self.memory_used.load(Ordering::Acquire);
+            let next = current.saturating_sub(bytes);
+            if self
+                .memory_used
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 }
 
@@ -163,6 +253,22 @@ pub enum EngineError {
     /// Configuration error (e.g. URL parsing).
     #[error("config error: {0}")]
     Config(String),
+    /// A `Producer::send` was rejected because reserving its payload bytes
+    /// would push the engine past the configured
+    /// [`ConnectionShared::memory_limit_bytes`] budget. Mirrors Java's
+    /// `MemoryLimitController` in `FailImmediately` policy. See
+    /// [ADR-0017](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
+    #[error(
+        "memory limit exceeded: current={current}B + requested={requested}B > limit={limit}B"
+    )]
+    MemoryLimitExceeded {
+        /// Bytes currently reserved on the budget when the request was rejected.
+        current: u64,
+        /// Configured limit (`ConnectionShared::memory_limit_bytes`).
+        limit: u64,
+        /// Bytes the caller asked to reserve.
+        requested: u64,
+    },
 }
 
 /// moonpool-backed engine handle. Generic over the [`Providers`] bundle so
@@ -214,7 +320,31 @@ impl<P: Providers> MoonpoolEngine<P> {
         addr: &str,
         config: ConnectionConfig,
     ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
-        let mut transport = Transport::<P>::connect(self.providers.network(), addr).await?;
+        self.connect_plain_with_resolver(addr, config, None).await
+    }
+
+    /// Connect to `addr`, routing the initial dial through `resolver` when
+    /// `Some`. Mirrors the tokio engine's `connect_with_resolver` path —
+    /// the resolver returns one or more candidate [`std::net::SocketAddr`]s
+    /// and the transport dials each in order.
+    ///
+    /// When `resolver = None`, behaves identically to [`Self::connect_plain`]
+    /// (routes the raw `host:port` through the moonpool
+    /// [`moonpool_core::NetworkProvider`]). Java parity:
+    /// `ClientBuilder#dnsResolver`. See
+    /// [ADR-0015](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0015-dns-resolver-injection.md).
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::connect_plain`], plus the resolver may
+    /// surface [`EngineError::Config`] if it returns no addresses.
+    pub async fn connect_plain_with_resolver(
+        &self,
+        addr: &str,
+        config: ConnectionConfig,
+        resolver: Option<&dyn DnsResolver>,
+    ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
+        let mut transport =
+            Transport::<P>::connect_with_resolver(self.providers.network(), addr, resolver).await?;
         let shared = ConnectionShared::new(config);
 
         // Drive the handshake inline. Once `Connected` lands we hand the
