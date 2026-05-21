@@ -3058,4 +3058,239 @@ mod conn_state_tests {
         // Second take is empty — outcomes are one-shot.
         assert!(conn.take_outcome(key).is_none());
     }
+
+    /// `begin_handshake` is the only `Uninitialized -> ConnectSent` edge; calling it twice
+    /// must return `Err(ProtocolError::Handshake)` rather than silently re-emitting a
+    /// second `CommandConnect`. Mirrors Java `ClientCnx#channelActive` which guards the
+    /// connect path with a state check.
+    #[test]
+    fn begin_handshake_twice_returns_handshake_error() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("first call succeeds");
+        let err = conn
+            .begin_handshake()
+            .expect_err("second call must fail because state is ConnectSent");
+        match err {
+            ProtocolError::Handshake(msg) => {
+                assert!(
+                    msg.contains("already"),
+                    "expected an 'already started' diagnostic, got {msg:?}"
+                );
+            }
+            other => panic!("expected Handshake error, got {other:?}"),
+        }
+        // Calling again after Connected is also a no-go.
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handshake");
+        assert!(conn.is_connected());
+        assert!(matches!(
+            conn.begin_handshake(),
+            Err(ProtocolError::Handshake(_))
+        ));
+    }
+
+    /// Feeding a `CommandPartitionedTopicMetadataResponse` to a connection that holds the
+    /// matching in-flight request must surface the partition count via both `take_outcome`
+    /// and a `ConnectionEvent::PartitionedMetadataResponse`. Ports the behaviour exercised
+    /// in Java `BinaryProtoLookupServiceTest#testPartitionedMetadataDeduplicationAndCleanup`
+    /// — without the dedup layer (which lives at the runtime level, not the sans-io
+    /// state machine).
+    #[test]
+    fn partitioned_metadata_response_surfaces_partition_count() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        // Drain the `Connected` event so subsequent `poll_event` returns ours.
+        let _ = conn.poll_event();
+
+        let request_id = conn.get_partitioned_topic_metadata("persistent://public/default/t");
+        let key = PendingOpKey::Request(request_id);
+        assert!(conn.take_outcome(key).is_none(), "pending until reply");
+
+        // Feed back a successful 8-partition response.
+        let resp = pb::BaseCommand {
+            r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+            partition_metadata_response: Some(pb::CommandPartitionedTopicMetadataResponse {
+                partitions: Some(8),
+                request_id: request_id.0,
+                response: Some(
+                    pb::command_partitioned_topic_metadata_response::LookupType::Success as i32,
+                ),
+                error: None,
+                message: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &resp).expect("encode partitioned-metadata response");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle partitioned-metadata response");
+
+        // Outcome arrived.
+        match conn.take_outcome(key) {
+            Some(OpOutcome::PartitionedMetadata {
+                request_id: rid,
+                partitions,
+                error,
+            }) => {
+                assert_eq!(rid, request_id);
+                assert_eq!(partitions, 8);
+                assert!(error.is_none());
+            }
+            other => panic!("expected PartitionedMetadata outcome, got {other:?}"),
+        }
+
+        // ConnectionEvent surfaces the same information for observers (e.g. metrics).
+        match conn.poll_event() {
+            Some(ConnectionEvent::PartitionedMetadataResponse {
+                request_id: rid,
+                partitions,
+                error,
+            }) => {
+                assert_eq!(rid, request_id);
+                assert_eq!(partitions, 8);
+                assert!(error.is_none());
+            }
+            other => panic!("expected PartitionedMetadataResponse event, got {other:?}"),
+        }
+    }
+
+    /// A partitioned-metadata response carrying an error must surface as an
+    /// `OpOutcome::PartitionedMetadata { error: Some((code, message)), .. }` so user
+    /// futures can fail with the broker's diagnostics. Ports Java
+    /// `BinaryProtoLookupService#getPartitionedTopicMetadata` failure handling.
+    #[test]
+    fn partitioned_metadata_response_propagates_broker_error() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        let request_id = conn.get_partitioned_topic_metadata("persistent://public/default/t");
+        let key = PendingOpKey::Request(request_id);
+
+        let resp = pb::BaseCommand {
+            r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+            partition_metadata_response: Some(pb::CommandPartitionedTopicMetadataResponse {
+                partitions: None,
+                request_id: request_id.0,
+                response: Some(
+                    pb::command_partitioned_topic_metadata_response::LookupType::Failed as i32,
+                ),
+                error: Some(pb::ServerError::AuthorizationError as i32),
+                message: Some("no perms".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &resp).expect("encode partitioned-metadata failure");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle partitioned-metadata failure");
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::PartitionedMetadata {
+                partitions, error, ..
+            }) => {
+                assert_eq!(partitions, 0, "no partitions on failure");
+                let (code, msg) = error.expect("error populated");
+                assert_eq!(code, pb::ServerError::AuthorizationError as i32);
+                assert_eq!(msg, "no perms");
+            }
+            other => panic!("expected PartitionedMetadata outcome, got {other:?}"),
+        }
+    }
+
+    /// Ported from Java `BinaryProtoLookupService` — a `CommandLookupTopicResponse` whose
+    /// `response = Redirect` must trigger a *fresh* outbound `CommandLookupTopic` with a
+    /// fresh request id. Verifies that the state machine itself drives the retry (no need
+    /// for the user to re-submit). The retry counter (Java `maxLookupRedirects`) lives at
+    /// the runtime layer; here we only pin that one redirect produces one retry frame.
+    #[test]
+    fn lookup_redirect_response_triggers_authoritative_retry() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        // Issue the lookup and capture the outbound size to detect the second emission.
+        let request_id = conn.lookup("persistent://public/default/foo", false);
+        let outbound_after_lookup = conn.outbound_len();
+        assert!(
+            outbound_after_lookup > 0,
+            "lookup must enqueue a CommandLookupTopic"
+        );
+
+        // Feed a Redirect response. The state machine must emit a *second* lookup frame
+        // with a different request id and the `authoritative` flag forced on.
+        let redirect = pb::BaseCommand {
+            r#type: pb::base_command::Type::LookupResponse as i32,
+            lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                broker_service_url: Some("pulsar://other:6650".to_owned()),
+                broker_service_url_tls: None,
+                response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+                request_id: request_id.0,
+                authoritative: Some(true),
+                error: None,
+                message: None,
+                proxy_through_service_url: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &redirect).expect("encode redirect");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle redirect");
+
+        // The state machine should have emitted a follow-up lookup. Detect it by checking
+        // that the outbound buffer grew.
+        assert!(
+            conn.outbound_len() > outbound_after_lookup,
+            "redirect must trigger a retry CommandLookupTopic (outbound={} -> {})",
+            outbound_after_lookup,
+            conn.outbound_len()
+        );
+
+        // The user-visible outcome is `LookupResponse::Redirected` for observability.
+        match conn.take_outcome(PendingOpKey::Request(request_id)) {
+            Some(OpOutcome::LookupResponse {
+                outcome: LookupOutcome::Redirected { .. },
+                ..
+            }) => {}
+            other => panic!("expected Redirected outcome, got {other:?}"),
+        }
+    }
+
+    /// Local `close()` from a state that was never connected (still `Uninitialized` or
+    /// mid-handshake) must NOT record a disconnect timestamp — there was no live session
+    /// to lose. Pinned because the metrics layer subtracts `connected_at` from
+    /// `disconnected_at`, and a phantom disconnect-without-connect would yield a negative
+    /// "session lifetime".
+    #[test]
+    fn close_before_connected_does_not_set_disconnected_timestamp() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        // Don't even call begin_handshake — we're still Uninitialized.
+        conn.close();
+        assert!(
+            conn.last_disconnected_timestamp().is_none(),
+            "close() from Uninitialized must not record a disconnect"
+        );
+        assert!(conn.is_closed(), "state is now Closing");
+
+        // Also from ConnectSent (mid-handshake) the disconnect must stay absent.
+        let mut conn2 = Connection::new(ConnectionConfig::default());
+        conn2.begin_handshake().expect("handshake");
+        // No handshake response — still in ConnectSent.
+        conn2.close();
+        assert!(
+            conn2.last_disconnected_timestamp().is_none(),
+            "close() from ConnectSent must not record a disconnect either"
+        );
+    }
 }
