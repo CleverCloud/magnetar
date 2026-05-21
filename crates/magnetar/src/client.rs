@@ -198,6 +198,77 @@ impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
     }
 }
 
+/// Java `ProducerInterceptor` SPI. Plug pipeline hooks in front of `Producer::send` to
+/// inspect, mutate, or react to outgoing messages. Mirrors the Java
+/// `org.apache.pulsar.client.api.interceptor.ProducerInterceptor` interface — `eligible`
+/// gates whether the interceptor runs for a given message, `before_send` runs first
+/// (mutating the [`OutgoingMessage`]), and `on_send_acknowledgement` fires after the
+/// broker acks the publish (or the send errors out).
+///
+/// Each callback runs on the send path — keep them fast and non-blocking. Use
+/// [`send_with_interceptors`] to chain a list of interceptors against an
+/// [`OutgoingMessage`].
+pub trait ProducerInterceptor: Send + Sync + std::fmt::Debug {
+    /// Decide whether this interceptor applies to the given message. Default: always.
+    fn eligible(&self, _msg: &OutgoingMessage) -> bool {
+        true
+    }
+
+    /// Mutate the message before it is encoded and sent. Mirrors Java
+    /// `ProducerInterceptor#beforeSend`.
+    fn before_send(&self, msg: &mut OutgoingMessage);
+
+    /// Fired after the broker acks the publish (or the send errors out). Mirrors Java
+    /// `ProducerInterceptor#onSendAcknowledgement`. The default no-ops so most
+    /// implementations only have to provide [`Self::before_send`].
+    fn on_send_acknowledgement(
+        &self,
+        _msg: &OutgoingMessage,
+        _outcome: Result<magnetar_proto::MessageId, &PulsarError>,
+    ) {
+    }
+}
+
+/// Send `msg` through `producer`, running every eligible [`ProducerInterceptor`] in
+/// `interceptors` in order. Mirrors Java's interceptor-chain semantics: `eligible` is
+/// evaluated against the *original* message, `before_send` runs in order on a single
+/// message the chain progressively mutates, and `on_send_acknowledgement` fires on every
+/// eligible interceptor regardless of whether the broker accepted the publish.
+///
+/// Use [`magnetar_runtime_tokio::Producer::send`] directly when no interceptors are
+/// configured — this helper exists so callers can opt into the chain without weaving the
+/// dispatch logic into the producer struct.
+///
+/// # Errors
+///
+/// Propagates the producer's error wrapped in [`PulsarError::Client`] after notifying
+/// the chain.
+pub async fn send_with_interceptors(
+    producer: &magnetar_runtime_tokio::Producer,
+    mut msg: OutgoingMessage,
+    interceptors: &[std::sync::Arc<dyn ProducerInterceptor>],
+) -> Result<magnetar_proto::MessageId, PulsarError> {
+    let eligible: Vec<std::sync::Arc<dyn ProducerInterceptor>> = interceptors
+        .iter()
+        .filter(|i| i.eligible(&msg))
+        .cloned()
+        .collect();
+    for i in &eligible {
+        i.before_send(&mut msg);
+    }
+    let snapshot = msg.clone();
+    let mapped: Result<magnetar_proto::MessageId, PulsarError> =
+        producer.send(msg.into()).await.map_err(PulsarError::Client);
+    for i in &eligible {
+        let outcome: Result<magnetar_proto::MessageId, &PulsarError> = match &mapped {
+            Ok(id) => Ok(*id),
+            Err(err) => Err(err),
+        };
+        i.on_send_acknowledgement(&snapshot, outcome);
+    }
+    mapped
+}
+
 /// Extension trait that gives [`magnetar_runtime_tokio::Producer`] the Java-symmetric
 /// `producer.new_message().key(..).value(..).send().await` entry point.
 ///
@@ -1677,5 +1748,54 @@ mod outgoing_message_tests {
         };
         assert!(!partitioned.is_batched());
         assert!(partitioned.is_partitioned());
+    }
+
+    #[derive(Debug, Default)]
+    struct AppendPropertyInterceptor {
+        key: String,
+        value: String,
+        applied: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProducerInterceptor for AppendPropertyInterceptor {
+        fn eligible(&self, msg: &OutgoingMessage) -> bool {
+            !msg.payload.is_empty()
+        }
+
+        fn before_send(&self, msg: &mut OutgoingMessage) {
+            msg.properties.push((self.key.clone(), self.value.clone()));
+            self.applied
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn interceptor_eligibility_skips_unmatched_messages() {
+        let i = AppendPropertyInterceptor {
+            key: "trace-id".to_owned(),
+            value: "abc".to_owned(),
+            applied: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let empty = OutgoingMessage::default();
+        assert!(!i.eligible(&empty));
+
+        let with_payload = OutgoingMessage::with_payload("hi");
+        assert!(i.eligible(&with_payload));
+    }
+
+    #[test]
+    fn interceptor_before_send_mutates_message() {
+        let i = AppendPropertyInterceptor {
+            key: "trace-id".to_owned(),
+            value: "abc".to_owned(),
+            applied: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut msg = OutgoingMessage::with_payload("hi");
+        assert!(msg.properties.is_empty());
+        i.before_send(&mut msg);
+        assert_eq!(msg.properties.len(), 1);
+        assert_eq!(msg.properties[0].0, "trace-id");
+        assert_eq!(msg.properties[0].1, "abc");
+        assert_eq!(i.applied.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
