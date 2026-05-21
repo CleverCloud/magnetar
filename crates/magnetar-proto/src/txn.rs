@@ -813,4 +813,123 @@ mod tests {
         client.forget(id);
         assert!(client.transaction(id).is_none());
     }
+
+    /// Stale response (unknown request id) returns `Ok(None)` rather than producing a fresh
+    /// `TxnId` — mirrors Java `TransactionImpl#handleResponse` which drops unknown ids on
+    /// the floor instead of spuriously committing. Pinned because the driver dispatcher
+    /// relies on this distinguishing "stale" from "broker said no".
+    #[test]
+    fn handle_new_txn_response_drops_unknown_request_id() {
+        let mut client = TxnClient::new(0);
+        // No `new_txn` was issued; an unsolicited response with request_id=42 should be
+        // silently dropped — `Ok(None)` means "stale, ignore".
+        let result = client.handle_new_txn_response(ok_new_txn_response(42, 0, 1));
+        assert!(matches!(result, Ok(None)));
+        // No metadata leaked.
+        assert!(client.is_empty());
+    }
+
+    /// `TxnError::from_broker` must map `InvalidTxnStatus` to the `Aborted` variant so the
+    /// user future surfaces a recoverable "transaction has been ended" error rather than
+    /// the generic broker fall-through. Mirrors Java
+    /// `TransactionCoordinatorClientException.translateException`.
+    #[test]
+    fn txn_error_invalid_status_maps_to_aborted() {
+        let err = TxnError::from_broker(pb::ServerError::InvalidTxnStatus as i32, "ended".into());
+        assert!(matches!(err, TxnError::Aborted));
+    }
+
+    /// `TxnError::from_broker` must map `TransactionCoordinatorNotFound` to `NotFound` —
+    /// alongside the more obvious `TransactionNotFound` — so callers can use a single arm
+    /// for the "TC has forgotten about this txn" failure mode. Mirrors the Java mapping in
+    /// `TransactionCoordinatorClientException`.
+    #[test]
+    fn txn_error_tc_not_found_maps_to_not_found() {
+        let err = TxnError::from_broker(
+            pb::ServerError::TransactionCoordinatorNotFound as i32,
+            "gc'd".into(),
+        );
+        assert!(matches!(err, TxnError::NotFound));
+        // Plain TransactionNotFound also maps the same way.
+        let err2 =
+            TxnError::from_broker(pb::ServerError::TransactionNotFound as i32, "gc'd".into());
+        assert!(matches!(err2, TxnError::NotFound));
+    }
+
+    /// `TxnId` derives `Display` formatting that mirrors Java
+    /// `TxnID#toString` ("`mostSigBits:leastSigBits`"). Pinned because it appears in log
+    /// lines + error messages and callers may parse it.
+    #[test]
+    fn txn_id_display_uses_colon_separator() {
+        let id = TxnId::new(7, 42);
+        assert_eq!(format!("{id}"), "7:42");
+        // Sorted/Hashed consistently.
+        assert_eq!(id, TxnId::new(7, 42));
+    }
+
+    /// After a broker error on `add_partition`, the transaction must transition to
+    /// `Errored` and the topic must NOT be recorded in `produced_topics`. Pinned because
+    /// the runtime relies on `Errored` to refuse subsequent `end_txn(Commit)` calls and
+    /// surfaces the rollback path. Mirrors Java
+    /// `TransactionImpl#registerProducedTopic` failure handling.
+    #[test]
+    fn add_partition_broker_error_marks_errored_and_skips_topic() {
+        let mut client = TxnClient::new(0);
+        let _ = client.new_txn(1, 0);
+        let id = client
+            .handle_new_txn_response(ok_new_txn_response(1, 0, 5))
+            .unwrap()
+            .unwrap();
+        let _ = client.add_partition(2, id, "persistent://p/n/t".to_owned());
+
+        let err = client
+            .handle_add_partition_response(pb::CommandAddPartitionToTxnResponse {
+                request_id: 2,
+                txnid_least_bits: Some(5),
+                txnid_most_bits: Some(0),
+                error: Some(pb::ServerError::PersistenceError as i32),
+                message: Some("bookie down".to_owned()),
+            })
+            .expect_err("broker error");
+        assert!(matches!(err, TxnError::Broker(..)));
+
+        let meta = client.transaction(id).expect("txn still tracked");
+        assert_eq!(meta.state, TxnState::Errored);
+        assert!(
+            meta.produced_topics.is_empty(),
+            "topic must NOT be recorded on broker error"
+        );
+    }
+
+    /// Same as above but for `add_subscription`. The subscription must not be recorded and
+    /// the txn must transition to `Errored`. Mirrors Java
+    /// `TransactionImpl#registerAckedTopic` failure handling.
+    #[test]
+    fn add_subscription_broker_error_marks_errored_and_skips_subscription() {
+        let mut client = TxnClient::new(0);
+        let _ = client.new_txn(1, 0);
+        let id = client
+            .handle_new_txn_response(ok_new_txn_response(1, 0, 6))
+            .unwrap()
+            .unwrap();
+        let _ = client.add_subscription(2, id, "sub-x".to_owned(), "persistent://p/n/t".to_owned());
+
+        let err = client
+            .handle_add_subscription_response(pb::CommandAddSubscriptionToTxnResponse {
+                request_id: 2,
+                txnid_least_bits: Some(6),
+                txnid_most_bits: Some(0),
+                error: Some(pb::ServerError::TransactionConflict as i32),
+                message: Some("conflict".to_owned()),
+            })
+            .expect_err("broker error");
+        assert!(matches!(err, TxnError::Conflict));
+
+        let meta = client.transaction(id).expect("txn still tracked");
+        assert_eq!(meta.state, TxnState::Errored);
+        assert!(
+            meta.acked_subscriptions.is_empty(),
+            "subscription must NOT be recorded on broker error"
+        );
+    }
 }
