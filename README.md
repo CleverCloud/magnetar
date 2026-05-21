@@ -416,7 +416,7 @@ known-missing feature.
 | `getLastDisconnectedTimestamp` | ✅ | ✅ | `Producer::last_disconnected_timestamp`. |
 | `flush()` | ✅ | ✅ | `Producer::flush`. |
 | `close()` | ✅ | ✅ | `Producer::close`. |
-| `getStats` | ✅ | ✅ | `Producer::stats` — counters + `send_latency_{p50,p99,max}_ms` via `hdrhistogram`. Rolling per-second windows still pending. |
+| `getStats` | ✅ | ✅ | `Producer::stats` — counters + `send_latency_{p50,p99,max}_ms` via `hdrhistogram` + rolling per-second `msgs_per_sec` / `bytes_per_sec` windows (`producer_record_rate_window`). |
 | `getCompressionType` getter | ✅ | ✅ | `Producer::compression`. |
 | Per-message `key` / `orderingKey` | ✅ | ✅ | `OutgoingMessage::key` / `ordering_key`. |
 | Per-message `eventTime` | ✅ | ✅ | `OutgoingMessage::event_time_ms`. |
@@ -617,9 +617,18 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Stats rolling windows.** Cumulative-only counters today; the broker dashboard expects msgs/sec, bytes/sec rolling windows. `hdrhistogram` p50/p99/max has shipped (`Consumer::stats` + `Producer::stats`).
-- **PIP-121 cluster failover.** `ServiceUrlProvider` + `ControlledClusterFailover` policy in flight; today the driver reconnects to the same `service_url`.
-- **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180 shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33 replicated subscriptions** are scoped for the M9 milestone.
+- **Moonpool engine parity train.** v0.1.0 Java parity is satisfied by
+  the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
+  Moonpool reaches feature parity with tokio in milestones M5–M8 (see
+  [`docs/parity-status.md`](docs/parity-status.md) "Moonpool parity
+  train").
+- **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180
+  shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33
+  replicated subscriptions** are scoped for the M9 milestone.
+- **SASL (Kerberos)** + **Athenz** auth providers are pre-alpha
+  scaffolds; full GSSAPI / ZTS plumbing is deferred to v0.2.0.
+- **`AutoProduceBytesSchema`** trait surface only; the common case
+  (`AutoConsumeSchema`) is ✅.
 
 ---
 
