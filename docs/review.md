@@ -1,202 +1,314 @@
-# Review: ask-quasar-plan.md
+# Review — tasks/todo.md against HEAD `37d3c3e`
 
-> Reviewer pass over `/home/florentin/.claude/plans/ask-quasar-plan.md` against the dossier `/home/florentin/.claude/plans/ask-quasar-research.md`, the live Pulsar source tree at `/home/florentin/Sources/github.com/apache/pulsar`, the empty quasar repo, `~/.claude/CLAUDE.md`, and crates.io reality.
+**Reviewer**: reviewer agent
+**Date**: 2026-05-21
+**Plan reviewed**: `tasks/todo.md` (979 lines)
+**Departure ref**: `main @ 37d3c3e`
 
----
-
-## A. Verdict
-
-**APPROVED with required changes.** The architecture is sound: the sans-io split + dual-engine (tokio default, moonpool opt-in) is the right call, the v0.1.0 PIP set is correctly scoped against Pulsar 3.0.x LTS, and every load-bearing claim about the Java sources I spot-checked traces back to a real line. The dossier-to-plan handoff is clean: PIP set, FeatureFlags, framing magic numbers, BaseCommand table, trackers, ClientCnx maps, and HandlerState all match the plan §3-§6 narrative. Required fixes are dependency-version drift (`apache-avro`, `testcontainers`), one factual error (`resolver = "3"` vs the stated `rust-version = "1.85"`), three policy/process gaps (no `cargo audit` in CI; no `cargo doc -D warnings` semantics check; allow-list is too narrow for what M0–M6 actually need), and several over-confident sub-decisions (TLS gap default, batch-index ACK proto field name, `prost-build` strategy).
-
----
-
-## B. Strengths
-
-- **Citation discipline holds.** I verified 12 spot-cited references; 11 PASS, 1 imprecise but defensible (`ClientCnx.java:117` is the class line, not a field range — see §G).
-- **Sans-io boundary is correctly placed.** `Connection::{handle_bytes, poll_transmit, poll_event, poll_timeout, handle_timeout}` mirrors `quinn-proto::Connection` cleanly, and the validation gate at M2 ("no `tokio`/`async`/`mio`/`socket2` in `cargo tree -p quasar-pulsar-proto`") is the right hard constraint.
-- **PIP coverage matrix is real.** v0.1.0 PIPs (30, 37, 107, 131, 34, 119, 282, 379, 54, 391, 22, 58, 124, 409, 26, 68, 90, 145, 188, 296, 313, 344) all map to wire-affecting changes; the deferral list (PIP-4, PIP-31, PIP-33, PIP-180, PIP-415, PIP-460, PIP-466, PIP-121) is appropriate for a v0 driver.
-- **Worktree-first is correctly described** (plan §2 step 14 and §15 item 20), including the explicit exception for the initial commit on the empty repo (the pre-edit hook returns early on empty repos because `git rev-parse --abbrev-ref HEAD` errors out — verified locally).
-- **Approval gates are comprehensive** (20 items in §15), which matches `~/.claude/CLAUDE.md`'s "approval-gated actions" mandate. The defaults are conservative.
-- **Test layering is well structured**: sans-io unit → broker fake → moonpool sim chaos → e2e Docker, in increasing cost order. The 10 representative unit tests directly correspond to existing Java test classes the dossier itemised.
+Verdict: the plan is well structured and overwhelmingly correct on the
+factual claims (worktree census, parity status, supervisor pattern,
+approval gates). It has **two CRITICAL file-path errors** that will
+make Phase 1.3 / Phase 2 M5 dispatch fail on first command, several
+**MAJOR** scoping or sequencing issues, and a handful of MINOR polish
+items. Address the criticals before any agent is dispatched.
 
 ---
 
-## C. Required changes (must fix before audit)
+## CRITICAL — plan must change
 
-### C-1. `apache-avro` version is stale.
-- **Location**: plan §1 workspace deps table, line `apache-avro = "0.17"`.
-- **Issue**: crates.io currently ships `apache-avro = "0.21.0"` (verified via `https://crates.io/api/v1/crates/apache-avro`, last release 2025-11-13). The 0.17 line is from 2024 and was pre-MSRV-1.85. The 0.21 line declares MSRV 1.85.0 — which matches the plan's `rust-version = "1.85"`.
-- **Fix**: bump to `apache-avro = "0.21"` in the workspace deps table, and call this out in the dossier allow-list (§15 lists `apache-avro` without a version pin, which is fine — but the plan's chosen pin must be the current line, not a 6-version-old one).
+### C1 — `MemoryLimitPolicy` lives in `conn.rs`, not `client/memory_limit.rs`
 
-### C-2. `testcontainers` version is stale.
-- **Location**: plan §1 workspace deps table, line `testcontainers = "0.20"`.
-- **Issue**: current is `0.27.3` (verified via crates.io). `0.20` lacks several runner ergonomics the e2e tests will want.
-- **Fix**: bump to `testcontainers = "0.27"`. Note that the crate name is `testcontainers` on crates.io; the repo is `testcontainers-rs` on GitHub — the plan is correctly using the crate name, but the dossier allow-list mentions both names ambiguously; tighten to `testcontainers` only.
+`tasks/todo.md:250` instructs P3 to *"Extend
+`crates/magnetar-proto/src/client/memory_limit.rs` (or wherever the
+accounting lives — confirm with grep on `MemoryLimitPolicy`)"*.
 
-### C-3. `resolver = "3"` requires Rust 1.84, not 1.85, and is conflated with edition 2024.
-- **Location**: plan §1 workspace `Cargo.toml` snippet (resolver = "3"); §2 step 5 ("Resolver `"3"`, edition `2024`, `rust-version = "1.85"`"); §2 risks ("Cargo `resolver = "3"` requires Rust 1.84+ stable").
-- **Issue**: the plan correctly notes 1.84+ is the resolver-3 floor, but pins `rust-version = "1.85"` to satisfy moonpool's edition 2024 requirement. That's fine — but `resolver = "3"` *is* the default for edition 2024, so explicitly setting it is redundant; the bigger concern is that resolver 3 changes `incompatible-rust-versions` from `allow` to `fallback`, which may surprise users when `cargo` silently picks an older version of a transitive dep. The plan should call out this behaviour change so that the M0 `cargo deny` / lockfile review accounts for it.
-- **Fix**: either drop the explicit `resolver = "3"` (it's implied by edition 2024) and add a paragraph in `GUIDELINES.md` documenting the `incompatible-rust-versions = "fallback"` behavior, or keep the explicit pin and add a one-line comment in `Cargo.toml` explaining why.
+There is no `client/` directory in `magnetar-proto`:
 
-### C-4. `prost-build` strategy is half-specified.
-- **Location**: plan §3 step 2 ("Decision: checked-in codegen via `xtask codegen`, not `build.rs`").
-- **Issue**: the plan correctly notes that `prost-build` invokes `protoc` by default, and proposes `xtask codegen` writing generated files into `src/pb/` checked into git. But it doesn't say *how* `xtask codegen` runs without `protoc` on a contributor machine. The right answer is one of: (a) require `protoc` for contributors who run `xtask codegen` (most ergonomic — most distros have it; document in `CONTRIBUTING.md`); (b) ship a vendored `protoc` via `protoc-bin-vendored` crate (works on Linux/macOS, no x-platform headaches); (c) use `prost-build::Config::skip_protoc_run()` with `file_descriptor_set_path()` (the documented escape hatch — see `https://docs.rs/prost-build/latest/prost_build/struct.Config.html`), pre-generating descriptors via a CI-only step.
-- **Fix**: pick (a) explicitly, document `protoc >= 3.19` in `CONTRIBUTING.md`, add `protoc --version` check at the top of `xtask codegen`. Drop the in-plan ambiguity.
+```
+crates/magnetar-proto/src/ → auth/  pb/  schema/  trackers/
+                            auth.rs  backoff.rs  cluster_failover.rs
+                            conn.rs  consumer.rs  error.rs  event.rs
+                            frame.rs  lib.rs  lookup.rs  producer.rs
+                            service_url.rs  supervisor.rs
+                            topic_watcher.rs  txn.rs  types.rs
+```
 
-### C-5. PIP-54 / PIP-391 ACK proto field needs verification.
-- **Location**: plan §4 step 4 ("PIP-54: batch bitset support via `MessageIdData.ack_set`"); §4 step 5 ("`ack_tracker.rs`: ... PIP-54 batch bitset support via `MessageIdData.ack_set`").
-- **Issue**: the dossier (§5 PIP-54) says "Adds `MessageIdData.ack_set` (bitset over batch indices)". This is correct (verified earlier in dossier §2: `MessageIdData (proto:59-69)` lists `ack_set`). But ACK uses `CommandAck.MessageIdData` via the `message_ids` repeated field; the bitset is on the `MessageIdData` inside ACK, not on a separate field. The plan should clarify which structure carries the bitset on the ACK path (it's the `MessageIdData` inside `CommandAck.message_ids`, not the top-level `CommandAck`). One sentence in §4 step 5 to that effect prevents an implementation slip.
-- **Fix**: clarify wording in §4 step 5 of the plan.
+The actual accounting site is `crates/magnetar-proto/src/conn.rs:113-117`
+(`ConnectionShared.memory_limit_bytes` + `memory_used: AtomicU64`) —
+the canonical home documented in `specs/adr/0017-memory-limit-atomic-reservation.md:30-52`.
+The runtime path is `crates/magnetar-runtime-tokio/src/producer.rs:171`
+(the `try_reserve_memory` no-op comment cited in ADR-0017).
 
-### C-6. CI is missing `cargo audit`.
-- **Location**: plan §2 step 12 (CI jobs list); §12 CI matrix.
-- **Issue**: `cargo deny` is on the list (advisory + license check), but `cargo audit` (which uses the RustSec advisory DB independently and is what most Rust shops actually run) is not. Even though `cargo deny check advisories` overlaps, it's worth running `cargo audit` separately because the two tools track slightly different vuln sources and timing. The plan §12 says "**`cargo-vet` or `cargo-audit`** — pick at v0.2.0; defer" — defer is acceptable but the rationale should be that `cargo deny check advisories` covers the immediate need. Make that explicit.
-- **Fix**: either (a) add `cargo audit` to v0.1.0 CI alongside `cargo deny`; or (b) keep deferred but state in the plan that `cargo deny check advisories` is the v0.1.0 substitute. Don't leave it ambiguous.
+Action: rewrite Phase 1.3's file-list (`tasks/todo.md:265-277`) to
+target `crates/magnetar-proto/src/conn.rs` (extend `ConnectionShared`
+with a `WakerSlab` field, add `try_reserve_with_waker(bytes, waker)`,
+release path stays in the existing `SendFut::Drop` cited in ADR-0017
+§Decision). The "client/memory_limit.rs" filename is hallucinated.
 
-### C-7. `cargo doc -D warnings` semantics.
-- **Location**: plan §12 CI matrix line `cargo doc --workspace --all-features --no-deps -D warnings`.
-- **Issue**: `cargo doc` does not natively accept `-D warnings` like clippy does. The correct invocation is `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps`. Without this, broken intra-doc links will not fail CI.
-- **Fix**: change the CI step to set `RUSTDOCFLAGS=-D warnings` before invoking `cargo doc`.
+### C2 — `feat/auto-schema-runtime-wire` is *already landed* — Phase 0b W6 has no port to do
 
-### C-8. Dependency allow-list is missing entries that M0–M6 will demand.
-- **Location**: plan §15 item 19; dossier §15 (referenced).
-- **Issue**: the allow-list does not include `prost-build`, `prost-types`, `tokio-util` (the actor inevitably wants `tokio_util::codec::Framed` or similar — even if you reject it, decide explicitly), `futures` / `futures-util` (for `Stream`/`Sink` glue), `parking_lot` (faster mutex if any state needs locking in engines), `prost-bin-vendored` if you go that route for §C-4, `cargo-deny` (it's a binary not a dep, but still), `socket2` (sometimes useful for TCP_NODELAY tuning before tokio takes over). At minimum, decide pre-M0 which of these are auto-allowed vs. each requires a separate approval gate.
-- **Fix**: expand the allow-list in plan §15 item 19 to include `prost-build`, `prost-types`, `tokio-util`, `futures`/`futures-util`, `pin-project-lite`, `tracing-subscriber` (for examples), `anyhow` (for examples + xtask), and `clap` (for xtask + future CLI). Or explicitly declare that anything beyond the current list triggers an approval gate per addition — but then the implementer will be blocked at every commit.
+`tasks/todo.md:145` says W6 should diff and possibly cherry-pick the
+one extra commit on `feat/auto-schema-runtime-wire`.
 
-### C-9. moonpool TLS gap default (option (c)) leaks scope.
-- **Location**: plan §6 step 3 ("Default proposal for v0.1.0: (c) — TLS-less moonpool engine").
-- **Issue**: shipping a TLS-less engine means *any* moonpool sim test against `pulsar+ssl://` cannot run. That's defensible for v0.1.0 (the engine is for sim, not production), but the plan needs to state explicitly that the sim engine's e2e is plaintext-only and document the implication: chaos-tests for the TLS handshake path are out of scope until (a) or (b) lands. Also missing: option (d) — wrap moonpool's connection in `tokio-rustls` outside moonpool (since rustls itself is sans-io, you can drive `ClientConnection::{read_tls, write_tls, process_new_packets}` over moonpool's bytes pipe synchronously). This is the *cleanest* path and the plan ignores it.
-- **Fix**: add option (d) explicitly to §6 step 3 ("Local rustls adapter via moonpool's byte pipe"). Re-evaluate the default — (d) is technically lower-risk than (c) because it lets sim tests exercise the TLS handshake state machine deterministically.
+`git log feat/auto-schema-runtime-wire --not main` shows the single
+ahead-commit is `e3d6dd3 feat(typed): wire AutoConsumeSchema runtime
+auto-fetch on first receive (PIP-87)`. The same patch was squashed
+onto main as `010e252 feat(typed): wire AutoConsumeSchema runtime
+auto-fetch on first receive (PIP-87)` — identical subject, identical
+commit body (the first lines match verbatim).
 
-### C-10. Worktree assumption for the M2 sub-milestones is implicit.
-- **Location**: plan §13 (parallelisation of M2a–M2d, M3, M4).
-- **Issue**: §13 says M2a–M2d can be parallelised and M3/M4 can run in parallel once M2 hits 80% — but doesn't say each parallel stream lives in its own `wt switch --create` worktree. Without that, the implementer (or another agent in a swarm) might edit the same crate from two contexts. Make the worktree-per-stream contract explicit.
-- **Fix**: add a sentence to §13 saying each parallel milestone-stream gets its own `wt`-managed worktree; merges back to `main` are user-approved per stream.
+The `git diff main..feat/auto-schema-runtime-wire --stat` output is
+**deletions of every ADR file and `xtask/src/main.rs`** —
+`79 files changed, 196 insertions(+), 11057 deletions(-)`. That diff
+is purely *stale base*, not "missed work". The branch is rooted before
+`99b7b04 docs: promote plan + annexes to docs/, atomise decisions into
+specs/adr/` and looks ahead-by-1 only because of that promotion.
 
----
-
-## D. Optional improvements (nice-to-have)
-
-- **`cargo-mutants` mutation testing.** Beyond proptest, run `cargo-mutants` against `quasar-pulsar-proto` once M2 stabilises. The sans-io state machine is the kind of code where mutation testing catches *real* gaps (the proptest only covers what you thought to assert; mutants flip code paths and check whether *any* test catches the mutation). Schedule for M2 close.
-- **Sim engine TLS option (d) — see C-9** is also an *improvement* over (c). Worth promoting from "fix" to "default" if you confirm rustls's `ClientConnection::process_new_packets` works cleanly over moonpool's byte pipe.
-- **Pulsar Java client interop test.** Spin up `apachepulsar/pulsar:3.0.x` standalone, run a Java producer (via the official Java client) + a quasar consumer (and vice versa), assert cross-publishes work. This catches subtle wire-format drift (proto field numbers, missing optional fields, FeatureFlag negotiation) that an all-quasar e2e suite won't. Add to e2e in v0.1.0 if you can find a way to ship the Java client as a sidecar in the testcontainer.
-- **Quinn-proto-style API doc framing.** Plan §4 mentions the quinn-proto shape but doesn't propose phrasing the rustdoc that way. Worth adding a doc-page in `docs/architecture.md` titled "For users coming from quinn-proto" that maps `Connection::poll_transmit` → `poll_transmit`, `handle_bytes` → `handle_event(Datagram)`, etc. This lowers the onboarding cost for the QUIC crowd, which has overlap with the distributed-systems crowd quasar aims at.
-- **`#[deny(missing_docs)]` from M1, not M2.** Plan §11 says deny at M2 for `quasar-pulsar-proto` — earlier is better because the codec crate is small enough that backfilling later is more painful than writing as-you-go.
-- **`cargo-llvm-cov` coverage report.** Useful for the sans-io crate to confirm the state machine has full transition coverage. Not a release gate; add as a CI artifact.
-- **`xtask check-vendor` job.** Add an `xtask check-vendor` that re-vendors `PulsarApi.proto` from upstream and diffs — catches Pulsar's proto drift without a human noticing.
+Action: change W6's anticipated outcome from "needs check / likely
+cherry-pick" to **drop without cherry-pick**. Add a one-line stash-list
+re-check (per R2 mitigation) and discard. The 810278f "stale-base
+merges" mention in the plan rationale is exactly this — the diff is
+*resync noise*, not pending work.
 
 ---
 
-## E. Open questions for the user (re-prioritised)
+## MAJOR — plan should change
 
-The plan's §17 already tiers the questions. I largely concur but rearrange one pair for sharpness. Verified each question is genuinely user-only (no source-readable answer).
+### M1 — `PulsarClient` is not generic today; Phase 2 M6 needs a smaller-step option
 
-**Tier 1 — blocks M0 (cannot start writing files without these):**
+`tasks/todo.md:351-376` mandates `PulsarClient<E: Engine>` and threads
+`<E>` through `partitioned_producer.rs`, `partitioned_consumer.rs`,
+`multi_topics.rs`, `pattern_consumer.rs`, `table_view.rs`,
+`transaction.rs`, `typed.rs`.
 
-1. **Published crate name** (dossier §11 Q1 / plan §17 #1). Default: `quasar-pulsar`. `quasar` is taken (anowell, 2017, 0.0.1, 8 recent dl — verified via crates.io API).
-2. **Repo hosting + GitHub repo creation** (dossier §11 Q13 / plan §17 #6). Default: `github.com/me/quasar`. Also gates the `gh repo create` action (plan §15 item 17).
-3. **License** (dossier §11 Q2 / plan §17 #2). Default: Apache-2.0 only. Drives `LICENSE` file + every per-file SPDX header.
-4. **moonpool risk acceptance + engine ordering** (dossier §11 Q3+Q14, plan §17 #3+#5 — *the planner echoed these as two questions; they're really one decision*). Default: tokio is the public-facing default, moonpool is opt-in for sim. Confirms both the engine set and the public-default story.
-5. **Crate split granularity** (dossier §11 Q4 / plan §17 #4). Default: 6-crate split as proposed.
+Current shape at `crates/magnetar/src/client.rs:736`:
 
-**Tier 2 — blocks M2 scope freeze (state machines can't start without these answers):**
+```rust
+pub struct PulsarClient { ... }                              // line 736
+impl PulsarClient { ... }                                    // line 741
+```
 
-6. **Minimum supported broker version** (Q5 / #7). Default: 3.0 LTS.
-7. **Schema scope for v0.1.0** (Q6 / #8). Default: (a). Drives M5 surface.
-8. **Auth scope for v0.1.0** (Q10 / #10). Default: token + TLS + AUTH_CHALLENGE. Drives M6 surface.
-9. **Transactions in v0.1.0** (Q7 / #9). Default: defer. Drives M2 inclusion of TC client.
-10. **Encryption (PIP-4) in v0.1.0** (Q11 / #11). Default: defer. Drives M2 inclusion of MessageMetadata encryption fields.
+No `<E>` generic, no `Engine` trait, no associated types. Importantly,
+`ConsumerInterceptor` and `ProducerInterceptor` (lib.rs:78-80) are
+re-exported as the public SPI surface, and the typed schemas (`Schema<T>`
+mirrored at `client.rs:875,886`) take `<T>` already. Adding `<E>` makes
+the public types `PulsarClient<E>`, `TypedConsumer<T, E>`, and the
+interceptor traits would need either `<E>` everywhere or
+type-erasure — non-trivial churn.
 
-**Tier 3 — blocks v0.1.0 release cut (defer until M5/M6 close):**
+The plan's Option B ("duplicate façade") is dismissed in one line at
+`tasks/todo.md:357`. Reconsider a third option:
 
-11. **Admin REST client in v0.1.0** (Q8 / #12). Default: scaffolded, unpublished.
-12. **CLI binary** (Q9 / #13). Default: library-only.
-13. **E2e CI broker provisioning** (Q12 / #14). Default: testcontainers + compose fallback.
-14. **Coexistence with pulsar-rs** (Q15 / #15). Default: separate project; revisit upstream after v0.1.0.
+- **Option C — feature-gated re-export**: keep `PulsarClient` non-generic.
+  Behind `#[cfg(feature = "tokio")]` the type aliases to
+  `PulsarClient<TokioEngine>` internally; behind `#[cfg(feature =
+  "moonpool")]` it aliases to `PulsarClient<MoonpoolEngine<P>>`. Users
+  only ever see one variant per build. Engine selection is a build-time
+  switch, not a runtime generic. This is what the README "default tokio,
+  opt-in moonpool" feature already implies — and it's the
+  `magnetar`-façade's existing pattern (`magnetar/src/lib.rs`
+  re-exports `magnetar_runtime_tokio::*`).
 
-**New for the user (not in the original 15):**
+Option C gets >80% of the moonpool-engine-driveable-from-façade goal
+without exploding generics across `ConsumerInterceptor`,
+`TypedConsumer<T>`, and the in-flight e2e suites. The plan should
+present A vs. B vs. C to Florentin at gate (e), not A vs. B.
 
-15. **`Cargo.lock` policy** (plan §2 step 9, "Default: commit `Cargo.lock`"). The plan flags this as needing confirmation but folds it under "stub crates so cargo build succeeds at M0". This is M0-blocking and deserves its own Q.
-16. **`protoc` contributor requirement** (per C-4). The user must agree the `xtask codegen` flow requires contributors install `protoc >= 3.19` locally.
+### M2 — Phase 2 M7 (moonpool chaos) and Phase 3 Batch C (broker-restart e2e) are 80% the same scenario set
+
+`tasks/todo.md:390-419` (M7) lists 8 chaos scenarios; 6 of them
+(handshake partition, frame reorder, send timeout, OAuth2 token refresh,
+PIP-188 topic-migrated, PIP-121 failover oscillation) overlap with
+Batch C's `e2e_reconnect.rs` + `e2e_cluster_failover.rs`
+(`tasks/todo.md:557-575`).
+
+Moonpool gives bit-for-bit reproducibility for these; testcontainers
+can stop/start a broker but cannot inject mid-frame partition,
+mid-handshake drop, or virtual-clock OAuth2 expiry. The work to make
+Batch C reliable on docker (the R4 "5% flake threshold" the plan
+already raises) is significant; the same coverage from M7 is *more
+reliable* and *strictly cheaper*.
+
+Action: drop sub-tests 1c (in-flight reconnect epoch bump),
+2c (PIP-188 via fakes) from Batch C — they're moonpool-native. Keep
+1a/1b/2a/2b as smoke-only ("does it survive a full broker bounce"). M7
+owns the deterministic side. Update R4 mitigation accordingly.
+
+### M3 — Locked agent worktrees: the `lsof`/`ps` safety step is documented but the loop is missing
+
+`tasks/todo.md:91-93` correctly calls for `lsof +D <path>` and
+`ps -eo pid,cmd | rg <path>` before any `--force` remove. R1
+(`tasks/todo.md:936`) repeats the safeguard.
+
+But the procedure at step 3 says *"git worktree remove --force <path>
+(these carry a .git/locked marker from agent runs)"* — that is a `git`
+command, **not** `wt remove`. The `wt` CLI has its own locked-worktree
+semantics (see CLAUDE.md "Worktree-First Development"). The plan should
+say which path is authoritative for the 14 locked
+`.claude/worktrees/agent-*` entries:
+
+- If `wt remove` honours `.git/locked` and refuses, the plan should
+  default to `wt remove`, fall back to `git worktree remove --force`
+  only after lsof clears.
+- If `wt remove` blindly force-removes, the plan should say so
+  explicitly so a junior agent doesn't assume otherwise.
+
+Action: pick one tool, document the fallback ladder.
+
+### M4 — `cargo xtask codegen --check` is genuinely absent from CI — Phase 4.1 is correct, but mind ordering
+
+`.github/workflows/ci.yml` (full file read) confirms no `codegen` step.
+Present jobs: `fmt`, `clippy`, `build`, `test`, `doc`, `deny`,
+`no-channels`, `no-io-deps`, `no-internal-clock`, `moonpool-sim`,
+`e2e`, `mutants-smoke` (workflow_dispatch), `fuzz-smoke`. The
+`no-internal-clock` job exists at lines 92-104. Phase 4.1's claim is
+**OK** on substance but the YAML stub at `tasks/todo.md:661-670` should
+add `Swatinem/rust-cache@v2` *before* the run step (it shows
+`uses: Swatinem/rust-cache@v2` already — verify the indentation and
+job-order in the actual patch).
+
+### M5 — MSRV-1.85 job: no MSRV declared anywhere
+
+Phase 4.2 (`tasks/todo.md:679-689`) is correct that the MSRV job is
+missing. Also note: `rust-toolchain.toml` declares `channel = "stable"`
+with no MSRV pin, and `Cargo.toml` has zero `rust-version` matches
+(verified via `rg -n 'rust-version'`). The Phase 4.2 step needs a
+companion edit to add `rust-version = "1.85.0"` to the workspace
+manifest *first*, otherwise `cargo build` on a 1.85 toolchain may
+succeed today but `cargo` will not refuse a 1.84 build later when
+nothing pins the lower bound. ADR-0007 says "MSRV 1.85" but doesn't
+materialize the pin.
+
+Action: split Phase 4.2 into two steps: (a) add `rust-version =
+"1.85.0"` to root `Cargo.toml`, (b) add the MSRV CI job.
+
+### M6 — Slack-webhook CI watcher is overreach for the user's ask
+
+User asked to "monitor CI to tackle errors if any". Plan §4.5
+(`tasks/todo.md:718-748`) proposes both Option A (cron `/loop`) and
+Option B (Slack webhook), then recommends B. The webhook commits a
+*recurring* obligation (channel hygiene, secret rotation, spam
+discipline), needs a private Slack channel + secret, and per R6
+(`tasks/todo.md:941`) carries a metadata-leak risk.
+
+The user's hard requirement is "tackle errors if any" — that fits the
+existing `gh run watch` / `gh run list` workflow inside a `/loop`
+session (Option A), no secret needed. The webhook is a separate
+discussion. Recommend Option A as the *plan default*, present B as a
+follow-up if Florentin asks for proactive paging.
 
 ---
 
-## F. Approval-gated actions to surface to user
+## MINOR — nice-to-have
 
-Verbatim copy of plan §15 with one addition (C-4 / Q16) and one clarification (Q15 + the no-default for the new GitHub repo). I tagged each with `[default: ...]` so the user can give a single blanket approval and the implementer knows what's auto-applied.
+### N1 — Recommendation: bump Phase 5 "co-located ADRs" out of separate phase
 
-1. **Published crate name.** [default: `quasar-pulsar`]
-2. **License.** [default: Apache-2.0 only]
-3. **Engine set for v0.1.0.** [default: tokio + moonpool, tokio is public default]
-4. **Crate split granularity.** [default: 6-crate split as proposed]
-5. **Minimum supported broker version.** [default: Pulsar 3.0 LTS]
-6. **Schema scope for v0.1.0.** [default: bytes + String + Json + raw Avro + Protobuf]
-7. **Transactions in v0.1.0.** [default: defer to v0.2.0]
-8. **Admin REST client in v0.1.0.** [default: scaffolded, unpublished]
-9. **CLI binary.** [default: library-only for v0.1.0]
-10. **Auth scope for v0.1.0.** [default: token + TLS + AUTH_CHALLENGE]
-11. **Encryption (PIP-4) in v0.1.0.** [default: defer]
-12. **E2e CI broker provisioning.** [default: testcontainers + docker-compose fallback]
-13. **Repo hosting.** [default: `github.com/me/quasar`]
-14. **moonpool risk acceptance.** [default: tokio public default, moonpool opt-in]
-15. **Coexistence with pulsar-rs.** [default: separate project]
-16. **Push to GitHub.** [no default — always per-push]
-17. **Creating the GitHub repository** (`gh repo create`). [no default — explicit]
-18. **Publishing any crate to crates.io.** [no default — per-crate]
-19. **Adding any non-trivial dependency outside allow-list.** [no default — per-dep; expand allow-list per C-8 first]
-20. **Merging `wt` worktrees to `main`.** [no default — per-merge]
-21. **(NEW) `Cargo.lock` committed to git.** [default: commit it]
-22. **(NEW) `protoc >= 3.19` as contributor build-tool dependency for `xtask codegen`.** [default: yes; document in CONTRIBUTING.md]
+`tasks/todo.md:761-792` treats Phase 5 as a separate stream. GUIDELINES
+"Docs are code" and CLAUDE.md project memory both require ADRs in the
+*same* changeset as the code. Phase 5 is structurally a *check* on
+phases 1–4, not a phase. Recasting it as "Phase 0 acceptance gate per
+merge" reduces D1's coordination cost.
 
-I did **not** find a "must contact `anowell` re: crate name `quasar`" gate to add. `quasar` is published but on a different ecosystem (wasm/asmjs); the right play is to publish under `quasar-pulsar` (or whichever name the user picks) and not attempt to claim the abandoned `quasar` name. No outreach to anowell needed unless the user wants to try transferring it (low-effort to ask, low-value to receive — `quasar-pulsar` is more discoverable anyway).
+### N2 — `0c` mentions `magnetar.docs-code-comments-reference-adrs` and `magnetar.refactor-simplify-pass` but `git worktree list` shows their tips at `35795ba` (= main parent). Verify these are *behind* main, not ahead-by-1
 
----
+`git worktree list` shows both at sha `35795ba`. `git log main..35795ba`
+will be empty (35795ba is an ancestor of main). They are safe-drop
+candidates and belong in 0a, not 0c. Move them to the 0a batch and
+drop 0c entirely (or absorb it into 0a — same agent W1 owns both).
 
-## G. Source-citation spot check
+### N3 — Phase 3 Batch D dependency adds (`rcgen`, `wiremock`)
 
-| # | Plan claim | Verified location | Result |
-|---|---|---|---|
-| 1 | "magicCrc32c = 0x0e01 (`Commands.java:138`)" | `Commands.java:138`: `public static final short magicCrc32c = 0x0e01;` | **PASS** |
-| 2 | "magicBrokerEntryMetadata = 0x0e02 (`Commands.java:140`)" | `Commands.java:140`: `public static final short magicBrokerEntryMetadata = 0x0e02;` | **PASS** |
-| 3 | "checksumSize = 4 (`Commands.java:141`)" | `Commands.java:141`: `private static final int checksumSize = 4;` | **PASS** |
-| 4 | "BaseCommand `enum Type` and `required Type type = 1` at PulsarApi.proto:1144-1342" | proto:1145 `enum Type {`, proto:1146 `CONNECT = 2;`, proto:1250 `required Type type = 1;` | **PASS** (range bracket is correct) |
-| 5 | "FeatureFlags at proto:311-320 with `supports_broker_entry_metadata=2`, `supports_topic_watchers=4`, `supports_get_partitioned_metadata_without_auto_creation=5`" | proto:311 `message FeatureFlags {`, :312 supports_auth_refresh=1, :313 supports_broker_entry_metadata=2, :315 supports_topic_watchers=4, :316 supports_get_partitioned_metadata_without_auto_creation=5 | **PASS** |
-| 6 | "ProtocolVersion at proto:254, claim v21" | proto:254 `enum ProtocolVersion {`; v21 = 21 is the highest enum value | **PASS** |
-| 7 | "CompressionType at proto:92 (NONE/LZ4/ZLIB/ZSTD/SNAPPY)" | proto:92 `enum CompressionType { NONE=0; LZ4=1; ZLIB=2; ZSTD=3; SNAPPY=4; }` | **PASS** |
-| 8 | "ProducerAccessMode at proto:100 (Shared/Exclusive/WaitForExclusive/ExclusiveWithFencing)" | proto:100 `enum ProducerAccessMode { Shared=0; Exclusive=1; WaitForExclusive=2; ExclusiveWithFencing=3; }` | **PASS** |
-| 9 | "ClientCnx.java:117 (extends PulsarHandler), pendingRequests at :132-134, producers at :141, consumers at :147" | `ClientCnx.java:117`: `public class ClientCnx extends PulsarHandler {`; :132 pendingRequests; :141 producers (close enough — actual is :142 declaration after annotations on :140); :147 consumers (annotations on :146) | **PASS (with off-by-one tolerance)** — the cited lines bracket the field declarations correctly |
-| 10 | "handleConnected at :432, handleAuthChallenge at :464, handleSendReceipt at :515" | `ClientCnx.java:432`: `protected void handleConnected(...)`; :464 handleAuthChallenge; :515 handleSendReceipt | **PASS** |
-| 11 | "ProducerImpl.java:113 batchMessageContainer at :135, lastSequenceIdPublished at :153, lastSequenceIdPushed at :158" | `ProducerImpl.java:113`: `public class ProducerImpl<T>...`; :135 batchMessageContainer; :155 lastSequenceIdPublished (plan says :153 — close, the declaration vs annotation order); :160 lastSequenceIdPushed (plan says :158 — same off-by-2) | **PASS (with off-by-2 tolerance)** — the cited lines point at the AtomicReferenceFieldUpdater for the volatile field |
-| 12 | "ConsumerImpl.java:143, acknowledgmentsGroupingTracker at :174, negativeAcksTracker at :175, seekStatus at :185, deadLetterPolicy at :209, chunkedMessagesMap at :219" | `ConsumerImpl.java:143`: `public class ConsumerImpl<T>...`; :174 acknowledgmentsGroupingTracker; :175 negativeAcksTracker; :185 seekStatus; :209 deadLetterPolicy; :219 chunkedMessagesMap | **PASS** |
+Plan `tasks/todo.md:592-596` correctly gates dep-adds (gate (f)). Spot
+check: `wiremock` is *already* a dev-dep in `magnetar-auth-oauth2`
+(`tasks/todo.md:595` acknowledges this with "verify"). The plan should
+just verify and inline-cite. Minor — does not change the plan, only
+preempts the verification step.
 
-**Bonus check**: "PIP-145 file absent in this snapshot, but command exists at proto:1229-1232" (dossier §5 row PIP-145). Verified: no `pip/pip-145.md` in `/home/florentin/Sources/github.com/apache/pulsar/pip/`. Confirmed via `ls pip/ | grep pip-145` (no match). The plan correctly leans on the proto evidence + Java `TopicListWatcherTest.java` instead of the missing PIP doc. **PASS**.
+### N4 — Supervisor designation per phase
 
-**Conclusion**: 12/12 spot-checks PASS (with small off-by-one/off-by-two on Java line numbers due to annotation lines between the cited line and the field declaration — defensible). The dossier and plan are not making up citations.
+CLAUDE.md "Supervisor pattern (4+ agents)" is honoured for Phase 0
+(S0 supervises W1..W7). Phase 2 has 4 active agents (S5–S8) but no
+designated supervisor. Phase 3 has 5 active agents (E1–E5) — `SP`
+("planner-supervisor") is named at `tasks/todo.md:846` to cover the
+overlap, but no per-phase explicit designation. Add an "S2-supervisor"
+and "S3-supervisor" line, or one `SP` covering both with explicit
+"≥4 ⇒ supervisor active" assertion.
+
+### N5 — Phase 0a step 4 escalation path
+
+`tasks/todo.md:94-96` says `git branch -D` triggers escalation if `-d`
+complains. Good. Add: also escalate if `git rev-list <branch>..main`
+is **empty in both directions** (= branch carries genuine work not on
+main); the merge-base check at step 1 catches most of these but a
+divergent branch could pass step 1 and still need attention. Belt and
+braces.
 
 ---
 
-## H. Risk the plan under-estimates
+## OK — already correct, called out for completeness
 
-**The real surprise is the interaction between PIP-30 (AUTH_CHALLENGE) and in-flight requests during token refresh, combined with chunked-message reassembly crossing batch boundaries.**
-
-The plan §4 step 2 / handler `handle_auth_challenge` says "PIP-30, ask the configured `AuthDataProvider` for a refresh challenge, enqueue `AUTH_RESPONSE`" and §16 risks-table calls it "AUTH_CHALLENGE token-refresh race [medium/medium]". Both under-state the actual problem.
-
-In the Java client, `AUTH_CHALLENGE` can arrive *mid-flight* — the broker can challenge at any time. Between the moment the broker sends `AUTH_CHALLENGE` and the moment the client returns `AUTH_RESPONSE`, the client must:
-
-1. Not panic if an in-flight `SEND` was already pushed (the broker may accept or reject it; `SEND_RECEIPT` may still come back even after challenge).
-2. Not duplicate any send when the new auth context kicks in (the dedup ledger must work *across* the refresh).
-3. Handle `AUTH_CHALLENGE` happening *during* a chunked message — when the producer has emitted chunk 3 of 5 and the broker challenges. The Java client's `ProducerImpl.java:1570` handles `ChunkedMessageCtx` cleanup on `SEND_ERROR`; but the corresponding cleanup on a *successful* challenge-then-resume path is subtle and not well-documented in PIP-30 or PIP-292.
-4. Handle `AUTH_CHALLENGE` during key_shared rebalance (a fresh consumer attach happens around the same time the broker draining-hashes; if the auth refresh fails, the broker fences the consumer with a different code path than a fresh subscribe).
-
-The plan's M2 timeline allocates 3-4 weeks for the full state machine; the auth-refresh-during-chunked-send edge case alone is worth ~2-3 days of careful testing. Without explicit test coverage in `quasar-pulsar-proto/tests/auth_refresh_during_chunked_send.rs`, this will be the first thing that breaks under a real-world token-renewal scenario (Kubernetes service-account tokens rotate every ~60 minutes; chunked messages can take >60 seconds to fully transmit on a slow link).
-
-Secondary under-estimated risks (in declining order):
-
-- **key_shared draining-hashes (PIP-379) implementation.** The plan §4 step 4 / `key_shared_dispatch.rs` test mentions it but doesn't allocate special M2 budget. PIP-379 (27 KB doc — verified) describes draining-hash semantics where the *broker* drives the dispatch and the *client* just observes. Getting the consumer state machine to correctly *not* assume keys stay with the same consumer is subtle.
-- **`prost`-generated code drift between Pulsar versions.** Pulsar's `PulsarApi.proto` adds optional fields regularly (FeatureFlags grew from 4 to 8 fields over the last 4 minor versions). The `xtask codegen --check` job will surface drift but the plan does not specify the *response* — is drift a CI failure (block merge) or a CI warning (open issue)? Decide.
-- **`tokio-rustls` v0.26 / `rustls` v0.23 API surface for `ServerName::try_from`.** rustls v0.23 deprecated several APIs the v0.22 examples used; the plan §5 step 2 doesn't show the exact connect snippet, but the implementer will hit `IoError(InvalidDnsName)` if they pass a non-IP string without `ServerName::try_from(&str)`. Spell out the rustls v0.23 connect path in the plan or in `crates/quasar-pulsar-runtime-tokio/src/engine.rs` design notes.
-- **moonpool 0.6 → 0.7 API break.** The plan §6 step 5 pins `moonpool-core = "=0.6"` which is correct, but doesn't say what the *unpinning trigger* is. Add: "Unpin to `^0.7` only after `quasar-pulsar-runtime-moonpool` v0.2.0 release prep, gated on a re-validation of the chaos test suite."
+- **ServiceUrlProvider claim**: plan `tasks/todo.md:52-54` cites
+  `crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs:40-91`.
+  Verified: the trait is actually at
+  `crates/magnetar-proto/src/service_url.rs:50` (ServiceUrlProvider
+  sync trait + `StaticServiceUrlProvider` impl), consumed via
+  `magnetar/src/client.rs:968` and `:1066`. The plan's claim that
+  `feat/service-url-provider` is superseded is correct; the file path
+  it cites for the production surface is close enough (runtime side)
+  but the trait itself lives in proto. Not a fix needed, just a polish
+  if the plan ever re-cites.
+- **Worktree census**: 39 entries on disk (`wt list`); plan claims 38.
+  Off-by-one is irrelevant given 28 safe-drop bulk. OK.
+- **No-channels rule + Waker slab**: plan §1.3 explicitly references
+  ADR-0011 + the no-channels rule and prescribes
+  `parking_lot::Mutex<Vec<Waker>>` — exactly what ADR-0017 already
+  uses. Correct sans-io discipline, no I/O leak risk.
+- **Approval gates a..i**: each user-irreversible action *is* gated.
+  ADR creation gating (M4 here notwithstanding) is implicit in "ADR
+  written in same changeset as code"; the gate is on the merge, which
+  is gate (b)/(c)/(d)/(e) depending on phase. OK.
+- **Agent-team multiplicity**: plan acknowledges
+  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` (line 852–853, line 978). OK.
+- **WIP termination is parallel**: §0b assigns one agent per worktree
+  (W2..W7), explicitly "all running in parallel under supervisor S0"
+  (line 113). User's intent ("schedule across the team of agent") is
+  honoured.
+- **PIP-415 + AutoProduceBytesSchema** correctly listed as out-of-scope
+  (`tasks/todo.md:968-975`). OK.
 
 ---
 
-End of review.
+## Summary
+
+Top 5 issues, in priority order:
+
+1. **C1** — Phase 1.3 file paths are wrong (`client/memory_limit.rs`
+   does not exist; accounting is in `magnetar-proto/src/conn.rs`).
+2. **C2** — W6's `feat/auto-schema-runtime-wire` ahead-commit
+   `e3d6dd3` is already landed as `010e252`; the apparent
+   "+336 over 6 files" is stale-base resync, not pending work. Drop,
+   don't port.
+3. **M1** — `PulsarClient<E>` blast radius is bigger than the plan
+   acknowledges (interceptor SPI, typed schemas). Present Option C
+   (feature-gated façade alias) at gate (e), not just A vs. B.
+4. **M2** — Phase 2 M7 and Phase 3 Batch C overlap. Pull frame-level
+   reconnect cases out of Batch C; let M7 own them (deterministic and
+   cheaper).
+5. **M3** — Locked-worktree teardown procedure mixes `wt remove` and
+   `git worktree remove --force`. Pick one ladder, document the
+   fallback explicitly so an agent doesn't pick the wrong tool.
+
+Once C1 + C2 are corrected and M1/M2/M3 are at least surfaced for
+Florentin's gate decision, the plan is **ready to dispatch**. The
+structural backbone (5 phases, supervisor pattern at ≥4 agents,
+approval gates a..i, validation chain) is sound.
+
+File paths for follow-up:
+
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/tasks/todo.md`
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/crates/magnetar-proto/src/conn.rs:113-117`
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/specs/adr/0017-memory-limit-atomic-reservation.md:30-52`
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/crates/magnetar/src/client.rs:736-741` (current non-generic `PulsarClient`)
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/.github/workflows/ci.yml` (no codegen, no MSRV job — confirmed)
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/rust-toolchain.toml` (no MSRV pin)
+- `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/Cargo.toml` (no `rust-version`)

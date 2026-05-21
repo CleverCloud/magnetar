@@ -114,6 +114,40 @@ These are tracked in [`docs/implementation-plan.md`](implementation-plan.md)
 under "M9 — beyond v0.1.0 parity"; they are *not* required for v0.1.0
 under [ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md).
 
+## Moonpool parity train (M5 → M8)
+
+Per [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md),
+the v0.1.0 Java parity matrix in `README.md` is satisfied **by the tokio
+engine**. The moonpool engine reaches feature parity with tokio in a
+follow-up train; this section tracks the gap.
+
+| Surface | tokio | moonpool | Milestone |
+|---|---|---|---|
+| Engine driver loop + transport scaffold | ✅ | ✅ (M1) | – |
+| Client (lookup + partitioned-metadata + topic-watch) | ✅ | ✅ (M2) | – |
+| Producer façade (send / flush / close) | ✅ | ✅ (M3) | – |
+| Consumer façade (subscribe / receive / ack) | ✅ | ✅ (M4) | – |
+| Supervised reconnect (Stage 2 / Stage 3) | ✅ | ❌ | M5 |
+| DNS resolver injection (ADR-0015) | ✅ | ❌ | M5 |
+| Driver-level TLS (rustls-over-bytepipe) | ✅ | partial | M5 |
+| `memory_limit` atomic-CAS accounting (ADR-0017) | ✅ | ❌ | M5 |
+| `ServiceUrlProvider` plumbing (ADR-0016 / PIP-121) | ✅ | ❌ | M5 |
+| PIP-188 `TOPIC_MIGRATED` reconnect-on-migrate (ADR-0018) | ✅ | ❌ | M5 |
+| Partitioned producer / consumer (façade) | ✅ | ❌ | M6 |
+| MultiTopicsConsumer (façade) | ✅ | ❌ | M6 |
+| PatternConsumer (façade) | ✅ | ❌ | M6 |
+| Reader (façade) | ✅ | ❌ | M6 |
+| TableView (façade) | ✅ | ❌ | M6 |
+| Transactions (PIP-31 façade) | ✅ | ❌ | M6 |
+| Typed schemas (façade) | ✅ | ❌ | M6 |
+| Deterministic chaos pack (mid-handshake partition, frame reorder, virtual-clock timeouts, OAuth refresh edges, PIP-121 oscillation, PIP-188 migrate-then-migrate-again) | n/a | planned | M7 |
+| tokio ↔ moonpool differential equivalence harness | n/a | planned | M8 |
+
+When M6 lands, the engine trait + façade lift removes the duplication;
+this table collapses to a single ✅ row per surface. Until then, callers
+that need a moonpool-only feature not on the list get a trait-bound
+compile error, not a silent fallback — see ADR-0019 §Consequences.
+
 ## Constraints recap
 
 - **No channels**: never use `tokio::sync::mpsc / broadcast / oneshot / watch`,
