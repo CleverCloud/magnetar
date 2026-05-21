@@ -1456,6 +1456,7 @@ dependencies = [
  "magnetar-proto",
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
+ "moonpool-core",
  "parking_lot",
  "reqwest",
  "serde",

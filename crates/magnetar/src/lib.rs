@@ -57,8 +57,17 @@ pub use magnetar_runtime_moonpool as runtime_moonpool;
 #[cfg(feature = "tokio")]
 pub use magnetar_runtime_tokio as runtime_tokio;
 
+mod engine;
+pub use engine::Engine;
+#[cfg(feature = "moonpool")]
+pub use engine::MoonpoolEngine;
+#[cfg(feature = "tokio")]
+pub use engine::TokioEngine;
+
 #[cfg(feature = "tokio")]
 mod client;
+#[cfg(feature = "moonpool")]
+mod moonpool_client;
 #[cfg(feature = "tokio")]
 mod multi_topics;
 #[cfg(feature = "tokio")]

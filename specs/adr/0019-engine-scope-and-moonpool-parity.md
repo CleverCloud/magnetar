@@ -55,14 +55,21 @@ Concretely:
    `PulsarClient<TokioEngine>`". The moonpool engine remains a
    *test-only* deterministic-simulation surface until M6 lifts the
    façade layer onto an `Engine` trait
-   ([Phase 2 M6](../../tasks/todo.md), gate (e)). When M6 lands, this
-   ADR will be superseded by an explicit "dual-engine parity reached"
-   ADR.
+   ([Phase 2 M6](../../tasks/todo.md), gate (e)). M6 landed on
+   2026-05-22: the façade now ships `PulsarClient<E: Engine = TokioEngine>`
+   with a moonpool branch that re-exports the engine's shared-state and
+   driver-handle plumbing without lifting the producer / consumer
+   surface (that is the M7–M8 work). When dual-engine parity is reached,
+   this ADR will be superseded by an explicit "dual-engine parity
+   reached" ADR.
 4. Public crate surface for v0.1.0:
    - `magnetar` ships `PulsarClient<E: Engine>` where `E` defaults to
-     `TokioEngine` (Phase 2 M6, Option A per gate (e) 2026-05-21).
-     Users targeting production use the default; users running
-     deterministic tests parametrise with `MoonpoolEngine`.
+     `TokioEngine` (Phase 2 M6, Option A per gate (e) 2026-05-21,
+     landed 2026-05-22). Users targeting production use the default;
+     users running deterministic tests parametrise with
+     `MoonpoolEngine<P>`. The `Engine` trait carries an associated
+     `ClientState` type so each engine plugs in its own per-client
+     storage.
    - Moonpool-only callers that need features not yet implemented
      in moonpool (partitioned, multi-topics, pattern, reader, table
      view, transactions, typed schemas, supervised reconnect, DNS,

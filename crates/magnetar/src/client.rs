@@ -731,14 +731,28 @@ impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
     }
 }
 
-/// High-level Pulsar client. Backed by the tokio engine.
+/// High-level Pulsar client, generic over the runtime [`Engine`](crate::Engine).
+///
+/// Defaults to [`crate::TokioEngine`] (the production engine) so existing
+/// callers write `PulsarClient::builder()` without naming a type parameter.
+/// Callers exercising the moonpool deterministic-simulation engine
+/// parametrise with `PulsarClient::<MoonpoolEngine<P>>` (see
+/// [ADR-0019](../../specs/adr/0019-engine-scope-and-moonpool-parity.md)
+/// gate (e), "Option A").
+///
+/// Every façade surface (`producer`, `consumer`, `reader`, `typed_producer`,
+/// `typed_consumer`, partitioned / multi-topics / pattern / table-view
+/// constructors, transactions, interceptor SPI, …) is implemented only on
+/// `PulsarClient<TokioEngine>` for v0.1.0. Moonpool-side callers that reach
+/// for one of these get a clean trait-bound failure — matching ADR-0019
+/// §Decision "no silent fallbacks".
 #[derive(Debug)]
-pub struct PulsarClient {
-    inner: Client,
-    memory_limit: Option<MemoryLimit>,
+pub struct PulsarClient<E: crate::Engine = crate::TokioEngine> {
+    pub(crate) inner: E::ClientState,
+    pub(crate) memory_limit: Option<MemoryLimit>,
 }
 
-impl PulsarClient {
+impl PulsarClient<crate::TokioEngine> {
     /// Borrow the underlying runtime client. Re-exported for sibling modules
     /// ([`crate::PartitionedProducer`]) that need to call lower-level methods like
     /// `partitioned_topic_metadata` without going through a builder.
@@ -746,7 +760,12 @@ impl PulsarClient {
         &self.inner
     }
 
-    /// Start building a client.
+    /// Start building a client. Returns a tokio-engine [`ClientBuilder`] —
+    /// the default `E = TokioEngine` on [`PulsarClient<E>`]. Users targeting
+    /// the moonpool engine open the engine directly via
+    /// [`magnetar_runtime_moonpool::MoonpoolEngine`] (see
+    /// [`PulsarClient::<MoonpoolEngine<P>>::from_moonpool`](crate::PulsarClient)
+    /// for the equivalent constructor).
     #[must_use]
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()

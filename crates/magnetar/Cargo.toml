@@ -18,7 +18,12 @@ workspace = true
 [features]
 default  = ["tokio"]
 tokio    = ["dep:magnetar-runtime-tokio", "dep:tokio", "dep:futures-util"]
-moonpool = ["dep:magnetar-runtime-moonpool"]
+# `moonpool` is additive on top of `tokio` — per ADR-0019 gate (e) the
+# façade ships both engines simultaneously available in the same binary,
+# so the moonpool branch lives behind `tokio + moonpool` rather than
+# moonpool-only. `PulsarClient<MoonpoolEngine<P>>` is reachable iff both
+# features are on.
+moonpool = ["tokio", "dep:magnetar-runtime-moonpool", "dep:moonpool-core"]
 admin    = ["dep:magnetar-admin"]
 auth-oauth2 = ["dep:magnetar-auth-oauth2"]
 auth-sasl   = ["dep:magnetar-auth-sasl"]
@@ -33,6 +38,7 @@ e2e         = ["tokio", "admin"]
 magnetar-proto             = { workspace = true }
 magnetar-runtime-tokio     = { workspace = true, optional = true }
 magnetar-runtime-moonpool  = { workspace = true, optional = true }
+moonpool-core              = { workspace = true, optional = true }
 magnetar-admin             = { workspace = true, optional = true }
 magnetar-auth-oauth2       = { workspace = true, optional = true }
 magnetar-auth-sasl         = { workspace = true, optional = true }

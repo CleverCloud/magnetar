@@ -199,20 +199,29 @@ follow-up train; this section tracks the gap.
 | `memory_limit` atomic-CAS accounting (ADR-0017) | ✅ | ❌ | M5 |
 | `ServiceUrlProvider` plumbing (ADR-0016 / PIP-121) | ✅ | ❌ | M5 |
 | PIP-188 `TOPIC_MIGRATED` reconnect-on-migrate (ADR-0018) | ✅ | ❌ | M5 |
-| Partitioned producer / consumer (façade) | ✅ | ❌ | M6 |
-| MultiTopicsConsumer (façade) | ✅ | ❌ | M6 |
-| PatternConsumer (façade) | ✅ | ❌ | M6 |
-| Reader (façade) | ✅ | ❌ | M6 |
-| TableView (façade) | ✅ | ❌ | M6 |
-| Transactions (PIP-31 façade) | ✅ | ❌ | M6 |
-| Typed schemas (façade) | ✅ | ❌ | M6 |
+| Generic `PulsarClient<E: Engine>` (gate (e)) | ✅ | ✅ (M6) | – |
+| Partitioned producer / consumer (façade) | ✅ | ❌ | M7–M8 |
+| MultiTopicsConsumer (façade) | ✅ | ❌ | M7–M8 |
+| PatternConsumer (façade) | ✅ | ❌ | M7–M8 |
+| Reader (façade) | ✅ | ❌ | M7–M8 |
+| TableView (façade) | ✅ | ❌ | M7–M8 |
+| Transactions (PIP-31 façade) | ✅ | ❌ | M7–M8 |
+| Typed schemas (façade) | ✅ | ❌ | M7–M8 |
 | Deterministic chaos pack (mid-handshake partition, frame reorder, virtual-clock timeouts, OAuth refresh edges, PIP-121 oscillation, PIP-188 migrate-then-migrate-again) | n/a | planned | M7 |
 | tokio ↔ moonpool differential equivalence harness | n/a | planned | M8 |
 
-When M6 lands, the engine trait + façade lift removes the duplication;
-this table collapses to a single ✅ row per surface. Until then, callers
-that need a moonpool-only feature not on the list get a trait-bound
-compile error, not a silent fallback — see ADR-0019 §Consequences.
+M6 landed the generic `PulsarClient<E: Engine = TokioEngine>` façade
+(2026-05-22, [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
+gate (e), "Option A"). The moonpool branch exposes
+`PulsarClient<MoonpoolEngine<P>>` with the shared connection state +
+driver-handle wrapper but does **not** yet carry the partitioned /
+multi-topics / pattern / reader / table-view / typed-schema /
+transactions surface — those stay bound to
+`PulsarClient<TokioEngine>` and lift across as part of M7–M8.
+
+Until then, callers that reach for a tokio-only method on the
+moonpool engine get a trait-bound compile error, not a silent
+fallback — see ADR-0019 §Consequences.
 
 ## Constraints recap
 
