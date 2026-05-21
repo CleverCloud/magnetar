@@ -16,6 +16,24 @@
 //! wakes the [`core::task::Waker`] that user futures previously registered via
 //! [`magnetar_proto::Connection::register_waker`]. See [GUIDELINES.md] §"No-channels rule".
 //!
+//! # Supervisor (auto-reconnect)
+//!
+//! When [`magnetar_proto::ConnectionConfig::supervisor`] is `Some`, the spawn helper wraps the
+//! per-socket driver loop in a backoff-driven reconnect cycle. The cycle:
+//!
+//! 1. runs [`driver_loop_inner`] until the socket errors or the peer closes;
+//! 2. checks whether the user requested a graceful close (state machine `is_closed`) — if so, exits
+//!    cleanly;
+//! 3. otherwise reads [`magnetar_proto::SupervisorConfig`] off the state machine, builds a
+//!    [`magnetar_proto::Backoff`], and sleeps for the next backoff interval;
+//! 4. reconnects via [`crate::transport::Transport::connect`], calls
+//!    [`magnetar_proto::Connection::reset`] (which fails every in-flight op with
+//!    [`magnetar_proto::OpOutcome::SessionLost`]), restarts the handshake, and resumes step 1.
+//!
+//! Stage 3 (consumer/producer state replay) is still pending — for now, in-flight publishes and
+//! pending subscribe / lookup / seek / txn requests fail with `SessionLost`, and the caller is
+//! expected to reopen producers / consumers on the freshly-handshaked session.
+//!
 //! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
 
 use std::sync::Arc;
@@ -28,6 +46,8 @@ use tokio::task::JoinHandle;
 
 use crate::ConnectionShared;
 use crate::error::ClientError;
+use crate::transport::Transport;
+use crate::url_parse::ParsedUrl;
 
 /// Drain the connection's semantic event queue and react to events that need
 /// runtime-layer work (currently only `AuthChallenge` — every other event is
@@ -110,16 +130,135 @@ impl DriverHandle {
     }
 }
 
-/// Spawn the driver loop on the current tokio runtime.
+/// Reconnect context passed to the supervised driver. Lets the supervisor re-open the TCP
+/// (and optionally TLS) connection to the broker after a transient drop.
+#[derive(Debug, Clone)]
+pub(crate) struct ReconnectContext {
+    /// Parsed Pulsar URL — `pulsar://` or `pulsar+ssl://` + host + port.
+    pub(crate) url: ParsedUrl,
+    /// `rustls::ClientConfig` for `pulsar+ssl://`. `None` for plaintext.
+    pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
+}
+
+/// Spawn the driver loop on the current tokio runtime — generic-socket flavour for
+/// tests / `Client::from_socket`. The auto-reconnect supervisor is **not** active on this
+/// spawn path: a generic socket has no notion of "reconnect", so the driver exits on the
+/// first I/O failure regardless of [`magnetar_proto::ConnectionConfig::supervisor`].
 pub(crate) fn spawn<S>(shared: Arc<ConnectionShared>, socket: S) -> DriverHandle
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let join = tokio::spawn(driver_loop(shared, socket));
+    let join = tokio::spawn(async move {
+        let mut socket = socket;
+        driver_loop_inner(&shared, &mut socket).await
+    });
     DriverHandle { join }
 }
 
-/// The driver loop.
+/// Spawn the driver loop with the auto-reconnect supervisor wired in.
+///
+/// When [`magnetar_proto::ConnectionConfig::supervisor`] is `Some`, the driver re-handshakes
+/// against the broker after a transient drop using `reconnect_ctx`. When the supervisor config
+/// is `None`, behaviour matches [`spawn`] — driver exits on the first I/O failure.
+pub(crate) fn spawn_supervised(
+    shared: Arc<ConnectionShared>,
+    socket: Transport,
+    reconnect_ctx: ReconnectContext,
+) -> DriverHandle {
+    let join = tokio::spawn(supervised_driver_loop(shared, socket, reconnect_ctx));
+    DriverHandle { join }
+}
+
+/// The supervised driver loop — runs [`driver_loop_inner`] on the current socket, then
+/// (if the supervisor is configured and the user has not closed the connection) sleeps for
+/// a backoff interval, reconnects, calls [`magnetar_proto::Connection::reset`], restarts the
+/// handshake, and resumes.
+async fn supervised_driver_loop(
+    shared: Arc<ConnectionShared>,
+    mut socket: Transport,
+    reconnect_ctx: ReconnectContext,
+) -> Result<(), ClientError> {
+    // Seed the backoff RNG from the address pointer so independent clients to the same broker
+    // spread their reconnect timing without depending on any I/O. `0` would land us on the
+    // splitmix default; using the (stable, unique) Arc pointer mixes in per-Client entropy.
+    let seed: u64 = Arc::as_ptr(&shared) as usize as u64;
+
+    // First pass uses the current socket. The inner-loop result is what we propagate to the
+    // caller if we exit without a supervisor reconnect.
+    let mut last_inner_result = driver_loop_inner(&shared, &mut socket).await;
+
+    loop {
+        // User-requested close beats reconnect — the state machine is already in `Closing`
+        // or `Closed`, so we propagate the inner result (Ok or Err) as-is.
+        if shared.inner.lock().is_closed() {
+            return last_inner_result;
+        }
+
+        // Snapshot the supervisor config + max-attempts on every iteration so dynamic updates
+        // to it (future work) take effect before the next reconnect.
+        let supervisor_cfg = shared.inner.lock().supervisor_config().cloned();
+        let Some(cfg) = supervisor_cfg else {
+            return last_inner_result;
+        };
+
+        // Fresh Backoff per disconnect: Java resets the schedule on a successful reconnect, so
+        // we reset on a *successful* handshake too. The attempt counter is the only piece of
+        // state that survives across reconnect attempts here.
+        let mut backoff = cfg.build_backoff(seed);
+        let mut attempt: u32 = 0;
+
+        // Reconnect loop — keep trying until we land a fresh socket + handshake OR exhaust
+        // `max_attempts`.
+        let new_socket = loop {
+            let delay = backoff.next();
+            tokio::time::sleep(delay).await;
+
+            attempt = attempt.saturating_add(1);
+            if let Some(max) = cfg.max_attempts {
+                if attempt > max {
+                    tracing::warn!(
+                        "supervisor: gave up after {attempt} reconnect attempt(s) \
+                         (max_attempts={max})"
+                    );
+                    return last_inner_result;
+                }
+            }
+
+            // Did the user request close while we were sleeping?
+            if shared.inner.lock().is_closed() {
+                return last_inner_result;
+            }
+
+            match Transport::connect(&reconnect_ctx.url, reconnect_ctx.tls_config.clone()).await {
+                Ok(t) => break t,
+                Err(err) => {
+                    tracing::warn!(
+                        "supervisor: reconnect attempt {attempt} failed: {err}; will retry"
+                    );
+                    // Loop and back off again.
+                }
+            }
+        };
+
+        // Got a new transport. Reset the state machine + kick off CONNECT.
+        {
+            let mut conn = shared.inner.lock();
+            conn.reset();
+            if let Err(err) = conn.begin_handshake() {
+                // Should never happen — reset() snaps state back to Uninitialized — but if it
+                // does, surface it.
+                tracing::error!("supervisor: begin_handshake after reset failed: {err}");
+                return Err(err.into());
+            }
+        }
+        shared.driver_waker.notify_one();
+
+        socket = new_socket;
+        last_inner_result = driver_loop_inner(&shared, &mut socket).await;
+    }
+}
+
+/// The per-socket driver loop.
 ///
 /// Implementation notes:
 ///
@@ -134,9 +273,9 @@ where
 ///   The state machine handles framing — partial frames stay in its internal `inbound` buffer.
 /// - **Timeout**: `Connection::poll_timeout` returns the next deadline if any. We `tokio::select!`
 ///   against `tokio::time::sleep_until(deadline)`. If no deadline is set, that arm is disabled.
-pub(crate) async fn driver_loop<S>(
-    shared: Arc<ConnectionShared>,
-    mut socket: S,
+pub(crate) async fn driver_loop_inner<S>(
+    shared: &Arc<ConnectionShared>,
+    socket: &mut S,
 ) -> Result<(), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -222,7 +361,7 @@ where
                 // already (the sans-io layer wakes them inline), but `AuthChallenge` requires
                 // the runtime to invoke the configured AuthProvider and submit the response.
                 // PIP-30 / PIP-292.
-                handle_pending_events(&shared)?;
+                handle_pending_events(shared)?;
             }
 
             // Timer fired.

@@ -909,6 +909,24 @@ impl ProducerState {
         }
     }
 
+    /// Drain every in-flight `OpSend` and return the `(sequence_id, waker)` pairs that
+    /// were registered by user-facing send futures. The caller is responsible for
+    /// installing a `SessionLost` outcome and waking each future. Also clears the batch
+    /// container so partial in-flight batches do not survive a reconnect. Mirrors Java
+    /// `ProducerImpl#connectionClosed`'s synthetic-failure pass over `pendingMessages`.
+    pub fn drain_pending_sends(&mut self) -> Vec<(SequenceId, Option<Waker>)> {
+        let mut out = Vec::with_capacity(self.pending.len());
+        while let Some(mut op) = self.pending.pop_front() {
+            self.pending_index.remove(&op.sequence_id);
+            out.push((op.sequence_id, op.waker.take()));
+        }
+        // Batch container holds messages that never made it to the wire — drop them so
+        // a stale batch does not re-emit on the freshly-handshaked connection.
+        self.batch = BatchContainer::default();
+        self.outbound.clear();
+        out
+    }
+
     /// Mark the producer closed. New sends return [`ProducerError::Closed`].
     pub fn close(&mut self) {
         self.closed = true;
