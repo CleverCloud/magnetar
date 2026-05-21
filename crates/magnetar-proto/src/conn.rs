@@ -2655,4 +2655,91 @@ mod conn_state_tests {
             );
         }
     }
+
+    /// PIP-188: feeding a `CommandTopicMigrated` BaseCommand surfaces a
+    /// [`ConnectionEvent::TopicMigrated`] carrying the resource handle and the new broker URLs
+    /// so the engine layer can re-bind the affected producer/consumer to the new broker.
+    #[test]
+    fn topic_migrated_command_surfaces_event() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake response");
+
+        // Drain the `Connected` event so subsequent `poll_event` returns the migration event.
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected event, got {other:?}"),
+        }
+
+        // Feed a CommandTopicMigrated for a producer being moved to a new broker.
+        let migrated = pb::BaseCommand {
+            r#type: pb::base_command::Type::TopicMigrated as i32,
+            topic_migrated: Some(pb::CommandTopicMigrated {
+                resource_id: 7,
+                resource_type: pb::command_topic_migrated::ResourceType::Producer as i32,
+                broker_service_url: Some("pulsar://new-broker:6650".to_owned()),
+                broker_service_url_tls: Some("pulsar+ssl://new-broker:6651".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &migrated).expect("encode CommandTopicMigrated");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandTopicMigrated");
+
+        match conn.poll_event() {
+            Some(ConnectionEvent::TopicMigrated {
+                producer,
+                consumer,
+                broker_service_url,
+                broker_service_url_tls,
+            }) => {
+                assert_eq!(producer, Some(ProducerHandle(7)));
+                assert_eq!(consumer, None);
+                assert_eq!(
+                    broker_service_url.as_deref(),
+                    Some("pulsar://new-broker:6650")
+                );
+                assert_eq!(
+                    broker_service_url_tls.as_deref(),
+                    Some("pulsar+ssl://new-broker:6651")
+                );
+            }
+            other => panic!("expected TopicMigrated event, got {other:?}"),
+        }
+
+        // A consumer migration must surface in the `consumer` slot of the same variant.
+        let migrated_cons = pb::BaseCommand {
+            r#type: pb::base_command::Type::TopicMigrated as i32,
+            topic_migrated: Some(pb::CommandTopicMigrated {
+                resource_id: 42,
+                resource_type: pb::command_topic_migrated::ResourceType::Consumer as i32,
+                broker_service_url: None,
+                broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf2 = bytes::BytesMut::new();
+        encode_command(&mut buf2, &migrated_cons)
+            .expect("encode consumer-side CommandTopicMigrated");
+        conn.handle_bytes(Instant::now(), &buf2)
+            .expect("handle consumer-side CommandTopicMigrated");
+
+        match conn.poll_event() {
+            Some(ConnectionEvent::TopicMigrated {
+                producer,
+                consumer,
+                broker_service_url,
+                broker_service_url_tls,
+            }) => {
+                assert_eq!(producer, None);
+                assert_eq!(consumer, Some(ConsumerHandle(42)));
+                assert!(broker_service_url.is_none());
+                assert!(broker_service_url_tls.is_none());
+            }
+            other => panic!("expected consumer-side TopicMigrated event, got {other:?}"),
+        }
+    }
 }
