@@ -587,6 +587,82 @@ impl Consumer {
         Ok(count)
     }
 
+    /// Republish a single message via `retry_producer` with a delay deadline, then ack
+    /// the original. Mirrors Java `Consumer#reconsumeLater(Message, long, TimeUnit)`.
+    ///
+    /// The broker holds the republished message in the retry-letter topic until
+    /// `delay` has elapsed, then dispatches it normally. A `RECONSUMETIMES` property is
+    /// incremented on each redelivery so consumers can implement a maximum-retry policy
+    /// above this layer. The original `partition_key`, `ordering_key`, `event_time`, and
+    /// properties are preserved; `REAL_TOPIC` and `ORIGINAL_MESSAGE_ID` are stamped for
+    /// correlation back to the source topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`ClientError`] from the republish or the subsequent ack.
+    pub async fn reconsume_later(
+        &self,
+        retry_producer: &crate::Producer,
+        msg: IncomingMessage,
+        delay: std::time::Duration,
+    ) -> Result<(), ClientError> {
+        let mut metadata = magnetar_proto::pb::MessageMetadata {
+            partition_key: msg.metadata.partition_key.clone(),
+            partition_key_b64_encoded: msg.metadata.partition_key_b64_encoded,
+            ordering_key: msg.metadata.ordering_key.clone(),
+            event_time: msg.metadata.event_time,
+            properties: msg.metadata.properties.clone(),
+            ..magnetar_proto::pb::MessageMetadata::default()
+        };
+        // Bump the RECONSUMETIMES property if present, otherwise stamp it at 1. Mirrors
+        // the Java retry-letter convention so downstream consumers can enforce caps.
+        let reconsumetimes = metadata
+            .properties
+            .iter()
+            .find(|kv| kv.key == "RECONSUMETIMES")
+            .and_then(|kv| kv.value.parse::<u64>().ok())
+            .unwrap_or(0)
+            + 1;
+        metadata.properties.retain(|kv| kv.key != "RECONSUMETIMES");
+        metadata.properties.push(magnetar_proto::pb::KeyValue {
+            key: "RECONSUMETIMES".to_owned(),
+            value: reconsumetimes.to_string(),
+        });
+        // Stamp REAL_TOPIC + ORIGINAL_MESSAGE_ID like the DLQ republish does so consumers
+        // of the retry topic can correlate back to the source.
+        metadata.properties.push(magnetar_proto::pb::KeyValue {
+            key: "REAL_TOPIC".to_owned(),
+            value: self
+                .shared
+                .inner
+                .lock()
+                .consumer_topic(self.handle)
+                .unwrap_or("")
+                .to_owned(),
+        });
+        metadata.properties.push(magnetar_proto::pb::KeyValue {
+            key: "ORIGINAL_MESSAGE_ID".to_owned(),
+            value: msg.message_id.to_string(),
+        });
+        // Set deliver_at_time so the broker queues the message for `delay` past now.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0i64, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+        metadata.deliver_at_time = Some(now_ms.saturating_add(delay_ms));
+        let payload_len = msg.payload.len();
+        let outgoing = magnetar_proto::producer::OutgoingMessage {
+            payload: msg.payload,
+            metadata,
+            uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
+            num_messages: 1,
+            txn_id: None,
+        };
+        retry_producer.send(outgoing).await?;
+        self.ack(msg.message_id).await?;
+        Ok(())
+    }
+
     /// Mirrors Java `Consumer#isInactive`. Returns `true` once the consumer has reached
     /// end-of-topic on its subscription (no more messages will be dispatched). Note: a
     /// closed consumer is not represented as "inactive" here; check the connection state

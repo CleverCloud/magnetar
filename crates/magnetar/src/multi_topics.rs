@@ -150,6 +150,32 @@ impl MultiTopicsConsumer {
             .map_err(PulsarError::Client)
     }
 
+    /// Republish `msg` via `retry_producer` with a delay, then ack the original on the
+    /// per-topic child. Mirrors Java `Consumer#reconsumeLater` at the multi-topic scope.
+    /// The caller supplies the topic the message came from (returned alongside the
+    /// message in [`MultiTopicsMessage::topic`]) so the ack routes to the correct child.
+    pub async fn reconsume_later(
+        &self,
+        topic: &str,
+        retry_producer: &magnetar_runtime_tokio::Producer,
+        msg: IncomingMessage,
+        delay: std::time::Duration,
+    ) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| {
+                PulsarError::Config(format!("reconsume_later for unknown topic {topic}"))
+            })?;
+        consumer
+            .consumer
+            .reconsume_later(retry_producer, msg, delay)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Tell the broker to redeliver every unacked message across every child consumer.
     /// Mirrors Java `Consumer#redeliverUnacknowledgedMessages` at the multi-topic scope.
     pub fn redeliver_unacked(&self) {

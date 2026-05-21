@@ -805,6 +805,22 @@ impl<S: Schema> TypedConsumer<S> {
             .await
             .map_err(PulsarError::Client)
     }
+
+    /// Republish `msg` via `retry_producer` with a delay, then ack the original. Mirrors
+    /// Java `Consumer#reconsumeLater(Message, long, TimeUnit)`. Takes the raw
+    /// `IncomingMessage` (use [`TypedMessage::raw`]) so the original payload is
+    /// preserved verbatim through the retry topic.
+    pub async fn reconsume_later(
+        &self,
+        retry_producer: &magnetar_runtime_tokio::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        delay: std::time::Duration,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .reconsume_later(retry_producer, msg, delay)
+            .await
+            .map_err(PulsarError::Client)
+    }
 }
 
 /// Builder for a [`TypedConsumer`].
