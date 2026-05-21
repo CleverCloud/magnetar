@@ -101,6 +101,70 @@ pub struct ConsumerState {
     /// sliding-window bucket and re-delivered if no positive ack arrives within the
     /// configured window. Mirrors Java's `UnAckedMessageTracker`.
     pub unacked_tracker: Option<UnackedMessageTracker>,
+    /// PIP-54 batch-ack tracker. Keyed by the batch's `(ledger_id, entry_id)`, value is
+    /// the bitset of *still-unacked* positions (bit `i` set ⇒ position `i` is unacked).
+    /// Populated on first delivery of any message in a batch, cleared once every position
+    /// is acked. When a batched message is acked individually, the client sends a partial
+    /// ack carrying this bitset so the broker knows not to advance the cursor past the
+    /// batch until every position is acked.
+    pub batch_ack_tracker: HashMap<(u64, u64), BatchAckEntry>,
+}
+
+/// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
+/// batch are still unacked.
+#[derive(Debug, Clone)]
+pub struct BatchAckEntry {
+    /// Number of messages in the batch (`metadata.num_messages_in_batch`).
+    pub batch_size: i32,
+    /// Bitset of unacked positions packed little-endian into `u64`s. Bit `i % 64` of
+    /// word `i / 64` represents position `i` in the batch; `1` means unacked.
+    pub unacked: Vec<u64>,
+}
+
+impl BatchAckEntry {
+    /// Construct a fresh entry for a batch of `batch_size` messages — every position
+    /// starts as unacked.
+    #[must_use]
+    pub fn fresh(batch_size: i32) -> Self {
+        let size = batch_size.max(0) as usize;
+        let n_words = size.div_ceil(64);
+        let mut unacked = vec![0u64; n_words];
+        for i in 0..size {
+            unacked[i / 64] |= 1u64 << (i % 64);
+        }
+        Self {
+            batch_size,
+            unacked,
+        }
+    }
+
+    /// Clear the bit at `position`. Returns `true` once *every* position has been acked
+    /// (bitset all-zero), which means the caller can drop this entry and send a "full"
+    /// ack (no `ack_set`) so the broker advances the cursor past the batch.
+    pub fn ack_position(&mut self, position: i32) -> bool {
+        if position < 0 || position >= self.batch_size {
+            return self.is_fully_acked();
+        }
+        let p = position as usize;
+        if let Some(word) = self.unacked.get_mut(p / 64) {
+            *word &= !(1u64 << (p % 64));
+        }
+        self.is_fully_acked()
+    }
+
+    /// `true` if every position in the batch has been acked.
+    #[must_use]
+    pub fn is_fully_acked(&self) -> bool {
+        self.unacked.iter().all(|w| *w == 0)
+    }
+
+    /// Borrow the bitset as `i64` for protobuf encoding. Pulsar's wire format declares
+    /// `ack_set` as a `repeated int64`; bit semantics are unchanged by the cast.
+    #[must_use]
+    pub fn ack_set_i64(&self) -> Vec<i64> {
+        #[allow(clippy::cast_possible_wrap)]
+        self.unacked.iter().map(|&w| w as i64).collect()
+    }
 }
 
 /// Snapshot of cumulative consumer counters. Mirrors `org.apache.pulsar.client.api.ConsumerStats`
@@ -180,6 +244,7 @@ impl ConsumerState {
             total_msgs_dead_lettered: 0,
             nack_tracker: None,
             unacked_tracker: None,
+            batch_ack_tracker: HashMap::new(),
         }
     }
 
@@ -323,6 +388,12 @@ impl ConsumerState {
         // Batched message path.
         let num_in_batch = metadata.num_messages_in_batch.unwrap_or(1);
         if num_in_batch > 1 {
+            // PIP-54: stamp the per-batch ack tracker once. Subsequent acks of individual
+            // positions in this batch clear bits in the bitset; the broker sees the partial
+            // ack state and only advances the cursor once every position is acked.
+            self.batch_ack_tracker
+                .entry((message_id.ledger_id, message_id.entry_id))
+                .or_insert_with(|| BatchAckEntry::fresh(num_in_batch));
             let mut cursor = body;
             let mut delivered = 0usize;
             for idx in 0..num_in_batch {
@@ -642,5 +713,44 @@ mod tests {
         }
         assert_eq!(c.stats().total_msgs_dead_lettered, 3);
         assert_eq!(c.dead_letter_pending.len(), 3);
+    }
+
+    #[test]
+    fn batch_ack_entry_fresh_sets_all_unacked_bits() {
+        let e = BatchAckEntry::fresh(5);
+        // 5 bits set in the low word.
+        assert_eq!(e.unacked, vec![0b0001_1111]);
+        assert!(!e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_acks_one_at_a_time() {
+        let mut e = BatchAckEntry::fresh(3);
+        assert!(!e.ack_position(0)); // 0b110 left
+        assert_eq!(e.unacked, vec![0b110]);
+        assert!(!e.ack_position(1)); // 0b100 left
+        assert_eq!(e.unacked, vec![0b100]);
+        assert!(e.ack_position(2)); // all acked
+        assert!(e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_spans_multiple_words() {
+        let mut e = BatchAckEntry::fresh(70);
+        assert_eq!(e.unacked.len(), 2);
+        // Ack position 65 — clears bit 1 of word 1.
+        assert!(!e.ack_position(65));
+        assert_eq!(e.unacked[1] & (1 << 1), 0);
+        assert!(!e.is_fully_acked());
+    }
+
+    #[test]
+    fn batch_ack_entry_ignores_out_of_range_positions() {
+        let mut e = BatchAckEntry::fresh(4);
+        // -1 / >= batch_size are no-ops.
+        let _ = e.ack_position(-1);
+        let _ = e.ack_position(99);
+        assert!(!e.is_fully_acked());
+        assert_eq!(e.unacked, vec![0b1111]);
     }
 }

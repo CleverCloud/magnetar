@@ -1652,6 +1652,61 @@ impl Connection {
                 }
             }
         }
+        // PIP-54: for any message id with `batch_index >= 0`, look up the per-batch ack
+        // tracker, clear the bit at `batch_index`, and emit either a "full" MessageIdData
+        // (no ack_set; the batch is now fully acked, so the broker can advance the cursor
+        // past it) or a partial-ack MessageIdData carrying the bitset of still-unacked
+        // positions so the broker holds the cursor.
+        let pb_ids: Vec<pb::MessageIdData> =
+            if matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
+                if let Some(consumer) = self.consumers.get_mut(&handle) {
+                    ack.message_ids
+                        .iter()
+                        .map(|id| {
+                            let mut pb_id = id.to_pb();
+                            if id.batch_index >= 0 {
+                                let key = (id.ledger_id, id.entry_id);
+                                let fully = if let Some(entry) =
+                                    consumer.batch_ack_tracker.get_mut(&key)
+                                {
+                                    let fully = entry.ack_position(id.batch_index);
+                                    if !fully {
+                                        pb_id.ack_set = entry.ack_set_i64();
+                                    }
+                                    fully
+                                } else {
+                                    // No tracker entry — either the batch's first delivery happened
+                                    // before PIP-54 wiring or the tracker was already cleared by a
+                                    // prior full-batch ack. Fall through as a regular ack.
+                                    true
+                                };
+                                if fully {
+                                    consumer.batch_ack_tracker.remove(&key);
+                                }
+                            }
+                            pb_id
+                        })
+                        .collect()
+                } else {
+                    ack.message_ids.iter().map(|m| m.to_pb()).collect()
+                }
+            } else {
+                // Cumulative ack — every position up to the supplied id is implicitly acked,
+                // so any per-batch tracker entries the cumulative position covers are stale.
+                // Drop them so future individual acks on the same batch don't synthesise a
+                // partial bitset for state the broker has already moved past.
+                if let Some(consumer) = self.consumers.get_mut(&handle) {
+                    let covered: Vec<(u64, u64)> = ack
+                        .message_ids
+                        .iter()
+                        .map(|id| (id.ledger_id, id.entry_id))
+                        .collect();
+                    for key in covered {
+                        consumer.batch_ack_tracker.remove(&key);
+                    }
+                }
+                ack.message_ids.iter().map(|m| m.to_pb()).collect()
+            };
         let properties: Vec<pb::KeyLongValue> = ack
             .properties
             .iter()
@@ -1663,7 +1718,7 @@ impl Connection {
         let cmd = pb::CommandAck {
             consumer_id: handle.0,
             ack_type: ack.ack_type as i32,
-            message_id: ack.message_ids.iter().map(|m| m.to_pb()).collect(),
+            message_id: pb_ids,
             validation_error: None,
             properties,
             txnid_least_bits: ack.txn_id.map(|t| t.least_sig_bits),
