@@ -541,6 +541,17 @@ impl Connection {
         matches!(self.state, HandshakeState::Connected)
     }
 
+    /// `true` once the connection has entered any terminal state (`Closing`, `Closed`, or
+    /// `Failed`). Mirrors Java `PulsarClient#isClosed`. Returns `false` for an active or
+    /// still-handshaking connection — pair with [`Self::is_connected`] for the live test.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        matches!(
+            self.state,
+            HandshakeState::Closing | HandshakeState::Closed | HandshakeState::Failed
+        )
+    }
+
     /// Wall-clock time the connection last reached [`HandshakeState::Connected`], if ever.
     /// Returns `None` before the first successful handshake.
     pub fn last_connected_timestamp(&self) -> Option<SystemTime> {
@@ -2237,5 +2248,25 @@ mod conn_state_tests {
 
         conn.close();
         assert!(conn.last_disconnected_timestamp().is_some());
+    }
+
+    #[test]
+    fn is_closed_tracks_terminal_states() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        assert!(!conn.is_closed(), "uninitialized is not closed");
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame).expect("handle");
+        assert!(!conn.is_closed(), "connected is not closed");
+        conn.close();
+        assert!(conn.is_closed(), "after close, is_closed is true");
+
+        // Mark_disconnected (Failed) is also a terminal state.
+        let mut conn2 = Connection::new(ConnectionConfig::default());
+        conn2.begin_handshake().expect("handshake");
+        let frame2 = handshake_response_bytes();
+        conn2.handle_bytes(Instant::now(), &frame2).expect("handle");
+        conn2.mark_disconnected();
+        assert!(conn2.is_closed(), "Failed state counts as closed");
     }
 }

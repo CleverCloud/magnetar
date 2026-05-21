@@ -434,6 +434,15 @@ impl Client {
         self.shared.inner.lock().is_connected()
     }
 
+    /// `true` once [`Self::close`] has been called or the broker connection has otherwise
+    /// entered a terminal state. Mirrors Java `PulsarClient#isClosed`. After this returns
+    /// `true` no new producer / consumer opens can succeed; pair with [`Self::is_connected`]
+    /// for the live test.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared.inner.lock().is_closed()
+    }
+
     /// Wall-clock time the broker connection was most recently torn down (peer close, I/O
     /// error, local `close()`). `None` while the connection has never been disconnected.
     ///
