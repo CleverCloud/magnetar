@@ -62,7 +62,8 @@ pub use self::bytes_schema::BytesSchema;
 pub use self::json::JsonSchema;
 pub use self::key_value::{KeyValueEncodingType, KeyValuePair, KeyValueSchema};
 pub use self::primitive::{
-    BoolSchema, DoubleSchema, FloatSchema, Int8Schema, Int16Schema, Int32Schema, Int64Schema,
+    BoolSchema, DateSchema, DoubleSchema, FloatSchema, Int8Schema, Int16Schema, Int32Schema,
+    Int64Schema, LocalDateSchema, LocalTimeSchema, TimeSchema, TimestampSchema,
 };
 pub use self::protobuf::ProtobufSchema;
 pub use self::protobuf_native::ProtobufNativeSchema;

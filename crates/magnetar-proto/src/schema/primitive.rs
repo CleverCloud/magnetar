@@ -64,6 +64,22 @@ primitive_schema!(Int64Schema, i64, pb::schema::Type::Int64, 8);
 primitive_schema!(FloatSchema, f32, pb::schema::Type::Float, 4);
 primitive_schema!(DoubleSchema, f64, pb::schema::Type::Double, 8);
 
+// Date / time schemas. Java's chrono-flavoured schemas all hit the wire as i64 big-endian
+// with a distinct schema_type discriminator so the broker stores the semantic intent. We
+// stay chrono-free: callers convert their own date/time types to/from i64 and pick the
+// schema that matches the field's semantics.
+//
+// - Date: epoch millis (java.util.Date)
+// - Time: millis since midnight (java.sql.Time)
+// - Timestamp: epoch millis (java.sql.Timestamp)
+// - LocalDate: epoch day (java.time.LocalDate#toEpochDay)
+// - LocalTime: nanos since midnight (java.time.LocalTime#toNanoOfDay)
+primitive_schema!(DateSchema, i64, pb::schema::Type::Date, 8);
+primitive_schema!(TimeSchema, i64, pb::schema::Type::Time, 8);
+primitive_schema!(TimestampSchema, i64, pb::schema::Type::Timestamp, 8);
+primitive_schema!(LocalDateSchema, i64, pb::schema::Type::LocalDate, 8);
+primitive_schema!(LocalTimeSchema, i64, pb::schema::Type::LocalTime, 8);
+
 /// Boolean schema. Encodes as a single 0x00 / 0x01 byte. Mirrors Java `BooleanSchema`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BoolSchema;
@@ -156,5 +172,30 @@ mod tests {
         let s = Int32Schema::new();
         assert!(s.decode(&[0_u8, 0, 0]).is_err());
         assert!(s.decode(&[0_u8, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn time_schemas_share_int64_encoding_with_distinct_types() {
+        // Same bytes, different semantic discriminators — the broker decides intent
+        // from schema_type, not payload shape.
+        let v: i64 = 1_700_000_000_000;
+        let date = DateSchema::new();
+        let time = TimeSchema::new();
+        let ts = TimestampSchema::new();
+        let ld = LocalDateSchema::new();
+        let lt = LocalTimeSchema::new();
+        assert_eq!(date.encode(&v).unwrap(), time.encode(&v).unwrap());
+        assert_eq!(date.encode(&v).unwrap(), ts.encode(&v).unwrap());
+        assert_eq!(date.encode(&v).unwrap(), ld.encode(&v).unwrap());
+        assert_eq!(date.encode(&v).unwrap(), lt.encode(&v).unwrap());
+
+        assert_eq!(date.schema_type(), pb::schema::Type::Date);
+        assert_eq!(time.schema_type(), pb::schema::Type::Time);
+        assert_eq!(ts.schema_type(), pb::schema::Type::Timestamp);
+        assert_eq!(ld.schema_type(), pb::schema::Type::LocalDate);
+        assert_eq!(lt.schema_type(), pb::schema::Type::LocalTime);
+
+        assert_eq!(date.decode(&date.encode(&v).unwrap()).unwrap(), v);
+        assert_eq!(lt.decode(&lt.encode(&v).unwrap()).unwrap(), v);
     }
 }
