@@ -922,25 +922,25 @@ mod tests {
         // The watcher accessors all hang off `self.auto_update: Option<Arc<AutoUpdateTask>>`.
         // Replicate the public getter logic against a synthesised `Option<Arc<...>>` to
         // prove the wiring without a broker.
-        fn observed_partitions(t: &Option<Arc<AutoUpdateTask>>) -> Option<u32> {
-            t.as_ref().map(|x| *x.observed_partitions.lock())
+        fn observed_partitions(t: Option<&Arc<AutoUpdateTask>>) -> Option<u32> {
+            t.map(|x| *x.observed_partitions.lock())
         }
-        fn change_count(t: &Option<Arc<AutoUpdateTask>>) -> Option<u64> {
-            t.as_ref().map(|x| *x.change_count.lock())
+        fn change_count(t: Option<&Arc<AutoUpdateTask>>) -> Option<u64> {
+            t.map(|x| *x.change_count.lock())
         }
-        fn has_auto_update(t: &Option<Arc<AutoUpdateTask>>) -> bool {
+        fn has_auto_update(t: Option<&Arc<AutoUpdateTask>>) -> bool {
             t.is_some()
         }
-        fn partitions_changed_notify(t: &Option<Arc<AutoUpdateTask>>) -> Option<Arc<Notify>> {
-            t.as_ref().map(|x| x.changed.clone())
+        fn partitions_changed_notify(t: Option<&Arc<AutoUpdateTask>>) -> Option<Arc<Notify>> {
+            t.map(|x| x.changed.clone())
         }
 
         // Default case: no builder opt-in → `None`.
         let no_watcher: Option<Arc<AutoUpdateTask>> = None;
-        assert!(!has_auto_update(&no_watcher));
-        assert_eq!(observed_partitions(&no_watcher), None);
-        assert_eq!(change_count(&no_watcher), None);
-        assert!(partitions_changed_notify(&no_watcher).is_none());
+        assert!(!has_auto_update(no_watcher.as_ref()));
+        assert_eq!(observed_partitions(no_watcher.as_ref()), None);
+        assert_eq!(change_count(no_watcher.as_ref()), None);
+        assert!(partitions_changed_notify(no_watcher.as_ref()).is_none());
 
         // Opt-in case: synthesise an `AutoUpdateTask` directly. The watcher would
         // normally be spawned by `spawn_auto_update_task`; we replicate the surface
@@ -959,18 +959,18 @@ mod tests {
             handle: tokio::sync::Mutex::new(Some(handle)),
         });
         let with_watcher = Some(task);
-        assert!(has_auto_update(&with_watcher));
-        assert_eq!(observed_partitions(&with_watcher), Some(0));
-        assert_eq!(change_count(&with_watcher), Some(0));
-        assert!(partitions_changed_notify(&with_watcher).is_some());
+        assert!(has_auto_update(with_watcher.as_ref()));
+        assert_eq!(observed_partitions(with_watcher.as_ref()), Some(0));
+        assert_eq!(change_count(with_watcher.as_ref()), Some(0));
+        assert!(partitions_changed_notify(with_watcher.as_ref()).is_some());
 
         // Simulate a partition-count change observation and verify the counter and
         // Notify are wired through.
         *observed.lock() = 4;
         *changes.lock() = 1;
         notify.notify_waiters();
-        assert_eq!(observed_partitions(&with_watcher), Some(4));
-        assert_eq!(change_count(&with_watcher), Some(1));
+        assert_eq!(observed_partitions(with_watcher.as_ref()), Some(4));
+        assert_eq!(change_count(with_watcher.as_ref()), Some(1));
     }
 
     /// Confirm the zero-interval guard in
@@ -1007,9 +1007,9 @@ mod tests {
             Duration::from_millis(100),
         );
         let notify = task.changed.clone();
-        // Advance well past one interval and verify the notify fires.
-        let fut = notify.notified();
-        tokio::pin!(fut);
+        // Touch the Notify handle so its plumbing is exercised without committing to
+        // an awaiter (the spawned task may not have ticked in this fake-time turn).
+        assert!(Arc::strong_count(&notify) >= 2);
         tokio::time::advance(Duration::from_millis(150)).await;
         // Give the spawned task a chance to run.
         tokio::task::yield_now().await;
@@ -1017,7 +1017,6 @@ mod tests {
         // the topic was recorded and the handle is still alive (the timer is
         // running). The drop test below covers the abort-on-drop side.
         assert_eq!(task.topic, "persistent://public/default/timer-test");
-        let _ = fut; // unused; we just confirm the future was creatable.
 
         // Confirm Drop aborts the spawned task — after we drop the `Arc`, the
         // handle inside is moved out and aborted.

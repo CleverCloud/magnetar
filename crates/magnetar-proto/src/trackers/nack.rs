@@ -119,19 +119,32 @@ impl MultiplierRedeliveryBackoff {
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     #[must_use]
     pub fn delay_for(&self, redelivery_count: u32) -> Duration {
-        // `as i32` is fine even for huge `redelivery_count` because powi for any positive
-        // i32 saturates the result well past max_delay (caught by the clamp below). Negative
-        // outcomes do not occur — we never feed a negative count.
-        let factor = self.multiplier.powi(redelivery_count as i32);
-        // Saturate the millis-as-f64 conversion so an absurdly large min_delay does not
-        // wrap. f64 covers Duration::MAX comfortably for any realistic Pulsar config.
+        // Short-circuit large counts (with `multiplier > 1.0` the result has already
+        // exceeded `max_delay` by exponent ~64). This avoids relying on `f64::INFINITY`
+        // surviving the `.powi -> mul -> as u64` cast chain — `f64::INFINITY as u64`
+        // is platform-defined and on some hosts truncates to `0`, which would silently
+        // collapse the delay back to `min_delay`. The threshold is conservative; in
+        // practice broker-reported `redelivery_count` is bounded by `max_redeliver_count`
+        // (DLQ kicks in long before this), so this branch is purely defensive.
+        if self.multiplier > 1.0 && redelivery_count > 64 {
+            return self.max_delay;
+        }
+        let exp = redelivery_count.min(i32::MAX as u32) as i32;
+        let factor = self.multiplier.powi(exp);
         let min_ms_u128 = self.min_delay.as_millis();
         let min_ms = if min_ms_u128 > u128::from(u64::MAX) {
             u64::MAX as f64
         } else {
             min_ms_u128 as f64
         };
-        let scaled_ms = (min_ms * factor).clamp(0.0, u64::MAX as f64);
+        let product = min_ms * factor;
+        let scaled_ms = if !product.is_finite() || product > u64::MAX as f64 {
+            u64::MAX as f64
+        } else if product < 0.0 {
+            0.0
+        } else {
+            product
+        };
         let scaled = Duration::from_millis(scaled_ms as u64);
         if scaled < self.min_delay {
             self.min_delay
