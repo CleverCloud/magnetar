@@ -525,7 +525,7 @@ known-missing feature.
 | Listener registration | ✅ | ✅ | `TableView::listen` (`TableViewListener`). |
 | Schema-aware `TypedTableView` | ✅ | ✅ | `TypedTableView<S>` decodes per-read. |
 | `startMessageId` / `subscriptionProperty` / `property` knobs | ✅ | ✅ | `TableViewBuilder` knob set. |
-| Auto-update-partitions ticker | ✅ | ❌ | Same gap as PartitionedProducer. |
+| Auto-update-partitions ticker | ✅ | ✅ | `TableViewBuilder::auto_update_partitions_interval(Duration)` spawns a background timer that signals `TableView::partitions_changed_notify`; callers drive `refresh_partitions(&client)` from the signal (or on their own cadence) and the watcher records the observed count + change counter. |
 | `cryptoKeyReader` wired through | ✅ | ✅ | `TableViewBuilder::encryption` + `TypedTableViewBuilder::encryption` stamp the decryptor onto the underlying `ConsumerBuilder`. |
 
 ### Transactions (PIP-31)
