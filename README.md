@@ -595,7 +595,7 @@ known-missing feature.
 | `memoryLimit` | ✅ | ❌ | No global memory governor yet. |
 | `dnsResolver` customisation | ✅ | ❌ | Uses tokio default. |
 | `isClosed` / `shutdown` / `getLastDisconnectedTimestamp` | ✅ | ✅ | All exposed on `PulsarClient`. |
-| Cluster failover (PIP-121) | ✅ | ❌ | Planned for M9 milestone. |
+| Cluster failover (PIP-121) | ✅ | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ClientBuilder::service_url_provider`; `AutoClusterFailover` and `ControlledClusterFailover` policies pending. |
 
 ### Open structural gaps
 
@@ -632,7 +632,7 @@ known-missing feature.
 | PIP-180 | Shadow topic | ❌ | M9 |
 | PIP-415 | `getMessageIdByIndex` | ❌ | M9 |
 | PIP-33 | Replicated subscriptions | ❌ | M9 |
-| PIP-121 | Cluster failover (Auto + Controlled) | ❌ | M9 |
+| PIP-121 | Cluster failover (Auto + Controlled) | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` shipped; Auto/Controlled policies pending |
 
 ---
 

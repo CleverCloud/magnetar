@@ -923,6 +923,7 @@ impl PulsarClient {
 #[derive(Debug, Default, Clone)]
 pub struct ClientBuilder {
     service_url: Option<String>,
+    service_url_provider: Option<std::sync::Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     client_version: Option<String>,
     keepalive: Option<Duration>,
     operation_timeout: Option<Duration>,
@@ -940,6 +941,23 @@ impl ClientBuilder {
     #[must_use]
     pub fn service_url(mut self, url: impl Into<String>) -> Self {
         self.service_url = Some(url.into());
+        self
+    }
+
+    /// Set a pluggable [`magnetar_proto::ServiceUrlProvider`] consulted on every
+    /// (re)connection attempt. Mirrors Java
+    /// `ClientBuilder#serviceUrlProvider(ServiceUrlProvider)` — lays the groundwork
+    /// for PIP-121 cluster failover (`AutoClusterFailover` /
+    /// `ControlledClusterFailover`). When set, the provider's
+    /// `get_service_url()` is used at connect time; the unset form retains the
+    /// legacy `service_url(...)` shortcut and is internally wrapped in a
+    /// [`magnetar_proto::StaticServiceUrlProvider`] at build time.
+    #[must_use]
+    pub fn service_url_provider(
+        mut self,
+        provider: std::sync::Arc<dyn magnetar_proto::ServiceUrlProvider>,
+    ) -> Self {
+        self.service_url_provider = Some(provider);
         self
     }
 
@@ -1041,9 +1059,15 @@ impl ClientBuilder {
     /// [`PulsarError::Client`] if the underlying tokio engine fails to
     /// connect.
     pub async fn build(self) -> Result<PulsarClient> {
-        let service_url = self
-            .service_url
-            .ok_or_else(|| PulsarError::Config("service_url is required".to_owned()))?;
+        let service_url = match (&self.service_url_provider, &self.service_url) {
+            (Some(provider), _) => provider.get_service_url(),
+            (None, Some(url)) => url.clone(),
+            (None, None) => {
+                return Err(PulsarError::Config(
+                    "service_url or service_url_provider is required".to_owned(),
+                ));
+            }
+        };
         let mut config = magnetar_proto::conn::ConnectionConfig::default();
         if let Some(v) = self.client_version {
             config.client_version = v;
