@@ -80,6 +80,73 @@ primitive_schema!(TimestampSchema, i64, pb::schema::Type::Timestamp, 8);
 primitive_schema!(LocalDateSchema, i64, pb::schema::Type::LocalDate, 8);
 primitive_schema!(LocalTimeSchema, i64, pb::schema::Type::LocalTime, 8);
 
+// Instant / LocalDateTime schemas. Java encodes both as 12 bytes: i64 epoch seconds
+// big-endian followed by i32 nanos-of-second big-endian. The pair maps directly to
+// `std::time::SystemTime` or `chrono::DateTime` once converted, but magnetar-proto stays
+// chrono-free — callers expose their own type and convert.
+
+macro_rules! seconds_nanos_schema {
+    ($name:ident, $pb_type:expr, $java_name:literal) => {
+        #[doc = concat!(
+                    "Schema for `(i64 epoch seconds, i32 nanos-of-second)` values encoded as ",
+                    "12 bytes big-endian. Mirrors Java `",
+                    $java_name,
+                    "`."
+                )]
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $name;
+
+        impl $name {
+            /// Construct.
+            #[must_use]
+            pub const fn new() -> Self {
+                Self
+            }
+        }
+
+        impl Schema for $name {
+            type Owned = (i64, i32);
+
+            fn schema_type(&self) -> pb::schema::Type {
+                $pb_type
+            }
+
+            fn schema_data(&self) -> Bytes {
+                Bytes::new()
+            }
+
+            fn encode(&self, value: &Self::Owned) -> Result<Bytes, SchemaError> {
+                let (secs, nanos) = *value;
+                let mut buf = [0u8; 12];
+                buf[..8].copy_from_slice(&secs.to_be_bytes());
+                buf[8..].copy_from_slice(&nanos.to_be_bytes());
+                Ok(Bytes::copy_from_slice(&buf))
+            }
+
+            fn decode(&self, bytes: &[u8]) -> Result<Self::Owned, SchemaError> {
+                if bytes.len() != 12 {
+                    return Err(SchemaError::Mismatch {
+                        expected: "12-byte big-endian (i64 seconds, i32 nanos)".to_owned(),
+                        actual: format!("{}-byte payload", bytes.len()),
+                    });
+                }
+                let mut secs_buf = [0u8; 8];
+                let mut nanos_buf = [0u8; 4];
+                secs_buf.copy_from_slice(&bytes[..8]);
+                nanos_buf.copy_from_slice(&bytes[8..]);
+                Ok((i64::from_be_bytes(secs_buf), i32::from_be_bytes(nanos_buf)))
+            }
+        }
+    };
+}
+
+seconds_nanos_schema!(InstantSchema, pb::schema::Type::Instant, "InstantSchema");
+seconds_nanos_schema!(
+    LocalDateTimeSchema,
+    pb::schema::Type::LocalDateTime,
+    "LocalDateTimeSchema"
+);
+
 /// Boolean schema. Encodes as a single 0x00 / 0x01 byte. Mirrors Java `BooleanSchema`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BoolSchema;
@@ -172,6 +239,36 @@ mod tests {
         let s = Int32Schema::new();
         assert!(s.decode(&[0_u8, 0, 0]).is_err());
         assert!(s.decode(&[0_u8, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn instant_roundtrip() {
+        let s = InstantSchema::new();
+        for v in [
+            (0_i64, 0_i32),
+            (1, 1),
+            (-1, 999_999_999),
+            (1_700_000_000, 500_000_000),
+            (i64::MAX, i32::MAX),
+            (i64::MIN, 0),
+        ] {
+            let bytes = s.encode(&v).unwrap();
+            assert_eq!(bytes.len(), 12);
+            assert_eq!(s.decode(&bytes).unwrap(), v);
+        }
+        // Wrong size is rejected.
+        assert!(s.decode(&[0u8; 11]).is_err());
+        assert!(s.decode(&[0u8; 13]).is_err());
+    }
+
+    #[test]
+    fn instant_and_local_date_time_share_layout_with_distinct_types() {
+        let v = (1_234_567_890_i64, 42_i32);
+        let instant = InstantSchema::new();
+        let ldt = LocalDateTimeSchema::new();
+        assert_eq!(instant.encode(&v).unwrap(), ldt.encode(&v).unwrap());
+        assert_eq!(instant.schema_type(), pb::schema::Type::Instant);
+        assert_eq!(ldt.schema_type(), pb::schema::Type::LocalDateTime);
     }
 
     #[test]
