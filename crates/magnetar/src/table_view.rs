@@ -31,6 +31,10 @@ pub struct TableView {
     state: Arc<RwLock<HashMap<String, Bytes>>>,
     listeners: Arc<RwLock<Vec<TableViewListener>>>,
     drain: Arc<DrainTask>,
+    /// Clone of the underlying consumer kept for read-only introspection (stats,
+    /// connection state, last message id). The drain task owns its own clone; both share
+    /// the same `Arc<ConnectionShared>` so closes propagate.
+    consumer: magnetar_runtime_tokio::Consumer,
 }
 
 impl std::fmt::Debug for TableView {
@@ -137,6 +141,31 @@ impl TableView {
     pub fn listener_count(&self) -> usize {
         self.listeners.read().len()
     }
+
+    /// Cumulative consumer counters for the underlying subscription. Mirrors Java
+    /// `TableView#getStats` (the Java table view exposes its consumer's stats directly).
+    #[must_use]
+    pub fn stats(&self) -> magnetar_proto::ConsumerStats {
+        self.consumer.stats()
+    }
+
+    /// `true` while the broker connection backing the table view is up. Mirrors Java
+    /// `TableView#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.consumer.is_connected()
+    }
+
+    /// Ask the broker for the underlying topic's last-published message id. Mirrors Java
+    /// `TableView#getLastMessageId` — useful for "is the view caught up?" checks. The
+    /// table view itself does not track its own cursor; pair this with the timestamps on
+    /// the messages your listener observed.
+    pub async fn last_message_id(&self) -> Result<magnetar_proto::MessageId, PulsarError> {
+        self.consumer
+            .last_message_id()
+            .await
+            .map_err(PulsarError::Client)
+    }
 }
 
 /// Builder for a [`TableView`]. Mirrors `org.apache.pulsar.client.api.TableViewBuilder`.
@@ -221,6 +250,9 @@ impl<'a> TableViewBuilder<'a> {
         let listeners: Arc<RwLock<Vec<TableViewListener>>> =
             Arc::new(RwLock::new(self.listener.into_iter().collect()));
         let listeners_drain = listeners.clone();
+        // Hold a separate clone for read-only introspection on the public TableView. Both
+        // clones share the same Arc<ConnectionShared>, so close()/disconnect propagates.
+        let consumer_view = consumer.clone();
         let join = tokio::spawn(async move {
             loop {
                 let Ok(msg) = consumer.receive().await else {
@@ -267,6 +299,7 @@ impl<'a> TableViewBuilder<'a> {
             drain: Arc::new(DrainTask {
                 handle: tokio::sync::Mutex::new(Some(join)),
             }),
+            consumer: consumer_view,
         })
     }
 }
