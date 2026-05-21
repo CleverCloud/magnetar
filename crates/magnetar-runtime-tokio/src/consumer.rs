@@ -772,46 +772,111 @@ impl Consumer {
                 conn.pop_message(self.handle)
             };
             let Some(mut msg) = msg else { break };
-            post_process_message(&mut msg, self.decryptor.as_ref())?;
-            acc_bytes = acc_bytes.saturating_add(msg.payload.len());
-            out.push(msg);
+            // PIP-4: honor the per-consumer crypto failure action for any encrypted message
+            // popped here (the first message went through `receive()` which already does
+            // this).
+            let action = self
+                .shared
+                .inner
+                .lock()
+                .consumer_crypto_failure_action(self.handle);
+            match post_process_message(&mut msg, self.decryptor.as_ref(), action) {
+                PostProcessOutcome::Deliver => {
+                    acc_bytes = acc_bytes.saturating_add(msg.payload.len());
+                    out.push(msg);
+                }
+                PostProcessOutcome::Discard => {
+                    // Ack and continue — the caller should never see this message.
+                    let mut conn = self.shared.inner.lock();
+                    let _ = conn.ack(
+                        self.handle,
+                        magnetar_proto::AckRequest {
+                            message_ids: vec![msg.message_id],
+                            ack_type: magnetar_proto::pb::command_ack::AckType::Individual,
+                            properties: Vec::new(),
+                            txn_id: None,
+                        },
+                    );
+                    drop(conn);
+                    self.shared.driver_waker.notify_one();
+                }
+                PostProcessOutcome::Fail(err) => return Err(err),
+            }
         }
         Ok(out)
     }
 }
 
+/// Outcome returned by [`post_process_message`].
+#[derive(Debug)]
+enum PostProcessOutcome {
+    /// The message is ready for the caller (plaintext, or — under `Consume` — ciphertext).
+    Deliver,
+    /// Decryption failed and the policy is [`magnetar_proto::CryptoFailureAction::Discard`].
+    /// The caller should ack the message and continue.
+    Discard,
+    /// Either decryption failed and the policy is `Fail`, or another step (decompression,
+    /// unknown compression code) hit an unrecoverable error. The caller should surface this
+    /// error.
+    Fail(ClientError),
+}
+
 /// Apply the consumer-side decompression + PIP-4 decryption pipeline to a message popped
 /// straight from the sans-io state machine. Mirrors the inline logic in [`ReceiveFut::poll`].
+/// `crypto_failure_action` governs what happens when the decryption step fails (see
+/// [`magnetar_proto::CryptoFailureAction`]).
 fn post_process_message(
     msg: &mut IncomingMessage,
     decryptor: Option<&Arc<dyn crate::crypto::MessageDecryptor>>,
-) -> Result<(), ClientError> {
+    crypto_failure_action: magnetar_proto::CryptoFailureAction,
+) -> PostProcessOutcome {
     if let Some(kind_i32) = msg.metadata.compression {
-        let pb_kind = magnetar_proto::pb::CompressionType::try_from(kind_i32)
-            .map_err(|_| ClientError::Other(format!("unknown compression code {kind_i32}")))?;
+        let Ok(pb_kind) = magnetar_proto::pb::CompressionType::try_from(kind_i32) else {
+            return PostProcessOutcome::Fail(ClientError::Other(format!(
+                "unknown compression code {kind_i32}"
+            )));
+        };
         let kind = crate::compress::kind_from_pb(pb_kind);
         if kind != magnetar_proto::types::CompressionKind::None {
             let expected = msg
                 .metadata
                 .uncompressed_size
                 .map_or(msg.payload.len(), |s| s as usize);
-            let plain = crate::compress::decompress(kind, &msg.payload, expected)
-                .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
-            msg.payload = plain;
+            match crate::compress::decompress(kind, &msg.payload, expected) {
+                Ok(plain) => msg.payload = plain,
+                Err(err) => {
+                    return PostProcessOutcome::Fail(ClientError::Other(format!(
+                        "decompress: {err}"
+                    )));
+                }
+            }
         }
     }
     if !msg.metadata.encryption_keys.is_empty() {
-        let Some(d) = decryptor else {
-            return Err(ClientError::Other(
+        let decrypt_result: Result<bytes::Bytes, ClientError> = match decryptor {
+            Some(d) => d
+                .decrypt(&msg.payload, &msg.metadata)
+                .map_err(|err| ClientError::Other(format!("decrypt: {err}"))),
+            None => Err(ClientError::Other(
                 "received encrypted message but consumer has no decryptor configured".to_owned(),
-            ));
+            )),
         };
-        let plain = d
-            .decrypt(&msg.payload, &msg.metadata)
-            .map_err(|err| ClientError::Other(format!("decrypt: {err}")))?;
-        msg.payload = plain;
+        match decrypt_result {
+            Ok(plain) => msg.payload = plain,
+            Err(err) => match crypto_failure_action {
+                magnetar_proto::CryptoFailureAction::Fail => {
+                    return PostProcessOutcome::Fail(err);
+                }
+                magnetar_proto::CryptoFailureAction::Discard => return PostProcessOutcome::Discard,
+                magnetar_proto::CryptoFailureAction::Consume => {
+                    // Preserve the ciphertext payload as-is; metadata.encryption_keys signals
+                    // to the caller that the bytes are still encrypted.
+                    return PostProcessOutcome::Deliver;
+                }
+            },
+        }
     }
-    Ok(())
+    PostProcessOutcome::Deliver
 }
 
 /// Future returned by [`Consumer::receive`].
@@ -829,8 +894,36 @@ impl Future for ReceiveFut {
     type Output = Result<IncomingMessage, ClientError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.shared.inner.lock();
-        if let Some(mut msg) = conn.pop_message(self.handle) {
+        // Loop so that PIP-4 `Discard` can ack the undecryptable message and immediately try
+        // the next queued one without bouncing back to the executor — otherwise the caller
+        // would need to re-poll just to skip a single dropped message.
+        loop {
+            let mut conn = self.shared.inner.lock();
+            let Some(mut msg) = conn.pop_message(self.handle) else {
+                drop(conn);
+                // Drain any state-machine events that may have arrived; we keep events queued
+                // but no typed waker channel for arrival yet. The driver loop's `notify_one`
+                // after handling bytes will re-poll us.
+                //
+                // Re-arm the per-future driver wake-up. We piggyback on
+                // `driver_waker.notified()` via a future-local notification subscription: the
+                // driver task notifies *all* parked tasks after any inbound bytes are
+                // processed.
+                //
+                // TODO(M3 follow-up): wire a dedicated per-consumer waker slab into
+                // `Connection` so receive() resolves exactly when a `CommandMessage` is
+                // delivered, instead of being re-polled on every inbound packet. Until then
+                // this is correct but not maximally efficient.
+                self.registered_waker = Some(cx.waker().clone());
+                let notified = self.shared.driver_waker.notified();
+                tokio::pin!(notified);
+                // Register interest so the next `notify_one` wakes our task.
+                if notified.as_mut().enable() {
+                    // Already notified: poll immediately.
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Pending;
+            };
             drop(conn);
             // Decompress the payload if the broker stamped a compression kind on it. Producer-
             // side compression lives in `producer::Producer::send`; this is the symmetric
@@ -871,41 +964,63 @@ impl Future for ReceiveFut {
             // we accept that combining compression + encryption on the *same* message may
             // need a follow-up to match Java exactly for batched paths.
             if !msg.metadata.encryption_keys.is_empty() {
-                let Some(decryptor) = self.decryptor.as_ref() else {
-                    return Poll::Ready(Err(ClientError::Other(
-                        "received encrypted message but consumer has no decryptor configured"
-                            .to_owned(),
-                    )));
-                };
-                let plaintext = decryptor
-                    .decrypt(&msg.payload, &msg.metadata)
-                    .map_err(|err| ClientError::Other(format!("decrypt: {err}")))?;
-                msg.payload = plaintext;
+                // The decryption failure policy is per-consumer (PIP-4). We resolve it now —
+                // before attempting decrypt — so that even the "no decryptor configured" path
+                // can honor `Discard` / `Consume` instead of unconditionally failing.
+                let action = self
+                    .shared
+                    .inner
+                    .lock()
+                    .consumer_crypto_failure_action(self.handle);
+                let decrypt_result: Result<bytes::Bytes, ClientError> =
+                    match self.decryptor.as_ref() {
+                        Some(decryptor) => decryptor
+                            .decrypt(&msg.payload, &msg.metadata)
+                            .map_err(|err| ClientError::Other(format!("decrypt: {err}"))),
+                        None => Err(ClientError::Other(
+                            "received encrypted message but consumer has no decryptor configured"
+                                .to_owned(),
+                        )),
+                    };
+                match decrypt_result {
+                    Ok(plaintext) => {
+                        msg.payload = plaintext;
+                    }
+                    Err(err) => match action {
+                        magnetar_proto::CryptoFailureAction::Fail => {
+                            return Poll::Ready(Err(err));
+                        }
+                        magnetar_proto::CryptoFailureAction::Discard => {
+                            // Ack the undecryptable message so the broker doesn't redeliver it
+                            // (the only consumer of this subscription couldn't read it
+                            // anyway), then loop to try the next queued message. Mirrors
+                            // Java's `ConsumerImpl#decryptPayloadIfNeeded` which calls
+                            // `discardMessage(...)` (an explicit ack) when the policy is
+                            // `DISCARD`.
+                            let mut conn = self.shared.inner.lock();
+                            let _ = conn.ack(
+                                self.handle,
+                                magnetar_proto::AckRequest {
+                                    message_ids: vec![msg.message_id],
+                                    ack_type: magnetar_proto::pb::command_ack::AckType::Individual,
+                                    properties: Vec::new(),
+                                    txn_id: None,
+                                },
+                            );
+                            drop(conn);
+                            self.shared.driver_waker.notify_one();
+                            continue;
+                        }
+                        magnetar_proto::CryptoFailureAction::Consume => {
+                            // Hand the ciphertext + `encryption_keys` metadata back to the
+                            // caller untouched, so they can attempt out-of-band decryption.
+                            return Poll::Ready(Ok(msg));
+                        }
+                    },
+                }
             }
             return Poll::Ready(Ok(msg));
         }
-        // Drain any state-machine events that may have arrived; we keep events queued but no
-        // typed waker channel for arrival yet. The driver loop's `notify_one` after handling
-        // bytes will re-poll us.
-        drop(conn);
-
-        // Re-arm the per-future driver wake-up. We piggyback on `driver_waker.notified()` via a
-        // future-local notification subscription: the driver task notifies *all* parked tasks
-        // after any inbound bytes are processed.
-        //
-        // TODO(M3 follow-up): wire a dedicated per-consumer waker slab into `Connection` so
-        // receive() resolves exactly when a `CommandMessage` is delivered, instead of being
-        // re-polled on every inbound packet. Until then this is correct but not maximally
-        // efficient.
-        self.registered_waker = Some(cx.waker().clone());
-        let notified = self.shared.driver_waker.notified();
-        tokio::pin!(notified);
-        // Register interest so the next `notify_one` wakes our task.
-        if notified.as_mut().enable() {
-            // Already notified: poll immediately.
-            cx.waker().wake_by_ref();
-        }
-        Poll::Pending
     }
 }
 
