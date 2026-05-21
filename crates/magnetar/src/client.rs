@@ -1428,6 +1428,34 @@ impl Reader {
     pub fn is_inactive(&self) -> bool {
         self.consumer.is_inactive()
     }
+
+    /// `true` once the reader's underlying subscription has been closed locally or by
+    /// the broker. Mirrors Java `Reader#isClosed`.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.consumer.is_closed()
+    }
+
+    /// Number of messages currently buffered in the reader's receiver queue, waiting for
+    /// a `read_next` call to pull them out. Mirrors Java
+    /// `Reader#getNumOfPendingMessages` semantics.
+    #[must_use]
+    pub fn available_in_queue(&self) -> usize {
+        self.consumer.available_in_queue()
+    }
+
+    /// Number of dispatch permits this reader still has with the broker.
+    #[must_use]
+    pub fn available_permits(&self) -> u32 {
+        self.consumer.available_permits()
+    }
+
+    /// `true` if the reader has received at least one message since opening. Mirrors
+    /// Java `Reader#hasReceivedAnyMessage`.
+    #[must_use]
+    pub fn has_received_any_message(&self) -> bool {
+        self.consumer.has_received_any_message()
+    }
 }
 
 #[cfg(test)]
