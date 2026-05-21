@@ -95,15 +95,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-no-io-deps
 
-  e2e:
-    name: e2e (Pulsar 4.x standalone)
+  moonpool-sim:
+    name: moonpool deterministic-simulation
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/release/') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --features e2e --locked
+      - name: Build moonpool engine
+        run: cargo build -p magnetar-runtime-moonpool --all-features --locked
+      - name: Run moonpool-sim test suite
+        # The moonpool engine carries its own deterministic-simulation tests
+        # (driver + client + producer + consumer façades, TLS handshake under
+        # chaos). They are pure unit / integration tests inside
+        # `magnetar-runtime-moonpool` — no Docker needed and they reproduce
+        # bit-for-bit under a given seed.
+        run: cargo test -p magnetar-runtime-moonpool --all-features --locked
+
+  e2e:
+    name: e2e (Pulsar 4.x standalone)
+    runs-on: ubuntu-latest
+    # Always runs on pushes to main and on PRs targeting main so the
+    # behavioural parity suite gates merges. workflow_dispatch lets
+    # maintainers retrigger after a docker-hub blip.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pre-pull Pulsar image (caches the layer for faster container startup)
+        run: docker pull apachepulsar/pulsar:4.0.4
+      - name: Run e2e suite
+        run: cargo test --workspace --features e2e --locked -- --nocapture
+        timeout-minutes: 30
 
   mutants-smoke:
     name: cargo-mutants smoke (magnetar-proto)
