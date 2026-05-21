@@ -118,4 +118,51 @@ mod tests {
         let err = schema.decode(b"{not json}").unwrap_err();
         assert!(matches!(err, SchemaError::Decoding(_)));
     }
+
+    #[test]
+    fn unknown_field_in_payload_is_accepted() {
+        // serde_json accepts unknown fields by default — this documents the
+        // status quo so a future migration to `deny_unknown_fields` is an
+        // explicit change, not a silent one.
+        let schema = JsonSchema::<Person>::new();
+        let payload = br#"{"name":"Bob","age":42,"extra":"ignored"}"#;
+        let decoded = schema.decode(payload).unwrap();
+        assert_eq!(decoded.name, "Bob");
+        assert_eq!(decoded.age, 42);
+    }
+
+    #[test]
+    fn missing_required_field_rejected() {
+        let schema = JsonSchema::<Person>::new();
+        let payload = br#"{"name":"Bob"}"#; // missing `age`
+        let err = schema.decode(payload).unwrap_err();
+        assert!(matches!(err, SchemaError::Decoding(_)));
+    }
+
+    #[test]
+    fn wrong_type_for_field_rejected() {
+        let schema = JsonSchema::<Person>::new();
+        let payload = br#"{"name":"Bob","age":"forty-two"}"#;
+        let err = schema.decode(payload).unwrap_err();
+        assert!(matches!(err, SchemaError::Decoding(_)));
+    }
+
+    #[test]
+    fn empty_payload_rejected() {
+        let schema = JsonSchema::<Person>::new();
+        let err = schema.decode(b"").unwrap_err();
+        assert!(matches!(err, SchemaError::Decoding(_)));
+    }
+
+    #[test]
+    fn unicode_in_field_value_round_trips() {
+        let schema = JsonSchema::<Person>::new();
+        let value = Person {
+            name: "Élise · μ".to_owned(),
+            age: 30,
+        };
+        let encoded = schema.encode(&value).unwrap();
+        let decoded = schema.decode(&encoded).unwrap();
+        assert_eq!(decoded, value);
+    }
 }
