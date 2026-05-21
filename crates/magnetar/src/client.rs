@@ -920,6 +920,50 @@ impl<'a> ReaderBuilder<'a> {
         self
     }
 
+    /// Read from the compacted (key-deduplicated) view of the topic. Mirrors Java
+    /// `ReaderBuilder#readCompacted`. Required for compacted-topic readers.
+    #[must_use]
+    pub fn read_compacted(mut self, on: bool) -> Self {
+        self.inner = self.inner.read_compacted(on);
+        self
+    }
+
+    /// Override the initial message id the reader starts from. Mirrors Java
+    /// `ReaderBuilder#startMessageId`. Pass [`magnetar_proto::MessageId::EARLIEST`] /
+    /// [`magnetar_proto::MessageId::LATEST`] for the sentinel positions.
+    #[must_use]
+    pub fn start_message_id(mut self, id: magnetar_proto::MessageId) -> Self {
+        self.inner = self.inner.start_message_id(id);
+        self
+    }
+
+    /// Mirrors Java `ReaderBuilder#cryptoKeyReader` — supplies a PIP-4 decryptor for the
+    /// reader's underlying subscription.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.inner = self.inner.encryption(decryptor);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::property`. The reader's underlying consumer carries the
+    /// (key, value) pair on its `CommandSubscribe.metadata`.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.inner = self.inner.property(key, value);
+        self
+    }
+
+    /// Roll the reader cursor back by `seconds` at create time. Mirrors Java
+    /// `ReaderBuilder#startMessageIdInclusive` rollback knob.
+    #[must_use]
+    pub fn start_message_rollback_duration(mut self, seconds: u64) -> Self {
+        self.inner = self.inner.start_message_rollback_duration(seconds);
+        self
+    }
+
     /// Create the reader.
     pub async fn create(self) -> Result<Reader> {
         let consumer = self.inner.subscribe().await?;
