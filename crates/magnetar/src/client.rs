@@ -1009,6 +1009,23 @@ impl Reader {
         Ok(msg)
     }
 
+    /// Same as [`Self::read_next`] but bounded by `timeout`. Returns `Ok(None)` when the
+    /// deadline elapses with no message. Mirrors Java
+    /// `Reader#readNext(int timeout, TimeUnit unit)`.
+    pub async fn read_next_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<magnetar_proto::IncomingMessage>, PulsarError> {
+        match tokio::time::timeout(timeout, self.consumer.receive()).await {
+            Ok(Ok(msg)) => {
+                *self.last_received.lock() = Some(msg.message_id);
+                Ok(Some(msg))
+            }
+            Ok(Err(err)) => Err(PulsarError::Client(err)),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Returns the raw [`magnetar_runtime_tokio::ReceiveFut`] without per-reader cursor
     /// tracking. Use this when integrating with a custom select loop where you want
     /// cancel-safe receive futures; pair with [`Self::record_received`] if you still want
