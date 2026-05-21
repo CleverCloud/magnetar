@@ -60,6 +60,7 @@
 )]
 
 mod client;
+mod consumer;
 mod driver;
 mod producer;
 pub mod tls;
@@ -75,6 +76,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 pub use crate::client::{Client, ClientError, LookupTopicResult};
+pub use crate::consumer::Consumer;
 pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
 use crate::transport::Transport;
