@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! End-to-end coverage for Stage 2 + Stage 3 supervised reconnect.
+//!
+//! Pins the contract that magnetar's
+//! [`magnetar_proto::SupervisorConfig`]-driven reconnect loop transparently
+//! rebuilds producers and consumers across a broker restart:
+//!
+//! * **Stage 2** — when the underlying TCP socket drops (broker stopped), the driver backs off,
+//!   redials, and re-handshakes; the user-facing `Producer` / `Consumer` handles stay live.
+//! * **Stage 3** — on every reconnect, `Connection::rebuild_producers` and `rebuild_consumers`
+//!   re-issue `CommandProducer` / `CommandSubscribe`, so a `send` / `receive` issued after the
+//!   restart succeeds without the user re-creating the handles.
+//!
+//! The simulation we can realistically run with `testcontainers` is "stop
+//! the broker, start it back up." Mid-frame chaos (in-flight ops cut
+//! mid-byte, virtual-clock backoff jitter) is moonpool territory and
+//! lives in the deterministic-simulation engine.
+//!
+//! A forced `Connection::reset()` sub-test would require a public test
+//! hook to drive the reset path from outside the driver loop; no such
+//! hook is exposed today, so that path is exercised only indirectly via
+//! the broker restart below.
+//!
+//! Gated behind the `e2e` feature flag. Run with:
+//!
+//! ```sh
+//! cargo test --features e2e -p magnetar --test e2e_reconnect -- --nocapture --ignored
+//! ```
+
+#![cfg(feature = "e2e")]
+
+use std::time::Duration;
+
+use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
+use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{GenericImage, ImageExt};
+use uuid::Uuid;
+
+const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
+const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const BROKER_BINARY_PORT: u16 = 6650;
+const BROKER_HTTP_PORT: u16 = 8080;
+
+fn image_repo() -> String {
+    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
+}
+
+fn image_tag() -> String {
+    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
+}
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+/// Start a Pulsar 4.x standalone container and return
+/// (`service_url`, `admin_url`, `container_handle`). Mirrors the helper
+/// in `e2e_pulsar.rs`; duplicated rather than shared because integration
+/// test files cannot share modules without a `tests/common/` layout that
+/// the rest of the suite does not adopt.
+async fn start_pulsar() -> Result<
+    (String, String, testcontainers::ContainerAsync<GenericImage>),
+    Box<dyn std::error::Error>,
+> {
+    init_tracing();
+    let container = GenericImage::new(image_repo(), image_tag())
+        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
+        .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
+        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_startup_timeout(Duration::from_secs(120))
+        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let binary_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+    let http_port = container.get_host_port_ipv4(BROKER_HTTP_PORT).await?;
+    let service_url = format!("pulsar://{host}:{binary_port}");
+    let admin_url = format!("http://{host}:{http_port}");
+    Ok((service_url, admin_url, container))
+}
+
+/// Generous reconnect budget — the broker takes several seconds to come
+/// back online after a restart, so we widen the backoff schedule beyond
+/// the default. `max_attempts = None` keeps the supervised driver
+/// redialing forever, mirroring the Java client default.
+fn supervisor_for_e2e() -> SupervisorConfig {
+    SupervisorConfig {
+        initial_backoff: Duration::from_millis(200),
+        max_backoff: Duration::from_secs(5),
+        mandatory_stop: Duration::from_secs(180),
+        max_attempts: None,
+    }
+}
+
+/// Stage 2 + Stage 3: stop the broker mid-session, restart it, verify
+/// that producers and consumers built before the outage successfully
+/// round-trip a message after the broker returns. Pins the
+/// supervised-reconnect + transparent-rebuild contract end-to-end.
+///
+/// `testcontainers` 0.27 has no `restart_async`; instead we call
+/// `stop_with_timeout(Some(5))` then `start()` on the same container
+/// handle. The container id (and therefore the host-port binding from
+/// Docker's NAT table) is preserved across the cycle, so the
+/// `service_url` we built at first start stays valid for the reconnect.
+#[ignore = "e2e: requires Docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (service_url, _admin_url, container) = start_pulsar().await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .enable_reconnect(supervisor_for_e2e())
+        .operation_timeout(Duration::from_secs(60))
+        .build()
+        .await?;
+
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-reconnect-{}",
+        Uuid::new_v4()
+    );
+    let subscription = format!("magnetar-e2e-reconnect-sub-{}", Uuid::new_v4());
+
+    let producer = client.producer(&topic).create().await?;
+    let consumer = client
+        .consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Exclusive)
+        .subscribe()
+        .await?;
+
+    // Sanity round-trip before the restart so we know the session is healthy.
+    producer
+        .send(OutgoingMessage::with_payload(b"before-restart".to_vec()).into())
+        .await?;
+    let pre = tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await??;
+    assert_eq!(pre.payload.as_ref(), b"before-restart");
+    consumer.ack(pre.message_id).await?;
+
+    // Stop the broker. SIGTERM with a short grace period mimics a real
+    // transient outage rather than an instant SIGKILL.
+    tracing::info!("stopping pulsar container to force reconnect");
+    container.stop_with_timeout(Some(5)).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Restart. `start()` reuses the same container id; the host-port
+    // mapping in Docker's NAT table persists, so `service_url` from the
+    // first start remains valid.
+    tracing::info!("starting pulsar container to verify reconnect");
+    container.start().await?;
+
+    // The broker takes a few seconds to come back. The supervisor
+    // handles retries; we poll send() until it succeeds or the budget
+    // runs out so the test fails fast if the supervisor gave up.
+    let payload = b"after-restart".to_vec();
+    let mut attempts = 0u32;
+    let send_outcome = loop {
+        attempts += 1;
+        match producer
+            .send(OutgoingMessage::with_payload(payload.clone()).into())
+            .await
+        {
+            Ok(_message_id) => break Ok(()),
+            Err(e) if attempts < 30 => {
+                tracing::info!(?e, attempts, "producer send retry after broker restart");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    send_outcome?;
+
+    // The supervisor + rebuild path re-subscribes the consumer; the
+    // message above must arrive without us re-creating the handle.
+    let post = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    assert_eq!(
+        post.payload.as_ref(),
+        payload.as_slice(),
+        "consumer must receive the post-restart message after supervised reconnect",
+    );
+    consumer.ack(post.message_id).await?;
+
+    consumer.close().await?;
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}
