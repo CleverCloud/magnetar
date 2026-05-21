@@ -421,6 +421,20 @@ impl IncomingMessage {
         self.id.partition >= 0
     }
 
+    /// Payload size in bytes (post-decompression / post-decryption). Mirrors Java
+    /// `Message#size`. Equivalent to `self.payload.len()`.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// `true` if the payload is empty — the Pulsar convention for a tombstone in a
+    /// compacted topic. Mirrors Java `Message#isEmpty`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+
     /// Mirrors Java `Message#hasReplicateTo`. `true` when the producer stamped an explicit
     /// replication cluster list (via `OutgoingMessage::replication_clusters` /
     /// `disable_replication`).
