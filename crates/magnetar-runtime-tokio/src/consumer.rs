@@ -216,8 +216,9 @@ impl Consumer {
     /// consumers. With no tracker configured, falls back to a synchronous immediate
     /// `CommandAck` so the message is never silently dropped.
     pub fn ack_grouped(&self, message_id: MessageId) {
+        let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
-        conn.ack_grouped_individual(self.handle, message_id);
+        conn.ack_grouped_individual(self.handle, message_id, now);
         drop(conn);
         self.shared.driver_waker.notify_one();
     }
@@ -225,8 +226,9 @@ impl Consumer {
     /// Stage a cumulative ack into the consumer's ack-grouping tracker. See
     /// [`Self::ack_grouped`] for the semantics.
     pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
-        conn.ack_grouped_cumulative(self.handle, message_id);
+        conn.ack_grouped_cumulative(self.handle, message_id, now);
         drop(conn);
         self.shared.driver_waker.notify_one();
     }
@@ -326,8 +328,9 @@ impl Consumer {
 
     /// Negatively acknowledge a batch of messages.
     pub fn negative_ack_many(&self, message_ids: Vec<MessageId>) {
+        let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
-        conn.negative_ack(self.handle, message_ids);
+        conn.negative_ack(self.handle, message_ids, now);
         drop(conn);
         self.shared.driver_waker.notify_one();
     }
@@ -337,8 +340,9 @@ impl Consumer {
     /// `magnetar_proto::trackers::nack::MultiplierRedeliveryBackoff::delay_for` to compute
     /// the delay from the broker-reported redelivery count.
     pub fn negative_ack_with_delay(&self, message_id: MessageId, delay: std::time::Duration) {
+        let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
-        conn.negative_ack_with_delay(self.handle, message_id, delay);
+        conn.negative_ack_with_delay(self.handle, message_id, delay, now);
         drop(conn);
         self.shared.driver_waker.notify_one();
     }

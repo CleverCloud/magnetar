@@ -165,8 +165,9 @@ impl Producer {
         }
 
         let result = {
+            let now = std::time::Instant::now();
             let mut conn = self.shared.inner.lock();
-            conn.send(self.handle, msg, publish_time_ms)
+            conn.send(self.handle, msg, publish_time_ms, now)
         };
 
         // Wake the driver so it can drain the freshly-queued frame.
@@ -195,8 +196,9 @@ impl Producer {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
         {
+            let now = std::time::Instant::now();
             let mut conn = self.shared.inner.lock();
-            conn.flush_producer(self.handle, publish_time_ms);
+            conn.flush_producer(self.handle, publish_time_ms, now);
         }
         self.shared.driver_waker.notify_one();
 
@@ -469,6 +471,7 @@ mod tests {
                     txn_id: None,
                 },
                 1_700_000_000_000,
+                std::time::Instant::now(),
             );
             h
         };

@@ -408,6 +408,7 @@ impl ConsumerState {
         metadata: pb::MessageMetadata,
         broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
         body: Bytes,
+        now: std::time::Instant,
     ) -> Result<DeliverOutcome, ConsumerError> {
         if self.closed {
             return Err(ConsumerError::Closed);
@@ -472,11 +473,11 @@ impl ConsumerState {
                     payload: assembled,
                     redelivery_count,
                     broker_entry_metadata: bem,
-                    arrived_at: std::time::Instant::now(),
+                    arrived_at: now,
                 };
                 self.total_chunked_msgs_received =
                     self.total_chunked_msgs_received.saturating_add(1);
-                let trigger = self.classify_and_queue(im, redelivery_count);
+                let trigger = self.classify_and_queue(im, redelivery_count, now);
                 return Ok(trigger);
             }
         }
@@ -520,9 +521,9 @@ impl ConsumerState {
                     payload,
                     redelivery_count: redelivery,
                     broker_entry_metadata: broker_entry_metadata.clone(),
-                    arrived_at: std::time::Instant::now(),
+                    arrived_at: now,
                 };
-                self.classify_and_queue(im, redelivery);
+                self.classify_and_queue(im, redelivery, now);
                 delivered += 1;
             }
             self.wake_receivers();
@@ -541,14 +542,21 @@ impl ConsumerState {
             broker_entry_metadata,
             arrived_at: std::time::Instant::now(),
         };
-        let outcome = self.classify_and_queue(im, redelivery);
+        let outcome = self.classify_and_queue(im, redelivery, now);
         self.wake_receivers();
         Ok(outcome)
     }
 
     /// Route an [`IncomingMessage`] to the queue or the DLQ pending list. Returns the
-    /// `DeliverOutcome::Delivered` count.
-    fn classify_and_queue(&mut self, msg: IncomingMessage, redelivery: u32) -> DeliverOutcome {
+    /// `DeliverOutcome::Delivered` count. `now` is the caller-supplied monotonic
+    /// timestamp used by the ack-timeout tracker so the sans-io state machine never
+    /// reaches for its own clock.
+    fn classify_and_queue(
+        &mut self,
+        msg: IncomingMessage,
+        redelivery: u32,
+        now: std::time::Instant,
+    ) -> DeliverOutcome {
         let payload_len = msg.payload.len();
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
             self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
@@ -559,13 +567,10 @@ impl ConsumerState {
             self.total_bytes_received =
                 self.total_bytes_received.saturating_add(payload_len as u64);
             // Track for ack-timeout-driven redelivery — backoff-aware when the consumer was
-            // configured with a PIP-37 `AckTimeoutRedeliveryBackoff`.
+            // configured with a PIP-37 `AckTimeoutRedeliveryBackoff`. `now` is supplied by
+            // the caller so the sans-io state machine never reads its own clock.
             if let Some(tracker) = self.unacked_tracker.as_mut() {
-                tracker.add_with_redelivery_count(
-                    msg.message_id,
-                    msg.redelivery_count,
-                    std::time::Instant::now(),
-                );
+                tracker.add_with_redelivery_count(msg.message_id, msg.redelivery_count, now);
             }
             self.queue.push_back(msg);
             DeliverOutcome::Delivered {

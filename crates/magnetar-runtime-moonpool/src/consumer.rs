@@ -217,9 +217,10 @@ impl<P: Providers> Consumer<P> {
     ///
     /// Mirrors `org.apache.pulsar.client.api.Consumer#negativeAcknowledge`.
     pub fn negative_ack(&self, message_id: MessageId) {
+        let now = std::time::Instant::now();
         {
             let mut conn = self.shared.inner.lock();
-            conn.negative_ack(self.handle, vec![message_id]);
+            conn.negative_ack(self.handle, vec![message_id], now);
         }
         self.shared.driver_waker.notify_one();
     }

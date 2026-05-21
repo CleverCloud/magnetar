@@ -485,6 +485,7 @@ impl ProducerState {
         &mut self,
         msg: OutgoingMessage,
         publish_time_ms: u64,
+        now: std::time::Instant,
     ) -> Result<SendDecision, ProducerError> {
         if self.closed {
             return Err(ProducerError::Closed);
@@ -507,16 +508,16 @@ impl ProducerState {
                 // can_batch returning true on a payload larger than max_message_size is
                 // possible only if max_batch_size_bytes >= max_message_size, which is rare but
                 // legal; the Java client honours the batch path in that case.
-                return self.add_to_batch(msg, publish_time_ms);
+                return self.add_to_batch(msg, publish_time_ms, now);
             }
-            return self.emit_chunked(msg, publish_time_ms);
+            return self.emit_chunked(msg, publish_time_ms, now);
         }
 
         if can_batch {
-            return self.add_to_batch(msg, publish_time_ms);
+            return self.add_to_batch(msg, publish_time_ms, now);
         }
 
-        self.emit_single(msg, publish_time_ms)
+        self.emit_single(msg, publish_time_ms, now)
     }
 
     /// Emit a single SEND frame for a small, non-batched message.
@@ -524,6 +525,7 @@ impl ProducerState {
         &mut self,
         mut msg: OutgoingMessage,
         publish_time_ms: u64,
+        now: std::time::Instant,
     ) -> Result<SendDecision, ProducerError> {
         // Pulsar invariant: even a non-chunked, non-batched send must declare exactly one chunk
         // — explicitly setting `total_chunks` is what the broker uses to disambiguate from a
@@ -573,7 +575,7 @@ impl ProducerState {
             waker: None,
             receipt: None,
             error: None,
-            enqueued_at: std::time::Instant::now(),
+            enqueued_at: now,
         };
         self.pending_index.insert(seq, self.pending.len());
         self.pending.push_back(op);
@@ -585,6 +587,7 @@ impl ProducerState {
         &mut self,
         msg: OutgoingMessage,
         publish_time_ms: u64,
+        now: std::time::Instant,
     ) -> Result<SendDecision, ProducerError> {
         let _ = publish_time_ms; // publish time gets stamped at flush
         let payload = msg.payload;
@@ -618,11 +621,12 @@ impl ProducerState {
         if self.batch.lowest_sequence_id.is_none() {
             self.batch.lowest_sequence_id = Some(self.next_sequence_id);
         }
-        // First message in the current batch — stamp the wall-clock timestamp so
+        // First message in the current batch — stamp the monotonic timestamp so
         // `Connection::handle_timeout` can force a flush once
-        // `batching_max_publish_delay` has elapsed.
+        // `batching_max_publish_delay` has elapsed. The caller-provided `now`
+        // keeps the state machine sans-io: no internal clock reads.
         if self.batch.first_added_at.is_none() {
-            self.batch.first_added_at = Some(std::time::Instant::now());
+            self.batch.first_added_at = Some(now);
         }
         Ok(SendDecision::Batched)
     }
@@ -647,8 +651,11 @@ impl ProducerState {
     /// and any encryption of the concatenated payload. We hand back the raw concatenated bytes
     /// (singles' length-prefixed metadata followed by payload).
     ///
+    /// `now` is the caller-supplied monotonic timestamp recorded on the resulting `OpSend`
+    /// so the sans-io state machine never reads its own clock.
+    ///
     /// Returns the number of frames now queued (always 0 or 1).
-    pub fn flush_batch(&mut self, publish_time_ms: u64) -> usize {
+    pub fn flush_batch(&mut self, publish_time_ms: u64, now: std::time::Instant) -> usize {
         if self.batch.is_empty() || self.closed {
             return 0;
         }
@@ -729,7 +736,7 @@ impl ProducerState {
             waker: None,
             receipt: None,
             error: None,
-            enqueued_at: std::time::Instant::now(),
+            enqueued_at: now,
         };
         self.pending_index.insert(lowest_seq, self.pending.len());
         self.pending.push_back(op);
@@ -743,6 +750,7 @@ impl ProducerState {
         &mut self,
         msg: OutgoingMessage,
         publish_time_ms: u64,
+        now: std::time::Instant,
     ) -> Result<SendDecision, ProducerError> {
         let txn_id = msg.txn_id;
         let payload = msg.payload;
@@ -826,7 +834,7 @@ impl ProducerState {
             waker: None,
             receipt: None,
             error: None,
-            enqueued_at: std::time::Instant::now(),
+            enqueued_at: now,
         };
         self.pending_index
             .insert(ctx.sequence_id, self.pending.len());

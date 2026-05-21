@@ -546,6 +546,12 @@ pub struct Connection {
     /// the outcome arrives. Mirrors Java's `ClientCnx#getEpoch` semantics for
     /// session-bound operations.
     session_epoch: u64,
+    /// Wall-clock provider — the sans-io state machine never calls
+    /// [`SystemTime::now`] directly. Engines inject a real wall clock via
+    /// [`Self::with_wall_clock_provider`]; the default is
+    /// `|| SystemTime::now()` so existing callers keep working. moonpool /
+    /// deterministic-simulation engines plug in a virtual clock here.
+    wall_clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -609,7 +615,33 @@ impl Connection {
             last_connected_at: None,
             last_disconnected_at: None,
             session_epoch: 0,
+            wall_clock: std::sync::Arc::new(SystemTime::now),
         }
+    }
+
+    /// Inject an explicit wall-clock provider. Engines that drive the state
+    /// machine under a virtual clock (e.g. moonpool simulation) call this
+    /// once after [`Self::new`] to make every internal `SystemTime` value
+    /// flow from the injected source instead of the host's wall clock.
+    /// Mirrors the same pattern as `now: Instant` parameters on
+    /// [`Self::handle_bytes`] / [`Self::handle_timeout`]: the state machine
+    /// never reaches for a clock on its own.
+    #[must_use]
+    pub fn with_wall_clock_provider(
+        mut self,
+        provider: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> Self {
+        self.wall_clock = provider;
+        self
+    }
+
+    /// Replace the wall-clock provider on an existing Connection. See
+    /// [`Self::with_wall_clock_provider`] for the rationale.
+    pub fn set_wall_clock_provider(
+        &mut self,
+        provider: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    ) {
+        self.wall_clock = provider;
     }
 
     /// Returns the current handshake state.
@@ -654,7 +686,7 @@ impl Connection {
             self.state,
             HandshakeState::Closed | HandshakeState::Failed | HandshakeState::Closing
         ) {
-            self.last_disconnected_at = Some(SystemTime::now());
+            self.last_disconnected_at = Some((self.wall_clock)());
         }
         self.state = HandshakeState::Failed;
     }
@@ -863,7 +895,7 @@ impl Connection {
                     .connected
                     .ok_or(ProtocolError::Handshake("missing CommandConnected"))?;
                 self.state = HandshakeState::Connected;
-                self.last_connected_at = Some(SystemTime::now());
+                self.last_connected_at = Some((self.wall_clock)());
                 self.broker_max_message_size = connected.max_message_size.map(|v| v as usize);
                 self.broker_protocol_version = connected.protocol_version.unwrap_or(0);
                 self.feature_flags = connected.feature_flags.unwrap_or_default();
@@ -976,6 +1008,7 @@ impl Connection {
                         payload.metadata.clone(),
                         payload.broker_entry_metadata.clone(),
                         payload.body.clone(),
+                        now,
                     );
                     if let Ok(crate::consumer::DeliverOutcome::Delivered { .. }) = outcome {
                         // Emit one event per delivered message — easier for the driver to
@@ -1556,7 +1589,7 @@ impl Connection {
         // Per-producer batch flush sweep — Java `ProducerBuilder#batchingMaxPublishDelay`.
         // Any non-empty batch whose first message has been waiting longer than the
         // configured delay flushes now, capping end-to-end batch latency.
-        let publish_time_ms = std::time::SystemTime::now()
+        let publish_time_ms = (self.wall_clock)()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let due_batch_handles: Vec<ProducerHandle> = self
@@ -1567,7 +1600,7 @@ impl Connection {
             .collect();
         for handle in due_batch_handles {
             if let Some(producer) = self.producers.get_mut(&handle) {
-                let _ = producer.flush_batch(publish_time_ms);
+                let _ = producer.flush_batch(publish_time_ms, now);
             }
         }
         // Drain any frames the batch flush queued so callers don't need an extra
@@ -1802,13 +1835,14 @@ impl Connection {
         handle: ProducerHandle,
         msg: crate::producer::OutgoingMessage,
         publish_time_ms: u64,
+        now: Instant,
     ) -> Result<SequenceId, ProtocolError> {
         let producer = self
             .producers
             .get_mut(&handle)
             .ok_or(ProtocolError::InvariantViolation("unknown producer handle"))?;
         let decision = producer
-            .queue_send(msg, publish_time_ms)
+            .queue_send(msg, publish_time_ms, now)
             .map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
         let seq_id = SequenceId(producer.last_sequence_id_pushed.max(0) as u64);
         match decision {
@@ -1819,11 +1853,16 @@ impl Connection {
     }
 
     /// Force a batch flush for a producer.
-    pub fn flush_producer(&mut self, handle: ProducerHandle, publish_time_ms: u64) -> usize {
+    pub fn flush_producer(
+        &mut self,
+        handle: ProducerHandle,
+        publish_time_ms: u64,
+        now: Instant,
+    ) -> usize {
         let n = self
             .producers
             .get_mut(&handle)
-            .map(|p| p.flush_batch(publish_time_ms))
+            .map(|p| p.flush_batch(publish_time_ms, now))
             .unwrap_or(0);
         self.drain_producer_outbound();
         n
@@ -2071,8 +2110,12 @@ impl Connection {
     /// tied to any one ack call. Falls back to an immediate `CommandAck` (synchronous,
     /// allocated `RequestId` is discarded) when no tracker is configured so the message
     /// is never silently dropped. Mirrors Java's `acknowledgmentGroupTime` path.
-    pub fn ack_grouped_individual(&mut self, handle: ConsumerHandle, message_id: MessageId) {
-        let now = Instant::now();
+    pub fn ack_grouped_individual(
+        &mut self,
+        handle: ConsumerHandle,
+        message_id: MessageId,
+        now: Instant,
+    ) {
         let actions = self
             .consumers
             .get_mut(&handle)
@@ -2095,8 +2138,12 @@ impl Connection {
 
     /// Stage a cumulative ack into this consumer's ack-grouping tracker. See
     /// [`Self::ack_grouped_individual`] for the semantics.
-    pub fn ack_grouped_cumulative(&mut self, handle: ConsumerHandle, message_id: MessageId) {
-        let now = Instant::now();
+    pub fn ack_grouped_cumulative(
+        &mut self,
+        handle: ConsumerHandle,
+        message_id: MessageId,
+        now: Instant,
+    ) {
         let actions = self
             .consumers
             .get_mut(&handle)
@@ -2247,11 +2294,15 @@ impl Connection {
     /// [`SubscribeRequest::negative_ack_redelivery_delay`]), the supplied ids are deferred
     /// until [`Self::handle_timeout`] notices the delay has elapsed. With no tracker the
     /// redelivery is sent immediately.
-    pub fn negative_ack(&mut self, handle: ConsumerHandle, message_ids: Vec<MessageId>) {
+    pub fn negative_ack(
+        &mut self,
+        handle: ConsumerHandle,
+        message_ids: Vec<MessageId>,
+        now: Instant,
+    ) {
         if !message_ids.is_empty() {
             if let Some(consumer) = self.consumers.get_mut(&handle) {
                 if let Some(tracker) = consumer.nack_tracker.as_mut() {
-                    let now = Instant::now();
                     for id in &message_ids {
                         tracker.add(*id, now);
                     }
@@ -2273,10 +2324,11 @@ impl Connection {
         handle: ConsumerHandle,
         message_id: MessageId,
         delay: core::time::Duration,
+        now: Instant,
     ) {
         if let Some(consumer) = self.consumers.get_mut(&handle) {
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
-                tracker.add_with_delay(message_id, delay, Instant::now());
+                tracker.add_with_delay(message_id, delay, now);
                 return;
             }
         }
@@ -2648,7 +2700,7 @@ impl Connection {
             self.state,
             HandshakeState::Connected | HandshakeState::AuthChallenging
         ) {
-            self.last_disconnected_at = Some(SystemTime::now());
+            self.last_disconnected_at = Some((self.wall_clock)());
         }
         self.state = HandshakeState::Closing;
         self.events

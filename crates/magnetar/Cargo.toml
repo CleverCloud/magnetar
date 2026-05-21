@@ -42,12 +42,12 @@ bytes                      = { workspace = true }
 futures-util               = { workspace = true, optional = true, features = ["std", "async-await"] }
 parking_lot                = { workspace = true }
 thiserror                  = { workspace = true }
-tokio                      = { workspace = true, optional = true, features = ["rt", "sync"] }
+tokio                      = { workspace = true, optional = true, features = ["rt", "sync", "test-util"] }
 tracing                    = { workspace = true }
 url                        = { workspace = true }
 uuid                       = { workspace = true }
 
 [dev-dependencies]
 testcontainers     = { workspace = true }
-tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tracing-subscriber = { workspace = true }

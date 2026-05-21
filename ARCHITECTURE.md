@@ -115,11 +115,37 @@ engines. The auth + messagecrypto crates are gated by feature flags on
 ### What "sans-io" means here
 
 `magnetar-proto::Connection` is a synchronous state machine. It has **no
-sockets, no `tokio`, no `async`, no threads**. The whole crate's
-[`Cargo.toml`] forbids I/O-bound dependencies — the rule is enforced by a
-`cargo xtask check-no-io-deps` step that walks `cargo tree -p
-magnetar-proto -e features` and trips on `tokio`, `mio`, `socket2`, …
-([GUIDELINES.md §I/O isolation](GUIDELINES.md#io-isolation)).
+sockets, no `tokio`, no `async`, no threads**, and **never reads its own
+clock**. The whole crate's [`Cargo.toml`] forbids I/O-bound dependencies
+— the rule is enforced by a `cargo xtask check-no-io-deps` step that
+walks `cargo tree -p magnetar-proto -e features` and trips on `tokio`,
+`mio`, `socket2`, … ([GUIDELINES.md §I/O isolation](GUIDELINES.md#io-isolation)).
+
+### Clock injection
+
+The state machine takes the monotonic clock as a parameter at every
+user-driven entry, and reads the wall clock through an injected provider.
+Engines snapshot the host clocks at the call site (or, in moonpool
+simulation, the virtual clock); the protocol layer never calls
+`Instant::now()` or `SystemTime::now()` itself.
+
+| Entry | Clock parameter | Engine plumbing |
+| --- | --- | --- |
+| `handle_bytes(now, &[u8])` | `now: Instant` | `Instant::now()` at the read site. |
+| `handle_timeout(now)` | `now: Instant` | Reused from the `select!` deadline. |
+| `send(handle, msg, publish_time_ms, now)` | `now: Instant` | Producer façade snapshots `Instant::now()` before locking the connection. |
+| `flush_producer(handle, publish_time_ms, now)` | `now: Instant` | Same as `send`. |
+| `negative_ack(handle, ids, now)` | `now: Instant` | Consumer façade snapshots before locking. |
+| `negative_ack_with_delay(handle, msg, delay, now)` | `now: Instant` | Same. |
+| `ack_grouped_individual(handle, msg, now)` | `now: Instant` | Same. |
+| `ack_grouped_cumulative(handle, msg, now)` | `now: Instant` | Same. |
+| `Connection::with_wall_clock_provider(Arc<dyn Fn() -> SystemTime>)` | constructor | Wall-clock injection. Default `\|\| SystemTime::now()`; moonpool sim plugs in a virtual wall clock. |
+
+Internal call paths inside the state machine propagate these parameters
+through their helpers (e.g. `ProducerState::queue_send` /
+`emit_single` / `emit_chunked` / `flush_batch` / `add_to_batch`,
+`ConsumerState::deliver` / `classify_and_queue`); no helper on the hot
+path reaches for the host's clock.
 
 The public surface mirrors [`quinn-proto`]:
 
@@ -130,6 +156,27 @@ The public surface mirrors [`quinn-proto`]:
 | `poll_event() -> Option<ConnectionEvent>` | state → engine | Yield semantic events (`AuthChallenge`, `TopicListChanged`, `ChecksumMismatch`, …) the engine needs to react to. |
 | `poll_timeout() -> Option<Instant>` | state → engine | Next deadline (keepalive, tracker tick, send timeout). |
 | `handle_timeout(now)` | engine → state | Drive timers that elapsed. |
+
+### Known non-determinism leaks (documented)
+
+Two non-time sources of host-environment dependency remain in
+`magnetar-proto`; both are accepted with rationale:
+
+1. **`uuid::Uuid::new_v4()` in `ProducerState::emit_chunked`** — PIP-37
+   chunked messages need a UUID per logical message so the broker can
+   reassemble out-of-order chunk frames. Determinising this requires
+   injecting an `Arc<dyn Fn() -> Uuid>` through the chunked-emit path;
+   deferred until moonpool-sim chaos tests start exercising chunked
+   publishes.
+2. **`std::env::var()` in `crates/magnetar-proto/src/auth/token.rs`** —
+   read once at `TokenAuth` construction so the auth provider can
+   resolve `$ENV_VAR -> token text`. This is a one-shot bootstrap read,
+   not on the state-machine hot path.
+
+A `cargo xtask check-no-internal-clock` step (planned) will treepunch
+the call graph for any new `Instant::now()` / `SystemTime::now()` /
+`uuid::new_v4` / `env::var` site introduced outside the documented
+leaks above.
 
 ### Why we did it
 
