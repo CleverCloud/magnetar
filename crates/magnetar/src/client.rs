@@ -316,6 +316,10 @@ pub struct IncomingMessage {
     pub payload: Bytes,
     /// Broker-supplied redelivery count.
     pub redelivery_count: u32,
+    /// PIP-90 `BrokerEntryMetadata`. `None` when the broker did not stamp one (older
+    /// brokers / disabled namespace policy). Carries the broker's wall-clock timestamp
+    /// and per-topic index — useful for routing, dedup, and exactly-once-ish flows.
+    pub broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
 }
 
 impl IncomingMessage {
@@ -443,6 +447,24 @@ impl IncomingMessage {
     pub fn schema_version(&self) -> Option<&[u8]> {
         self.metadata.schema_version.as_deref()
     }
+
+    /// PIP-90 broker timestamp — wall-clock millis since epoch the broker assigned when it
+    /// persisted the entry. Returns `None` when the namespace policy disables broker-entry
+    /// metadata or the broker is older than PIP-90.
+    #[must_use]
+    pub fn broker_publish_time_ms(&self) -> Option<u64> {
+        self.broker_entry_metadata
+            .as_ref()
+            .and_then(|m| m.broker_timestamp)
+    }
+
+    /// PIP-90 per-topic broker index — monotonic offset the broker assigned when it
+    /// persisted the entry. `None` under the same conditions as
+    /// [`Self::broker_publish_time_ms`].
+    #[must_use]
+    pub fn broker_index(&self) -> Option<u64> {
+        self.broker_entry_metadata.as_ref().and_then(|m| m.index)
+    }
 }
 
 impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
@@ -452,6 +474,7 @@ impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
             metadata: msg.metadata,
             payload: msg.payload,
             redelivery_count: msg.redelivery_count,
+            broker_entry_metadata: msg.broker_entry_metadata,
         }
     }
 }
@@ -1408,6 +1431,7 @@ mod outgoing_message_tests {
             metadata,
             payload: Bytes::new(),
             redelivery_count: 0,
+            broker_entry_metadata: None,
         }
     }
 
@@ -1457,5 +1481,19 @@ mod outgoing_message_tests {
         });
         assert!(stamped.has_replicate_to());
         assert_eq!(stamped.replicate_to(), &["a", "b"]);
+    }
+
+    #[test]
+    fn broker_entry_metadata_getters() {
+        let mut msg = message_with(pb::MessageMetadata::default());
+        assert_eq!(msg.broker_publish_time_ms(), None);
+        assert_eq!(msg.broker_index(), None);
+
+        msg.broker_entry_metadata = Some(pb::BrokerEntryMetadata {
+            broker_timestamp: Some(1_700_000_000_000),
+            index: Some(42),
+        });
+        assert_eq!(msg.broker_publish_time_ms(), Some(1_700_000_000_000));
+        assert_eq!(msg.broker_index(), Some(42));
     }
 }
