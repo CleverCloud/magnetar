@@ -49,8 +49,81 @@ struct Inner {
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
-    /// Subscription name applied to every per-topic child.
+    /// Template for subscribing newly-discovered topics. Captures every
+    /// [`crate::ConsumerBuilder`] knob the user set on the original
+    /// [`PatternConsumerBuilder`].
+    template: ConsumerTemplate,
+}
+
+/// Frozen [`crate::ConsumerBuilder`] template propagated to every per-topic child. Stored
+/// inside [`Inner`] so [`PatternConsumer::update`] can subscribe newly-discovered topics
+/// with the same configuration as the initial snapshot.
+#[derive(Debug, Clone)]
+struct ConsumerTemplate {
     subscription: String,
+    sub_type: magnetar_proto::pb::command_subscribe::SubType,
+    receiver_queue_size: usize,
+    initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
+    durable: bool,
+    properties: Vec<(String, String)>,
+    negative_ack_redelivery_delay: Option<std::time::Duration>,
+    ack_timeout: Option<std::time::Duration>,
+    ack_group_time: Option<std::time::Duration>,
+    dlq_policy: Option<(u32, Option<String>)>,
+    read_compacted: bool,
+    priority_level: Option<i32>,
+    subscription_properties: Vec<(String, String)>,
+    key_shared: Option<magnetar_proto::KeySharedConfig>,
+    replicate_subscription_state: Option<bool>,
+    force_topic_creation: Option<bool>,
+    start_message_rollback_duration_sec: Option<u64>,
+}
+
+impl ConsumerTemplate {
+    /// Apply the template to a [`crate::ConsumerBuilder`] for the given topic.
+    fn apply<'a>(&self, mut builder: crate::ConsumerBuilder<'a>) -> crate::ConsumerBuilder<'a> {
+        builder = builder
+            .subscription(self.subscription.clone())
+            .subscription_type(self.sub_type)
+            .durable(self.durable)
+            .initial_position(self.initial_position)
+            .receiver_queue_size(self.receiver_queue_size)
+            .read_compacted(self.read_compacted);
+        for (k, v) in &self.properties {
+            builder = builder.property(k.clone(), v.clone());
+        }
+        if let Some(d) = self.negative_ack_redelivery_delay {
+            builder = builder.negative_ack_redelivery_delay(d);
+        }
+        if let Some(t) = self.ack_timeout {
+            builder = builder.ack_timeout(t);
+        }
+        if let Some(w) = self.ack_group_time {
+            builder = builder.ack_group_time(w);
+        }
+        if let Some((max, topic_opt)) = &self.dlq_policy {
+            builder = builder.dead_letter_policy(*max, topic_opt.clone());
+        }
+        if let Some(level) = self.priority_level {
+            builder = builder.priority_level(level);
+        }
+        for (k, v) in &self.subscription_properties {
+            builder = builder.subscription_property(k.clone(), v.clone());
+        }
+        if let Some(cfg) = self.key_shared.clone() {
+            builder = builder.key_shared_policy(cfg);
+        }
+        if let Some(on) = self.replicate_subscription_state {
+            builder = builder.replicate_subscription_state(on);
+        }
+        if let Some(on) = self.force_topic_creation {
+            builder = builder.force_topic_creation(on);
+        }
+        if let Some(s) = self.start_message_rollback_duration_sec {
+            builder = builder.start_message_rollback_duration(s);
+        }
+        builder
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +166,7 @@ impl PatternConsumer {
     /// Subscription name shared across every per-topic child.
     #[must_use]
     pub fn subscription(&self) -> &str {
-        &self.inner.subscription
+        &self.inner.template.subscription
     }
 
     /// Snapshot of the topics currently subscribed, in the order they were added.
@@ -176,9 +249,7 @@ impl PatternConsumer {
                 if already_subscribed {
                     continue;
                 }
-                let builder = client
-                    .consumer(topic.clone())
-                    .subscription(self.inner.subscription.clone());
+                let builder = self.inner.template.apply(client.consumer(topic.clone()));
                 let consumer = builder.subscribe().await?;
                 self.inner
                     .consumers
@@ -339,7 +410,7 @@ impl Clone for PatternConsumer {
     }
 }
 
-/// Builder for [`PatternConsumer`]. Mirrors a subset of Java's
+/// Builder for [`PatternConsumer`]. Mirrors Java's
 /// `PulsarClient#newConsumer().topicsPattern(...)`.
 #[derive(Debug)]
 pub struct PatternConsumerBuilder<'a> {
@@ -347,6 +418,22 @@ pub struct PatternConsumerBuilder<'a> {
     namespace: Option<String>,
     pattern: Option<String>,
     subscription: Option<String>,
+    sub_type: magnetar_proto::pb::command_subscribe::SubType,
+    receiver_queue_size: usize,
+    initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
+    durable: bool,
+    properties: Vec<(String, String)>,
+    negative_ack_redelivery_delay: Option<std::time::Duration>,
+    ack_timeout: Option<std::time::Duration>,
+    ack_group_time: Option<std::time::Duration>,
+    dlq_policy: Option<(u32, Option<String>)>,
+    read_compacted: bool,
+    priority_level: Option<i32>,
+    subscription_properties: Vec<(String, String)>,
+    key_shared: Option<magnetar_proto::KeySharedConfig>,
+    replicate_subscription_state: Option<bool>,
+    force_topic_creation: Option<bool>,
+    start_message_rollback_duration_sec: Option<u64>,
 }
 
 impl<'a> PatternConsumerBuilder<'a> {
@@ -356,6 +443,22 @@ impl<'a> PatternConsumerBuilder<'a> {
             namespace: None,
             pattern: None,
             subscription: None,
+            sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
+            receiver_queue_size: 1000,
+            initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
+            durable: true,
+            properties: Vec::new(),
+            negative_ack_redelivery_delay: None,
+            ack_timeout: None,
+            ack_group_time: None,
+            dlq_policy: None,
+            read_compacted: false,
+            priority_level: None,
+            subscription_properties: Vec::new(),
+            key_shared: None,
+            replicate_subscription_state: None,
+            force_topic_creation: None,
+            start_message_rollback_duration_sec: None,
         }
     }
 
@@ -381,9 +484,138 @@ impl<'a> PatternConsumerBuilder<'a> {
         self
     }
 
+    /// Set the subscription type applied to every per-topic child.
+    #[must_use]
+    pub fn subscription_type(
+        mut self,
+        sub_type: magnetar_proto::pb::command_subscribe::SubType,
+    ) -> Self {
+        self.sub_type = sub_type;
+        self
+    }
+
+    /// Set the receiver queue size on every per-topic child.
+    #[must_use]
+    pub fn receiver_queue_size(mut self, size: usize) -> Self {
+        self.receiver_queue_size = size;
+        self
+    }
+
+    /// Set the initial position on every per-topic child.
+    #[must_use]
+    pub fn initial_position(
+        mut self,
+        position: magnetar_proto::pb::command_subscribe::InitialPosition,
+    ) -> Self {
+        self.initial_position = position;
+        self
+    }
+
+    /// Toggle durability of the underlying subscriptions.
+    #[must_use]
+    pub fn durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::property` — forwarded onto every per-topic child.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::negative_ack_redelivery_delay`.
+    #[must_use]
+    pub fn negative_ack_redelivery_delay(mut self, delay: std::time::Duration) -> Self {
+        self.negative_ack_redelivery_delay = Some(delay);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::ack_timeout`.
+    #[must_use]
+    pub fn ack_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ack_timeout = Some(timeout);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::ack_group_time`. Applied to every per-topic child.
+    #[must_use]
+    pub fn ack_group_time(mut self, window: std::time::Duration) -> Self {
+        self.ack_group_time = Some(window);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::dead_letter_policy`.
+    #[must_use]
+    pub fn dead_letter_policy(
+        mut self,
+        max_redeliver_count: u32,
+        dead_letter_topic: Option<String>,
+    ) -> Self {
+        self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::read_compacted`.
+    #[must_use]
+    pub fn read_compacted(mut self, on: bool) -> Self {
+        self.read_compacted = on;
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::priority_level`.
+    #[must_use]
+    pub fn priority_level(mut self, level: i32) -> Self {
+        self.priority_level = Some(level);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::subscription_property` — appends a (key, value) pair to
+    /// every per-topic child's subscription metadata.
+    #[must_use]
+    pub fn subscription_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.subscription_properties
+            .push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::key_shared_policy`.
+    #[must_use]
+    pub fn key_shared_policy(mut self, cfg: magnetar_proto::KeySharedConfig) -> Self {
+        self.key_shared = Some(cfg);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::replicate_subscription_state`.
+    #[must_use]
+    pub fn replicate_subscription_state(mut self, on: bool) -> Self {
+        self.replicate_subscription_state = Some(on);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::force_topic_creation`.
+    #[must_use]
+    pub fn force_topic_creation(mut self, on: bool) -> Self {
+        self.force_topic_creation = Some(on);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::start_message_rollback_duration`.
+    #[must_use]
+    pub fn start_message_rollback_duration(mut self, seconds: u64) -> Self {
+        self.start_message_rollback_duration_sec = Some(seconds);
+        self
+    }
+
     /// Take an initial snapshot of matching topics, subscribe to each, and return the
     /// [`PatternConsumer`]. Call [`PatternConsumer::update`] periodically to reconcile
-    /// against newly-emitted PIP-145 deltas.
+    /// against newly-emitted PIP-145 deltas — newly-discovered topics inherit every knob
+    /// configured here.
     ///
     /// # Errors
     ///
@@ -401,6 +633,26 @@ impl<'a> PatternConsumerBuilder<'a> {
             .subscription
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;
 
+        let template = ConsumerTemplate {
+            subscription,
+            sub_type: self.sub_type,
+            receiver_queue_size: self.receiver_queue_size,
+            initial_position: self.initial_position,
+            durable: self.durable,
+            properties: self.properties,
+            negative_ack_redelivery_delay: self.negative_ack_redelivery_delay,
+            ack_timeout: self.ack_timeout,
+            ack_group_time: self.ack_group_time,
+            dlq_policy: self.dlq_policy,
+            read_compacted: self.read_compacted,
+            priority_level: self.priority_level,
+            subscription_properties: self.subscription_properties,
+            key_shared: self.key_shared,
+            replicate_subscription_state: self.replicate_subscription_state,
+            force_topic_creation: self.force_topic_creation,
+            start_message_rollback_duration_sec: self.start_message_rollback_duration_sec,
+        };
+
         let topics = self
             .client
             .topic_list_snapshot(&namespace, &pattern)
@@ -408,13 +660,8 @@ impl<'a> PatternConsumerBuilder<'a> {
 
         let mut opened: Vec<NamedConsumer> = Vec::with_capacity(topics.len());
         for topic in &topics {
-            let result = self
-                .client
-                .consumer(topic.clone())
-                .subscription(subscription.clone())
-                .subscribe()
-                .await;
-            match result {
+            let builder = template.apply(self.client.consumer(topic.clone()));
+            match builder.subscribe().await {
                 Ok(c) => opened.push(NamedConsumer {
                     topic: topic.clone(),
                     consumer: c,
@@ -433,7 +680,7 @@ impl<'a> PatternConsumerBuilder<'a> {
                 consumers: Mutex::new(opened),
                 namespace,
                 pattern,
-                subscription,
+                template,
             }),
         })
     }
