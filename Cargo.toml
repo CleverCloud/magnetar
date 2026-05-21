@@ -94,6 +94,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 thiserror          = "2"
 anyhow             = "1"
+hdrhistogram       = { version = "7", default-features = false }
 
 # Test infrastructure
 testcontainers = "0.27"

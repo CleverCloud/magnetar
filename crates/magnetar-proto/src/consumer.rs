@@ -124,6 +124,12 @@ pub struct ConsumerState {
     /// runtime engine reads this via [`Self::crypto_failure_action`] when decryption fails
     /// to decide whether to propagate, drop, or surface the ciphertext.
     pub crypto_failure_action: crate::conn::CryptoFailureAction,
+    /// Receive-latency histogram, in milliseconds. Recorded on each [`Self::pop_message`] call,
+    /// measuring the wall-clock interval between [`IncomingMessage::arrived_at`] (the moment
+    /// the consumer state machine queued the message) and the moment the user calls
+    /// `pop_message` / `receive`. Mirrors the latency percentiles surfaced by Java
+    /// `ConsumerStatsRecorder` (p50, p99, max). Three significant digits, auto-resizing.
+    pub receive_latency_hist: hdrhistogram::Histogram<u64>,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -184,7 +190,8 @@ impl BatchAckEntry {
 }
 
 /// Snapshot of cumulative consumer counters. Mirrors `org.apache.pulsar.client.api.ConsumerStats`
-/// for the totals; rates are derived above this layer.
+/// for the totals; rates are derived above this layer. Latency percentiles mirror the p50/p99/max
+/// surfaced by Java `ConsumerStatsRecorder`.
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(clippy::struct_field_names)]
 pub struct ConsumerStats {
@@ -200,6 +207,13 @@ pub struct ConsumerStats {
     pub total_msgs_dead_lettered: u64,
     /// Cumulative count of chunked messages fully reassembled and delivered.
     pub total_chunked_msgs_received: u64,
+    /// 50th percentile receive latency, in milliseconds, computed from the consumer's
+    /// `receive_latency_hist`. Zero when no message has been popped yet.
+    pub receive_latency_p50_ms: u64,
+    /// 99th percentile receive latency, in milliseconds.
+    pub receive_latency_p99_ms: u64,
+    /// Maximum observed receive latency, in milliseconds.
+    pub receive_latency_max_ms: u64,
 }
 
 #[derive(Debug)]
@@ -266,6 +280,10 @@ impl ConsumerState {
             batch_ack_tracker: HashMap::new(),
             ack_tracker: None,
             crypto_failure_action: crate::conn::CryptoFailureAction::Fail,
+            // 3 significant digits, auto-resizing — same precision the Java client uses for its
+            // ConsumerStatsRecorder.
+            receive_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
+                .expect("hdrhistogram precision 3 is valid"),
         }
     }
 
@@ -277,7 +295,15 @@ impl ConsumerState {
     }
 
     /// Snapshot of cumulative counters. Mirrors Java `ConsumerStats`.
+    ///
+    /// Latency percentiles (`receive_latency_*_ms`) are computed from the consumer's
+    /// [`Self::receive_latency_hist`] at snapshot time so callers receive plain `u64` values
+    /// without paying the histogram's clone cost. An empty histogram (no `pop_message` yet)
+    /// yields zero percentiles.
     pub fn stats(&self) -> ConsumerStats {
+        let p50 = self.receive_latency_p50_ms();
+        let p99 = self.receive_latency_p99_ms();
+        let pmax = self.receive_latency_max_ms();
         ConsumerStats {
             total_msgs_received: self.total_msgs_received,
             total_bytes_received: self.total_bytes_received,
@@ -285,7 +311,40 @@ impl ConsumerState {
             total_acks_failed: self.total_acks_failed,
             total_msgs_dead_lettered: self.total_msgs_dead_lettered,
             total_chunked_msgs_received: self.total_chunked_msgs_received,
+            receive_latency_p50_ms: p50,
+            receive_latency_p99_ms: p99,
+            receive_latency_max_ms: pmax,
         }
+    }
+
+    /// 50th percentile receive latency, in milliseconds. Mirrors Java
+    /// `ConsumerStatsRecorder#getRcvLatencyMillis50pct`.
+    #[must_use]
+    pub fn receive_latency_p50_ms(&self) -> u64 {
+        if self.receive_latency_hist.is_empty() {
+            return 0;
+        }
+        self.receive_latency_hist.value_at_quantile(0.50)
+    }
+
+    /// 99th percentile receive latency, in milliseconds. Mirrors Java
+    /// `ConsumerStatsRecorder#getRcvLatencyMillis99pct`.
+    #[must_use]
+    pub fn receive_latency_p99_ms(&self) -> u64 {
+        if self.receive_latency_hist.is_empty() {
+            return 0;
+        }
+        self.receive_latency_hist.value_at_quantile(0.99)
+    }
+
+    /// Maximum observed receive latency, in milliseconds. Mirrors Java
+    /// `ConsumerStatsRecorder#getRcvLatencyMillisMax`.
+    #[must_use]
+    pub fn receive_latency_max_ms(&self) -> u64 {
+        if self.receive_latency_hist.is_empty() {
+            return 0;
+        }
+        self.receive_latency_hist.max()
     }
 
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
@@ -321,9 +380,14 @@ impl ConsumerState {
 
     /// Pop the next available message for the user. Caller wakes its future when a new message
     /// is delivered (the [`Connection`](crate::Connection) does this automatically).
+    ///
+    /// Records the wall-clock latency (`Instant::now() - msg.arrived_at`) into
+    /// [`Self::receive_latency_hist`] so [`ConsumerStats`] can surface p50/p99/max.
     pub fn pop_message(&mut self) -> Option<IncomingMessage> {
         let msg = self.queue.pop_front()?;
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+        let latency_ms = u64::try_from(msg.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.receive_latency_hist.saturating_record(latency_ms);
         Some(msg)
     }
 
@@ -408,6 +472,7 @@ impl ConsumerState {
                     payload: assembled,
                     redelivery_count,
                     broker_entry_metadata: bem,
+                    arrived_at: std::time::Instant::now(),
                 };
                 self.total_chunked_msgs_received =
                     self.total_chunked_msgs_received.saturating_add(1);
@@ -455,6 +520,7 @@ impl ConsumerState {
                     payload,
                     redelivery_count: redelivery,
                     broker_entry_metadata: broker_entry_metadata.clone(),
+                    arrived_at: std::time::Instant::now(),
                 };
                 self.classify_and_queue(im, redelivery);
                 delivered += 1;
@@ -473,6 +539,7 @@ impl ConsumerState {
             payload: body,
             redelivery_count: redelivery,
             broker_entry_metadata,
+            arrived_at: std::time::Instant::now(),
         };
         let outcome = self.classify_and_queue(im, redelivery);
         self.wake_receivers();
@@ -789,5 +856,55 @@ mod tests {
         let _ = e.ack_position(99);
         assert!(!e.is_fully_acked());
         assert_eq!(e.unacked, vec![0b1111]);
+    }
+
+    /// Drive a synthetic distribution through `receive_latency_hist` and confirm the snapshot
+    /// percentiles + accessors line up with the input. Mirrors the Java
+    /// `ConsumerStatsRecorderTest#testGetLatencyPercentiles` smoke test.
+    #[test]
+    fn receive_latency_percentiles_reflect_recorded_samples() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        // Empty histogram — accessors and snapshot must report zero, not panic.
+        assert_eq!(c.receive_latency_p50_ms(), 0);
+        assert_eq!(c.receive_latency_p99_ms(), 0);
+        assert_eq!(c.receive_latency_max_ms(), 0);
+        let stats0 = c.stats();
+        assert_eq!(stats0.receive_latency_p50_ms, 0);
+        assert_eq!(stats0.receive_latency_p99_ms, 0);
+        assert_eq!(stats0.receive_latency_max_ms, 0);
+
+        // 100 samples uniformly in [1, 100].
+        for v in 1u64..=100 {
+            c.receive_latency_hist.saturating_record(v);
+        }
+        let p50 = c.receive_latency_p50_ms();
+        let p99 = c.receive_latency_p99_ms();
+        let pmax = c.receive_latency_max_ms();
+        assert!((45..=55).contains(&p50), "expected p50 ~50 ms, got {p50}");
+        assert!((95..=100).contains(&p99), "expected p99 ~99 ms, got {p99}");
+        assert_eq!(pmax, 100, "max sample is 100 ms");
+
+        let stats = c.stats();
+        assert_eq!(stats.receive_latency_p50_ms, p50);
+        assert_eq!(stats.receive_latency_p99_ms, p99);
+        assert_eq!(stats.receive_latency_max_ms, pmax);
+    }
+
+    /// End-to-end: deliver a message, sleep briefly, pop it, observe the histogram now has one
+    /// sample whose max reflects the sleep duration.
+    #[test]
+    fn pop_message_records_receive_latency() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c.deliver(&message_cmd(0), metadata(1), None, Bytes::from_static(b"x"))
+            .unwrap();
+        assert!(c.receive_latency_hist.is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _msg = c.pop_message().expect("queued message");
+        assert_eq!(c.receive_latency_hist.len(), 1);
+        assert!(c.receive_latency_max_ms() >= 1);
+        let stats = c.stats();
+        assert_eq!(stats.receive_latency_max_ms, c.receive_latency_max_ms());
     }
 }

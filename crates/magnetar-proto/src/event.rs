@@ -264,4 +264,9 @@ pub struct IncomingMessage {
     pub redelivery_count: u32,
     /// Optional broker-entry metadata (PIP-90).
     pub broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
+    /// Wall-clock instant at which the consumer state machine first saw this message (i.e. the
+    /// moment `ConsumerState::deliver` queued it). The consumer uses
+    /// `pop_message`-time `Instant::now() - arrived_at` to feed its
+    /// `receive_latency_hist`, mirroring Java `ConsumerStatsRecorder` p50/p99/max.
+    pub arrived_at: std::time::Instant,
 }
