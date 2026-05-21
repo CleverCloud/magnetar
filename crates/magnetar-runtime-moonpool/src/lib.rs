@@ -61,6 +61,7 @@
 
 mod client;
 mod driver;
+mod producer;
 pub mod tls;
 mod transport;
 
@@ -75,6 +76,7 @@ use tokio::sync::Notify;
 
 pub use crate::client::{Client, ClientError, LookupTopicResult};
 pub use crate::driver::DriverHandle;
+pub use crate::producer::{Producer, SendFut};
 use crate::transport::Transport;
 
 /// Shared connection state for the moonpool engine. Mirrors the tokio
