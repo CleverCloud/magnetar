@@ -166,10 +166,18 @@ pub struct ProducerState {
     /// runtime-side getter without round-tripping back to the original
     /// [`crate::conn::CreateProducerRequest`].
     pub access_mode: pb::ProducerAccessMode,
+    /// Send-latency histogram, in milliseconds. Recorded on each `CommandSendReceipt`,
+    /// measuring the wall-clock interval between the user's `send` enqueue
+    /// (`OpSend::enqueued_at`) and the broker's receipt acknowledgement. Mirrors the latency
+    /// percentiles surfaced by Java `ProducerStatsRecorder` (p50, p99, max). Three significant
+    /// digits, default range — the typical broker round-trip is sub-second so the bucket layout
+    /// fits comfortably within the default 1-bound..u64::MAX scale.
+    pub send_latency_hist: hdrhistogram::Histogram<u64>,
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
-/// for the totals; rates are derived above this layer.
+/// for the totals; rates are derived above this layer. Latency percentiles mirror the p50/p99/max
+/// surfaced by Java `ProducerStatsRecorder`.
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(clippy::struct_field_names)]
 pub struct ProducerStats {
@@ -183,6 +191,13 @@ pub struct ProducerStats {
     pub total_acks_received: u64,
     /// Number of in-flight publishes (queued but not yet acked by the broker).
     pub pending_queue_size: u64,
+    /// 50th percentile send latency, in milliseconds, computed from the producer's
+    /// `send_latency_hist`. Zero when no `CommandSendReceipt` has been observed yet.
+    pub send_latency_p50_ms: u64,
+    /// 99th percentile send latency, in milliseconds.
+    pub send_latency_p99_ms: u64,
+    /// Maximum observed send latency, in milliseconds.
+    pub send_latency_max_ms: u64,
 }
 
 /// In-memory batch container.
@@ -300,6 +315,11 @@ impl ProducerState {
             send_timeout: None,
             batching_max_publish_delay: None,
             access_mode: pb::ProducerAccessMode::Shared,
+            // 3 significant digits, auto-resize so we never reject a sample for being above the
+            // initial high bound. The Java client uses the same precision in
+            // `ProducerStatsRecorderImpl`.
+            send_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
+                .expect("hdrhistogram precision 3 is valid"),
         }
     }
 
@@ -350,14 +370,55 @@ impl ProducerState {
     }
 
     /// Snapshot of cumulative counters. Mirrors Java `ProducerStats`.
+    ///
+    /// Latency percentiles (`send_latency_*_ms`) are computed from the producer's
+    /// [`Self::send_latency_hist`] at snapshot time so callers receive plain `u64` values without
+    /// paying the histogram's clone cost. An empty histogram (no receipt observed yet) yields
+    /// zero percentiles.
     pub fn stats(&self) -> ProducerStats {
+        let p50 = self.send_latency_p50_ms();
+        let p99 = self.send_latency_p99_ms();
+        let pmax = self.send_latency_max_ms();
         ProducerStats {
             total_msgs_sent: self.total_msgs_sent,
             total_bytes_sent: self.total_bytes_sent,
             total_send_failed: self.total_send_failed,
             total_acks_received: self.total_acks_received,
             pending_queue_size: self.pending.len() as u64,
+            send_latency_p50_ms: p50,
+            send_latency_p99_ms: p99,
+            send_latency_max_ms: pmax,
         }
+    }
+
+    /// 50th percentile send latency, in milliseconds. Mirrors Java
+    /// `ProducerStatsRecorder#getSendLatencyMillis50pct`.
+    #[must_use]
+    pub fn send_latency_p50_ms(&self) -> u64 {
+        if self.send_latency_hist.is_empty() {
+            return 0;
+        }
+        self.send_latency_hist.value_at_quantile(0.50)
+    }
+
+    /// 99th percentile send latency, in milliseconds. Mirrors Java
+    /// `ProducerStatsRecorder#getSendLatencyMillis99pct`.
+    #[must_use]
+    pub fn send_latency_p99_ms(&self) -> u64 {
+        if self.send_latency_hist.is_empty() {
+            return 0;
+        }
+        self.send_latency_hist.value_at_quantile(0.99)
+    }
+
+    /// Maximum observed send latency, in milliseconds. Mirrors Java
+    /// `ProducerStatsRecorder#getSendLatencyMillisMax`.
+    #[must_use]
+    pub fn send_latency_max_ms(&self) -> u64 {
+        if self.send_latency_hist.is_empty() {
+            return 0;
+        }
+        self.send_latency_hist.max()
     }
 
     /// Returns whether this producer can add the given payload to its current batch.
@@ -805,6 +866,12 @@ impl ProducerState {
                 batch_size: 0,
             });
         self.last_sequence_id_published = seq.0 as i64;
+        // Record the broker round-trip latency (enqueue → receipt). `saturating_record` keeps us
+        // safe if a future record landed above the histogram's current bound — auto-resize will
+        // grow but a saturating fallback is still cheaper than the panic path. Mirrors the Java
+        // `ProducerStatsRecorder#updateLatency(long latencyNanos)` call site.
+        let latency_ms = u64::try_from(op.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.send_latency_hist.saturating_record(latency_ms);
         op.receipt = Some(mid);
         let waker = op.waker.take();
         // Re-index remaining positions.
@@ -1307,5 +1374,77 @@ mod tests {
         assert!(!p.batch_deadline_elapsed(anchor + Duration::from_millis(19)));
         assert!(p.batch_deadline_elapsed(anchor + Duration::from_millis(20)));
         assert!(p.batch_deadline_elapsed(anchor + Duration::from_millis(50)));
+    }
+
+    /// Drive a synthetic set of latency samples through `send_latency_hist` (without going via
+    /// the network) and check that `ProducerStats::send_latency_*_ms` line up with the
+    /// percentiles we'd compute from the input distribution by hand. Mirrors the Java
+    /// `ProducerStatsRecorderTest#testGetLatencyPercentiles` smoke test.
+    #[test]
+    fn send_latency_percentiles_reflect_recorded_samples() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        // Empty histogram — accessors and snapshot must report zero, not panic.
+        assert_eq!(p.send_latency_p50_ms(), 0);
+        assert_eq!(p.send_latency_p99_ms(), 0);
+        assert_eq!(p.send_latency_max_ms(), 0);
+        let stats0 = p.stats();
+        assert_eq!(stats0.send_latency_p50_ms, 0);
+        assert_eq!(stats0.send_latency_p99_ms, 0);
+        assert_eq!(stats0.send_latency_max_ms, 0);
+
+        // 100 samples uniformly in [1, 100]. p50 should land near 50, p99 near 99, max == 100.
+        for v in 1u64..=100 {
+            p.send_latency_hist.saturating_record(v);
+        }
+        let p50 = p.send_latency_p50_ms();
+        let p99 = p.send_latency_p99_ms();
+        let pmax = p.send_latency_max_ms();
+        assert!((45..=55).contains(&p50), "expected p50 ~50 ms, got {p50}");
+        assert!((95..=100).contains(&p99), "expected p99 ~99 ms, got {p99}");
+        assert_eq!(pmax, 100, "max sample is 100 ms");
+
+        // Snapshot path mirrors the accessor path.
+        let stats = p.stats();
+        assert_eq!(stats.send_latency_p50_ms, p50);
+        assert_eq!(stats.send_latency_p99_ms, p99);
+        assert_eq!(stats.send_latency_max_ms, pmax);
+    }
+
+    /// End-to-end check: enqueue a send, sleep briefly, apply the receipt, observe that the
+    /// histogram now has exactly one sample and the max is at least the sleep duration.
+    #[test]
+    fn apply_receipt_records_send_latency() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let _ = p.queue_send(small_message(b"abc"), 100).unwrap();
+        let _ = p.next_outbound_frame();
+        assert!(p.send_latency_hist.is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let r = pb::CommandSendReceipt {
+            producer_id: 1,
+            sequence_id: 0,
+            message_id: Some(pb::MessageIdData {
+                ledger_id: 1,
+                entry_id: 1,
+                ..Default::default()
+            }),
+            highest_sequence_id: None,
+        };
+        let (_seq, _mid, _waker) = p.apply_receipt(&r).expect("receipt matched");
+        assert_eq!(p.send_latency_hist.len(), 1);
+        // We slept for at least 2 ms; the sample we recorded must reflect that.
+        assert!(p.send_latency_max_ms() >= 1);
+        let stats = p.stats();
+        assert_eq!(stats.send_latency_max_ms, p.send_latency_max_ms());
     }
 }
