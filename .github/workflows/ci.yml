@@ -126,6 +126,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-no-internal-clock
 
+  msrv:
+    name: msrv (1.85)
+    # Pin-check against the workspace MSRV declared in `Cargo.toml`
+    # (`[workspace.package] rust-version = "1.85"`, ADR-0007). Builds
+    # the whole workspace with `--all-features` on Rust 1.85 so that
+    # accidental use of newer language or `std` features fails CI rather
+    # than slipping into a release. Mirrors the `build` job but with the
+    # toolchain pinned exactly to the MSRV, not the rolling stable.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-features --locked
+
+  codegen-check:
+    name: codegen drift (magnetar-proto)
+    # Verify-only run of `cargo xtask codegen --check`. Fails if the
+    # committed `magnetar-proto/src/pb/` contents diverge from what
+    # regenerating from the vendored proto files would produce. Mirrors
+    # the validation chain documented in `CLAUDE.md`; without this gate
+    # proto codegen drift would go silent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
+
   moonpool-sim:
     name: moonpool deterministic-simulation
     runs-on: ubuntu-latest

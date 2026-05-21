@@ -1,0 +1,24 @@
+# Dependabot configuration for magnetar.
+#
+# - Cargo: weekly bumps for the workspace `Cargo.toml` + lockfile. Keeps the
+#   workspace within reach of upstream security patches without flooding
+#   review queues with daily noise.
+# - GitHub Actions: weekly bumps for the workflows under `.github/workflows/`.
+#   Catches pinned-action drift (e.g. `dtolnay/rust-toolchain`,
+#   `Swatinem/rust-cache`, `actions/checkout`) before it rots.
+#
+# This is intentionally minimal — extend with grouping, ignore rules, or
+# reviewers as the project grows.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
