@@ -350,6 +350,19 @@ impl Producer {
             .unwrap_or_default()
     }
 
+    /// Capture a rolling-window sample for this producer. Mirrors Java
+    /// `ProducerStatsRecorderImpl#updateNumMsgsSent` — call periodically (e.g. once
+    /// per second) to refresh [`magnetar_proto::ProducerStats::msgs_per_sec`] and
+    /// [`magnetar_proto::ProducerStats::bytes_per_sec`]. The first call only seeds
+    /// the baseline (rates stay at `0.0`); the second and subsequent calls compute
+    /// the per-second deltas between consecutive samples.
+    pub fn record_rate_window(&self, now: std::time::Instant) {
+        self.shared
+            .inner
+            .lock()
+            .producer_record_rate_window(self.handle, now);
+    }
+
     /// Topic name this producer is bound to. Returns an empty string if the producer is no
     /// longer registered (closed).
     pub fn topic(&self) -> String {

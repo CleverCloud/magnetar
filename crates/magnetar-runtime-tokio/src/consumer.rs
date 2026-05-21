@@ -557,6 +557,19 @@ impl Consumer {
             .unwrap_or_default()
     }
 
+    /// Capture a rolling-window sample for this consumer. Mirrors Java
+    /// `ConsumerStatsRecorderImpl#updateNumMsgsReceived` — call periodically (e.g.
+    /// once per second) to refresh [`magnetar_proto::ConsumerStats::msgs_per_sec`]
+    /// and [`magnetar_proto::ConsumerStats::bytes_per_sec`]. The first call only
+    /// seeds the baseline (rates stay at `0.0`); the second and subsequent calls
+    /// compute the per-second deltas between consecutive samples.
+    pub fn record_rate_window(&self, now: std::time::Instant) {
+        self.shared
+            .inner
+            .lock()
+            .consumer_record_rate_window(self.handle, now);
+    }
+
     /// Mirrors `org.apache.pulsar.client.api.Consumer#pause`. Stops automatic flow refills so
     /// the broker stops dispatching new messages once already-issued permits drain. Buffered
     /// messages remain receivable.
