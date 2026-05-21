@@ -2076,6 +2076,24 @@ impl Connection {
         self.consumers.get(&handle).map(ConsumerState::stats)
     }
 
+    /// Take a rolling-window stats snapshot on the consumer identified by `handle`. Runtime
+    /// engines wire this to a `tokio::time::interval` ticker. Mirrors Java
+    /// `ConsumerStatsRecorder`'s rolling-window rate calculation. No-op if the handle is
+    /// unknown.
+    pub fn consumer_record_rate_window(&mut self, handle: ConsumerHandle, now: std::time::Instant) {
+        if let Some(state) = self.consumers.get_mut(&handle) {
+            state.record_rate_window(now);
+        }
+    }
+
+    /// Take a rolling-window stats snapshot on the producer identified by `handle`. Same
+    /// shape as [`Self::consumer_record_rate_window`] but for the producer side.
+    pub fn producer_record_rate_window(&mut self, handle: ProducerHandle, now: std::time::Instant) {
+        if let Some(state) = self.producers.get_mut(&handle) {
+            state.record_rate_window(now);
+        }
+    }
+
     /// `true` if the producer with this handle has been closed (locally via
     /// [`Self::close_producer`] or remotely via a broker `CloseProducer`). Returns `true`
     /// for unknown handles so callers can treat "handle dropped" as "closed". Mirrors Java

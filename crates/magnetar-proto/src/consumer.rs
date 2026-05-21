@@ -136,6 +136,18 @@ pub struct ConsumerState {
     /// `CommandSubscribe` so the broker resumes from the post-ack position after a reconnect
     /// (avoids double-delivery of pre-reconnect messages). `None` until the first ack lands.
     pub last_acked_message_id: Option<MessageId>,
+    /// Last rolling-window stats snapshot: `(msgs_at_snapshot, bytes_at_snapshot, taken_at)`.
+    /// Updated by [`Self::record_rate_window`] to compute msgs/sec + bytes/sec rates.
+    /// Mirrors Java `ConsumerStatsRecorder` rolling-window rate calculation. `None` until
+    /// the first `record_rate_window` call.
+    pub last_rate_snapshot: Option<(u64, u64, std::time::Instant)>,
+    /// Most recent rolling-window rate: messages-per-second delivered, computed from the delta
+    /// between the previous and current `record_rate_window` calls. `0.0` until the second
+    /// snapshot lands. Mirrors Java `ConsumerStats#getRateMsgsReceived`.
+    pub current_msgs_per_sec: f64,
+    /// Most recent rolling-window rate: bytes-per-second delivered. Mirrors Java
+    /// `ConsumerStats#getRateBytesReceived`.
+    pub current_bytes_per_sec: f64,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -220,6 +232,12 @@ pub struct ConsumerStats {
     pub receive_latency_p99_ms: u64,
     /// Maximum observed receive latency, in milliseconds.
     pub receive_latency_max_ms: u64,
+    /// Rolling per-second message-receive rate, computed from the delta between the two most
+    /// recent [`ConsumerState::record_rate_window`] calls. `0.0` before the second snapshot
+    /// lands. Mirrors Java `ConsumerStats#getRateMsgsReceived`.
+    pub msgs_per_sec: f64,
+    /// Rolling per-second byte-receive rate. Mirrors Java `ConsumerStats#getRateBytesReceived`.
+    pub bytes_per_sec: f64,
 }
 
 #[derive(Debug)]
@@ -291,7 +309,38 @@ impl ConsumerState {
             receive_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
                 .expect("hdrhistogram precision 3 is valid"),
             last_acked_message_id: None,
+            last_rate_snapshot: None,
+            current_msgs_per_sec: 0.0,
+            current_bytes_per_sec: 0.0,
         }
+    }
+
+    /// Take a rolling-window snapshot at `now`. On the first call, just records
+    /// the baseline and returns. On subsequent calls, computes the per-second
+    /// delivery rates against the previous snapshot and writes them to
+    /// [`Self::current_msgs_per_sec`] / [`Self::current_bytes_per_sec`].
+    ///
+    /// Sans-io discipline: `now` is injected (see
+    /// [ADR-0011](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md)).
+    /// Runtime engines typically wire this to a `tokio::time::interval` ticker.
+    pub fn record_rate_window(&mut self, now: std::time::Instant) {
+        if let Some((prev_msgs, prev_bytes, prev_at)) = self.last_rate_snapshot {
+            let elapsed = now.saturating_duration_since(prev_at).as_secs_f64();
+            if elapsed > f64::EPSILON {
+                // The lossy cast is intentional — rates are reported as f64 (Java's `double`)
+                // and ±1 unit on a u64 counter is irrelevant once you divide by seconds.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "rate counters fit comfortably below f64::MAX_SAFE_INTEGER in practice"
+                )]
+                let d_msgs = self.total_msgs_received.saturating_sub(prev_msgs) as f64;
+                #[allow(clippy::cast_precision_loss, reason = "same as above")]
+                let d_bytes = self.total_bytes_received.saturating_sub(prev_bytes) as f64;
+                self.current_msgs_per_sec = d_msgs / elapsed;
+                self.current_bytes_per_sec = d_bytes / elapsed;
+            }
+        }
+        self.last_rate_snapshot = Some((self.total_msgs_received, self.total_bytes_received, now));
     }
 
     /// PIP-4 decryption failure handling configured for this consumer. Mirrors Java
@@ -321,6 +370,8 @@ impl ConsumerState {
             receive_latency_p50_ms: p50,
             receive_latency_p99_ms: p99,
             receive_latency_max_ms: pmax,
+            msgs_per_sec: self.current_msgs_per_sec,
+            bytes_per_sec: self.current_bytes_per_sec,
         }
     }
 
@@ -1287,5 +1338,56 @@ mod tests {
         logical_id_of_chunk1.hash(&mut h1);
         logical_id_of_chunk2.hash(&mut h2);
         assert_ne!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    fn record_rate_window_baseline_then_delta() {
+        let mut c = ConsumerState::new(
+            crate::types::ConsumerHandle(1),
+            "t".to_owned(),
+            "s".to_owned(),
+            10,
+        );
+        let t0 = std::time::Instant::now();
+
+        // First call records the baseline; rates stay zero.
+        c.total_msgs_received = 0;
+        c.total_bytes_received = 0;
+        c.record_rate_window(t0);
+        assert!((c.current_msgs_per_sec - 0.0).abs() < f64::EPSILON);
+        assert!((c.current_bytes_per_sec - 0.0).abs() < f64::EPSILON);
+        assert!(c.last_rate_snapshot.is_some());
+
+        // Simulate 100 messages / 1024 bytes received over 2 s — rates should
+        // be 50 msgs/sec, 512 bytes/sec.
+        c.total_msgs_received = 100;
+        c.total_bytes_received = 1024;
+        let t1 = t0 + std::time::Duration::from_secs(2);
+        c.record_rate_window(t1);
+        assert!((c.current_msgs_per_sec - 50.0).abs() < 0.001);
+        assert!((c.current_bytes_per_sec - 512.0).abs() < 0.001);
+
+        // Cumulative counters unchanged → next window snapshot reports zero rate.
+        let t2 = t1 + std::time::Duration::from_secs(1);
+        c.record_rate_window(t2);
+        assert!((c.current_msgs_per_sec - 0.0).abs() < 0.001);
+        assert!((c.current_bytes_per_sec - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn record_rate_window_safe_under_zero_elapsed() {
+        let mut c = ConsumerState::new(
+            crate::types::ConsumerHandle(1),
+            "t".to_owned(),
+            "s".to_owned(),
+            10,
+        );
+        let t0 = std::time::Instant::now();
+        c.record_rate_window(t0);
+        c.total_msgs_received = 100;
+        // Repeat the snapshot at the same instant — should not divide by zero,
+        // should leave the previous rate untouched.
+        c.record_rate_window(t0);
+        assert!(c.current_msgs_per_sec.is_finite());
     }
 }

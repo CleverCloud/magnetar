@@ -446,7 +446,7 @@ known-missing feature.
 | `redeliverUnacknowledgedMessages` | ✅ | ✅ | `Consumer::redeliver_unacked`. |
 | `getLastMessageId` | ✅ | ✅ | `Consumer::last_message_id`. |
 | `getStats` (counters) | ✅ | ✅ | `Consumer::stats`. Includes `total_chunked_msgs_received`. |
-| Stats: rolling windows (msgs/sec, bytes/sec) | ✅ | 🟡 | Cumulative only today; rolling-window tick pending. |
+| Stats: rolling windows (msgs/sec, bytes/sec) | ✅ | ✅ | `ConsumerStats::msgs_per_sec` / `bytes_per_sec` + `ProducerStats::msgs_per_sec` / `bytes_per_sec`. Runtime engines call `Connection::consumer_record_rate_window(handle, now)` / `producer_record_rate_window(handle, now)` on a `tokio::time::interval` ticker; first call records the baseline, subsequent calls compute per-second rates from the delta. |
 | Stats: latency hdrhistogram (p50/p99/max) | ✅ | ✅ | `Consumer::stats` exposes `receive_latency_{p50,p99,max}_ms`; `Producer::stats` exposes `send_latency_{p50,p99,max}_ms`. |
 | `subscriptionProperties` | ✅ | ✅ | `ConsumerBuilder::subscription_property`. |
 | `replicateSubscriptionState` | ✅ | ✅ | `ConsumerBuilder::replicate_subscription_state`. |
@@ -600,7 +600,6 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Stats rolling windows.** Cumulative-only counters today; the broker dashboard expects msgs/sec, bytes/sec rolling windows. `hdrhistogram` p50/p99/max has shipped (`Consumer::stats` + `Producer::stats`).
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180 shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33 replicated subscriptions** are scoped for the M9 milestone.
 
 ---
@@ -695,13 +694,10 @@ Top open items at the time of this writing:
    (opcode missing from the current `PulsarApi.proto` snapshot).
 2. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
    topic / PIP-33 replicated subscriptions** — scoped for M9.
-3. **Stats rolling per-second windows** (msgs/sec, bytes/sec snapshot).
-   Cumulative counters + hdrhistogram latency already shipped; this
-   adds an `EMA`-style ticker.
 
-`hdrhistogram` latency stats (p50/p99/max), the
-`MultiTopicsConsumer::add_topic` / `remove_topic` mutators, the
-`PatternConsumer::start_auto_reconcile` ticker, the
+`hdrhistogram` latency stats (p50/p99/max), rolling-window msgs/sec +
+bytes/sec rates, the `MultiTopicsConsumer::add_topic` / `remove_topic`
+mutators, the `PatternConsumer::start_auto_reconcile` ticker, the
 `ServiceUrlProvider` runtime URL rotation, the full PIP-121 cluster
 failover surface (`AutoClusterFailover` + `ControlledClusterFailover`),
 the `memory_limit` runtime enforcement, and the

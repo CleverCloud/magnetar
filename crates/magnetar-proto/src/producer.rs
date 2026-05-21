@@ -179,6 +179,17 @@ pub struct ProducerState {
     /// `CommandProducer.epoch` so the broker accepts the re-attach (rejects stale
     /// reconnects of older epochs). Starts at `0` for the original create.
     pub epoch: u64,
+    /// Last rolling-window stats snapshot: `(msgs_at_snapshot, bytes_at_snapshot, taken_at)`.
+    /// Updated by [`Self::record_rate_window`] to compute msgs/sec + bytes/sec send rates.
+    /// Mirrors Java `ProducerStatsRecorder` rolling-window rate calculation. `None` until
+    /// the first snapshot lands.
+    pub last_rate_snapshot: Option<(u64, u64, std::time::Instant)>,
+    /// Most recent rolling-window rate: messages-per-second sent. `0.0` until the second
+    /// snapshot lands. Mirrors Java `ProducerStats#getSendMsgsRate`.
+    pub current_msgs_per_sec: f64,
+    /// Most recent rolling-window rate: bytes-per-second sent. Mirrors Java
+    /// `ProducerStats#getSendBytesRate`.
+    pub current_bytes_per_sec: f64,
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
@@ -204,6 +215,12 @@ pub struct ProducerStats {
     pub send_latency_p99_ms: u64,
     /// Maximum observed send latency, in milliseconds.
     pub send_latency_max_ms: u64,
+    /// Rolling per-second message-send rate, computed from the delta between the two most
+    /// recent [`ProducerState::record_rate_window`] calls. `0.0` before the second snapshot
+    /// lands. Mirrors Java `ProducerStats#getSendMsgsRate`.
+    pub msgs_per_sec: f64,
+    /// Rolling per-second byte-send rate. Mirrors Java `ProducerStats#getSendBytesRate`.
+    pub bytes_per_sec: f64,
 }
 
 /// In-memory batch container.
@@ -327,6 +344,9 @@ impl ProducerState {
             send_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
                 .expect("hdrhistogram precision 3 is valid"),
             epoch: 0,
+            last_rate_snapshot: None,
+            current_msgs_per_sec: 0.0,
+            current_bytes_per_sec: 0.0,
         }
     }
 
@@ -395,7 +415,37 @@ impl ProducerState {
             send_latency_p50_ms: p50,
             send_latency_p99_ms: p99,
             send_latency_max_ms: pmax,
+            msgs_per_sec: self.current_msgs_per_sec,
+            bytes_per_sec: self.current_bytes_per_sec,
         }
+    }
+
+    /// Take a rolling-window snapshot at `now`. On the first call, just records the
+    /// baseline and returns. On subsequent calls, computes the per-second send rates
+    /// against the previous snapshot and writes them to [`Self::current_msgs_per_sec`] /
+    /// [`Self::current_bytes_per_sec`].
+    ///
+    /// Sans-io discipline: `now` is injected (see [ADR-0011]). Runtime engines wire this
+    /// to a `tokio::time::interval` ticker.
+    ///
+    /// [ADR-0011]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
+    pub fn record_rate_window(&mut self, now: std::time::Instant) {
+        if let Some((prev_msgs, prev_bytes, prev_at)) = self.last_rate_snapshot {
+            let elapsed = now.saturating_duration_since(prev_at).as_secs_f64();
+            if elapsed > f64::EPSILON {
+                // Lossy cast intentional — see `ConsumerState::record_rate_window`.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "rate counters fit comfortably below f64::MAX_SAFE_INTEGER in practice"
+                )]
+                let d_msgs = self.total_msgs_sent.saturating_sub(prev_msgs) as f64;
+                #[allow(clippy::cast_precision_loss, reason = "same as above")]
+                let d_bytes = self.total_bytes_sent.saturating_sub(prev_bytes) as f64;
+                self.current_msgs_per_sec = d_msgs / elapsed;
+                self.current_bytes_per_sec = d_bytes / elapsed;
+            }
+        }
+        self.last_rate_snapshot = Some((self.total_msgs_sent, self.total_bytes_sent, now));
     }
 
     /// 50th percentile send latency, in milliseconds. Mirrors Java
