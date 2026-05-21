@@ -98,6 +98,24 @@ pub struct ConnectionShared {
     /// `None` means no in-band token refresh — the connection will drop if the
     /// broker challenges. PIP-30 / PIP-292.
     pub auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+    /// PIP-145 topic-list-watcher deltas. The driver pushes
+    /// [`magnetar_proto::ConnectionEvent::TopicListChanged`] events here as the broker
+    /// emits them; surface them via [`Client::next_topic_list_change`].
+    pub topic_list_changes: Mutex<std::collections::VecDeque<TopicListChange>>,
+    /// Wakeup for `next_topic_list_change` futures. Notified after every push to
+    /// `topic_list_changes`.
+    pub topic_list_notify: Notify,
+}
+
+/// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
+/// [`Client`]. Mirrors `ConnectionEvent::TopicListChanged` with owned vectors so callers
+/// don't pay for borrows across the await boundary.
+#[derive(Debug, Clone)]
+pub struct TopicListChange {
+    /// Topics that newly match the pattern.
+    pub added: Vec<String>,
+    /// Topics that no longer match the pattern.
+    pub removed: Vec<String>,
 }
 
 impl std::fmt::Debug for ConnectionShared {
@@ -124,6 +142,8 @@ impl ConnectionShared {
             inner: Mutex::new(magnetar_proto::Connection::new(config)),
             driver_waker: Notify::new(),
             auth_provider,
+            topic_list_changes: Mutex::new(std::collections::VecDeque::new()),
+            topic_list_notify: Notify::new(),
         })
     }
 }
@@ -132,11 +152,31 @@ impl ConnectionShared {
 mod tests {
     use magnetar_proto::ConnectionConfig;
 
-    use super::ConnectionShared;
+    use super::{ConnectionShared, TopicListChange};
 
     #[test]
     fn shared_state_can_be_constructed() {
         let s = ConnectionShared::new(ConnectionConfig::default());
         let _g = s.inner.lock();
+        // Topic-list buffer starts empty.
+        assert!(s.topic_list_changes.lock().is_empty());
+    }
+
+    #[test]
+    fn topic_list_changes_buffer_round_trip() {
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        s.topic_list_changes.lock().push_back(TopicListChange {
+            added: vec!["a".to_owned()],
+            removed: vec![],
+        });
+        s.topic_list_changes.lock().push_back(TopicListChange {
+            added: vec![],
+            removed: vec!["b".to_owned()],
+        });
+        let first = s.topic_list_changes.lock().pop_front().unwrap();
+        assert_eq!(first.added, vec!["a".to_owned()]);
+        let second = s.topic_list_changes.lock().pop_front().unwrap();
+        assert_eq!(second.removed, vec!["b".to_owned()]);
+        assert!(s.topic_list_changes.lock().is_empty());
     }
 }

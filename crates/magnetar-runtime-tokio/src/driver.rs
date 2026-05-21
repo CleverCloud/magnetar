@@ -38,30 +38,42 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
         let Some(event) = event else {
             return Ok(());
         };
-        if let ConnectionEvent::AuthChallenge {
-            method: _,
-            challenge,
-        } = event
-        {
-            let Some(provider) = shared.auth_provider.clone() else {
-                tracing::warn!(
-                    "broker requested in-band auth refresh but no AuthProvider configured; \
-                     the connection will be reset"
-                );
-                return Err(ClientError::Other(
-                    "broker requested AUTH_CHALLENGE but client has no auth provider".to_owned(),
-                ));
-            };
-            let bytes = challenge.unwrap_or_default();
-            let refreshed = provider
-                .respond_to_challenge(&bytes)
-                .map_err(|err| ClientError::Other(format!("auth refresh failed: {err}")))?;
-            let method = provider.method().to_owned();
-            shared
-                .inner
-                .lock()
-                .submit_auth_response(refreshed.to_vec(), Some(method));
-            shared.driver_waker.notify_one();
+        match event {
+            ConnectionEvent::AuthChallenge {
+                method: _,
+                challenge,
+            } => {
+                let Some(provider) = shared.auth_provider.clone() else {
+                    tracing::warn!(
+                        "broker requested in-band auth refresh but no AuthProvider configured; \
+                         the connection will be reset"
+                    );
+                    return Err(ClientError::Other(
+                        "broker requested AUTH_CHALLENGE but client has no auth provider"
+                            .to_owned(),
+                    ));
+                };
+                let bytes = challenge.unwrap_or_default();
+                let refreshed = provider
+                    .respond_to_challenge(&bytes)
+                    .map_err(|err| ClientError::Other(format!("auth refresh failed: {err}")))?;
+                let method = provider.method().to_owned();
+                shared
+                    .inner
+                    .lock()
+                    .submit_auth_response(refreshed.to_vec(), Some(method));
+                shared.driver_waker.notify_one();
+            }
+            ConnectionEvent::TopicListChanged { added, removed } => {
+                // PIP-145 topic-list watcher delta. Push into the per-client buffer + wake
+                // any `Client::next_topic_list_change` future.
+                shared
+                    .topic_list_changes
+                    .lock()
+                    .push_back(crate::TopicListChange { added, removed });
+                shared.topic_list_notify.notify_waiters();
+            }
+            _ => {}
         }
     }
 }

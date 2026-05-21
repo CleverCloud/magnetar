@@ -326,6 +326,32 @@ impl Client {
         }
     }
 
+    /// Await the next PIP-145 `TopicListChanged` delta. Resolves with the broker-reported
+    /// added / removed topics when the next watcher delta arrives, or `None` if the
+    /// connection has closed and no further deltas will arrive. Pair with
+    /// [`Self::watch_topic_list`] to first establish the watcher subscription.
+    ///
+    /// The future is cancel-safe: dropping it without polling does not drop pending
+    /// deltas, the next `next_topic_list_change` call still sees them.
+    pub async fn next_topic_list_change(&self) -> Option<crate::TopicListChange> {
+        loop {
+            if let Some(change) = self.shared.topic_list_changes.lock().pop_front() {
+                return Some(change);
+            }
+            if self.shared.inner.lock().is_closed() {
+                return None;
+            }
+            self.shared.topic_list_notify.notified().await;
+        }
+    }
+
+    /// Non-blocking peek for the next PIP-145 topic-list delta. Returns `None` when the
+    /// queue is empty.
+    #[must_use]
+    pub fn poll_topic_list_change(&self) -> Option<crate::TopicListChange> {
+        self.shared.topic_list_changes.lock().pop_front()
+    }
+
     /// Query the broker for the number of partitions a topic has. Returns `0` for
     /// non-partitioned topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
     pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {
