@@ -48,6 +48,11 @@ url                        = { workspace = true }
 uuid                       = { workspace = true }
 
 [dev-dependencies]
+# `aws-lc-rs` is pulled in only for the PIP-4 e2e tests
+# (`tests/e2e_crypto.rs`) where we need to generate RSA test keys for the
+# `MessageCrypto` round-trip. The non-test crate path stays free of this
+# heavy dep — encryption itself lives in `magnetar-messagecrypto`.
+aws-lc-rs          = { workspace = true }
 reqwest            = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
