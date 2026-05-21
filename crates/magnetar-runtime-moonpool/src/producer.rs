@@ -1,0 +1,699 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Producer façade for the moonpool engine.
+//!
+//! Mirrors [`magnetar_runtime_tokio::Producer`] but is generic over
+//! [`moonpool_core::Providers`] so the same façade runs on production Tokio
+//! sockets and on a `moonpool-sim` deterministic substrate.
+//!
+//! ## M3 surface
+//!
+//! - [`Client::open_producer`] — `CommandProducer` round-trip.
+//! - [`Producer::send`] / [`Producer::flush`] / [`Producer::close`].
+//! - Introspection: [`Producer::topic`], [`Producer::name`], [`Producer::is_closed`],
+//!   [`Producer::pending_count`], [`Producer::last_sequence_id`], [`Producer::stats`].
+//!
+//! ## No-channels invariant
+//!
+//! Futures here follow the same pattern as the tokio engine: park on the
+//! sans-io [`Connection`]'s `Waker` slab via
+//! [`Connection::register_waker`], plus a single
+//! [`tokio::sync::Notify`] (`driver_waker`) used as a wake-up signal across
+//! the protocol-level pending queue. No `mpsc` / `oneshot` / `watch` /
+//! `broadcast` channels of any flavour. See `GUIDELINES.md`
+//! §"No-channels rule".
+//!
+//! ## Compression
+//!
+//! The user-facing [`Producer`] stores the [`CompressionKind`] it was opened
+//! with so the broker sees the same compression metadata the state machine
+//! stamps. The moonpool engine does **not** ship a built-in codec stack in
+//! M3 — calling [`Producer::send`] with anything other than
+//! [`CompressionKind::None`] yields [`ClientError::Other`] until a follow-up
+//! milestone wires the codecs in. Mirrors the tokio engine's
+//! ordering (compression → encryption → state machine) so the swap will be a
+//! drop-in once codecs land.
+//!
+//! [`Connection`]: magnetar_proto::Connection
+//! [`Connection::register_waker`]: magnetar_proto::Connection::register_waker
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use magnetar_proto::producer::OutgoingMessage;
+use magnetar_proto::types::CompressionKind;
+use magnetar_proto::{
+    ConnectionEvent, CreateProducerRequest, MessageId, OpOutcome, PendingOpKey, ProducerHandle,
+    ProducerStats, SequenceId,
+};
+use moonpool_core::Providers;
+
+use crate::ConnectionShared;
+use crate::client::{Client, ClientError};
+
+/// User-facing producer handle, moonpool engine flavour.
+///
+/// Holds an [`Arc<ConnectionShared>`] plus a [`magnetar_proto::ProducerHandle`]
+/// — cheap to clone (Arc bump). Caller-facing futures park on the sans-io
+/// state machine's `Waker` slab, never on channels.
+pub struct Producer<P: Providers> {
+    pub(crate) shared: Arc<ConnectionShared>,
+    pub(crate) handle: ProducerHandle,
+    pub(crate) compression: CompressionKind,
+    /// Held only so `Producer` is generic over `P` without leaking the
+    /// driver-handle type parameter. The driver itself has already consumed
+    /// the providers.
+    pub(crate) _providers: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P: Providers> Clone for Producer<P> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            compression: self.compression,
+            _providers: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P: Providers> std::fmt::Debug for Producer<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Producer")
+            .field("handle", &self.handle)
+            .field("compression", &self.compression)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P: Providers> Producer<P> {
+    /// The protocol-layer producer handle this façade wraps.
+    #[must_use]
+    pub fn handle(&self) -> ProducerHandle {
+        self.handle
+    }
+
+    /// Compression codec this producer was opened with. Mirrors Java
+    /// `ProducerImpl#conf.getCompressionType()`. Returns
+    /// [`CompressionKind::None`] when the producer was opened without
+    /// explicit compression.
+    #[must_use]
+    pub fn compression(&self) -> CompressionKind {
+        self.compression
+    }
+
+    /// Topic name this producer is bound to. Returns an empty string if the
+    /// producer is no longer registered (closed).
+    #[must_use]
+    pub fn topic(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .producer_topic(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// Broker-assigned producer name. Returns an empty string until the
+    /// broker assigns one (typically right after the `ProducerSuccess`
+    /// round-trip) or if the producer is no longer registered.
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .producer_name(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// `true` if this producer has been closed (locally via
+    /// [`Self::close`] or remotely via a broker `CloseProducer`). Mirrors
+    /// Java `ProducerImpl#getState() == CLOSED`.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared.inner.lock().producer_is_closed(self.handle)
+    }
+
+    /// Number of in-flight sends (queued and not yet acked by the broker).
+    /// Mirrors the un-batched view of Java
+    /// `ProducerStats#getPendingQueueSize`.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.shared.inner.lock().producer_pending_count(self.handle)
+    }
+
+    /// Last sequence id this client has pushed onto the wire. Returns `-1`
+    /// if the producer has never sent. Mirrors
+    /// `org.apache.pulsar.client.api.Producer#getLastSequenceId`.
+    #[must_use]
+    pub fn last_sequence_id(&self) -> i64 {
+        self.shared
+            .inner
+            .lock()
+            .producer_last_sequence_id_pushed(self.handle)
+    }
+
+    /// Snapshot of this producer's cumulative counters. Mirrors Java
+    /// `org.apache.pulsar.client.api.Producer#getStats`. Returns a zeroed
+    /// snapshot if the producer handle is no longer registered (closed).
+    #[must_use]
+    pub fn stats(&self) -> ProducerStats {
+        self.shared
+            .inner
+            .lock()
+            .producer_stats(self.handle)
+            .unwrap_or_default()
+    }
+
+    /// Enqueue a send. The returned future resolves when the broker
+    /// acknowledges the publish (a `CommandSendReceipt`) or rejects it (a
+    /// `CommandSendError`).
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Other`] if compression is requested but no codec is wired into the moonpool
+    ///   engine yet.
+    /// - [`ClientError::Other`] wrapping a [`magnetar_proto::ProtocolError`] if the state machine
+    ///   rejects the send (e.g. closed producer, unknown handle).
+    /// - [`ClientError::Broker`] if the broker subsequently rejects the publish.
+    pub fn send(&self, msg: OutgoingMessage) -> SendFut {
+        let publish_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+
+        // The moonpool engine does not ship a compression codec stack in M3.
+        // The state machine still stamps `metadata.compression` based on the
+        // configured `CompressionKind`; until the runtime codec lands, we
+        // refuse non-`None` codecs so the broker never sees mis-labelled
+        // bytes. Mirrors the tokio engine's ordering — compression goes
+        // first, before the sans-io enqueue.
+        if self.compression != CompressionKind::None {
+            return SendFut {
+                shared: self.shared.clone(),
+                handle: self.handle,
+                state: SendState::Failed {
+                    error: Some(ClientError::Other(format!(
+                        "moonpool engine: compression {:?} not yet wired (M3); \
+                         use CompressionKind::None for now",
+                        self.compression
+                    ))),
+                },
+            };
+        }
+
+        let result = {
+            let mut conn = self.shared.inner.lock();
+            conn.send(self.handle, msg, publish_time_ms)
+        };
+
+        // Wake the driver so it can drain the freshly-queued frame.
+        self.shared.driver_waker.notify_one();
+
+        SendFut {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            state: match result {
+                Ok(seq) => SendState::Pending { sequence_id: seq },
+                Err(err) => SendState::Failed {
+                    error: Some(ClientError::Other(format!("send: {err}"))),
+                },
+            },
+        }
+    }
+
+    /// Flush this producer: force any pending batch to flush and wait for
+    /// every in-flight send to be acknowledged by the broker. Idempotent —
+    /// calling `flush()` on a quiescent producer returns immediately.
+    ///
+    /// Mirrors `org.apache.pulsar.client.api.Producer#flushAsync`. Use
+    /// before `close()` if you want at-least-once semantics on the trailing
+    /// sends.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible. The signature returns
+    /// `Result<(), ClientError>` for parity with the tokio engine and so
+    /// future drop-detection / disconnect-detection can surface errors
+    /// without a breaking change.
+    pub async fn flush(&self) -> Result<(), ClientError> {
+        let publish_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.flush_producer(self.handle, publish_time_ms);
+        }
+        self.shared.driver_waker.notify_one();
+
+        // Drain by waiting on the driver waker until the producer's pending
+        // queue is empty. Each `CommandSendReceipt` decrements the pending
+        // count inside the sans-io layer; the per-send `Waker`s registered
+        // by [`SendFut`] wake their owners directly, and any user code
+        // calling `flush` repolls the count after every `driver_waker`
+        // notification. The notify cell is set by user-facing futures
+        // (`send`, `close_producer`); the driver itself sets it on every
+        // loop tick.
+        loop {
+            let pending = self.shared.inner.lock().producer_pending_count(self.handle);
+            if pending == 0 {
+                return Ok(());
+            }
+            let notified = self.shared.driver_waker.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            notified.await;
+        }
+    }
+
+    /// Close this producer. The returned future resolves when the broker
+    /// acknowledges the close.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Broker`] if the broker returns an error correlated with the close.
+    /// - [`ClientError::Other`] if an unexpected outcome arrives on the close request id.
+    pub async fn close(self) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.close_producer(self.handle)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected outcome for close request {request_id}: {other:?}"
+            ))),
+        }
+    }
+}
+
+impl<P: Providers> Client<P> {
+    /// Open a producer.
+    ///
+    /// Returns once the broker has sent `CommandProducerSuccess`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Closed`] if the broker closes the producer before it becomes ready (or
+    ///   while we wait for the success ack).
+    /// - [`ClientError::Other`] if the connection drops mid-open.
+    pub async fn open_producer(
+        &self,
+        req: CreateProducerRequest,
+    ) -> Result<Producer<P>, ClientError> {
+        let compression = req.compression;
+        let handle = {
+            let mut conn = self.shared().inner.lock();
+            conn.create_producer(req)
+        };
+        self.shared().driver_waker.notify_one();
+        wait_producer_ready(self.shared(), handle).await?;
+        Ok(Producer {
+            shared: self.shared().clone(),
+            handle,
+            compression,
+            _providers: std::marker::PhantomData,
+        })
+    }
+}
+
+/// Future returned by [`Producer::send`].
+///
+/// Polls until the matching [`OpOutcome::SendReceipt`] /
+/// [`OpOutcome::SendError`] lands inside the sans-io state machine. NO
+/// channel.
+#[derive(Debug)]
+pub struct SendFut {
+    shared: Arc<ConnectionShared>,
+    handle: ProducerHandle,
+    state: SendState,
+}
+
+#[derive(Debug)]
+enum SendState {
+    Pending {
+        sequence_id: SequenceId,
+    },
+    /// `send()` returned an error synchronously (e.g. producer not yet
+    /// open, compression not wired). We surface it on the first `poll`.
+    Failed {
+        error: Option<ClientError>,
+    },
+}
+
+impl Future for SendFut {
+    type Output = Result<MessageId, ClientError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Snapshot fields before borrowing `state` mutably to keep the
+        // borrow checker happy.
+        let handle = self.handle;
+        let shared = self.shared.clone();
+        match &mut self.state {
+            SendState::Failed { error } => {
+                let err = error
+                    .take()
+                    .unwrap_or_else(|| ClientError::Other("send future polled after error".into()));
+                Poll::Ready(Err(err))
+            }
+            SendState::Pending { sequence_id } => {
+                let key = PendingOpKey::Send(handle, *sequence_id);
+                let mut conn = shared.inner.lock();
+                if let Some(outcome) = conn.take_outcome(key) {
+                    drop(conn);
+                    return Poll::Ready(translate_send_outcome(outcome));
+                }
+                conn.register_waker(key, cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> {
+    match outcome {
+        OpOutcome::SendReceipt { message_id, .. } => Ok(message_id),
+        OpOutcome::SendError { code, message, .. } => Err(ClientError::Broker { code, message }),
+        other => Err(ClientError::Other(format!(
+            "unexpected send outcome: {other:?}"
+        ))),
+    }
+}
+
+/// Helper future to wait for a generic request outcome.
+struct RequestFut {
+    shared: Arc<ConnectionShared>,
+    key: PendingOpKey,
+}
+
+impl Future for RequestFut {
+    type Output = OpOutcome;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut conn = self.shared.inner.lock();
+        if let Some(outcome) = conn.take_outcome(self.key) {
+            drop(conn);
+            return Poll::Ready(outcome);
+        }
+        conn.register_waker(self.key, cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Future that drives the connection's semantic event queue until the
+/// expected [`ConnectionEvent::ProducerReady`] (or a terminal
+/// `ProducerClosedByBroker` / `Closed`) lands for the given handle.
+///
+/// Mirrors the tokio engine's `EventWaitFut::ProducerReady`. Unlike
+/// [`RequestFut`] this watches an event stream, not a single outcome
+/// slot, because the broker emits `CommandProducerSuccess` separately
+/// from any request-correlated outcome — the sans-io layer surfaces it
+/// as `ProducerReady`.
+struct ProducerReadyFut {
+    shared: Arc<ConnectionShared>,
+    handle: ProducerHandle,
+}
+
+impl Future for ProducerReadyFut {
+    type Output = Result<(), ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut conn = self.shared.inner.lock();
+        loop {
+            match conn.poll_event() {
+                Some(ConnectionEvent::ProducerReady { handle, .. }) => {
+                    if handle == self.handle {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Some(ConnectionEvent::ProducerClosedByBroker { handle, .. }) => {
+                    if handle == self.handle {
+                        return Poll::Ready(Err(ClientError::Closed));
+                    }
+                }
+                Some(ConnectionEvent::Closed { reason }) => {
+                    return Poll::Ready(Err(ClientError::Other(
+                        reason.unwrap_or_else(|| "connection closed".into()),
+                    )));
+                }
+                Some(_) => {} // ignore unrelated events
+                None => break,
+            }
+        }
+        drop(conn);
+
+        // We have no per-event waker slot in the sans-io layer; park on the
+        // driver waker. Every inbound batch ends with the driver looping
+        // back to `select!`, which gives any pending `notified()` a chance
+        // to fire as the next loop tick. Mirrors the tokio engine's
+        // `EventWaitFut` (spawned helper) but without spawning — the await
+        // happens inline because moonpool needs to remain `Send`-compatible
+        // across simulators that may run on a single thread.
+        let waker = cx.waker().clone();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            shared.driver_waker.notified().await;
+            waker.wake();
+        });
+        Poll::Pending
+    }
+}
+
+async fn wait_producer_ready(
+    shared: &Arc<ConnectionShared>,
+    handle: ProducerHandle,
+) -> Result<(), ClientError> {
+    ProducerReadyFut {
+        shared: shared.clone(),
+        handle,
+    }
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bytes::{Bytes, BytesMut};
+    use magnetar_proto::producer::OutgoingMessage;
+    use magnetar_proto::types::CompressionKind;
+    use magnetar_proto::{ConnectionConfig, CreateProducerRequest, encode_command, pb};
+    use moonpool_core::TokioProviders;
+
+    use super::Producer;
+    use crate::client::Client;
+    use crate::{ConnectionShared, MoonpoolEngine};
+
+    fn handshake_response_bytes() -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    /// Spin up a `ConnectionShared` whose inner state machine has completed
+    /// the handshake, so `create_producer` runs cleanly without erroring
+    /// on protocol-state checks.
+    fn handshake_complete_shared() -> Arc<ConnectionShared> {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        shared
+    }
+
+    /// Smoke test: a freshly-constructed producer reports defaults that
+    /// match the sans-io layer (no sends pushed, none pending, no name).
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_producer_reports_defaults() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/defaults".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        assert_eq!(producer.pending_count(), 0);
+        assert_eq!(producer.last_sequence_id(), -1);
+        assert!(!producer.is_closed());
+        assert_eq!(producer.name(), "");
+        assert_eq!(producer.topic(), "persistent://public/default/defaults");
+        assert_eq!(producer.compression(), CompressionKind::None);
+        let stats = producer.stats();
+        assert_eq!(stats.total_msgs_sent, 0);
+        assert_eq!(stats.pending_queue_size, 0);
+    }
+
+    /// `send` on a freshly-opened (post-handshake) producer enqueues the
+    /// frame into the sans-io state machine; `pending_count` flips to 1
+    /// because no driver is running to drain the `CommandSendReceipt`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_enqueues_pending_op() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/enqueue".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        let _fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"hello"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 5,
+            num_messages: 1,
+            txn_id: None,
+        });
+        assert!(
+            producer.pending_count() >= 1,
+            "expected pending send; got {}",
+            producer.pending_count()
+        );
+    }
+
+    /// `send` with a non-`None` compression codec yields a `SendFut` that
+    /// resolves to `ClientError::Other` on the first poll. Until the
+    /// moonpool engine ships a runtime codec, the producer refuses to
+    /// hand mis-labelled bytes to the state machine.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_with_compression_returns_error() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/zstd".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::Zstd,
+            _providers: std::marker::PhantomData,
+        };
+        let res = producer
+            .send(OutgoingMessage {
+                payload: Bytes::from_static(b"hello"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 5,
+                num_messages: 1,
+                txn_id: None,
+            })
+            .await;
+        let err = res.expect_err("expected error for unwired compression");
+        let s = format!("{err}");
+        assert!(
+            s.contains("not yet wired"),
+            "expected compression-not-wired message, got {s:?}"
+        );
+    }
+
+    /// `flush()` on a quiescent producer returns immediately. Idempotency
+    /// guarantee mirrored from the tokio engine.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_quiescent_is_noop() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/flush-ok".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        assert_eq!(producer.pending_count(), 0);
+        tokio::time::timeout(Duration::from_secs(1), producer.flush())
+            .await
+            .expect("flush should resolve on quiescent producer")
+            .expect("flush ok");
+    }
+
+    /// Producer façade is `Clone` (cheap Arc bump). Confirm both clones
+    /// share the same handle.
+    #[test]
+    fn producer_clones_share_handle() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/clone".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        let clone = producer.clone();
+        assert_eq!(producer.handle(), clone.handle());
+        assert_eq!(producer.compression(), clone.compression());
+    }
+
+    /// `Client::open_producer` against `TokioProviders` resolves at the
+    /// type level. We can't construct a `Client` without a real
+    /// connection, so the bound is checked through the free function
+    /// below.
+    #[allow(dead_code)]
+    fn _open_producer_bounds<P: moonpool_core::Providers>(
+        client: &Client<P>,
+        req: CreateProducerRequest,
+    ) -> impl std::future::Future<Output = Result<super::Producer<P>, super::ClientError>> + '_
+    {
+        client.open_producer(req)
+    }
+
+    /// Smoke: `Client::connect_plain` is generic over `TokioProviders` and
+    /// the engine's surface composes with the producer module.
+    #[test]
+    #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
+    fn open_producer_compiles_against_tokio_providers() {
+        let providers = TokioProviders::new();
+        let engine = MoonpoolEngine::new(providers);
+        let _client_fut =
+            Client::connect_plain(&engine, "127.0.0.1:6650", ConnectionConfig::default());
+    }
+}
