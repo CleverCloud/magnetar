@@ -75,9 +75,11 @@ impl Client {
     ///
     /// Returns [`ClientError::Other`] if no valid certificate is parsed from the PEM.
     pub fn tls_config_from_pem(pem_bytes: &[u8]) -> Result<Arc<rustls::ClientConfig>, ClientError> {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+
         let mut roots = rustls::RootCertStore::empty();
-        let mut cursor = std::io::Cursor::new(pem_bytes);
-        for cert in rustls_pemfile::certs(&mut cursor) {
+        for cert in CertificateDer::pem_slice_iter(pem_bytes) {
             let cert = cert.map_err(|e| {
                 ClientError::Other(format!("failed to parse a trust certificate from PEM: {e}"))
             })?;

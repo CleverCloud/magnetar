@@ -59,8 +59,10 @@ slab            = "0.4"
 
 # TLS — rustls everywhere, no native-tls
 rustls               = { version = "0.23", default-features = false, features = ["std", "ring"] }
-rustls-pemfile       = "2"
-rustls-native-certs  = "0.7"
+# rustls-pemfile was marked unmaintained (RUSTSEC-2025-0134); we now parse PEMs via
+# rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
+rustls-pki-types     = { version = "1", features = ["std"] }
+rustls-native-certs  = "0.8"
 tokio-rustls         = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Compression — Pulsar's four codecs

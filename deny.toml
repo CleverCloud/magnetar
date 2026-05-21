@@ -7,19 +7,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # rustls-pemfile is unmaintained but its successor lives in rustls-pki-types
-    # (`PemObject` trait). Pulled transitively by rustls-native-certs 0.7.x.
-    # Resolution scheduled for M3 alongside rustls-native-certs upgrade to 0.8.x.
-    "RUSTSEC-2025-0134",
-    # time 0.3.x < 0.3.47: DoS via stack exhaustion on RFC 2822 parsing of
-    # untrusted input. Pulled transitively via testcontainers -> bollard. Only
-    # affects the e2e test path (dev-dep), never the production runtime.
-    # Upgrade requires Rust ≥ 1.88 (time-core 0.1.8 MSRV), but our workspace
-    # MSRV is 1.85 per workspace.package.rust-version. Revisit when bumping
-    # MSRV or when testcontainers / bollard drop the dependency.
-    "RUSTSEC-2026-0009",
-]
+ignore = []
 
 [licenses]
 version = 2

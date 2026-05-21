@@ -24,7 +24,7 @@ tokio               = { workspace = true, features = ["rt", "net", "time", "io-u
 tokio-util          = { workspace = true, features = ["compat"] }
 tokio-rustls        = { workspace = true }
 rustls              = { workspace = true }
-rustls-pemfile      = { workspace = true }
+rustls-pki-types    = { workspace = true }
 rustls-native-certs = { workspace = true }
 # Compression codecs — Pulsar's `CompressionType` enum maps 1:1 to these crates.
 lz4_flex            = { workspace = true }
