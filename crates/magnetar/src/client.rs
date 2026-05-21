@@ -198,6 +198,21 @@ impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
     }
 }
 
+/// Per-topic seek target supplied by the closure passed to
+/// [`crate::MultiTopicsConsumer::seek_per_partition`] (and the equivalent on
+/// [`crate::PartitionedConsumer`]). Mirrors Java's
+/// `Consumer#seek(Function<String, Object>)`, where the function returns either a
+/// `MessageId` or a `Long` publish-time millis-since-epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekTarget {
+    /// Seek the child consumer to a specific message id. Mirrors Java
+    /// `Consumer#seek(MessageId)`.
+    MessageId(magnetar_proto::MessageId),
+    /// Seek the child consumer to a publish-time deadline (millis since UNIX epoch).
+    /// Mirrors Java `Consumer#seek(long)`.
+    PublishTimeMs(u64),
+}
+
 /// Java `ProducerInterceptor` SPI. Plug pipeline hooks in front of `Producer::send` to
 /// inspect, mutate, or react to outgoing messages. Mirrors the Java
 /// `org.apache.pulsar.client.api.interceptor.ProducerInterceptor` interface — `eligible`

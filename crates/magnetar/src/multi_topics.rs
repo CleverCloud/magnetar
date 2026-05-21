@@ -30,7 +30,7 @@ use magnetar_runtime_tokio::Consumer;
 use parking_lot::Mutex;
 
 use crate::PulsarClient;
-use crate::client::PulsarError;
+use crate::client::{PulsarError, SeekTarget};
 
 /// Multi-topics consumer. Each contained [`Consumer`] subscribes to one topic; `receive()`
 /// returns the next message across the whole set.
@@ -605,6 +605,39 @@ impl MultiTopicsConsumer {
         first_err
     }
 
+    /// Seek every child consumer to a per-topic target computed by `f`. Mirrors Java's
+    /// `Consumer#seek(Function<String, Object>)` (where the function returns either a
+    /// `MessageId` or a `Long` publish-time millis-since-epoch).
+    ///
+    /// `f` is invoked synchronously per child, in the order supplied to the builder, with
+    /// the child's topic name (matching what `topics()` returns — for a
+    /// [`crate::PartitionedConsumer`] this is `<topic>-partition-N`). The returned
+    /// [`SeekTarget`] is then dispatched to the appropriate per-topic seek primitive.
+    ///
+    /// All children are attempted even if one fails; the first error encountered is
+    /// returned and subsequent errors are dropped (every child still gets a chance to
+    /// issue its seek). This matches the existing [`Self::seek_to_timestamp`] semantics.
+    pub async fn seek_per_partition<F>(&self, mut f: F) -> Result<(), PulsarError>
+    where
+        F: FnMut(&str) -> SeekTarget,
+    {
+        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let mut first_err: Result<(), PulsarError> = Ok(());
+        for nc in &snapshot {
+            let target = f(nc.topic.as_str());
+            let res = match target {
+                SeekTarget::MessageId(id) => nc.consumer.seek_to_message(id).await,
+                SeekTarget::PublishTimeMs(ts) => nc.consumer.seek_to_timestamp(ts).await,
+            };
+            if let Err(e) = res
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Client(e));
+            }
+        }
+        first_err
+    }
+
     /// Ask the broker for each topic's last-published message id. Returns one `(topic, id)`
     /// per child consumer, in the order they appear in the current consumer set. Mirrors
     /// Java `Consumer#getLastMessageIds` for partitioned/multi-topic consumers.
@@ -906,7 +939,12 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use magnetar_proto::MessageId;
+
     use super::*;
+    use crate::SeekTarget;
 
     fn empty_template() -> ConsumerTemplate {
         ConsumerTemplate {
@@ -969,5 +1007,76 @@ mod tests {
             clone.subscription_properties,
             vec![("sk".to_owned(), "sv".to_owned())]
         );
+    }
+
+    /// Mirror of the dispatch arm inside [`super::MultiTopicsConsumer::seek_per_partition`].
+    /// Records the routing decision per topic instead of issuing a real seek so the routing
+    /// logic can be exercised without spinning up a broker.
+    fn dispatch<F>(topics: &[&str], mut f: F) -> Vec<(String, DispatchKind)>
+    where
+        F: FnMut(&str) -> SeekTarget,
+    {
+        topics
+            .iter()
+            .map(|t| {
+                let kind = match f(t) {
+                    SeekTarget::MessageId(id) => DispatchKind::MessageId(id),
+                    SeekTarget::PublishTimeMs(ts) => DispatchKind::PublishTimeMs(ts),
+                };
+                ((*t).to_owned(), kind)
+            })
+            .collect()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum DispatchKind {
+        MessageId(MessageId),
+        PublishTimeMs(u64),
+    }
+
+    #[test]
+    fn seek_per_partition_routes_each_topic_via_closure() {
+        let topics = [
+            "persistent://public/default/orders-partition-0",
+            "persistent://public/default/orders-partition-1",
+            "persistent://public/default/orders-partition-2",
+        ];
+
+        // Track what topics the closure was called with — mirrors Java's
+        // Function<String, Object> semantics where each partition gets its own decision.
+        let seen = RefCell::new(Vec::<String>::new());
+        let mid = MessageId::EARLIEST;
+        let decisions = dispatch(&topics, |t| {
+            seen.borrow_mut().push(t.to_owned());
+            if t.ends_with("-partition-1") {
+                SeekTarget::PublishTimeMs(1_700_000_000_000)
+            } else {
+                SeekTarget::MessageId(mid)
+            }
+        });
+
+        // Closure was called exactly once per topic, in builder order.
+        assert_eq!(seen.borrow().len(), 3);
+        assert_eq!(seen.borrow()[0], topics[0]);
+        assert_eq!(seen.borrow()[1], topics[1]);
+        assert_eq!(seen.borrow()[2], topics[2]);
+
+        // Routing: partition-0 / partition-2 -> MessageId seek; partition-1 -> timestamp seek.
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(decisions[0].1, DispatchKind::MessageId(mid));
+        assert_eq!(
+            decisions[1].1,
+            DispatchKind::PublishTimeMs(1_700_000_000_000)
+        );
+        assert_eq!(decisions[2].1, DispatchKind::MessageId(mid));
+    }
+
+    #[test]
+    fn seek_target_enum_variants_are_constructible() {
+        let by_id = SeekTarget::MessageId(MessageId::LATEST);
+        let by_ts = SeekTarget::PublishTimeMs(42);
+        // PartialEq + Copy: derived impls round-trip without surprises.
+        assert_eq!(by_id, SeekTarget::MessageId(MessageId::LATEST));
+        assert_ne!(by_id, by_ts);
     }
 }
