@@ -64,6 +64,14 @@ impl Consumer {
             .consumer_available_permits(self.handle)
     }
 
+    /// `true` if this consumer has received at least one message since opening. Mirrors
+    /// Java `Consumer#hasReceivedAnyMessage` — useful as a "did anything ever arrive?"
+    /// probe without inspecting the full `ConsumerStats`.
+    #[must_use]
+    pub fn has_received_any_message(&self) -> bool {
+        self.stats().total_msgs_received > 0
+    }
+
     /// Receive the next message, bounded by `timeout`. Returns `Ok(None)` if the deadline
     /// elapses with no message. Mirrors Java `Consumer#receive(int timeout, TimeUnit unit)`.
     pub async fn receive_with_timeout(

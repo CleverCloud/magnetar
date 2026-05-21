@@ -273,6 +273,16 @@ impl MultiTopicsConsumer {
             .fold(0u32, u32::saturating_add)
     }
 
+    /// `true` if any child consumer has received at least one message. Mirrors Java
+    /// `Consumer#hasReceivedAnyMessage` at the multi-topic / partitioned scope.
+    #[must_use]
+    pub fn has_received_any_message(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|c| c.consumer.has_received_any_message())
+    }
+
     /// `true` once every child consumer is closed. Mirrors Java `Consumer#isClosed` at the
     /// multi-topic / partitioned scope.
     #[must_use]

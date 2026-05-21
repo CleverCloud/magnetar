@@ -559,6 +559,13 @@ impl<S: Schema> TypedConsumer<S> {
         self.inner.available_permits()
     }
 
+    /// `true` if this consumer has received at least one message since opening. Mirrors
+    /// Java `Consumer#hasReceivedAnyMessage`.
+    #[must_use]
+    pub fn has_received_any_message(&self) -> bool {
+        self.inner.has_received_any_message()
+    }
+
     /// `true` when the consumer has been disconnected longer than the configured inactive
     /// threshold. Mirrors Java `Consumer#isInactive` semantics.
     #[must_use]
