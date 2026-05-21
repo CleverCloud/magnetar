@@ -624,7 +624,7 @@ known-missing feature.
 | PIP-34 / 119 / 282 / 379 | Key_Shared family | ✅ | `KeySharedConfig` + builder |
 | PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
-| PIP-188 | `TOPIC_MIGRATED` | 🟡 | Wire opcode present; engine-level reconnect-on-migrate pending |
+| PIP-188 | `TOPIC_MIGRATED` | ✅ | Wire opcode decoded; tokio driver's event loop catches the `ConnectionEvent::TopicMigrated` event, logs the new-broker hint, and returns an error from `driver_loop_inner` so the supervisor triggers `Connection::reset` + reconnect. `rebuild_producers` / `rebuild_consumers` re-attach every still-open handle on the new socket, which re-runs lookup and yields the new owner. |
 | PIP-460 | Scalable topics | ❌ | Scoped for M9 (experimental) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim — magnetar ships its own idiomatic surface |
 | PIP-180 | Shadow topic | ❌ | M9 |

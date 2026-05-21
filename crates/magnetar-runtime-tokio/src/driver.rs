@@ -97,6 +97,34 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     .push_back(crate::TopicListChange { added, removed });
                 shared.topic_list_notify.notify_waiters();
             }
+            ConnectionEvent::TopicMigrated {
+                producer,
+                consumer,
+                broker_service_url,
+                broker_service_url_tls,
+            } => {
+                // PIP-188: broker asked the client to move the producer / consumer to a
+                // different broker. The new URL is a hint: the correct way to honour it
+                // is to tear the connection down so the supervised reconnect path re-runs
+                // lookup (and yields the new owner). On reconnect,
+                // `Connection::rebuild_producers` + `rebuild_consumers` re-emit every
+                // still-open handle's `CommandProducer` / `CommandSubscribe` so user
+                // futures stay live across the migration.
+                //
+                // We surface the hint via tracing so operators can see why the reconnect
+                // fired, then return an error from the driver — the supervised loop
+                // catches it, calls `Connection::reset`, sleeps the backoff, and reopens.
+                tracing::info!(
+                    ?producer,
+                    ?consumer,
+                    new_url = broker_service_url.as_deref(),
+                    new_url_tls = broker_service_url_tls.as_deref(),
+                    "broker requested PIP-188 topic migration; supervised reconnect will fire"
+                );
+                return Err(ClientError::Other(
+                    "PIP-188: broker requested topic migration; resetting connection".to_owned(),
+                ));
+            }
             _ => {}
         }
     }
