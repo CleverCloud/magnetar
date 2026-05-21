@@ -86,6 +86,14 @@ pub struct TypedProducerBuilder<'a, S: Schema> {
     topic: String,
     schema: Arc<S>,
     name: Option<String>,
+    compression: magnetar_proto::types::CompressionKind,
+    batching: Option<(usize, usize)>,
+    chunking: bool,
+    properties: Vec<(String, String)>,
+    initial_sequence_id: Option<u64>,
+    access_mode: pb::ProducerAccessMode,
+    send_timeout: Option<std::time::Duration>,
+    encryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
 
 impl<S: Schema> std::fmt::Debug for TypedProducerBuilder<'_, S> {
@@ -105,6 +113,14 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
             topic,
             schema,
             name: None,
+            compression: magnetar_proto::types::CompressionKind::None,
+            batching: None,
+            chunking: false,
+            properties: Vec::new(),
+            initial_sequence_id: None,
+            access_mode: pb::ProducerAccessMode::Shared,
+            send_timeout: None,
+            encryptor: None,
         }
     }
 
@@ -112,6 +128,65 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::compression`.
+    #[must_use]
+    pub fn compression(mut self, kind: magnetar_proto::types::CompressionKind) -> Self {
+        self.compression = kind;
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::batching`.
+    #[must_use]
+    pub fn batching(mut self, max_messages: usize, max_bytes: usize) -> Self {
+        self.batching = Some((max_messages, max_bytes));
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::chunking`.
+    #[must_use]
+    pub fn chunking(mut self, enable: bool) -> Self {
+        self.chunking = enable;
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::property`.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::initial_sequence_id`.
+    #[must_use]
+    pub fn initial_sequence_id(mut self, id: u64) -> Self {
+        self.initial_sequence_id = Some(id);
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::access_mode`.
+    #[must_use]
+    pub fn access_mode(mut self, mode: pb::ProducerAccessMode) -> Self {
+        self.access_mode = mode;
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::send_timeout`.
+    #[must_use]
+    pub fn send_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.send_timeout = Some(timeout);
+        self
+    }
+
+    /// Mirrors `ProducerBuilder::encryption`.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        encryptor: Arc<dyn magnetar_runtime_tokio::MessageEncryptor>,
+    ) -> Self {
+        self.encryptor = Some(encryptor);
         self
     }
 
@@ -124,9 +199,30 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
             r#type: self.schema.schema_type() as i32,
             properties: Vec::new(),
         };
-        let mut builder = self.client.producer(self.topic).schema(schema_pb);
+        let mut builder = self
+            .client
+            .producer(self.topic)
+            .schema(schema_pb)
+            .compression(self.compression)
+            .chunking(self.chunking)
+            .access_mode(self.access_mode);
         if let Some(n) = self.name {
             builder = builder.name(n);
+        }
+        if let Some((max_msgs, max_bytes)) = self.batching {
+            builder = builder.batching(max_msgs, max_bytes);
+        }
+        for (k, v) in self.properties {
+            builder = builder.property(k, v);
+        }
+        if let Some(id) = self.initial_sequence_id {
+            builder = builder.initial_sequence_id(id);
+        }
+        if let Some(t) = self.send_timeout {
+            builder = builder.send_timeout(t);
+        }
+        if let Some(e) = self.encryptor {
+            builder = builder.encryption(e);
         }
         let inner = builder.create().await?;
         Ok(TypedProducer {
