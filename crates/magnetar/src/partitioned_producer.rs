@@ -185,6 +185,7 @@ pub struct PartitionedProducerBuilder<'a> {
     routing: MessageRoutingMode,
     initial_sequence_id: Option<u64>,
     access_mode: pb::ProducerAccessMode,
+    producer_metadata: Vec<(String, String)>,
     schema: Option<pb::Schema>,
     encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
@@ -213,6 +214,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
             routing: MessageRoutingMode::default(),
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
+            producer_metadata: Vec::new(),
             schema: None,
             encryptor: None,
         }
@@ -270,6 +272,15 @@ impl<'a> PartitionedProducerBuilder<'a> {
         self
     }
 
+    /// Appends a `(key, value)` entry to the broker-visible producer metadata, applied
+    /// to every per-partition child. Mirrors Java `ProducerBuilder#property` at the
+    /// partitioned scope.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.producer_metadata.push((key.into(), value.into()));
+        self
+    }
+
     /// Advertise a schema on every per-partition `CommandProducer`.
     #[must_use]
     pub fn schema(mut self, schema: pb::Schema) -> Self {
@@ -317,7 +328,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
                 schema: self.schema.clone(),
                 initial_sequence_id: self.initial_sequence_id,
                 access_mode: self.access_mode,
-                producer_metadata: Vec::new(),
+                producer_metadata: self.producer_metadata.clone(),
             };
             let result = self
                 .client
