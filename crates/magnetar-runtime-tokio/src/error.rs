@@ -61,6 +61,13 @@ pub enum ClientError {
     #[error("invalid server name for tls: {0}")]
     InvalidServerName(String),
 
+    /// A bounded operation exceeded its caller-supplied deadline. Mirrors Java
+    /// `PulsarClientException.TimeoutException` — surfaced by `Producer::flush_with_timeout`
+    /// and any other API that wraps a long-running protocol round-trip in
+    /// `tokio::time::timeout`.
+    #[error("timed out: {0}")]
+    Timeout(String),
+
     /// Catch-all for engine-internal misconfiguration.
     #[error("other: {0}")]
     Other(String),
