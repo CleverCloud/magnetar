@@ -215,4 +215,28 @@ mod tests {
             "no decrypted plaintext should appear pre-handshake"
         );
     }
+
+    /// Push enough garbage encrypted bytes to drive rustls past the
+    /// ClientHello / fatal-alert split. Confirms `step()` surfaces the
+    /// rustls error path rather than silently dropping bytes — important
+    /// because the moonpool transport relies on it to terminate `read_buf`
+    /// with `InvalidData` rather than hang.
+    #[test]
+    fn adapter_step_propagates_decrypt_error() {
+        let session = make_session();
+        let mut adapter = RustlsByteAdapter::new(session);
+        // Issue the ClientHello first so rustls is past the "waiting for
+        // input" stage. The subsequent garbage push fails decryption.
+        adapter.step().unwrap();
+        let _ = adapter.take_encrypted_outbound();
+        // Push a TLS-record-header-shaped payload that decrypts to nothing
+        // useful. rustls should reject it on `process_new_packets`.
+        let bogus = vec![0x17, 0x03, 0x03, 0x00, 0x05, 0xff, 0xff, 0xff, 0xff, 0xff];
+        adapter.push_encrypted(&bogus);
+        let outcome = adapter.step();
+        assert!(
+            outcome.is_err(),
+            "rustls must reject the bogus record, got {outcome:?}"
+        );
+    }
 }

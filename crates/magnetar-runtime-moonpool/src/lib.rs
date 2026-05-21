@@ -31,9 +31,11 @@
 //! TLS for the moonpool engine is the `option (d)` adapter ([`tls`]): drive
 //! [`rustls::ClientConnection`] (itself sans-io) over the moonpool-supplied
 //! byte pipe. The TLS handshake therefore survives `moonpool-sim` chaos with
-//! the same determinism as `magnetar-proto` itself. The driver loop only
-//! drives the plaintext path today; TLS wiring lands in a follow-up
-//! milestone.
+//! the same determinism as `magnetar-proto` itself. The
+//! [`crate::transport::Transport`] enum exposes a `Tls` variant that the
+//! driver loop drives identically to the plaintext path —
+//! [`MoonpoolEngine::connect_tls`] runs the handshake inline before handing
+//! the transport to the driver task.
 //!
 //! ## No channels
 //!
@@ -73,13 +75,26 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use magnetar_proto::{Connection, ConnectionConfig};
+/// Convenience re-exports of the sans-io cluster-failover types. They live
+/// in `magnetar-proto` so the runtime engines can plug them into the
+/// supervised reconnect path without re-implementing the trait. Java
+/// parity: `org.apache.pulsar.client.api.ServiceUrlProvider`. See
+/// [ADR-0016](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0016-pip-121-cluster-failover.md).
+///
+/// `AutoClusterFailover` (the health-probe-driven background policy) is
+/// **not** ported to the moonpool engine — it requires a tokio-driven
+/// probe loop tightly coupled to the runtime. See
+/// `docs/m5b-deferrals.md` for the rationale. Use
+/// [`magnetar_proto::ControlledClusterFailover`] for moonpool — set the
+/// URL from your own task or test harness.
+pub use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider, StaticServiceUrlProvider};
 use moonpool_core::Providers;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 pub use crate::client::{Client, ClientError, LookupTopicResult};
 pub use crate::consumer::Consumer;
-pub use crate::dns::{arc_dns_resolver, DnsResolveFuture, DnsResolver, StaticDnsResolver};
+pub use crate::dns::{DnsResolveFuture, DnsResolver, StaticDnsResolver, arc_dns_resolver};
 pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
 use crate::transport::Transport;
@@ -258,9 +273,7 @@ pub enum EngineError {
     /// [`ConnectionShared::memory_limit_bytes`] budget. Mirrors Java's
     /// `MemoryLimitController` in `FailImmediately` policy. See
     /// [ADR-0017](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
-    #[error(
-        "memory limit exceeded: current={current}B + requested={requested}B > limit={limit}B"
-    )]
+    #[error("memory limit exceeded: current={current}B + requested={requested}B > limit={limit}B")]
     MemoryLimitExceeded {
         /// Bytes currently reserved on the budget when the request was rejected.
         current: u64,
@@ -357,6 +370,89 @@ impl<P: Providers> MoonpoolEngine<P> {
             self.providers.time().clone(),
             self.providers.task(),
         );
+        Ok((shared, driver))
+    }
+
+    /// Connect to `addr` over TLS (rustls-over-bytepipe via
+    /// [`tls::RustlsByteAdapter`]) and spawn the driver task that runs the
+    /// protocol forward.
+    ///
+    /// `addr` is a `host:port` string per moonpool's API (NOT a `pulsar+ssl://`
+    /// URL — strip the scheme before calling). `host` is the SNI /
+    /// hostname-verification name handed to rustls; pass the broker hostname
+    /// even if `addr` is a resolved IP. `tls_config` is the workspace-wide
+    /// [`rustls::ClientConfig`] (no `native-tls` / `openssl` shim,
+    /// [ADR-0005](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0005-rustls-only-tls.md)).
+    ///
+    /// The TLS handshake runs inline before `connect_tls` returns. After
+    /// that, the driver loop pumps decrypted plaintext through the same
+    /// sans-io state machine the plaintext path uses, so producer / consumer
+    /// flows complete identically under `moonpool-sim`.
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::connect_plain`], plus [`EngineError::Tls`]
+    /// for rustls handshake failures.
+    pub async fn connect_tls(
+        &self,
+        addr: &str,
+        host: &str,
+        tls_config: Arc<rustls::ClientConfig>,
+        config: ConnectionConfig,
+        resolver: Option<&dyn DnsResolver>,
+    ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
+        let mut transport =
+            Transport::<P>::connect_tls(self.providers.network(), addr, host, tls_config, resolver)
+                .await?;
+        let shared = ConnectionShared::new(config);
+        handshake_plain::<P>(&shared, &mut transport).await?;
+        let driver = driver::spawn::<P>(
+            shared.clone(),
+            transport,
+            self.providers.time().clone(),
+            self.providers.task(),
+        );
+        Ok((shared, driver))
+    }
+
+    /// Connect to `addr`, then spawn the supervised driver loop. When
+    /// [`ConnectionConfig::supervisor`] is `Some`, the driver auto-reconnects
+    /// on transient socket failures using the moonpool [`Providers`] —
+    /// `sleep` goes through [`moonpool_core::TimeProvider::sleep`] so
+    /// `moonpool-sim` runs the backoff schedule deterministically.
+    ///
+    /// When the supervisor config is `None`, behaviour matches
+    /// [`Self::connect_plain`] — the driver exits on the first I/O failure.
+    ///
+    /// `service_url_provider` is the PIP-121 cluster-failover hook —
+    /// when `Some`, every reconnect attempt polls the provider for a fresh
+    /// `pulsar://host:port` (or `pulsar+ssl://host:port`) URL before
+    /// dialling. `dns_resolver` mirrors Java's `ClientBuilder#dnsResolver`.
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::connect_plain_with_resolver`].
+    pub async fn connect_plain_supervised(
+        &self,
+        addr: &str,
+        config: ConnectionConfig,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+        dns_resolver: Option<Arc<dyn DnsResolver>>,
+    ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
+        let mut transport = Transport::<P>::connect_with_resolver(
+            self.providers.network(),
+            addr,
+            dns_resolver.as_deref(),
+        )
+        .await?;
+        let shared = ConnectionShared::new(config);
+
+        handshake_plain::<P>(&shared, &mut transport).await?;
+        let ctx = driver::ReconnectContext {
+            host_port: addr.to_owned(),
+            service_url_provider,
+            dns_resolver,
+        };
+        let driver =
+            driver::spawn_supervised::<P>(shared.clone(), transport, ctx, self.providers.clone());
         Ok((shared, driver))
     }
 }
@@ -462,6 +558,44 @@ mod tests {
         let providers = TokioProviders::new();
         let engine = MoonpoolEngine::new(providers);
         let _fut = engine.connect_plain("127.0.0.1:6650", ConnectionConfig::default());
+    }
+
+    /// `connect_plain_supervised` compiles against `TokioProviders` with no
+    /// supervisor / failover / resolver wired (the simplest invocation
+    /// shape). Confirms the trait bounds + `Providers: Clone` propagate.
+    #[test]
+    #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
+    fn connect_plain_supervised_compiles() {
+        let providers = TokioProviders::new();
+        let engine = MoonpoolEngine::new(providers);
+        let _fut = engine.connect_plain_supervised(
+            "127.0.0.1:6650",
+            ConnectionConfig::default(),
+            None,
+            None,
+        );
+    }
+
+    /// `connect_tls` compiles against `TokioProviders` with a stock empty
+    /// rustls config. Smoke-tests that the TLS variant of the `Transport`
+    /// enum + `RustlsByteAdapter` plumbing typechecks end-to-end.
+    #[test]
+    #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
+    fn connect_tls_compiles() {
+        let providers = TokioProviders::new();
+        let engine = MoonpoolEngine::new(providers);
+        let tls_config = std::sync::Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let _fut = engine.connect_tls(
+            "127.0.0.1:6651",
+            "broker.example.com",
+            tls_config,
+            ConnectionConfig::default(),
+            None,
+        );
     }
 
     /// Confirm we're not accidentally pulling in any channel crate.

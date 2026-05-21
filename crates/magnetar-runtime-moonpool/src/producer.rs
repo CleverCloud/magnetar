@@ -202,6 +202,30 @@ impl<P: Providers> Producer<P> {
                         self.compression
                     ))),
                 },
+                reserved_bytes: 0,
+            };
+        }
+
+        // Reserve memory against the configured global budget BEFORE handing
+        // the payload to the sans-io state machine. Mirrors Java's
+        // `MemoryLimitController.reserveMemory(...)`. The moonpool engine
+        // implements only the `FailImmediately` policy:
+        // `ProducerBlock`'s waker fan-out is tightly coupled to the tokio
+        // runtime's slab-based wakeups (see
+        // `magnetar_runtime_tokio::ConnectionShared::memory_wakers`) and
+        // would require a parallel slab/Notify dance to be deterministic
+        // under moonpool-sim. Until that work lands, an overflow is a
+        // synchronous `EngineError::MemoryLimitExceeded`. `try_reserve_memory`
+        // is a no-op when `memory_limit_bytes = 0` (the default).
+        let reserved_bytes = msg.payload.len() as u64;
+        if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
+            return SendFut {
+                shared: self.shared.clone(),
+                handle: self.handle,
+                state: SendState::Failed {
+                    error: Some(ClientError::Engine(err)),
+                },
+                reserved_bytes: 0,
             };
         }
 
@@ -214,15 +238,27 @@ impl<P: Providers> Producer<P> {
         // Wake the driver so it can drain the freshly-queued frame.
         self.shared.driver_waker.notify_one();
 
-        SendFut {
-            shared: self.shared.clone(),
-            handle: self.handle,
-            state: match result {
-                Ok(seq) => SendState::Pending { sequence_id: seq },
-                Err(err) => SendState::Failed {
-                    error: Some(ClientError::Other(format!("send: {err}"))),
-                },
+        match result {
+            Ok(seq) => SendFut {
+                shared: self.shared.clone(),
+                handle: self.handle,
+                state: SendState::Pending { sequence_id: seq },
+                reserved_bytes,
             },
+            Err(err) => {
+                // The state machine rejected the send (e.g. producer not yet
+                // open). Release the reservation so the budget reflects only
+                // actually-in-flight bytes.
+                self.shared.release_memory(reserved_bytes);
+                SendFut {
+                    shared: self.shared.clone(),
+                    handle: self.handle,
+                    state: SendState::Failed {
+                        error: Some(ClientError::Other(format!("send: {err}"))),
+                    },
+                    reserved_bytes: 0,
+                }
+            }
         }
     }
 
@@ -334,11 +370,24 @@ impl<P: Providers> Client<P> {
 /// Polls until the matching [`OpOutcome::SendReceipt`] /
 /// [`OpOutcome::SendError`] lands inside the sans-io state machine. NO
 /// channel.
+///
+/// Holds the memory-budget reservation taken in [`Producer::send`] and
+/// releases it on completion (success OR error) or on `Drop`. Mirrors Java
+/// `MemoryLimitController.releaseMemory(...)`. The moonpool engine
+/// implements only the `FailImmediately` policy; `ProducerBlock`'s
+/// waker-slab fan-out is deferred until a moonpool-friendly equivalent
+/// lands.
 #[derive(Debug)]
 pub struct SendFut {
     shared: Arc<ConnectionShared>,
     handle: ProducerHandle,
     state: SendState,
+    /// Bytes reserved against [`ConnectionShared::memory_limit_bytes`] for
+    /// this send. Released exactly once when the future returns
+    /// `Poll::Ready` or is dropped (whichever comes first). `0` when no
+    /// reservation was taken (the budget is unlimited, or the send failed
+    /// synchronously before reserving).
+    reserved_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -353,6 +402,19 @@ enum SendState {
     },
 }
 
+impl Drop for SendFut {
+    fn drop(&mut self) {
+        // The future may be dropped before completion (caller cancelled the
+        // send). Release the reservation so the budget doesn't permanently
+        // leak. Note: if `poll` already released and zeroed
+        // `reserved_bytes` on `Poll::Ready`, this branch is a no-op.
+        if self.reserved_bytes > 0 {
+            self.shared.release_memory(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
+    }
+}
+
 impl Future for SendFut {
     type Output = Result<MessageId, ClientError>;
 
@@ -361,7 +423,7 @@ impl Future for SendFut {
         // borrow checker happy.
         let handle = self.handle;
         let shared = self.shared.clone();
-        match &mut self.state {
+        let outcome = match &mut self.state {
             SendState::Failed { error } => {
                 let err = error
                     .take()
@@ -373,12 +435,22 @@ impl Future for SendFut {
                 let mut conn = shared.inner.lock();
                 if let Some(outcome) = conn.take_outcome(key) {
                     drop(conn);
-                    return Poll::Ready(translate_send_outcome(outcome));
+                    Poll::Ready(translate_send_outcome(outcome))
+                } else {
+                    conn.register_waker(key, cx.waker().clone());
+                    Poll::Pending
                 }
-                conn.register_waker(key, cx.waker().clone());
-                Poll::Pending
             }
+        };
+        if matches!(outcome, Poll::Ready(_)) && self.reserved_bytes > 0 {
+            // Release the budget reservation. `Drop` would also catch the
+            // cancellation path; this branch covers the normal completion
+            // path so the count is current the instant the user observes
+            // the result.
+            self.shared.release_memory(self.reserved_bytes);
+            self.reserved_bytes = 0;
         }
+        outcome
     }
 }
 
@@ -697,5 +769,115 @@ mod tests {
         let engine = MoonpoolEngine::new(providers);
         let _client_fut =
             Client::connect_plain(&engine, "127.0.0.1:6650", ConnectionConfig::default());
+    }
+
+    /// `send` reserves payload bytes against the configured memory budget
+    /// (FailImmediately policy). Once enqueued, `ConnectionShared::memory_used`
+    /// reflects the reservation. Dropping the `SendFut` (the test stand-in
+    /// for cancellation) releases the reservation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_reserves_and_releases_memory_budget() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 1024,
+            ..ConnectionConfig::default()
+        };
+        let shared = ConnectionShared::new(cfg);
+        // Seed the handshake by hand so create_producer succeeds.
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/budget".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        let fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"abcdef"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 6,
+            num_messages: 1,
+            txn_id: None,
+        });
+        assert_eq!(
+            shared
+                .memory_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            6,
+            "payload bytes must be reserved against the budget"
+        );
+        drop(fut);
+        assert_eq!(
+            shared
+                .memory_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "dropping the SendFut must release the reservation"
+        );
+    }
+
+    /// `send` with a payload larger than the memory budget refuses
+    /// synchronously (FailImmediately policy). The budget counter stays at
+    /// zero — the reservation never lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_fails_when_memory_budget_would_overflow() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 4,
+            ..ConnectionConfig::default()
+        };
+        let shared = ConnectionShared::new(cfg);
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/overflow".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        let res = producer
+            .send(OutgoingMessage {
+                payload: Bytes::from_static(b"too-big-payload"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 15,
+                num_messages: 1,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            res,
+            Err(super::ClientError::Engine(
+                super::super::EngineError::MemoryLimitExceeded { .. }
+            ))
+        ));
+        assert_eq!(
+            shared
+                .memory_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "rejected sends must not bump the budget counter"
+        );
     }
 }

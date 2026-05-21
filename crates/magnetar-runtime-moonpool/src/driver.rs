@@ -14,11 +14,37 @@
 //! 3. park on either fresh outbound work ([`ConnectionShared::driver_waker`]), inbound bytes from
 //!    the wire, or the next scheduled timeout,
 //! 4. tick timers when their deadline elapses,
-//! 5. dispatch semantic events that need runtime-layer work (`AuthChallenge`, `TopicListChanged`).
+//! 5. dispatch semantic events that need runtime-layer work (`AuthChallenge`, `TopicListChanged`,
+//!    `TopicMigrated`).
 //!
 //! The driver does **not** wake user-facing futures itself — the sans-io
 //! layer does that when an `OpOutcome` lands. See
 //! [GUIDELINES.md] §"No-channels rule".
+//!
+//! # Supervisor (auto-reconnect)
+//!
+//! When [`magnetar_proto::ConnectionConfig::supervisor`] is `Some` and the
+//! driver is spawned via [`spawn_supervised`], the per-socket loop is wrapped
+//! in a backoff-driven reconnect cycle. The cycle:
+//!
+//! 1. runs [`driver_loop_inner`] until the socket errors or the peer closes,
+//! 2. checks whether the user requested a graceful close (state machine `is_closed`) — if so, exits
+//!    cleanly,
+//! 3. otherwise reads [`magnetar_proto::SupervisorConfig`] off the state machine, builds a
+//!    [`magnetar_proto::Backoff`], and sleeps for the next backoff interval (via the moonpool
+//!    [`moonpool_core::TimeProvider`] so `moonpool-sim` keeps the schedule deterministic),
+//! 4. reconnects via [`Transport::connect_with_resolver`] (routing through the optional
+//!    `dns_resolver` carried on [`ReconnectContext`]), calls [`magnetar_proto::Connection::reset`]
+//!    (which fails every in-flight op with [`magnetar_proto::OpOutcome::SessionLost`]), restarts
+//!    the handshake, and resumes step 1.
+//!
+//! Stage 3 (producer / consumer state replay): after the new socket completes
+//! its handshake, the inner loop calls
+//! [`magnetar_proto::Connection::rebuild_producers`] and
+//! [`magnetar_proto::Connection::rebuild_consumers`], which re-emit every
+//! still-open handle's `CommandProducer` / `CommandSubscribe` against the new
+//! transport. In-flight publishes severed by the reset still surface
+//! `SessionLost` — full at-least-once replay is follow-up work.
 //!
 //! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
 //! [`Transport`]: crate::transport::Transport
@@ -33,6 +59,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use crate::dns::DnsResolver;
 use crate::transport::Transport;
 use crate::{ConnectionShared, EngineError, TopicListChange};
 
@@ -44,8 +71,8 @@ const READ_BUFFER_CAPACITY: usize = 64 * 1024;
 /// Drain the connection's semantic event queue and react to events that need
 /// runtime-layer work. Most events (`Connected`, `SendReceipt`, `Message`,
 /// …) are routed back to user-facing futures by the sans-io layer itself
-/// through `Waker` slabs; only `AuthChallenge` and `TopicListChanged`
-/// require the driver to do anything.
+/// through `Waker` slabs; only `AuthChallenge`, `TopicListChanged`, and
+/// `TopicMigrated` require the driver to do anything.
 fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineError> {
     loop {
         let event = shared.inner.lock().poll_event();
@@ -84,6 +111,31 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     .lock()
                     .push_back(TopicListChange { added, removed });
                 shared.topic_list_notify.notify_waiters();
+            }
+            ConnectionEvent::TopicMigrated {
+                producer,
+                consumer,
+                broker_service_url,
+                broker_service_url_tls,
+            } => {
+                // PIP-188: broker asked us to move the producer / consumer to a different
+                // broker. The new URL is a hint: the correct response is to tear the
+                // connection down so the supervised reconnect path re-runs lookup. On
+                // reconnect, `rebuild_producers` + `rebuild_consumers` re-emit every
+                // still-open handle's command so user futures stay live across the
+                // migration. We surface the hint via tracing, then return an error from
+                // the driver — the supervised loop catches it, calls
+                // `Connection::reset`, sleeps the backoff, and reopens.
+                tracing::info!(
+                    ?producer,
+                    ?consumer,
+                    new_url = broker_service_url.as_deref(),
+                    new_url_tls = broker_service_url_tls.as_deref(),
+                    "broker requested PIP-188 topic migration; supervised reconnect will fire"
+                );
+                return Err(EngineError::Config(
+                    "PIP-188: broker requested topic migration; resetting connection".to_owned(),
+                ));
             }
             _ => {}
         }
@@ -152,6 +204,48 @@ impl DriverHandle {
     }
 }
 
+/// Reconnect context passed to the supervised moonpool driver. Lets the
+/// supervisor re-open the TCP connection (and, when wired, the TLS upgrade)
+/// to the broker after a transient drop.
+///
+/// When `service_url_provider` is set, every reconnect attempt re-resolves
+/// the broker address via
+/// [`magnetar_proto::ServiceUrlProvider::get_service_url`] instead of
+/// reusing the cached `host_port`. This is the runtime hook that makes
+/// PIP-121 cluster failover (`ControlledClusterFailover` in the sans-io
+/// crate, `AutoClusterFailover` in the tokio engine only) able to swap
+/// broker URLs between reconnect attempts without re-building the client.
+#[derive(Clone)]
+pub(crate) struct ReconnectContext {
+    /// Cached `host:port` literal — the moonpool engine accepts a raw
+    /// authority (no `pulsar://` scheme), so we cache the exact string used
+    /// on the initial dial as a fallback.
+    pub(crate) host_port: String,
+    /// Optional PIP-121 provider polled on every reconnect attempt. When
+    /// `None`, the cached `host_port` is reused (matches the pre-PIP-121
+    /// behaviour). The provider returns a `pulsar://` or `pulsar+ssl://`
+    /// URL; the supervisor strips the scheme + path before dialling.
+    pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+    /// Optional pluggable DNS resolver invoked on every reconnect attempt
+    /// before dialling the broker. When `None`, the runtime falls back to
+    /// whatever [`moonpool_core::NetworkProvider::connect`] does with a
+    /// `host:port` string. Mirrors Java's `ClientBuilder#dnsResolver`.
+    pub(crate) dns_resolver: Option<Arc<dyn DnsResolver>>,
+}
+
+impl std::fmt::Debug for ReconnectContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReconnectContext")
+            .field("host_port", &self.host_port)
+            .field(
+                "has_service_url_provider",
+                &self.service_url_provider.is_some(),
+            )
+            .field("has_dns_resolver", &self.dns_resolver.is_some())
+            .finish()
+    }
+}
+
 /// Spawn the driver loop using the moonpool [`TaskProvider`]. The provider
 /// is consulted by the driver loop for `sleep`, which is what makes the
 /// engine deterministic under `moonpool-sim`.
@@ -170,11 +264,195 @@ where
     });
     let result_for_task = result.clone();
     let join = task.spawn_task("magnetar-moonpool-driver", async move {
-        let outcome = driver_loop::<P>(shared, transport, time).await;
+        let outcome = driver_loop_inner::<P>(shared, transport, time).await;
         *result_for_task.result.lock() = Some(outcome);
         result_for_task.done.notify_waiters();
     });
     DriverHandle { join, result }
+}
+
+/// Spawn the driver with the auto-reconnect supervisor wired in.
+///
+/// When [`magnetar_proto::ConnectionConfig::supervisor`] is `Some`, the
+/// driver re-handshakes against the broker after a transient drop using
+/// `reconnect_ctx`. When the supervisor config is `None`, behaviour matches
+/// [`spawn`] — driver exits on the first I/O failure.
+pub(crate) fn spawn_supervised<P>(
+    shared: Arc<ConnectionShared>,
+    transport: Transport<P>,
+    reconnect_ctx: ReconnectContext,
+    providers: P,
+) -> DriverHandle
+where
+    P: Providers,
+{
+    let result = Arc::new(DriverResult {
+        result: Mutex::new(None),
+        done: Notify::new(),
+    });
+    let result_for_task = result.clone();
+    let time = providers.time().clone();
+    let task = providers.task().clone();
+    let join = task.spawn_task("magnetar-moonpool-driver-supervised", async move {
+        let outcome =
+            supervised_driver_loop::<P>(shared, transport, reconnect_ctx, providers, time).await;
+        *result_for_task.result.lock() = Some(outcome);
+        result_for_task.done.notify_waiters();
+    });
+    DriverHandle { join, result }
+}
+
+/// The supervised driver loop. Runs [`driver_loop_inner`] on the current
+/// socket; on failure, if the supervisor is configured and the user has not
+/// closed the connection, sleeps for a backoff interval (using the moonpool
+/// [`TimeProvider`] so `moonpool-sim` stays deterministic), reconnects via
+/// the moonpool [`moonpool_core::NetworkProvider`], calls
+/// [`magnetar_proto::Connection::reset`], restarts the handshake, and
+/// resumes.
+async fn supervised_driver_loop<P>(
+    shared: Arc<ConnectionShared>,
+    mut transport: Transport<P>,
+    reconnect_ctx: ReconnectContext,
+    providers: P,
+    time: P::Time,
+) -> Result<(), EngineError>
+where
+    P: Providers,
+{
+    // Seed the backoff RNG from the shared-arc pointer so independent clients spread
+    // their reconnect timing without depending on any I/O. `0` would land on the
+    // splitmix default; the (stable, unique) Arc pointer mixes in per-client entropy.
+    let seed: u64 = Arc::as_ptr(&shared) as usize as u64;
+
+    let mut last_inner_result =
+        driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
+
+    loop {
+        // User-requested close beats reconnect.
+        if shared.inner.lock().is_closed() {
+            return last_inner_result;
+        }
+
+        let supervisor_cfg = shared.inner.lock().supervisor_config().cloned();
+        let Some(cfg) = supervisor_cfg else {
+            return last_inner_result;
+        };
+
+        // Fresh Backoff per disconnect: Java resets the schedule on a successful
+        // reconnect, so we reset on a *successful* handshake too. The attempt counter
+        // is the only piece of state that survives across reconnect attempts here.
+        let mut backoff = cfg.build_backoff(seed);
+        let mut attempt: u32 = 0;
+
+        // Reconnect loop — keep trying until we land a fresh socket + handshake OR
+        // exhaust `max_attempts`.
+        let new_transport = loop {
+            let delay = backoff.next();
+            // Use the moonpool TimeProvider so sim runs stay deterministic.
+            let _ = time.sleep(delay).await;
+
+            attempt = attempt.saturating_add(1);
+            if let Some(max) = cfg.max_attempts {
+                if attempt > max {
+                    tracing::warn!(
+                        "supervisor: gave up after {attempt} reconnect attempt(s) \
+                         (max_attempts={max})"
+                    );
+                    return last_inner_result;
+                }
+            }
+
+            // Did the user request close while we were sleeping?
+            if shared.inner.lock().is_closed() {
+                return last_inner_result;
+            }
+
+            // PIP-121 cluster failover — re-resolve the broker URL via the provider
+            // on every attempt before dialling. The provider is sync + cheap by
+            // contract (see `magnetar_proto::ServiceUrlProvider` doc). If no
+            // provider is configured, fall back to the cached host:port captured at
+            // start time.
+            let target_host_port: String =
+                if let Some(provider) = reconnect_ctx.service_url_provider.as_ref() {
+                    strip_url_to_host_port(&provider.get_service_url()).unwrap_or_else(|| {
+                        tracing::warn!(
+                            "supervisor: service-url provider returned an unparseable URL \
+                         on attempt {attempt}; falling back to the cached host:port"
+                        );
+                        reconnect_ctx.host_port.clone()
+                    })
+                } else {
+                    reconnect_ctx.host_port.clone()
+                };
+
+            let resolver = reconnect_ctx.dns_resolver.as_deref();
+            match Transport::<P>::connect_with_resolver(
+                providers.network(),
+                &target_host_port,
+                resolver,
+            )
+            .await
+            {
+                Ok(t) => break t,
+                Err(err) => {
+                    tracing::warn!(
+                        "supervisor: reconnect attempt {attempt} failed \
+                         (target={target_host_port}): {err}; will retry"
+                    );
+                    // Loop and back off again.
+                }
+            }
+        };
+
+        // Got a new transport. Reset the state machine + kick off CONNECT. Stage 3:
+        // arm the rebuild flag so the inner loop replays every still-open producer
+        // / consumer once the new socket's handshake completes.
+        {
+            let mut conn = shared.inner.lock();
+            conn.reset();
+            if let Err(err) = conn.begin_handshake() {
+                tracing::error!("supervisor: begin_handshake after reset failed: {err}");
+                return Err(EngineError::Protocol(err));
+            }
+        }
+        shared
+            .pending_rebuild
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        shared.driver_waker.notify_one();
+
+        transport = new_transport;
+        last_inner_result = driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
+    }
+}
+
+/// Parse a `pulsar://host:port` / `pulsar+ssl://host:port` URL into its
+/// `host:port` authority. Returns `None` for unrecognised schemes or
+/// malformed inputs. Kept inline (no `url` dep) since the moonpool engine
+/// otherwise doesn't pull in `url`; matches the level of robustness Java's
+/// `ServiceUrlProvider` requires (callers are trusted).
+fn strip_url_to_host_port(raw: &str) -> Option<String> {
+    let rest = raw
+        .strip_prefix("pulsar://")
+        .or_else(|| raw.strip_prefix("pulsar+ssl://"))?;
+    // Trim path / query / fragment if any.
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    // Default ports when none provided (matches `Scheme::default_port` in the tokio
+    // engine — plain → 6650, tls → 6651). We can't tell the schemes apart cheaply
+    // here without re-parsing, so default to 6650 (plaintext); tests / production
+    // configs typically include the port.
+    if rest.contains(':') {
+        Some(rest.to_owned())
+    } else {
+        let default_port = if raw.starts_with("pulsar+ssl://") {
+            6651
+        } else {
+            6650
+        };
+        Some(format!("{rest}:{default_port}"))
+    }
 }
 
 /// The driver loop.
@@ -190,7 +468,11 @@ where
 /// - **Timeout**: `Connection::poll_timeout` returns the next deadline, if any. We `tokio::select!`
 ///   against `time.sleep(remaining)`. If no deadline is set, that arm is replaced by a `pending`
 ///   future.
-pub(crate) async fn driver_loop<P>(
+/// - **Rebuild on reconnect**: after each successful `handle_bytes`, if `shared.pending_rebuild` is
+///   set and the state machine has transitioned to `Connected`, replay every still-open producer +
+///   consumer via `rebuild_producers` / `rebuild_consumers`. The CAS ensures the replay fires
+///   exactly once per reconnect.
+pub(crate) async fn driver_loop_inner<P>(
     shared: Arc<ConnectionShared>,
     mut transport: Transport<P>,
     time: P::Time,
@@ -267,6 +549,44 @@ where
                     shared.inner.lock().mark_disconnected();
                     return Err(err.into());
                 }
+                // Supervisor Stage 3: once the new session's handshake completes, replay every
+                // still-open producer + consumer so user-facing handles survive the reconnect
+                // transparently. The compare-exchange ensures the rebuild fires exactly once
+                // per reconnect even if `handle_bytes` is called multiple times in quick
+                // succession.
+                if shared
+                    .pending_rebuild
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let connected = shared.inner.lock().is_connected();
+                    if connected
+                        && shared
+                            .pending_rebuild
+                            .compare_exchange(
+                                true,
+                                false,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok()
+                    {
+                        let (n_p, n_c) = {
+                            let mut conn = shared.inner.lock();
+                            let producers = conn.rebuild_producers();
+                            let consumers = conn.rebuild_consumers();
+                            (producers.len(), consumers.len())
+                        };
+                        tracing::info!(
+                            producers = n_p,
+                            consumers = n_c,
+                            "supervisor: replayed producer + consumer state on reconnect"
+                        );
+                        // Wake the next loop iteration so `poll_transmit` flushes the
+                        // re-emitted `CommandProducer` / `CommandSubscribe` / `CommandFlow`
+                        // frames onto the new socket.
+                        shared.driver_waker.notify_one();
+                    }
+                }
                 handle_pending_events(&shared)?;
             }
 
@@ -291,5 +611,130 @@ async fn sleep_or_pending<P: Providers>(time: &P::Time, dur: Option<Duration>) {
             let _ = time.sleep(d).await;
         }
         None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use bytes::BytesMut;
+    use magnetar_proto::{ConnectionConfig, ConnectionEvent, ProducerHandle, encode_command, pb};
+
+    use super::{handle_pending_events, strip_url_to_host_port};
+    use crate::{ConnectionShared, EngineError};
+
+    /// Build a synthetic `CommandConnected` frame for use in tests that need
+    /// the state machine past handshake without running an engine.
+    fn handshake_response_bytes() -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    /// PIP-188: feeding a `CommandTopicMigrated` to the state machine, then
+    /// invoking `handle_pending_events`, returns an `EngineError::Config`.
+    /// The supervised driver loop catches this as a recoverable failure and
+    /// reopens the connection, mirroring the tokio engine.
+    #[test]
+    fn topic_migrated_triggers_recoverable_error() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+            // Drain the Connected event so the next poll_event yields the migration.
+            match conn.poll_event() {
+                Some(ConnectionEvent::Connected { .. }) => {}
+                other => panic!("expected Connected, got {other:?}"),
+            }
+            // Feed CommandTopicMigrated.
+            let migrated = pb::BaseCommand {
+                r#type: pb::base_command::Type::TopicMigrated as i32,
+                topic_migrated: Some(pb::CommandTopicMigrated {
+                    resource_id: 42,
+                    resource_type: pb::command_topic_migrated::ResourceType::Producer as i32,
+                    broker_service_url: Some("pulsar://new-broker:6650".to_owned()),
+                    broker_service_url_tls: None,
+                }),
+                ..Default::default()
+            };
+            let mut buf = BytesMut::new();
+            encode_command(&mut buf, &migrated).expect("encode CommandTopicMigrated");
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle migration");
+        }
+        // The driver's event handler must surface a recoverable Config error so
+        // the supervised loop catches it, calls reset+begin_handshake, and
+        // reopens. The resource handle should map onto the producer slot.
+        let err = handle_pending_events(&shared).expect_err("migration must error");
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, EngineError::Config(_)) && msg.contains("PIP-188"),
+            "expected PIP-188 config error, got {err:?}"
+        );
+
+        // Sanity: confirm ProducerHandle is reachable so any future refactor
+        // that hides the constructor surfaces here too. The actual handle
+        // routing inside the proto layer is already covered by the
+        // magnetar-proto unit tests.
+        assert_eq!(ProducerHandle(42), ProducerHandle(42));
+    }
+
+    #[test]
+    fn strip_url_to_host_port_handles_plain() {
+        assert_eq!(
+            strip_url_to_host_port("pulsar://broker:6650").as_deref(),
+            Some("broker:6650")
+        );
+    }
+
+    #[test]
+    fn strip_url_to_host_port_handles_tls() {
+        assert_eq!(
+            strip_url_to_host_port("pulsar+ssl://broker.example.com:6651").as_deref(),
+            Some("broker.example.com:6651")
+        );
+    }
+
+    #[test]
+    fn strip_url_to_host_port_defaults_plain_port() {
+        assert_eq!(
+            strip_url_to_host_port("pulsar://broker").as_deref(),
+            Some("broker:6650")
+        );
+    }
+
+    #[test]
+    fn strip_url_to_host_port_defaults_tls_port() {
+        assert_eq!(
+            strip_url_to_host_port("pulsar+ssl://broker").as_deref(),
+            Some("broker:6651")
+        );
+    }
+
+    #[test]
+    fn strip_url_to_host_port_strips_path() {
+        assert_eq!(
+            strip_url_to_host_port("pulsar://broker:6650/admin").as_deref(),
+            Some("broker:6650")
+        );
+    }
+
+    #[test]
+    fn strip_url_to_host_port_rejects_unknown_scheme() {
+        assert!(strip_url_to_host_port("http://broker:6650").is_none());
     }
 }

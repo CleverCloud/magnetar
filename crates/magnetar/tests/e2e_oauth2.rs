@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end coverage for the OAuth2 `ClientCredentialsFlow` auth provider
+//! End-to-end coverage for the `OAuth2` `ClientCredentialsFlow` auth provider
 //! ([`magnetar_auth_oauth2`], ADR-0014).
 //!
 //! The Pulsar broker is left in its default (unauthenticated) standalone mode

@@ -122,6 +122,38 @@ impl<P: Providers> Client<P> {
         })
     }
 
+    /// Connect via the supervised driver. When [`ConnectionConfig::supervisor`]
+    /// is `Some`, the driver auto-reconnects on transient socket failures
+    /// using the moonpool [`Providers`]; sleeps go through
+    /// [`moonpool_core::TimeProvider::sleep`] so the backoff schedule is
+    /// deterministic under `moonpool-sim`.
+    ///
+    /// `service_url_provider` is the PIP-121 cluster-failover hook —
+    /// when `Some`, every reconnect attempt polls the provider for a fresh
+    /// `pulsar://host:port` (or `pulsar+ssl://host:port`) URL before
+    /// dialling. Use [`magnetar_proto::ControlledClusterFailover`] for
+    /// externally-driven URL swaps; the runtime polls it synchronously.
+    /// `dns_resolver` mirrors Java's `ClientBuilder#dnsResolver`.
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::connect_plain`].
+    pub async fn connect_plain_supervised(
+        engine: &MoonpoolEngine<P>,
+        addr: &str,
+        config: ConnectionConfig,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+        dns_resolver: Option<Arc<dyn crate::DnsResolver>>,
+    ) -> Result<Self, ClientError> {
+        let (shared, driver) = engine
+            .connect_plain_supervised(addr, config, service_url_provider, dns_resolver)
+            .await?;
+        Ok(Self {
+            shared,
+            driver: Mutex::new(Some(driver)),
+            _providers: std::marker::PhantomData,
+        })
+    }
+
     /// Borrow the shared connection state. Mostly useful for tests and
     /// instrumentation.
     #[must_use]
@@ -403,6 +435,41 @@ mod tests {
         let conn = shared.inner.lock();
         assert!(!conn.is_connected());
         assert!(!conn.is_closed());
+    }
+
+    /// `Client::connect_plain_supervised` compiles against `TokioProviders`
+    /// when handed a `ControlledClusterFailover` for PIP-121.
+    #[test]
+    #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
+    fn connect_supervised_with_controlled_failover_compiles() {
+        use std::sync::Arc;
+
+        use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider};
+
+        let providers = TokioProviders::new();
+        let engine = MoonpoolEngine::new(providers);
+        let failover = ControlledClusterFailover::new("pulsar://primary:6650");
+        let provider: Arc<dyn ServiceUrlProvider> = Arc::new(failover);
+        let _fut = Client::connect_plain_supervised(
+            &engine,
+            "127.0.0.1:6650",
+            ConnectionConfig::default(),
+            Some(provider),
+            None,
+        );
+    }
+
+    /// `ControlledClusterFailover::set_url` updates the URL the supervisor
+    /// will dial on the next reconnect. Exercised through the proto trait
+    /// directly so the moonpool runtime doesn't need a live driver.
+    #[test]
+    fn controlled_failover_set_url_observed_by_provider() {
+        use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider};
+
+        let failover = ControlledClusterFailover::new("pulsar://primary:6650");
+        assert_eq!(failover.get_service_url(), "pulsar://primary:6650");
+        failover.set_url("pulsar://secondary:6650");
+        assert_eq!(failover.get_service_url(), "pulsar://secondary:6650");
     }
 
     /// Confirm `Duration` import is still referenced — the moonpool engine
