@@ -29,6 +29,7 @@ pub type TableViewListener = Arc<dyn Fn(&str, Option<&Bytes>) + Send + Sync>;
 #[derive(Clone)]
 pub struct TableView {
     state: Arc<RwLock<HashMap<String, Bytes>>>,
+    listeners: Arc<RwLock<Vec<TableViewListener>>>,
     drain: Arc<DrainTask>,
 }
 
@@ -121,6 +122,21 @@ impl TableView {
             let _ = h.await;
         }
     }
+
+    /// Register an additional listener fired for every subsequent mutation. Mirrors Java
+    /// `TableView#listen`. The callback runs inside the drain task — keep it fast and
+    /// non-blocking. Listeners installed via this method fire after the one optionally
+    /// configured at build time, in the order they were registered.
+    pub fn listen(&self, listener: TableViewListener) {
+        self.listeners.write().push(listener);
+    }
+
+    /// Number of listeners currently registered (includes the build-time listener, if any).
+    /// Mostly useful for tests and instrumentation.
+    #[must_use]
+    pub fn listener_count(&self) -> usize {
+        self.listeners.read().len()
+    }
 }
 
 /// Builder for a [`TableView`]. Mirrors `org.apache.pulsar.client.api.TableViewBuilder`.
@@ -199,7 +215,12 @@ impl<'a> TableViewBuilder<'a> {
 
         let state: Arc<RwLock<HashMap<String, Bytes>>> = Arc::new(RwLock::new(HashMap::new()));
         let state_drain = state.clone();
-        let listener = self.listener.clone();
+        // Seed the listeners vec with the build-time listener (if any). Post-create
+        // `TableView::listen` calls push onto the same vec, so the drain picks them up
+        // immediately on the next message.
+        let listeners: Arc<RwLock<Vec<TableViewListener>>> =
+            Arc::new(RwLock::new(self.listener.into_iter().collect()));
+        let listeners_drain = listeners.clone();
         let join = tokio::spawn(async move {
             loop {
                 let Ok(msg) = consumer.receive().await else {
@@ -225,7 +246,11 @@ impl<'a> TableViewBuilder<'a> {
                         s.insert(key.clone(), payload.clone());
                     }
                 }
-                if let Some(l) = &listener {
+                // Snapshot under the read lock then drop it before invoking the callbacks
+                // so a listener that tries to call `TableView::listen` recursively does not
+                // deadlock against itself.
+                let snapshot: Vec<TableViewListener> = listeners_drain.read().clone();
+                for l in &snapshot {
                     if is_tombstone {
                         l(&key, None);
                     } else {
@@ -238,6 +263,7 @@ impl<'a> TableViewBuilder<'a> {
 
         Ok(TableView {
             state,
+            listeners,
             drain: Arc::new(DrainTask {
                 handle: tokio::sync::Mutex::new(Some(join)),
             }),
@@ -266,5 +292,28 @@ mod tests {
         assert_eq!(state.read().len(), 1);
         assert!(state.read().contains_key("b"));
         assert_eq!(state.read().get("b").unwrap().as_ref(), b"2");
+    }
+
+    #[test]
+    fn listen_appends_and_fires_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listeners: Arc<RwLock<Vec<TableViewListener>>> = Arc::new(RwLock::new(Vec::new()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+        listeners.write().push(Arc::new(move |_k, _v| {
+            c1.fetch_add(1, Ordering::SeqCst);
+        }));
+        listeners.write().push(Arc::new(move |_k, _v| {
+            c2.fetch_add(10, Ordering::SeqCst);
+        }));
+        // Simulate the drain's "snapshot then fire" pattern.
+        let snapshot: Vec<TableViewListener> = listeners.read().clone();
+        let payload = Bytes::from_static(b"v");
+        for l in &snapshot {
+            l("k", Some(&payload));
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 11);
+        assert_eq!(snapshot.len(), 2);
     }
 }
