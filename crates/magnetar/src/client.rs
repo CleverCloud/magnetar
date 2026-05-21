@@ -198,6 +198,113 @@ impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
     }
 }
 
+/// Extension trait that gives [`magnetar_runtime_tokio::Producer`] the Java-symmetric
+/// `producer.new_message().key(..).value(..).send().await` entry point.
+///
+/// Bring it into scope with `use magnetar::ProducerExt;`.
+pub trait ProducerExt {
+    /// Start a new [`OutgoingMessage`] bound to this producer. Chain the same setters as
+    /// `OutgoingMessage` ([`OutgoingMessage::key`], [`OutgoingMessage::value`],
+    /// [`OutgoingMessage::event_time_ms`], etc.) and finish with `.send().await`.
+    fn new_message(&self) -> MessageBuilder<'_>;
+}
+
+impl ProducerExt for magnetar_runtime_tokio::Producer {
+    fn new_message(&self) -> MessageBuilder<'_> {
+        MessageBuilder {
+            producer: self,
+            msg: OutgoingMessage::default(),
+        }
+    }
+}
+
+/// Producer-bound counterpart to [`OutgoingMessage`]. Mirrors Java's
+/// `TypedMessageBuilder` — the producer is captured at construction so the terminal `send()`
+/// has no extra argument.
+#[derive(Debug)]
+pub struct MessageBuilder<'a> {
+    producer: &'a magnetar_runtime_tokio::Producer,
+    msg: OutgoingMessage,
+}
+
+impl MessageBuilder<'_> {
+    /// Set the routing key. See [`OutgoingMessage::key`].
+    #[must_use]
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.msg = self.msg.key(key);
+        self
+    }
+
+    /// Set the ordering key. See [`OutgoingMessage::ordering_key`].
+    #[must_use]
+    pub fn ordering_key(mut self, key: impl Into<Bytes>) -> Self {
+        self.msg = self.msg.ordering_key(key);
+        self
+    }
+
+    /// Set the event time (millis since epoch). See [`OutgoingMessage::event_time_ms`].
+    #[must_use]
+    pub fn event_time_ms(mut self, ts: u64) -> Self {
+        self.msg = self.msg.event_time_ms(ts);
+        self
+    }
+
+    /// Append a property. See [`OutgoingMessage::property`].
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.msg = self.msg.property(key, value);
+        self
+    }
+
+    /// See [`OutgoingMessage::deliver_at_ms`].
+    #[must_use]
+    pub fn deliver_at_ms(mut self, ts_ms: i64) -> Self {
+        self.msg = self.msg.deliver_at_ms(ts_ms);
+        self
+    }
+
+    /// See [`OutgoingMessage::deliver_after_ms`].
+    #[must_use]
+    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms(delay_ms);
+        self
+    }
+
+    /// See [`OutgoingMessage::replication_clusters`].
+    #[must_use]
+    pub fn replication_clusters(mut self, clusters: Vec<String>) -> Self {
+        self.msg = self.msg.replication_clusters(clusters);
+        self
+    }
+
+    /// See [`OutgoingMessage::disable_replication`].
+    #[must_use]
+    pub fn disable_replication(mut self) -> Self {
+        self.msg = self.msg.disable_replication();
+        self
+    }
+
+    /// See [`OutgoingMessage::txn`].
+    #[must_use]
+    pub fn txn(mut self, txn_id: magnetar_proto::TxnId) -> Self {
+        self.msg = self.msg.txn(txn_id);
+        self
+    }
+
+    /// Set the payload bytes. See [`OutgoingMessage::value`].
+    #[must_use]
+    pub fn value(mut self, payload: impl Into<Bytes>) -> Self {
+        self.msg = self.msg.value(payload);
+        self
+    }
+
+    /// Submit the message to the producer captured at `new_message()` time. Mirrors Java's
+    /// terminal `TypedMessageBuilder#send`.
+    pub fn send(self) -> magnetar_runtime_tokio::SendFut {
+        self.producer.send(self.msg.into())
+    }
+}
+
 /// Convenience alias for an incoming message handed back to the caller.
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {

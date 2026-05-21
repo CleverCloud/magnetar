@@ -73,8 +73,8 @@ mod transaction;
 mod typed;
 #[cfg(feature = "tokio")]
 pub use client::{
-    ClientBuilder, ConsumerBuilder, IncomingMessage, OutgoingMessage, ProducerBuilder,
-    PulsarClient, PulsarError, Reader, ReaderBuilder,
+    ClientBuilder, ConsumerBuilder, IncomingMessage, MessageBuilder, OutgoingMessage,
+    ProducerBuilder, ProducerExt, PulsarClient, PulsarError, Reader, ReaderBuilder,
 };
 #[cfg(feature = "tokio")]
 pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};
