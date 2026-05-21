@@ -907,4 +907,341 @@ mod tests {
         let stats = c.stats();
         assert_eq!(stats.receive_latency_max_ms, c.receive_latency_max_ms());
     }
+
+    // ---------------------------------------------------------------------
+    // PIP-37 chunk reassembly behavioural tests — backported from Java
+    // `org.apache.pulsar.client.impl.ChunkMessageIdImplTest` and the
+    // `ConsumerImpl` chunked-receive paths in
+    // `org.apache.pulsar.client.impl.ConsumerImpl`. They drive the
+    // `ChunkBuffer` logic in this module without touching the wire.
+    // ---------------------------------------------------------------------
+
+    /// Build a chunk metadata for a logical message of `total` chunks identified
+    /// by `uuid`. `seq` is the per-message sequence id (constant across chunks),
+    /// `chunk_id` is the 0-based index of this chunk.
+    fn chunk_meta(uuid: &str, seq: u64, total: i32, chunk_id: i32) -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "p".to_owned(),
+            sequence_id: seq,
+            publish_time: 1_700_000_000,
+            uuid: Some(uuid.to_owned()),
+            num_chunks_from_msg: Some(total),
+            chunk_id: Some(chunk_id),
+            total_chunk_msg_size: Some(0),
+            ..Default::default()
+        }
+    }
+
+    /// A `CommandMessage` whose broker-assigned `MessageIdData` carries the
+    /// caller-supplied `entry_id` so chunk-buffer tests can distinguish each
+    /// chunk's own broker id from the logical message's surfaced id.
+    fn message_cmd_at(entry_id: u64, redelivery: u32) -> pb::CommandMessage {
+        pb::CommandMessage {
+            consumer_id: 1,
+            message_id: pb::MessageIdData {
+                ledger_id: 1,
+                entry_id,
+                ..Default::default()
+            },
+            redelivery_count: Some(redelivery),
+            ack_set: Vec::new(),
+            consumer_epoch: None,
+        }
+    }
+
+    /// A single-chunk message (`num_chunks_from_msg == 1`) must NOT engage the
+    /// chunk reassembly buffer — it should be delivered immediately, just like
+    /// the non-chunked path. Mirrors the Java consumer's `processMessageChunk`
+    /// short-circuit when `totalChunks <= 1`.
+    #[test]
+    fn single_chunk_message_delivers_immediately() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        let meta = chunk_meta("u-single", 11, 1, 0);
+        let outcome = c
+            .deliver(
+                &message_cmd_at(7, 0),
+                meta,
+                None,
+                Bytes::from_static(b"only-chunk"),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 1),
+            other => panic!("expected Delivered(1), got {other:?}"),
+        }
+        // No chunk reassembly state should be left dangling.
+        assert!(
+            c.chunk_reassembly.is_empty(),
+            "single-chunk messages must not allocate ChunkBuffer entries"
+        );
+        // The "total chunked messages" counter only counts messages that go
+        // through the reassembly path — a 1-chunk message shouldn't bump it.
+        assert_eq!(c.stats().total_chunked_msgs_received, 0);
+
+        let msg = c.pop_message().expect("immediate delivery");
+        assert_eq!(msg.payload.as_ref(), b"only-chunk");
+        // Reassembly metadata must be cleared on the user-visible message: the
+        // consumer never lies about a single-chunk message being chunked.
+        assert!(
+            msg.metadata.num_chunks_from_msg.is_none()
+                || msg.metadata.num_chunks_from_msg == Some(1)
+        );
+    }
+
+    /// Multi-chunk message: the first N-1 chunks are buffered and produce no
+    /// queue activity; the last chunk triggers reassembly and queues a single
+    /// logical message whose payload is the concatenation in chunk-id order.
+    /// Mirrors the Java consumer's `processMessageChunk` accumulator.
+    #[test]
+    fn multi_chunk_message_buffers_until_last_chunk() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        // Three chunks of a logical message identified by uuid "u-multi".
+        let payloads: [&[u8]; 3] = [b"aaa", b"bbb", b"cccc"];
+        for (idx, body) in payloads.iter().enumerate() {
+            let meta = chunk_meta("u-multi", 42, 3, idx as i32);
+            let outcome = c
+                .deliver(
+                    &message_cmd_at(100 + idx as u64, 0),
+                    meta,
+                    None,
+                    Bytes::copy_from_slice(body),
+                )
+                .unwrap();
+            if idx < 2 {
+                // Intermediate chunks must be buffered, not delivered.
+                assert!(
+                    matches!(outcome, DeliverOutcome::Buffered),
+                    "chunk {idx} should buffer, got {outcome:?}"
+                );
+                assert_eq!(c.queue_len(), 0, "no user-visible message yet");
+            } else {
+                // The last chunk surfaces exactly one logical message.
+                match outcome {
+                    DeliverOutcome::Delivered { count } => assert_eq!(count, 1),
+                    other => panic!("last chunk must deliver, got {other:?}"),
+                }
+            }
+        }
+
+        // After the last chunk: exactly one message, fully reassembled, and the
+        // per-uuid buffer is cleaned up.
+        assert_eq!(c.queue_len(), 1);
+        assert!(c.chunk_reassembly.is_empty());
+        let msg = c.pop_message().expect("reassembled message");
+        assert_eq!(msg.payload.as_ref(), b"aaabbbcccc");
+        assert_eq!(c.stats().total_chunked_msgs_received, 1);
+        // Reassembled message must not carry chunk markers downstream.
+        assert!(msg.metadata.chunk_id.is_none());
+        assert!(msg.metadata.num_chunks_from_msg.is_none());
+        assert!(msg.metadata.total_chunk_msg_size.is_none());
+    }
+
+    /// Out-of-order chunk arrival (chunk 2 before chunk 1) must still reassemble
+    /// into the correct payload because the buffer is keyed by `chunk_id`.
+    /// Although the broker normally dispatches chunks in order, reconnection
+    /// races and replay can interleave them — the buffer logic is defensive.
+    #[test]
+    fn out_of_order_chunks_are_buffered_correctly() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        // Deliver chunk 2 first, then chunk 0, then chunk 1.
+        let order: [(i32, &[u8]); 3] = [(2, b"ZZZZ"), (0, b"AAAA"), (1, b"BBBB")];
+        for &(chunk_id, body) in &order {
+            let meta = chunk_meta("u-oo", 99, 3, chunk_id);
+            let outcome = c
+                .deliver(
+                    &message_cmd_at(200 + chunk_id as u64, 0),
+                    meta,
+                    None,
+                    Bytes::copy_from_slice(body),
+                )
+                .unwrap();
+            // The outcome on each delivery depends on whether the buffer is
+            // complete; we just check the queue state at the end.
+            let _ = outcome;
+        }
+        assert_eq!(c.queue_len(), 1, "all chunks present, one logical message");
+        let msg = c.pop_message().expect("reassembled");
+        // Reassembled in chunk-id order regardless of arrival order.
+        assert_eq!(msg.payload.as_ref(), b"AAAABBBBZZZZ");
+        assert!(c.chunk_reassembly.is_empty());
+    }
+
+    /// Duplicate chunk delivery (same uuid + chunk_id) must be a no-op — the
+    /// reassembly buffer drops the duplicate and reports `Dropped` rather than
+    /// double-counting it as progress. Mirrors the Java
+    /// `processMessageChunk` guard against duplicate chunk delivery.
+    #[test]
+    fn duplicate_chunk_is_dropped() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        // First arrival of chunk 0/3 — should buffer.
+        let m0 = chunk_meta("u-dup", 1, 3, 0);
+        let outcome0 = c
+            .deliver(
+                &message_cmd_at(300, 0),
+                m0,
+                None,
+                Bytes::from_static(b"first"),
+            )
+            .unwrap();
+        assert!(matches!(outcome0, DeliverOutcome::Buffered));
+
+        // Second arrival of the SAME chunk_id 0/3 — must be dropped, the
+        // received_chunks counter must NOT advance, and the buffered payload
+        // must NOT be overwritten.
+        let m0_dup = chunk_meta("u-dup", 1, 3, 0);
+        let outcome_dup = c
+            .deliver(
+                &message_cmd_at(301, 0),
+                m0_dup,
+                None,
+                Bytes::from_static(b"second"),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome_dup, DeliverOutcome::Dropped),
+            "duplicate chunk_id must be Dropped, got {outcome_dup:?}"
+        );
+        // Sanity: still one chunk seen, two more remaining.
+        let entry = c
+            .chunk_reassembly
+            .get("u-dup")
+            .expect("buffer still present");
+        assert_eq!(entry.received_chunks, 1);
+        assert_eq!(entry.expected_chunks, 3);
+    }
+
+    /// Chunks belonging to two different logical messages (different uuids)
+    /// must be tracked independently. Interleaved arrival of chunks from
+    /// message A and message B must still produce two separately reassembled
+    /// messages once each set is complete.
+    #[test]
+    fn interleaved_chunked_messages_are_independent() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        // Interleaved arrival: A0, B0, A1, B1.
+        let plan: [(&str, u64, i32, &[u8]); 4] = [
+            ("u-A", 10, 0, b"A0"),
+            ("u-B", 20, 0, b"B0"),
+            ("u-A", 10, 1, b"A1"),
+            ("u-B", 20, 1, b"B1"),
+        ];
+        for &(uuid, seq, chunk_id, body) in &plan {
+            let meta = chunk_meta(uuid, seq, 2, chunk_id);
+            let _ = c
+                .deliver(
+                    &message_cmd_at(400 + chunk_id as u64, 0),
+                    meta,
+                    None,
+                    Bytes::copy_from_slice(body),
+                )
+                .unwrap();
+        }
+        // Both messages should be queued and the reassembly buffer empty.
+        assert_eq!(c.queue_len(), 2);
+        assert!(c.chunk_reassembly.is_empty());
+        assert_eq!(c.stats().total_chunked_msgs_received, 2);
+
+        // First popped: message A (queued first when its last chunk arrived).
+        let a = c.pop_message().expect("A");
+        let b = c.pop_message().expect("B");
+        assert_eq!(a.payload.as_ref(), b"A0A1");
+        assert_eq!(b.payload.as_ref(), b"B0B1");
+    }
+
+    // ---------------------------------------------------------------------
+    // ChunkMessageId comparison semantics — backported from Java
+    // `ChunkMessageIdImplTest`. The Java client exposes
+    // `ChunkMessageIdImpl(firstChunkMessageId, lastChunkMessageId)` whose
+    // ordering / equality is delegated to its `lastChunkMessageId`. Our
+    // `MessageId` is the single user-facing id; the reassembled logical
+    // message carries the *last* chunk's id (`ChunkMessageIdImpl
+    // #getLastChunkMessageId`). The Java tests of compareTo/equals/hashCode
+    // therefore map onto MessageId's derived Ord/Eq/Hash, which we exercise
+    // here.
+    // ---------------------------------------------------------------------
+
+    /// Mirrors Java `ChunkMessageIdImplTest#compareToTest`.
+    #[test]
+    fn chunk_message_id_compare_semantics() {
+        // chunkMsgId1 := (first=0/0/0, last=1/1/1) — its "logical" id is the last.
+        let id1 = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: 1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        // chunkMsgId2 := (first=2/2/2, last=3/3/3) — its "logical" id is 3/3/3.
+        let id2 = MessageId {
+            ledger_id: 3,
+            entry_id: 3,
+            partition: 3,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        use core::cmp::Ordering;
+        assert_eq!(id1.cmp(&id2), Ordering::Less);
+        assert_eq!(id2.cmp(&id1), Ordering::Greater);
+        assert_eq!(id2.cmp(&id2), Ordering::Equal);
+    }
+
+    /// Mirrors Java `ChunkMessageIdImplTest#equalsTest` + `hashCodeTest`. The
+    /// Java client makes `equals` compare against the inner
+    /// `lastChunkMessageId`, which means a plain `MessageIdImpl` carrying the
+    /// same ledger/entry/partition as the chunked id's last chunk compares
+    /// equal. We mirror that by checking that two `MessageId`s with the
+    /// same field values are `Eq` and share a hash.
+    #[test]
+    fn chunk_message_id_equals_and_hash_semantics() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let logical_id_of_chunk1 = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: 1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let logical_id_of_chunk2 = MessageId {
+            ledger_id: 3,
+            entry_id: 3,
+            partition: 3,
+            batch_index: -1,
+            batch_size: 0,
+        };
+
+        // A plain `MessageId` matching the lastChunkMessageId of chunk1.
+        let plain = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: 1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        // Equal to itself.
+        assert_eq!(logical_id_of_chunk1, logical_id_of_chunk1);
+        // Different chunks are unequal.
+        assert_ne!(logical_id_of_chunk1, logical_id_of_chunk2);
+        // A plain message id compares equal to the chunked id's last-chunk id.
+        assert_eq!(plain, logical_id_of_chunk1);
+
+        // Hash discipline: equal values hash equal; distinct values *probably*
+        // don't (we just check the test data picks distinct hashes — the
+        // derived `Hash` is structural).
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        logical_id_of_chunk1.hash(&mut h1);
+        logical_id_of_chunk2.hash(&mut h2);
+        assert_ne!(h1.finish(), h2.finish());
+    }
 }

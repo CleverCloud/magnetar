@@ -1415,6 +1415,161 @@ mod tests {
         assert_eq!(stats.send_latency_max_ms, pmax);
     }
 
+    // ---------------------------------------------------------------------
+    // PIP-37 producer chunking behavioural tests — backported from the Java
+    // `ProducerImpl` chunked-send paths (`ProducerImpl.java:696-704` and
+    // `:793-868`). They drive `emit_chunked` directly via `queue_send` and
+    // assert the per-chunk metadata layout the broker expects.
+    // ---------------------------------------------------------------------
+
+    /// Helper: build an `OutgoingMessage` with no metadata-side properties so
+    /// the chunking-emission path is exercised in isolation.
+    fn payload_message(payload: Vec<u8>) -> OutgoingMessage {
+        OutgoingMessage {
+            uncompressed_size: payload.len() as u32,
+            payload: Bytes::from(payload),
+            metadata: pb::MessageMetadata {
+                producer_name: "p".to_owned(),
+                sequence_id: 0,
+                publish_time: 0,
+                ..Default::default()
+            },
+            num_messages: 1,
+            txn_id: None,
+        }
+    }
+
+    /// Payload above `max_message_size` must produce
+    /// `ceil(payload_len / max_message_size)` chunk frames with monotonic
+    /// `chunk_id` 0..N and a `num_chunks_from_msg` that matches N.
+    #[test]
+    fn producer_chunks_emit_n_frames_with_monotonic_chunk_id() {
+        let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 4);
+        p.chunking_enabled = true;
+        // 14 bytes, max_chunk_size = 4 → expected 4 chunks (4 + 4 + 4 + 2).
+        let payload = b"ABCDEFGHIJKLMN".to_vec();
+        let decision = p.queue_send(payload_message(payload), 100).unwrap();
+        match decision {
+            SendDecision::Emit { count } => assert_eq!(count, 4, "expected 4 chunks"),
+            other => panic!("expected Emit, got {other:?}"),
+        }
+
+        // Drain the frames, verify monotonic chunk_id, total_chunks, and the
+        // per-chunk payload slicing.
+        let frames: Vec<OutboundFrame> = std::iter::from_fn(|| p.next_outbound_frame()).collect();
+        assert_eq!(frames.len(), 4);
+        for (idx, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.metadata.chunk_id,
+                Some(idx as i32),
+                "chunk_id at index {idx}"
+            );
+            assert_eq!(
+                f.metadata.num_chunks_from_msg,
+                Some(4),
+                "num_chunks_from_msg at index {idx}"
+            );
+            // The broker expects the total *uncompressed* size of the logical
+            // message on every chunk, so it can size the reassembly buffer.
+            assert_eq!(f.metadata.total_chunk_msg_size, Some(14));
+            // Each chunk frame is marked is_chunk = true in CommandSend.
+            assert_eq!(
+                f.command.send.as_ref().and_then(|s| s.is_chunk),
+                Some(true),
+                "CommandSend.is_chunk at index {idx}"
+            );
+        }
+        // Per-chunk byte slicing: first three full chunks of 4 bytes, last
+        // chunk picks up the 2-byte tail.
+        assert_eq!(frames[0].payload.as_ref(), b"ABCD");
+        assert_eq!(frames[1].payload.as_ref(), b"EFGH");
+        assert_eq!(frames[2].payload.as_ref(), b"IJKL");
+        assert_eq!(frames[3].payload.as_ref(), b"MN");
+    }
+
+    /// All chunk frames of a single logical message must share the same
+    /// `uuid` AND the same `sequence_id`. The Java client uses these as the
+    /// chunk-reassembly key on the consumer side
+    /// (`ProducerImpl.java:793-868`).
+    #[test]
+    fn producer_chunks_share_uuid_and_sequence_id() {
+        let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 8);
+        p.chunking_enabled = true;
+        // 20 bytes → 3 chunks (8 + 8 + 4).
+        let payload = vec![b'x'; 20];
+        let _ = p.queue_send(payload_message(payload), 100).unwrap();
+
+        let frames: Vec<OutboundFrame> = std::iter::from_fn(|| p.next_outbound_frame()).collect();
+        assert_eq!(frames.len(), 3);
+        let uuid0 = frames[0].metadata.uuid.clone();
+        let seq0 = frames[0].metadata.sequence_id;
+        let cmd_seq0 = frames[0].command.send.as_ref().unwrap().sequence_id;
+        assert!(
+            uuid0.is_some() && !uuid0.as_deref().unwrap_or("").is_empty(),
+            "uuid must be populated on chunked publishes"
+        );
+        for (idx, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f.metadata.uuid, uuid0,
+                "uuid mismatch at chunk {idx}: {:?} vs {uuid0:?}",
+                f.metadata.uuid
+            );
+            assert_eq!(
+                f.metadata.sequence_id, seq0,
+                "metadata.sequence_id must be constant across chunks at {idx}"
+            );
+            assert_eq!(
+                f.command.send.as_ref().unwrap().sequence_id,
+                cmd_seq0,
+                "CommandSend.sequence_id must be constant across chunks at {idx}"
+            );
+            assert_eq!(
+                f.sequence_id.0, cmd_seq0,
+                "OutboundFrame.sequence_id must match CommandSend at {idx}"
+            );
+        }
+
+        // The single OpSend entry covers the whole logical chunked message —
+        // only one receipt is expected by the broker.
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending.front().unwrap().sequence_id.0, seq0);
+    }
+
+    /// Edge: a payload whose size is an exact multiple of `max_message_size`
+    /// must produce exactly `len / max_message_size` chunks (no spurious
+    /// empty final chunk). Mirrors the `div_ceil` math
+    /// `ChunkedMessageContext::compute_total_chunks` performs.
+    #[test]
+    fn producer_chunks_exact_multiple_emits_no_empty_tail_chunk() {
+        let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 5);
+        p.chunking_enabled = true;
+        let payload = vec![b'y'; 15]; // 15 / 5 == 3 chunks, no remainder
+        let decision = p.queue_send(payload_message(payload), 100).unwrap();
+        match decision {
+            SendDecision::Emit { count } => assert_eq!(count, 3),
+            other => panic!("expected Emit, got {other:?}"),
+        }
+        for idx in 0..3 {
+            let f = p.next_outbound_frame().expect("chunk frame");
+            assert_eq!(f.metadata.chunk_id, Some(idx));
+            assert_eq!(f.payload.len(), 5);
+        }
+        assert!(p.next_outbound_frame().is_none(), "no extra frames");
+    }
+
+    /// `ChunkedMessageContext::compute_total_chunks` math sanity, mirroring
+    /// the helper Java callers use to know how many sends to expect. Includes
+    /// the zero-chunk-size guard (returns 1 to avoid division by zero in the
+    /// hot path).
+    #[test]
+    fn compute_total_chunks_math() {
+        assert_eq!(ChunkedMessageContext::compute_total_chunks(10, 4), 3);
+        assert_eq!(ChunkedMessageContext::compute_total_chunks(12, 4), 3);
+        assert_eq!(ChunkedMessageContext::compute_total_chunks(0, 4), 1);
+        // Zero chunk size is treated as "no chunking", returns 1.
+        assert_eq!(ChunkedMessageContext::compute_total_chunks(100, 0), 1);
+    }
+
     /// End-to-end check: enqueue a send, sleep briefly, apply the receipt, observe that the
     /// histogram now has exactly one sample and the max is at least the sleep duration.
     #[test]
