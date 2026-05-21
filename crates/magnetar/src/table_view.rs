@@ -175,6 +175,9 @@ pub struct TableViewBuilder<'a> {
     subscription: Option<String>,
     receiver_queue_size: usize,
     listener: Option<TableViewListener>,
+    properties: Vec<(String, String)>,
+    subscription_properties: Vec<(String, String)>,
+    start_message_id: Option<magnetar_proto::MessageId>,
 }
 
 impl std::fmt::Debug for TableViewBuilder<'_> {
@@ -184,6 +187,12 @@ impl std::fmt::Debug for TableViewBuilder<'_> {
             .field("subscription", &self.subscription)
             .field("receiver_queue_size", &self.receiver_queue_size)
             .field("has_listener", &self.listener.is_some())
+            .field("properties", &self.properties.len())
+            .field(
+                "subscription_properties",
+                &self.subscription_properties.len(),
+            )
+            .field("start_message_id", &self.start_message_id)
             .finish()
     }
 }
@@ -196,6 +205,9 @@ impl<'a> TableViewBuilder<'a> {
             subscription: None,
             receiver_queue_size: 1000,
             listener: None,
+            properties: Vec::new(),
+            subscription_properties: Vec::new(),
+            start_message_id: None,
         }
     }
 
@@ -215,6 +227,37 @@ impl<'a> TableViewBuilder<'a> {
         self
     }
 
+    /// Append a `(key, value)` consumer-metadata entry advertised on the underlying
+    /// `CommandSubscribe.metadata`. Mirrors Java `TableViewBuilder#consumerProperty`.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Append a `(key, value)` to the underlying subscription's `subscription_properties`.
+    /// Mirrors Java `TableViewBuilder#subscriptionProperty`.
+    #[must_use]
+    pub fn subscription_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.subscription_properties
+            .push((key.into(), value.into()));
+        self
+    }
+
+    /// Override the initial message id the underlying subscription starts from. Useful for
+    /// resuming a table view at a specific cursor (e.g. recovery from snapshot). Has no
+    /// effect on an already-persisted subscription. Mirrors Java
+    /// `TableViewBuilder#startMessageId`.
+    #[must_use]
+    pub fn start_message_id(mut self, id: magnetar_proto::MessageId) -> Self {
+        self.start_message_id = Some(id);
+        self
+    }
+
     /// Install a listener invoked for every materialised update. The callback runs inside
     /// the drain task; keep it fast and non-blocking.
     #[must_use]
@@ -230,7 +273,7 @@ impl<'a> TableViewBuilder<'a> {
         let subscription = self
             .subscription
             .unwrap_or_else(|| format!("table-view-{}", uuid::Uuid::new_v4().simple()));
-        let consumer = self
+        let mut builder = self
             .client
             .consumer(self.topic)
             .subscription(subscription)
@@ -238,9 +281,17 @@ impl<'a> TableViewBuilder<'a> {
             .durable(false)
             .initial_position(magnetar_proto::pb::command_subscribe::InitialPosition::Earliest)
             .read_compacted(true)
-            .receiver_queue_size(self.receiver_queue_size)
-            .subscribe()
-            .await?;
+            .receiver_queue_size(self.receiver_queue_size);
+        for (k, v) in self.properties {
+            builder = builder.property(k, v);
+        }
+        for (k, v) in self.subscription_properties {
+            builder = builder.subscription_property(k, v);
+        }
+        if let Some(id) = self.start_message_id {
+            builder = builder.start_message_id(id);
+        }
+        let consumer = builder.subscribe().await?;
 
         let state: Arc<RwLock<HashMap<String, Bytes>>> = Arc::new(RwLock::new(HashMap::new()));
         let state_drain = state.clone();
