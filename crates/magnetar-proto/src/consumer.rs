@@ -87,6 +87,10 @@ pub struct ConsumerState {
     pub total_acks_sent: u64,
     /// Cumulative count of broker-reported ACK failures (CommandAckResponse with error).
     pub total_acks_failed: u64,
+    /// Cumulative count of messages diverted to the DLQ pending list because they exceeded
+    /// the configured `max_redeliver_count`. Mirrors the Java client's "exceeded max
+    /// redelivery" counter — useful for monitoring poison-pill rates.
+    pub total_msgs_dead_lettered: u64,
     /// Optional negative-ack tracker. When configured via
     /// `SubscribeRequest::negative_ack_redelivery_delay`, calls to `Connection::negative_ack`
     /// stage the ids here and the redelivery fires on the next `handle_timeout` once the
@@ -112,6 +116,8 @@ pub struct ConsumerStats {
     pub total_acks_sent: u64,
     /// Cumulative count of broker-reported ACK failures.
     pub total_acks_failed: u64,
+    /// Cumulative count of messages routed to the DLQ pending list (exceeded max redelivery).
+    pub total_msgs_dead_lettered: u64,
 }
 
 #[derive(Debug)]
@@ -171,6 +177,7 @@ impl ConsumerState {
             total_bytes_received: 0,
             total_acks_sent: 0,
             total_acks_failed: 0,
+            total_msgs_dead_lettered: 0,
             nack_tracker: None,
             unacked_tracker: None,
         }
@@ -183,6 +190,7 @@ impl ConsumerState {
             total_bytes_received: self.total_bytes_received,
             total_acks_sent: self.total_acks_sent,
             total_acks_failed: self.total_acks_failed,
+            total_msgs_dead_lettered: self.total_msgs_dead_lettered,
         }
     }
 
@@ -374,6 +382,7 @@ impl ConsumerState {
     fn classify_and_queue(&mut self, msg: IncomingMessage, redelivery: u32) -> DeliverOutcome {
         let payload_len = msg.payload.len();
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
+            self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
             self.dead_letter_pending.push(msg);
             DeliverOutcome::Buffered
         } else {
@@ -613,5 +622,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(c.stats().total_msgs_received, 2);
+    }
+
+    #[test]
+    fn dlq_counter_increments_per_diverted_message() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        c.max_redeliver_count = 2;
+        let _ = c.initial_flow();
+        assert_eq!(c.stats().total_msgs_dead_lettered, 0);
+        for _ in 0..3 {
+            let _ = c
+                .deliver(
+                    &message_cmd(5),
+                    metadata(1),
+                    None,
+                    Bytes::from_static(b"poison"),
+                )
+                .unwrap();
+        }
+        assert_eq!(c.stats().total_msgs_dead_lettered, 3);
+        assert_eq!(c.dead_letter_pending.len(), 3);
     }
 }
