@@ -128,6 +128,70 @@ impl MultiTopicsConsumer {
             .map_err(PulsarError::Client)
     }
 
+    /// `true` while every child consumer reports the underlying connection is up.
+    /// Mirrors Java `Consumer#isConnected` at the multi-topic / partitioned scope.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .all(|c| c.consumer.is_connected())
+    }
+
+    /// Earliest disconnect wall-clock across all child consumers. `None` if no child has
+    /// ever disconnected.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.inner
+            .consumers
+            .iter()
+            .filter_map(|c| c.consumer.last_disconnected_timestamp())
+            .min()
+    }
+
+    /// Aggregate cumulative stats across all child consumers. Sums the totals; useful
+    /// for monitoring fan-in throughput on the multi-topic / partitioned scope.
+    #[must_use]
+    pub fn aggregate_stats(&self) -> magnetar_proto::ConsumerStats {
+        let mut agg = magnetar_proto::ConsumerStats::default();
+        for nc in &self.inner.consumers {
+            let s = nc.consumer.stats();
+            agg.total_msgs_received = agg
+                .total_msgs_received
+                .saturating_add(s.total_msgs_received);
+            agg.total_bytes_received = agg
+                .total_bytes_received
+                .saturating_add(s.total_bytes_received);
+            agg.total_acks_sent = agg.total_acks_sent.saturating_add(s.total_acks_sent);
+            agg.total_acks_failed = agg.total_acks_failed.saturating_add(s.total_acks_failed);
+        }
+        agg
+    }
+
+    /// Pause every child consumer. Mirrors Java `Consumer#pause` at the multi-topic scope.
+    pub fn pause(&self) {
+        for nc in &self.inner.consumers {
+            nc.consumer.pause();
+        }
+    }
+
+    /// Resume every child consumer.
+    pub fn resume(&self) {
+        for nc in &self.inner.consumers {
+            nc.consumer.resume();
+        }
+    }
+
+    /// `true` once every child consumer has reached end-of-topic. Mirrors Java
+    /// `Consumer#hasReachedEndOfTopic` at the multi-topic scope.
+    #[must_use]
+    pub fn has_reached_end_of_topic(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .all(|c| c.consumer.has_reached_end_of_topic())
+    }
+
     /// Close every underlying consumer concurrently. Returns the first error encountered;
     /// the rest are dropped.
     pub async fn close(self) -> Result<(), PulsarError> {
