@@ -511,8 +511,18 @@ pub struct Connection {
     pending_requests: HashMap<RequestId, PendingRequestKind>,
     /// Open producers.
     producers: HashMap<ProducerHandle, ProducerState>,
+    /// Original [`CreateProducerRequest`] for every still-open producer. Stashed at
+    /// [`Self::create_producer`] time so the supervisor can replay `CommandProducer` on a
+    /// freshly-handshaked transport via [`Self::rebuild_producers`]. Mirrors the parameters
+    /// Java keeps inside `ProducerImpl#conf` for the same purpose.
+    producer_create_requests: HashMap<ProducerHandle, CreateProducerRequest>,
     /// Open consumers.
     consumers: HashMap<ConsumerHandle, ConsumerState>,
+    /// Original [`SubscribeRequest`] for every still-open consumer. Stashed at
+    /// [`Self::subscribe`] time so the supervisor can replay `CommandSubscribe` on a
+    /// freshly-handshaked transport via [`Self::rebuild_consumers`]. Mirrors the parameters
+    /// Java keeps inside `ConsumerImpl#conf` for the same purpose.
+    consumer_subscribe_requests: HashMap<ConsumerHandle, SubscribeRequest>,
     /// Lookup registry.
     lookup: LookupRegistry,
     /// Topic watcher registry.
@@ -603,7 +613,9 @@ impl Connection {
             wakers: HashMap::new(),
             pending_requests: HashMap::new(),
             producers: HashMap::new(),
+            producer_create_requests: HashMap::new(),
             consumers: HashMap::new(),
+            consumer_subscribe_requests: HashMap::new(),
             lookup: LookupRegistry::default(),
             topic_watchers: TopicWatcherRegistry::default(),
             txn_client: TxnClient::new(0),
@@ -815,6 +827,82 @@ impl Connection {
         self.broker_protocol_version = 0;
         self.feature_flags = pb::FeatureFlags::default();
         self.last_activity = None;
+    }
+
+    /// Re-emit a `CommandProducer` for every still-open producer that was created before the
+    /// most recent [`Self::reset`]. The supervisor calls this after the new socket's handshake
+    /// completes so user-facing producer handles transparently survive the reconnect — once each
+    /// returned [`RequestId`] surfaces an [`OpOutcome::Success`], the producer is "live" again
+    /// and queued sends can flow on the new transport.
+    ///
+    /// Each replay increments the producer's [`crate::producer::ProducerState::epoch`] field so
+    /// the broker can detect — and accept — the re-attach (rejecting stale reconnects of older
+    /// epochs). Mirrors Java `ProducerImpl#reconnectLater`.
+    ///
+    /// Producers explicitly closed via [`Self::close_producer`] (or by the broker via
+    /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured.
+    pub fn rebuild_producers(&mut self) -> Vec<RequestId> {
+        // Snapshot the (handle, request) pairs we want to replay so the borrow of
+        // `producer_create_requests` doesn't conflict with `emit_command_producer`'s mutable
+        // borrow of `self`.
+        let pending: Vec<(ProducerHandle, CreateProducerRequest)> = self
+            .producer_create_requests
+            .iter()
+            .filter(|(handle, _)| self.producers.get(*handle).is_some_and(|p| !p.closed))
+            .map(|(handle, req)| (*handle, req.clone()))
+            .collect();
+        let mut request_ids = Vec::with_capacity(pending.len());
+        for (handle, req) in pending {
+            if let Some(p) = self.producers.get_mut(&handle) {
+                p.epoch = p.epoch.saturating_add(1);
+            }
+            let request_id = self.emit_command_producer(handle, &req);
+            request_ids.push(request_id);
+        }
+        request_ids
+    }
+
+    /// Re-emit a `CommandSubscribe` + initial `CommandFlow` for every still-open consumer that
+    /// was created before the most recent [`Self::reset`]. The supervisor calls this after the
+    /// new socket's handshake completes so user-facing consumer handles transparently survive
+    /// the reconnect — once each returned [`RequestId`] surfaces an [`OpOutcome::Success`], the
+    /// consumer's receive queue is "live" again and the broker resumes dispatching messages.
+    ///
+    /// When a consumer has acknowledged at least one message before the reconnect, the
+    /// replayed `CommandSubscribe` uses the highest acked id as `start_message_id` so the
+    /// broker resumes from the post-ack position. This avoids double-delivery of pre-reconnect
+    /// messages on subscriptions where the cursor was not yet persisted broker-side. Mirrors
+    /// Java `ConsumerImpl#connectionOpened`.
+    ///
+    /// Consumers explicitly closed via [`Self::close_consumer`] / [`Self::unsubscribe`] (or by
+    /// the broker via `CommandCloseConsumer`) are skipped — their `closed` flag is honoured.
+    pub fn rebuild_consumers(&mut self) -> Vec<RequestId> {
+        let pending: Vec<(ConsumerHandle, SubscribeRequest, Option<MessageId>)> = self
+            .consumer_subscribe_requests
+            .iter()
+            .filter_map(|(handle, req)| {
+                let state = self.consumers.get(handle)?;
+                if state.closed {
+                    return None;
+                }
+                Some((*handle, req.clone(), state.last_acked_message_id))
+            })
+            .collect();
+        let mut request_ids = Vec::with_capacity(pending.len());
+        for (handle, req, resume_from) in pending {
+            // Resume position: prefer the post-ack id when known, else fall back to the
+            // original `start_message_id` from the subscribe request (broker uses its
+            // persisted cursor if both are absent).
+            let resume = resume_from.or(req.start_message_id);
+            let subscribe_request_id = self.emit_command_subscribe(handle, &req, resume);
+            // Re-issue the initial flow now so the broker starts dispatching as soon as it
+            // acks the subscribe. `initial_flow` quietly tolerates an unknown handle, but the
+            // consumer must already be in `self.consumers` (it is — we filtered above), so
+            // the flow command goes onto the wire alongside the subscribe.
+            self.initial_flow(handle);
+            request_ids.push(subscribe_request_id);
+        }
+        request_ids
     }
 
     /// Returns the feature flags negotiated with the broker (empty until `Connected`).
@@ -1674,7 +1762,6 @@ impl Connection {
     pub fn create_producer(&mut self, req: CreateProducerRequest) -> ProducerHandle {
         let handle = ProducerHandle(self.next_producer_id);
         self.next_producer_id = self.next_producer_id.wrapping_add(1);
-        let request_id = self.alloc_request_id();
         let max_size = self
             .broker_max_message_size
             .unwrap_or(self.config.default_max_message_size);
@@ -1691,7 +1778,27 @@ impl Connection {
         state.batching_max_publish_delay = req.batching_max_publish_delay;
         state.access_mode = req.access_mode;
         self.producers.insert(handle, state);
+        // Stash the request so [`Self::rebuild_producers`] can replay it on a freshly-handshaked
+        // session.
+        self.producer_create_requests.insert(handle, req.clone());
 
+        let _ = self.emit_command_producer(handle, &req);
+        handle
+    }
+
+    /// Emit a `CommandProducer` carrying `req`'s parameters for the producer identified by
+    /// `handle`. Used by both [`Self::create_producer`] (initial open) and
+    /// [`Self::rebuild_producers`] (post-reconnect replay).
+    ///
+    /// Returns the allocated [`RequestId`] so the caller can correlate the broker's
+    /// `CommandProducerSuccess` (via [`OpOutcome::Success`]) against it.
+    fn emit_command_producer(
+        &mut self,
+        handle: ProducerHandle,
+        req: &CreateProducerRequest,
+    ) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let epoch = self.producers.get(&handle).map(|p| p.epoch).unwrap_or(0);
         let producer_metadata: Vec<pb::KeyValue> = req
             .producer_metadata
             .iter()
@@ -1701,14 +1808,17 @@ impl Connection {
             })
             .collect();
         let cmd = pb::CommandProducer {
-            topic: req.topic,
+            topic: req.topic.clone(),
             producer_id: handle.0,
             request_id: request_id.0,
             producer_name: req.producer_name.clone(),
             encrypted: None,
             metadata: producer_metadata,
-            schema: req.schema,
-            epoch: None,
+            schema: req.schema.clone(),
+            // Only stamp the epoch on the wire once it's non-zero — Java's `ProducerImpl`
+            // omits the field on the initial create and stamps it on every subsequent
+            // re-attach. Matching that keeps brokers that predate the field happy.
+            epoch: if epoch == 0 { None } else { Some(epoch) },
             user_provided_producer_name: Some(req.producer_name.is_some()),
             producer_access_mode: Some(req.access_mode as i32),
             topic_epoch: None,
@@ -1723,7 +1833,7 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::ProducerOpen { handle });
-        handle
+        request_id
     }
 
     /// Open a consumer. Returns the handle and emits `CommandSubscribe`. The driver receives
@@ -1732,7 +1842,6 @@ impl Connection {
     pub fn subscribe(&mut self, req: SubscribeRequest) -> ConsumerHandle {
         let handle = ConsumerHandle(self.next_consumer_id);
         self.next_consumer_id = self.next_consumer_id.wrapping_add(1);
-        let request_id = self.alloc_request_id();
         let mut state = ConsumerState::new(
             handle,
             req.topic.clone(),
@@ -1756,11 +1865,32 @@ impl Connection {
         }
         state.crypto_failure_action = req.crypto_failure_action;
         self.consumers.insert(handle, state);
+        // Stash the request so [`Self::rebuild_consumers`] can replay it on a freshly-handshaked
+        // session.
+        self.consumer_subscribe_requests.insert(handle, req.clone());
 
+        let _ = self.emit_command_subscribe(handle, &req, req.start_message_id);
+        handle
+    }
+
+    /// Emit a `CommandSubscribe` carrying `req`'s parameters for the consumer identified by
+    /// `handle`. `resume_from` overrides `req.start_message_id` — used by
+    /// [`Self::rebuild_consumers`] to point the broker at the post-ack position after a
+    /// reconnect.
+    fn emit_command_subscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        req: &SubscribeRequest,
+        resume_from: Option<MessageId>,
+    ) -> RequestId {
+        let request_id = self.alloc_request_id();
         let subscription_properties: Vec<pb::KeyValue> = req
             .subscription_properties
-            .into_iter()
-            .map(|(key, value)| pb::KeyValue { key, value })
+            .iter()
+            .map(|(key, value)| pb::KeyValue {
+                key: key.clone(),
+                value: value.clone(),
+            })
             .collect();
         let key_shared_meta = req.key_shared.as_ref().map(|cfg| pb::KeySharedMeta {
             key_shared_mode: cfg.mode as i32,
@@ -1774,25 +1904,28 @@ impl Connection {
                 .collect(),
             allow_out_of_order_delivery: Some(cfg.allow_out_of_order_delivery),
         });
-        let start_message_id = req.start_message_id.map(MessageId::to_pb);
+        let start_message_id = resume_from.map(MessageId::to_pb);
         let consumer_metadata: Vec<pb::KeyValue> = req
             .consumer_metadata
-            .into_iter()
-            .map(|(key, value)| pb::KeyValue { key, value })
+            .iter()
+            .map(|(key, value)| pb::KeyValue {
+                key: key.clone(),
+                value: value.clone(),
+            })
             .collect();
         let cmd = pb::CommandSubscribe {
-            topic: req.topic,
-            subscription: req.subscription,
+            topic: req.topic.clone(),
+            subscription: req.subscription.clone(),
             sub_type: req.sub_type as i32,
             consumer_id: handle.0,
             request_id: request_id.0,
-            consumer_name: req.consumer_name,
+            consumer_name: req.consumer_name.clone(),
             priority_level: req.priority_level,
             durable: Some(req.durable),
             start_message_id,
             metadata: consumer_metadata,
             read_compacted: if req.read_compacted { Some(true) } else { None },
-            schema: req.schema,
+            schema: req.schema.clone(),
             initial_position: Some(req.initial_position as i32),
             replicate_subscription_state: req.replicate_subscription_state,
             force_topic_creation: req.force_topic_creation,
@@ -1809,7 +1942,7 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::ConsumerSubscribe { handle });
-        handle
+        request_id
     }
 
     /// Emit the initial flow command for a consumer once it's been acked.
@@ -2005,7 +2138,9 @@ impl Connection {
         let request_id = self.alloc_request_id();
         let n_ids = ack.message_ids.len() as u64;
         // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
-        // (caller may have nacked then acked the same id).
+        // (caller may have nacked then acked the same id). Also remember the highest acked
+        // id so [`Self::rebuild_consumers`] resumes from the post-ack position after a
+        // reconnect.
         if let Some(consumer) = self.consumers.get_mut(&handle) {
             for id in &ack.message_ids {
                 if let Some(t) = consumer.unacked_tracker.as_mut() {
@@ -2013,6 +2148,12 @@ impl Connection {
                 }
                 if let Some(t) = consumer.nack_tracker.as_mut() {
                     t.remove(id);
+                }
+                // Track the highest acked id. `MessageId` derives `Ord` and orders on
+                // `(ledger_id, entry_id, partition, batch_index, batch_size)`, which matches the
+                // broker's cursor order on the leading `(ledger_id, entry_id)` pair.
+                if consumer.last_acked_message_id.is_none_or(|prev| *id > prev) {
+                    consumer.last_acked_message_id = Some(*id);
                 }
             }
         }
@@ -3345,5 +3486,243 @@ mod conn_state_tests {
             conn2.last_disconnected_timestamp().is_none(),
             "close() from ConnectSent must not record a disconnect either"
         );
+    }
+
+    /// Decode every command currently sitting in the connection's outbound buffer. Used by
+    /// the rebuild_* tests to assert that the supervisor replay landed the right frames on
+    /// the new socket. Drains [`Connection::poll_transmit`] (clearing internal state) and
+    /// returns the parsed [`pb::BaseCommand`]s in wire order.
+    fn drain_outbound_commands(conn: &mut Connection) -> Vec<pb::BaseCommand> {
+        let mut buf = Vec::<u8>::new();
+        let _ = conn.poll_transmit(&mut buf);
+        let mut cursor = Bytes::copy_from_slice(&buf);
+        let mut commands = Vec::new();
+        while !cursor.is_empty() {
+            let frame = crate::frame::decode_one(&mut cursor).expect("decode frame");
+            commands.push(frame.command);
+        }
+        commands
+    }
+
+    #[test]
+    fn rebuild_producers_re_emits_command_producer_after_reset() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        // Open two producers with different parameters so we can assert per-producer fields
+        // (topic, access_mode) survived the replay verbatim.
+        let p_a = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/topic-a".to_owned(),
+            producer_name: Some("alpha".to_owned()),
+            access_mode: pb::ProducerAccessMode::Shared,
+            ..Default::default()
+        });
+        let p_b = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/topic-b".to_owned(),
+            producer_name: Some("beta".to_owned()),
+            access_mode: pb::ProducerAccessMode::Exclusive,
+            ..Default::default()
+        });
+        // Discard the initial CommandProducer frames — we only want to inspect the rebuild.
+        let _initial = drain_outbound_commands(&mut conn);
+
+        // Simulate a supervisor reconnect: reset, replay the handshake on the new socket,
+        // then rebuild.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        // Drop the post-handshake CONNECT we just emitted.
+        let _post_handshake = drain_outbound_commands(&mut conn);
+
+        let request_ids = conn.rebuild_producers();
+        assert_eq!(
+            request_ids.len(),
+            2,
+            "one RequestId per still-open producer"
+        );
+
+        // Two `Producer` commands must hit the wire — one per re-attached producer.
+        let cmds = drain_outbound_commands(&mut conn);
+        let producer_cmds: Vec<&pb::CommandProducer> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Producer as i32)
+            .filter_map(|c| c.producer.as_ref())
+            .collect();
+        assert_eq!(producer_cmds.len(), 2);
+
+        // Topics + access modes must match the original create requests; the request_ids
+        // returned by rebuild_producers must match the ones embedded in the frames.
+        let by_id: std::collections::HashMap<u64, &pb::CommandProducer> = producer_cmds
+            .iter()
+            .copied()
+            .map(|c| (c.producer_id, c))
+            .collect();
+        let cmd_a = by_id.get(&p_a.0).expect("producer a re-emitted");
+        let cmd_b = by_id.get(&p_b.0).expect("producer b re-emitted");
+        assert_eq!(cmd_a.topic, "persistent://public/default/topic-a");
+        assert_eq!(cmd_a.producer_name.as_deref(), Some("alpha"));
+        assert_eq!(
+            cmd_a.producer_access_mode,
+            Some(pb::ProducerAccessMode::Shared as i32)
+        );
+        assert_eq!(cmd_b.topic, "persistent://public/default/topic-b");
+        assert_eq!(cmd_b.producer_name.as_deref(), Some("beta"));
+        assert_eq!(
+            cmd_b.producer_access_mode,
+            Some(pb::ProducerAccessMode::Exclusive as i32)
+        );
+
+        let emitted_ids: std::collections::HashSet<u64> =
+            producer_cmds.iter().map(|c| c.request_id).collect();
+        for rid in request_ids {
+            assert!(
+                emitted_ids.contains(&rid.0),
+                "RequestId returned by rebuild_producers must match a wire frame"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_consumers_re_emits_subscribe_and_flow_after_reset() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let c_handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/topic".to_owned(),
+            subscription: "sub-x".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Shared,
+            receiver_queue_size: 128,
+            priority_level: Some(7),
+            durable: true,
+            ..Default::default()
+        });
+        // Drop the initial subscribe traffic.
+        let _initial = drain_outbound_commands(&mut conn);
+
+        // Simulate the consumer having acked a message before the disconnect, so the rebuild
+        // should resume from the post-ack id (not from `start_message_id == None`).
+        let acked = MessageId {
+            ledger_id: 42,
+            entry_id: 17,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+        };
+        let _ = conn.ack(
+            c_handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+        );
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Reconnect.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let request_ids = conn.rebuild_consumers();
+        assert_eq!(request_ids.len(), 1);
+
+        let cmds = drain_outbound_commands(&mut conn);
+
+        let subscribe_cmd = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Subscribe as i32)
+            .find_map(|c| c.subscribe.as_ref())
+            .expect("CommandSubscribe re-emitted");
+        assert_eq!(subscribe_cmd.topic, "persistent://public/default/topic");
+        assert_eq!(subscribe_cmd.subscription, "sub-x");
+        assert_eq!(
+            subscribe_cmd.sub_type,
+            pb::command_subscribe::SubType::Shared as i32
+        );
+        assert_eq!(subscribe_cmd.priority_level, Some(7));
+        // Resume from post-ack: the start_message_id field must carry the acked id, not
+        // None (which is what the original subscribe used).
+        let smid = subscribe_cmd
+            .start_message_id
+            .as_ref()
+            .expect("start_message_id stamped from last_acked_message_id");
+        assert_eq!(smid.ledger_id, acked.ledger_id);
+        assert_eq!(smid.entry_id, acked.entry_id);
+
+        // A CommandFlow must follow the subscribe so the broker resumes dispatching as soon
+        // as it acks.
+        let flow_cmd = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .find_map(|c| c.flow.as_ref())
+            .expect("CommandFlow re-emitted alongside subscribe");
+        assert_eq!(flow_cmd.consumer_id, c_handle.0);
+        assert_eq!(flow_cmd.message_permits, 128);
+
+        // The returned RequestId must match the one stamped on the subscribe frame.
+        assert_eq!(request_ids[0].0, subscribe_cmd.request_id);
+    }
+
+    #[test]
+    fn producer_epoch_increments_on_rebuild() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/topic".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+
+        // First rebuild — epoch was 0 (initial create) and must bump to 1.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        let _ = drain_outbound_commands(&mut conn);
+        conn.rebuild_producers();
+        assert_eq!(
+            conn.producer(handle).expect("producer alive").epoch,
+            1,
+            "first rebuild bumps producer epoch from 0 to 1"
+        );
+
+        // Inspect the wire frame — its `CommandProducer.epoch` field must carry the new
+        // epoch so the broker can detect (and accept) the re-attach.
+        let cmds = drain_outbound_commands(&mut conn);
+        let cmd = cmds
+            .iter()
+            .find_map(|c| c.producer.as_ref())
+            .expect("CommandProducer re-emitted");
+        assert_eq!(cmd.epoch, Some(1));
+
+        // Second rebuild — epoch must bump again.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake 2");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect 2");
+        let _ = drain_outbound_commands(&mut conn);
+        conn.rebuild_producers();
+        assert_eq!(
+            conn.producer(handle).expect("producer alive").epoch,
+            2,
+            "second rebuild bumps producer epoch from 1 to 2"
+        );
+        let cmds = drain_outbound_commands(&mut conn);
+        let cmd = cmds
+            .iter()
+            .find_map(|c| c.producer.as_ref())
+            .expect("CommandProducer re-emitted");
+        assert_eq!(cmd.epoch, Some(2));
     }
 }
