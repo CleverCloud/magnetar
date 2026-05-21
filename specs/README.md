@@ -34,6 +34,8 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0016](adr/0016-pip-121-cluster-failover.md) | PIP-121 `ServiceUrlProvider` + `ControlledClusterFailover` + `AutoClusterFailover` w/ `HealthProbe` | Accepted | commits `87f2080`, `7b8d3e6`, `c978288` |
 | [0017](adr/0017-memory-limit-atomic-reservation.md) | `memory_limit` runtime accounting via atomic CAS + `SendFut::Drop` release | Accepted | commits `6b2fa8e`, `703744e` |
 | [0018](adr/0018-pip-188-reconnect-on-migrate.md) | PIP-188 `TOPIC_MIGRATED` → supervised reset + reconnect (re-uses Stage 2/3 supervisor) | Accepted | commits `7d568f9`, `9a35db4` |
+| [0019](adr/0019-engine-scope-and-moonpool-parity.md) | Engine scope for v0.1.0 parity; moonpool parity as M5–M8 follow-up train | Accepted | commit `1c9bb5d` |
+| [0020](adr/0020-memory-limit-producer-block.md) | `MemoryLimitPolicy::ProducerBlock` back-pressure via Waker slab | Accepted | commits `13842b7`, `81a7df0`, `458224a` |
 
 ## How to add an ADR
 

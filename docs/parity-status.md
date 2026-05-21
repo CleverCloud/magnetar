@@ -1,8 +1,8 @@
 # Magnetar — Java Parity Status Snapshot
 
-**Generated**: 2026-05-21 (post parity-matrix resync)
-**HEAD**: `810278f docs(parity-matrix): resync rows clobbered by stale-base merges`
-**Total LOC across crates**: ~21,000 (driver+facade+proto) + ~2,400 (e2e suite)
+**Generated**: 2026-05-22 (post v0.1.0 finish-line wave)
+**HEAD**: 17 commits ahead of `origin/main` — landed via the `/ask --with-codex` plan dated 2026-05-21 + the multi-agent execution wave on 2026-05-22.
+**Total LOC across crates**: ~22,500 (driver + facade + proto, post-M5b) + ~3,800 (e2e suite — 14 files).
 
 The authoritative parity matrix lives in
 [`README.md#java-client-parity-matrix`](../README.md). This snapshot is a
@@ -25,7 +25,73 @@ periodic narrative of what has *recently* landed and what genuinely remains.
 | magnetar-fakes | ~400 | In-process broker stub for tests |
 | xtask | ~250 | Workspace automation (`check-no-channels`, `check-no-io-deps`, `check-no-internal-clock`, `codegen`) |
 
-## Recently landed (since last snapshot — 50 commits)
+## Recently landed (since 2026-05-22 finish-line wave — 17 commits)
+
+Order is reverse-chronological. Each item below maps to a commit on
+`main` (currently ahead of `origin/main` pending push gate (i)).
+
+### v0.1.0 finish-line — Phase 1 (parity polish)
+
+- **ADR-0019 — engine scope for v0.1.0 + moonpool parity train.** Clarifies
+  ADR-0010 ("full Java parity") as *tokio-engine satisfied*; moonpool
+  parity is the M5–M8 follow-up train. Public API: `PulsarClient<E: Engine
+  = TokioEngine>` per gate (e) Option A. Commit `1c9bb5d`.
+- **`MemoryLimitPolicy::ProducerBlock` (ADR-0020).** Sans-io Waker slab
+  on the runtime `ConnectionShared`; `SendFut::Reserving` retries the CAS
+  via `try_reserve_memory_or_register` and dispatches via
+  `release_memory`-fan-out. README `:613` flipped. Commits `13842b7`,
+  `81a7df0`, `458224a`.
+- **README parity-matrix cleanups (Phase 1.2).** `Producer::stats`
+  rolling-windows row reconciled; "Open structural gaps" section
+  updated to point at the moonpool parity train, SASL/Athenz/
+  AutoProduceBytesSchema deferrals, and v0.2.0 surface. Commit
+  `8ecdbeb`.
+
+### Phase 2 — moonpool engine parity train (M5)
+
+- **Moonpool DnsResolver + transport scaffold (M5a).** `DnsResolver`
+  trait + `StaticDnsResolver` + `arc_dns_resolver` helper, wired into
+  `Transport::connect_plain`. Commit `b3752c7`.
+- **Moonpool supervised reconnect Stage 2 + 3 (M5b).** `spawn_supervised`
+  driver loop with backoff via `moonpool_core::TimeProvider`,
+  `Connection::reset` integration, `rebuild_producers` +
+  `rebuild_consumers` after handshake. Commit inside M5b squash.
+- **Moonpool driver-TLS finish, memory_limit accounting,
+  ServiceUrlProvider + `ControlledClusterFailover`, PIP-188
+  `TOPIC_MIGRATED` → reset+reconnect.** All five remaining M5 surfaces
+  landed via M5b squash. `AutoClusterFailover` deferred — see
+  `docs/m5b-deferrals.md`.
+
+### Phase 3 — e2e expansion (Batches A..E + A2 + A3 + C2)
+
+- **e2e_crypto.rs** — PIP-4 + Fail/Discard/Consume action coverage + PIP-37
+  chunking+encryption cross. Commit `ee13d29`.
+- **e2e_pattern_auto_reconcile.rs** — PatternConsumer background ticker
+  rediscovers topics. Commit `6b645ff`.
+- **e2e_oauth2.rs** — `ClientCredentialsFlow` round-trip + token cache +
+  refresh-on-expiry via injectable `Clock`. Commit `bb80b6d`.
+- **e2e_seek_per_partition.rs + e2e_memory_limit.rs +
+  e2e_force_unsubscribe.rs (Batch A).** Commit `5b6e859`.
+- **e2e_dns_resolver.rs + Producer/Consumer::record_rate_window helpers
+  (Batch A2).** Commit `9f4db4e`.
+- **e2e_rolling_stats.rs + e2e_schemas_extended.rs (Batch A3).** Commit
+  `6aadbaf`.
+- **e2e_reconnect.rs + e2e_cluster_failover.rs (Batch C2).** Stage 2/3
+  supervised reconnect under broker stop/start; PIP-121 manual swap with
+  two broker containers. Commit `dc5a76f`.
+
+### Phase 4 — CI hardening
+
+- **`cargo xtask codegen --check` + MSRV-1.85 job + dependabot.** Commit
+  `6b387b2`. `/loop` CI-monitor note in `docs/ci-monitor-loop.md`.
+
+### Phase 0 — worktree triage + WIP terminations
+
+- **38 → 1 worktree.** Bulk-dropped 28 subset-of-main worktrees; 5 WIP
+  terminations (W2/W3/W4/W5/W7/W8) with reports in `docs/wip-W*-report.md`.
+  Commits `8698961`, `2191176`, `8821ab0`, `8ecdbeb`.
+
+## Previously landed (pre-2026-05-22 — 50+ commits)
 
 Order is reverse-chronological. Each item below maps to either an ADR
 or a row flipped in the README parity matrix.
