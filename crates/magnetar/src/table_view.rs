@@ -178,6 +178,8 @@ pub struct TableViewBuilder<'a> {
     properties: Vec<(String, String)>,
     subscription_properties: Vec<(String, String)>,
     start_message_id: Option<magnetar_proto::MessageId>,
+    crypto_failure_action: magnetar_proto::conn::CryptoFailureAction,
+    auto_update_partitions_interval: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for TableViewBuilder<'_> {
@@ -208,6 +210,8 @@ impl<'a> TableViewBuilder<'a> {
             properties: Vec::new(),
             subscription_properties: Vec::new(),
             start_message_id: None,
+            crypto_failure_action: magnetar_proto::conn::CryptoFailureAction::Fail,
+            auto_update_partitions_interval: None,
         }
     }
 
@@ -255,6 +259,27 @@ impl<'a> TableViewBuilder<'a> {
     #[must_use]
     pub fn start_message_id(mut self, id: magnetar_proto::MessageId) -> Self {
         self.start_message_id = Some(id);
+        self
+    }
+
+    /// PIP-4 decryption failure handling, forwarded to the underlying consumer. Default
+    /// `Fail`. Mirrors Java `TableViewBuilder#cryptoFailureAction`.
+    #[must_use]
+    pub fn crypto_failure_action(
+        mut self,
+        action: magnetar_proto::conn::CryptoFailureAction,
+    ) -> Self {
+        self.crypto_failure_action = action;
+        self
+    }
+
+    /// Period at which the table view re-checks its topic's partition count and re-binds
+    /// the underlying subscription if the count changed (e.g. broker-side partition
+    /// expansion). `None` (the default) keeps a static binding. Mirrors Java
+    /// `TableViewBuilder#autoUpdatePartitionsInterval`.
+    #[must_use]
+    pub fn auto_update_partitions_interval(mut self, interval: std::time::Duration) -> Self {
+        self.auto_update_partitions_interval = Some(interval);
         self
     }
 
