@@ -69,4 +69,42 @@ mod tests {
         let decoded = schema.decode(&[]).unwrap();
         assert!(decoded.is_empty());
     }
+
+    #[test]
+    fn encode_clones_bytes_handle() {
+        let schema = BytesSchema::new();
+        let payload = Bytes::from_static(b"shared-buf");
+        let encoded = schema.encode(&payload).unwrap();
+        assert_eq!(encoded, payload);
+        assert_eq!(encoded.len(), payload.len());
+    }
+
+    #[test]
+    fn decode_returns_owned_bytes() {
+        let schema = BytesSchema::new();
+        let buf = b"transient".to_vec();
+        let decoded = schema.decode(&buf).unwrap();
+        drop(buf);
+        assert_eq!(decoded.as_ref(), b"transient");
+    }
+
+    #[test]
+    fn binary_payload_round_trips() {
+        let schema = BytesSchema::new();
+        let payload = Bytes::from(vec![0x00, 0xFF, 0x7F, 0x80, 0xAA, 0x55]);
+        let encoded = schema.encode(&payload).unwrap();
+        let decoded = schema.decode(&encoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn very_large_payload_round_trips() {
+        let schema = BytesSchema::new();
+        let payload = Bytes::from(vec![0x42u8; 1_000_000]);
+        let encoded = schema.encode(&payload).unwrap();
+        assert_eq!(encoded.len(), 1_000_000);
+        let decoded = schema.decode(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1_000_000);
+        assert!(decoded.iter().all(|&b| b == 0x42));
+    }
 }
