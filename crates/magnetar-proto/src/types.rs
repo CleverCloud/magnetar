@@ -121,6 +121,29 @@ impl MessageId {
             first_chunk_message_id: None,
         }
     }
+
+    /// Serialise this message id to a portable byte string. Mirrors Java
+    /// `MessageId#toByteArray` — encodes a `MessageIdData` protobuf message. Callers can
+    /// stash the result anywhere (Kafka header, DB column, log line) and reconstruct via
+    /// [`Self::from_bytes`] later.
+    pub fn to_bytes(self) -> Vec<u8> {
+        use prost::Message as _;
+        let pb = self.to_pb();
+        let mut buf = Vec::with_capacity(pb.encoded_len());
+        pb.encode(&mut buf)
+            .expect("encoding MessageIdData into a fresh Vec cannot fail");
+        buf
+    }
+
+    /// Reconstruct a message id from the byte string produced by [`Self::to_bytes`].
+    /// Mirrors Java `MessageId#fromByteArray`. Returns `None` if `bytes` is not a valid
+    /// protobuf `MessageIdData`.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        use prost::Message as _;
+        let pb = pb::MessageIdData::decode(bytes).ok()?;
+        Some(Self::from_pb(&pb))
+    }
 }
 
 impl fmt::Display for MessageId {
@@ -173,5 +196,30 @@ impl CompressionKind {
             pb::CompressionType::Zstd => Self::Zstd,
             pb::CompressionType::Snappy => Self::Snappy,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_id_byte_roundtrip() {
+        let id = MessageId {
+            ledger_id: 1234,
+            entry_id: 5678,
+            partition: 2,
+            batch_index: 7,
+            batch_size: 16,
+        };
+        let bytes = id.to_bytes();
+        let back = MessageId::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn message_id_from_bytes_rejects_garbage() {
+        let garbage = &[0xFF, 0xFE, 0xFD][..];
+        assert!(MessageId::from_bytes(garbage).is_none());
     }
 }
