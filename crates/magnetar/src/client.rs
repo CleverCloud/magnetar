@@ -671,6 +671,37 @@ impl IncomingMessage {
     pub fn broker_index(&self) -> Option<u64> {
         self.broker_entry_metadata.as_ref().and_then(|m| m.index)
     }
+
+    /// `true` if the message metadata carries PIP-4 encryption context (one or more
+    /// wrapped symmetric keys + the encryption algorithm name). Useful for callers
+    /// running with `CryptoFailureAction::Consume` who want to know whether they need
+    /// to attempt out-of-band decryption.
+    #[must_use]
+    pub fn has_encryption(&self) -> bool {
+        !self.metadata.encryption_keys.is_empty()
+    }
+
+    /// PIP-4 encryption algorithm name (e.g. `"AES/GCM/NoPadding"`). `None` if the
+    /// producer did not encrypt this message.
+    #[must_use]
+    pub fn encryption_algorithm(&self) -> Option<&str> {
+        self.metadata.encryption_algo.as_deref()
+    }
+
+    /// PIP-4 wrapped symmetric-key entries. Empty slice when the producer did not
+    /// encrypt this message. Each entry carries the key name + the ciphertext-wrapped
+    /// data key the broker echoed back from the producer's `CryptoKeyReader`.
+    #[must_use]
+    pub fn encryption_keys(&self) -> &[magnetar_proto::pb::EncryptionKeys] {
+        &self.metadata.encryption_keys
+    }
+
+    /// PIP-4 encryption parameter bytes (typically the AES GCM IV/nonce). `None` if the
+    /// producer did not encrypt this message.
+    #[must_use]
+    pub fn encryption_param(&self) -> Option<&[u8]> {
+        self.metadata.encryption_param.as_deref()
+    }
 }
 
 impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
