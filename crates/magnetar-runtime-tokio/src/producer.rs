@@ -167,19 +167,62 @@ impl Producer {
         }
 
         // Reserve memory against the configured global budget BEFORE handing the payload to
-        // the sans-io state machine. Mirrors Java `MemoryLimitController.reserveMemory(...)`
-        // under `MemoryLimitPolicy.FailImmediately`. `try_reserve_memory` is a no-op when
-        // `memory_limit_bytes = 0` (the default).
+        // the sans-io state machine. Mirrors Java `MemoryLimitController.reserveMemory(...)`.
+        // Two policies (Java parity):
+        //  - `FailImmediately`: try the CAS once; an overflow surfaces synchronously as
+        //    `ClientError::MemoryLimitExceeded`.
+        //  - `ProducerBlock`: park the send on a Waker slab until enough budget frees up; the
+        //    `Reserving` variant of `SendState` re-attempts the CAS on every poll.
+        // `try_reserve_memory` is a no-op when `memory_limit_bytes = 0` (the default).
         let reserved_bytes = msg.payload.len() as u64;
-        if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
-            return SendFut {
-                shared: self.shared.clone(),
-                handle: self.handle,
-                state: SendState::Failed { error: Some(err) },
-                reserved_bytes: 0,
-            };
+        match self.shared.memory_limit_policy {
+            magnetar_proto::MemoryLimitPolicy::FailImmediately => {
+                if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
+                    return SendFut {
+                        shared: self.shared.clone(),
+                        handle: self.handle,
+                        state: SendState::Failed { error: Some(err) },
+                        reserved_bytes: 0,
+                    };
+                }
+                self.queue_send(msg, publish_time_ms, reserved_bytes)
+            }
+            magnetar_proto::MemoryLimitPolicy::ProducerBlock => {
+                // Fast path: budget has room right now. The slow path inside `Reserving`
+                // takes over otherwise; we don't synchronously park here so callers that
+                // never `.await` (e.g. `Pin::poll` from a custom executor) still get a
+                // future they can drive.
+                if self.shared.try_reserve_memory(reserved_bytes).is_ok() {
+                    return self.queue_send(msg, publish_time_ms, reserved_bytes);
+                }
+                SendFut {
+                    shared: self.shared.clone(),
+                    handle: self.handle,
+                    state: SendState::Reserving {
+                        msg: Some(Box::new(msg)),
+                        publish_time_ms,
+                        bytes: reserved_bytes,
+                        slab_key: None,
+                    },
+                    // `Reserving` owns the reservation lifecycle itself: it only
+                    // transitions to `Pending` AFTER a successful CAS, at which point
+                    // it copies `bytes` into the outer `reserved_bytes`. Until then
+                    // there is no reservation outstanding.
+                    reserved_bytes: 0,
+                }
+            }
         }
+    }
 
+    /// Hand the (compressed/encrypted) message to the sans-io state machine. Assumes the
+    /// `reserved_bytes` reservation has already been taken; releases it on synchronous
+    /// failure so the budget reflects only actually-in-flight bytes.
+    fn queue_send(
+        &self,
+        msg: OutgoingMessage,
+        publish_time_ms: u64,
+        reserved_bytes: u64,
+    ) -> SendFut {
         let result = {
             let now = std::time::Instant::now();
             let mut conn = self.shared.inner.lock();
@@ -378,6 +421,15 @@ impl Drop for SendFut {
             self.shared.release_memory(self.reserved_bytes);
             self.reserved_bytes = 0;
         }
+        // If dropped while parked on the budget waker slab, evict the slot so
+        // a later `release_memory` doesn't try to wake a dead future.
+        if let SendState::Reserving {
+            slab_key: Some(key),
+            ..
+        } = &self.state
+        {
+            self.shared.cancel_memory_waker(*key);
+        }
     }
 }
 
@@ -391,6 +443,17 @@ enum SendState {
     Failed {
         error: Option<ClientError>,
     },
+    /// `MemoryLimitPolicy::ProducerBlock` saw the budget full on the synchronous fast
+    /// path. Each `poll` retries the CAS via `try_reserve_memory_or_register`; on
+    /// success the state transitions to `Pending`; on failure the waker is parked in
+    /// the runtime's slab and dispatched when capacity frees up. `msg` is boxed so
+    /// this variant doesn't dominate the `SendState` discriminant size.
+    Reserving {
+        msg: Option<Box<OutgoingMessage>>,
+        publish_time_ms: u64,
+        bytes: u64,
+        slab_key: Option<usize>,
+    },
 }
 
 impl Future for SendFut {
@@ -400,6 +463,59 @@ impl Future for SendFut {
         // Snapshot fields before borrowing `state` mutably to keep the borrow checker happy.
         let handle = self.handle;
         let shared = self.shared.clone();
+
+        // `Reserving` needs to move out of `self.state`; handle it before the borrow.
+        if matches!(self.state, SendState::Reserving { .. }) {
+            let prev = std::mem::replace(&mut self.state, SendState::Failed { error: None });
+            let SendState::Reserving {
+                mut msg,
+                publish_time_ms,
+                bytes,
+                slab_key,
+            } = prev
+            else {
+                unreachable!()
+            };
+            match shared.try_reserve_memory_or_register(bytes, cx.waker()) {
+                Ok(()) => {
+                    if let Some(prior) = slab_key {
+                        shared.cancel_memory_waker(prior);
+                    }
+                    let owned = *msg.take().expect("Reserving polled with no message");
+                    let result = {
+                        let now = std::time::Instant::now();
+                        let mut conn = shared.inner.lock();
+                        conn.send(handle, owned, publish_time_ms, now)
+                    };
+                    shared.driver_waker.notify_one();
+                    match result {
+                        Ok(seq) => {
+                            self.state = SendState::Pending { sequence_id: seq };
+                            self.reserved_bytes = bytes;
+                            // Loop back to attempt to take the outcome now that
+                            // we're in `Pending`; falls through to the normal match.
+                        }
+                        Err(err) => {
+                            shared.release_memory(bytes);
+                            return Poll::Ready(Err(ClientError::Protocol(err)));
+                        }
+                    }
+                }
+                Err(new_key) => {
+                    if let Some(prior) = slab_key {
+                        shared.cancel_memory_waker(prior);
+                    }
+                    self.state = SendState::Reserving {
+                        msg,
+                        publish_time_ms,
+                        bytes,
+                        slab_key: Some(new_key),
+                    };
+                    return Poll::Pending;
+                }
+            }
+        }
+
         let outcome = match &mut self.state {
             SendState::Failed { error } => {
                 let err = error
@@ -418,6 +534,7 @@ impl Future for SendFut {
                     Poll::Pending
                 }
             }
+            SendState::Reserving { .. } => unreachable!("Reserving handled above"),
         };
         if matches!(outcome, Poll::Ready(_)) && self.reserved_bytes > 0 {
             // Release the budget reservation. `Drop` would also catch the cancellation

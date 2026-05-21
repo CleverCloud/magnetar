@@ -1607,6 +1607,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
+ "slab",
  "snap",
  "thiserror",
  "tokio",

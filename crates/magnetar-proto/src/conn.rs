@@ -109,12 +109,40 @@ pub struct ConnectionConfig {
     /// the limit. Runtime engines that honour this enforce a CAS-reserve on
     /// every `Producer::send` before queueing into the sans-io state
     /// machine; sends that would push the in-flight bytes past the limit
-    /// are rejected with a `MemoryLimitExceeded` error (Java's
-    /// `MemoryLimitPolicy.FailImmediately`). The companion
-    /// `MemoryLimitPolicy.ProducerBlock` variant — which blocks the
-    /// caller until the budget frees up — is planned follow-up. Mirrors
-    /// Java `ClientBuilder#memoryLimit`.
+    /// are gated by [`memory_limit_policy`](Self::memory_limit_policy).
+    /// Mirrors Java `ClientBuilder#memoryLimit`.
     pub memory_limit_bytes: u64,
+    /// Policy applied when the global publish memory budget is exhausted.
+    /// Defaults to [`MemoryLimitPolicy::FailImmediately`] to match the Java
+    /// client default. [`MemoryLimitPolicy::ProducerBlock`] makes the
+    /// runtime park the offending send future on a waker slab until enough
+    /// budget frees up. Ignored when
+    /// [`memory_limit_bytes`](Self::memory_limit_bytes) is `0`.
+    pub memory_limit_policy: MemoryLimitPolicy,
+}
+
+/// Policy applied when the configured global publish memory budget is
+/// exhausted. Mirrors Java `org.apache.pulsar.client.api.MemoryLimitPolicy`.
+///
+/// The proto crate exposes this enum so the runtime engines can read the
+/// policy from [`ConnectionConfig`] without going through a higher-level
+/// re-export. The user-facing [`magnetar::MemoryLimitPolicy`] re-export
+/// in the facade crate is the same shape and converts 1:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryLimitPolicy {
+    /// Reject the send synchronously with `MemoryLimitExceeded`. Mirrors
+    /// Java `MemoryLimitPolicy.FAIL_IMMEDIATELY` (the Java default).
+    #[default]
+    FailImmediately,
+    /// Park the send future until enough budget frees up. Releases are
+    /// observed via a waker-slab fan-out on the runtime's
+    /// `ConnectionShared`. Mirrors Java `MemoryLimitPolicy.PRODUCER_BLOCK`.
+    ///
+    /// Implemented per
+    /// [ADR-0020](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
+    /// — the wait uses a `parking_lot::Mutex<Slab<Waker>>` (not a channel)
+    /// honouring [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
+    ProducerBlock,
 }
 
 impl Default for ConnectionConfig {
@@ -132,6 +160,7 @@ impl Default for ConnectionConfig {
             proxy_to_broker_url: None,
             supervisor: None,
             memory_limit_bytes: 0,
+            memory_limit_policy: MemoryLimitPolicy::FailImmediately,
         }
     }
 }

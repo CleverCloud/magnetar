@@ -80,8 +80,10 @@ mod url_parse;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::Waker;
 
 use parking_lot::Mutex;
+use slab::Slab;
 use tokio::sync::Notify;
 
 pub use crate::auto_cluster_failover::{AutoClusterFailover, HealthProbe, HealthProbeFuture};
@@ -140,6 +142,29 @@ pub struct ConnectionShared {
     /// `SendError`. Bumped in `send` (CAS against `memory_limit_bytes`); decremented
     /// in [`crate::SendFut::poll`] when the future returns `Poll::Ready`.
     pub memory_used: AtomicU64,
+    /// Configured back-pressure policy when the publish budget is exhausted.
+    /// Mirrors Java `org.apache.pulsar.client.api.MemoryLimitPolicy`. When
+    /// `FailImmediately`, reservations that would overflow are rejected
+    /// synchronously with [`ClientError::MemoryLimitExceeded`]. When
+    /// `ProducerBlock`, the runtime parks the offending send future on
+    /// [`Self::memory_wakers`] until enough budget frees up.
+    ///
+    /// Snapshotted from
+    /// [`magnetar_proto::ConnectionConfig::memory_limit_policy`] at
+    /// construction time. See [ADR-0020](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md).
+    pub memory_limit_policy: magnetar_proto::MemoryLimitPolicy,
+    /// Waker slab consulted by [`Self::release_memory`] when a reservation
+    /// frees up. Populated by [`Self::try_reserve_memory_or_register`] from
+    /// inside [`crate::Producer::send`] under
+    /// [`magnetar_proto::MemoryLimitPolicy::ProducerBlock`]. Drained on every
+    /// release: every parked send wakes and re-attempts the reservation
+    /// (fairness is approximate — first-to-poll wins, matching Java's
+    /// `MemoryLimitController` semantics).
+    ///
+    /// Not a channel — this is a `Slab<Waker>` behind a `parking_lot::Mutex`,
+    /// the canonical no-channel wake pattern (see
+    /// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+    pub memory_wakers: Mutex<Slab<Waker>>,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -209,8 +234,17 @@ impl ConnectionShared {
     /// Release a previous reservation. Called by [`crate::SendFut`] when the
     /// send completes (success or error). Saturating sub so a buggy
     /// over-release can't underflow the counter.
+    ///
+    /// After releasing, drains every waker parked on
+    /// [`Self::memory_wakers`] so blocked
+    /// [`magnetar_proto::MemoryLimitPolicy::ProducerBlock`] sends re-attempt
+    /// their reservation. Drain-all (rather than wake-one) matches Java's
+    /// `MemoryLimitController` behaviour where any released byte may unblock
+    /// several smaller pending sends; spurious wake-ups are cheap because
+    /// the futures re-check the CAS budget on every poll.
     pub fn release_memory(&self, bytes: u64) {
         if bytes == 0 || self.memory_limit_bytes == 0 {
+            // No budget configured: there cannot be parked wakers either.
             return;
         }
         // `fetch_sub` wraps on underflow; guard manually with a CAS loop.
@@ -222,8 +256,76 @@ impl ConnectionShared {
                 .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                break;
             }
+        }
+        self.drain_memory_wakers();
+    }
+
+    /// Try to reserve `bytes` against the configured memory budget; on
+    /// failure, register `waker` on [`Self::memory_wakers`] so the caller can
+    /// be re-polled when budget frees up via [`Self::release_memory`].
+    ///
+    /// Returns:
+    /// - `Ok(())` when the reservation succeeded (or no limit is configured).
+    /// - `Err(slab_key)` when the reservation failed; the caller MUST cancel the registration via
+    ///   [`Self::cancel_memory_waker`] if it is dropped before observing the next release.
+    ///
+    /// This is the building block of
+    /// [`magnetar_proto::MemoryLimitPolicy::ProducerBlock`]. The
+    /// [`MemoryReserveFut`](crate::producer::MemoryReserveFut) future polls
+    /// this method until it succeeds; on `Drop` it calls
+    /// [`Self::cancel_memory_waker`] to evict the stale waker slot.
+    ///
+    /// Re-checking after registration closes the lost-wakeup window: a
+    /// release that lands between the failed CAS and the slab insert will
+    /// have drained the (empty) slab without observing this waker, so we
+    /// re-attempt the reservation once the waker is installed.
+    pub fn try_reserve_memory_or_register(&self, bytes: u64, waker: &Waker) -> Result<(), usize> {
+        // Fast path: no budget configured, or budget has room right now.
+        if self.try_reserve_memory(bytes).is_ok() {
+            return Ok(());
+        }
+        // Slow path: park a waker and re-check. The recheck closes the race
+        // where a release fires between the failed CAS above and the slab
+        // insert below.
+        let key = self.memory_wakers.lock().insert(waker.clone());
+        if self.try_reserve_memory(bytes).is_ok() {
+            // Won the recheck; drop our registration so the next release
+            // doesn't wake a future that already completed.
+            self.cancel_memory_waker(key);
+            return Ok(());
+        }
+        Err(key)
+    }
+
+    /// Remove a previously-registered waker. Called from the
+    /// [`MemoryReserveFut`](crate::producer::MemoryReserveFut) `Drop` impl
+    /// and on the "won the recheck" path of
+    /// [`Self::try_reserve_memory_or_register`]. Idempotent — a missing slot
+    /// is a no-op (a concurrent [`Self::release_memory`] may have drained it
+    /// already).
+    pub fn cancel_memory_waker(&self, slab_key: usize) {
+        let mut slab = self.memory_wakers.lock();
+        if slab.contains(slab_key) {
+            slab.remove(slab_key);
+        }
+    }
+
+    /// Drain every parked waker and wake it. Called from
+    /// [`Self::release_memory`] after the CAS-decrement lands.
+    ///
+    /// Held the slab lock only for the duration of the swap; `wake()` runs
+    /// outside the critical section so user code that re-polls cannot
+    /// deadlock on the slab mutex.
+    fn drain_memory_wakers(&self) {
+        let wakers: Vec<Waker> = {
+            let mut slab = self.memory_wakers.lock();
+            let drained: Vec<Waker> = slab.drain().collect();
+            drained
+        };
+        for w in wakers {
+            w.wake();
         }
     }
 
@@ -233,6 +335,7 @@ impl ConnectionShared {
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     ) -> Arc<Self> {
         let memory_limit_bytes = config.memory_limit_bytes;
+        let memory_limit_policy = config.memory_limit_policy;
         Arc::new(Self {
             inner: Mutex::new(magnetar_proto::Connection::new(config)),
             driver_waker: Notify::new(),
@@ -242,6 +345,8 @@ impl ConnectionShared {
             pending_rebuild: AtomicBool::new(false),
             memory_limit_bytes,
             memory_used: AtomicU64::new(0),
+            memory_limit_policy,
+            memory_wakers: Mutex::new(Slab::new()),
         })
     }
 }
@@ -328,5 +433,129 @@ mod tests {
         // Over-release must not underflow.
         s.release_memory(1_000_000);
         assert_eq!(s.memory_used.load(super::Ordering::Acquire), 0);
+    }
+
+    // Cheap counter-Waker so we don't pull in `futures-task` for the test.
+    // Mirrors the pattern used elsewhere in the workspace; counts how many
+    // times `wake()` was invoked.
+    struct CountingWaker {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingWaker {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                count: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn try_reserve_memory_or_register_succeeds_when_budget_available() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 1024,
+            ..ConnectionConfig::default()
+        };
+        let s = ConnectionShared::new(cfg);
+        let cw = CountingWaker::new();
+        let waker = std::task::Waker::from(cw.clone());
+
+        // Empty budget: must take the fast path and NOT register a waker.
+        s.try_reserve_memory_or_register(512, &waker)
+            .expect("should succeed with budget available");
+        assert_eq!(s.memory_used.load(super::Ordering::Acquire), 512);
+        assert_eq!(s.memory_wakers.lock().len(), 0);
+        assert_eq!(cw.count(), 0);
+    }
+
+    #[test]
+    fn try_reserve_memory_or_register_parks_when_budget_full() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 1024,
+            ..ConnectionConfig::default()
+        };
+        let s = ConnectionShared::new(cfg);
+        // Saturate the budget.
+        s.try_reserve_memory(1024).expect("initial reserve");
+
+        let cw = CountingWaker::new();
+        let waker = std::task::Waker::from(cw.clone());
+
+        let key = s
+            .try_reserve_memory_or_register(1, &waker)
+            .expect_err("must park when full");
+        assert_eq!(s.memory_wakers.lock().len(), 1);
+        assert_eq!(cw.count(), 0);
+
+        // Releasing wakes parked futures.
+        s.release_memory(1024);
+        assert_eq!(s.memory_used.load(super::Ordering::Acquire), 0);
+        assert_eq!(cw.count(), 1);
+        // The slab was drained — caller's cancel must be a no-op.
+        s.cancel_memory_waker(key);
+        assert_eq!(s.memory_wakers.lock().len(), 0);
+    }
+
+    #[test]
+    fn cancel_memory_waker_clears_slot() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 100,
+            ..ConnectionConfig::default()
+        };
+        let s = ConnectionShared::new(cfg);
+        s.try_reserve_memory(100).expect("initial reserve");
+
+        let cw = CountingWaker::new();
+        let waker = std::task::Waker::from(cw.clone());
+
+        let key = s
+            .try_reserve_memory_or_register(1, &waker)
+            .expect_err("must park when full");
+        assert_eq!(s.memory_wakers.lock().len(), 1);
+
+        // Cancel: simulates the future being dropped before release.
+        s.cancel_memory_waker(key);
+        assert_eq!(s.memory_wakers.lock().len(), 0);
+
+        // Release after cancel must not panic and must not wake the dropped waker.
+        s.release_memory(100);
+        assert_eq!(cw.count(), 0);
+    }
+
+    #[test]
+    fn release_wakes_all_parked_wakers() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 100,
+            ..ConnectionConfig::default()
+        };
+        let s = ConnectionShared::new(cfg);
+        s.try_reserve_memory(100).expect("initial reserve");
+
+        let cw1 = CountingWaker::new();
+        let cw2 = CountingWaker::new();
+        let w1 = std::task::Waker::from(cw1.clone());
+        let w2 = std::task::Waker::from(cw2.clone());
+
+        let _k1 = s.try_reserve_memory_or_register(1, &w1).expect_err("park");
+        let _k2 = s.try_reserve_memory_or_register(1, &w2).expect_err("park");
+        assert_eq!(s.memory_wakers.lock().len(), 2);
+
+        s.release_memory(100);
+        assert_eq!(cw1.count(), 1);
+        assert_eq!(cw2.count(), 1);
+        assert_eq!(s.memory_wakers.lock().len(), 0);
     }
 }

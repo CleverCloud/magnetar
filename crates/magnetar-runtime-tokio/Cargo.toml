@@ -20,6 +20,7 @@ magnetar-proto      = { workspace = true }
 bytes               = { workspace = true }
 parking_lot         = { workspace = true }
 pin-project-lite    = { workspace = true }
+slab                = { workspace = true }
 tokio               = { workspace = true, features = ["rt", "net", "time", "io-util", "sync", "macros"] }
 tokio-util          = { workspace = true, features = ["compat"] }
 tokio-rustls        = { workspace = true }

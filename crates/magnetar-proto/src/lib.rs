@@ -99,7 +99,8 @@ pub use crate::backoff::Backoff;
 pub use crate::cluster_failover::ControlledClusterFailover;
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, CryptoFailureAction,
-    HandshakeState, KeySharedConfig, OpOutcome, PendingOpKey, SeekTarget, SubscribeRequest,
+    HandshakeState, KeySharedConfig, MemoryLimitPolicy, OpOutcome, PendingOpKey, SeekTarget,
+    SubscribeRequest,
 };
 pub use crate::consumer::ConsumerStats;
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
