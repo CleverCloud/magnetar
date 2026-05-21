@@ -91,6 +91,11 @@ pub struct ConsumerState {
     /// the configured `max_redeliver_count`. Mirrors the Java client's "exceeded max
     /// redelivery" counter — useful for monitoring poison-pill rates.
     pub total_msgs_dead_lettered: u64,
+    /// Cumulative count of chunked messages that have been fully reassembled and
+    /// delivered to the user-facing queue. Single-chunk and batched messages don't count
+    /// here. Useful for picking up on unexpected chunk traffic / monitoring chunking
+    /// activity.
+    pub total_chunked_msgs_received: u64,
     /// Optional negative-ack tracker. When configured via
     /// `SubscribeRequest::negative_ack_redelivery_delay`, calls to `Connection::negative_ack`
     /// stage the ids here and the redelivery fires on the next `handle_timeout` once the
@@ -188,6 +193,8 @@ pub struct ConsumerStats {
     pub total_acks_failed: u64,
     /// Cumulative count of messages routed to the DLQ pending list (exceeded max redelivery).
     pub total_msgs_dead_lettered: u64,
+    /// Cumulative count of chunked messages fully reassembled and delivered.
+    pub total_chunked_msgs_received: u64,
 }
 
 #[derive(Debug)]
@@ -248,6 +255,7 @@ impl ConsumerState {
             total_acks_sent: 0,
             total_acks_failed: 0,
             total_msgs_dead_lettered: 0,
+            total_chunked_msgs_received: 0,
             nack_tracker: None,
             unacked_tracker: None,
             batch_ack_tracker: HashMap::new(),
@@ -263,6 +271,7 @@ impl ConsumerState {
             total_acks_sent: self.total_acks_sent,
             total_acks_failed: self.total_acks_failed,
             total_msgs_dead_lettered: self.total_msgs_dead_lettered,
+            total_chunked_msgs_received: self.total_chunked_msgs_received,
         }
     }
 
@@ -387,6 +396,8 @@ impl ConsumerState {
                     redelivery_count,
                     broker_entry_metadata: bem,
                 };
+                self.total_chunked_msgs_received =
+                    self.total_chunked_msgs_received.saturating_add(1);
                 let trigger = self.classify_and_queue(im, redelivery_count);
                 return Ok(trigger);
             }
@@ -646,6 +657,7 @@ mod tests {
         }
         let msg = c.pop_message().expect("reassembled message");
         assert_eq!(msg.payload.as_ref(), b"aabbcc");
+        assert_eq!(c.stats().total_chunked_msgs_received, 1);
     }
 
     #[test]

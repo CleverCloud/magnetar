@@ -334,6 +334,9 @@ impl MultiTopicsConsumer {
             agg.total_msgs_dead_lettered = agg
                 .total_msgs_dead_lettered
                 .saturating_add(s.total_msgs_dead_lettered);
+            agg.total_chunked_msgs_received = agg
+                .total_chunked_msgs_received
+                .saturating_add(s.total_chunked_msgs_received);
         }
         agg
     }
