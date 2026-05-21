@@ -253,6 +253,7 @@ pub struct TypedProducerBuilder<'a, S: Schema> {
     initial_sequence_id: Option<u64>,
     access_mode: pb::ProducerAccessMode,
     send_timeout: Option<std::time::Duration>,
+    batching_max_publish_delay: Option<std::time::Duration>,
     encryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
 
@@ -280,6 +281,7 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
             send_timeout: None,
+            batching_max_publish_delay: None,
             encryptor: None,
         }
     }
@@ -340,6 +342,13 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
         self
     }
 
+    /// Mirrors `ProducerBuilder::batching_max_publish_delay`.
+    #[must_use]
+    pub fn batching_max_publish_delay(mut self, delay: std::time::Duration) -> Self {
+        self.batching_max_publish_delay = Some(delay);
+        self
+    }
+
     /// Mirrors `ProducerBuilder::encryption`.
     #[must_use]
     pub fn encryption(
@@ -380,6 +389,9 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
         }
         if let Some(t) = self.send_timeout {
             builder = builder.send_timeout(t);
+        }
+        if let Some(d) = self.batching_max_publish_delay {
+            builder = builder.batching_max_publish_delay(d);
         }
         if let Some(e) = self.encryptor {
             builder = builder.encryption(e);

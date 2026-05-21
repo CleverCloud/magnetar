@@ -222,6 +222,7 @@ pub struct PartitionedProducerBuilder<'a> {
     access_mode: pb::ProducerAccessMode,
     producer_metadata: Vec<(String, String)>,
     send_timeout: Option<std::time::Duration>,
+    batching_max_publish_delay: Option<std::time::Duration>,
     schema: Option<pb::Schema>,
     encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
@@ -252,6 +253,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
             access_mode: pb::ProducerAccessMode::Shared,
             producer_metadata: Vec::new(),
             send_timeout: None,
+            batching_max_publish_delay: None,
             schema: None,
             encryptor: None,
         }
@@ -327,6 +329,15 @@ impl<'a> PartitionedProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#batchingMaxPublishDelay` — applied to every
+    /// per-partition child. With batching enabled, the state machine flushes any non-empty
+    /// batch whose oldest message has been waiting longer than `delay`.
+    #[must_use]
+    pub fn batching_max_publish_delay(mut self, delay: std::time::Duration) -> Self {
+        self.batching_max_publish_delay = Some(delay);
+        self
+    }
+
     /// Advertise a schema on every per-partition `CommandProducer`.
     #[must_use]
     pub fn schema(mut self, schema: pb::Schema) -> Self {
@@ -376,6 +387,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
                 access_mode: self.access_mode,
                 producer_metadata: self.producer_metadata.clone(),
                 send_timeout: self.send_timeout,
+                batching_max_publish_delay: self.batching_max_publish_delay,
             };
             let result = self
                 .client

@@ -250,6 +250,12 @@ pub struct CreateProducerRequest {
     /// `SendError(code=11008, "send timeout")` on the next `Connection::handle_timeout`
     /// tick. `None` disables the sweep (the default).
     pub send_timeout: Option<Duration>,
+    /// Mirrors Java `ProducerBuilder#batchingMaxPublishDelay`. When set and batching is
+    /// enabled, the state machine flushes any non-empty batch whose oldest message has
+    /// been waiting longer than this duration. Caps end-to-end latency for batched sends
+    /// that would otherwise sit until the batch fills. `None` (the default) means the
+    /// batch only flushes on size / count limits.
+    pub batching_max_publish_delay: Option<Duration>,
 }
 
 impl Default for CreateProducerRequest {
@@ -267,6 +273,7 @@ impl Default for CreateProducerRequest {
             access_mode: pb::ProducerAccessMode::Shared,
             producer_metadata: Vec::new(),
             send_timeout: None,
+            batching_max_publish_delay: None,
         }
     }
 }
@@ -1249,6 +1256,9 @@ impl Connection {
             if let Some(d) = producer.next_send_deadline() {
                 consider(d);
             }
+            if let Some(d) = producer.next_batch_deadline() {
+                consider(d);
+            }
         }
         next
     }
@@ -1294,6 +1304,27 @@ impl Connection {
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
         }
+
+        // Per-producer batch flush sweep — Java `ProducerBuilder#batchingMaxPublishDelay`.
+        // Any non-empty batch whose first message has been waiting longer than the
+        // configured delay flushes now, capping end-to-end batch latency.
+        let publish_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let due_batch_handles: Vec<ProducerHandle> = self
+            .producers
+            .iter()
+            .filter(|(_, p)| p.batch_deadline_elapsed(now))
+            .map(|(h, _)| *h)
+            .collect();
+        for handle in due_batch_handles {
+            if let Some(producer) = self.producers.get_mut(&handle) {
+                let _ = producer.flush_batch(publish_time_ms);
+            }
+        }
+        // Drain any frames the batch flush queued so callers don't need an extra
+        // poll_transmit round-trip just to wake them up.
+        self.drain_producer_outbound();
 
         // Per-producer send-timeout sweep. Surface each timed-out send as an
         // `OpOutcome::SendError` so the caller's send future resolves with the configured
@@ -1376,6 +1407,7 @@ impl Connection {
             state.set_initial_sequence_id(initial);
         }
         state.send_timeout = req.send_timeout;
+        state.batching_max_publish_delay = req.batching_max_publish_delay;
         self.producers.insert(handle, state);
 
         let producer_metadata: Vec<pb::KeyValue> = req

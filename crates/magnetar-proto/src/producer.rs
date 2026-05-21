@@ -156,6 +156,11 @@ pub struct ProducerState {
     /// `enqueued_at + d` has elapsed. Mirrors Java `ProducerBuilder#sendTimeout`. `None`
     /// disables the sweep.
     pub send_timeout: Option<std::time::Duration>,
+    /// Optional max wait before forcing a batch flush. When `Some(d)`, the Connection's
+    /// `handle_timeout` sweep flushes any non-empty batch whose first-added timestamp is
+    /// older than `d`. Mirrors Java `ProducerBuilder#batchingMaxPublishDelay`. `None`
+    /// (the default) means the batch only flushes on size / count limits.
+    pub batching_max_publish_delay: Option<std::time::Duration>,
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
@@ -190,6 +195,9 @@ pub struct BatchContainer {
     pub lowest_sequence_id: Option<u64>,
     /// Highest sequence id in the batch (used as `highest_sequence_id` of the SEND command).
     pub highest_sequence_id: Option<u64>,
+    /// Wall-clock instant the first message was added to the current batch. Drives the
+    /// `batching_max_publish_delay` deadline; `None` when the batch is empty.
+    pub first_added_at: Option<std::time::Instant>,
 }
 
 impl BatchContainer {
@@ -209,6 +217,7 @@ impl BatchContainer {
         self.current_size_bytes = 0;
         self.lowest_sequence_id = None;
         self.highest_sequence_id = None;
+        self.first_added_at = None;
     }
 }
 
@@ -284,6 +293,7 @@ impl ProducerState {
             total_send_failed: 0,
             total_acks_received: 0,
             send_timeout: None,
+            batching_max_publish_delay: None,
         }
     }
 
@@ -541,7 +551,29 @@ impl ProducerState {
         if self.batch.lowest_sequence_id.is_none() {
             self.batch.lowest_sequence_id = Some(self.next_sequence_id);
         }
+        // First message in the current batch — stamp the wall-clock timestamp so
+        // `Connection::handle_timeout` can force a flush once
+        // `batching_max_publish_delay` has elapsed.
+        if self.batch.first_added_at.is_none() {
+            self.batch.first_added_at = Some(std::time::Instant::now());
+        }
         Ok(SendDecision::Batched)
+    }
+
+    /// Wall-clock deadline at which the batch should be force-flushed. Returns `None`
+    /// when batching has no max-publish-delay, or the batch is currently empty.
+    #[must_use]
+    pub fn next_batch_deadline(&self) -> Option<std::time::Instant> {
+        let max_delay = self.batching_max_publish_delay?;
+        let first = self.batch.first_added_at?;
+        Some(first + max_delay)
+    }
+
+    /// `true` if the batch should be force-flushed at `now` because
+    /// `batching_max_publish_delay` has elapsed since the first added message.
+    #[must_use]
+    pub fn batch_deadline_elapsed(&self, now: std::time::Instant) -> bool {
+        self.next_batch_deadline().is_some_and(|d| now >= d)
     }
 
     /// Flush the batch container into one SEND frame. The caller is responsible for compression
@@ -1034,5 +1066,38 @@ mod tests {
         let _ = p.queue_send(small_message(b"second"), 100).unwrap();
         let frame = p.next_outbound_frame().expect("frame");
         assert_eq!(frame.metadata.sequence_id, 43);
+    }
+
+    #[test]
+    fn batch_max_publish_delay_deadline_tracking() {
+        use std::time::Duration;
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 100;
+        p.batching_max_publish_delay = Some(Duration::from_millis(50));
+
+        // No deadline when the batch is empty.
+        assert!(p.next_batch_deadline().is_none());
+
+        let _ = p.queue_send(small_message(b"first"), 100).unwrap();
+        let deadline = p
+            .next_batch_deadline()
+            .expect("deadline once batch is non-empty");
+        let now = p.batch.first_added_at.unwrap();
+        assert_eq!(deadline, now + Duration::from_millis(50));
+
+        // Not yet elapsed.
+        assert!(!p.batch_deadline_elapsed(now + Duration::from_millis(49)));
+        // Past deadline.
+        assert!(p.batch_deadline_elapsed(now + Duration::from_millis(51)));
+
+        // Flush clears the timestamp.
+        let _ = p.flush_batch(101);
+        assert!(p.next_batch_deadline().is_none());
     }
 }

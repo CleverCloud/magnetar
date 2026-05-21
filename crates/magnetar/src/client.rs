@@ -858,6 +858,16 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#batchingMaxPublishDelay`. With batching enabled,
+    /// the state machine flushes any non-empty batch whose oldest message has been waiting
+    /// longer than this duration. Caps end-to-end latency for batched sends that would
+    /// otherwise sit until the batch fills up.
+    #[must_use]
+    pub fn batching_max_publish_delay(mut self, delay: Duration) -> Self {
+        self.req.batching_max_publish_delay = Some(delay);
+        self
+    }
+
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload. Pass an
     /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the
