@@ -7,7 +7,8 @@
 //! machines, lookup, topic-list watcher, acknowledgement trackers, and backoff. The crate has
 //! **zero I/O dependencies** and **zero channels** — see [`GUIDELINES.md`] for the rationale and
 //! the `Arc<Mutex<…>> + Notify + Waker-slab` pattern that engines (`magnetar-runtime-tokio`,
-//! `magnetar-runtime-moonpool`) use to drive it.
+//! `magnetar-runtime-moonpool`) use to drive it. The architectural choice is recorded as
+//! [ADR-0003] (no channels) + [ADR-0004] (sans-io split) + [ADR-0011] (clock injection).
 //!
 //! # API shape
 //!
@@ -19,6 +20,9 @@
 //! the protocol without touching raw [`pb::BaseCommand`] frames.
 //!
 //! [`GUIDELINES.md`]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [ADR-0003]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md
+//! [ADR-0004]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md
+//! [ADR-0011]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]

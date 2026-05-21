@@ -12,7 +12,10 @@
 //! [`insecure_tls_config`] disables both signature-chain verification and
 //! hostname checking, so the client cannot tell a legitimate broker from
 //! a MITM. The crate-wide ban on `native-tls` / `openssl` still applies —
-//! this only adds a rustls verifier that always says "yes".
+//! this only adds a rustls verifier that always says "yes". See
+//! [ADR-0005](../../specs/adr/0005-rustls-only-tls.md) for the TLS
+//! backend rule and `docs/security-review-2026-05-21.md` §M-01 for the
+//! footgun-mitigation discussion.
 //!
 //! The verifier honors whichever subset of TLS 1.2 / 1.3 the configured
 //! `rustls::crypto::CryptoProvider` supports; under the workspace's `ring`

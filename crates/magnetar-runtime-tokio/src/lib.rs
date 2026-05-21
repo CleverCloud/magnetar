@@ -38,13 +38,18 @@
 //! # No channels
 //!
 //! This crate does not use any flavour of channel (mpsc / broadcast / watch / oneshot). The
-//! pattern is documented in [GUIDELINES.md] §"No-channels rule":
+//! pattern is documented in [GUIDELINES.md] §"No-channels rule" and atomised in
+//! [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md):
 //!
 //! - User-facing futures lock `Arc<parking_lot::Mutex<magnetar_proto::Connection>>` directly.
 //! - Driver wake-ups travel through a single-cell [`tokio::sync::Notify`].
 //! - Future completion uses [`Waker`](core::task::Waker) slabs inside the sans-io state machine,
 //!   registered via [`magnetar_proto::Connection::register_waker`] and dispatched when the matching
 //!   [`magnetar_proto::OpOutcome`] lands.
+//!
+//! See also [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
+//! (sans-io split) and [ADR-0011](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md)
+//! (clock injection on state-machine entries).
 //!
 //! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
 

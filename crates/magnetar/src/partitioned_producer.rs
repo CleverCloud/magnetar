@@ -699,12 +699,6 @@ impl<'a> PartitionedProducerBuilder<'a> {
     }
 }
 
-// helper to avoid unused-import warning if Bytes isn't needed here
-#[allow(dead_code)]
-fn _bytes_in_use() -> Bytes {
-    Bytes::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

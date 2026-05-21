@@ -7,8 +7,11 @@
 //! adapter drives those methods against an arbitrary byte pipe (in
 //! particular, a moonpool-supplied `AsyncRead + AsyncWrite` stream),
 //! making TLS handshakes deterministic under `moonpool-sim` chaos
-//! testing — the audit-recommended option (d) from
-//! `ask-magnetar-decisions.md`.
+//! testing — option (d) from
+//! [`docs/decisions-log.md`](../../docs/decisions-log.md), atomised as
+//! [ADR-0006](../../specs/adr/0006-moonpool-tls-byte-pipe.md).
+//! See also [ADR-0005](../../specs/adr/0005-rustls-only-tls.md) for the
+//! workspace-wide ban on `native-tls` / `openssl`.
 //!
 //! Usage shape:
 //!
