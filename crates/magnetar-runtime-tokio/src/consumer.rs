@@ -412,6 +412,72 @@ impl Consumer {
         conn.drain_dead_letter(self.handle)
     }
 
+    /// Drain the per-consumer dead-letter queue and republish every entry via `dlq_producer`,
+    /// preserving each message's `partition_key`, `ordering_key`, `event_time`, and
+    /// `properties`. After successful republish each original is acked so the consumer's
+    /// cursor advances. Returns the number of messages republished.
+    ///
+    /// Pairs with [`crate::consumer::Consumer::drain_dead_letter`] for callers that want
+    /// to inspect the messages before republishing — this helper is the "just republish
+    /// transparently" convenience.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`ClientError`] encountered. Already-republished messages stay
+    /// republished — partial progress is not rolled back.
+    pub async fn republish_dead_letters(
+        &self,
+        dlq_producer: &crate::Producer,
+    ) -> Result<usize, ClientError> {
+        let drained = self.drain_dead_letter();
+        let mut count = 0;
+        for msg in drained {
+            let mut metadata = magnetar_proto::pb::MessageMetadata::default();
+            metadata.partition_key = msg.metadata.partition_key.clone();
+            metadata.partition_key_b64_encoded = msg.metadata.partition_key_b64_encoded;
+            metadata.ordering_key = msg.metadata.ordering_key.clone();
+            metadata.event_time = msg.metadata.event_time;
+            metadata.properties = msg.metadata.properties.clone();
+            // Tag the republished message with the original id so DLQ consumers can
+            // correlate back to the source. Mirrors Java's DeadLetterTopicMessageId
+            // property convention.
+            metadata.properties.push(magnetar_proto::pb::KeyValue {
+                key: "REAL_TOPIC".to_owned(),
+                value: self
+                    .shared
+                    .inner
+                    .lock()
+                    .consumer_topic(self.handle)
+                    .unwrap_or("")
+                    .to_owned(),
+            });
+            metadata.properties.push(magnetar_proto::pb::KeyValue {
+                key: "ORIGINAL_MESSAGE_ID".to_owned(),
+                value: msg.message_id.to_string(),
+            });
+            let payload_len = msg.payload.len();
+            let outgoing = magnetar_proto::producer::OutgoingMessage {
+                payload: msg.payload,
+                metadata,
+                uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
+                num_messages: 1,
+                txn_id: None,
+            };
+            dlq_producer.send(outgoing).await?;
+            self.ack(msg.message_id).await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Mirrors Java `Consumer#isInactive`. Returns `true` once the consumer has reached
+    /// end-of-topic on its subscription (no more messages will be dispatched). Note: a
+    /// closed consumer is not represented as "inactive" here; check the connection state
+    /// machine if you need to detect close.
+    pub fn is_inactive(&self) -> bool {
+        self.has_reached_end_of_topic()
+    }
+
     /// Receive up to `max_messages` messages in one call. Mirrors Java
     /// `Consumer#batchReceive`. Waits up to `max_wait` for the first message, then drains any
     /// additional already-buffered messages without further waiting.
