@@ -46,6 +46,14 @@ impl Producer {
         self.compression
     }
 
+    /// Access mode the producer was opened with (`Shared`, `Exclusive`,
+    /// `WaitForExclusive`, `ExclusiveWithFencing`). Mirrors Java
+    /// `Producer#getProducerAccessMode`.
+    #[must_use]
+    pub fn access_mode(&self) -> magnetar_proto::pb::ProducerAccessMode {
+        self.shared.inner.lock().producer_access_mode(self.handle)
+    }
+
     /// `true` if this producer has been closed (locally via [`Self::close`] or remotely
     /// via a broker `CloseProducer`). Mirrors Java `ProducerImpl#getState() == CLOSED`.
     /// Use [`Self::is_connected`] for the live test — `is_closed` only flips after a

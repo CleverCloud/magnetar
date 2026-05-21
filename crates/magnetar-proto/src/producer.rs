@@ -161,6 +161,11 @@ pub struct ProducerState {
     /// older than `d`. Mirrors Java `ProducerBuilder#batchingMaxPublishDelay`. `None`
     /// (the default) means the batch only flushes on size / count limits.
     pub batching_max_publish_delay: Option<std::time::Duration>,
+    /// Access mode the producer was opened with. Mirrors
+    /// `CommandProducer.producer_access_mode`. Persisted so callers can query it via a
+    /// runtime-side getter without round-tripping back to the original
+    /// [`crate::conn::CreateProducerRequest`].
+    pub access_mode: pb::ProducerAccessMode,
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
@@ -294,6 +299,7 @@ impl ProducerState {
             total_acks_received: 0,
             send_timeout: None,
             batching_max_publish_delay: None,
+            access_mode: pb::ProducerAccessMode::Shared,
         }
     }
 

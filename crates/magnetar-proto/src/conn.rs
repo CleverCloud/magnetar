@@ -1439,6 +1439,7 @@ impl Connection {
         }
         state.send_timeout = req.send_timeout;
         state.batching_max_publish_delay = req.batching_max_publish_delay;
+        state.access_mode = req.access_mode;
         self.producers.insert(handle, state);
 
         let producer_metadata: Vec<pb::KeyValue> = req
@@ -1631,6 +1632,16 @@ impl Connection {
         self.producers
             .get(&handle)
             .map_or(0, |p| p.batch.current_size_bytes)
+    }
+
+    /// Access mode the producer was opened with. Returns
+    /// `ProducerAccessMode::Shared` (the broker default) for unknown handles. Mirrors Java
+    /// `Producer#getProducerAccessMode`.
+    #[must_use]
+    pub fn producer_access_mode(&self, handle: ProducerHandle) -> pb::ProducerAccessMode {
+        self.producers
+            .get(&handle)
+            .map_or(pb::ProducerAccessMode::Shared, |p| p.access_mode)
     }
 
     /// Last sequence id this client has pushed onto the wire. `-1` if the producer has
