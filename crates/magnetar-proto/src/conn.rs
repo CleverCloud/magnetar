@@ -1736,6 +1736,17 @@ impl Connection {
             .map_or(0, |c| c.available_permits)
     }
 
+    /// PIP-4 decryption failure handling configured for this consumer. Returns
+    /// [`CryptoFailureAction::Fail`] (the safe default) for unknown handles so callers can
+    /// treat a missing consumer as fail-fast. Mirrors Java `Consumer#getCryptoFailureAction`.
+    #[must_use]
+    pub fn consumer_crypto_failure_action(&self, handle: ConsumerHandle) -> CryptoFailureAction {
+        self.consumers.get(&handle).map_or(
+            CryptoFailureAction::Fail,
+            ConsumerState::crypto_failure_action,
+        )
+    }
+
     fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.
@@ -2599,5 +2610,42 @@ mod conn_state_tests {
         conn2.handle_bytes(Instant::now(), &frame2).expect("handle");
         conn2.mark_disconnected();
         assert!(conn2.is_closed(), "Failed state counts as closed");
+    }
+
+    #[test]
+    fn consumer_crypto_failure_action_defaults_to_fail_for_unknown_handle() {
+        let conn = Connection::new(ConnectionConfig::default());
+        // No consumer has been created; an arbitrary handle must map to the safe default.
+        let action = conn.consumer_crypto_failure_action(ConsumerHandle(42));
+        assert_eq!(action, CryptoFailureAction::Fail);
+    }
+
+    #[test]
+    fn consumer_crypto_failure_action_round_trips_from_subscribe_request() {
+        // Spin up a handshake-complete connection so `subscribe` runs cleanly. We never
+        // observe the broker response — we only need the locally-stored consumer state.
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame).expect("handle");
+
+        for action in [
+            CryptoFailureAction::Fail,
+            CryptoFailureAction::Discard,
+            CryptoFailureAction::Consume,
+        ] {
+            let req = SubscribeRequest {
+                topic: "persistent://public/default/t".to_owned(),
+                subscription: "s".to_owned(),
+                crypto_failure_action: action,
+                ..Default::default()
+            };
+            let handle = conn.subscribe(req);
+            assert_eq!(
+                conn.consumer_crypto_failure_action(handle),
+                action,
+                "crypto_failure_action {action:?} should round-trip through subscribe",
+            );
+        }
     }
 }
