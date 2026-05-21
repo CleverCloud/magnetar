@@ -108,6 +108,12 @@ pub struct ConsumerState {
     /// ack carrying this bitset so the broker knows not to advance the cursor past the
     /// batch until every position is acked.
     pub batch_ack_tracker: HashMap<(u64, u64), BatchAckEntry>,
+    /// Optional ack-grouping tracker. When configured via
+    /// `SubscribeRequest::ack_group_time`, the runtime's `Consumer::ack_grouped` family
+    /// stages individual / cumulative acks here and the state machine flushes them as one
+    /// coalesced `CommandAck` per group window. `None` keeps every ack synchronous (the
+    /// default).
+    pub ack_tracker: Option<crate::trackers::AckGroupingTracker>,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -245,6 +251,7 @@ impl ConsumerState {
             nack_tracker: None,
             unacked_tracker: None,
             batch_ack_tracker: HashMap::new(),
+            ack_tracker: None,
         }
     }
 

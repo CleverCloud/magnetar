@@ -175,6 +175,29 @@ impl Consumer {
         )
     }
 
+    /// Stage an individual ack into the consumer's ack-grouping tracker (opt-in via
+    /// `ConsumerBuilder::ack_group_time`). Fire-and-forget: the call returns immediately
+    /// without a future, and the coalesced `CommandAck` is emitted by the state machine
+    /// once `ack_group_time` has elapsed. Mirrors Java's `acknowledgmentGroupTime` path
+    /// — trades broker-confirmation guarantees for lower ack bandwidth on high-throughput
+    /// consumers. With no tracker configured, falls back to a synchronous immediate
+    /// `CommandAck` so the message is never silently dropped.
+    pub fn ack_grouped(&self, message_id: MessageId) {
+        let mut conn = self.shared.inner.lock();
+        conn.ack_grouped_individual(self.handle, message_id);
+        drop(conn);
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// Stage a cumulative ack into the consumer's ack-grouping tracker. See
+    /// [`Self::ack_grouped`] for the semantics.
+    pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        let mut conn = self.shared.inner.lock();
+        conn.ack_grouped_cumulative(self.handle, message_id);
+        drop(conn);
+        self.shared.driver_waker.notify_one();
+    }
+
     /// Cumulative ack with caller-supplied properties. Mirrors Java
     /// `Consumer#acknowledgeCumulativeAsync(MessageId, Map<String, Long>)`. The broker
     /// stores the properties alongside the cursor (no semantic effect at the dispatch

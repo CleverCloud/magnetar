@@ -345,6 +345,12 @@ pub struct SubscribeRequest {
     /// is tracked client-side; if no positive ack arrives within `d`, the consumer forces a
     /// redelivery. `None` disables the tracker (the default).
     pub ack_timeout: Option<Duration>,
+    /// Mirrors Java `ConsumerBuilder#acknowledgmentGroupTime`. When `Some(d)`, calls to
+    /// the runtime `Consumer::ack_grouped` family stage acks in an in-memory tracker and
+    /// flush them as a single coalesced `CommandAck` every `d`. Trades broker-confirmation
+    /// guarantees for lower ack-bandwidth on high-throughput consumers. `None` keeps every
+    /// ack synchronous (the default).
+    pub ack_group_time: Option<Duration>,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -394,6 +400,7 @@ impl Default for SubscribeRequest {
             consumer_metadata: Vec::new(),
             negative_ack_redelivery_delay: None,
             ack_timeout: None,
+            ack_group_time: None,
         }
     }
 }
@@ -1251,6 +1258,11 @@ impl Connection {
                     consider(d);
                 }
             }
+            if let Some(t) = consumer.ack_tracker.as_ref() {
+                if let Some(d) = t.next_deadline() {
+                    consider(d);
+                }
+            }
         }
         for producer in self.producers.values() {
             if let Some(d) = producer.next_send_deadline() {
@@ -1286,6 +1298,7 @@ impl Connection {
         // produce the same CommandRedeliverUnacknowledgedMessages payload, so we collect
         // then emit through the shared helper.
         let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
+        let mut ack_actions: Vec<crate::trackers::AckAction> = Vec::new();
         for (handle, consumer) in &mut self.consumers {
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 for action in tracker.poll(now) {
@@ -1300,9 +1313,19 @@ impl Connection {
                     redeliveries.push((*handle, message_ids));
                 }
             }
+            if let Some(tracker) = consumer.ack_tracker.as_mut() {
+                ack_actions.extend(tracker.poll(now));
+            }
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
+        }
+        // Flush the ack-grouping tracker. The actions go through the shared dispatcher
+        // which allocates a `RequestId` per coalesced `CommandAck`; the response is
+        // routed back through the existing pending-requests slot, but no user future is
+        // tied to it (ack_grouped_* is fire-and-forget).
+        if !ack_actions.is_empty() {
+            self.dispatch_ack_actions(ack_actions);
         }
 
         // Per-producer batch flush sweep — Java `ProducerBuilder#batchingMaxPublishDelay`.
@@ -1465,6 +1488,9 @@ impl Connection {
         if let Some(timeout) = req.ack_timeout {
             state.unacked_tracker =
                 Some(crate::trackers::UnackedMessageTracker::new(handle, timeout));
+        }
+        if let Some(group_time) = req.ack_group_time {
+            state.ack_tracker = Some(crate::trackers::AckGroupingTracker::new(handle, group_time));
         }
         self.consumers.insert(handle, state);
 
@@ -1785,6 +1811,91 @@ impl Connection {
             consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
         }
         request_id
+    }
+
+    /// Stage an individual ack into this consumer's ack-grouping tracker. The state
+    /// machine flushes the tracker once `ack_group_time` has elapsed since the first
+    /// staged ack, emitting one coalesced `CommandAck` for the whole batch. Fire-and-
+    /// forget: there is no per-call `RequestId` because the broker response will not be
+    /// tied to any one ack call. Falls back to an immediate `CommandAck` (synchronous,
+    /// allocated `RequestId` is discarded) when no tracker is configured so the message
+    /// is never silently dropped. Mirrors Java's `acknowledgmentGroupTime` path.
+    pub fn ack_grouped_individual(&mut self, handle: ConsumerHandle, message_id: MessageId) {
+        let now = Instant::now();
+        let actions = self
+            .consumers
+            .get_mut(&handle)
+            .and_then(|c| c.ack_tracker.as_mut())
+            .map(|t| t.add_individual(message_id, now));
+        if let Some(actions) = actions {
+            self.dispatch_ack_actions(actions);
+        } else {
+            let _ = self.ack(
+                handle,
+                AckRequest {
+                    message_ids: vec![message_id],
+                    ack_type: pb::command_ack::AckType::Individual,
+                    properties: Vec::new(),
+                    txn_id: None,
+                },
+            );
+        }
+    }
+
+    /// Stage a cumulative ack into this consumer's ack-grouping tracker. See
+    /// [`Self::ack_grouped_individual`] for the semantics.
+    pub fn ack_grouped_cumulative(&mut self, handle: ConsumerHandle, message_id: MessageId) {
+        let now = Instant::now();
+        let actions = self
+            .consumers
+            .get_mut(&handle)
+            .and_then(|c| c.ack_tracker.as_mut())
+            .map(|t| t.add_cumulative(message_id, now));
+        if let Some(actions) = actions {
+            self.dispatch_ack_actions(actions);
+        } else {
+            let _ = self.ack(
+                handle,
+                AckRequest {
+                    message_ids: vec![message_id],
+                    ack_type: pb::command_ack::AckType::Cumulative,
+                    properties: Vec::new(),
+                    txn_id: None,
+                },
+            );
+        }
+    }
+
+    fn dispatch_ack_actions(&mut self, actions: Vec<crate::trackers::AckAction>) {
+        for action in actions {
+            match action {
+                crate::trackers::AckAction::SendIndividualAck {
+                    handle,
+                    message_ids,
+                } => {
+                    let _ = self.ack(
+                        handle,
+                        AckRequest {
+                            message_ids,
+                            ack_type: pb::command_ack::AckType::Individual,
+                            properties: Vec::new(),
+                            txn_id: None,
+                        },
+                    );
+                }
+                crate::trackers::AckAction::SendCumulativeAck { handle, message_id } => {
+                    let _ = self.ack(
+                        handle,
+                        AckRequest {
+                            message_ids: vec![message_id],
+                            ack_type: pb::command_ack::AckType::Cumulative,
+                            properties: Vec::new(),
+                            txn_id: None,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Issue an explicit FLOW for a consumer.

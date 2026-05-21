@@ -1078,6 +1078,19 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#acknowledgmentGroupTime`. When set, calls to
+    /// [`magnetar_runtime_tokio::Consumer::ack_grouped`] (and
+    /// `ack_grouped_cumulative`) stage acks in an in-memory tracker and the state
+    /// machine flushes them as one coalesced `CommandAck` every `window`. Trades
+    /// broker-confirmation guarantees for lower ack bandwidth on high-throughput
+    /// consumers. Has no effect on the synchronous [`Self::ack_timeout`] or the
+    /// awaited `Consumer::ack` paths.
+    #[must_use]
+    pub fn ack_group_time(mut self, window: Duration) -> Self {
+        self.req.ack_group_time = Some(window);
+        self
+    }
+
     /// Mirrors Java `ConsumerBuilder#deadLetterPolicy`. After `max_redeliver_count`
     /// redeliveries, the consumer flags the message as dead-letter — drain via
     /// [`magnetar_runtime_tokio::Consumer::drain_dead_letter`] and republish to
