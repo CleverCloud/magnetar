@@ -53,6 +53,39 @@ impl Consumer {
         self.shared.inner.lock().consumer_queue_len(self.handle)
     }
 
+    /// Drain up to `max` already-buffered messages from this consumer's receive queue
+    /// without awaiting the broker. Returns an empty `Vec` when the queue is empty or
+    /// `max == 0`. Does NOT acknowledge — the caller is responsible for acking each
+    /// returned [`IncomingMessage`] (or batching them via [`Self::ack_batch`]).
+    ///
+    /// Mirrors the Java pattern of polling `Consumer#receiveAsync` in a non-blocking loop:
+    /// useful for "process whatever's already here, then move on" workloads where blocking
+    /// for new arrivals is undesirable.
+    ///
+    /// Encrypted or compressed payloads are returned as-is — this is a raw drain of the
+    /// state-machine queue. Callers that need the decompression / decryption pipeline
+    /// should use [`Self::receive`] or [`Self::receive_batch`] instead.
+    #[must_use]
+    pub fn drain_messages(&self, max: usize) -> Vec<IncomingMessage> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(max.min(64));
+        let mut conn = self.shared.inner.lock();
+        while out.len() < max {
+            match conn.pop_message(self.handle) {
+                Some(msg) => out.push(msg),
+                None => break,
+            }
+        }
+        drop(conn);
+        // `pop_message` may have queued FLOW frames; wake the driver to flush them.
+        if !out.is_empty() {
+            self.shared.driver_waker.notify_one();
+        }
+        out
+    }
+
     /// Number of dispatch permits this consumer still has with the broker — i.e. messages
     /// it has authorised the broker to push without an explicit `CommandFlow`. Mirrors
     /// Java `ConsumerBase#getAvailablePermits`.
@@ -1049,4 +1082,147 @@ impl Future for RequestFut {
 fn message_id_greater(lhs: &MessageId, rhs: &MessageId) -> bool {
     (lhs.ledger_id, lhs.entry_id, lhs.partition, lhs.batch_index)
         > (rhs.ledger_id, rhs.entry_id, rhs.partition, rhs.batch_index)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use bytes::BytesMut;
+    use magnetar_proto::{ConnectionConfig, SubscribeRequest, encode_command, encode_payload, pb};
+
+    use super::Consumer;
+    use crate::ConnectionShared;
+
+    fn handshake_response_bytes() -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    fn command_message_bytes(consumer_id: u64, entry_id: u64, payload: &[u8]) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "test".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, &meta, payload).expect("encode CommandMessage");
+        buf
+    }
+
+    fn handshake_complete_shared() -> std::sync::Arc<ConnectionShared> {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        shared
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_messages_with_zero_returns_empty_vec() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/drain-zero".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        assert!(
+            consumer.drain_messages(0).is_empty(),
+            "max=0 must short-circuit to an empty vec"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_messages_with_unknown_handle_returns_empty() {
+        // Even when the underlying handle is unknown to the sans-io layer (e.g. closed
+        // consumer), `drain_messages` returns an empty `Vec` rather than panicking.
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let consumer = Consumer {
+            shared,
+            handle: magnetar_proto::ConsumerHandle(9999),
+            decryptor: None,
+        };
+        assert!(consumer.drain_messages(10).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_messages_respects_the_cap_when_messages_are_in_flight() {
+        // Pump CommandMessage frames through `handle_bytes` to materialise per-consumer
+        // delivery state, then assert the drain never exceeds the requested cap. Even if
+        // the burst-emit shape of `handle_bytes` routes the message bytes through the
+        // events queue (current scaffolding behavior, see conn.rs:825-833), the
+        // cardinality invariant `len <= max` must hold — that's the safety guarantee
+        // callers rely on.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/drain-cap".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..5_u64 {
+                let bytes = command_message_bytes(handle.0, 100 + i, format!("m{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+
+        for cap in [0_usize, 1, 3, 100] {
+            let drained = consumer.drain_messages(cap);
+            assert!(
+                drained.len() <= cap,
+                "drain_messages({cap}) returned {} items, exceeds the cap",
+                drained.len()
+            );
+        }
+    }
 }

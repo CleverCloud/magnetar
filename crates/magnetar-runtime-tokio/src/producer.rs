@@ -215,6 +215,30 @@ impl Producer {
         }
     }
 
+    /// Flush this producer, bounded by `timeout`. Wraps [`Self::flush`] in
+    /// [`tokio::time::timeout`]. If every in-flight send is acknowledged within the deadline
+    /// the call resolves with `Ok(())`; if the deadline elapses with sends still pending the
+    /// call resolves with [`ClientError::Timeout`].
+    ///
+    /// The pending sends are *not* cancelled — they remain in flight and may still be acked
+    /// (or rejected) by the broker afterwards. Callers that need cancellation semantics must
+    /// drop the producer or call [`Self::close`].
+    ///
+    /// Mirrors the Java pattern `producer.flushAsync().get(timeout, TimeUnit.MILLIS)`.
+    pub async fn flush_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), ClientError> {
+        if let Ok(res) = tokio::time::timeout(timeout, self.flush()).await {
+            res
+        } else {
+            let pending = self.shared.inner.lock().producer_pending_count(self.handle);
+            Err(ClientError::Timeout(format!(
+                "producer flush exceeded {timeout:?} with {pending} sends still pending"
+            )))
+        }
+    }
+
     /// Close this producer. The returned future resolves when the broker acknowledges the close.
     ///
     /// # Errors
@@ -378,5 +402,120 @@ impl Future for RequestFut {
         }
         conn.register_waker(self.key, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use bytes::{Bytes, BytesMut};
+    use magnetar_proto::producer::OutgoingMessage;
+    use magnetar_proto::types::CompressionKind;
+    use magnetar_proto::{ConnectionConfig, CreateProducerRequest, encode_command, pb};
+
+    use super::Producer;
+    use crate::ConnectionShared;
+    use crate::error::ClientError;
+
+    fn handshake_response_bytes() -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    /// Spin up a `ConnectionShared` whose inner state machine has completed the handshake, so
+    /// `create_producer` runs cleanly without erroring on protocol-state checks.
+    fn handshake_complete_shared() -> std::sync::Arc<ConnectionShared> {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        shared
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn flush_with_timeout_returns_timeout_when_nothing_acks() {
+        let shared = handshake_complete_shared();
+        // Register a producer and queue a send. No driver task is running, so the broker
+        // will never respond with `CommandSendReceipt` — `pending_count` stays at 1 forever.
+        let handle = {
+            let mut conn = shared.inner.lock();
+            let h = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/flush-timeout".to_owned(),
+                ..Default::default()
+            });
+            let _ = conn.send(
+                h,
+                OutgoingMessage {
+                    payload: Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                },
+                1_700_000_000_000,
+            );
+            h
+        };
+        let producer = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+        // Pre-condition: at least one in-flight send.
+        assert!(
+            producer.pending_count() >= 1,
+            "expected pending send; got {}",
+            producer.pending_count()
+        );
+
+        match producer.flush_with_timeout(Duration::from_millis(50)).await {
+            Err(ClientError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("pending"),
+                    "timeout message should mention pending sends: {msg}"
+                );
+            }
+            other => panic!("expected ClientError::Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_with_timeout_returns_ok_on_quiescent_producer() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/flush-ok".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+        assert_eq!(producer.pending_count(), 0);
+        producer
+            .flush_with_timeout(Duration::from_secs(5))
+            .await
+            .expect("idempotent flush on quiescent producer must succeed");
     }
 }
