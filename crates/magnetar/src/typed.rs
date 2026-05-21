@@ -224,6 +224,14 @@ pub struct TypedConsumerBuilder<'a, S: Schema> {
     durable: bool,
     initial_position: pb::command_subscribe::InitialPosition,
     receiver_queue_size: usize,
+    consumer_name: Option<String>,
+    priority_level: Option<i32>,
+    properties: Vec<(String, String)>,
+    subscription_properties: Vec<(String, String)>,
+    read_compacted: bool,
+    negative_ack_redelivery_delay: Option<std::time::Duration>,
+    ack_timeout: Option<std::time::Duration>,
+    dlq_policy: Option<(u32, Option<String>)>,
 }
 
 impl<S: Schema> std::fmt::Debug for TypedConsumerBuilder<'_, S> {
@@ -249,7 +257,81 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
             durable: true,
             initial_position: pb::command_subscribe::InitialPosition::Latest,
             receiver_queue_size: 1000,
+            consumer_name: None,
+            priority_level: None,
+            properties: Vec::new(),
+            subscription_properties: Vec::new(),
+            read_compacted: false,
+            negative_ack_redelivery_delay: None,
+            ack_timeout: None,
+            dlq_policy: None,
         }
+    }
+
+    /// Set the consumer name advertised to the broker. Mirrors Java
+    /// `ConsumerBuilder#consumerName`.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.consumer_name = Some(name.into());
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::priority_level`.
+    #[must_use]
+    pub fn priority_level(mut self, level: i32) -> Self {
+        self.priority_level = Some(level);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::property`.
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::subscription_property`.
+    #[must_use]
+    pub fn subscription_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.subscription_properties
+            .push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::read_compacted`.
+    #[must_use]
+    pub fn read_compacted(mut self, on: bool) -> Self {
+        self.read_compacted = on;
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::negative_ack_redelivery_delay`.
+    #[must_use]
+    pub fn negative_ack_redelivery_delay(mut self, delay: std::time::Duration) -> Self {
+        self.negative_ack_redelivery_delay = Some(delay);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::ack_timeout`.
+    #[must_use]
+    pub fn ack_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ack_timeout = Some(timeout);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::dead_letter_policy`.
+    #[must_use]
+    pub fn dead_letter_policy(
+        mut self,
+        max_redeliver_count: u32,
+        dead_letter_topic: Option<String>,
+    ) -> Self {
+        self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
     }
 
     /// Required: set the subscription name.
@@ -298,7 +380,7 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
             r#type: self.schema.schema_type() as i32,
             properties: Vec::new(),
         };
-        let inner = self
+        let mut builder = self
             .client
             .consumer(self.topic)
             .subscription(subscription)
@@ -306,9 +388,30 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
             .durable(self.durable)
             .initial_position(self.initial_position)
             .receiver_queue_size(self.receiver_queue_size)
-            .schema(schema_pb)
-            .subscribe()
-            .await?;
+            .read_compacted(self.read_compacted)
+            .schema(schema_pb);
+        if let Some(name) = self.consumer_name {
+            builder = builder.name(name);
+        }
+        if let Some(level) = self.priority_level {
+            builder = builder.priority_level(level);
+        }
+        for (k, v) in self.properties {
+            builder = builder.property(k, v);
+        }
+        for (k, v) in self.subscription_properties {
+            builder = builder.subscription_property(k, v);
+        }
+        if let Some(d) = self.negative_ack_redelivery_delay {
+            builder = builder.negative_ack_redelivery_delay(d);
+        }
+        if let Some(t) = self.ack_timeout {
+            builder = builder.ack_timeout(t);
+        }
+        if let Some((max, topic_opt)) = self.dlq_policy {
+            builder = builder.dead_letter_policy(max, topic_opt);
+        }
+        let inner = builder.subscribe().await?;
         Ok(TypedConsumer {
             inner,
             schema: self.schema,
