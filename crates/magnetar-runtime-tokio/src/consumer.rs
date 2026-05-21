@@ -629,6 +629,22 @@ impl Consumer {
         msg: IncomingMessage,
         delay: std::time::Duration,
     ) -> Result<(), ClientError> {
+        self.reconsume_later_with_properties(retry_producer, msg, Vec::new(), delay)
+            .await
+    }
+
+    /// Same as [`Self::reconsume_later`] but lets the caller stamp additional custom
+    /// properties on the republished message. Custom entries are merged with the original
+    /// message's properties — on a key collision, the custom value takes precedence.
+    /// Mirrors Java
+    /// `Consumer#reconsumeLater(Message, Map<String, String> customProperties, long, TimeUnit)`.
+    pub async fn reconsume_later_with_properties(
+        &self,
+        retry_producer: &crate::Producer,
+        msg: IncomingMessage,
+        custom_properties: Vec<(String, String)>,
+        delay: std::time::Duration,
+    ) -> Result<(), ClientError> {
         let mut metadata = magnetar_proto::pb::MessageMetadata {
             partition_key: msg.metadata.partition_key.clone(),
             partition_key_b64_encoded: msg.metadata.partition_key_b64_encoded,
@@ -637,6 +653,13 @@ impl Consumer {
             properties: msg.metadata.properties.clone(),
             ..magnetar_proto::pb::MessageMetadata::default()
         };
+        // Apply custom properties (overrides on key collision).
+        for (k, v) in custom_properties {
+            metadata.properties.retain(|kv| kv.key != k);
+            metadata
+                .properties
+                .push(magnetar_proto::pb::KeyValue { key: k, value: v });
+        }
         // Bump the RECONSUMETIMES property if present, otherwise stamp it at 1. Mirrors
         // the Java retry-letter convention so downstream consumers can enforce caps.
         let reconsumetimes = metadata

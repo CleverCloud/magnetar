@@ -863,6 +863,21 @@ impl<S: Schema> TypedConsumer<S> {
             .await
             .map_err(PulsarError::Client)
     }
+
+    /// Same as [`Self::reconsume_later`] but stamps custom properties on the republished
+    /// message. Mirrors Java's properties-aware reconsumeLater overload.
+    pub async fn reconsume_later_with_properties(
+        &self,
+        retry_producer: &magnetar_runtime_tokio::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        custom_properties: Vec<(String, String)>,
+        delay: std::time::Duration,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .reconsume_later_with_properties(retry_producer, msg, custom_properties, delay)
+            .await
+            .map_err(PulsarError::Client)
+    }
 }
 
 /// Builder for a [`TypedConsumer`].

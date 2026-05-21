@@ -210,6 +210,33 @@ impl MultiTopicsConsumer {
             .map_err(PulsarError::Client)
     }
 
+    /// Same as [`Self::reconsume_later`] but stamps custom properties on the republished
+    /// message. Mirrors Java's properties-aware reconsumeLater overload.
+    pub async fn reconsume_later_with_properties(
+        &self,
+        topic: &str,
+        retry_producer: &magnetar_runtime_tokio::Producer,
+        msg: IncomingMessage,
+        custom_properties: Vec<(String, String)>,
+        delay: std::time::Duration,
+    ) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| {
+                PulsarError::Config(format!(
+                    "reconsume_later_with_properties for unknown topic {topic}"
+                ))
+            })?;
+        consumer
+            .consumer
+            .reconsume_later_with_properties(retry_producer, msg, custom_properties, delay)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Tell the broker to redeliver every unacked message across every child consumer.
     /// Mirrors Java `Consumer#redeliverUnacknowledgedMessages` at the multi-topic scope.
     pub fn redeliver_unacked(&self) {
