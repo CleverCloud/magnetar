@@ -82,7 +82,7 @@ pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTop
 pub use partitioned_consumer::{PartitionedConsumer, PartitionedConsumerBuilder};
 #[cfg(feature = "tokio")]
 pub use partitioned_producer::{
-    MessageRoutingMode, PartitionedProducer, PartitionedProducerBuilder,
+    MessageRouter, MessageRoutingMode, PartitionedProducer, PartitionedProducerBuilder,
 };
 #[cfg(feature = "tokio")]
 pub use table_view::{TableView, TableViewBuilder, TableViewListener};
