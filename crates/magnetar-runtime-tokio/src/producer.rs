@@ -56,6 +56,21 @@ impl Producer {
             .producer_last_sequence_id_published(self.handle)
     }
 
+    /// Convenience: publish raw payload bytes with no extra metadata. Mirrors Java
+    /// `Producer#sendAsync(byte[])`. For richer metadata (keys, properties, deliver-at,
+    /// etc.) construct an [`OutgoingMessage`] explicitly and call [`Self::send`].
+    pub fn send_bytes(&self, payload: impl Into<bytes::Bytes>) -> SendFut {
+        let payload = payload.into();
+        let uncompressed_size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        self.send(OutgoingMessage {
+            payload,
+            metadata: magnetar_proto::pb::MessageMetadata::default(),
+            uncompressed_size,
+            num_messages: 1,
+            txn_id: None,
+        })
+    }
+
     /// Enqueue a send. The returned future resolves when the broker acknowledges the publish
     /// (a `CommandSendReceipt`) or rejects it (a `CommandSendError`).
     pub fn send(&self, mut msg: OutgoingMessage) -> SendFut {
