@@ -220,6 +220,16 @@ pub enum OpOutcome {
         /// Topics currently matching the watcher's namespace + pattern.
         topics: Vec<String>,
     },
+    /// `CommandGetSchemaResponse` correlated with a [`Connection::get_schema`] call.
+    ///
+    /// Carries the schema-registry round-trip outcome: `Ok((schema, version))` on success,
+    /// `Err((code, message))` on failure.
+    GetSchemaResponse {
+        /// Request id of the originating `CommandGetSchema`.
+        request_id: RequestId,
+        /// The schema-registry round-trip outcome.
+        result: crate::event::GetSchemaResult,
+    },
 }
 
 /// Parameters for opening a producer.
@@ -551,6 +561,7 @@ enum PendingRequestKind {
     AddPartitionToTxn,
     AddSubscriptionToTxn,
     EndTxn,
+    GetSchema,
 }
 
 impl Connection {
@@ -1236,6 +1247,38 @@ impl Connection {
                     request_id,
                     outcome: TxnRoundTrip::EndTxn(result),
                 });
+            }
+            pb::base_command::Type::GetSchemaResponse => {
+                let resp = command
+                    .get_schema_response
+                    .ok_or(ProtocolError::InvariantViolation(
+                        "missing CommandGetSchemaResponse",
+                    ))?;
+                let request_id = RequestId(resp.request_id);
+                if matches!(
+                    self.pending_requests.get(&request_id),
+                    Some(PendingRequestKind::GetSchema)
+                ) {
+                    self.pending_requests.remove(&request_id);
+                    let result = match (resp.schema, resp.error_code) {
+                        (Some(schema), None) => Ok((schema, resp.schema_version)),
+                        (_, Some(code)) => Err((code, resp.error_message.unwrap_or_default())),
+                        (None, None) => Err((
+                            0,
+                            "broker returned empty CommandGetSchemaResponse".to_owned(),
+                        )),
+                    };
+                    self.outcomes.insert(
+                        PendingOpKey::Request(request_id),
+                        OpOutcome::GetSchemaResponse {
+                            request_id,
+                            result: result.clone(),
+                        },
+                    );
+                    self.wake_for_request(request_id);
+                    self.events
+                        .push_back(ConnectionEvent::GetSchemaResponse { request_id, result });
+                }
             }
             _ => {
                 // Unhandled command — we tolerate them silently for forward compatibility, but
@@ -2198,6 +2241,37 @@ impl Connection {
         self.pending_requests
             .insert(request_id, PendingRequestKind::Lookup);
         Ok(())
+    }
+
+    /// Issue a `CommandGetSchema` to look up the schema declared for `topic` in the broker's
+    /// schema registry.
+    ///
+    /// Mirrors Java `PulsarClientImpl#getSchema` and the `LookupService#getSchema` round-trip.
+    /// The state machine surfaces the response via [`OpOutcome::GetSchemaResponse`] and
+    /// [`ConnectionEvent::GetSchemaResponse`].
+    ///
+    /// `version` is the requested schema version when known (e.g. when re-decoding a historical
+    /// payload). Pass `None` to ask the broker for the topic's current schema.
+    ///
+    /// Used by [`crate::schema::AutoConsumeSchema`] and
+    /// [`crate::schema::AutoProduceBytesSchema`] to populate their per-instance schema cache
+    /// (PIP-87 broker-side schema lookup).
+    pub fn get_schema(&mut self, topic: &str, version: Option<Vec<u8>>) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = pb::CommandGetSchema {
+            request_id: request_id.0,
+            topic: topic.to_owned(),
+            schema_version: version,
+        };
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetSchema as i32,
+            get_schema: Some(cmd),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::GetSchema);
+        request_id
     }
 
     /// Request partitioned-topic metadata.

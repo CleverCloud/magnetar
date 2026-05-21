@@ -96,7 +96,7 @@ pub use crate::conn::{
 };
 pub use crate::consumer::ConsumerStats;
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
-pub use crate::event::{ConnectionEvent, IncomingMessage};
+pub use crate::event::{ConnectionEvent, GetSchemaResult, IncomingMessage};
 pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
