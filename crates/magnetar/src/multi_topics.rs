@@ -200,8 +200,40 @@ impl MultiTopicsConsumer {
                 .saturating_add(s.total_bytes_received);
             agg.total_acks_sent = agg.total_acks_sent.saturating_add(s.total_acks_sent);
             agg.total_acks_failed = agg.total_acks_failed.saturating_add(s.total_acks_failed);
+            agg.total_msgs_dead_lettered = agg
+                .total_msgs_dead_lettered
+                .saturating_add(s.total_msgs_dead_lettered);
         }
         agg
+    }
+
+    /// Sum of buffered messages across every child consumer's receiver queue. Mirrors
+    /// Java `Consumer#getNumMessagesInQueue` aggregated over partitions/topics.
+    #[must_use]
+    pub fn available_in_queue(&self) -> usize {
+        self.inner
+            .consumers
+            .iter()
+            .map(|c| c.consumer.available_in_queue())
+            .sum()
+    }
+
+    /// Sum of outstanding broker permits across every child consumer. Mirrors Java
+    /// `ConsumerBase#getAvailablePermits` aggregated over partitions/topics.
+    #[must_use]
+    pub fn available_permits(&self) -> u32 {
+        self.inner
+            .consumers
+            .iter()
+            .map(|c| c.consumer.available_permits())
+            .fold(0u32, u32::saturating_add)
+    }
+
+    /// `true` once every child consumer is closed. Mirrors Java `Consumer#isClosed` at the
+    /// multi-topic / partitioned scope.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.consumers.iter().all(|c| c.consumer.is_closed())
     }
 
     /// Pause every child consumer. Mirrors Java `Consumer#pause` at the multi-topic scope.
