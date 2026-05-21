@@ -914,7 +914,10 @@ impl<'a> ReaderBuilder<'a> {
     /// Create the reader.
     pub async fn create(self) -> Result<Reader> {
         let consumer = self.inner.subscribe().await?;
-        Ok(Reader { consumer })
+        Ok(Reader {
+            consumer,
+            last_received: parking_lot::Mutex::new(None),
+        })
     }
 }
 
@@ -924,12 +927,56 @@ impl<'a> ReaderBuilder<'a> {
 #[derive(Debug)]
 pub struct Reader {
     consumer: magnetar_runtime_tokio::Consumer,
+    /// Last message id returned via [`Self::read_next_tracked`] / [`Self::read_next`].
+    /// Used by [`Self::has_message_available`] to ask the broker "is there anything past
+    /// what I last handed you?" without the caller having to track the cursor.
+    last_received: parking_lot::Mutex<Option<magnetar_proto::MessageId>>,
 }
 
 impl Reader {
-    /// Block until the next message arrives.
-    pub fn read_next(&self) -> magnetar_runtime_tokio::ReceiveFut {
+    /// Block until the next message arrives. Identical to Java `Reader#readNext`.
+    /// Internally also stamps the returned id into the per-reader cursor so a subsequent
+    /// [`Self::has_message_available`] call asks the broker the right question.
+    pub async fn read_next(&self) -> Result<magnetar_proto::IncomingMessage, PulsarError> {
+        let msg = self.consumer.receive().await.map_err(PulsarError::Client)?;
+        *self.last_received.lock() = Some(msg.message_id);
+        Ok(msg)
+    }
+
+    /// Returns the raw [`magnetar_runtime_tokio::ReceiveFut`] without per-reader cursor
+    /// tracking. Use this when integrating with a custom select loop where you want
+    /// cancel-safe receive futures; pair with [`Self::record_received`] if you still want
+    /// `has_message_available` to work.
+    pub fn read_next_fut(&self) -> magnetar_runtime_tokio::ReceiveFut {
         self.consumer.receive()
+    }
+
+    /// Manually record a received message id into the per-reader cursor. Useful when
+    /// callers go through [`Self::read_next_fut`] / `.consumer().receive()` directly and
+    /// still want [`Self::has_message_available`] to behave correctly.
+    pub fn record_received(&self, message_id: magnetar_proto::MessageId) {
+        *self.last_received.lock() = Some(message_id);
+    }
+
+    /// `true` if the broker has at least one message strictly past the most-recently
+    /// returned message id. Mirrors Java `Reader#hasMessageAvailable` (no argument —
+    /// the reader tracks its own cursor). Returns `true` for fresh readers (no
+    /// `read_next` yet) if the broker reports any non-empty topic.
+    pub async fn has_message_available(&self) -> Result<bool, PulsarError> {
+        let cursor = *self.last_received.lock();
+        if let Some(c) = cursor {
+            return self
+                .consumer
+                .has_message_after(c)
+                .await
+                .map_err(PulsarError::Client);
+        }
+        let last = self
+            .consumer
+            .last_message_id()
+            .await
+            .map_err(PulsarError::Client)?;
+        Ok(last != magnetar_proto::MessageId::EARLIEST)
     }
 
     /// Borrow the underlying consumer (for advanced operations like `flow()`).
