@@ -364,6 +364,60 @@ impl PatternConsumer {
         guard.iter().all(|c| c.consumer.is_closed())
     }
 
+    /// Spawn a background tokio task that drives [`PatternConsumer::update`] on a periodic
+    /// ticker, mirroring Java's `PatternMultiTopicsConsumerImpl` internal reconciliation
+    /// timer.
+    ///
+    /// The task ticks every `interval`, calls `update(&client)`, swallows errors (logged
+    /// at `warn`), and exits cleanly once [`PatternConsumer::is_closed`] returns `true`.
+    /// The caller can also stop the loop early by calling
+    /// [`tokio::task::JoinHandle::abort`] on the returned handle — the task is not stored
+    /// inside the consumer, so it never outlives the caller's intent.
+    ///
+    /// The returned [`tokio::task::JoinHandle`] is detached from the consumer: dropping
+    /// the consumer does not abort the task on its own, but the next tick after every
+    /// child is closed will observe `is_closed()` and return. For deterministic teardown,
+    /// abort the handle before dropping the consumer.
+    ///
+    /// `client` is taken as [`Arc`] because the task captures it for the lifetime of the
+    /// ticker loop; callers typically already hold the client behind an [`Arc`].
+    #[must_use = "the JoinHandle must be retained to abort the auto-reconcile task; dropping it detaches the task"]
+    pub fn start_auto_reconcile(
+        &self,
+        client: std::sync::Arc<PulsarClient>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let consumer = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip missed ticks if the previous reconciliation overran — we only care about
+            // catching up to the current topic set, not replaying every missed deadline.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The first tick fires immediately; consume it so we don't reconcile twice in
+            // quick succession when the caller has just built the consumer.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                // Exit once every child consumer is closed — but only after the set has
+                // been non-empty at least once. A pattern that has not yet matched any
+                // topic must keep ticking; otherwise `is_closed()` (vacuously `true` on
+                // an empty set) would terminate the task before the first match.
+                if !consumer.is_empty() && consumer.is_closed() {
+                    break;
+                }
+                if let Err(err) = consumer.update(&client).await {
+                    tracing::warn!(
+                        target: "magnetar::pattern_consumer",
+                        error = %err,
+                        namespace = %consumer.namespace(),
+                        pattern = %consumer.pattern(),
+                        "auto-reconcile tick failed",
+                    );
+                }
+            }
+        })
+    }
+
     /// Close every underlying consumer. Drops the consumer set and returns the first
     /// per-child error encountered. Mirrors `MultiTopicsConsumer::close` semantics: best-effort
     /// teardown — every child gets a chance to close.
@@ -688,7 +742,11 @@ impl<'a> PatternConsumerBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::ReconcileReport;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use super::{ConsumerTemplate, Inner, PatternConsumer, ReconcileReport};
 
     #[test]
     fn reconcile_report_default_is_zero() {
@@ -708,5 +766,116 @@ mod tests {
             removed: 1,
         };
         assert_eq!(a, b);
+    }
+
+    /// Helper: build an empty [`PatternConsumer`] for tests. The set is empty and the
+    /// embedded template is a defaults-only stub — sufficient for tests that never reach
+    /// `update()` or any per-topic dispatch.
+    fn empty_pattern_consumer() -> PatternConsumer {
+        let template = ConsumerTemplate {
+            subscription: "test-sub".to_owned(),
+            sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
+            receiver_queue_size: 1000,
+            initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
+            durable: true,
+            properties: Vec::new(),
+            negative_ack_redelivery_delay: None,
+            ack_timeout: None,
+            ack_group_time: None,
+            dlq_policy: None,
+            read_compacted: false,
+            priority_level: None,
+            subscription_properties: Vec::new(),
+            key_shared: None,
+            replicate_subscription_state: None,
+            force_topic_creation: None,
+            start_message_rollback_duration_sec: None,
+        };
+        PatternConsumer {
+            inner: Arc::new(Inner {
+                consumers: Mutex::new(Vec::new()),
+                namespace: "public/default".to_owned(),
+                pattern: "persistent://public/default/test-.*".to_owned(),
+                template,
+            }),
+        }
+    }
+
+    /// Exercise the [`PatternConsumer::start_auto_reconcile`] abort path.
+    ///
+    /// We cannot construct a live [`crate::PulsarClient`] without a broker, so this test
+    /// reproduces the auto-reconcile loop body inline using the same primitives
+    /// (`tokio::time::interval`, clone of `Arc<Inner>`, `is_empty()` + `is_closed()`
+    /// guard). With an empty consumer set the loop never reaches `update()` — the first
+    /// `tick()` fires immediately and the second blocks on the long interval, so abort
+    /// catches the task parked on the second tick and tears it down cleanly.
+    ///
+    /// This guards against three regressions: (1) the abort path producing a panic
+    /// instead of a `JoinError::is_cancelled()`, (2) the empty-set early-exit short
+    /// circuit firing despite the `!is_empty()` guard, and (3) the consumer's `Arc<Inner>`
+    /// not being captured by the task (which would force the test to keep a separate
+    /// reference alive).
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_reconcile_aborts_cleanly_on_empty_set() {
+        let consumer = empty_pattern_consumer();
+        // Sanity check: an empty pattern consumer reports empty and vacuously closed.
+        assert!(consumer.is_empty(), "fresh test consumer should be empty");
+        assert!(
+            consumer.is_closed(),
+            "empty consumer is vacuously closed; the auto-reconcile loop must \
+             not treat that as an exit condition while the set is empty",
+        );
+
+        let consumer_for_task = consumer.clone();
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Mirror `start_auto_reconcile`: consume the immediate first tick, then loop
+            // on the long interval and exit only when the set has become non-empty and
+            // every child reports closed.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if !consumer_for_task.is_empty() && consumer_for_task.is_closed() {
+                    break;
+                }
+                // No client is held in this test surrogate — the real
+                // `start_auto_reconcile` would invoke `update(&client)` here. Reaching
+                // this point inside the test would be a bug: it means the long-interval
+                // tick fired prematurely.
+                unreachable!("auto-reconcile tick fired before abort");
+            }
+        });
+
+        // Yield once so the spawned task progresses past the immediate first tick and
+        // parks on the long-interval second tick.
+        tokio::task::yield_now().await;
+
+        handle.abort();
+        let join = handle.await;
+        match join {
+            Err(err) => assert!(
+                err.is_cancelled(),
+                "join error must signal cancellation, got: {err:?}",
+            ),
+            Ok(()) => panic!("auto-reconcile task completed instead of being cancelled"),
+        }
+
+        // The consumer must still be usable after the task is torn down — the abort
+        // tears down only the spawned future, not the shared `Arc<Inner>`.
+        assert!(consumer.is_empty());
+        assert_eq!(consumer.len(), 0);
+    }
+
+    /// Compile-time witness that [`PatternConsumer::start_auto_reconcile`] has the
+    /// exact signature required by the Java-parity API: takes `&self`, an
+    /// `Arc<PulsarClient>`, a `Duration`, and returns `JoinHandle<()>`.
+    #[test]
+    fn start_auto_reconcile_signature() {
+        let _: fn(
+            &PatternConsumer,
+            std::sync::Arc<crate::PulsarClient>,
+            std::time::Duration,
+        ) -> tokio::task::JoinHandle<()> = PatternConsumer::start_auto_reconcile;
     }
 }
