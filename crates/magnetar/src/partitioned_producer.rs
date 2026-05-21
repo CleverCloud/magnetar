@@ -34,6 +34,91 @@ pub enum MessageRoutingMode {
     SinglePartition(u32),
 }
 
+/// Partitioned-producer-bound counterpart to [`crate::MessageBuilder`]. Same chained
+/// setters; the terminal `.send().await` resolves the partition and dispatches.
+#[derive(Debug)]
+pub struct PartitionedMessageBuilder<'a> {
+    producer: &'a PartitionedProducer,
+    msg: OutgoingMessage,
+}
+
+impl PartitionedMessageBuilder<'_> {
+    /// See [`OutgoingMessage::key`].
+    #[must_use]
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.msg = self.msg.key(key);
+        self
+    }
+
+    /// See [`OutgoingMessage::ordering_key`].
+    #[must_use]
+    pub fn ordering_key(mut self, key: impl Into<Bytes>) -> Self {
+        self.msg = self.msg.ordering_key(key);
+        self
+    }
+
+    /// See [`OutgoingMessage::event_time_ms`].
+    #[must_use]
+    pub fn event_time_ms(mut self, ts: u64) -> Self {
+        self.msg = self.msg.event_time_ms(ts);
+        self
+    }
+
+    /// See [`OutgoingMessage::property`].
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.msg = self.msg.property(key, value);
+        self
+    }
+
+    /// See [`OutgoingMessage::deliver_at_ms`].
+    #[must_use]
+    pub fn deliver_at_ms(mut self, ts_ms: i64) -> Self {
+        self.msg = self.msg.deliver_at_ms(ts_ms);
+        self
+    }
+
+    /// See [`OutgoingMessage::deliver_after_ms`].
+    #[must_use]
+    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms(delay_ms);
+        self
+    }
+
+    /// See [`OutgoingMessage::replication_clusters`].
+    #[must_use]
+    pub fn replication_clusters(mut self, clusters: Vec<String>) -> Self {
+        self.msg = self.msg.replication_clusters(clusters);
+        self
+    }
+
+    /// See [`OutgoingMessage::disable_replication`].
+    #[must_use]
+    pub fn disable_replication(mut self) -> Self {
+        self.msg = self.msg.disable_replication();
+        self
+    }
+
+    /// See [`OutgoingMessage::txn`].
+    #[must_use]
+    pub fn txn(mut self, txn_id: magnetar_proto::TxnId) -> Self {
+        self.msg = self.msg.txn(txn_id);
+        self
+    }
+
+    /// Set the payload bytes. See [`OutgoingMessage::value`].
+    #[must_use]
+    pub fn value(mut self, payload: impl Into<Bytes>) -> Self {
+        self.msg = self.msg.value(payload);
+        self
+    }
+
+    /// Resolve the partition and dispatch. Returns the broker-assigned [`MessageId`].
+    pub async fn send(self) -> Result<MessageId, PulsarError> {
+        self.producer.send(self.msg).await
+    }
+}
+
 /// Plug a user-provided routing function in front of [`MessageRoutingMode`]. Mirrors
 /// Java's `MessageRouter` SPI — when set on the builder, the function decides the
 /// partition for every outgoing message; the configured [`MessageRoutingMode`] is
@@ -90,6 +175,18 @@ impl PartitionedProducer {
         let proto_msg: magnetar_proto::producer::OutgoingMessage = msg.into();
         let id = producer.send(proto_msg).await?;
         Ok(id)
+    }
+
+    /// Start a Java-symmetric `MessageBuilder` chain that ends with `.send().await`. The
+    /// routing decision happens on `send` based on the constructed `OutgoingMessage`, so
+    /// `.key(..)` participates in `MessageRoutingMode::KeyHashOrRoundRobin` and any
+    /// installed `MessageRouter` sees the full message.
+    #[must_use]
+    pub fn new_message(&self) -> PartitionedMessageBuilder<'_> {
+        PartitionedMessageBuilder {
+            producer: self,
+            msg: OutgoingMessage::default(),
+        }
     }
 
     fn pick_partition(&self, msg: &OutgoingMessage) -> usize {
