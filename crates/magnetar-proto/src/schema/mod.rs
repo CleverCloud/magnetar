@@ -50,6 +50,7 @@ mod avro;
 mod bytes_schema;
 mod json;
 mod key_value;
+mod primitive;
 mod protobuf;
 mod protobuf_native;
 mod string;
@@ -60,6 +61,9 @@ pub use self::avro::AvroSchema;
 pub use self::bytes_schema::BytesSchema;
 pub use self::json::JsonSchema;
 pub use self::key_value::{KeyValueEncodingType, KeyValuePair, KeyValueSchema};
+pub use self::primitive::{
+    BoolSchema, DoubleSchema, FloatSchema, Int8Schema, Int16Schema, Int32Schema, Int64Schema,
+};
 pub use self::protobuf::ProtobufSchema;
 pub use self::protobuf_native::ProtobufNativeSchema;
 pub use self::string::StringSchema;
