@@ -54,19 +54,35 @@ client at v0.1.0.
   table view, transactions.
 - **PIPs implemented or partially wired**: PIP-4 (end-to-end encryption),
   PIP-30 / PIP-292 (in-band `AUTH_CHALLENGE` refresh), PIP-31 (transactions),
-  PIP-37 (chunking + redelivery backoff), PIP-54 (partial-batch ACK), PIP-90
-  (broker-entry metadata), PIP-145 (regex topic discovery), PIP-313 (force
-  unsubscribe). See [Supported PIPs](#supported-pips).
+  PIP-37 (chunking + redelivery backoff), PIP-54 (partial-batch ACK), PIP-87
+  (AutoConsumeSchema broker lookup), PIP-90 (broker-entry metadata),
+  PIP-121 (cluster failover — `ServiceUrlProvider` + `ControlledClusterFailover`
+  + `AutoClusterFailover`), PIP-145 (regex topic discovery), PIP-188
+  (`TOPIC_MIGRATED` with supervised reconnect), PIP-313 (force unsubscribe).
+  See [Supported PIPs](#supported-pips).
+- **Resilience**: supervised reconnect with `Connection::reset` (Stage 2) +
+  transparent producer / consumer rebuild via `rebuild_producers` /
+  `rebuild_consumers` (Stage 3) + `memory_limit` runtime enforcement (Java
+  `MemoryLimitPolicy::FailImmediately`) + global publish-bytes accounting via
+  `AtomicU64` CAS in `Producer::send` with release on `Drop`.
+- **Observability**: cumulative counters + `hdrhistogram` p50/p99/max latency
+  + rolling-window msgs/sec + bytes/sec rates (`record_rate_window`).
 - **Transports**: TCP, TLS 1.3 (`rustls`-only — no `native-tls`,
-  no `openssl`), binary proxy (`proxy_to_broker_url`).
+  no `openssl`), binary proxy (`proxy_to_broker_url`), pluggable DNS
+  (`DnsResolver` trait + `TokioDnsResolver` default routed through
+  `Transport::connect`).
+- **TLS knobs**: `tls_trust_certs_file_path`, `tls_allow_insecure_connection`
+  (blanket override), `tls_hostname_verification_enable(false)` paired with a
+  PEM trust store (chain-on / hostname-off via custom rustls verifier).
 - **Schemas**: bytes, string, JSON, Avro, Protobuf, Protobuf-native,
   KeyValue, Auto-consume, Auto-produce-bytes, plus the full primitive
   family — Int8, Int16, Int32, Int64, Float, Double, Bool, Date, Time,
   Timestamp, LocalDate, LocalTime, Instant, LocalDateTime.
 - **Compression**: LZ4, ZSTD, Snappy, ZLIB.
 - **Auth providers**: token, mTLS (the two stock providers in
-  `magnetar-proto::auth`), plus the OAuth2 ClientCredentialsFlow, SASL, and
-  Athenz scaffolds in dedicated crates.
+  `magnetar-proto::auth`), OAuth2 `ClientCredentialsFlow` (working — fetches
+  + caches + auto-refreshes JWTs against a standard OIDC token endpoint),
+  SASL and Athenz scaffolds.
 - **Trackers**: ack grouping, unacked-message tracker (ack timeout +
   redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff`
   (PIP-37), batch-index ACK set (PIP-54).

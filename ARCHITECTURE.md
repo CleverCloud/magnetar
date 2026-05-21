@@ -998,6 +998,168 @@ Key properties:
 
 ---
 
+## PIP-121 cluster failover architecture
+
+The supervised reconnect path (Stage 2) re-resolves the broker URL on every
+attempt via a pluggable `ServiceUrlProvider`. Three implementations ship:
+
+```
++--------------------------------+      +--------------------------------+
+| StaticServiceUrlProvider       |      | ControlledClusterFailover      |
+| (magnetar-proto::service_url)  |      | (magnetar-proto::cluster_*)    |
+|                                |      |                                |
+| pulsar://a:6650                |      | active = Arc<Mutex<String>>    |
+| (never changes)                |      | set_url(...) -> swap           |
++--------------------------------+      +--------------------------------+
+                |                                   |
+                |                                   |
+                v                                   v
++----------------------------------------------------------------------+
+| ServiceUrlProvider trait (sync, Send + Sync + Debug)                  |
+|   fn get_service_url(&self) -> String                                 |
++----------------------------------------------------------------------+
+                            ^
+                            |
++----------------------------------------------------------------------+
+| AutoClusterFailover (magnetar-runtime-tokio::auto_cluster_failover)   |
+|                                                                      |
+|   urls:   Arc<Vec<String>>  (priority order; index 0 = primary)      |
+|   probe:  Arc<dyn HealthProbe>  (async fn(url) -> bool)              |
+|   active: Arc<Mutex<usize>>                                          |
+|                                                                      |
+| start(interval) -> tokio::spawn(prober) -> JoinHandle                 |
+|                                                                      |
+|   on every tick: for each url -> probe -> first-healthy-wins         |
+|     if active_index changes -> tracing::info!(...) + atomic swap     |
++----------------------------------------------------------------------+
+
+                            |
+                            | (consulted on every reconnect attempt)
+                            v
++----------------------------------------------------------------------+
+| supervised_driver_loop (magnetar-runtime-tokio::driver)               |
+|                                                                      |
+| loop {                                                                |
+|     let url = reconnect_ctx.service_url_provider                      |
+|         .as_ref()                                                     |
+|         .map(|p| ParsedUrl::parse(&p.get_service_url())?)             |
+|         .unwrap_or(&reconnect_ctx.url);                               |
+|     Transport::connect_with_resolver(                                 |
+|         url, tls_config, dns_resolver.as_deref()                      |
+|     ).await?;                                                         |
+|     // ... handshake + rebuild_producers + rebuild_consumers          |
+| }                                                                     |
++----------------------------------------------------------------------+
+```
+
+Java-parity API:
+
+```rust
+use magnetar::PulsarClient;
+use magnetar_runtime_tokio::AutoClusterFailover;
+use std::sync::Arc;
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let failover = AutoClusterFailover::new(
+    vec![
+        "pulsar://primary:6650".into(),
+        "pulsar://standby:6650".into(),
+    ],
+    Arc::new(MyHealthProbe),
+);
+let _handle = failover.start(std::time::Duration::from_secs(5));
+
+let client = PulsarClient::builder()
+    .service_url_provider(Arc::new(failover))
+    .build()
+    .await?;
+# Ok(()) }
+```
+
+ADR-0011 (clock injection) is unaffected — the prober uses tokio's wall
+clock for its `interval` driver, but the active URL itself is just a
+`String`.
+
+---
+
+## memory_limit runtime accounting
+
+Java's `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)` is enforced via
+an `AtomicU64` CAS reservation in `Producer::send`:
+
+```
+ClientBuilder::memory_limit(bytes, FailImmediately)
+   |
+   v  (config.memory_limit_bytes = bytes)
+ConnectionConfig (magnetar-proto, just a u64; 0 = unlimited)
+   |
+   v
+ConnectionShared (magnetar-runtime-tokio)
+  + memory_limit_bytes: u64    (copied from config at construction)
+  + memory_used: AtomicU64     (in-flight reserved bytes)
+
+Producer::send(msg):
+  let n = msg.payload.len() as u64;
+  shared.try_reserve_memory(n)?
+      // CAS loop: load(Acquire) -> check current+n <= limit -> compare_exchange(AcqRel)
+      // Err(MemoryLimitExceeded { current, limit, requested }) on overflow.
+  let result = conn.send(handle, msg, ...);
+  match result {
+    Ok(seq) => SendFut { reserved_bytes: n, ... },         // released on Poll::Ready
+    Err(_)  => { shared.release_memory(n); SendFut { reserved_bytes: 0 } }
+  }
+
+SendFut::poll -> Ready -> release_memory(self.reserved_bytes)
+SendFut::drop -> release if not already released (caller cancelled)
+```
+
+`ProducerBlock` policy semantics (block until budget frees up) is the
+planned follow-up — would park the future on a `Notify` keyed on the
+budget counter.
+
+---
+
+## PIP-188 reconnect-on-migrate flow
+
+The broker can ask the client to move a producer / consumer to a different
+broker via `CommandTopicMigrated`. magnetar handles it as:
+
+```
+broker -> CommandTopicMigrated { producer | consumer, new_url, new_url_tls }
+                |
+                v
+magnetar-proto::Connection::handle_bytes
+                |
+                v
+ConnectionEvent::TopicMigrated -> events queue
+                |
+                v
+magnetar-runtime-tokio::driver::handle_pending_events
+                |
+                v
+tracing::info!("PIP-188 topic migration; supervised reconnect will fire")
+                |
+                v
+Err(ClientError::Other) -> caught by supervised_driver_loop
+                |
+                v
+Connection::reset() -> backoff -> Transport::connect(...) -> handshake
+                |
+                v
+rebuild_producers() / rebuild_consumers() -> re-emit every still-open
+                                              handle's CommandProducer /
+                                              CommandSubscribe (new epoch).
+                                              Broker-side lookup happens
+                                              naturally and yields the new
+                                              owner.
+```
+
+User futures stay live across the migration. In-flight publishes severed
+by the reset surface `OpOutcome::SessionLost` and the user retries (the
+planned Stage 3 follow-up is transparent at-least-once replay).
+
+---
+
 ## TLS sites
 
 The workspace has **three** TLS sites. **None** use `native-tls`.
