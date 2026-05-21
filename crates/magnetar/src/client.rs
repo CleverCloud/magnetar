@@ -612,12 +612,26 @@ impl PulsarClient {
         self.inner.close().await;
     }
 
+    /// Alias for [`Self::close`]. Mirrors Java `PulsarClient#shutdown`, which is just the
+    /// blocking form of `close` — same semantics from Rust because every async future is
+    /// already non-blocking from the caller's perspective.
+    pub async fn shutdown(self) {
+        self.close().await;
+    }
+
     /// Returns `true` while the underlying broker connection is up. Mirrors Java's
     /// `org.apache.pulsar.client.api.Producer#isConnected` and
     /// `Consumer#isConnected` at the client scope.
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected()
+    }
+
+    /// `true` once [`Self::close`] has been called or the broker connection has entered a
+    /// terminal state. Mirrors Java `PulsarClient#isClosed`.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     /// Wall-clock time the underlying broker connection was most recently torn down (peer
