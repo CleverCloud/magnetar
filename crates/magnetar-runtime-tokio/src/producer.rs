@@ -38,6 +38,14 @@ impl Producer {
         self.handle
     }
 
+    /// Compression codec this producer was opened with. Mirrors Java
+    /// `ProducerImpl#conf.getCompressionType()`. Returns `CompressionKind::None` when
+    /// the producer was opened without explicit compression.
+    #[must_use]
+    pub fn compression(&self) -> CompressionKind {
+        self.compression
+    }
+
     /// `true` if this producer has been closed (locally via [`Self::close`] or remotely
     /// via a broker `CloseProducer`). Mirrors Java `ProducerImpl#getState() == CLOSED`.
     /// Use [`Self::is_connected`] for the live test — `is_closed` only flips after a

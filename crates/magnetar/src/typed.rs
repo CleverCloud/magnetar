@@ -100,6 +100,12 @@ impl<S: Schema> TypedProducer<S> {
         self.inner.name()
     }
 
+    /// Compression codec this producer was configured with. See `Producer::compression`.
+    #[must_use]
+    pub fn compression(&self) -> magnetar_proto::types::CompressionKind {
+        self.inner.compression()
+    }
+
     /// `true` while the broker connection is up. Mirrors Java `Producer#isConnected`.
     #[must_use]
     pub fn is_connected(&self) -> bool {
