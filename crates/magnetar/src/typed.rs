@@ -73,6 +73,15 @@ impl<S: Schema> TypedProducer<S> {
         Ok(id)
     }
 
+    /// Start a Java-symmetric `TypedMessageBuilder`. Mirrors `producer.newMessage()` —
+    /// chain `.key`, `.event_time_ms`, `.property`, etc., end with `.send(&value).await`.
+    pub fn new_message(&self) -> TypedMessageBuilder<'_, S> {
+        TypedMessageBuilder {
+            producer: self,
+            msg: crate::OutgoingMessage::default(),
+        }
+    }
+
     /// Close the underlying producer.
     pub async fn close(self) -> Result<(), PulsarError> {
         self.inner.close().await.map_err(PulsarError::Client)
@@ -133,6 +142,100 @@ impl<S: Schema> TypedProducer<S> {
     /// `Producer#flushAsync`.
     pub async fn flush(&self) -> Result<(), PulsarError> {
         self.inner.flush().await.map_err(PulsarError::Client)
+    }
+}
+
+/// Schema-aware counterpart to [`crate::MessageBuilder`]. Captures a `&TypedProducer`
+/// and lets callers chain Java-style: `producer.new_message().key(..).value(&typed).send()`.
+/// The schema runs on `.send(&value)` so we don't pay the encode cost on values that get
+/// dropped mid-build (a logic error caught by the borrow checker, but cheap to be
+/// defensive about).
+#[derive(Debug)]
+pub struct TypedMessageBuilder<'a, S: Schema> {
+    producer: &'a TypedProducer<S>,
+    msg: crate::OutgoingMessage,
+}
+
+impl<S: Schema> TypedMessageBuilder<'_, S> {
+    /// Set the routing key. See [`crate::OutgoingMessage::key`].
+    #[must_use]
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.msg = self.msg.key(key);
+        self
+    }
+
+    /// Set the ordering key. See [`crate::OutgoingMessage::ordering_key`].
+    #[must_use]
+    pub fn ordering_key(mut self, key: impl Into<Bytes>) -> Self {
+        self.msg = self.msg.ordering_key(key);
+        self
+    }
+
+    /// Set the event time (millis since epoch). See [`crate::OutgoingMessage::event_time_ms`].
+    #[must_use]
+    pub fn event_time_ms(mut self, ts: u64) -> Self {
+        self.msg = self.msg.event_time_ms(ts);
+        self
+    }
+
+    /// Append a property. See [`crate::OutgoingMessage::property`].
+    #[must_use]
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.msg = self.msg.property(key, value);
+        self
+    }
+
+    /// See [`crate::OutgoingMessage::deliver_at_ms`].
+    #[must_use]
+    pub fn deliver_at_ms(mut self, ts_ms: i64) -> Self {
+        self.msg = self.msg.deliver_at_ms(ts_ms);
+        self
+    }
+
+    /// See [`crate::OutgoingMessage::deliver_after_ms`].
+    #[must_use]
+    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms(delay_ms);
+        self
+    }
+
+    /// See [`crate::OutgoingMessage::replication_clusters`].
+    #[must_use]
+    pub fn replication_clusters(mut self, clusters: Vec<String>) -> Self {
+        self.msg = self.msg.replication_clusters(clusters);
+        self
+    }
+
+    /// See [`crate::OutgoingMessage::disable_replication`].
+    #[must_use]
+    pub fn disable_replication(mut self) -> Self {
+        self.msg = self.msg.disable_replication();
+        self
+    }
+
+    /// See [`crate::OutgoingMessage::txn`].
+    #[must_use]
+    pub fn txn(mut self, txn_id: magnetar_proto::TxnId) -> Self {
+        self.msg = self.msg.txn(txn_id);
+        self
+    }
+
+    /// Encode `value` with the producer's schema and submit. Mirrors Java's
+    /// terminal `TypedMessageBuilder#send`.
+    pub async fn send(self, value: &S::Owned) -> Result<MessageId, PulsarError> {
+        let bytes = self
+            .producer
+            .schema
+            .encode(value)
+            .map_err(schema_to_pulsar)?;
+        let with_payload = self.msg.value(bytes);
+        let id = self
+            .producer
+            .inner
+            .send(with_payload.into())
+            .await
+            .map_err(PulsarError::Client)?;
+        Ok(id)
     }
 }
 

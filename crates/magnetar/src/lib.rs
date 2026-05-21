@@ -90,7 +90,8 @@ pub use table_view::{TableView, TableViewBuilder, TableViewListener};
 pub use transaction::{Transaction, TxnState};
 #[cfg(feature = "tokio")]
 pub use typed::{
-    TypedConsumer, TypedConsumerBuilder, TypedMessage, TypedProducer, TypedProducerBuilder,
+    TypedConsumer, TypedConsumerBuilder, TypedMessage, TypedMessageBuilder, TypedProducer,
+    TypedProducerBuilder,
 };
 
 // PIP-4 encryption bridge: implement the runtime's MessageEncryptor / MessageDecryptor traits
