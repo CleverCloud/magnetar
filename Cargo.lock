@@ -1432,6 +1432,7 @@ dependencies = [
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "testcontainers",
