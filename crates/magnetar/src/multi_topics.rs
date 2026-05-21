@@ -78,6 +78,42 @@ impl MultiTopicsConsumer {
         self.inner.consumers.is_empty()
     }
 
+    /// Shared subscription name across every per-topic child. Returns an empty string if
+    /// no child consumer exists (empty topic list — should not happen post-builder).
+    /// Mirrors Java `Consumer#getSubscription` at the multi-topic / partitioned scope.
+    #[must_use]
+    pub fn subscription(&self) -> String {
+        self.inner
+            .consumers
+            .first()
+            .map(|c| c.consumer.subscription())
+            .unwrap_or_default()
+    }
+
+    /// Negatively acknowledge a message. The caller supplies the topic the message came
+    /// from (returned alongside the message in [`MultiTopicsMessage::topic`]) so the nack
+    /// goes to the correct per-topic consumer.
+    pub fn negative_ack(&self, topic: &str, message_id: MessageId) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| {
+                PulsarError::Config(format!("negative_ack for unknown topic {topic}"))
+            })?;
+        consumer.consumer.negative_ack(message_id);
+        Ok(())
+    }
+
+    /// Tell the broker to redeliver every unacked message across every child consumer.
+    /// Mirrors Java `Consumer#redeliverUnacknowledgedMessages` at the multi-topic scope.
+    pub fn redeliver_unacked(&self) {
+        for nc in &self.inner.consumers {
+            nc.consumer.redeliver_unacked();
+        }
+    }
+
     /// Receive the next message across any subscribed topic. The future is cancel-safe:
     /// dropping it without polling to completion leaves all unpopped messages in their
     /// respective per-consumer queues.
