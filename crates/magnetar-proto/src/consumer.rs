@@ -119,6 +119,11 @@ pub struct ConsumerState {
     /// coalesced `CommandAck` per group window. `None` keeps every ack synchronous (the
     /// default).
     pub ack_tracker: Option<crate::trackers::AckGroupingTracker>,
+    /// PIP-4 decryption failure handling, mirrors Java
+    /// `org.apache.pulsar.client.api.ConsumerCryptoFailureAction`. Default `Fail`. The
+    /// runtime engine reads this via [`Self::crypto_failure_action`] when decryption fails
+    /// to decide whether to propagate, drop, or surface the ciphertext.
+    pub crypto_failure_action: crate::conn::CryptoFailureAction,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -260,7 +265,15 @@ impl ConsumerState {
             unacked_tracker: None,
             batch_ack_tracker: HashMap::new(),
             ack_tracker: None,
+            crypto_failure_action: crate::conn::CryptoFailureAction::Fail,
         }
+    }
+
+    /// PIP-4 decryption failure handling configured for this consumer. Mirrors Java
+    /// `Consumer#getCryptoFailureAction`.
+    #[must_use]
+    pub fn crypto_failure_action(&self) -> crate::conn::CryptoFailureAction {
+        self.crypto_failure_action
     }
 
     /// Snapshot of cumulative counters. Mirrors Java `ConsumerStats`.

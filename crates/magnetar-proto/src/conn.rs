@@ -358,6 +358,28 @@ pub struct SubscribeRequest {
     /// guarantees for lower ack-bandwidth on high-throughput consumers. `None` keeps every
     /// ack synchronous (the default).
     pub ack_group_time: Option<Duration>,
+    /// Mirrors Java `ConsumerBuilder#cryptoFailureAction`. Controls what the consumer does
+    /// when payload decryption fails (PIP-4). `Fail` (default) propagates the error to the
+    /// caller; `Discard` silently drops the message; `Consume` delivers the encrypted
+    /// ciphertext as-is.
+    pub crypto_failure_action: CryptoFailureAction,
+}
+
+/// PIP-4 decryption failure handling. Mirrors Java
+/// `org.apache.pulsar.client.api.ConsumerCryptoFailureAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CryptoFailureAction {
+    /// Surface the decryption error to the caller (default — fail-fast). Matches the
+    /// pre-PIP-4 behavior.
+    #[default]
+    Fail,
+    /// Silently drop the message and continue receiving. The caller never sees the
+    /// undecryptable payload — useful when some keys are rotated out and lingering
+    /// messages encrypted with retired keys should be ignored.
+    Discard,
+    /// Deliver the encrypted ciphertext + the `EncryptionKeys` metadata as-is to the
+    /// caller, who can then attempt out-of-band decryption.
+    Consume,
 }
 
 /// Mirrors Java's `KeySharedPolicy`. Configures how a `Key_Shared` subscription distributes
@@ -409,6 +431,7 @@ impl Default for SubscribeRequest {
             ack_timeout: None,
             ack_timeout_backoff: None,
             ack_group_time: None,
+            crypto_failure_action: CryptoFailureAction::Fail,
         }
     }
 }
@@ -1504,6 +1527,7 @@ impl Connection {
         if let Some(group_time) = req.ack_group_time {
             state.ack_tracker = Some(crate::trackers::AckGroupingTracker::new(handle, group_time));
         }
+        state.crypto_failure_action = req.crypto_failure_action;
         self.consumers.insert(handle, state);
 
         let subscription_properties: Vec<pb::KeyValue> = req
