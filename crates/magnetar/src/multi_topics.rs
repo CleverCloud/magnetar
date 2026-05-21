@@ -275,6 +275,12 @@ pub struct MultiTopicsConsumerBuilder<'a> {
     ack_timeout: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
     read_compacted: bool,
+    priority_level: Option<i32>,
+    subscription_properties: Vec<(String, String)>,
+    key_shared: Option<magnetar_proto::KeySharedConfig>,
+    replicate_subscription_state: Option<bool>,
+    force_topic_creation: Option<bool>,
+    start_message_rollback_duration_sec: Option<u64>,
 }
 
 impl<'a> MultiTopicsConsumerBuilder<'a> {
@@ -292,6 +298,12 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             ack_timeout: None,
             dlq_policy: None,
             read_compacted: false,
+            priority_level: None,
+            subscription_properties: Vec::new(),
+            key_shared: None,
+            replicate_subscription_state: None,
+            force_topic_creation: None,
+            start_message_rollback_duration_sec: None,
         }
     }
 
@@ -390,6 +402,54 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors `ConsumerBuilder::priority_level`.
+    #[must_use]
+    pub fn priority_level(mut self, level: i32) -> Self {
+        self.priority_level = Some(level);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::subscription_property` — appends a (key, value) pair to
+    /// every per-topic child's subscription metadata.
+    #[must_use]
+    pub fn subscription_property(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.subscription_properties
+            .push((key.into(), value.into()));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::key_shared_policy`.
+    #[must_use]
+    pub fn key_shared_policy(mut self, cfg: magnetar_proto::KeySharedConfig) -> Self {
+        self.key_shared = Some(cfg);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::replicate_subscription_state`.
+    #[must_use]
+    pub fn replicate_subscription_state(mut self, on: bool) -> Self {
+        self.replicate_subscription_state = Some(on);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::force_topic_creation`.
+    #[must_use]
+    pub fn force_topic_creation(mut self, on: bool) -> Self {
+        self.force_topic_creation = Some(on);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::start_message_rollback_duration`.
+    #[must_use]
+    pub fn start_message_rollback_duration(mut self, seconds: u64) -> Self {
+        self.start_message_rollback_duration_sec = Some(seconds);
+        self
+    }
+
     /// Open every per-topic subscription concurrently. If any subscribe fails the others
     /// that already succeeded are torn down before the error is returned.
     pub async fn subscribe(self) -> Result<MultiTopicsConsumer, PulsarError> {
@@ -426,6 +486,24 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             }
             if let Some((max, topic_opt)) = &self.dlq_policy {
                 builder = builder.dead_letter_policy(*max, topic_opt.clone());
+            }
+            if let Some(level) = self.priority_level {
+                builder = builder.priority_level(level);
+            }
+            for (k, v) in &self.subscription_properties {
+                builder = builder.subscription_property(k.clone(), v.clone());
+            }
+            if let Some(cfg) = self.key_shared.clone() {
+                builder = builder.key_shared_policy(cfg);
+            }
+            if let Some(on) = self.replicate_subscription_state {
+                builder = builder.replicate_subscription_state(on);
+            }
+            if let Some(on) = self.force_topic_creation {
+                builder = builder.force_topic_creation(on);
+            }
+            if let Some(s) = self.start_message_rollback_duration_sec {
+                builder = builder.start_message_rollback_duration(s);
             }
             let result = builder.subscribe().await;
             match result {
