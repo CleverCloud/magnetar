@@ -547,7 +547,7 @@ impl ConsumerState {
             payload: body,
             redelivery_count: redelivery,
             broker_entry_metadata,
-            arrived_at: std::time::Instant::now(),
+            arrived_at: now,
         };
         let outcome = self.classify_and_queue(im, redelivery, now);
         self.wake_receivers();

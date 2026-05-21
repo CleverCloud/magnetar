@@ -6,6 +6,9 @@
 //! - `codegen` / `codegen --check`: regenerate / verify `magnetar-proto/src/pb/`.
 //! - `check-no-channels`: grep the workspace for banned channel paths.
 //! - `check-no-io-deps`: assert `magnetar-proto` has zero I/O dependencies.
+//! - `check-no-internal-clock`: assert `magnetar-proto/src/**` never reads the host clock
+//!   (`Instant::now()` / `SystemTime::now()`) outside the two documented leak files. Mirrors
+//!   ADR-0011.
 //! - `vendor-proto --rev <sha>`: refresh vendored `PulsarApi.proto`.
 //!
 //! Codegen drives `prost-build` against `crates/magnetar-proto/proto/`, writes
@@ -68,6 +71,12 @@ enum Cmd {
     CheckNoChannels,
     /// Assert that `magnetar-proto` has no I/O dependencies in its dep graph.
     CheckNoIoDeps,
+    /// Assert that `magnetar-proto/src/**` does not read the host clock.
+    ///
+    /// Greps for direct calls to [`std::time::Instant::now`] and
+    /// [`std::time::SystemTime::now`] outside `#[cfg(test)]` blocks and
+    /// outside the two documented leak files. See ADR-0011.
+    CheckNoInternalClock,
     /// Refresh the vendored Pulsar proto from a given upstream commit.
     VendorProto {
         /// Apache Pulsar commit SHA to vendor from.
@@ -95,6 +104,7 @@ fn dispatch() -> Result<()> {
         Cmd::Codegen { check } => codegen(check),
         Cmd::CheckNoChannels => check_no_channels(),
         Cmd::CheckNoIoDeps => check_no_io_deps(),
+        Cmd::CheckNoInternalClock => check_no_internal_clock(),
         Cmd::VendorProto { rev, source: _ } => {
             bail!("xtask vendor-proto: not implemented yet (lands in M1). Requested rev: {rev}");
         }
@@ -310,6 +320,135 @@ fn check_no_io_deps() -> Result<()> {
         }
         bail!(
             "magnetar-proto pulled in {} forbidden I/O crate(s). See GUIDELINES.md#i-o-isolation.",
+            offenders.len()
+        );
+    }
+    Ok(())
+}
+
+/// File paths inside `magnetar-proto/src/` that are *explicitly* allowed to
+/// touch the host clock, mirroring the "Known non-determinism leaks" list in
+/// [`ARCHITECTURE.md`] + ADR-0011. Every other file under
+/// `crates/magnetar-proto/src/` must drive time through the injected
+/// `now: Instant` / `wall_clock` parameters.
+///
+/// Paths are workspace-relative and matched with [`Path::ends_with`] so the
+/// check is robust to symlinks and absolute prefixes. Keep this list in lockstep
+/// with the leak inventory in `ARCHITECTURE.md` (search for
+/// "Known non-determinism leaks").
+const CLOCK_LEAK_ALLOWLIST: &[&str] = &[
+    // PIP-37 chunked emit currently uses uuid::Uuid::new_v4() — no clock
+    // reads, but listed here so the file is visited by the inventory checker
+    // when leak categories are expanded.
+    "crates/magnetar-proto/src/producer.rs",
+    // TokenAuth bootstrap calls std::env::var() once at construction — no
+    // clock reads either, but same rationale: keeps the leak list in one
+    // place.
+    "crates/magnetar-proto/src/auth/token.rs",
+];
+
+fn check_no_internal_clock() -> Result<()> {
+    // We want to flag direct host-clock reads in `magnetar-proto/src/**`. The
+    // patterns we treat as "host clock reads" are
+    //   - `Instant::now()`        (matches both `std::time::Instant::now()` and unqualified
+    //     `Instant::now()`)
+    //   - `SystemTime::now()`     (same logic)
+    //
+    // We must NOT flag occurrences inside `#[cfg(test)]` blocks (tests
+    // legitimately materialise instants for their fixtures) nor inside
+    // doc-comments / regular comments (those are documentation, not calls).
+    //
+    // The cheap implementation: a small line-level scanner that maintains an
+    // "inside cfg(test) block" depth counter. It's not a Rust parser, but the
+    // workspace style is consistent enough — `#[cfg(test)]` attributes sit on
+    // their own line, immediately followed by a `mod` or `fn` and a brace
+    // that opens on the same/next line. We follow the brace count from the
+    // first `{` after the attribute until we return to the surrounding depth.
+    //
+    // See ADR-0011 for the rationale; see ARCHITECTURE.md
+    // "Known non-determinism leaks (documented)" for the allowlist.
+    let workspace_root = workspace_root()?;
+    let proto_src = workspace_root.join("crates/magnetar-proto/src");
+
+    let needles: &[&str] = &["Instant::now()", "SystemTime::now()"];
+
+    let mut offenders: Vec<String> = Vec::new();
+    visit(&proto_src, &mut |path, contents| {
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            return;
+        }
+        // Allow the documented leak sites.
+        if CLOCK_LEAK_ALLOWLIST
+            .iter()
+            .any(|allowed| path.ends_with(allowed) || path.to_string_lossy().ends_with(allowed))
+        {
+            return;
+        }
+
+        // Walk lines, tracking #[cfg(test)] brace depth so we can skip them.
+        let mut in_cfg_test = false;
+        let mut depth: i32 = 0;
+        let mut pending_cfg_test = false;
+
+        for (lineno_zero, line) in contents.lines().enumerate() {
+            let lineno = lineno_zero + 1;
+            let trimmed = line.trim_start();
+
+            // Detect a fresh `#[cfg(test)]` attribute. We mark it pending so
+            // the *next* `{` opens a test scope. We tolerate composite
+            // attributes like `#[cfg(all(test, feature = "x"))]`.
+            if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
+                pending_cfg_test = true;
+            }
+
+            // Count braces on this line so we can enter/leave the cfg(test)
+            // span as the source nests.
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+
+            if pending_cfg_test && opens > 0 {
+                in_cfg_test = true;
+                pending_cfg_test = false;
+                depth = opens - closes;
+                continue;
+            }
+
+            if in_cfg_test {
+                depth += opens - closes;
+                if depth <= 0 {
+                    in_cfg_test = false;
+                    depth = 0;
+                }
+                continue;
+            }
+
+            // Strip the trailing "//" comment (if any) so we don't flag prose
+            // that *mentions* `Instant::now()` in a doc-string or comment.
+            let code = match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            };
+
+            for needle in needles {
+                if code.contains(needle) {
+                    offenders.push(format!(
+                        "{}:{}: contains {needle} outside #[cfg(test)] — see ADR-0011",
+                        path.display(),
+                        lineno
+                    ));
+                }
+            }
+        }
+    })?;
+
+    if !offenders.is_empty() {
+        for line in &offenders {
+            eprintln!("forbidden host-clock read — {line}");
+        }
+        bail!(
+            "no-internal-clock check failed: {} offender(s). \
+             magnetar-proto must take `now: Instant` / `wall_clock` providers \
+             through its API — see specs/adr/0011-clock-injection-sans-io.md.",
             offenders.len()
         );
     }

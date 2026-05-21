@@ -95,6 +95,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-no-io-deps
 
+  no-internal-clock:
+    name: no-internal-clock (magnetar-proto)
+    # Asserts `magnetar-proto/src/**` never reads the host clock outside
+    # `#[cfg(test)]` blocks + the two documented leak files. Mirrors ADR-0011
+    # (clock-injection-sans-io). The sans-io state machine must receive
+    # `now: Instant` / `wall_clock` providers from the engine.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-no-internal-clock
+
   moonpool-sim:
     name: moonpool deterministic-simulation
     runs-on: ubuntu-latest
