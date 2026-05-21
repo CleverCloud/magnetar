@@ -735,6 +735,7 @@ impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
 #[derive(Debug)]
 pub struct PulsarClient {
     inner: Client,
+    memory_limit: Option<MemoryLimit>,
 }
 
 impl PulsarClient {
@@ -749,6 +750,18 @@ impl PulsarClient {
     #[must_use]
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
+    }
+
+    /// The global publish memory budget configured at build time, if any.
+    /// Mirrors Java `PulsarClient#getMemoryLimit`. `None` means no limit was
+    /// configured (the Java default).
+    ///
+    /// **Note**: today this is configuration-only — the runtime does not yet
+    /// enforce the limit. See [`ClientBuilder::memory_limit`] for the planned
+    /// follow-up.
+    #[must_use]
+    pub fn memory_limit(&self) -> Option<MemoryLimit> {
+        self.memory_limit
     }
 
     /// Open a `ProducerBuilder` for the given topic.
@@ -919,6 +932,35 @@ impl PulsarClient {
     }
 }
 
+/// Java parity: `org.apache.pulsar.client.api.MemoryLimitPolicy`.
+///
+/// Selects how the client behaves when the configured global publish memory budget is
+/// exhausted (see [`ClientBuilder::memory_limit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryLimitPolicy {
+    /// Fail new sends immediately with an `out of memory` error. Mirrors Java
+    /// `MemoryLimitPolicy.FAIL_IMMEDIATELY` (the Java default).
+    FailImmediately,
+    /// Block the producer's `send`/`sendAsync` until enough room frees up. Mirrors
+    /// Java `MemoryLimitPolicy.PRODUCER_BLOCK`.
+    ProducerBlock,
+}
+
+/// Java parity: configured global publish memory budget. Stored verbatim on
+/// [`ClientBuilder`] and exposed to consumers via [`PulsarClient::memory_limit`].
+///
+/// **Note**: today this is configuration storage only — the actual enforcement
+/// (accounting against in-flight publish bytes per the policy) is a follow-up
+/// to land before the `0.1` release. The surface is shipped now so callers can
+/// migrate from Java without changing their builder chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimit {
+    /// Upper bound in bytes. `0` disables the limit (matches Java default).
+    pub bytes: usize,
+    /// Policy applied when the budget is exhausted.
+    pub policy: MemoryLimitPolicy,
+}
+
 /// Builder for [`PulsarClient`].
 #[derive(Debug, Default, Clone)]
 pub struct ClientBuilder {
@@ -934,6 +976,7 @@ pub struct ClientBuilder {
     default_max_message_size: Option<usize>,
     proxy_to_broker_url: Option<String>,
     supervisor: Option<magnetar_proto::SupervisorConfig>,
+    memory_limit: Option<MemoryLimit>,
 }
 
 impl ClientBuilder {
@@ -941,6 +984,21 @@ impl ClientBuilder {
     #[must_use]
     pub fn service_url(mut self, url: impl Into<String>) -> Self {
         self.service_url = Some(url.into());
+        self
+    }
+
+    /// Set the global publish memory budget for the client. Mirrors Java
+    /// `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)`. `bytes = 0`
+    /// disables the limit (matches Java default).
+    ///
+    /// **Storage today**: the configured limit + policy are stored on the
+    /// resulting [`PulsarClient`] and retrievable via
+    /// [`PulsarClient::memory_limit`]. Enforcement (accounting against
+    /// in-flight publish bytes, blocking on `ProducerBlock`, failing on
+    /// `FailImmediately`) is a planned follow-up.
+    #[must_use]
+    pub fn memory_limit(mut self, bytes: usize, policy: MemoryLimitPolicy) -> Self {
+        self.memory_limit = Some(MemoryLimit { bytes, policy });
         self
     }
 
@@ -1103,7 +1161,10 @@ impl ClientBuilder {
         } else {
             Client::connect_auth(&service_url, config, self.auth_provider).await?
         };
-        Ok(PulsarClient { inner })
+        Ok(PulsarClient {
+            inner,
+            memory_limit: self.memory_limit,
+        })
     }
 }
 

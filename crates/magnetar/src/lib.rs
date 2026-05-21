@@ -75,10 +75,11 @@ mod transaction;
 mod typed;
 #[cfg(feature = "tokio")]
 pub use client::{
-    ClientBuilder, ConsumerBuilder, ConsumerInterceptor, IncomingMessage, MessageBuilder,
-    OutgoingMessage, ProducerBuilder, ProducerExt, ProducerInterceptor, PulsarClient, PulsarError,
-    Reader, ReaderBuilder, SeekTarget, ack_cumulative_with_interceptors, ack_with_interceptors,
-    receive_with_interceptors, send_with_interceptors,
+    ClientBuilder, ConsumerBuilder, ConsumerInterceptor, IncomingMessage, MemoryLimit,
+    MemoryLimitPolicy, MessageBuilder, OutgoingMessage, ProducerBuilder, ProducerExt,
+    ProducerInterceptor, PulsarClient, PulsarError, Reader, ReaderBuilder, SeekTarget,
+    ack_cumulative_with_interceptors, ack_with_interceptors, receive_with_interceptors,
+    send_with_interceptors,
 };
 #[cfg(feature = "tokio")]
 pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};

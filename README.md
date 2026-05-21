@@ -589,10 +589,10 @@ known-missing feature.
 | `maxMessageSize` | ✅ | ✅ | `ClientBuilder::max_message_size`. |
 | `tlsTrustCertsFilePath` | ✅ | ✅ | `ClientBuilder::tls_trust_certs_file_path`. |
 | `tlsAllowInsecureConnection` | ✅ | ❌ | Use a custom rustls config (workaround). |
-| `serviceUrlProvider` (URL rotation) | ✅ | ❌ | Single URL only today. |
+| `serviceUrlProvider` (URL rotation) | ✅ | 🟡 | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)`; runtime URL rotation on reconnect pending. |
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
-| `memoryLimit` | ✅ | ❌ | No global memory governor yet. |
+| `memoryLimit` | ✅ | 🟡 | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` + `PulsarClient::memory_limit` getter; runtime enforcement (accounting + blocking on `ProducerBlock`) pending. |
 | `dnsResolver` customisation | ✅ | ❌ | Uses tokio default. |
 | `isClosed` / `shutdown` / `getLastDisconnectedTimestamp` | ✅ | ✅ | All exposed on `PulsarClient`. |
 | Cluster failover (PIP-121) | ✅ | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ClientBuilder::service_url_provider`; `AutoClusterFailover` and `ControlledClusterFailover` policies pending. |
