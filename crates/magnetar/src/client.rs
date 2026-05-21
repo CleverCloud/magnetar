@@ -395,6 +395,54 @@ impl IncomingMessage {
     pub fn replicated_from(&self) -> Option<&str> {
         self.metadata.replicated_from.as_deref()
     }
+
+    /// Mirrors Java `Message#hasReplicateTo`. `true` when the producer stamped an explicit
+    /// replication cluster list (via `OutgoingMessage::replication_clusters` /
+    /// `disable_replication`).
+    #[must_use]
+    pub fn has_replicate_to(&self) -> bool {
+        !self.metadata.replicate_to.is_empty()
+    }
+
+    /// Mirrors Java `Message#getReplicateTo`. Returns the cluster ids the message was
+    /// pinned to, or an empty slice when the producer used the namespace default.
+    #[must_use]
+    pub fn replicate_to(&self) -> &[String] {
+        &self.metadata.replicate_to
+    }
+
+    /// Mirrors Java `Message#hasEventTime`. `true` if the producer stamped a non-zero
+    /// event-time (Java distinguishes "unset" from "stamped 0" via this predicate).
+    #[must_use]
+    pub fn has_event_time(&self) -> bool {
+        self.metadata.event_time.is_some_and(|t| t != 0)
+    }
+
+    /// Mirrors Java `Message#hasOrderingKey`.
+    #[must_use]
+    pub fn has_ordering_key(&self) -> bool {
+        self.metadata.ordering_key.is_some()
+    }
+
+    /// Mirrors Java `Message#hasProperty(String)`.
+    #[must_use]
+    pub fn has_property(&self, key: &str) -> bool {
+        self.metadata.properties.iter().any(|kv| kv.key == key)
+    }
+
+    /// Mirrors Java `Message#hasProperties` — `true` if the message carries at least one
+    /// (key, value) property entry.
+    #[must_use]
+    pub fn has_properties(&self) -> bool {
+        !self.metadata.properties.is_empty()
+    }
+
+    /// Mirrors Java `Message#getSchemaVersion`. `None` for messages produced by schemaless
+    /// producers (or via auto-produce-bytes).
+    #[must_use]
+    pub fn schema_version(&self) -> Option<&[u8]> {
+        self.metadata.schema_version.as_deref()
+    }
 }
 
 impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
@@ -1352,5 +1400,62 @@ mod outgoing_message_tests {
         assert_eq!(converted.metadata.event_time, Some(7));
         assert_eq!(converted.metadata.properties.len(), 1);
         assert_eq!(converted.uncompressed_size, 3);
+    }
+
+    fn message_with(metadata: pb::MessageMetadata) -> IncomingMessage {
+        IncomingMessage {
+            id: magnetar_proto::types::MessageId::EARLIEST,
+            metadata,
+            payload: Bytes::new(),
+            redelivery_count: 0,
+        }
+    }
+
+    #[test]
+    fn incoming_has_event_time_distinguishes_zero_and_unset() {
+        let unset = message_with(pb::MessageMetadata::default());
+        assert!(!unset.has_event_time());
+
+        let zero = message_with(pb::MessageMetadata {
+            event_time: Some(0),
+            ..pb::MessageMetadata::default()
+        });
+        assert!(!zero.has_event_time());
+
+        let stamped = message_with(pb::MessageMetadata {
+            event_time: Some(42),
+            ..pb::MessageMetadata::default()
+        });
+        assert!(stamped.has_event_time());
+        assert_eq!(stamped.event_time_ms(), 42);
+    }
+
+    #[test]
+    fn incoming_property_helpers() {
+        let msg = message_with(pb::MessageMetadata {
+            properties: vec![pb::KeyValue {
+                key: "k".to_owned(),
+                value: "v".to_owned(),
+            }],
+            ..pb::MessageMetadata::default()
+        });
+        assert!(msg.has_properties());
+        assert!(msg.has_property("k"));
+        assert!(!msg.has_property("missing"));
+        assert_eq!(msg.property("k"), Some("v"));
+    }
+
+    #[test]
+    fn incoming_replicate_to_helpers() {
+        let empty = message_with(pb::MessageMetadata::default());
+        assert!(!empty.has_replicate_to());
+        assert!(empty.replicate_to().is_empty());
+
+        let stamped = message_with(pb::MessageMetadata {
+            replicate_to: vec!["a".to_owned(), "b".to_owned()],
+            ..pb::MessageMetadata::default()
+        });
+        assert!(stamped.has_replicate_to());
+        assert_eq!(stamped.replicate_to(), &["a", "b"]);
     }
 }
