@@ -60,6 +60,16 @@ impl Consumer {
         self.ack_many(vec![message_id], pb::command_ack::AckType::Individual)
     }
 
+    /// Acknowledge multiple messages in a single round-trip. Mirrors Java
+    /// `Consumer#acknowledgeAsync(List<MessageId>)`. Returns a future that resolves when the
+    /// broker confirms (`CommandAckResponse`).
+    pub fn ack_batch(
+        &self,
+        message_ids: Vec<MessageId>,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many(message_ids, pb::command_ack::AckType::Individual)
+    }
+
     /// Acknowledge a cumulative position.
     pub fn ack_cumulative(
         &self,
