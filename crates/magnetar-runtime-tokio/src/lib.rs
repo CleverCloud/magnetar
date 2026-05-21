@@ -70,6 +70,7 @@ mod transport;
 mod url_parse;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -105,6 +106,14 @@ pub struct ConnectionShared {
     /// Wakeup for `next_topic_list_change` futures. Notified after every push to
     /// `topic_list_changes`.
     pub topic_list_notify: Notify,
+    /// Set by the auto-reconnect supervisor between [`magnetar_proto::Connection::reset`] and
+    /// the new socket's handshake. When `true`, the driver loop runs
+    /// [`magnetar_proto::Connection::rebuild_producers`] +
+    /// [`magnetar_proto::Connection::rebuild_consumers`] the first time it observes the new
+    /// session transitioning to [`magnetar_proto::HandshakeState::Connected`], then clears
+    /// the flag so the rebuild fires exactly once per reconnect. Stage 3 of the supervisor
+    /// work: transparent producer / consumer replay on session loss.
+    pub pending_rebuild: AtomicBool,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -144,6 +153,7 @@ impl ConnectionShared {
             auth_provider,
             topic_list_changes: Mutex::new(std::collections::VecDeque::new()),
             topic_list_notify: Notify::new(),
+            pending_rebuild: AtomicBool::new(false),
         })
     }
 }

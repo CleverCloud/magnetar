@@ -173,6 +173,12 @@ pub struct ProducerState {
     /// digits, default range — the typical broker round-trip is sub-second so the bucket layout
     /// fits comfortably within the default 1-bound..u64::MAX scale.
     pub send_latency_hist: hdrhistogram::Histogram<u64>,
+    /// Reconnect epoch — bumped by [`crate::Connection::rebuild_producers`] each time the
+    /// supervisor re-issues this producer's [`pb::CommandProducer`] on a freshly-handshaked
+    /// session. Mirrors Java `ProducerImpl#epoch` and is stamped onto
+    /// `CommandProducer.epoch` so the broker accepts the re-attach (rejects stale
+    /// reconnects of older epochs). Starts at `0` for the original create.
+    pub epoch: u64,
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
@@ -320,6 +326,7 @@ impl ProducerState {
             // `ProducerStatsRecorderImpl`.
             send_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
                 .expect("hdrhistogram precision 3 is valid"),
+            epoch: 0,
         }
     }
 

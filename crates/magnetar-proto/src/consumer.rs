@@ -130,6 +130,12 @@ pub struct ConsumerState {
     /// `pop_message` / `receive`. Mirrors the latency percentiles surfaced by Java
     /// `ConsumerStatsRecorder` (p50, p99, max). Three significant digits, auto-resizing.
     pub receive_latency_hist: hdrhistogram::Histogram<u64>,
+    /// Highest message id whose ack the runtime has surfaced via
+    /// [`crate::Connection::ack`] / `ack_grouped_individual` / `ack_grouped_cumulative`. Used by
+    /// [`crate::Connection::rebuild_consumers`] to set the `start_message_id` on the replayed
+    /// `CommandSubscribe` so the broker resumes from the post-ack position after a reconnect
+    /// (avoids double-delivery of pre-reconnect messages). `None` until the first ack lands.
+    pub last_acked_message_id: Option<MessageId>,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -284,6 +290,7 @@ impl ConsumerState {
             // ConsumerStatsRecorder.
             receive_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
                 .expect("hdrhistogram precision 3 is valid"),
+            last_acked_message_id: None,
         }
     }
 

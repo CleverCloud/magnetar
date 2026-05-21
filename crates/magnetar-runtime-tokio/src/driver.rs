@@ -30,9 +30,13 @@
 //!    [`magnetar_proto::Connection::reset`] (which fails every in-flight op with
 //!    [`magnetar_proto::OpOutcome::SessionLost`]), restarts the handshake, and resumes step 1.
 //!
-//! Stage 3 (consumer/producer state replay) is still pending — for now, in-flight publishes and
-//! pending subscribe / lookup / seek / txn requests fail with `SessionLost`, and the caller is
-//! expected to reopen producers / consumers on the freshly-handshaked session.
+//! Stage 3 (producer / consumer state replay) wires in here too: after the new socket completes
+//! its handshake, the inner loop calls [`magnetar_proto::Connection::rebuild_producers`] and
+//! [`magnetar_proto::Connection::rebuild_consumers`], which re-emit every still-open producer's
+//! `CommandProducer` (with a bumped `epoch`) and every still-open consumer's `CommandSubscribe`
+//! plus `CommandFlow` (resuming from `last_acked_message_id` when known). In-flight publishes
+//! severed by the reset still surface `SessionLost` — full at-least-once replay is follow-up
+//! work.
 //!
 //! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
 
@@ -240,7 +244,9 @@ async fn supervised_driver_loop(
             }
         };
 
-        // Got a new transport. Reset the state machine + kick off CONNECT.
+        // Got a new transport. Reset the state machine + kick off CONNECT. Stage 3: arm the
+        // rebuild flag so the inner loop replays every still-open producer / consumer once the
+        // new socket's handshake completes.
         {
             let mut conn = shared.inner.lock();
             conn.reset();
@@ -251,6 +257,9 @@ async fn supervised_driver_loop(
                 return Err(err.into());
             }
         }
+        shared
+            .pending_rebuild
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         shared.driver_waker.notify_one();
 
         socket = new_socket;
@@ -356,6 +365,44 @@ where
                 if let Err(err) = shared.inner.lock().handle_bytes(now, &bytes) {
                     shared.inner.lock().mark_disconnected();
                     return Err(err.into());
+                }
+                // Supervisor Stage 3: once the new session's handshake completes, replay every
+                // still-open producer + consumer so user-facing handles survive the reconnect
+                // transparently. The compare-exchange ensures the rebuild fires exactly once
+                // per reconnect even if `handle_bytes` is called multiple times in quick
+                // succession.
+                if shared
+                    .pending_rebuild
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    let connected = shared.inner.lock().is_connected();
+                    if connected
+                        && shared
+                            .pending_rebuild
+                            .compare_exchange(
+                                true,
+                                false,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok()
+                    {
+                        let (n_p, n_c) = {
+                            let mut conn = shared.inner.lock();
+                            let producers = conn.rebuild_producers();
+                            let consumers = conn.rebuild_consumers();
+                            (producers.len(), consumers.len())
+                        };
+                        tracing::info!(
+                            producers = n_p,
+                            consumers = n_c,
+                            "supervisor: replayed producer + consumer state on reconnect"
+                        );
+                        // Wake the next loop iteration so `poll_transmit` flushes the
+                        // re-emitted `CommandProducer` / `CommandSubscribe` / `CommandFlow`
+                        // frames onto the new socket.
+                        shared.driver_waker.notify_one();
+                    }
                 }
                 // After handling bytes, drain semantic events. Most go to per-future Wakers
                 // already (the sans-io layer wakes them inline), but `AuthChallenge` requires
