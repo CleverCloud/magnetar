@@ -142,6 +142,27 @@ impl OutgoingMessage {
         self.txn_id = Some(txn_id);
         self
     }
+
+    /// Set the payload bytes. Mirrors Java `TypedMessageBuilder#value(byte[])` for the raw
+    /// bytes case — schema-encoded values land here after the schema-aware layer serialises
+    /// them. Lets the builder be constructed `OutgoingMessage::default().key(..).value(..)`
+    /// without forcing the caller through [`Self::with_payload`].
+    #[must_use]
+    pub fn value(mut self, payload: impl Into<Bytes>) -> Self {
+        self.payload = payload.into();
+        self
+    }
+
+    /// Send this message through `producer` and return the in-flight
+    /// [`magnetar_runtime_tokio::SendFut`]. Mirrors the terminal `send()` step of Java's
+    /// `TypedMessageBuilder`: `producer.newMessage().key(..).value(..).send()`. Equivalent
+    /// to `producer.send(msg.into())`, just chainable.
+    pub fn send(
+        self,
+        producer: &magnetar_runtime_tokio::Producer,
+    ) -> magnetar_runtime_tokio::SendFut {
+        producer.send(self.into())
+    }
 }
 
 impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
@@ -1163,5 +1184,38 @@ impl Reader {
     #[must_use]
     pub fn stats(&self) -> magnetar_proto::ConsumerStats {
         self.consumer.stats()
+    }
+}
+
+#[cfg(test)]
+mod outgoing_message_tests {
+    use super::*;
+
+    #[test]
+    fn value_sets_payload() {
+        let msg = OutgoingMessage::default()
+            .key("k")
+            .event_time_ms(42)
+            .property("p", "v")
+            .value("hello");
+        assert_eq!(msg.payload.as_ref(), b"hello");
+        assert_eq!(msg.key.as_deref(), Some("k"));
+        assert_eq!(msg.event_time_ms, Some(42));
+        assert_eq!(msg.properties.len(), 1);
+    }
+
+    #[test]
+    fn into_carries_payload_and_metadata() {
+        let msg = OutgoingMessage::default()
+            .key("k")
+            .event_time_ms(7)
+            .property("p", "v")
+            .value(b"abc".to_vec());
+        let converted: magnetar_proto::producer::OutgoingMessage = msg.into();
+        assert_eq!(converted.payload.as_ref(), b"abc");
+        assert_eq!(converted.metadata.partition_key.as_deref(), Some("k"));
+        assert_eq!(converted.metadata.event_time, Some(7));
+        assert_eq!(converted.metadata.properties.len(), 1);
+        assert_eq!(converted.uncompressed_size, 3);
     }
 }
