@@ -678,6 +678,8 @@ pub struct ClientBuilder {
     auth_data: Option<Vec<u8>>,
     auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
     tls_trust_certs_pem: Option<Vec<u8>>,
+    default_max_message_size: Option<usize>,
+    proxy_to_broker_url: Option<String>,
 }
 
 impl ClientBuilder {
@@ -706,6 +708,26 @@ impl ClientBuilder {
     #[must_use]
     pub fn operation_timeout(mut self, dur: Duration) -> Self {
         self.operation_timeout = Some(dur);
+        self
+    }
+
+    /// Override the default `max_message_size` used as the chunking threshold when the
+    /// broker does not advertise one on `CommandConnected`. The Pulsar default is 5 MiB;
+    /// match the broker's configured `maxMessageSize` to avoid mis-sized chunks. Mirrors
+    /// Java `ClientBuilder#maxMessageSize`.
+    #[must_use]
+    pub fn max_message_size(mut self, size: usize) -> Self {
+        self.default_max_message_size = Some(size);
+        self
+    }
+
+    /// Set the proxy-to-broker URL for the binary proxy path. The connection then opens
+    /// against the proxy with the broker URL stamped on the `CommandConnect.proxy_to_broker_url`
+    /// field. Mirrors Java `ClientBuilder#proxyServiceUrl(... ProxyProtocol.SNI)`. Leave
+    /// unset for direct broker connections.
+    #[must_use]
+    pub fn proxy_to_broker_url(mut self, url: impl Into<String>) -> Self {
+        self.proxy_to_broker_url = Some(url.into());
         self
     }
 
@@ -761,6 +783,12 @@ impl ClientBuilder {
         }
         if let Some(d) = self.operation_timeout {
             config.operation_timeout = d;
+        }
+        if let Some(s) = self.default_max_message_size {
+            config.default_max_message_size = s;
+        }
+        if let Some(url) = self.proxy_to_broker_url {
+            config.proxy_to_broker_url = Some(url);
         }
         if let Some(name) = self.auth_method_name {
             config.auth_method_name = name;
