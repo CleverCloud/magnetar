@@ -1292,6 +1292,34 @@ impl Reader {
     pub fn stats(&self) -> magnetar_proto::ConsumerStats {
         self.consumer.stats()
     }
+
+    /// `true` once the broker has signalled (via `CommandReachedEndOfTopic`) that no more
+    /// messages will be dispatched on this topic. Mirrors Java
+    /// `Reader#hasReachedEndOfTopic`.
+    #[must_use]
+    pub fn has_reached_end_of_topic(&self) -> bool {
+        self.consumer.has_reached_end_of_topic()
+    }
+
+    /// Pause delivery for this reader. The broker stops dispatching new messages once
+    /// already-issued permits drain; buffered messages remain available via
+    /// [`Self::read_next`]. Mirrors `Reader#pause`.
+    pub fn pause(&self) {
+        self.consumer.pause();
+    }
+
+    /// Resume delivery after [`Self::pause`]. Mirrors `Reader#resume`.
+    pub fn resume(&self) {
+        self.consumer.resume();
+    }
+
+    /// `true` when the reader has been disconnected longer than the configured
+    /// "inactive" threshold. Mirrors Java `Reader#isInactive` (returns the underlying
+    /// consumer's inactivity state since readers wrap an `Exclusive` subscription).
+    #[must_use]
+    pub fn is_inactive(&self) -> bool {
+        self.consumer.is_inactive()
+    }
 }
 
 #[cfg(test)]
