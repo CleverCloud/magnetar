@@ -455,6 +455,95 @@ impl<S: Schema> TypedConsumer<S> {
     pub fn available_permits(&self) -> u32 {
         self.inner.available_permits()
     }
+
+    /// `true` when the consumer has been disconnected longer than the configured inactive
+    /// threshold. Mirrors Java `Consumer#isInactive` semantics.
+    #[must_use]
+    pub fn is_inactive(&self) -> bool {
+        self.inner.is_inactive()
+    }
+
+    /// Cumulative ack. Mirrors Java `Consumer#acknowledgeCumulativeAsync(MessageId)`.
+    pub async fn ack_cumulative(&self, message_id: MessageId) -> Result<(), PulsarError> {
+        self.inner
+            .ack_cumulative(message_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Batched individual ack. Mirrors Java `Consumer#acknowledgeAsync(List<MessageId>)`.
+    pub async fn ack_batch(&self, message_ids: Vec<MessageId>) -> Result<(), PulsarError> {
+        self.inner
+            .ack_batch(message_ids)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Unsubscribe this consumer's subscription from the broker. Mirrors Java
+    /// `Consumer#unsubscribe`. `force=true` (PIP-313) drops the subscription even when
+    /// other consumers are still attached to the same subscription name.
+    pub async fn unsubscribe(&self, force: bool) -> Result<(), PulsarError> {
+        self.inner
+            .unsubscribe(force)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek to a specific message id. Mirrors Java `Consumer#seek(MessageId)`.
+    pub async fn seek_to_message(&self, message_id: MessageId) -> Result<(), PulsarError> {
+        self.inner
+            .seek_to_message(message_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek to the earliest message. Mirrors Java `Consumer#seek(MessageId.earliest)`.
+    pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
+        self.inner
+            .seek_to_earliest()
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek to the latest (head) position. Mirrors Java `Consumer#seek(MessageId.latest)`.
+    pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
+        self.inner
+            .seek_to_latest()
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Seek to a publish-time deadline (millis since epoch). Mirrors Java
+    /// `Consumer#seek(long)`.
+    pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
+        self.inner
+            .seek_to_timestamp(publish_time_ms)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Ask the broker for the topic's last-published message id. Mirrors Java
+    /// `Consumer#getLastMessageId`.
+    pub async fn last_message_id(&self) -> Result<MessageId, PulsarError> {
+        self.inner
+            .last_message_id()
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// `true` if the broker has at least one message strictly past `cursor`. Mirrors Java
+    /// `Consumer#hasMessageAvailable` (the variant taking a cursor).
+    pub async fn has_message_after(&self, cursor: MessageId) -> Result<bool, PulsarError> {
+        self.inner
+            .has_message_after(cursor)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Issue an explicit FLOW (permit refill). Mirrors `ConsumerBase#increaseAvailablePermits`.
+    pub fn flow(&self, permits: u32) {
+        self.inner.flow(permits);
+    }
 }
 
 /// Builder for a [`TypedConsumer`].
