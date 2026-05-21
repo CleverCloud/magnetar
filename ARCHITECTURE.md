@@ -398,10 +398,44 @@ Every other event has already been turned into a future-completion via
 the Waker slab inside the state machine; the driver does not need to
 touch it.
 
+### Supervised reconnect
+
+When `driver_loop_inner` returns (the socket errored or the peer closed),
+the outer `supervised_driver_loop` decides whether to retry. The supervisor:
+
+1. **Records the disconnect** via `Connection::mark_disconnected(now, wall_now)`
+   so `Producer::last_disconnected_timestamp` and the consumer stats are
+   correct.
+2. **Resets the state machine** with `Connection::reset()` — this snaps the
+   handshake back to `Uninitialized`, bumps the `session_epoch`, drains the
+   pending-op slabs, and surfaces `OpOutcome::SessionLost` to every
+   in-flight user future. Producers / consumers see `is_connected() = false`
+   but stay live.
+3. **Backs off** with a small exponential schedule capped by
+   `ReconnectConfig::max_backoff` (jittered by the engine clock — under
+   moonpool-sim this is deterministic per seed).
+4. **Reconnects** through the same `Transport::connect` path used at
+   client init.
+5. **Rebuilds producers and consumers** via
+   `Connection::rebuild_producers(now)` and
+   `Connection::rebuild_consumers(now)`. Each helper re-emits
+   `CommandProducer` / `CommandSubscribe` for every still-open handle and
+   stamps the new `session_epoch`. User-facing futures stay registered;
+   they get woken when the new producer/consumer IDs are issued by the
+   broker and become live again.
+6. **Drains in-flight publish replays** — Stage 3 follow-up; today the
+   send paths see `SessionLost` and surface an error per send rather than
+   transparently re-queueing. The waker slabs are already cleared by
+   `reset()`.
+
+The supervisor never retries past `ReconnectConfig::max_attempts`; on
+exhaustion it propagates the last `EngineError::Io` upward and the
+`Client` is closed.
+
 ### Source
 
 [`crates/magnetar-runtime-tokio/src/driver.rs`](crates/magnetar-runtime-tokio/src/driver.rs)
-— `driver_loop` is 239 lines and intentionally easy to read in one sitting.
+— `driver_loop_inner` + `supervised_driver_loop` total ~425 lines.
 
 ---
 
@@ -933,31 +967,34 @@ allows it (wrap `Client` in `Arc`, spawn a tokio task that polls
 | `error.rs` | 67 | `ClientError` enum. |
 | `crypto.rs` | 48 | `MessageEncryptor` + `MessageDecryptor` traits. |
 
-### `magnetar-runtime-moonpool` — deterministic simulation (~450 LOC, M1 scope)
+### `magnetar-runtime-moonpool` — deterministic simulation (~2,740 LOC, M1 → M4 landed)
 
 | File | Lines | Role |
 | --- | --- | --- |
-| `lib.rs` | 235 | `ConnectionShared` (no `Notify` — single-task pattern), `MoonpoolEngine<P>` generic over `moonpool_core::Providers`, `connect_plain` handshake driver. |
-| `tls.rs` | ~215 | `RustlsByteAdapter` — drives `rustls::ClientConnection` over a `moonpool_core::NetworkProvider`-supplied byte pipe (`read_tls` / `process_new_packets` / `write_tls`). Sans-io composition end to end. |
+| `lib.rs` | 343 | `ConnectionShared` (no `Notify` — single-task pattern), `MoonpoolEngine<P>` generic over `moonpool_core::Providers`, `connect_plain` handshake driver. |
+| `driver.rs` | 295 | Driver loop mirroring `magnetar-runtime-tokio::driver` over the moonpool byte pipe. |
+| `client.rs` | 414 | `Client` façade — `connect`, `connect_with`, partitioned metadata lookup, txn coordinator helpers. |
+| `producer.rs` | 701 | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters. Surface mirrors `magnetar-runtime-tokio::producer`. |
+| `consumer.rs` | 670 | `Consumer` façade — `receive`, ack variants, nack, seek, pause/resume, DLQ drain. |
+| `tls.rs` | 215 | `RustlsByteAdapter` — drives `rustls::ClientConnection` over a `moonpool_core::NetworkProvider`-supplied byte pipe (`read_tls` / `process_new_packets` / `write_tls`). Sans-io composition end to end. |
+| `transport.rs` | 104 | Plaintext byte pipe over the configured `NetworkProvider::TcpStream`. |
 
-Key M1-scope properties:
+Key properties:
 
 - The engine is generic over `moonpool_core::Providers`, which bundles
   `NetworkProvider`, `TimeProvider`, `TaskProvider`, `RandomProvider`,
   `StorageProvider`. Plug `TokioProviders` for production-style runs
   against a real broker; plug a sim bundle for reproducible chaos under
   `moonpool-sim`.
-- Handshake-only today: `connect_plain` queues `CommandConnect`, pumps
-  the state machine until `CONNECTED` or `AuthChallenging`, returns the
-  shared state.
+- The driver consumes the same `magnetar-proto::Connection` state machine
+  as the tokio engine — the only differences are which byte pipe runs
+  the I/O and which clock source the engine snapshots into
+  `Connection::send(now, …)` / `flush_producer(now, …)` and into the
+  `with_wall_clock_provider` slot.
 - TLS handshakes survive `moonpool-sim` chaos with the same determinism
   as `magnetar-proto` itself — the adapter never blocks on a network
   call inside `process_new_packets`; reads and writes go through the
   byte pipe under sim control.
-
-The pending M2 work mirrors the tokio engine: driver loop, producer
-façade, consumer façade, client façade behind the `moonpool` feature on
-the `magnetar` façade crate.
 
 ---
 

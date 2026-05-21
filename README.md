@@ -7,9 +7,11 @@
 [![Status](https://img.shields.io/badge/status-pre--alpha-red.svg)](#status)
 [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: pre-alpha.** The wire protocol layer is feature-rich and the tokio
-> engine is usable end-to-end; the moonpool engine is a deterministic-simulation
-> stub. API is unstable. Do not depend on this in production.
+> **Status: pre-alpha.** The wire protocol layer is feature-rich, the tokio
+> engine is usable end-to-end with supervised reconnect + transparent
+> producer/consumer rebuild, and the moonpool engine ships the full
+> client/producer/consumer/reader façade family for deterministic-simulation
+> testing. API is unstable. Do not depend on this in production.
 
 ---
 
@@ -597,9 +599,9 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Auto-reconnect supervisor.** The driver exits on I/O failure; reconnect + resubscribe + replay is the largest open item.
 - **Latency histograms.** No p50/p99/max stats — pending `hdrhistogram` adoption.
 - **Stats rolling windows.** Cumulative-only counters; the broker dashboard expects msgs/sec, bytes/sec.
+- **PIP-121 cluster failover.** `ServiceUrlProvider` + `ControlledClusterFailover` policy in flight; today the driver reconnects to the same `service_url`.
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180 shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33 replicated subscriptions** are scoped for the M9 milestone.
 
 ---
@@ -656,13 +658,19 @@ Pick at compile time via feature flags.
 
 ### `magnetar-runtime-moonpool` — deterministic simulation
 
-- ~450 lines of code (handshake only — M1 driver loop scope). Connect to a
-  broker over a `moonpool_core::NetworkProvider` byte pipe, ship `CONNECT`,
-  pump the state machine until `CONNECTED`, return the shared state.
+- ~2,740 lines of code across `client.rs` (414), `consumer.rs` (670),
+  `driver.rs` (295), `lib.rs` (343), `producer.rs` (701), `tls.rs` (215),
+  `transport.rs` (104). The M1 → M4 milestones (engine, client, producer,
+  consumer) have all landed; the surface mirrors the tokio engine 1:1 so
+  the same `magnetar::PulsarClient`-style usage compiles under the
+  `moonpool` feature.
 - TLS uses a local `rustls::ClientConnection` adapter (`tls.rs`) that drives
   `read_tls` / `process_new_packets` / `write_tls` over the moonpool byte
   pipe. The handshake is therefore deterministic under `moonpool-sim` chaos.
-- Producer / consumer façades are pending.
+- Generic over `moonpool_core::Providers` (`NetworkProvider`, `TimeProvider`,
+  `TaskProvider`, `RandomProvider`, `StorageProvider`). Plug `TokioProviders`
+  for production-style runs against a real broker, or a sim bundle for
+  reproducible chaos under `moonpool-sim` seeds.
 
 ---
 
@@ -684,14 +692,18 @@ PIP-121 / PIP-33 / PIP-460 / PIP-180 / PIP-415 / replicated subscriptions
 
 Top open items at the time of this writing:
 
-1. **Auto-reconnect supervisor** — wrap the driver loop with exponential
-   backoff, redo handshake, re-subscribe.
-2. **Moonpool engine completion** — mirror the tokio engine surface (driver
-   loop + producer / consumer / client façades).
-3. **`hdrhistogram` latency stats** + rolling windows for msgs/sec.
-4. **PatternConsumer auto-update ticker** (broker pushes `TopicListChanged`
+1. **PIP-121 cluster failover** — `ServiceUrlProvider` URL rotation +
+   `ControlledClusterFailover` policy.
+2. **`hdrhistogram` latency stats** + rolling windows for msgs/sec.
+3. **PatternConsumer auto-update ticker** (broker pushes `TopicListChanged`
    but reconcile is caller-driven today).
-5. **MultiTopicsConsumer dynamic `add_topic` / `remove_topic`**.
+4. **MultiTopicsConsumer dynamic `add_topic` / `remove_topic`**.
+5. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
+   (opcode missing from the current `PulsarApi.proto` snapshot).
+
+The supervised reconnect (Stage 2) and transparent in-flight producer +
+consumer rebuild (Stage 3, `Connection::rebuild_producers` /
+`rebuild_consumers`) have landed and run on every disconnect.
 
 ---
 
