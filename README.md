@@ -439,7 +439,7 @@ known-missing feature.
 | `negativeAckRedeliveryDelay` | ✅ | ✅ | `ConsumerBuilder::negative_ack_redelivery_delay`. |
 | `seek(MessageId)` | ✅ | ✅ | `Consumer::seek`. |
 | `seek(timestamp)` | ✅ | ✅ | `Consumer::seek_timestamp`. |
-| `seekAsync(Function<String, Object>)` (per-partition) | ✅ | ❌ | Per-partition function seek not yet wired. |
+| `seekAsync(Function<String, Object>)` (per-partition) | ✅ | ✅ | `PartitionedConsumer::seek_per_partition` / `MultiTopicsConsumer::seek_per_partition` — callback returns `SeekTarget::MessageId` or `SeekTarget::PublishTimeMs` per topic. |
 | `seekToEarliest` / `seekToLatest` | ✅ | ✅ | `Consumer::seek_to_earliest` / `seek_to_latest`. |
 | `pause()` / `resume()` / `isPaused()` | ✅ | ✅ | `Consumer::pause` / `resume` / `is_paused`. |
 | `hasReachedEndOfTopic` | ✅ | ✅ | `Consumer::has_reached_end_of_topic`. |
@@ -494,7 +494,7 @@ known-missing feature.
 | Subscribe to N explicit topics under one subscription | ✅ | ✅ | `MultiTopicsConsumerBuilder::topics`. |
 | Receive / ack / nack / seek across all topics | ✅ | ✅ | Per-topic forwarding. |
 | `negativeAckWithDelay` / `ackCumulative` | ✅ | ✅ | Forwarded. |
-| Dynamic `add_topic` / `remove_topic` | ✅ | ❌ | Blocked by `Arc<Inner>` immutability; planned as `DynamicMultiTopicsConsumer`. |
+| Dynamic `add_topic` / `remove_topic` | ✅ | ✅ | `MultiTopicsConsumer::add_topic` / `remove_topic` — subscribe / unsubscribe at runtime. |
 
 ### Pattern consumer (PIP-145)
 
@@ -694,12 +694,16 @@ Top open items at the time of this writing:
 
 1. **PIP-121 cluster failover** — `ServiceUrlProvider` URL rotation +
    `ControlledClusterFailover` policy.
-2. **`hdrhistogram` latency stats** + rolling windows for msgs/sec.
-3. **PatternConsumer auto-update ticker** (broker pushes `TopicListChanged`
+2. **PatternConsumer auto-update ticker** (broker pushes `TopicListChanged`
    but reconcile is caller-driven today).
-4. **MultiTopicsConsumer dynamic `add_topic` / `remove_topic`**.
-5. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
+3. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
    (opcode missing from the current `PulsarApi.proto` snapshot).
+4. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
+   topic / PIP-33 replicated subscriptions** — scoped for M9.
+
+`hdrhistogram` latency stats (p50/p99/max) and the
+`MultiTopicsConsumer::add_topic` / `remove_topic` mutators have already
+landed.
 
 The supervised reconnect (Stage 2) and transparent in-flight producer +
 consumer rebuild (Stage 3, `Connection::rebuild_producers` /
