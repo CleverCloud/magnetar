@@ -42,6 +42,7 @@ impl<P: Providers> Transport<P> {
     /// Wrap an already-established stream (used by tests and by the future
     /// TLS path where the TCP socket is set up separately).
     #[cfg(test)]
+    #[allow(dead_code, reason = "wired by M3 TLS adapter; kept for symmetry today")]
     pub(crate) fn from_stream(stream: <P::Network as NetworkProvider>::TcpStream) -> Self {
         Self { stream }
     }

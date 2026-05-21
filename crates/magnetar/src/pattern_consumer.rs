@@ -834,6 +834,7 @@ mod tests {
             // on the long interval and exit only when the set has become non-empty and
             // every child reports closed.
             ticker.tick().await;
+            #[allow(clippy::never_loop)]
             loop {
                 ticker.tick().await;
                 if !consumer_for_task.is_empty() && consumer_for_task.is_closed() {
