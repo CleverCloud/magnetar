@@ -647,6 +647,157 @@ impl<S: Schema> TypedConsumer<S> {
     pub fn flow(&self, permits: u32) {
         self.inner.flow(permits);
     }
+
+    /// Same as [`Self::receive`] but bounded by `timeout`. Returns `Ok(None)` when the
+    /// deadline elapses with no message. Mirrors Java
+    /// `Consumer#receive(int timeout, TimeUnit unit)`.
+    pub async fn receive_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<TypedMessage<S>>, PulsarError> {
+        match self.inner.receive_with_timeout(timeout).await? {
+            Some(raw) => {
+                let value = self.schema.decode(&raw.payload).map_err(schema_to_pulsar)?;
+                Ok(Some(TypedMessage {
+                    message_id: raw.message_id,
+                    value,
+                    payload: raw.payload.clone(),
+                    raw,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Batched receive. Mirrors Java `Consumer#batchReceive`. Decodes every payload with
+    /// the schema; the first decode error short-circuits the call.
+    pub async fn receive_batch(
+        &self,
+        max_messages: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<TypedMessage<S>>, PulsarError> {
+        let raw_batch = self.inner.receive_batch(max_messages, max_wait).await?;
+        let mut out = Vec::with_capacity(raw_batch.len());
+        for raw in raw_batch {
+            let value = self.schema.decode(&raw.payload).map_err(schema_to_pulsar)?;
+            out.push(TypedMessage {
+                message_id: raw.message_id,
+                value,
+                payload: raw.payload.clone(),
+                raw,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Batched receive with a bytes cap. See [`Self::receive_batch`] and the runtime's
+    /// `Consumer::receive_batch_with_bytes_cap` for `BatchReceivePolicy` parity.
+    pub async fn receive_batch_with_bytes_cap(
+        &self,
+        max_messages: usize,
+        max_bytes: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<TypedMessage<S>>, PulsarError> {
+        let raw_batch = self
+            .inner
+            .receive_batch_with_bytes_cap(max_messages, max_bytes, max_wait)
+            .await?;
+        let mut out = Vec::with_capacity(raw_batch.len());
+        for raw in raw_batch {
+            let value = self.schema.decode(&raw.payload).map_err(schema_to_pulsar)?;
+            out.push(TypedMessage {
+                message_id: raw.message_id,
+                value,
+                payload: raw.payload.clone(),
+                raw,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Ack with caller-supplied properties. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Map<String, Long>)`.
+    pub async fn ack_with_properties(
+        &self,
+        message_id: MessageId,
+        properties: Vec<(String, i64)>,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .ack_with_properties(message_id, properties)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Ack a single message inside a transaction. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Transaction)`.
+    pub async fn ack_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .ack_with_txn(message_id, txn_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Batched ack inside a transaction. Mirrors Java
+    /// `Consumer#acknowledgeAsync(List<MessageId>, Transaction)`.
+    pub async fn ack_batch_with_txn(
+        &self,
+        message_ids: Vec<MessageId>,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .ack_batch_with_txn(message_ids, txn_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Cumulative ack with caller-supplied properties. Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Map<String, Long>)`.
+    pub async fn ack_cumulative_with_properties(
+        &self,
+        message_id: MessageId,
+        properties: Vec<(String, i64)>,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .ack_cumulative_with_properties(message_id, properties)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Cumulative ack inside a transaction. Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Transaction)`.
+    pub async fn ack_cumulative_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), PulsarError> {
+        self.inner
+            .ack_cumulative_with_txn(message_id, txn_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
+    /// Drain every DLQ-flagged message (raw, un-decoded so schema mismatches don't lose
+    /// the payload). See the runtime's `Consumer::drain_dead_letter`.
+    #[must_use]
+    pub fn drain_dead_letter(&self) -> Vec<IncomingMessage> {
+        self.inner.drain_dead_letter()
+    }
+
+    /// Drain the DLQ pending list and republish every entry via `dlq_producer`. See the
+    /// runtime's `Consumer::republish_dead_letters`. Returns the number republished.
+    pub async fn republish_dead_letters(
+        &self,
+        dlq_producer: &magnetar_runtime_tokio::Producer,
+    ) -> Result<usize, PulsarError> {
+        self.inner
+            .republish_dead_letters(dlq_producer)
+            .await
+            .map_err(PulsarError::Client)
+    }
 }
 
 /// Builder for a [`TypedConsumer`].
