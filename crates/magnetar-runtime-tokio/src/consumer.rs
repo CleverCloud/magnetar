@@ -539,7 +539,23 @@ impl Consumer {
         max_messages: usize,
         max_wait: std::time::Duration,
     ) -> Result<Vec<IncomingMessage>, ClientError> {
-        if max_messages == 0 {
+        self.receive_batch_with_bytes_cap(max_messages, usize::MAX, max_wait)
+            .await
+    }
+
+    /// Same as [`Self::receive_batch`] but stops once the accumulated payload size would
+    /// exceed `max_bytes`. Mirrors Java's `BatchReceivePolicy` — the broker-side policy
+    /// supports three caps (max messages, max bytes, max wait) and stops on whichever
+    /// fires first. Pass `usize::MAX` to disable a cap. The first message is always
+    /// included even if it alone exceeds `max_bytes` (matches Java's "deliver at least
+    /// one" semantic), but subsequent ones obey the cap strictly.
+    pub async fn receive_batch_with_bytes_cap(
+        &self,
+        max_messages: usize,
+        max_bytes: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<IncomingMessage>, ClientError> {
+        if max_messages == 0 || max_bytes == 0 {
             return Ok(Vec::new());
         }
         let first = tokio::time::timeout(max_wait, self.receive()).await;
@@ -548,15 +564,28 @@ impl Consumer {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Ok(Vec::new()),
         };
+        let mut acc_bytes = first.payload.len();
         let mut out = Vec::with_capacity(max_messages.min(64));
         out.push(first);
         while out.len() < max_messages {
+            // Peek at the next message's payload size; if popping it would exceed the
+            // byte cap, leave it for the next batch.
+            let next_size = self
+                .shared
+                .inner
+                .lock()
+                .peek_message_payload_size(self.handle);
+            let Some(next_size) = next_size else { break };
+            if acc_bytes.saturating_add(next_size) > max_bytes {
+                break;
+            }
             let msg = {
                 let mut conn = self.shared.inner.lock();
                 conn.pop_message(self.handle)
             };
             let Some(mut msg) = msg else { break };
             post_process_message(&mut msg, self.decryptor.as_ref())?;
+            acc_bytes = acc_bytes.saturating_add(msg.payload.len());
             out.push(msg);
         }
         Ok(out)

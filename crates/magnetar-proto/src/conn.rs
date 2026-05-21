@@ -2184,6 +2184,19 @@ impl Connection {
         self.outbound.len()
     }
 
+    /// Payload size (post-decompression / post-decryption — payload as it sits in the
+    /// queue, which is the bytes the runtime layer will hand to user code) of the next
+    /// message that [`Self::pop_message`] would return. Returns `None` for unknown
+    /// handles or empty queues. Lets the runtime peek before committing to a pop —
+    /// useful for size-capped batch receive (Java `BatchReceivePolicy.maxNumBytes`).
+    #[must_use]
+    pub fn peek_message_payload_size(&self, handle: ConsumerHandle) -> Option<usize> {
+        self.consumers
+            .get(&handle)
+            .and_then(|c| c.queue.front())
+            .map(|m| m.payload.len())
+    }
+
     /// Drain a single message from the given consumer's queue.
     pub fn pop_message(&mut self, handle: ConsumerHandle) -> Option<IncomingMessage> {
         let consumer = self.consumers.get_mut(&handle)?;
