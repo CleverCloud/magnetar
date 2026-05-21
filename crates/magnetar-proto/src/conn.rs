@@ -99,6 +99,12 @@ pub struct ConnectionConfig {
     pub default_max_message_size: usize,
     /// Optional proxy-to-broker URL for the binary proxy path.
     pub proxy_to_broker_url: Option<String>,
+    /// Optional auto-reconnect supervisor. When `Some`, runtime engines wrap the
+    /// driver loop in a backoff-driven reconnect cycle that survives transport
+    /// failures. `None` (the default) keeps the pre-supervisor behavior — driver
+    /// exits on the first I/O error. Mirrors Java's `PulsarClientImpl` reconnect
+    /// loop.
+    pub supervisor: Option<crate::supervisor::SupervisorConfig>,
 }
 
 impl Default for ConnectionConfig {
@@ -114,6 +120,7 @@ impl Default for ConnectionConfig {
             default_compression: CompressionKind::None,
             default_max_message_size: 5 * 1024 * 1024,
             proxy_to_broker_url: None,
+            supervisor: None,
         }
     }
 }

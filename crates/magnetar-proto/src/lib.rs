@@ -68,6 +68,7 @@ pub mod frame;
 pub mod lookup;
 pub mod producer;
 pub mod schema;
+pub mod supervisor;
 pub mod topic_watcher;
 pub mod trackers;
 pub mod txn;
@@ -88,6 +89,7 @@ pub mod pb {
 }
 
 pub use crate::auth::{AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth};
+pub use crate::backoff::Backoff;
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, CryptoFailureAction,
     HandshakeState, KeySharedConfig, OpOutcome, PendingOpKey, SeekTarget, SubscribeRequest,
@@ -100,5 +102,6 @@ pub use crate::frame::{
     decode_one, encode_command, encode_payload,
 };
 pub use crate::producer::ProducerStats;
+pub use crate::supervisor::SupervisorConfig;
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};

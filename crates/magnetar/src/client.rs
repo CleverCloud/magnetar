@@ -932,6 +932,7 @@ pub struct ClientBuilder {
     tls_trust_certs_pem: Option<Vec<u8>>,
     default_max_message_size: Option<usize>,
     proxy_to_broker_url: Option<String>,
+    supervisor: Option<magnetar_proto::SupervisorConfig>,
 }
 
 impl ClientBuilder {
@@ -980,6 +981,23 @@ impl ClientBuilder {
     #[must_use]
     pub fn proxy_to_broker_url(mut self, url: impl Into<String>) -> Self {
         self.proxy_to_broker_url = Some(url.into());
+        self
+    }
+
+    /// Enable the auto-reconnect supervisor with the supplied
+    /// [`magnetar_proto::SupervisorConfig`]. When set, runtime engines wrap the driver
+    /// loop in a [`magnetar_proto::Backoff`]-driven reconnect cycle so the connection
+    /// survives transport failures. Without this knob the driver exits on the first
+    /// I/O error (matches the pre-supervisor behavior). Mirrors Java's
+    /// `PulsarClientImpl` reconnect loop.
+    ///
+    /// Note: pending in-flight producer/consumer requests issued before the drop
+    /// surface a "session lost" outcome on the new connection; transparent
+    /// re-subscription and producer reattachment across reconnects is a future
+    /// enhancement layered on top of this scaffold.
+    #[must_use]
+    pub fn enable_reconnect(mut self, config: magnetar_proto::SupervisorConfig) -> Self {
+        self.supervisor = Some(config);
         self
     }
 
@@ -1041,6 +1059,9 @@ impl ClientBuilder {
         }
         if let Some(url) = self.proxy_to_broker_url {
             config.proxy_to_broker_url = Some(url);
+        }
+        if let Some(sv) = self.supervisor {
+            config.supervisor = Some(sv);
         }
         if let Some(name) = self.auth_method_name {
             config.auth_method_name = name;
