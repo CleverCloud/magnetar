@@ -1432,6 +1432,8 @@ dependencies = [
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
  "parking_lot",
+ "serde",
+ "serde_json",
  "testcontainers",
  "thiserror",
  "tokio",
