@@ -1,117 +1,1165 @@
-# Architecture
+# Magnetar — Architecture
 
-## Layers
+> **Audience.** This document is for engineers evaluating, contributing to,
+> or porting code into magnetar. It explains *how* the workspace is wired
+> and *why*. See [README.md](README.md) for the user-facing surface and the
+> Java parity matrix.
 
+---
+
+## Table of contents
+
+1. [Layering](#layering)
+2. [Sans-io design](#sans-io-design)
+3. [The no-channels rationale](#the-no-channels-rationale)
+4. [Concurrency primitives we *do* use](#concurrency-primitives-we-do-use)
+5. [The driver loop](#the-driver-loop)
+6. [Protocol state machine (`magnetar-proto`)](#protocol-state-machine-magnetar-proto)
+7. [Wire framing](#wire-framing)
+8. [Producer paths — batching vs chunking](#producer-paths--batching-vs-chunking)
+9. [Consumer paths — ack grouping, unacked tracker, nack tracker, DLQ](#consumer-paths--ack-grouping-unacked-tracker-nack-tracker-dlq)
+10. [Multi-topics fan-in](#multi-topics-fan-in)
+11. [Pattern consumer + topic watcher (PIP-145)](#pattern-consumer--topic-watcher-pip-145)
+12. [Runtime engines](#runtime-engines)
+13. [TLS sites](#tls-sites)
+14. [Schemas](#schemas)
+15. [PIP coverage map](#pip-coverage-map)
+16. [Tests](#tests)
+17. [Build & validation](#build--validation)
+18. [Further reading](#further-reading)
+
+---
+
+## Layering
+
+Magnetar is organised in four layers. Lower layers know nothing about higher
+ones — `magnetar-proto` is pure-Rust state machines with **zero I/O
+dependencies**, and the high-level façade is a thin re-export plus
+ergonomics layer.
+
+```text
++--------------------------------------------------------------------------+
+|                                user code                                   |
++--------------------------------------------------------------------------+
+                                    |
+                                    v
++--------------------------------------------------------------------------+
+| magnetar (façade)                | magnetar-cli      | magnetar-admin     |
+| ----------------------------     | --------------    | -----------------  |
+| PulsarClient, builders,          | clap-driven       | reqwest + rustls   |
+| typed schemas wiring,            | produce / consume | REST admin client. |
+| partitioned / multi-topics /     | / inspect /       |                    |
+| pattern / table-view types,      | admin lookups.    |                    |
+| interceptor SPIs,                |                   |                    |
+| message routers + hashers.       |                   |                    |
++--------------------------------------------------------------------------+
+                                    |
+                                    v
++--------------------------------------------------------------------------+
+| magnetar-runtime-tokio    |       magnetar-runtime-moonpool              |
+| --------------------      |       --------------------------             |
+| Public default.           |       Deterministic-simulation engine.       |
+| tokio + tokio-rustls.     |       moonpool-core `Providers` (Network,    |
+| One driver task per       |       Time, Task, Random, Storage).          |
+| Connection.               |       Custom rustls-over-bytepipe adapter.   |
+|                           |       Currently handshake-only (M1 scope).   |
++--------------------------------------------------------------------------+
+                                    |
+                                    v
++--------------------------------------------------------------------------+
+| magnetar-proto (sans-io core — NO I/O deps, NO channels, NO async)       |
+| ------------------------------------------------------------             |
+| `Connection` state machine — `quinn-proto` shape:                        |
+|   handle_bytes(now, &[u8])  -> ...                                       |
+|   poll_transmit(&mut Vec<u8>) -> usize                                   |
+|   poll_event() -> Option<ConnectionEvent>                                |
+|   poll_timeout() -> Option<Instant>                                      |
+|   handle_timeout(now)                                                    |
+|                                                                          |
+| Handle-based façade (no raw `BaseCommand`):                              |
+|   create_producer(req), subscribe(req)                                   |
+|   send(handle, msg), ack(handle, ack), seek(handle, target), close_*(h)  |
+|   watch_topic_list(namespace, pattern), partitioned_metadata_request(t)  |
+|                                                                          |
+| Internal state: pending_ops (Slab<Waker>), per-producer + per-consumer   |
+| state, trackers (ack grouping, nack, unacked), schemas, batch container, |
+| chunk reassembly, topic-list watcher registry, transaction client.       |
++--------------------------------------------------------------------------+
+                                    |
+                                    v
+                              wire (TCP/TLS)
 ```
-+------------------------------------------------------------------------+
-|                              user code                                  |
-+------------------------------------------------------------------------+
-                                  |
-                                  v
-+------------------------------------------------------------------------+
-|  magnetar (façade)              |  magnetar-cli  |  magnetar-admin     |
-|  ---------------                |  -------------  |  ------------------ |
-|  builder, Pulsar URL parser,    |  clap-driven    |  REST admin client  |
-|  schema registry façade, auth   |  produce/       |  (reqwest).         |
-|  registry, runtime selector.    |  consume/       |                     |
-|                                 |  inspect.       |                     |
-+------------------------------------------------------------------------+
-                                  |
-                                  v
-+------------------------------------------------------------------------+
-|  magnetar-runtime-tokio   |   magnetar-runtime-moonpool                |
-|  ------------------------ |   --------------------------                |
-|  Public default.          |   Opt-in. Deterministic sim via moonpool-  |
-|  tokio + tokio-rustls.    |   sim. Custom rustls-over-bytepipe TLS     |
-|  One driver task per      |   adapter (option d). Same Connection      |
-|  Connection.              |   sans-io state machine.                   |
-+------------------------------------------------------------------------+
-                                  |
-                                  v
-+------------------------------------------------------------------------+
-|  magnetar-proto (sans-io core, NO I/O deps, NO channels)               |
-|  ----------------------------------------------------------            |
-|  Connection state machine — quinn-proto shape:                         |
-|      handle_bytes(now, &[u8])                                          |
-|      poll_transmit(&mut Vec<u8>) -> usize                              |
-|      poll_event() -> Option<ConnectionEvent>                           |
-|      poll_timeout() -> Option<Instant>                                 |
-|      handle_timeout(now: Instant)                                      |
-|  + handle-based façade:                                                |
-|      open_producer(req) -> ProducerHandle                              |
-|      subscribe(req) -> ConsumerHandle                                  |
-|      send(h, msg) -> sequence_id                                       |
-|      ack(h, ack), seek(h, target), close_*(h)                          |
-|  Internal state: pending_ops (Slab<Waker>), producers, consumers,      |
-|  trackers (ack, nack, unack), lookup, batch container, chunk reasm.    |
-+------------------------------------------------------------------------+
+
+### Crate-level dependency directions
+
+```text
+magnetar-cli ──> magnetar-admin
+            └──> magnetar (faç.) ──> magnetar-runtime-tokio ───┐
+                                ├──> magnetar-runtime-moonpool ┤
+                                ├──> magnetar-auth-{oauth2,sasl,athenz}
+                                └──> magnetar-messagecrypto ───┤
+                                                               v
+                                                       magnetar-proto
 ```
 
-## No-channels rule
+`magnetar-proto` is the only mandatory dependency for every other crate.
+`magnetar-auth-*` and `magnetar-messagecrypto` provide trait
+implementations for traits owned by `magnetar-proto` and the runtime
+engines. The auth + messagecrypto crates are gated by feature flags on
+`magnetar` (see [README.md §Installation](README.md#installation)).
 
-Channels (mpsc / broadcast / watch / oneshot, any flavour) are **forbidden** in the entire workspace. See [GUIDELINES.md](GUIDELINES.md#no-channels) for the why and the replacement pattern.
+---
 
-The driver-to-API path uses:
+## Sans-io design
 
+### What "sans-io" means here
+
+`magnetar-proto::Connection` is a synchronous state machine. It has **no
+sockets, no `tokio`, no `async`, no threads**. The whole crate's
+[`Cargo.toml`] forbids I/O-bound dependencies — the rule is enforced by a
+`cargo xtask check-no-io-deps` step that walks `cargo tree -p
+magnetar-proto -e features` and trips on `tokio`, `mio`, `socket2`, …
+([GUIDELINES.md §I/O isolation](GUIDELINES.md#io-isolation)).
+
+The public surface mirrors [`quinn-proto`]:
+
+| Method | Direction | What it does |
+| --- | --- | --- |
+| `handle_bytes(now, &[u8])` | wire → state | Decode any complete frames in the supplied bytes. Update state, push events, dispatch wakers. |
+| `poll_transmit(&mut Vec<u8>) -> usize` | state → wire | Drain queued outbound bytes into the caller's buffer. |
+| `poll_event() -> Option<ConnectionEvent>` | state → engine | Yield semantic events (`AuthChallenge`, `TopicListChanged`, `ChecksumMismatch`, …) the engine needs to react to. |
+| `poll_timeout() -> Option<Instant>` | state → engine | Next deadline (keepalive, tracker tick, send timeout). |
+| `handle_timeout(now)` | engine → state | Drive timers that elapsed. |
+
+### Why we did it
+
+1. **Multi-engine.** The same state machine is driven by `tokio` in
+   production and by `moonpool` for deterministic-simulation testing. A
+   future `smol` / `async-std` / `glommio` engine is a swap-out, not a
+   rewrite. The boundary is the same five methods above.
+2. **Testable in isolation.** Every protocol bug can be reproduced with a
+   fixture: feed bytes in, observe transmit out. No sockets, no tasks, no
+   timing. The 220+ unit tests do exactly this.
+3. **No hidden runtime.** The protocol layer does not spawn tasks or hold
+   network handles. Everything it owns can be inspected by a debugger
+   without async-context glue.
+4. **Compiles fast.** Stripping `tokio` from `magnetar-proto`'s dep graph
+   saves measurable build time and lets the crate ship as a pure
+   `no_std`-adjacent library (we still need `std` for `Instant` and
+   `HashMap`, but no async runtime).
+
+### Reference Java code
+
+The state machine maps onto `ClientCnx.java` plus its sibling state objects
+(`ProducerImpl.java`, `ConsumerImpl.java`, `HandlerState.java`,
+`AckGroupingTracker.java`, `UnAckedMessageTracker.java`,
+`NegativeAcksTracker.java`). The handshake states mirror
+`HandlerState.State`. See [`crates/magnetar-proto/src/conn.rs:18-26`] for
+the cross-reference at the top of `conn.rs`.
+
+[`Cargo.toml`]: crates/magnetar-proto/Cargo.toml
+[`quinn-proto`]: https://docs.rs/quinn-proto
+[`crates/magnetar-proto/src/conn.rs:18-26`]: crates/magnetar-proto/src/conn.rs
+
+---
+
+## The no-channels rationale
+
+`tokio::sync::mpsc`, `broadcast`, `watch`, `oneshot`, `std::sync::mpsc`,
+`crossbeam-channel`, `flume`, `async-channel`, `kanal`, `postage`,
+`tachyonix`, `thingbuf` — **forbidden everywhere in the workspace**. The
+ban is enforced three ways:
+
+1. `cargo deny check bans` rejects the crates outright in CI.
+2. `clippy.toml`'s `disallowed-types` covers `tokio::sync::mpsc::*` and
+   friends so even an accidental local import trips a lint.
+3. `cargo xtask check-no-channels` greps the entire source tree for
+   `::mpsc`, `::broadcast`, `::watch`, `::oneshot` paths as a final
+   belt-and-braces.
+
+### Why we banned them
+
+- **Hidden backpressure.** A bounded mpsc that fills up under load surfaces
+  as latency in a place the producer cannot see. An unbounded mpsc leaks
+  memory. Either failure mode is invisible at the channel's *type
+  signature*.
+- **Close semantics.** Every channel library has its own answer to "drop
+  the receiver while the sender still holds messages". The bug surface
+  multiplies with the number of channels in the architecture.
+- **Debug "where did this message go?" mode.** Anyone who has chased a
+  message through three mpscs across two tasks knows how expensive this
+  is. The sans-io split makes the alternative natural and cheap to debug.
+
+### How we replace channels
+
+The single mechanism is a `Waker` slab keyed by `op_id` *inside the state
+machine*:
+
+```text
+                    user-facing future                       driver loop
+                    -----------------                        -----------
+                          |                                        |
+                          v                                        v
+                  ConnectionShared.inner                          owns same
+                  parking_lot::Mutex<Connection>                  Arc<ConnectionShared>
+                          |                                        |
+                          v                                        v
+                  on poll(cx):                              on socket read:
+                    lock(inner)                               lock(inner)
+                    look up the (op_id) outcome               handle_bytes(now, &bytes)
+                    if Some(out) -> Poll::Ready(out)          (state machine pushes
+                    else                                       OpOutcome into the slab
+                      register cx.waker() in slab               and wakes the matching
+                    drop(inner)                                 Waker)
+                    return Poll::Pending                      drop(inner)
+                                                            then drain events
 ```
-[user task]                       [I/O driver task]
-       |                                  |
-       v                                  v
-  Arc<ConnectionShared>            owns the same Arc
-       |                                  |
-       v                                  v
-  parking_lot::Mutex<magnetar_proto::Connection>
-       ^                                  ^
-       |  user grabs lock, mutates,       |
-       |  releases, then calls            |
-       |  shared.driver_waker.notify_one()|
-       |                                  |
-  user-side Future:                  driver loop:
-    poll() locks Connection,            select! {
-    looks up pending op,                  _ = notify.notified() => {}
-    if ready -> returns it,               r = socket.read_buf() => { lock + handle_bytes }
-    else registers cx.waker().clone()     _ = sleep_until(deadline), if some => { lock + handle_timeout }
-    in the Connection's slab,             _ = socket.writable(), if write_buf.has_data => { try_write }
-    drops lock, returns Pending.        }
-                                       after each select! arm, lock + poll_transmit + dispatch_pending_event_wakers
+
+The state machine owns:
+
+- A slab of `(PendingOpKey -> Waker)` where `PendingOpKey` is one of
+  `Request(RequestId)` for lookups / seeks / acks-with-response, or
+  `Send(ProducerHandle, SequenceId)` for publishes.
+- A slab of `(PendingOpKey -> OpOutcome)` where the matching response is
+  parked until the future polls it.
+
+When `handle_bytes` decodes a `CommandSendReceipt`, it stores the
+`OpOutcome::SendReceipt` in the outcome slab keyed by
+`(producer_handle, sequence_id)`, then calls `Waker::wake()` on whatever
+the producer future registered. The future polls again, locks the
+connection, finds the outcome, and resolves.
+
+This is the cancer-free equivalent of a `oneshot<Result<MessageId,
+SendError>>`. The "channel" is the slab entry; the "send" is the state
+machine populating it; the "receive" is the future polling it. No
+backpressure surface, no orphaned senders, no `Drop` glue.
+
+The driver-to-driver communication path is *also* not a channel — it is a
+single-cell `tokio::sync::Notify` (the driver wakes on
+`shared.driver_waker.notified()`). `Notify` is permitted because it has no
+queue and no payload — it is an async condvar, not a channel. If even
+`Notify` feels too channel-flavoured, a `parking_lot::Condvar +
+Mutex<bool>` is the documented fallback.
+
+### Reference
+
+The pattern is the same one [`quinn`] *would* be using if it didn't ship
+its own bespoke `tokio::sync::mpsc` wrapper for legacy reasons —
+`quinn-proto` itself is sans-io and channel-free; the channels are only in
+the engine glue.
+
+[`quinn`]: https://github.com/quinn-rs/quinn
+
+---
+
+## Concurrency primitives we *do* use
+
+| Primitive | Where | Why |
+| --- | --- | --- |
+| `parking_lot::Mutex<Connection>` | `ConnectionShared.inner` | The full sans-io state. Critical sections are short and never `.await`. |
+| `parking_lot::Mutex<VecDeque<TopicListChange>>` | `ConnectionShared.topic_list_changes` | PIP-145 topic-list-watcher delta buffer surfaced to user futures. |
+| `parking_lot::RwLock` | tracker internals | Pure read paths under load. |
+| `tokio::sync::Notify` | `ConnectionShared.driver_waker`, `topic_list_notify` | Single-cell async wake-up. Not a channel. |
+| `std::sync::atomic::*` | stats + state flags | Lock-free counters. |
+| `core::task::Waker` slab | `magnetar-proto::Connection.pending_ops` | Future completion. |
+| `tokio::select!` | driver loop | Control-flow multiplexing. Not a channel. |
+| `Arc<T>` | `ConnectionShared`, `MessageEncryptor`, `MessageDecryptor`, `AuthProvider`, `MessageRouter`, interceptors | Cheap clone-and-share. |
+| `arc_swap::ArcSwap` | rare config-rotation slots | Lock-free swap. |
+| `slab::Slab` | per-future Waker keyspace | O(1) insertion + removal. |
+
+Anything not on this list either has a justification in
+[GUIDELINES.md](GUIDELINES.md) or is a candidate for removal.
+
+---
+
+## The driver loop
+
+One driver task per connection. Owns the I/O resources (TCP or TLS
+stream), the per-connection read buffer, and the `select!` loop that
+shuttles bytes between the state machine and the network.
+
+### State diagram
+
+```text
+                                ┌─────────────────────────────┐
+                                │   Acquire ConnectionShared  │
+                                └──────────────┬──────────────┘
+                                               │
+                                ┌──────────────▼──────────────┐
+                                │   loop {                    │
+                                └──────────────┬──────────────┘
+                                               │
+        ┌──────────────────────────────────────▼──────────────────────────────────┐
+        │  (1) Lock state. Drain outbound bytes (poll_transmit) into write_buf.   │
+        │      Read next deadline (poll_timeout). Read closing-flag. Drop lock.   │
+        └──────────────────────────────────────┬──────────────────────────────────┘
+                                               │
+                                ┌──────────────▼──────────────┐
+                                │  (2) write_all(write_buf)   │
+                                │      then flush()           │
+                                └──────────────┬──────────────┘
+                                               │
+                                ┌──────────────▼──────────────┐
+                                │  (3) if closing: shutdown   │
+                                │      return Ok(())          │
+                                └──────────────┬──────────────┘
+                                               │
+                                ┌──────────────▼──────────────┐
+                                │  (4) tokio::select! { biased │
+                                └──────────────┬──────────────┘
+                                               │
+              ┌────────────────────────────────┼────────────────────────────────┐
+              │                                │                                │
+              ▼                                ▼                                ▼
+   ┌──────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
+   │ shared.driver_waker  │     │ socket.read_buf(&buf)   │     │ sleep_until(deadline)   │
+   │   .notified()        │     │   on Ok(0) -> PeerClosed │     │   on tick -> handle_   │
+   │   (user enqueued     │     │   on Ok(n) -> lock +     │     │   timeout(now)           │
+   │   a send/ack/etc.)   │     │   handle_bytes(now, &b)  │     │                         │
+   │   loop continues     │     │   then drain events      │     │                         │
+   └──────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+                                               │
+                                ┌──────────────▼──────────────┐
+                                │     back to (1)             │
+                                └─────────────────────────────┘
 ```
 
-`dispatch_pending_event_wakers` walks the Connection's slab of `(op_id → Waker)` and `wake()`s the futures whose responses have arrived.
+### Lock discipline
 
-## Three TLS sites
+Every interaction with `Connection` happens inside a `parking_lot::Mutex`
+critical section. Critical sections are short — they **never `.await`**.
+The write_all / flush calls happen *outside* the lock so user futures can
+keep enqueuing while the driver holds the network handle.
 
-1. **`magnetar-runtime-tokio`**: `tokio_rustls::TlsConnector::connect(server_name, tcp)` — the standard path.
-2. **`magnetar-runtime-moonpool`**: a custom adapter at `magnetar-runtime-moonpool/src/tls.rs` driving `rustls::ClientConnection` via `read_tls` / `process_new_packets` / `write_tls` against the moonpool `NetworkProvider`-supplied byte pipe. This makes TLS handshakes deterministic under `moonpool-sim` chaos.
-3. **`magnetar-admin`**: `reqwest` configured with `rustls-tls` — no native-tls anywhere.
+### Event dispatch
 
-## Wire protocol summary
+`handle_bytes` is the inbound entry. As frames are decoded, the state
+machine populates the outcome slab and calls `Waker::wake()` on whatever
+user future is waiting. After the lock drops, the driver pulls semantic
+events via `poll_event()` and reacts to the two that the runtime layer
+must handle:
 
-- **Simple frame**: `[total_size u32][cmd_size u32][BaseCommand protobuf]`.
-- **Payload frame**: `[total_size u32][cmd_size u32][BaseCommand][magic u16=0x0e01][crc32c u32][meta_size u32][MessageMetadata][payload]`.
-- **Broker-entry-metadata envelope** (v16+, opt-in via FeatureFlags): `[magic u16=0x0e02][bem_size u32][BrokerEntryMetadata]` prepended to the standard frame on dispatched messages.
-- Cite the Java reference at `pulsar-common/src/main/java/org/apache/pulsar/common/protocol/Commands.java:1866-2038`.
+- `ConnectionEvent::AuthChallenge { method, challenge }` — driver
+  consults the configured `AuthProvider`, asks it for a fresh blob via
+  `respond_to_challenge`, and submits it via `submit_auth_response`
+  (PIP-30 / PIP-292).
+- `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes
+  the delta into `ConnectionShared.topic_list_changes` and wakes
+  `topic_list_notify` (PIP-145).
 
-`magnetar-proto::frame` exposes `encode_simple`, `encode_payload`, and `decode_one` returning a `(BaseCommand, Option<(MessageMetadata, Bytes)>, Option<BrokerEntryMetadata>)` triple.
+Every other event has already been turned into a future-completion via
+the Waker slab inside the state machine; the driver does not need to
+touch it.
 
-## Producer state machine notes
+### Source
 
-Critical Java semantics to mirror (per `ProducerImpl.java` and Codex cross-check):
+[`crates/magnetar-runtime-tokio/src/driver.rs`](crates/magnetar-runtime-tokio/src/driver.rs)
+— `driver_loop` is 239 lines and intentionally easy to read in one sitting.
 
-- **Chunks and batches are mutually exclusive.** If `canAddToBatch(msg)`, `totalChunks` is forced to `1`. Two distinct emit paths:
-  - **Chunked path** (large message, no batching): non-batch compress → schema/metadata → split → per-chunk metadata → encrypt each chunk → send each chunk frame.
-  - **Batched path** (small messages aggregated): add to `BatchMessageContainer` → flush serialises singles → compress the whole batch → encrypt → set batch metadata → send.
-- **Sequence id assignment** happens inside the chunk loop (`ProducerImpl.java:696-704`, `:745-753`) for both first-send and resend paths.
-- **Dedup** uses `lastSequenceIdPublished` and `lastSequenceIdPushed` for resend safety.
+---
 
-The Rust state machine has separate `emit_chunked` and `emit_batched` paths plus a `canAddToBatch ⇒ totalChunks == 1` invariant test.
+## Protocol state machine (`magnetar-proto`)
 
-## Schema-registry parity
+`magnetar-proto::Connection` is ~2,600 lines of state machine plus its
+satellites. Top-level types live at [`crates/magnetar-proto/src/conn.rs`].
 
-Per Codex cross-check: AVRO, JSON, and PROTOBUF are canonicalised broker-side by Avro `Schema.Parser` before version lookup (`SchemaRegistryServiceImpl.java:405-418, 657-662`). **All other types — including PROTOBUF_NATIVE and KeyValue — use raw-byte equality on `schema.getData()`** (`:429-438`). Magnetar's schema serialisers must emit byte-identical Java output for those types or the broker will create a fresh version on every connect.
+### Handshake state
+
+```text
+Uninitialized
+    │  (caller queues CommandConnect via Connection::new()+poll_transmit)
+    ▼
+ConnectSent
+    │  (CommandConnected arrives via handle_bytes)
+    ▼
+Connected   ⇄  AuthChallenging      (PIP-30/292 in-band auth refresh)
+    │                  │
+    │                  ▼
+    │     submit_auth_response → CommandAuthResponse on the wire
+    │                  │
+    │                  └─ broker accepts → back to Connected
+    │                  └─ broker rejects → Failed
+    │
+    │  (Client::close)
+    ▼
+Closing
+    │  (driver flushes; peer EOF or shutdown())
+    ▼
+Closed                      Failed   (handshake error / I/O error)
+```
+
+`Connection::state()` reports the live state. Source: [`HandshakeState`
+enum at conn.rs:52`].
+
+### Pending-op machinery
+
+```rust
+pub enum PendingOpKey {
+    /// A pending request keyed by request id (lookup, seek, ack-response, etc.).
+    Request(RequestId),
+    /// A pending publish keyed by `(producer_id, sequence_id)`.
+    Send(ProducerHandle, SequenceId),
+}
+
+pub enum OpOutcome {
+    SendReceipt { sequence_id, message_id },
+    SendError   { sequence_id, code, message },
+    Success     { request_id },
+    Error       { request_id, code, message },
+    Lookup      { request_id, outcome: LookupOutcome },
+    // ...
+}
+```
+
+The slab maps `PendingOpKey -> Waker` + `PendingOpKey -> OpOutcome`. A
+future registers its waker via `Connection::register_waker(key, waker)`
+and consumes the outcome via `Connection::take_outcome(key)`.
+
+### Producer / consumer states
+
+`ProducerState` lives at
+[`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/producer.rs).
+`ConsumerState` lives at
+[`crates/magnetar-proto/src/consumer.rs`](crates/magnetar-proto/src/consumer.rs).
+Both are owned by the parent `Connection` and addressed by stable
+`ProducerHandle` / `ConsumerHandle` ids.
+
+A `ProducerState` carries:
+
+- `producer_id`, `producer_name`, `topic`, `schema`, `compression`,
+  `access_mode`.
+- A `BatchMessageContainer` (only when batching is enabled).
+- A chunked-send slot (only when chunking is enabled — chunks-never-batched).
+- The send queue (pending `SendDecision`s).
+- Per-producer stats counters.
+
+A `ConsumerState` carries:
+
+- `consumer_id`, `consumer_name`, `subscription`, `subscription_type`,
+  `read_compacted`, `priority_level`, `key_shared`, `dead_letter_policy`.
+- The receive queue (inbound `IncomingMessage`s pending a `receive()` call).
+- The optional `AckGroupingTracker`, `NegativeAcksTracker`, and
+  `UnackedMessageTracker`.
+- The PIP-54 batch-ack table (per-batch position bitset).
+- The PIP-4 `crypto_failure_action`.
+
+### Trackers (`magnetar-proto/src/trackers`)
+
+Three single-purpose tick-driven state machines:
+
+| Tracker | Purpose | Lines | API |
+| --- | --- | --- | --- |
+| `AckGroupingTracker` | Coalesce acks inside a window so we send one `CommandAck` per batch of N acks. Wired via `ConsumerBuilder::ack_group_time`. | 353 | `add(...)`, `add_cumulative(...)`, `poll(now)`. |
+| `NegativeAcksTracker` | Defer redelivery commands by `delay`. Optionally drives a `MultiplierRedeliveryBackoff` over the broker-reported `redelivery_count` (PIP-37). | 212 | `add(...)`, `add_with_delay(...)`, `poll(now)`. |
+| `UnackedMessageTracker` | Client-side ack-timeout. Forces a `RedeliverUnacknowledged` if no positive ack arrives within `timeout`. Optionally backs off per-message via the same PIP-37 backoff. | 453 | `track(msg_id)`, `ack(msg_id)`, `poll(now)`. |
+
+All three drive off `Connection::poll_timeout` / `handle_timeout` and emit
+their outputs as `Vec<TrackerAction>`. The connection turns each action
+into an outbound `BaseCommand`.
+
+### Topic-list watcher
+
+`magnetar-proto::topic_watcher::TopicWatcherRegistry` (85 lines) carries
+the PIP-145 broker-driven topic-discovery state. The connection handles
+`CommandWatchTopicListResponse` / `CommandTopicListUpdated` opcodes and
+emits `ConnectionEvent::TopicListChanged` on the event queue. The driver
+forwards those to `ConnectionShared.topic_list_changes`, where
+`PatternConsumer::update` reconciles them against its child consumers.
+
+### Transactions (`magnetar-proto/src/txn.rs`)
+
+Owns the transaction-coordinator client. Pulsar transactions use four
+opcodes (`NEW_TXN`, `ADD_PARTITION_TO_TXN`, `ADD_SUBSCRIPTION_TO_TXN`,
+`END_TXN_*`) routed to the TC. `TxnClient` carries the `TxnId` registry
+and surfaces a Rust `Transaction` handle. The producer attaches `txn_id`
+to its publish via `OutgoingMessage::txn`, and the consumer attaches it
+to acks via `ack_with_txn` / `ack_cumulative_with_txn` /
+`ack_batch_with_txn`.
+
+[`crates/magnetar-proto/src/conn.rs`]: crates/magnetar-proto/src/conn.rs
+[`HandshakeState` enum at conn.rs:52`]: crates/magnetar-proto/src/conn.rs
+
+---
+
+## Wire framing
+
+Pulsar's wire format is three nested shapes plus an optional PIP-90
+envelope. Magnetar implements the codec in
+[`crates/magnetar-proto/src/frame.rs`](crates/magnetar-proto/src/frame.rs)
+(620 lines). All multi-byte integers are big-endian. Outer `total_size`
+excludes the four bytes used to encode itself.
+
+### Command-only frame
+
+```text
+[total_size u32][cmd_size u32][BaseCommand bytes]
+```
+
+`total_size == 4 + cmd_size`. Used for opcodes that have no message
+payload (`CONNECT`, `CONNECTED`, `LOOKUP`, `SEEK`, `ACK`, …).
+
+### Payload-bearing frame (SEND / MESSAGE)
+
+```text
+[total_size u32][cmd_size u32][BaseCommand]
+  [0x0e01 u16][crc32c u32]
+  [metadata_size u32][MessageMetadata][payload bytes]
+```
+
+`crc32c` (Castagnoli) is computed over
+`[metadata_size u32 BE][metadata bytes][payload bytes]`. Mismatch →
+emit `ConnectionEvent::ChecksumMismatch` and **drop the frame** (per
+[GUIDELINES.md §Protocol-correctness invariants point 1](GUIDELINES.md#protocol-correctness-invariants)).
+
+### Broker-entry-metadata envelope (PIP-90)
+
+When the namespace policy enables broker-entry metadata, dispatched
+messages carry a `BrokerEntryMetadata` prelude inserted by the broker:
+
+```text
+[total_size u32][cmd_size u32][BaseCommand]
+  [0x0e02 u16][bem_size u32][BrokerEntryMetadata]
+  [0x0e01 u16][crc32c u32][metadata_size u32][MessageMetadata][payload]
+```
+
+A producer must **never** emit `0x0e02`. Consumers peel it before parsing
+the standard frame and surface it via
+`IncomingMessage::broker_entry_metadata` (`broker_publish_time_ms`,
+`broker_index`). Source: [`crates/magnetar-proto/src/frame.rs:30-48`].
+
+### Constants
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `MAGIC_CRC32C` | `0x0e01` | Marks the start of the CRC + metadata prelude. |
+| `MAGIC_BROKER_ENTRY_METADATA` | `0x0e02` | Marks the optional PIP-90 envelope. |
+| `MAX_FRAME_SIZE` | `5 MiB` | Pulsar default cap. Higher layers may enforce smaller. |
+
+[`crates/magnetar-proto/src/frame.rs:30-48`]: crates/magnetar-proto/src/frame.rs
+
+---
+
+## Producer paths — batching vs chunking
+
+Pulsar enforces a critical invariant per `ProducerImpl.java:630-654`:
+
+> **Chunked messages can never be batched.** If a message is eligible for
+> the batch container, `totalChunks` is forced to `1`.
+
+Magnetar mirrors this in `ProducerState::queue_send`:
+
+```text
+                              user calls Producer::send(msg)
+                                       │
+                                       ▼
+                          ┌────────────────────────────┐
+                          │  ProducerState::queue_send │
+                          └─────────────┬──────────────┘
+                                        │
+                       canAddToBatch(msg) ?
+                                        │
+                ┌───────────── yes ─────┴────── no ─────────────┐
+                │                                                │
+                ▼                                                ▼
+   ┌─────────────────────────┐                  ┌──────────────────────────┐
+   │ Batched path             │                  │ Chunked path              │
+   │ -------------            │                  │ -------------            │
+   │ - add to BatchMessage    │                  │ - non-batch compress     │
+   │   Container.             │                  │ - schema + metadata      │
+   │ - flush condition:       │                  │ - split into chunks of   │
+   │     max_messages reached │                  │   max_message_size       │
+   │     OR max_bytes reached │                  │ - per-chunk metadata     │
+   │     OR publish_delay     │                  │   (chunk_id, total_chunks,│
+   │     timer fired.         │                  │   uuid) — PIP-37          │
+   │ - on flush:              │                  │ - encrypt each chunk     │
+   │     serialise singles    │                  │   (if PIP-4 enabled)     │
+   │     compress the whole   │                  │ - one CommandSend frame  │
+   │     batch                │                  │   per chunk              │
+   │     encrypt              │                  │                          │
+   │     set batch metadata   │                  │                          │
+   │     send                 │                  │                          │
+   └─────────────────────────┘                  └──────────────────────────┘
+                │                                                │
+                └───────────────────┬────────────────────────────┘
+                                    ▼
+                         single CommandSend frame
+                         (or N chunk frames)
+                                    │
+                                    ▼
+                      enter inflight slab keyed by
+                      (producer_id, sequence_id)
+                                    │
+                                    ▼
+                              broker SEND_RECEIPT
+                                    │
+                                    ▼
+                  resolve via OpOutcome::SendReceipt → wake SendFut
+```
+
+### Batch flush state machine
+
+```text
+                       Empty
+                         │
+                  add(msg)
+                         │
+                         ▼
+                    Buffering ──── publish_delay timer fires ─────────┐
+                         │                                            │
+                  add(msg) ─── max_messages reached ─── flush         │
+                         │                                            │
+                  add(msg) ─── max_bytes reached  ─── flush           │
+                         │                                            │
+                  flush() ─────────────────────────── flush ──────────┤
+                         │                                            │
+                         ▼                                            ▼
+                     Flushing  ──── awaiting SEND_RECEIPT ────────  done
+                                        │
+                                        ▼
+                                     Empty
+```
+
+`batching_max_publish_delay` (Java `batchingMaxPublishDelay`) drives the
+left-hand timer. The state machine ticks it via `poll_timeout` /
+`handle_timeout` so latency is bounded even if the batch never fills.
+
+Source: [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/producer.rs).
+
+### Sequence-id discipline
+
+- Sequence ids are assigned inside the chunk loop (Java
+  `ProducerImpl.java:696-704`, `:745-753` — both first-send and resend
+  paths).
+- Resend reuses the original sequence id.
+- `last_sequence_id` and `last_sequence_id_published` are tracked
+  separately so the runtime can drive resend-safe dedup.
+- Sequence id and request id are **monotonically non-decreasing** per
+  connection per producer ([GUIDELINES.md §Protocol-correctness
+  invariants point 4](GUIDELINES.md#protocol-correctness-invariants)).
+
+---
+
+## Consumer paths — ack grouping, unacked tracker, nack tracker, DLQ
+
+### Inbound message dispatch
+
+```text
+                            broker MESSAGE
+                                  │
+                                  ▼
+                         decode_one (frame.rs)
+                                  │
+                                  ▼
+                    crc32c verify (or drop + ChecksumMismatch)
+                                  │
+                                  ▼
+                       peel PIP-90 broker_entry_metadata (if 0x0e02 present)
+                                  │
+                                  ▼
+                         decompress (CompressionKind)
+                                  │
+                                  ▼
+                    decrypt (if PIP-4 keys present + decryptor configured)
+                                  │
+                                  ▼
+                         schema decode (for TypedConsumer)
+                                  │
+                                  ▼
+                  ConsumerState::push_incoming(IncomingMessage)
+                                  │
+                                  ▼
+                  if a receive() future is parked → wake its Waker
+                  else                            → queue in receive_queue
+```
+
+### Ack grouping flush window
+
+```text
+                            user calls Consumer::ack_grouped(msg_id)
+                                            │
+                                            ▼
+                           AckGroupingTracker::add(msg_id)
+                                            │
+                            ack_group_time timer not yet armed ?
+                                            │
+                              ┌─── yes ─────┴───── no ──────────────┐
+                              │                                     │
+                              ▼                                     ▼
+                  arm deadline = now + window         deadline already set
+                              │                                     │
+                              └──────────────┬──────────────────────┘
+                                             │
+                                             ▼
+                                   Connection::poll_timeout
+                                   returns the next deadline
+                                             │
+                                             ▼
+                                   driver sleep_until fires
+                                             │
+                                             ▼
+                                   Connection::handle_timeout
+                                             │
+                                             ▼
+                              AckGroupingTracker::poll(now)
+                                             │
+                                             ▼
+                              emit one coalesced CommandAck
+                              with all pending ids
+                                             │
+                                             ▼
+                                     unarm deadline
+```
+
+The PIP-54 ack_set bitset is stamped on per-batch ids so partial-batch
+acks (one position out of N) round-trip correctly.
+
+### Unacked tracker (ack-timeout)
+
+```text
+                receive(msg)
+                    │
+                    ▼
+        UnackedMessageTracker::track(msg.id, now + ack_timeout)
+                    │
+                    │
+       (caller does or doesn't ack inside ack_timeout)
+                    │
+       ┌──── ack arrives ─────┐         ┌──── timer fires ─────┐
+       │                      │         │                       │
+       ▼                      ▼         ▼                       ▼
+   tracker.ack(msg.id)        OK     tracker.poll(now)         emit
+   (purge entry)                     returns {redeliver_ids}   CommandRedeliverUnacked
+                                                                │
+                                                                ▼
+                                                  arm next deadline using
+                                                  optional PIP-37 backoff
+                                                  (multiplier * base_delay,
+                                                  capped at max_delay).
+```
+
+### Negative-ack tracker
+
+```text
+                negative_ack(msg_id) or negative_ack_with_delay(msg_id, d)
+                    │
+                    ▼
+        NegativeAcksTracker::add(msg_id, now + delay)
+                    │
+                    │
+                    ▼
+              poll_timeout returns
+              the next nack deadline
+                    │
+                    ▼
+              handle_timeout(now)
+                    │
+                    ▼
+              tracker.poll(now)
+                    │
+                    ▼
+              emit CommandRedeliverUnackedMessages
+              for ready ids
+                    │
+                    ▼
+              (re-arm if PIP-37 backoff configured)
+```
+
+### DLQ + retry-letter
+
+```text
+                      receive(msg) — redelivery_count = N
+                                  │
+                                  ▼
+                  if N >= max_redeliver_count
+                                  │
+                              yes ───── no → normal ack flow
+                                  │
+                                  ▼
+                  push msg into dead_letter_queue
+                  on the consumer state
+                                  │
+                                  ▼
+                  user calls Consumer::drain_dead_letter
+                                  │
+                                  ▼
+                  republish to dead_letter_topic
+                  (defaults to `<topic>-<subscription>-DLQ`)
+                                  │
+                                  ▼
+                  ack the original msg
+```
+
+`Consumer::reconsume_later` is the retry-letter variant: republish to
+the retry topic with delay + properties, then ack the original.
+
+---
+
+## Multi-topics fan-in
+
+`MultiTopicsConsumer` and `PatternConsumer` are façade types layered on
+top of N child `Consumer`s — one per subscribed topic. The receive race
+is *not* a channel — it is a `futures_util::future::select_all` over the
+child consumers' `receive()` futures.
+
+```text
+            ┌──── child Consumer 1 ────┐
+            │  Consumer::receive() ────┼──┐
+            └─────────────────────────┘   │
+            ┌──── child Consumer 2 ────┐  │
+            │  Consumer::receive() ────┼──┼──> select_all picks the first ready
+            └─────────────────────────┘   │     and returns (msg, topic).
+            ┌──── child Consumer N ────┐  │
+            │  Consumer::receive() ────┼──┘     remaining futures stay parked
+            └─────────────────────────┘         on their Connection's Waker slab.
+```
+
+Per-topic ack / nack / seek dispatch via the topic name attached to the
+incoming message.
+
+### Dynamic membership
+
+- `MultiTopicsConsumer` is currently static (Arc<Inner> immutability) —
+  dynamic `add_topic` / `remove_topic` is a known parity gap.
+- `PatternConsumer` reconciles topic list deltas on demand via
+  `update(&client)`. The driver pushes `TopicListChanged` deltas into
+  `ConnectionShared.topic_list_changes`; `update()` drains the buffer,
+  diffs against `topics()`, and spawns / closes child consumers.
+
+---
+
+## Pattern consumer + topic watcher (PIP-145)
+
+```text
+                       PatternConsumerBuilder::subscribe(&client)
+                                            │
+                                            ▼
+                  Client::watch_topic_list(namespace, pattern)
+                                            │
+                                            ▼
+                  initial snapshot of matching topics
+                                            │
+                                            ▼
+                  open one child Consumer per matched topic
+                  (under the same subscription name)
+                                            │
+                                            ▼
+                  return PatternConsumer { children: Mutex<Vec<...>> }
+                                            │
+                                            ▼
+                  meanwhile, on the driver:
+                  every CommandTopicListUpdated →
+                    ConnectionShared.topic_list_changes.push_back(delta)
+                    topic_list_notify.notify_waiters()
+                                            │
+                                            ▼
+                  caller does PatternConsumer::update(&client)
+                                            │
+                                            ▼
+                  drain topic_list_changes
+                  diff against current children
+                  open new children for `added`
+                  close child consumers for `removed`
+                  emit a ReconcileReport
+```
+
+Auto-update on a background ticker is a known gap — the architecture
+allows it (wrap `Client` in `Arc`, spawn a tokio task that polls
+`next_topic_list_change` or a `tokio::time::interval`), but
+`Client::is_clone` is currently false. Tracked internally.
+
+---
+
+## Runtime engines
+
+### `magnetar-runtime-tokio` — production (~2,950 LOC)
+
+| File | Lines | Role |
+| --- | --- | --- |
+| `client.rs` | 654 | `Client::connect` + `connect_auth` + `connect_with` + transaction-coordinator helpers (`new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`), partitioned metadata lookup, topic-list watcher entry point. |
+| `consumer.rs` | 937 | `Consumer` façade — `receive`, `receive_with_timeout`, `receive_batch_with_bytes_cap`, ack variants (individual / cumulative / batch / with-properties / with-txn / partial-batch), nack, seek (id / timestamp / earliest / latest), pause / resume, DLQ drain, stats, `last_message_id`, `close`. |
+| `producer.rs` | 382 | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters, `access_mode` / `compression` getters, `last_disconnected_timestamp`. |
+| `driver.rs` | 239 | The driver loop + auth-challenge dispatch + PIP-145 forwarding. |
+| `compress.rs` | 210 | Encode + decode for `None` / `Lz4` / `Zlib` / `Zstd` / `Snappy`. |
+| `transport.rs` | 125 | TCP connect + optional `tokio-rustls` wrap. |
+| `lib.rs` | 182 | `ConnectionShared` + `TopicListChange`. |
+| `url_parse.rs` | 113 | `pulsar://` / `pulsar+ssl://` URL parsing. |
+| `error.rs` | 67 | `ClientError` enum. |
+| `crypto.rs` | 48 | `MessageEncryptor` + `MessageDecryptor` traits. |
+
+### `magnetar-runtime-moonpool` — deterministic simulation (~450 LOC, M1 scope)
+
+| File | Lines | Role |
+| --- | --- | --- |
+| `lib.rs` | 235 | `ConnectionShared` (no `Notify` — single-task pattern), `MoonpoolEngine<P>` generic over `moonpool_core::Providers`, `connect_plain` handshake driver. |
+| `tls.rs` | ~215 | `RustlsByteAdapter` — drives `rustls::ClientConnection` over a `moonpool_core::NetworkProvider`-supplied byte pipe (`read_tls` / `process_new_packets` / `write_tls`). Sans-io composition end to end. |
+
+Key M1-scope properties:
+
+- The engine is generic over `moonpool_core::Providers`, which bundles
+  `NetworkProvider`, `TimeProvider`, `TaskProvider`, `RandomProvider`,
+  `StorageProvider`. Plug `TokioProviders` for production-style runs
+  against a real broker; plug a sim bundle for reproducible chaos under
+  `moonpool-sim`.
+- Handshake-only today: `connect_plain` queues `CommandConnect`, pumps
+  the state machine until `CONNECTED` or `AuthChallenging`, returns the
+  shared state.
+- TLS handshakes survive `moonpool-sim` chaos with the same determinism
+  as `magnetar-proto` itself — the adapter never blocks on a network
+  call inside `process_new_packets`; reads and writes go through the
+  byte pipe under sim control.
+
+The pending M2 work mirrors the tokio engine: driver loop, producer
+façade, consumer façade, client façade behind the `moonpool` feature on
+the `magnetar` façade crate.
+
+---
+
+## TLS sites
+
+The workspace has **three** TLS sites. **None** use `native-tls`.
+
+1. **`magnetar-runtime-tokio`** — `tokio_rustls::TlsConnector::connect(server_name, tcp)`
+   is the standard path. Roots come from
+   `rustls-native-certs` by default; users can override with
+   `ClientBuilder::tls_trust_certs_pem` / `tls_trust_certs_file_path`,
+   in which case `Client::tls_config_from_pem` builds a custom
+   `rustls::ClientConfig` from the supplied PEM chain.
+2. **`magnetar-runtime-moonpool`** — `tls::RustlsByteAdapter` drives a
+   `rustls::ClientConnection` (itself sans-io) over the moonpool
+   byte pipe. Each iteration of the driver loop pumps
+   `socket.read` → `session.read_tls` → `session.process_new_packets()`
+   → drain `session.reader()` into `plaintext_in`. Symmetric on the
+   write path.
+3. **`magnetar-admin`** — `reqwest` configured with `rustls-tls` for the
+   REST admin client.
+
+Source: GUIDELINES.md §"TLS" — rule is hard. `cargo deny check` rejects
+`openssl-sys` / `native-tls` / `native-tls-sys` outright.
+
+---
+
+## Schemas
+
+The `Schema` trait lives at
+[`crates/magnetar-proto/src/schema/mod.rs`](crates/magnetar-proto/src/schema/mod.rs):
+
+```rust
+pub trait Schema: Send + Sync + std::fmt::Debug {
+    type Owned: Send + 'static;
+    fn schema_type(&self) -> pb::schema::Type;
+    fn schema_data(&self) -> Bytes;
+    fn encode(&self, value: &Self::Owned) -> Result<Bytes, SchemaError>;
+    fn decode(&self, bytes: &[u8]) -> Result<Self::Owned, SchemaError>;
+}
+```
+
+### Implementations
+
+| Schema | Owned type | Wire bytes |
+| --- | --- | --- |
+| `BytesSchema` | `Bytes` | passthrough |
+| `StringSchema` | `String` | UTF-8 |
+| `JsonSchema<T: Serialize + DeserializeOwned>` | `T` | JSON via `serde_json`; broker stores canonicalised form |
+| `AvroSchema` | `apache_avro::Value` | Avro single-object encoding; canonical parsing form for version dedup |
+| `ProtobufSchema` | `prost::Message` | Protobuf wire encoding; descriptor-based version dedup |
+| `ProtobufNativeSchema` | `prost::Message` | Protobuf wire encoding; byte-identical Java `FileDescriptorSet` for version dedup |
+| `KeyValueSchema` | `KeyValuePair<K, V>` | Concatenated `(key_len, key, value_len, value)` with `KeyValueEncodingType::{Inline, Separated}` |
+| `AutoConsumeSchema` | `GenericRecord` | Trait surface only — broker-driven lookup pending |
+| `AutoProduceBytesSchema` | `Bytes` | Trait surface only |
+| `Int8Schema` / `Int16Schema` / `Int32Schema` / `Int64Schema` | `iN` | Big-endian fixed-width |
+| `FloatSchema` / `DoubleSchema` | `fN` | IEEE 754 big-endian |
+| `BoolSchema` | `bool` | Single byte (`0x00` / `0x01`) |
+| `DateSchema` / `TimeSchema` / `TimestampSchema` / `LocalDateSchema` / `LocalTimeSchema` | `i64` | 8-byte big-endian |
+| `InstantSchema` | `(i64 seconds, i32 nanos)` | 12-byte big-endian |
+| `LocalDateTimeSchema` | `(i64 seconds, i32 nanos)` | 12-byte big-endian |
+
+### Canonicalisation (Codex Q4)
+
+Per the cross-check on
+`SchemaRegistryServiceImpl.java:405-438`:
+
+- **AVRO / JSON / PROTOBUF** schemas are re-parsed broker-side via the
+  Avro `Schema.Parser` before the version lookup. Magnetar emits the
+  Avro canonical parsing form (`AvroSchema`) so two logically-identical
+  schemas hash to the same version regardless of whitespace, field
+  order, or property ordering.
+- **PROTOBUF_NATIVE** and **KeyValue** are stored as opaque blobs and
+  compared by **raw-byte equality**. The Java client emits a
+  `FileDescriptorSet` for `PROTOBUF_NATIVE` and a stable JSON shape
+  (`{"key": ..., "value": ..., "keyValueEncodingType": ...}`) for
+  `KeyValue`. Magnetar emits byte-identical output for both, otherwise
+  the broker would create a fresh schema version on every (re)connect
+  and defeat the registry's deduplication.
+
+Source: [`crates/magnetar-proto/src/schema/mod.rs:19-34`](crates/magnetar-proto/src/schema/mod.rs).
+
+### Typed producer / consumer
+
+`magnetar::TypedProducer<S: Schema>` and `magnetar::TypedConsumer<S>`
+serialise / deserialise per call. Construction:
+
+```rust,no_run
+# use std::sync::Arc;
+# use magnetar::PulsarClient;
+# use magnetar_proto::schema::AvroSchema;
+# async fn run(client: PulsarClient) -> Result<(), Box<dyn std::error::Error>> {
+let schema = Arc::new(AvroSchema::new_from_str(r#"
+    {"type":"record","name":"User","fields":[
+        {"name":"id","type":"long"},
+        {"name":"name","type":"string"}
+    ]}
+"#)?);
+
+let p = client.typed_producer("persistent://public/default/users", schema.clone()).create().await?;
+let c = client.typed_consumer("persistent://public/default/users", schema)
+    .subscription("readers")
+    .subscribe()
+    .await?;
+# Ok(()) }
+```
+
+The schema is advertised on `CommandProducer.schema` /
+`CommandSubscribe.schema`; the broker performs version negotiation.
+
+---
+
+## PIP coverage map
+
+| PIP | Title | Status | Lives in |
+| --- | --- | --- | --- |
+| PIP-4 | End-to-end encryption (AES-GCM) | ✅ | `crates/magnetar-messagecrypto/src/lib.rs:98-220`; bridge: `crates/magnetar/src/crypto_bridge.rs` |
+| PIP-22 | DLQ topic | ✅ | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter` |
+| PIP-30 | In-band `AUTH_CHALLENGE` refresh | ✅ | `crates/magnetar-proto/src/auth.rs`; dispatch: `crates/magnetar-runtime-tokio/src/driver.rs:42-66` |
+| PIP-31 | Transactions | ✅ | `crates/magnetar-proto/src/txn.rs`; client surface: `Client::new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn` |
+| PIP-37 | Chunking + `AckTimeoutRedeliveryBackoff` | ✅ | Chunked producer path: `crates/magnetar-proto/src/producer.rs`; backoff: `crates/magnetar-proto/src/trackers/nack.rs` |
+| PIP-54 | Partial-batch ACK (ack_set bitset) | ✅ | `crates/magnetar-proto/src/consumer.rs:109-130`; ack stamping: `crates/magnetar-proto/src/conn.rs:1775` |
+| PIP-58 | Retry-letter topic | ✅ | `Consumer::reconsume_later` + `reconsume_later_with_properties` |
+| PIP-68 | Exclusive producer access mode | ✅ | `ProducerBuilder::access_mode` |
+| PIP-90 | Broker-entry metadata envelope | ✅ | `crates/magnetar-proto/src/frame.rs:30-48`; consumer getters: `IncomingMessage::broker_publish_time_ms` / `broker_index` |
+| PIP-124 | Multi-DLQ topics for KeyShared | ✅ | DLQ policy infra (shared with PIP-22) |
+| PIP-145 | Topic list watcher (regex pattern) | ✅ | `crates/magnetar-proto/src/topic_watcher.rs`; consumer façade: `crates/magnetar/src/pattern_consumer.rs` |
+| PIP-188 | `TOPIC_MIGRATED` | 🟡 | Wire opcode decoded; engine-level reconnect-on-migrate pending |
+| PIP-292 | Better in-band auth refresh ergonomics | ✅ | `crates/magnetar-runtime-tokio/src/driver.rs:42-66` |
+| PIP-313 | Force unsubscribe | ✅ | `CommandUnsubscribe.force` field plumbed |
+| PIP-34 / 119 / 282 / 379 | Key_Shared family | ✅ | `magnetar_proto::KeySharedConfig` + builder routing |
+| PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
+| PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
+| PIP-460 | Scalable topics | ❌ | M9 scope (experimental) |
+| PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim |
+| PIP-180 | Shadow topic | ❌ | M9 |
+| PIP-415 | `getMessageIdByIndex` | ❌ | M9 |
+| PIP-33 | Replicated subscriptions | ❌ | M9 |
+| PIP-121 | Cluster failover (Auto + Controlled) | ❌ | M9 |
+
+---
+
+## Tests
+
+### Unit + integration (220+ tests)
+
+```sh
+cargo test --workspace --all-features
+```
+
+Every sans-io behaviour is exercised in isolation: feed bytes, assert
+events / transmit / state. Trackers ship 13 ported behavioural cases
+from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`. The
+producer ships 6 ported cases from `BatchMessageContainerImplTest`.
+
+### End-to-end (5 tests, behind `--features e2e`)
+
+Requires Docker. Image: `apachepulsar/pulsar:4.0.4`.
+
+```sh
+cargo test --workspace --features e2e
+```
+
+Tests:
+
+- `e2e_produce_consume_roundtrip` — basic producer + consumer round-trip.
+- `e2e_partitioned_topic_roundtrip` — partitioned producer + consumer
+  across N partitions.
+- `e2e_key_shared_dispatch` — Key_Shared sticky-hash dispatch (PIP-34).
+- `e2e_pattern_consumer_snapshot` — PIP-145 regex discovery snapshot.
+- (one further — count tracked internally).
+
+### Mutation testing (scoped for M5/M6)
+
+```sh
+cargo mutants --package magnetar-proto --timeout 60 --shard 1/4
+```
+
+Targets: frame decode, request correlation, resend / dedup, flow
+permits, chunk metadata, timeout transitions. Promoted from v0.2.0
+plans to v0.1.0 deliverable.
+
+### Fuzz (`magnetar-proto/fuzz`)
+
+```sh
+cargo +nightly fuzz run encode_roundtrip
+```
+
+Round-trip-encodes `BaseCommand` shapes and asserts re-decode equality.
+
+---
+
+## Build & validation
+
+Stable Rust **1.85** (workspace MSRV in `rust-toolchain.toml`).
+
+### Per-commit chain
+
+```sh
+cargo build --workspace --all-features
+cargo clippy --workspace --all-features -- -D warnings
+cargo +nightly fmt --check
+cargo test --workspace
+cargo deny check
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
+  cargo doc --no-deps --all-features --workspace --locked
+```
+
+### When touching `magnetar-proto`
+
+```sh
+cargo xtask check-no-channels   # greps src/** for banned channel paths
+cargo xtask check-no-io-deps    # asserts magnetar-proto has no I/O deps
+cargo xtask codegen --check     # asserts proto codegen has no drift
+```
+
+### Workspace lints
+
+`forbid(unsafe_code)` workspace-wide. `unreachable_pub = "warn"`,
+`missing_debug_implementations = "warn"`. Pedantic clippy on the whole
+workspace with `cast_possible_truncation`, `cast_sign_loss`,
+`cast_possible_wrap`, `module_name_repetitions`, `must_use_candidate`,
+`missing_errors_doc`, `missing_panics_doc`, and `unnecessary_literal_bound`
+allowed (justification in workspace `Cargo.toml`).
+
+### Forbidden crates (`cargo deny bans deny`)
+
+Channel-shaped: any crate that ships an `mpsc` / `broadcast` / `watch` /
+`oneshot` flavour — `crossbeam-channel`, `flume`, `async-channel`,
+`kanal`, `postage`, `tachyonix`, `thingbuf`, plus the corresponding
+`tokio::sync::*` paths via `clippy.toml`'s `disallowed-types`.
+
+TLS-related: `openssl-sys`, `openssl`, `native-tls`, `native-tls-sys`.
+
+### Dependency allow-list
+
+The final allow-list is tracked internally and enforced through
+`cargo deny`. Any addition needs explicit project-owner approval.
+
+---
 
 ## Further reading
 
-- Decision log: `~/.claude/plans/ask-magnetar-decisions.md`
-- Research dossier: `~/.claude/plans/ask-magnetar-research.md`
-- Implementation plan: `~/.claude/plans/ask-magnetar-plan.md` (also `tasks/todo.md` while the repo is bootstrapping)
-- Codex cross-check: `~/.claude/plans/ask-magnetar-codex.md`
+- [README.md](README.md) — user-facing entry point.
+- [GUIDELINES.md](GUIDELINES.md) — coding conventions + invariants.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — patch flow + sign-off.
+- The Apache Pulsar Java client at
+  [`apache/pulsar/pulsar-client`](https://github.com/apache/pulsar/tree/master/pulsar-client)
+  — primary parity reference.
+- `quinn-proto` at
+  [`quinn-rs/quinn/quinn-proto`](https://github.com/quinn-rs/quinn/tree/main/quinn-proto)
+  — sans-io reference shape that `magnetar-proto::Connection` mirrors.
