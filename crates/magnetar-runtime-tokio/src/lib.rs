@@ -64,6 +64,7 @@
     clippy::doc_markdown
 )]
 
+pub mod auto_cluster_failover;
 mod client;
 pub mod compress;
 mod consumer;
@@ -73,6 +74,7 @@ mod driver;
 mod error;
 mod producer;
 pub mod tls_insecure;
+pub mod tls_no_hostname;
 mod transport;
 mod url_parse;
 
@@ -82,6 +84,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+pub use crate::auto_cluster_failover::{AutoClusterFailover, HealthProbe, HealthProbeFuture};
 pub use crate::client::Client;
 pub use crate::compress::CompressionError;
 pub use crate::consumer::{Consumer, ReceiveFut};
@@ -91,6 +94,7 @@ pub use crate::driver::DriverHandle;
 pub use crate::error::ClientError;
 pub use crate::producer::{Producer, SendFut};
 pub use crate::tls_insecure::insecure_tls_config;
+pub use crate::tls_no_hostname::tls_config_no_hostname;
 pub use crate::transport::default_tls_config;
 pub use crate::url_parse::{ParsedUrl, Scheme};
 

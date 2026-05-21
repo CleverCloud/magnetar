@@ -1267,7 +1267,15 @@ impl ClientBuilder {
         } else if let Some(pem) = self.tls_trust_certs_pem {
             let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
             let tls_config = match parsed.scheme {
-                magnetar_runtime_tokio::Scheme::Tls => Some(Client::tls_config_from_pem(&pem)?),
+                magnetar_runtime_tokio::Scheme::Tls => {
+                    // Java parity: `enableTlsHostnameVerification(false)` paired with a
+                    // PEM trust store keeps the chain check but skips the hostname match.
+                    if self.tls_hostname_verification_enable {
+                        Some(Client::tls_config_from_pem(&pem)?)
+                    } else {
+                        Some(magnetar_runtime_tokio::tls_config_no_hostname(&pem)?)
+                    }
+                }
                 magnetar_runtime_tokio::Scheme::Plain => None,
             };
             Client::connect_with_provider(

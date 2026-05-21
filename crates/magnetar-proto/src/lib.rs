@@ -64,6 +64,7 @@
 
 pub mod auth;
 pub mod backoff;
+pub mod cluster_failover;
 pub mod conn;
 pub mod consumer;
 pub mod error;
@@ -95,6 +96,7 @@ pub mod pb {
 
 pub use crate::auth::{AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth};
 pub use crate::backoff::Backoff;
+pub use crate::cluster_failover::ControlledClusterFailover;
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, CryptoFailureAction,
     HandshakeState, KeySharedConfig, OpOutcome, PendingOpKey, SeekTarget, SubscribeRequest,

@@ -589,19 +589,18 @@ known-missing feature.
 | `maxMessageSize` | ✅ | ✅ | `ClientBuilder::max_message_size`. |
 | `tlsTrustCertsFilePath` | ✅ | ✅ | `ClientBuilder::tls_trust_certs_file_path`. |
 | `tlsAllowInsecureConnection` | ✅ | ✅ | `ClientBuilder::tls_allow_insecure_connection(true)` — accepts any server cert via a custom rustls verifier. **Insecure**, do not use in production. |
-| `enableTlsHostnameVerification` | ✅ | 🟡 | `ClientBuilder::tls_hostname_verification_enable(bool)`; the "chain on + hostname off" combination is the planned follow-up (today honoured only via the `tls_allow_insecure_connection` blanket override). |
+| `enableTlsHostnameVerification` | ✅ | ✅ | `ClientBuilder::tls_hostname_verification_enable(bool)` — `true` (the default) uses the standard WebPKI verifier (chain + hostname); `false` paired with `tls_trust_certs_pem` routes through `magnetar_runtime_tokio::tls_config_no_hostname` which delegates chain check to WebPKI and intercepts only the `NotValidForName` failure. |
 | `serviceUrlProvider` (URL rotation) | ✅ | ✅ | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)` — the supervised reconnect path calls `provider.get_service_url()` on every reconnect attempt, so cluster-failover policies can swap broker URLs between attempts. |
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
 | `memoryLimit` | ✅ | ✅ | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` enforced at runtime via `AtomicU64` CAS reservation in `Producer::send` (Java's `FailImmediately` semantics). `ProducerBlock` (block until budget frees) is the planned follow-up. |
 | `dnsResolver` customisation | ✅ | 🟡 | `ClientBuilder::dns_resolver(Arc<dyn DnsResolver>)` trait + `TokioDnsResolver` default impl shipped; routing through `Transport::connect` is the planned follow-up (same pattern ServiceUrlProvider followed). |
 | `isClosed` / `shutdown` / `getLastDisconnectedTimestamp` | ✅ | ✅ | All exposed on `PulsarClient`. |
-| Cluster failover (PIP-121) | ✅ | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ClientBuilder::service_url_provider`; `AutoClusterFailover` and `ControlledClusterFailover` policies pending. |
+| Cluster failover (PIP-121) | ✅ | ✅ | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ControlledClusterFailover` (in `magnetar-proto`) + `AutoClusterFailover` (in `magnetar-runtime-tokio`, with user-supplied `HealthProbe` callback + background tokio task). All three plug into `ClientBuilder::service_url_provider`. |
 
 ### Open structural gaps
 
 - **Stats rolling windows.** Cumulative-only counters today; the broker dashboard expects msgs/sec, bytes/sec rolling windows. `hdrhistogram` p50/p99/max has shipped (`Consumer::stats` + `Producer::stats`).
-- **PIP-121 cluster failover.** `ServiceUrlProvider` + `ControlledClusterFailover` policy in flight; today the driver reconnects to the same `service_url`.
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180 shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33 replicated subscriptions** are scoped for the M9 milestone.
 
 ---
@@ -632,7 +631,7 @@ known-missing feature.
 | PIP-180 | Shadow topic | ❌ | M9 |
 | PIP-415 | `getMessageIdByIndex` | ❌ | M9 |
 | PIP-33 | Replicated subscriptions | ❌ | M9 |
-| PIP-121 | Cluster failover (Auto + Controlled) | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` shipped; Auto/Controlled policies pending |
+| PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime, with `HealthProbe` callback). Active URL re-resolved on every supervised-reconnect attempt. |
 
 ---
 
@@ -692,19 +691,22 @@ PIP-121 / PIP-33 / PIP-460 / PIP-180 / PIP-415 / replicated subscriptions
 
 Top open items at the time of this writing:
 
-1. **PIP-121 cluster failover policies** — `AutoClusterFailover` (latency-
-   based) + `ControlledClusterFailover` (external-signal) on top of the
-   shipped `ServiceUrlProvider` runtime URL rotation.
-2. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
+1. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
    (opcode missing from the current `PulsarApi.proto` snapshot).
-3. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
+2. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
    topic / PIP-33 replicated subscriptions** — scoped for M9.
+3. **Stats rolling per-second windows** (msgs/sec, bytes/sec snapshot).
+   Cumulative counters + hdrhistogram latency already shipped; this
+   adds an `EMA`-style ticker.
 
 `hdrhistogram` latency stats (p50/p99/max), the
 `MultiTopicsConsumer::add_topic` / `remove_topic` mutators, the
-`PatternConsumer::start_auto_reconcile` ticker, and the
-`ServiceUrlProvider` runtime URL rotation on every reconnect attempt
-have already landed.
+`PatternConsumer::start_auto_reconcile` ticker, the
+`ServiceUrlProvider` runtime URL rotation, the full PIP-121 cluster
+failover surface (`AutoClusterFailover` + `ControlledClusterFailover`),
+the `memory_limit` runtime enforcement, and the
+`enableTlsHostnameVerification(false)` chain-on / hostname-off
+combination have already landed.
 
 The supervised reconnect (Stage 2) and transparent in-flight producer +
 consumer rebuild (Stage 3, `Connection::rebuild_producers` /
