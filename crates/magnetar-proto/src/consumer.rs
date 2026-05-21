@@ -478,9 +478,14 @@ impl ConsumerState {
             self.total_msgs_received = self.total_msgs_received.saturating_add(1);
             self.total_bytes_received =
                 self.total_bytes_received.saturating_add(payload_len as u64);
-            // Track for ack-timeout-driven redelivery.
+            // Track for ack-timeout-driven redelivery — backoff-aware when the consumer was
+            // configured with a PIP-37 `AckTimeoutRedeliveryBackoff`.
             if let Some(tracker) = self.unacked_tracker.as_mut() {
-                tracker.add(msg.message_id, std::time::Instant::now());
+                tracker.add_with_redelivery_count(
+                    msg.message_id,
+                    msg.redelivery_count,
+                    std::time::Instant::now(),
+                );
             }
             self.queue.push_back(msg);
             DeliverOutcome::Delivered {

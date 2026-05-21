@@ -1333,6 +1333,18 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#ackTimeoutRedeliveryBackoff`. PIP-37 backoff applied to
+    /// the per-message ack-timeout deadline using the broker-reported `redelivery_count`.
+    /// Has no effect unless [`Self::ack_timeout`] is also set.
+    #[must_use]
+    pub fn ack_timeout_backoff(
+        mut self,
+        backoff: magnetar_proto::trackers::MultiplierRedeliveryBackoff,
+    ) -> Self {
+        self.req.ack_timeout_backoff = Some(backoff);
+        self
+    }
+
     /// Mirrors Java `ConsumerBuilder#acknowledgmentGroupTime`. When set, calls to
     /// [`magnetar_runtime_tokio::Consumer::ack_grouped`] (and
     /// `ack_grouped_cumulative`) stage acks in an in-memory tracker and the state

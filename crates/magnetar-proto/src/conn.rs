@@ -345,6 +345,13 @@ pub struct SubscribeRequest {
     /// is tracked client-side; if no positive ack arrives within `d`, the consumer forces a
     /// redelivery. `None` disables the tracker (the default).
     pub ack_timeout: Option<Duration>,
+    /// Mirrors Java `ConsumerBuilder#ackTimeoutRedeliveryBackoff`. PIP-37: when set together
+    /// with [`Self::ack_timeout`], the ack-timeout deadline for each delivered message is
+    /// computed via
+    /// [`crate::trackers::nack::MultiplierRedeliveryBackoff::delay_for`] using the
+    /// broker-reported `redelivery_count` on the incoming message. `None` keeps the flat
+    /// `ack_timeout` window.
+    pub ack_timeout_backoff: Option<crate::trackers::nack::MultiplierRedeliveryBackoff>,
     /// Mirrors Java `ConsumerBuilder#acknowledgmentGroupTime`. When `Some(d)`, calls to
     /// the runtime `Consumer::ack_grouped` family stage acks in an in-memory tracker and
     /// flush them as a single coalesced `CommandAck` every `d`. Trades broker-confirmation
@@ -400,6 +407,7 @@ impl Default for SubscribeRequest {
             consumer_metadata: Vec::new(),
             negative_ack_redelivery_delay: None,
             ack_timeout: None,
+            ack_timeout_backoff: None,
             ack_group_time: None,
         }
     }
@@ -1486,8 +1494,11 @@ impl Connection {
             state.nack_tracker = Some(crate::trackers::NegativeAcksTracker::new(handle, delay));
         }
         if let Some(timeout) = req.ack_timeout {
-            state.unacked_tracker =
-                Some(crate::trackers::UnackedMessageTracker::new(handle, timeout));
+            let mut tracker = crate::trackers::UnackedMessageTracker::new(handle, timeout);
+            if let Some(backoff) = req.ack_timeout_backoff {
+                tracker = tracker.with_backoff(backoff);
+            }
+            state.unacked_tracker = Some(tracker);
         }
         if let Some(group_time) = req.ack_group_time {
             state.ack_tracker = Some(crate::trackers::AckGroupingTracker::new(handle, group_time));
