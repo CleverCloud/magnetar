@@ -19,7 +19,10 @@ use parking_lot::Mutex;
 
 use crate::ConnectionShared;
 use crate::consumer::Consumer;
-use crate::driver::{DriverHandle, spawn as spawn_driver};
+use crate::driver::{
+    DriverHandle, ReconnectContext, spawn as spawn_driver,
+    spawn_supervised as spawn_supervised_driver,
+};
 use crate::error::ClientError;
 use crate::producer::Producer;
 use crate::transport::{Transport, default_tls_config};
@@ -96,6 +99,10 @@ impl Client {
     /// Connect using a pre-parsed URL and an explicit TLS configuration. Intended for advanced
     /// callers that need to customise trust anchors / client certificates / ALPN.
     ///
+    /// When `config.supervisor` is `Some`, the resulting driver task is wrapped with the
+    /// auto-reconnect supervisor: subsequent transport drops trigger a backoff-driven
+    /// reconnect against `url` (and `tls_config` if `pulsar+ssl://`).
+    ///
     /// # Errors
     ///
     /// Same as [`Self::connect`].
@@ -105,12 +112,13 @@ impl Client {
         config: ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     ) -> Result<Self, ClientError> {
-        let socket = Transport::connect(&url, tls_config).await?;
-        Self::start_handshake(socket, config, auth_provider).await
+        let socket = Transport::connect(&url, tls_config.clone()).await?;
+        Self::start_supervised_handshake(socket, url, tls_config, config, auth_provider).await
     }
 
     /// Drive the handshake against an already-connected socket. Useful for tests and for
-    /// custom transports (e.g. `tokio::io::duplex` in tests).
+    /// custom transports (e.g. `tokio::io::duplex` in tests). The auto-reconnect supervisor
+    /// is **not** wired in on this path: a raw socket cannot be reopened after a drop.
     pub async fn from_socket<S>(socket: S, config: ConnectionConfig) -> Result<Self, ClientError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -138,6 +146,33 @@ impl Client {
 
         // Park until the state machine emits `ConnectionEvent::Connected`. We do this with a
         // local future that polls the event queue.
+        match wait_connected(shared.clone()).await {
+            Ok(()) => Ok(Self {
+                shared,
+                driver: Mutex::new(Some(driver)),
+            }),
+            Err(e) => {
+                driver.abort();
+                Err(e)
+            }
+        }
+    }
+
+    async fn start_supervised_handshake(
+        socket: Transport,
+        url: ParsedUrl,
+        tls_config: Option<Arc<rustls::ClientConfig>>,
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+    ) -> Result<Self, ClientError> {
+        let shared = ConnectionShared::with_auth(config, auth_provider);
+
+        shared.inner.lock().begin_handshake()?;
+        shared.driver_waker.notify_one();
+
+        let ctx = ReconnectContext { url, tls_config };
+        let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
+
         match wait_connected(shared.clone()).await {
             Ok(()) => Ok(Self {
                 shared,
@@ -473,10 +508,19 @@ impl Client {
     /// error, local `close()`). `None` while the connection has never been disconnected.
     ///
     /// Mirrors Java's `Producer/Consumer#getLastDisconnectedTimestamp`. Convert with
-    /// [`std::time::SystemTime::duration_since`] if the Java-style millis-since-epoch number
+    /// [`std::time::SystemTime::duration_since`] if the Java-session-millis-since-epoch number
     /// is needed.
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         self.shared.inner.lock().last_disconnected_timestamp()
+    }
+
+    /// Monotonic counter bumped each time the auto-reconnect supervisor severs the broker
+    /// session via [`magnetar_proto::Connection::reset`]. Callers detect a reconnect by
+    /// observing this value change between two operations on the same `Client`. Mirrors
+    /// Java `ClientCnx#getEpoch` at the client-façade scope.
+    #[must_use]
+    pub fn session_epoch(&self) -> u64 {
+        self.shared.inner.lock().session_epoch()
     }
 }
 

@@ -220,6 +220,17 @@ pub enum OpOutcome {
         /// Topics currently matching the watcher's namespace + pattern.
         topics: Vec<String>,
     },
+    /// Synthetic outcome surfaced to every waiter when the underlying broker
+    /// connection drops and the supervisor begins a reconnect. Callers detect
+    /// the lost session via the embedded `PendingOpKey` and decide whether to
+    /// retry the operation against the freshly-handshaked connection. Mirrors
+    /// the "session-lost" failure mode of Java
+    /// `ClientCnx#handleConnectionClosed`.
+    SessionLost {
+        /// The original op key (request id or `(producer, sequence_id)`)
+        /// whose future is being woken up with this outcome.
+        key: PendingOpKey,
+    },
 }
 
 /// Parameters for opening a producer.
@@ -519,6 +530,12 @@ pub struct Connection {
     /// the UNIX epoch in Java; an [`Option<SystemTime>`] here so the caller picks its own
     /// epoch conversion).
     last_disconnected_at: Option<SystemTime>,
+    /// Monotonic counter incremented each time [`Self::reset`] is called. Lets
+    /// callers detect that an in-flight operation was severed by a supervisor
+    /// reconnect: capture the epoch before issuing an op, then re-check after
+    /// the outcome arrives. Mirrors Java's `ClientCnx#getEpoch` semantics for
+    /// session-bound operations.
+    session_epoch: u64,
 }
 
 impl core::fmt::Debug for Connection {
@@ -580,6 +597,7 @@ impl Connection {
             last_activity: None,
             last_connected_at: None,
             last_disconnected_at: None,
+            session_epoch: 0,
         }
     }
 
@@ -628,6 +646,132 @@ impl Connection {
             self.last_disconnected_at = Some(SystemTime::now());
         }
         self.state = HandshakeState::Failed;
+    }
+
+    /// Monotonic session epoch — incremented each time the supervisor invokes
+    /// [`Self::reset`]. Callers that need to detect whether an in-flight operation
+    /// survived a reconnect snapshot this value before issuing the op and compare
+    /// after the response arrives. Mirrors Java `ClientCnx#getEpoch`.
+    #[must_use]
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    /// Borrow the auto-reconnect supervisor configuration, if one was set. The
+    /// runtime driver reads this between disconnects to decide whether to
+    /// re-handshake. Returning `None` keeps the pre-supervisor behavior (driver
+    /// exits on first I/O failure).
+    #[must_use]
+    pub fn supervisor_config(&self) -> Option<&crate::supervisor::SupervisorConfig> {
+        self.config.supervisor.as_ref()
+    }
+
+    /// Reset the state machine for a fresh handshake on a new transport. Used by the
+    /// runtime supervisor between [`mark_disconnected`](Self::mark_disconnected) and the
+    /// new TCP / TLS handshake.
+    ///
+    /// Semantics, in order:
+    ///
+    /// 1. Bump [`Self::session_epoch`].
+    /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
+    ///    round-trip, …) and every in-flight producer publish. The corresponding user futures are
+    ///    woken with that outcome.
+    /// 3. Reset every producer's in-flight `OpSend` queue and batch container, and clear every
+    ///    consumer's queue + pending seek + ack tracker. Producers and consumers themselves are
+    ///    *not* removed — Stage 3 of the supervisor work will replay their `CommandProducer` /
+    ///    `CommandSubscribe` against the new transport. Until then, callers must reopen them by
+    ///    hand.
+    /// 4. Clear connection-level outbound + inbound byte buffers; flush queued events.
+    /// 5. Snap the state machine back to [`HandshakeState::Uninitialized`] so
+    ///    [`Self::begin_handshake`] can fire again on the new socket.
+    pub fn reset(&mut self) {
+        self.session_epoch = self.session_epoch.wrapping_add(1);
+
+        // (2) Fail every pending request and wake its waiter.
+        let pending_request_keys: Vec<PendingOpKey> = self
+            .pending_requests
+            .keys()
+            .copied()
+            .map(PendingOpKey::Request)
+            .collect();
+        for key in pending_request_keys {
+            self.outcomes.insert(key, OpOutcome::SessionLost { key });
+            if let Some(w) = self.wakers.remove(&key) {
+                w.wake();
+            }
+        }
+        self.pending_requests.clear();
+
+        // Fail every in-flight publish across every producer.
+        let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
+        for handle in producer_handles {
+            if let Some(producer) = self.producers.get_mut(&handle) {
+                let drained = producer.drain_pending_sends();
+                for (seq, waker_opt) in drained {
+                    let key = PendingOpKey::Send(handle, seq);
+                    self.outcomes.insert(key, OpOutcome::SessionLost { key });
+                    // Prefer the producer-stored waker (registered via
+                    // ProducerState::register_waker); fall back to the connection-level
+                    // slab when no producer-stored waker was set.
+                    if let Some(w) = waker_opt {
+                        w.wake();
+                    } else if let Some(w) = self.wakers.remove(&key) {
+                        w.wake();
+                    }
+                }
+            }
+        }
+
+        // Drop any remaining (orphaned) wakers — every legitimate one was either
+        // dispatched above or belongs to an op the runtime will re-register after the
+        // reconnect.
+        let leftover_keys: Vec<PendingOpKey> = self.wakers.keys().copied().collect();
+        for key in leftover_keys {
+            if let Some(w) = self.wakers.remove(&key) {
+                self.outcomes.insert(key, OpOutcome::SessionLost { key });
+                w.wake();
+            }
+        }
+
+        // (3) Reset consumer-side per-session state. We keep the ConsumerState struct
+        // itself (Stage 3 will replay CommandSubscribe), but clear anything that was
+        // pinned to the now-dead session: in-flight seek, in-memory queue, ack-tracker
+        // state, broker permits. The runtime layer is responsible for re-subscribing
+        // and re-issuing the initial flow.
+        for consumer in self.consumers.values_mut() {
+            consumer.queue.clear();
+            consumer.pending_seek = None;
+            consumer.available_permits = 0;
+            consumer.consumed_since_flow = 0;
+            consumer.dead_letter_pending.clear();
+            consumer.batch_ack_tracker.clear();
+            if let Some(receive_waker) = consumer.receive_waker.take() {
+                // Wake any in-flight receive so it observes the queue is empty and
+                // re-registers on the freshly-handshaked connection.
+                receive_waker.wake();
+            }
+        }
+
+        // (4) Drop queued events + raw bytes. Anything not yet observed by the runtime
+        // belongs to the dead session.
+        self.events.clear();
+        self.outbound.clear();
+        self.inbound.clear();
+
+        // Lookup / topic-watcher registries hold no Wakers themselves — their futures
+        // poll via the per-request waker slab we already drained above. Clearing the
+        // registries avoids replaying stale `Connect`/`Redirect` traffic on the new
+        // socket.
+        self.lookup = LookupRegistry::default();
+        self.topic_watchers = TopicWatcherRegistry::default();
+
+        // (5) Back to Uninitialized so begin_handshake on the freshly-handshaked socket
+        // succeeds.
+        self.state = HandshakeState::Uninitialized;
+        self.broker_max_message_size = None;
+        self.broker_protocol_version = 0;
+        self.feature_flags = pb::FeatureFlags::default();
+        self.last_activity = None;
     }
 
     /// Returns the feature flags negotiated with the broker (empty until `Connected`).
@@ -2654,5 +2798,103 @@ mod conn_state_tests {
                 "crypto_failure_action {action:?} should round-trip through subscribe",
             );
         }
+    }
+
+    #[test]
+    fn reset_bumps_epoch_and_fails_pending_ops_with_session_lost() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame).expect("handle");
+        assert!(conn.is_connected());
+        let epoch_before = conn.session_epoch();
+        assert_eq!(epoch_before, 0);
+
+        // Issue a request-bound op (partitioned-metadata lookup) — pending until broker reply.
+        let request_id = conn.get_partitioned_topic_metadata("persistent://public/default/t");
+        let key = PendingOpKey::Request(request_id);
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no outcome before broker reply"
+        );
+
+        // Also queue an in-flight publish so we exercise the producer-side drain branch.
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/p".to_owned(),
+            ..Default::default()
+        });
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"hi"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 2,
+                    num_messages: 1,
+                    txn_id: None,
+                },
+                0,
+            )
+            .expect("send queues");
+        let send_key = PendingOpKey::Send(producer, seq);
+        // The send should have been queued as pending.
+        assert!(
+            conn.take_outcome(send_key).is_none(),
+            "publish stays pending until broker replies"
+        );
+        // Sanity: the producer reports the publish as pending.
+        assert_eq!(
+            conn.producer_pending_count(producer),
+            1,
+            "send must produce a pending OpSend"
+        );
+
+        // Now reset — every pending op must surface SessionLost and the epoch must bump.
+        conn.reset();
+        assert_eq!(conn.session_epoch(), epoch_before + 1);
+        assert!(
+            matches!(
+                conn.take_outcome(key),
+                Some(OpOutcome::SessionLost { key: k }) if k == key
+            ),
+            "request-bound op fails with SessionLost after reset"
+        );
+        assert!(
+            matches!(
+                conn.take_outcome(send_key),
+                Some(OpOutcome::SessionLost { key: k }) if k == send_key
+            ),
+            "in-flight publish fails with SessionLost after reset"
+        );
+        assert_eq!(
+            conn.state(),
+            HandshakeState::Uninitialized,
+            "reset snaps state back to Uninitialized so begin_handshake can fire on a new socket"
+        );
+    }
+
+    #[test]
+    fn op_outcome_session_lost_round_trips_through_outcome_slab() {
+        // The slab itself is HashMap<PendingOpKey, OpOutcome>; this test exercises the
+        // SessionLost variant end-to-end so the runtime-side dispatcher can pattern-match.
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame).expect("handle");
+
+        let request_id = conn.get_partitioned_topic_metadata("persistent://public/default/t");
+        let key = PendingOpKey::Request(request_id);
+
+        // No outcome before reset.
+        assert!(conn.take_outcome(key).is_none());
+
+        conn.reset();
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::SessionLost { key: k }) => assert_eq!(k, key),
+            other => panic!("expected SessionLost, got {other:?}"),
+        }
+        // Second take is empty — outcomes are one-shot.
+        assert!(conn.take_outcome(key).is_none());
     }
 }
