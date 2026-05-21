@@ -209,4 +209,100 @@ mod tests {
         // Far past the ceiling — clamps to max_delay.
         assert_eq!(b.delay_for(40), Duration::from_secs(60));
     }
+
+    #[test]
+    fn empty_tracker_has_no_deadline() {
+        let t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_secs(1));
+        assert!(t.is_empty());
+        assert!(t.next_deadline().is_none());
+    }
+
+    #[test]
+    fn duplicate_add_overwrites_deadline() {
+        // Adding the same id twice with different times overwrites the deadline (the second
+        // wins). Matches Java behavior where re-nacking pushes the redelivery time forward.
+        let mut t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        t.add(mid(1), t0 + Duration::from_millis(50)); // second add — later deadline
+        // 110ms in: first add's deadline would fire, but the second add pushed it to 150ms.
+        assert!(t.poll(t0 + Duration::from_millis(110)).is_empty());
+        // 160ms in: now past the overwritten deadline.
+        let actions = t.poll(t0 + Duration::from_millis(160));
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn next_deadline_returns_earliest() {
+        let mut t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_secs(10));
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        t.add_with_delay(mid(2), Duration::from_millis(50), t0); // earlier
+        t.add_with_delay(mid(3), Duration::from_secs(5), t0);
+        let next = t.next_deadline().unwrap();
+        assert!(next <= t0 + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn poll_groups_co_due_messages_into_one_action() {
+        // Three messages added at the same wall clock — one action with all three ids.
+        let mut t = NegativeAcksTracker::new(ConsumerHandle(7), Duration::from_millis(50));
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        t.add(mid(2), t0);
+        t.add(mid(3), t0);
+        let actions = t.poll(t0 + Duration::from_millis(60));
+        assert_eq!(actions.len(), 1, "co-due redeliveries must coalesce");
+        match &actions[0] {
+            NackAction::RedeliverUnacked {
+                handle,
+                message_ids,
+            } => {
+                assert_eq!(*handle, ConsumerHandle(7));
+                assert_eq!(message_ids.len(), 3);
+            }
+        }
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn remove_unknown_id_is_safe() {
+        let mut t = NegativeAcksTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        t.remove(&mid(42));
+        assert!(t.is_empty());
+        assert!(t.poll(Instant::now() + Duration::from_secs(1)).is_empty());
+    }
+
+    #[test]
+    fn multiplier_with_unity_stays_at_min() {
+        let b = MultiplierRedeliveryBackoff {
+            min_delay: Duration::from_millis(200),
+            max_delay: Duration::from_secs(60),
+            multiplier: 1.0,
+        };
+        for n in 0..10u32 {
+            assert_eq!(b.delay_for(n), Duration::from_millis(200));
+        }
+    }
+
+    #[test]
+    fn multiplier_zero_count_returns_min() {
+        let b = MultiplierRedeliveryBackoff {
+            min_delay: Duration::from_millis(750),
+            max_delay: Duration::from_secs(60),
+            multiplier: 2.0,
+        };
+        assert_eq!(b.delay_for(0), Duration::from_millis(750));
+    }
+
+    #[test]
+    fn multiplier_max_redelivery_count_clamps_to_max() {
+        // u32::MAX should not overflow / panic — the saturating math path clamps.
+        let b = MultiplierRedeliveryBackoff {
+            min_delay: Duration::from_millis(1),
+            max_delay: Duration::from_secs(10),
+            multiplier: 2.0,
+        };
+        assert_eq!(b.delay_for(u32::MAX), Duration::from_secs(10));
+    }
 }

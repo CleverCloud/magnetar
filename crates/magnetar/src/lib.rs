@@ -49,8 +49,8 @@ pub use magnetar_proto::conn::{ConnectionConfig, OpOutcome};
 // Re-export the most commonly used protocol types at the top level so users
 // don't have to remember which crate they live in.
 pub use magnetar_proto::{
-    AuthProvider, ConnectionEvent, ConsumerHandle, MessageId, ProducerHandle, ProtocolError,
-    RequestId, SequenceId,
+    AuthProvider, Backoff, ConnectionEvent, ConsumerHandle, MessageId, ProducerHandle,
+    ProtocolError, RequestId, SequenceId, SupervisorConfig,
 };
 #[cfg(feature = "moonpool")]
 pub use magnetar_runtime_moonpool as runtime_moonpool;
