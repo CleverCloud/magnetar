@@ -970,7 +970,9 @@ mod tests {
             CompressionKind::None,
             1024,
         );
-        let decision = p.queue_send(small_message(b"hello"), 100).unwrap();
+        let decision = p
+            .queue_send(small_message(b"hello"), 100, std::time::Instant::now())
+            .unwrap();
         match decision {
             SendDecision::Emit { count } => assert_eq!(count, 1),
             other => panic!("expected Emit, got {other:?}"),
@@ -987,7 +989,9 @@ mod tests {
             ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 10);
         p.chunking_enabled = true;
         let payload = vec![b'a'; 25];
-        let decision = p.queue_send(small_message(&payload), 100).unwrap();
+        let decision = p
+            .queue_send(small_message(&payload), 100, std::time::Instant::now())
+            .unwrap();
         match decision {
             SendDecision::Emit { count } => assert_eq!(count, 3),
             other => panic!("expected Emit, got {other:?}"),
@@ -1008,7 +1012,9 @@ mod tests {
         let mut p =
             ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 10);
         let payload = vec![b'a'; 25];
-        let err = p.queue_send(small_message(&payload), 100).unwrap_err();
+        let err = p
+            .queue_send(small_message(&payload), 100, std::time::Instant::now())
+            .unwrap_err();
         match err {
             ProducerError::MessageTooLarge { size, .. } => assert_eq!(size, 25),
             other => panic!("expected MessageTooLarge, got {other:?}"),
@@ -1027,11 +1033,13 @@ mod tests {
         p.max_batch_size_bytes = 1024;
         p.max_messages_in_batch = 10;
         for _ in 0..3 {
-            let d = p.queue_send(small_message(b"x"), 100).unwrap();
+            let d = p
+                .queue_send(small_message(b"x"), 100, std::time::Instant::now())
+                .unwrap();
             assert!(matches!(d, SendDecision::Batched));
         }
         assert_eq!(p.outbound_len(), 0);
-        let flushed = p.flush_batch(101);
+        let flushed = p.flush_batch(101, std::time::Instant::now());
         assert_eq!(flushed, 1);
         let frame = p.next_outbound_frame().expect("flushed frame");
         assert_eq!(frame.metadata.num_messages_in_batch, Some(3));
@@ -1055,7 +1063,7 @@ mod tests {
         // A "small enough to batch" message:
         let msg = small_message(b"small");
         assert!(p.can_add_to_batch(msg.payload.len(), 1));
-        let decision = p.queue_send(msg, 100).unwrap();
+        let decision = p.queue_send(msg, 100, std::time::Instant::now()).unwrap();
         assert!(
             matches!(decision, SendDecision::Batched),
             "can_add_to_batch was true, must batch, not chunk"
@@ -1072,7 +1080,9 @@ mod tests {
             CompressionKind::None,
             1024,
         );
-        let _ = p.queue_send(small_message(b"a"), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(b"a"), 100, std::time::Instant::now())
+            .unwrap();
         let _ = p.next_outbound_frame();
         assert_eq!(p.pending.len(), 1);
         let r = pb::CommandSendReceipt {
@@ -1103,8 +1113,12 @@ mod tests {
         assert_eq!(p.stats().total_msgs_sent, 0);
         assert_eq!(p.stats().total_bytes_sent, 0);
 
-        let _ = p.queue_send(small_message(b"hello"), 100).unwrap();
-        let _ = p.queue_send(small_message(b"world!"), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(b"hello"), 100, std::time::Instant::now())
+            .unwrap();
+        let _ = p
+            .queue_send(small_message(b"world!"), 100, std::time::Instant::now())
+            .unwrap();
         let stats = p.stats();
         assert_eq!(stats.total_msgs_sent, 2);
         assert_eq!(stats.total_bytes_sent, 5 + 6);
@@ -1117,7 +1131,9 @@ mod tests {
             ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 10);
         p.chunking_enabled = true;
         let payload = vec![b'a'; 25];
-        let _ = p.queue_send(small_message(&payload), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(&payload), 100, std::time::Instant::now())
+            .unwrap();
         let stats = p.stats();
         assert_eq!(stats.total_msgs_sent, 3);
         // 25 bytes split as 10 + 10 + 5
@@ -1136,10 +1152,12 @@ mod tests {
         p.max_batch_size_bytes = 1024;
         p.max_messages_in_batch = 10;
         for _ in 0..3 {
-            let _ = p.queue_send(small_message(b"x"), 100).unwrap();
+            let _ = p
+                .queue_send(small_message(b"x"), 100, std::time::Instant::now())
+                .unwrap();
         }
         assert_eq!(p.stats().total_msgs_sent, 0); // not flushed yet
-        let _ = p.flush_batch(101);
+        let _ = p.flush_batch(101, std::time::Instant::now());
         let stats = p.stats();
         assert_eq!(stats.total_msgs_sent, 3);
         assert!(stats.total_bytes_sent > 0);
@@ -1157,12 +1175,16 @@ mod tests {
         assert_eq!(p.last_sequence_id_pushed, 41);
         assert_eq!(p.last_sequence_id_published, 41);
 
-        let _ = p.queue_send(small_message(b"first"), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(b"first"), 100, std::time::Instant::now())
+            .unwrap();
         let frame = p.next_outbound_frame().expect("frame");
         assert_eq!(frame.metadata.sequence_id, 42);
         assert_eq!(frame.sequence_id.0, 42);
 
-        let _ = p.queue_send(small_message(b"second"), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(b"second"), 100, std::time::Instant::now())
+            .unwrap();
         let frame = p.next_outbound_frame().expect("frame");
         assert_eq!(frame.metadata.sequence_id, 43);
     }
@@ -1183,7 +1205,9 @@ mod tests {
         // No deadline when the batch is empty.
         assert!(p.next_batch_deadline().is_none());
 
-        let _ = p.queue_send(small_message(b"first"), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(b"first"), 100, std::time::Instant::now())
+            .unwrap();
         let deadline = p
             .next_batch_deadline()
             .expect("deadline once batch is non-empty");
@@ -1196,7 +1220,7 @@ mod tests {
         assert!(p.batch_deadline_elapsed(now + Duration::from_millis(51)));
 
         // Flush clears the timestamp.
-        let _ = p.flush_batch(101);
+        let _ = p.flush_batch(101, std::time::Instant::now());
         assert!(p.next_batch_deadline().is_none());
     }
 
@@ -1264,7 +1288,7 @@ mod tests {
         // 3 more bytes would overflow the 8-byte budget.
         assert!(!p.can_add_to_batch(3, 1));
 
-        let flushed = p.flush_batch(101);
+        let flushed = p.flush_batch(101, std::time::Instant::now());
         assert_eq!(flushed, 1, "non-empty batch always flushes one frame");
         // Flush drains the messages vec but keeps the SEND frame queued.
         assert!(p.batch.is_empty());
@@ -1296,7 +1320,7 @@ mod tests {
         );
 
         // After flush the cap should reset and new sends fit again.
-        let flushed = p.flush_batch(101);
+        let flushed = p.flush_batch(101, std::time::Instant::now());
         assert_eq!(flushed, 1);
         assert_eq!(p.batch.len(), 0);
         assert!(p.can_add_to_batch(1, 1));
@@ -1315,14 +1339,18 @@ mod tests {
         );
         p.batching_enabled = true;
         assert!(p.batch.is_empty());
-        assert_eq!(p.flush_batch(100), 0, "empty batch flushes nothing");
+        assert_eq!(
+            p.flush_batch(100, std::time::Instant::now()),
+            0,
+            "empty batch flushes nothing"
+        );
         assert_eq!(p.outbound_len(), 0);
 
         // Closed producer also flushes nothing even when messages remain
         // (mirrors Java behaviour where a closed producer drops the batch).
         push_into_batch(&mut p.batch, 0, b"x");
         p.closed = true;
-        assert_eq!(p.flush_batch(100), 0);
+        assert_eq!(p.flush_batch(100, std::time::Instant::now()), 0);
     }
 
     /// Java tests assign `messageMetadata.setSequenceId(i)` while building
@@ -1474,7 +1502,9 @@ mod tests {
         p.chunking_enabled = true;
         // 14 bytes, max_chunk_size = 4 → expected 4 chunks (4 + 4 + 4 + 2).
         let payload = b"ABCDEFGHIJKLMN".to_vec();
-        let decision = p.queue_send(payload_message(payload), 100).unwrap();
+        let decision = p
+            .queue_send(payload_message(payload), 100, std::time::Instant::now())
+            .unwrap();
         match decision {
             SendDecision::Emit { count } => assert_eq!(count, 4, "expected 4 chunks"),
             other => panic!("expected Emit, got {other:?}"),
@@ -1523,7 +1553,9 @@ mod tests {
         p.chunking_enabled = true;
         // 20 bytes → 3 chunks (8 + 8 + 4).
         let payload = vec![b'x'; 20];
-        let _ = p.queue_send(payload_message(payload), 100).unwrap();
+        let _ = p
+            .queue_send(payload_message(payload), 100, std::time::Instant::now())
+            .unwrap();
 
         let frames: Vec<OutboundFrame> = std::iter::from_fn(|| p.next_outbound_frame()).collect();
         assert_eq!(frames.len(), 3);
@@ -1570,7 +1602,9 @@ mod tests {
         let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 5);
         p.chunking_enabled = true;
         let payload = vec![b'y'; 15]; // 15 / 5 == 3 chunks, no remainder
-        let decision = p.queue_send(payload_message(payload), 100).unwrap();
+        let decision = p
+            .queue_send(payload_message(payload), 100, std::time::Instant::now())
+            .unwrap();
         match decision {
             SendDecision::Emit { count } => assert_eq!(count, 3),
             other => panic!("expected Emit, got {other:?}"),
@@ -1606,7 +1640,9 @@ mod tests {
             CompressionKind::None,
             1024,
         );
-        let _ = p.queue_send(small_message(b"abc"), 100).unwrap();
+        let _ = p
+            .queue_send(small_message(b"abc"), 100, std::time::Instant::now())
+            .unwrap();
         let _ = p.next_outbound_frame();
         assert!(p.send_latency_hist.is_empty());
 

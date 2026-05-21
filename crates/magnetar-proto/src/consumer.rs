@@ -656,8 +656,14 @@ mod tests {
         let _ = c.initial_flow();
         // Deliver 2 messages and pop them — half drained.
         for _ in 0..2 {
-            c.deliver(&message_cmd(0), metadata(1), None, Bytes::from_static(b"x"))
-                .unwrap();
+            c.deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"x"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
             let _ = c.pop_message();
         }
         let flow = c.maybe_flow().expect("flow at half drain");
@@ -674,6 +680,7 @@ mod tests {
                 metadata(1),
                 None,
                 Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
             )
             .unwrap();
         assert!(matches!(outcome, DeliverOutcome::Delivered { .. }));
@@ -700,7 +707,13 @@ mod tests {
         }
 
         let outcome = c
-            .deliver(&message_cmd(0), metadata(2), None, buf.freeze())
+            .deliver(
+                &message_cmd(0),
+                metadata(2),
+                None,
+                buf.freeze(),
+                std::time::Instant::now(),
+            )
             .unwrap();
         match outcome {
             DeliverOutcome::Delivered { count } => assert_eq!(count, 2),
@@ -738,7 +751,9 @@ mod tests {
             make_chunk(1, b"bb"),
             make_chunk(2, b"cc"),
         ] {
-            let outcome = c.deliver(&message_cmd(0), meta, None, body).unwrap();
+            let outcome = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
             // The first two are buffered; the third triggers delivery.
             match outcome {
                 DeliverOutcome::Buffered | DeliverOutcome::Delivered { .. } => {}
@@ -761,6 +776,7 @@ mod tests {
                 metadata(1),
                 None,
                 Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
             )
             .unwrap();
         assert!(c.queue.is_empty());
@@ -777,6 +793,7 @@ mod tests {
                 metadata(1),
                 None,
                 Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
             )
             .unwrap();
         let _ = c
@@ -785,6 +802,7 @@ mod tests {
                 metadata(1),
                 None,
                 Bytes::from_static(b"hello"),
+                std::time::Instant::now(),
             )
             .unwrap();
         let stats = c.stats();
@@ -799,6 +817,7 @@ mod tests {
                 metadata(1),
                 None,
                 Bytes::from_static(b"DROPPED"),
+                std::time::Instant::now(),
             )
             .unwrap();
         assert_eq!(c.stats().total_msgs_received, 2);
@@ -817,6 +836,7 @@ mod tests {
                     metadata(1),
                     None,
                     Bytes::from_static(b"poison"),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
         }
@@ -901,8 +921,14 @@ mod tests {
     fn pop_message_records_receive_latency() {
         let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
         let _ = c.initial_flow();
-        c.deliver(&message_cmd(0), metadata(1), None, Bytes::from_static(b"x"))
-            .unwrap();
+        c.deliver(
+            &message_cmd(0),
+            metadata(1),
+            None,
+            Bytes::from_static(b"x"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
         assert!(c.receive_latency_hist.is_empty());
 
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -970,6 +996,7 @@ mod tests {
                 meta,
                 None,
                 Bytes::from_static(b"only-chunk"),
+                std::time::Instant::now(),
             )
             .unwrap();
         match outcome {
@@ -1014,6 +1041,7 @@ mod tests {
                     meta,
                     None,
                     Bytes::copy_from_slice(body),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
             if idx < 2 {
@@ -1064,6 +1092,7 @@ mod tests {
                     meta,
                     None,
                     Bytes::copy_from_slice(body),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
             // The outcome on each delivery depends on whether the buffer is
@@ -1094,6 +1123,7 @@ mod tests {
                 m0,
                 None,
                 Bytes::from_static(b"first"),
+                std::time::Instant::now(),
             )
             .unwrap();
         assert!(matches!(outcome0, DeliverOutcome::Buffered));
@@ -1108,6 +1138,7 @@ mod tests {
                 m0_dup,
                 None,
                 Bytes::from_static(b"second"),
+                std::time::Instant::now(),
             )
             .unwrap();
         assert!(
@@ -1147,6 +1178,7 @@ mod tests {
                     meta,
                     None,
                     Bytes::copy_from_slice(body),
+                    std::time::Instant::now(),
                 )
                 .unwrap();
         }

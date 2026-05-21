@@ -3047,6 +3047,7 @@ mod conn_state_tests {
                     txn_id: None,
                 },
                 0,
+                Instant::now(),
             )
             .expect("send queues");
         let send_key = PendingOpKey::Send(producer, seq);
