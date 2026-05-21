@@ -36,6 +36,19 @@ impl Consumer {
         self.handle
     }
 
+    /// Receive the next message, bounded by `timeout`. Returns `Ok(None)` if the deadline
+    /// elapses with no message. Mirrors Java `Consumer#receive(int timeout, TimeUnit unit)`.
+    pub async fn receive_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<IncomingMessage>, ClientError> {
+        match tokio::time::timeout(timeout, self.receive()).await {
+            Ok(Ok(msg)) => Ok(Some(msg)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Receive the next message. Resolves when the broker delivers a `CommandMessage` and the
     /// state machine emits it into this consumer's queue.
     pub fn receive(&self) -> ReceiveFut {
