@@ -2933,6 +2933,24 @@ impl Connection {
         encode_command(&mut self.outbound, cmd)?;
         Ok(())
     }
+
+    /// Peek the next request id the state machine will hand out. Used by runtime-crate tests
+    /// that need to know the request id before the operation has been issued (e.g. to inject
+    /// a broker response). Not part of the stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn peek_next_request_id_for_test(&self) -> u64 {
+        self.next_request_id
+    }
+
+    /// Returns `true` if the state machine has registered a pending request for `id`. Used by
+    /// runtime-crate tests to gate broker-response injection until the request future has
+    /// actually issued the command. Not part of the stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_pending_request_for_test(&self, id: RequestId) -> bool {
+        self.pending_requests.contains_key(&id)
+    }
 }
 
 // We use a small helper on ConsumerState to clone-pop the front message without leaving the

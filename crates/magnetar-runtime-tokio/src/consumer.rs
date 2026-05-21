@@ -389,6 +389,54 @@ impl Consumer {
         Ok(message_id_greater(&last, &cursor))
     }
 
+    /// Look up the broker-registered schema for the consumer's topic (PIP-87).
+    ///
+    /// Issues a `CommandGetSchema` for the topic this consumer is bound to and awaits the
+    /// `CommandGetSchemaResponse`. Returns the registry-resolved [`pb::Schema`] on success or
+    /// [`ClientError::Broker`] when the broker rejects the lookup (e.g. `TopicNotFound`).
+    /// Mirrors Java `PulsarClientImpl#getSchema(TopicName, Optional<byte[]>)`.
+    ///
+    /// `version = None` asks the broker for the topic's current schema; pass
+    /// `Some(schema_version_bytes)` to re-resolve a historical schema (used by replay paths).
+    ///
+    /// The result is **not** cached here — callers that need a per-instance cache (e.g.
+    /// [`magnetar_proto::schema::AutoConsumeSchema`]) push the resolved schema into their own
+    /// `Arc<Mutex<…>>` after this future resolves.
+    pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
+        let topic = self
+            .shared
+            .inner
+            .lock()
+            .consumer_topic(self.handle)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ClientError::Other(format!(
+                    "get_schema: consumer handle {:?} is no longer registered",
+                    self.handle
+                ))
+            })?;
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_schema(&topic, version)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::GetSchemaResponse { result, .. } => match result {
+                Ok((schema, _version)) => Ok(schema),
+                Err((code, message)) => Err(ClientError::Broker { code, message }),
+            },
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected get_schema outcome: {other:?}"
+            ))),
+        }
+    }
+
     /// Seek this consumer to a specific message id. The broker replays from there.
     ///
     /// Mirrors `org.apache.pulsar.client.api.Consumer#seek(MessageId)`.
@@ -1186,6 +1234,166 @@ mod tests {
             decryptor: None,
         };
         assert!(consumer.drain_messages(10).is_empty());
+    }
+
+    fn get_schema_response_bytes(request_id: u64, schema: Option<pb::Schema>) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetSchemaResponse as i32,
+            get_schema_response: Some(pb::CommandGetSchemaResponse {
+                request_id,
+                schema,
+                schema_version: Some(b"v1".to_vec()),
+                error_code: None,
+                error_message: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandGetSchemaResponse");
+        buf
+    }
+
+    fn get_schema_error_bytes(request_id: u64, code: i32, message: &str) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetSchemaResponse as i32,
+            get_schema_response: Some(pb::CommandGetSchemaResponse {
+                request_id,
+                schema: None,
+                schema_version: None,
+                error_code: Some(code),
+                error_message: Some(message.to_owned()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandGetSchemaResponse error");
+        buf
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_get_schema_round_trip_resolves_with_cached_schema() {
+        // End-to-end: Consumer::get_schema issues a CommandGetSchema, the broker replies with a
+        // CommandGetSchemaResponse, and the future resolves with the broker-resolved pb::Schema.
+        // Mirrors the PIP-87 runtime path used by AutoConsumeSchema's on-first-receive lookup.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/auto-schema-ok".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let response_schema = pb::Schema {
+            name: "persistent://public/default/auto-schema-ok-schema".to_owned(),
+            schema_data: b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}".to_vec(),
+            r#type: pb::schema::Type::Avro as i32,
+            properties: Vec::new(),
+        };
+
+        // Spawn a task that injects the broker response once the request has been registered.
+        let injector_shared = shared.clone();
+        let injector_schema = response_schema.clone();
+        let injector = tokio::spawn(async move {
+            // Yield until the get_schema future has registered the pending request — then feed
+            // the response back through `handle_bytes`. Bounded retries so we don't spin forever
+            // if the wiring breaks.
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+                let has_pending = injector_shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                if has_pending {
+                    let frame = get_schema_response_bytes(request_id, Some(injector_schema));
+                    injector_shared
+                        .inner
+                        .lock()
+                        .handle_bytes(Instant::now(), &frame)
+                        .expect("handle CommandGetSchemaResponse");
+                    return;
+                }
+            }
+            panic!("pending get_schema request was never registered");
+        });
+
+        let resolved = consumer
+            .get_schema(None)
+            .await
+            .expect("get_schema resolves with broker reply");
+        injector.await.expect("injector task completes");
+
+        assert_eq!(resolved.name, response_schema.name);
+        assert_eq!(resolved.schema_data, response_schema.schema_data);
+        assert_eq!(resolved.r#type, response_schema.r#type);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_get_schema_surfaces_broker_error() {
+        // Error path: broker returns CommandGetSchemaResponse with error_code set —
+        // Consumer::get_schema surfaces a ClientError::Broker carrying both code and message.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/auto-schema-missing".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let injector_shared = shared.clone();
+        let injector = tokio::spawn(async move {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+                let has_pending = injector_shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                if has_pending {
+                    let frame = get_schema_error_bytes(request_id, 13, "TopicNotFound");
+                    injector_shared
+                        .inner
+                        .lock()
+                        .handle_bytes(Instant::now(), &frame)
+                        .expect("handle CommandGetSchemaResponse error");
+                    return;
+                }
+            }
+            panic!("pending get_schema request was never registered");
+        });
+
+        let err = consumer
+            .get_schema(None)
+            .await
+            .expect_err("get_schema must surface broker error");
+        injector.await.expect("injector task completes");
+        match err {
+            crate::error::ClientError::Broker { code, message } => {
+                assert_eq!(
+                    code, 13,
+                    "code propagates from CommandGetSchemaResponse.error_code"
+                );
+                assert_eq!(
+                    message, "TopicNotFound",
+                    "message propagates from CommandGetSchemaResponse.error_message"
+                );
+            }
+            other => panic!("expected ClientError::Broker, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

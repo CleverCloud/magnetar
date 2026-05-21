@@ -135,4 +135,26 @@ pub trait Schema: Send + Sync + std::fmt::Debug {
     /// if the bytes do not satisfy schema-level invariants (e.g. invalid UTF-8 for
     /// [`StringSchema`]).
     fn decode(&self, bytes: &[u8]) -> Result<Self::Owned, SchemaError>;
+
+    /// Reports whether this schema still needs a broker-side `CommandGetSchema` round-trip
+    /// before it can decode payloads. Default is `false` — inline schemas (Avro, JSON,
+    /// primitives) carry their definition with them and never need a broker lookup.
+    ///
+    /// PIP-87 schemas ([`AutoConsumeSchema`], [`AutoProduceBytesSchema`]) override this to
+    /// return `true` while their cache is empty so the runtime can issue
+    /// [`Connection::get_schema`](crate::conn::Connection::get_schema) on the consumer's
+    /// first receive. Mirrors Java's `AutoConsumeSchema#requireFetchingSchemaInfo`.
+    #[must_use]
+    fn needs_broker_schema(&self) -> bool {
+        false
+    }
+
+    /// Populate the broker-resolved [`pb::Schema`] into this schema instance's cache.
+    /// Default is a no-op so inline schemas can ignore the hook.
+    ///
+    /// PIP-87 schemas override this to push the resolved schema into their
+    /// `Arc<Mutex<Option<pb::Schema>>>` cache. The runtime calls this after a successful
+    /// [`Connection::get_schema`](crate::conn::Connection::get_schema) round-trip. Mirrors
+    /// Java's `AutoConsumeSchema#setSchemaInfoProvider` populate path.
+    fn store_resolved_schema(&self, _schema: pb::Schema) {}
 }

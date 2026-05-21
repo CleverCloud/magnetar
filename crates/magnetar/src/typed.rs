@@ -481,7 +481,22 @@ impl<S: Schema> TypedConsumer<S> {
     /// Receive the next message. The payload is schema-decoded; if decoding fails the error
     /// is surfaced as [`PulsarError::Schema`] and the message remains unacked so the broker
     /// re-delivers it (subject to the consumer's redelivery policy).
+    ///
+    /// PIP-87 [`AutoConsumeSchema`](magnetar_proto::schema::AutoConsumeSchema) consumers
+    /// transparently fetch the broker-registered schema on first call via
+    /// [`Schema::needs_broker_schema`](magnetar_proto::schema::Schema::needs_broker_schema) +
+    /// [`Schema::store_resolved_schema`](magnetar_proto::schema::Schema::store_resolved_schema).
+    /// Subsequent receives reuse the cache. A broker-side schema-lookup failure surfaces as
+    /// [`PulsarError::Client`] with [`magnetar_runtime_tokio::ClientError::Broker`].
     pub async fn receive(&self) -> Result<TypedMessage<S>, PulsarError> {
+        if self.schema.needs_broker_schema() {
+            let resolved = self
+                .inner
+                .get_schema(None)
+                .await
+                .map_err(PulsarError::Client)?;
+            self.schema.store_resolved_schema(resolved);
+        }
         let raw = self.inner.receive().await?;
         let value = self.schema.decode(&raw.payload).map_err(schema_to_pulsar)?;
         Ok(TypedMessage {

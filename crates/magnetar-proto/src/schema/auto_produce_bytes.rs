@@ -112,6 +112,18 @@ impl Schema for AutoProduceBytesSchema {
     fn decode(&self, bytes: &[u8]) -> Result<Self::Owned, SchemaError> {
         Ok(Bytes::copy_from_slice(bytes))
     }
+
+    fn needs_broker_schema(&self) -> bool {
+        // Producer-side schemas use the broker round-trip for compatibility validation only —
+        // encode is pass-through whether or not the cache is populated. We still report the
+        // miss so the runtime can warm the cache on first send for diagnostics symmetry with
+        // [`AutoConsumeSchema`].
+        !self.has_cached_schema()
+    }
+
+    fn store_resolved_schema(&self, schema: pb::Schema) {
+        self.set_cached_schema(schema);
+    }
 }
 
 #[cfg(test)]

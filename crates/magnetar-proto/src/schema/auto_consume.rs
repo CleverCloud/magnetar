@@ -138,6 +138,19 @@ impl Schema for AutoConsumeSchema {
         }
         Ok(Bytes::copy_from_slice(bytes))
     }
+
+    fn needs_broker_schema(&self) -> bool {
+        // Auto-fetch is gated on cache state — once populated, subsequent receives reuse the
+        // resolved schema without further broker traffic.
+        !self.has_cached_schema()
+    }
+
+    fn store_resolved_schema(&self, schema: pb::Schema) {
+        // Re-uses the existing cache mutex; equivalent to `set_cached_schema` but reachable
+        // through the `Schema` trait so the runtime engine can populate the cache without
+        // knowing the concrete schema type.
+        self.set_cached_schema(schema);
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +219,54 @@ mod tests {
         assert!(
             original.has_cached_schema(),
             "cache populated through clone must be visible through original"
+        );
+    }
+
+    #[test]
+    fn needs_broker_schema_toggles_with_cache_state() {
+        // The PIP-87 runtime path in `TypedConsumer::receive` gates the `CommandGetSchema`
+        // round-trip on `Schema::needs_broker_schema`. Empty cache -> fetch; populated cache ->
+        // skip. Subsequent receives after a populated cache MUST skip the fetch (no extra
+        // broker traffic).
+        let schema = AutoConsumeSchema::new();
+        assert!(
+            schema.needs_broker_schema(),
+            "empty cache must report needs_broker_schema = true"
+        );
+        schema.store_resolved_schema(sample_schema());
+        assert!(
+            !schema.needs_broker_schema(),
+            "populated cache must report needs_broker_schema = false — subsequent receives reuse the cached schema without a second get_schema call"
+        );
+        // Invalidation re-arms the fetch (mirrors Java's reconnect-revalidate path).
+        schema.invalidate_cache();
+        assert!(
+            schema.needs_broker_schema(),
+            "post-invalidate cache must re-arm needs_broker_schema = true"
+        );
+    }
+
+    #[test]
+    fn store_resolved_schema_populates_cache_via_trait_hook() {
+        // The runtime engine calls `Schema::store_resolved_schema` after a successful
+        // `CommandGetSchema` round-trip. The trait hook must round-trip the broker-resolved
+        // bytes back through `cached_schema` and `schema_data` — proving the runtime can
+        // populate the cache without knowing the concrete schema type.
+        let schema = AutoConsumeSchema::new();
+        let broker_schema = sample_schema();
+        // Round-trip via the trait API (the path the runtime uses).
+        let as_trait: &dyn Schema<Owned = Bytes> = &schema;
+        as_trait.store_resolved_schema(broker_schema.clone());
+        assert!(schema.has_cached_schema());
+        let cached = schema
+            .cached_schema()
+            .expect("cache populated by trait hook");
+        assert_eq!(cached.name, broker_schema.name);
+        assert_eq!(cached.schema_data, broker_schema.schema_data);
+        assert_eq!(
+            schema.schema_data().as_ref(),
+            broker_schema.schema_data.as_slice(),
+            "schema_data() reflects the broker-resolved bytes after trait-driven cache fill"
         );
     }
 }
