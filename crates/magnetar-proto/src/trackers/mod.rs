@@ -15,5 +15,5 @@ pub mod nack;
 pub mod unacked;
 
 pub use ack::{AckAction, AckGroupingTracker};
-pub use nack::{NackAction, NegativeAcksTracker};
+pub use nack::{MultiplierRedeliveryBackoff, NackAction, NegativeAcksTracker};
 pub use unacked::{UnackedAction, UnackedMessageTracker};

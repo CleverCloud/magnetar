@@ -268,6 +268,17 @@ impl Consumer {
         self.shared.driver_waker.notify_one();
     }
 
+    /// Negatively acknowledge a single message with an explicit per-message redelivery
+    /// delay. Mirrors Java's PIP-37 backoff path — pair with
+    /// `magnetar_proto::trackers::nack::MultiplierRedeliveryBackoff::delay_for` to compute
+    /// the delay from the broker-reported redelivery count.
+    pub fn negative_ack_with_delay(&self, message_id: MessageId, delay: std::time::Duration) {
+        let mut conn = self.shared.inner.lock();
+        conn.negative_ack_with_delay(self.handle, message_id, delay);
+        drop(conn);
+        self.shared.driver_waker.notify_one();
+    }
+
     /// Ask the broker to redeliver *every* unacked message on this consumer. Useful when a
     /// consumer detects it has lost local state and wants the broker to replay.
     pub fn redeliver_unacked(&self) {

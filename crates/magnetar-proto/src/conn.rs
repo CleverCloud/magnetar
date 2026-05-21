@@ -1797,6 +1797,27 @@ impl Connection {
         self.emit_redeliver_unacked(handle, message_ids);
     }
 
+    /// Negative-ack a single message with an explicit per-message delay, bypassing the
+    /// consumer's default `negative_ack_redelivery_delay`. Falls back to an immediate
+    /// redelivery when the subscription was opened without a nack tracker (so the message
+    /// is never silently lost). Mirrors PIP-37's per-message backoff path — the caller
+    /// computes `delay` from the message's redelivery count via
+    /// [`crate::trackers::nack::MultiplierRedeliveryBackoff::delay_for`].
+    pub fn negative_ack_with_delay(
+        &mut self,
+        handle: ConsumerHandle,
+        message_id: MessageId,
+        delay: core::time::Duration,
+    ) {
+        if let Some(consumer) = self.consumers.get_mut(&handle) {
+            if let Some(tracker) = consumer.nack_tracker.as_mut() {
+                tracker.add_with_delay(message_id, delay, Instant::now());
+                return;
+            }
+        }
+        self.emit_redeliver_unacked(handle, vec![message_id]);
+    }
+
     fn emit_redeliver_unacked(&mut self, handle: ConsumerHandle, message_ids: Vec<MessageId>) {
         let pb_ids = message_ids.into_iter().map(MessageId::to_pb).collect();
         let cmd = pb::CommandRedeliverUnacknowledgedMessages {
