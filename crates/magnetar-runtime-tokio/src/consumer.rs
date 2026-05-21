@@ -152,6 +152,53 @@ impl Consumer {
         )
     }
 
+    /// Acknowledge a batch of messages as part of a Pulsar transaction (PIP-31). Mirrors
+    /// Java `Consumer#acknowledgeAsync(List<MessageId>, Transaction)`.
+    pub fn ack_batch_with_txn(
+        &self,
+        message_ids: Vec<MessageId>,
+        txn_id: magnetar_proto::TxnId,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with(
+            message_ids,
+            pb::command_ack::AckType::Individual,
+            Vec::new(),
+            Some(txn_id),
+        )
+    }
+
+    /// Cumulative ack with caller-supplied properties. Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Map<String, Long>)`. The broker
+    /// stores the properties alongside the cursor (no semantic effect at the dispatch
+    /// layer; useful for diagnostics and replay tooling).
+    pub fn ack_cumulative_with_properties(
+        &self,
+        message_id: MessageId,
+        properties: Vec<(String, i64)>,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with(
+            vec![message_id],
+            pb::command_ack::AckType::Cumulative,
+            properties,
+            None,
+        )
+    }
+
+    /// Cumulative ack as part of a Pulsar transaction (PIP-31). Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Transaction)`.
+    pub fn ack_cumulative_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        self.ack_many_with(
+            vec![message_id],
+            pb::command_ack::AckType::Cumulative,
+            Vec::new(),
+            Some(txn_id),
+        )
+    }
+
     fn ack_many(
         &self,
         message_ids: Vec<MessageId>,
