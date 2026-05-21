@@ -667,6 +667,11 @@ pub struct TypedConsumerBuilder<'a, S: Schema> {
     negative_ack_redelivery_delay: Option<std::time::Duration>,
     ack_timeout: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
+    key_shared: Option<magnetar_proto::KeySharedConfig>,
+    start_message_id: Option<magnetar_proto::MessageId>,
+    replicate_subscription_state: Option<bool>,
+    force_topic_creation: Option<bool>,
+    start_message_rollback_duration_sec: Option<u64>,
 }
 
 impl<S: Schema> std::fmt::Debug for TypedConsumerBuilder<'_, S> {
@@ -700,6 +705,11 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
             negative_ack_redelivery_delay: None,
             ack_timeout: None,
             dlq_policy: None,
+            key_shared: None,
+            start_message_id: None,
+            replicate_subscription_state: None,
+            force_topic_creation: None,
+            start_message_rollback_duration_sec: None,
         }
     }
 
@@ -766,6 +776,43 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
         dead_letter_topic: Option<String>,
     ) -> Self {
         self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::key_shared_policy`. Only meaningful with `Key_Shared`
+    /// subscription type.
+    #[must_use]
+    pub fn key_shared_policy(mut self, cfg: magnetar_proto::KeySharedConfig) -> Self {
+        self.key_shared = Some(cfg);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::start_message_id`. Only honoured for fresh subscriptions.
+    #[must_use]
+    pub fn start_message_id(mut self, id: magnetar_proto::MessageId) -> Self {
+        self.start_message_id = Some(id);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::replicate_subscription_state`.
+    #[must_use]
+    pub fn replicate_subscription_state(mut self, on: bool) -> Self {
+        self.replicate_subscription_state = Some(on);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::force_topic_creation`.
+    #[must_use]
+    pub fn force_topic_creation(mut self, on: bool) -> Self {
+        self.force_topic_creation = Some(on);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::start_message_rollback_duration`. Rolls the subscription
+    /// cursor back by `seconds` at subscribe time.
+    #[must_use]
+    pub fn start_message_rollback_duration(mut self, seconds: u64) -> Self {
+        self.start_message_rollback_duration_sec = Some(seconds);
         self
     }
 
@@ -845,6 +892,21 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
         }
         if let Some((max, topic_opt)) = self.dlq_policy {
             builder = builder.dead_letter_policy(max, topic_opt);
+        }
+        if let Some(cfg) = self.key_shared {
+            builder = builder.key_shared_policy(cfg);
+        }
+        if let Some(id) = self.start_message_id {
+            builder = builder.start_message_id(id);
+        }
+        if let Some(on) = self.replicate_subscription_state {
+            builder = builder.replicate_subscription_state(on);
+        }
+        if let Some(on) = self.force_topic_creation {
+            builder = builder.force_topic_creation(on);
+        }
+        if let Some(sec) = self.start_message_rollback_duration_sec {
+            builder = builder.start_message_rollback_duration(sec);
         }
         let inner = builder.subscribe().await?;
         Ok(TypedConsumer {
