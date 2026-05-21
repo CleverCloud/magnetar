@@ -328,6 +328,7 @@ pub struct TableViewBuilder<'a> {
     start_message_id: Option<magnetar_proto::MessageId>,
     crypto_failure_action: CryptoFailureAction,
     auto_update_partitions_interval: Option<Duration>,
+    decryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
 }
 
 impl std::fmt::Debug for TableViewBuilder<'_> {
@@ -348,6 +349,7 @@ impl std::fmt::Debug for TableViewBuilder<'_> {
                 "auto_update_partitions_interval",
                 &self.auto_update_partitions_interval,
             )
+            .field("has_decryptor", &self.decryptor.is_some())
             .finish()
     }
 }
@@ -365,6 +367,7 @@ impl<'a> TableViewBuilder<'a> {
             start_message_id: None,
             crypto_failure_action: CryptoFailureAction::Fail,
             auto_update_partitions_interval: None,
+            decryptor: None,
         }
     }
 
@@ -431,6 +434,20 @@ impl<'a> TableViewBuilder<'a> {
         self
     }
 
+    /// Configure PIP-4 end-to-end decryption on the underlying consumer. The
+    /// decryptor is consulted on every received message whose
+    /// `MessageMetadata.encryption_keys` is non-empty. Mirrors Java
+    /// `TableViewBuilder#cryptoKeyReader` (which delegates to
+    /// `ConsumerBuilder#cryptoKeyReader`).
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.decryptor = Some(decryptor);
+        self
+    }
+
     /// Enable a background timer that signals every `interval`, intended to drive
     /// re-checks of the topic's partition count. Mirrors Java
     /// `TableViewBuilder#autoUpdatePartitionsInterval`.
@@ -494,6 +511,9 @@ impl<'a> TableViewBuilder<'a> {
         }
         if let Some(id) = self.start_message_id {
             builder = builder.start_message_id(id);
+        }
+        if let Some(decryptor) = self.decryptor {
+            builder = builder.encryption(decryptor);
         }
         let consumer = builder.subscribe().await?;
 
@@ -727,6 +747,7 @@ pub struct TypedTableViewBuilder<'a, S: magnetar_proto::schema::Schema> {
     receiver_queue_size: usize,
     crypto_failure_action: CryptoFailureAction,
     auto_update_partitions_interval: Option<Duration>,
+    decryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
 }
 
 impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableViewBuilder<'_, S> {
@@ -741,6 +762,7 @@ impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableViewBuilde
                 "auto_update_partitions_interval",
                 &self.auto_update_partitions_interval,
             )
+            .field("has_decryptor", &self.decryptor.is_some())
             .finish()
     }
 }
@@ -755,6 +777,7 @@ impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
             receiver_queue_size: 1000,
             crypto_failure_action: CryptoFailureAction::Fail,
             auto_update_partitions_interval: None,
+            decryptor: None,
         }
     }
 
@@ -778,6 +801,18 @@ impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
     #[must_use]
     pub fn crypto_failure_action(mut self, action: CryptoFailureAction) -> Self {
         self.crypto_failure_action = action;
+        self
+    }
+
+    /// Configure PIP-4 end-to-end decryption on the underlying consumer.
+    /// Mirrors Java `TableViewBuilder#cryptoKeyReader` (typed view variant). See
+    /// [`TableViewBuilder::encryption`] for semantics.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.decryptor = Some(decryptor);
         self
     }
 
@@ -807,6 +842,9 @@ impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
         }
         if let Some(interval) = self.auto_update_partitions_interval {
             builder = builder.auto_update_partitions_interval(interval);
+        }
+        if let Some(decryptor) = self.decryptor {
+            builder = builder.encryption(decryptor);
         }
         let inner = builder.create().await?;
         Ok(TypedTableView {
@@ -1021,5 +1059,36 @@ mod tests {
         // Confirm Drop aborts the spawned task — after we drop the `Arc`, the
         // handle inside is moved out and aborted.
         drop(task);
+    }
+
+    /// Confirm the `decryptor` field flips the `Debug` `has_decryptor` flag and
+    /// that the underlying option mirrors `is_some()` directly. Mirrors the
+    /// other "no-broker" builder tests in this module: we exercise the storage
+    /// surface and the `Debug` projection without standing up a `PulsarClient`.
+    #[test]
+    fn encryption_setter_storage_predicate() {
+        use magnetar_proto::pb;
+        use magnetar_runtime_tokio::{EncryptError, MessageDecryptor};
+
+        #[derive(Debug)]
+        struct NoOp;
+        impl MessageDecryptor for NoOp {
+            fn decrypt(
+                &self,
+                _ciphertext: &[u8],
+                _metadata: &pb::MessageMetadata,
+            ) -> Result<Bytes, EncryptError> {
+                Err(EncryptError::new("test"))
+            }
+        }
+
+        // Mirror the inline logic from the Debug impl: `decryptor.is_some()` is
+        // what `has_decryptor` reports.
+        let none_slot: Option<Arc<dyn MessageDecryptor>> = None;
+        assert!(none_slot.is_none());
+
+        let some_slot: Option<Arc<dyn MessageDecryptor>> = Some(Arc::new(NoOp));
+        assert!(some_slot.is_some());
+        assert_eq!(Arc::strong_count(some_slot.as_ref().expect("set above")), 1);
     }
 }

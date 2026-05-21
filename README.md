@@ -526,7 +526,7 @@ known-missing feature.
 | Schema-aware `TypedTableView` | ✅ | ✅ | `TypedTableView<S>` decodes per-read. |
 | `startMessageId` / `subscriptionProperty` / `property` knobs | ✅ | ✅ | `TableViewBuilder` knob set. |
 | Auto-update-partitions ticker | ✅ | ❌ | Same gap as PartitionedProducer. |
-| `cryptoKeyReader` wired through | ✅ | ❌ | Pending — Java's TableView wires through PIP-4 decryption. |
+| `cryptoKeyReader` wired through | ✅ | ✅ | `TableViewBuilder::encryption` + `TypedTableViewBuilder::encryption` stamp the decryptor onto the underlying `ConsumerBuilder`. |
 
 ### Transactions (PIP-31)
 
