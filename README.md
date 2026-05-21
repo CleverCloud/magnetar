@@ -457,7 +457,7 @@ known-missing feature.
 | `readCompacted` | ✅ | ✅ | `ConsumerBuilder::read_compacted`. |
 | `forceTopicCreation` | ✅ | ✅ | `ConsumerBuilder::force_topic_creation`. |
 | Dead-letter policy | ✅ | ✅ | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter`. PIP-22/58/124/409. |
-| `cryptoFailureAction` (PIP-4) | ✅ | 🟡 | API surface present; runtime currently honours `Fail` exhaustively (`Discard` / `Consume` plumb but apply opportunistically). |
+| `cryptoFailureAction` (PIP-4) | ✅ | ✅ | `Fail` returns the decryption error; `Discard` silently drops the message; `Consume` delivers the ciphertext to the user. All three wired in `magnetar-runtime-tokio::consumer::deliver_post_process`. |
 | Encryption (PIP-4) | ✅ | ✅ | `ConsumerBuilder::encryption` accepts a `MessageDecryptor`. |
 | `ConsumerInterceptor` SPI | ✅ | ✅ | `magnetar::ConsumerInterceptor` + `receive_with_interceptors`. |
 | `unsubscribe()` | ✅ | ✅ | Consumer / multi-topics expose unsubscribe. |
@@ -503,7 +503,7 @@ known-missing feature.
 | Regex topic subscription | ✅ | ✅ | `PatternConsumerBuilder::pattern`. |
 | `TopicListChanged` delta stream | ✅ | ✅ | `Client::next_topic_list_change`. |
 | Manual `update()` reconcile | ✅ | ✅ | `PatternConsumer::update(&client)` returns a `ReconcileReport`. |
-| Auto-update background ticker | ✅ | ❌ | Driver-driven reconcile pending. |
+| Auto-update background ticker | ✅ | ✅ | `PatternConsumer::start_auto_reconcile(client, interval)` spawns a `tokio::time::interval`-driven loop that calls `update(&client)` on every tick; returns a `JoinHandle` for clean shutdown. |
 
 ### Reader
 
@@ -559,7 +559,7 @@ known-missing feature.
 | `MessageEncryptor` trait on producer | ✅ | ✅ | `ProducerBuilder::encryption`. |
 | `MessageDecryptor` trait on consumer | ✅ | ✅ | `ConsumerBuilder::encryption`. |
 | AES-GCM via `aws-lc-rs` | n/a (Java uses BouncyCastle) | ✅ | `magnetar-messagecrypto::MessageCrypto`. |
-| `cryptoFailureAction` | ✅ | 🟡 | API surface present; runtime layer wires `Fail` exhaustively (PIP-4 `Discard` / `Consume` plumb but apply opportunistically). |
+| `cryptoFailureAction` | ✅ | ✅ | `Fail` / `Discard` / `Consume` all wired end-to-end in `magnetar-runtime-tokio::consumer::deliver_post_process`. |
 
 ### Schemas
 
@@ -594,7 +594,7 @@ known-missing feature.
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
 | `memoryLimit` | ✅ | 🟡 | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` + `PulsarClient::memory_limit` getter; runtime enforcement (accounting + blocking on `ProducerBlock`) pending. |
-| `dnsResolver` customisation | ✅ | ❌ | Uses tokio default. |
+| `dnsResolver` customisation | ✅ | 🟡 | `ClientBuilder::dns_resolver(Arc<dyn DnsResolver>)` trait + `TokioDnsResolver` default impl shipped; routing through `Transport::connect` is the planned follow-up (same pattern ServiceUrlProvider followed). |
 | `isClosed` / `shutdown` / `getLastDisconnectedTimestamp` | ✅ | ✅ | All exposed on `PulsarClient`. |
 | Cluster failover (PIP-121) | ✅ | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ClientBuilder::service_url_provider`; `AutoClusterFailover` and `ControlledClusterFailover` policies pending. |
 
@@ -692,18 +692,19 @@ PIP-121 / PIP-33 / PIP-460 / PIP-180 / PIP-415 / replicated subscriptions
 
 Top open items at the time of this writing:
 
-1. **PIP-121 cluster failover** — `ServiceUrlProvider` URL rotation +
-   `ControlledClusterFailover` policy.
-2. **PatternConsumer auto-update ticker** (broker pushes `TopicListChanged`
-   but reconcile is caller-driven today).
-3. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
+1. **PIP-121 cluster failover policies** — `AutoClusterFailover` (latency-
+   based) + `ControlledClusterFailover` (external-signal) on top of the
+   shipped `ServiceUrlProvider` runtime URL rotation.
+2. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
    (opcode missing from the current `PulsarApi.proto` snapshot).
-4. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
+3. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
    topic / PIP-33 replicated subscriptions** — scoped for M9.
 
-`hdrhistogram` latency stats (p50/p99/max) and the
-`MultiTopicsConsumer::add_topic` / `remove_topic` mutators have already
-landed.
+`hdrhistogram` latency stats (p50/p99/max), the
+`MultiTopicsConsumer::add_topic` / `remove_topic` mutators, the
+`PatternConsumer::start_auto_reconcile` ticker, and the
+`ServiceUrlProvider` runtime URL rotation on every reconnect attempt
+have already landed.
 
 The supervised reconnect (Stage 2) and transparent in-flight producer +
 consumer rebuild (Stage 3, `Connection::rebuild_producers` /

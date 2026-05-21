@@ -979,6 +979,7 @@ pub struct ClientBuilder {
     proxy_to_broker_url: Option<String>,
     supervisor: Option<magnetar_proto::SupervisorConfig>,
     memory_limit: Option<MemoryLimit>,
+    dns_resolver: Option<std::sync::Arc<dyn magnetar_runtime_tokio::DnsResolver>>,
 }
 
 impl Default for ClientBuilder {
@@ -999,6 +1000,7 @@ impl Default for ClientBuilder {
             proxy_to_broker_url: None,
             supervisor: None,
             memory_limit: None,
+            dns_resolver: None,
         }
     }
 }
@@ -1008,6 +1010,23 @@ impl ClientBuilder {
     #[must_use]
     pub fn service_url(mut self, url: impl Into<String>) -> Self {
         self.service_url = Some(url.into());
+        self
+    }
+
+    /// Plug in a custom DNS resolver. Mirrors Java
+    /// `ClientBuilder#dnsResolver`. Used on every connection attempt
+    /// (initial + reconnect) instead of tokio's default
+    /// [`tokio::net::lookup_host`]. Useful for service-mesh sidecar
+    /// resolution, IPv4/IPv6 preference, pinning, etc.
+    ///
+    /// Default: tokio's built-in DNS via
+    /// [`magnetar_runtime_tokio::TokioDnsResolver`].
+    #[must_use]
+    pub fn dns_resolver(
+        mut self,
+        resolver: std::sync::Arc<dyn magnetar_runtime_tokio::DnsResolver>,
+    ) -> Self {
+        self.dns_resolver = Some(resolver);
         self
     }
 
