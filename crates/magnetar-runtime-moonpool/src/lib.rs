@@ -59,6 +59,7 @@
     clippy::doc_markdown
 )]
 
+mod client;
 mod driver;
 pub mod tls;
 mod transport;
@@ -72,6 +73,7 @@ use moonpool_core::Providers;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+pub use crate::client::{Client, ClientError, LookupTopicResult};
 pub use crate::driver::DriverHandle;
 use crate::transport::Transport;
 
