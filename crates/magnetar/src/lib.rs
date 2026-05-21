@@ -86,7 +86,9 @@ pub use partitioned_producer::{
     PartitionedProducerBuilder,
 };
 #[cfg(feature = "tokio")]
-pub use table_view::{TableView, TableViewBuilder, TableViewListener};
+pub use table_view::{
+    TableView, TableViewBuilder, TableViewListener, TypedTableView, TypedTableViewBuilder,
+};
 #[cfg(feature = "tokio")]
 pub use transaction::{Transaction, TxnState};
 #[cfg(feature = "tokio")]

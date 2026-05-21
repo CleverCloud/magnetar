@@ -355,6 +355,159 @@ impl<'a> TableViewBuilder<'a> {
     }
 }
 
+/// Schema-aware [`TableView`]. Wraps a raw `TableView` plus an `Arc<S>` and exposes
+/// typed accessors that decode the payload on demand. Mirrors Java's
+/// `pulsar.tableView(Schema)` shape.
+pub struct TypedTableView<S: magnetar_proto::schema::Schema> {
+    inner: TableView,
+    schema: Arc<S>,
+}
+
+impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableView<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedTableView")
+            .field("inner", &self.inner)
+            .field("schema_type", &self.schema.schema_type())
+            .finish()
+    }
+}
+
+impl<S: magnetar_proto::schema::Schema> Clone for TypedTableView<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            schema: self.schema.clone(),
+        }
+    }
+}
+
+impl<S: magnetar_proto::schema::Schema + 'static> TypedTableView<S> {
+    /// Borrow the underlying raw [`TableView`]. Useful for the unchanged getters
+    /// (`len`, `is_empty`, `keys`, listener registration, etc.).
+    #[must_use]
+    pub fn inner(&self) -> &TableView {
+        &self.inner
+    }
+
+    /// Decode the value for `key`. Returns `Ok(None)` when the key is absent, `Err` when
+    /// decoding the stored bytes against the schema fails.
+    pub fn get(&self, key: &str) -> Result<Option<S::Owned>, PulsarError> {
+        match self.inner.get(key) {
+            Some(bytes) => {
+                let value = self.schema.decode(&bytes).map_err(PulsarError::Schema)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Decode every currently-known value. Allocates; use [`Self::for_each`] to avoid the
+    /// `HashMap` allocation when streaming. Errors stop at the first decode failure.
+    pub fn snapshot(&self) -> Result<HashMap<String, S::Owned>, PulsarError> {
+        let raw = self.inner.snapshot();
+        let mut out = HashMap::with_capacity(raw.len());
+        for (k, v) in raw {
+            let value = self.schema.decode(&v).map_err(PulsarError::Schema)?;
+            out.insert(k, value);
+        }
+        Ok(out)
+    }
+
+    /// Iterate every currently-known (key, decoded value) pair. The callback receives
+    /// `Result<S::Owned, SchemaError>` so per-key decode failures don't abort the iteration.
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&str, Result<S::Owned, magnetar_proto::schema::SchemaError>),
+    {
+        self.inner.for_each(|k, v| {
+            f(k, self.schema.decode(v));
+        });
+    }
+
+    /// Register a typed listener fired for every mutation. The callback receives the
+    /// pre-decoded value (or `None` for a tombstone). Decode failures replace the value
+    /// with `None` so the listener is never poisoned by a single bad payload. The
+    /// callback runs inside the drain task — keep it fast and non-blocking.
+    pub fn listen<F>(&self, callback: F)
+    where
+        F: Fn(&str, Option<&S::Owned>) + Send + Sync + 'static,
+    {
+        let schema = self.schema.clone();
+        let raw: TableViewListener =
+            Arc::new(move |key: &str, value: Option<&Bytes>| match value {
+                Some(bytes) => match schema.decode(bytes) {
+                    Ok(decoded) => callback(key, Some(&decoded)),
+                    Err(_) => callback(key, None),
+                },
+                None => callback(key, None),
+            });
+        self.inner.listen(raw);
+    }
+}
+
+/// Builder for a [`TypedTableView`]. Mirrors Java's schema-aware
+/// `pulsar.tableViewBuilder(Schema)` shape.
+pub struct TypedTableViewBuilder<'a, S: magnetar_proto::schema::Schema> {
+    client: &'a PulsarClient,
+    topic: String,
+    schema: Arc<S>,
+    subscription: Option<String>,
+    receiver_queue_size: usize,
+}
+
+impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableViewBuilder<'_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypedTableViewBuilder")
+            .field("topic", &self.topic)
+            .field("schema_type", &self.schema.schema_type())
+            .field("subscription", &self.subscription)
+            .field("receiver_queue_size", &self.receiver_queue_size)
+            .finish()
+    }
+}
+
+impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
+    pub(crate) fn new(client: &'a PulsarClient, topic: String, schema: Arc<S>) -> Self {
+        Self {
+            client,
+            topic,
+            schema,
+            subscription: None,
+            receiver_queue_size: 1000,
+        }
+    }
+
+    /// Override the auto-generated subscription name.
+    #[must_use]
+    pub fn subscription_name(mut self, name: impl Into<String>) -> Self {
+        self.subscription = Some(name.into());
+        self
+    }
+
+    /// Override the receiver-queue size.
+    #[must_use]
+    pub fn receiver_queue_size(mut self, size: usize) -> Self {
+        self.receiver_queue_size = size;
+        self
+    }
+
+    /// Subscribe and return the schema-aware view.
+    pub async fn create(self) -> Result<TypedTableView<S>, PulsarError> {
+        let mut builder = self
+            .client
+            .table_view(self.topic)
+            .receiver_queue_size(self.receiver_queue_size);
+        if let Some(name) = self.subscription {
+            builder = builder.subscription_name(name);
+        }
+        let inner = builder.create().await?;
+        Ok(TypedTableView {
+            inner,
+            schema: self.schema,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

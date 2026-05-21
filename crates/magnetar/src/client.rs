@@ -562,6 +562,18 @@ impl PulsarClient {
         crate::TableViewBuilder::new(self, topic.into())
     }
 
+    /// Schema-aware [`crate::TypedTableView`] builder. Mirrors Java
+    /// `pulsar.tableViewBuilder(Schema)` — the view decodes payloads on read so getters
+    /// return `S::Owned` directly.
+    #[must_use]
+    pub fn typed_table_view<S: magnetar_proto::schema::Schema>(
+        &self,
+        topic: impl Into<String>,
+        schema: std::sync::Arc<S>,
+    ) -> crate::TypedTableViewBuilder<'_, S> {
+        crate::TypedTableViewBuilder::new(self, topic.into(), schema)
+    }
+
     /// Open a [`crate::MultiTopicsConsumerBuilder`] that subscribes to many topics at once.
     /// Mirrors Java's `PulsarClient#newConsumer().topics(...)`.
     #[must_use]
