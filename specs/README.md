@@ -36,6 +36,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0018](adr/0018-pip-188-reconnect-on-migrate.md) | PIP-188 `TOPIC_MIGRATED` → supervised reset + reconnect (re-uses Stage 2/3 supervisor) | Accepted | commits `7d568f9`, `9a35db4` |
 | [0019](adr/0019-engine-scope-and-moonpool-parity.md) | Engine scope for v0.1.0 parity; moonpool parity as M5–M8 follow-up train | Accepted | commit `1c9bb5d` |
 | [0020](adr/0020-memory-limit-producer-block.md) | `MemoryLimitPolicy::ProducerBlock` back-pressure via Waker slab | Accepted | commits `13842b7`, `81a7df0`, `458224a` |
+| [0021](adr/0021-no-silent-test-ignore-or-remove.md) | Tests are fixed, not silently ignored or removed | Accepted | broker_smoke follow-up (2026-05-22) |
 
 ## How to add an ADR
 
