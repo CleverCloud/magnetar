@@ -86,8 +86,9 @@ pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTop
 pub use partitioned_consumer::{PartitionedConsumer, PartitionedConsumerBuilder};
 #[cfg(feature = "tokio")]
 pub use partitioned_producer::{
-    MessageRouter, MessageRoutingMode, PartitionedMessageBuilder, PartitionedProducer,
-    PartitionedProducerBuilder,
+    JavaStringHashHasher, MessageRouter, MessageRoutingMode, Murmur3HashHasher,
+    PartitionedMessageBuilder, PartitionedProducer, PartitionedProducerBuilder, java_string_hash,
+    murmur3_32_hash,
 };
 #[cfg(feature = "tokio")]
 pub use pattern_consumer::{

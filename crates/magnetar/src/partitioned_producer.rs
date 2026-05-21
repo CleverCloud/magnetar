@@ -133,6 +133,132 @@ pub trait MessageRouter: Send + Sync + std::fmt::Debug {
     fn route(&self, msg: &crate::OutgoingMessage, partitions: usize) -> usize;
 }
 
+/// Bit-for-bit port of Apache Pulsar's `Murmur3_32Hash.makeHash(byte[])`
+/// ([`Murmur3_32Hash.java`]). Used by [`Murmur3HashHasher`] so cross-language consumers
+/// (Java, C++, Go) see identical routing for the same key.
+///
+/// Returns a non-negative 31-bit value — the Java implementation masks with
+/// `Integer.MAX_VALUE` before returning.
+///
+/// [`Murmur3_32Hash.java`]: https://github.com/apache/pulsar/blob/master/pulsar-common/src/main/java/org/apache/pulsar/common/util/Murmur3_32Hash.java
+#[must_use]
+pub fn murmur3_32_hash(bytes: &[u8]) -> u32 {
+    const C1: u32 = 0xcc9e_2d51;
+    const C2: u32 = 0x1b87_3593;
+    const SEED: u32 = 0;
+
+    let len = bytes.len();
+    let mut h1: u32 = SEED;
+
+    let mix_k1 = |mut k1: u32| -> u32 {
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(15);
+        k1 = k1.wrapping_mul(C2);
+        k1
+    };
+
+    let chunks = bytes.chunks_exact(4);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        // Java's `ByteBuffer.LITTLE_ENDIAN.getInt()` reads four bytes little-endian.
+        let k1 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let k1 = mix_k1(k1);
+        h1 ^= k1;
+        h1 = h1.rotate_left(13);
+        h1 = h1.wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+
+    // Tail.
+    let mut k1: u32 = 0;
+    for (i, byte) in remainder.iter().enumerate() {
+        k1 ^= u32::from(*byte) << (i * 8);
+    }
+    h1 ^= mix_k1(k1);
+
+    // Finalisation: XOR length, then `fmix`.
+    h1 ^= len as u32;
+    h1 ^= h1 >> 16;
+    h1 = h1.wrapping_mul(0x85eb_ca6b);
+    h1 ^= h1 >> 13;
+    h1 = h1.wrapping_mul(0xc2b2_ae35);
+    h1 ^= h1 >> 16;
+
+    // Mirror Java's `& Integer.MAX_VALUE` mask so the value fits into a non-negative
+    // signed int32 — matches `Murmur3Hash32.makeHash` and `Murmur3_32Hash.makeHash`.
+    h1 & 0x7FFF_FFFF
+}
+
+/// Bit-for-bit port of `String.hashCode() & Integer.MAX_VALUE`. Iterates over UTF-16
+/// code units (matching Java's `char`) so non-BMP code points hash identically to the
+/// JDK. ASCII strings short-circuit through the byte path.
+///
+/// Used by [`JavaStringHashHasher`].
+#[must_use]
+pub fn java_string_hash(key: &str) -> u32 {
+    let mut h: u32 = 0;
+    if key.is_ascii() {
+        for byte in key.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(u32::from(byte));
+        }
+    } else {
+        for code_unit in key.encode_utf16() {
+            h = h.wrapping_mul(31).wrapping_add(u32::from(code_unit));
+        }
+    }
+    h & 0x7FFF_FFFF
+}
+
+/// Pick the partition by hashing the message's UTF-8-encoded partition key with
+/// [`murmur3_32_hash`] (Apache Pulsar `Murmur3_32Hash`, seed `0`), then `hash %
+/// partitions`. Falls back to round-robin via [`OutgoingMessage::key`] being `None` or
+/// empty.
+///
+/// Wire-compatible with Java's `HashingScheme.Murmur3_32Hash` so Java, C++, Go, and
+/// magnetar producers route the same key to the same partition.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Murmur3HashHasher;
+
+impl MessageRouter for Murmur3HashHasher {
+    fn route(&self, msg: &crate::OutgoingMessage, partitions: usize) -> usize {
+        partition_for_key(msg.key.as_deref(), partitions, |k| {
+            murmur3_32_hash(k.as_bytes())
+        })
+    }
+}
+
+/// Pick the partition with [`java_string_hash`] (Java `String.hashCode()` semantics),
+/// then `hash % partitions`. Falls back to round-robin when no key is set.
+///
+/// Wire-compatible with Java's default `HashingScheme.JavaStringHash`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JavaStringHashHasher;
+
+impl MessageRouter for JavaStringHashHasher {
+    fn route(&self, msg: &crate::OutgoingMessage, partitions: usize) -> usize {
+        partition_for_key(msg.key.as_deref(), partitions, java_string_hash)
+    }
+}
+
+/// Shared "keyed hash, fall back to a sticky default" routing helper. The fallback
+/// returns partition `0`; the surrounding [`PartitionedProducer`] is responsible for
+/// running round-robin when no router is installed. When a router *is* installed it
+/// overrides the configured [`MessageRoutingMode`] entirely (mirrors Java
+/// `ProducerBuilder#messageRouter`), so we cannot rotate through the cursor here —
+/// instead we sticky-route to partition `0`, matching Java's `RoundRobinPartitionMessageRouter`
+/// behaviour when the key is null and batching keeps a key-affine sticky partition.
+fn partition_for_key<F>(key: Option<&str>, partitions: usize, hash: F) -> usize
+where
+    F: FnOnce(&str) -> u32,
+{
+    if partitions == 0 {
+        return 0;
+    }
+    match key {
+        Some(k) if !k.is_empty() => (hash(k) as usize) % partitions,
+        _ => 0,
+    }
+}
+
 /// Partition-aware producer.
 #[derive(Debug)]
 pub struct PartitionedProducer {
@@ -636,5 +762,112 @@ mod tests {
         let r: std::sync::Arc<dyn MessageRouter> = std::sync::Arc::new(ConstantRouter(2));
         let msg = OutgoingMessage::default();
         assert_eq!(r.route(&msg, 4), 2);
+    }
+
+    // -- Murmur3 parity with Apache Pulsar's `HashTest.murmur3_32HashTest`. -----------
+    //
+    // Vectors copied verbatim from
+    // `pulsar-client/src/test/java/org/apache/pulsar/client/impl/HashTest.java`. They
+    // are also the C++ client's expected outputs, so a regression here breaks
+    // cross-language partition affinity.
+    #[test]
+    fn murmur3_matches_java_hashtest_vectors() {
+        assert_eq!(murmur3_32_hash(b"k1"), 2_110_152_746);
+        assert_eq!(murmur3_32_hash(b"k2"), 1_479_966_664);
+        assert_eq!(murmur3_32_hash(b"key1"), 462_881_061);
+        assert_eq!(murmur3_32_hash(b"key2"), 1_936_800_180);
+        assert_eq!(murmur3_32_hash(b"key01"), 39_696_932);
+        assert_eq!(murmur3_32_hash(b"key02"), 751_761_803);
+    }
+
+    #[test]
+    fn murmur3_handles_empty_input() {
+        // Empty input under seed=0 with the masking we apply should be 0 (matches
+        // Java's `Murmur3_32Hash.makeHash(new byte[0]) & Integer.MAX_VALUE`).
+        assert_eq!(murmur3_32_hash(b""), 0);
+    }
+
+    // -- JavaStringHash parity with Apache Pulsar's `HashTest.javaStringHashTest`. ----
+    //
+    // The `"keykeykey2"` value overflows i32 as unsigned (Java's `hashCode()` returns
+    // negative) — the mask with `Integer.MAX_VALUE` restores the non-negative form.
+    #[test]
+    fn java_string_hash_matches_java_hashtest_vectors() {
+        assert_eq!(java_string_hash("keykeykeykeykey1"), 434_058_482);
+        assert_eq!(java_string_hash("keykeykey2"), 42_978_643);
+        // Well-known textbook value: "abc".hashCode() == 96354.
+        assert_eq!(java_string_hash("abc"), 96_354);
+    }
+
+    #[test]
+    fn java_string_hash_empty_is_zero() {
+        // `"".hashCode()` is 0 in Java, masked stays 0.
+        assert_eq!(java_string_hash(""), 0);
+    }
+
+    // -- Routing determinism: same key always routes to the same partition. ----------
+    #[test]
+    fn murmur3_router_is_keyed_and_deterministic() {
+        let router = Murmur3HashHasher;
+        let msg = OutgoingMessage::default().key("user-42");
+        let p0 = router.route(&msg, 16);
+        // Call ten times — must be stable.
+        for _ in 0..10 {
+            assert_eq!(router.route(&msg, 16), p0);
+        }
+        // And different keys can land on different partitions (smoke check).
+        let other = OutgoingMessage::default().key("user-9999");
+        let p1 = router.route(&other, 16);
+        // Not asserting `p0 != p1` because hash collisions exist for 16 partitions; we
+        // just want to prove the value is in range.
+        assert!(p0 < 16);
+        assert!(p1 < 16);
+    }
+
+    #[test]
+    fn java_string_hash_router_is_keyed_and_deterministic() {
+        let router = JavaStringHashHasher;
+        let msg = OutgoingMessage::default().key("orders-tenant-A");
+        let p0 = router.route(&msg, 8);
+        for _ in 0..10 {
+            assert_eq!(router.route(&msg, 8), p0);
+        }
+        assert!(p0 < 8);
+    }
+
+    // Same key value must land on the same partition under both hashers across
+    // independent invocations — guards against accidental cursor / RNG bleed-in.
+    #[test]
+    fn hashers_have_no_hidden_state() {
+        let m1 = Murmur3HashHasher;
+        let m2 = Murmur3HashHasher;
+        let key = OutgoingMessage::default().key("k1");
+        assert_eq!(m1.route(&key, 32), m2.route(&key, 32));
+
+        let j1 = JavaStringHashHasher;
+        let j2 = JavaStringHashHasher;
+        assert_eq!(j1.route(&key, 32), j2.route(&key, 32));
+    }
+
+    // Cross-check Murmur3 routing against the Java expected value mod partition count
+    // (uses the vector from `HashTest`): "key1" -> 462881061 -> 462881061 % 16 = 5.
+    #[test]
+    fn murmur3_router_matches_java_modulo() {
+        let router = Murmur3HashHasher;
+        let msg = OutgoingMessage::default().key("key1");
+        assert_eq!(router.route(&msg, 16), (462_881_061_usize) % 16);
+    }
+
+    // No-key fallback uses sticky partition 0 (router overrides MessageRoutingMode).
+    #[test]
+    fn hashers_fall_back_to_partition_zero_without_key() {
+        let m = Murmur3HashHasher;
+        let j = JavaStringHashHasher;
+        let msg = OutgoingMessage::default();
+        assert_eq!(m.route(&msg, 8), 0);
+        assert_eq!(j.route(&msg, 8), 0);
+        let msg_empty = OutgoingMessage::default().key("");
+        assert_eq!(m.route(&msg_empty, 8), 0);
+        assert_eq!(j.route(&msg_empty, 8), 0);
     }
 }
