@@ -138,6 +138,24 @@ impl<S: Schema> TypedProducer<S> {
         self.inner.last_sequence_id_published()
     }
 
+    /// Number of in-flight sends. See `Producer::pending_count`.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.inner.pending_count()
+    }
+
+    /// Number of messages buffered in the batch container. See `Producer::batch_len`.
+    #[must_use]
+    pub fn batch_len(&self) -> usize {
+        self.inner.batch_len()
+    }
+
+    /// Payload bytes buffered in the batch container. See `Producer::batch_bytes`.
+    #[must_use]
+    pub fn batch_bytes(&self) -> usize {
+        self.inner.batch_bytes()
+    }
+
     /// Flush pending batches and await every in-flight send. Mirrors Java
     /// `Producer#flushAsync`.
     pub async fn flush(&self) -> Result<(), PulsarError> {

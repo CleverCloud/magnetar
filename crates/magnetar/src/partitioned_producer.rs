@@ -204,6 +204,33 @@ impl PartitionedProducer {
             .max()
             .unwrap_or(-1)
     }
+
+    /// Sum of in-flight sends across every child producer.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::pending_count)
+            .sum()
+    }
+
+    /// Sum of batch-buffered messages across every child producer.
+    #[must_use]
+    pub fn batch_len(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::batch_len)
+            .sum()
+    }
+
+    /// Sum of batch-buffered payload bytes across every child producer.
+    #[must_use]
+    pub fn batch_bytes(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::batch_bytes)
+            .sum()
+    }
 }
 
 /// Builder for [`PartitionedProducer`]. Mirrors Java's `ProducerBuilder` at the partitioned

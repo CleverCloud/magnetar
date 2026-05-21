@@ -56,6 +56,27 @@ impl Producer {
             .producer_last_sequence_id_pushed(self.handle)
     }
 
+    /// Number of in-flight sends (queued and not yet acked by the broker). Mirrors the
+    /// un-batched view of Java `ProducerStats#getPendingQueueSize`. Equivalent to
+    /// `self.stats().pending_queue_size as usize` but spares the full stats snapshot.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.shared.inner.lock().producer_pending_count(self.handle)
+    }
+
+    /// Number of messages currently buffered in the batch container, waiting for the next
+    /// flush cycle. Returns `0` when batching is disabled or the batch is empty.
+    #[must_use]
+    pub fn batch_len(&self) -> usize {
+        self.shared.inner.lock().producer_batch_len(self.handle)
+    }
+
+    /// Sum of payload bytes currently buffered in the batch container.
+    #[must_use]
+    pub fn batch_bytes(&self) -> usize {
+        self.shared.inner.lock().producer_batch_bytes(self.handle)
+    }
+
     /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. Returns `-1`
     /// if no sends have been acked yet. Useful for resume-from-checkpoint flows.
     pub fn last_sequence_id_published(&self) -> i64 {

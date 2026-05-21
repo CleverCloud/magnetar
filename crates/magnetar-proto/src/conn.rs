@@ -1580,6 +1580,22 @@ impl Connection {
         self.producers.get(&handle).map_or(0, |p| p.pending.len())
     }
 
+    /// Number of messages currently buffered in the producer's batch container (waiting
+    /// for the next flush cycle). Returns `0` for unknown handles or when batching is
+    /// disabled / the batch is empty.
+    #[must_use]
+    pub fn producer_batch_len(&self, handle: ProducerHandle) -> usize {
+        self.producers.get(&handle).map_or(0, |p| p.batch.len())
+    }
+
+    /// Sum of payload bytes currently buffered in the producer's batch container.
+    #[must_use]
+    pub fn producer_batch_bytes(&self, handle: ProducerHandle) -> usize {
+        self.producers
+            .get(&handle)
+            .map_or(0, |p| p.batch.current_size_bytes)
+    }
+
     /// Last sequence id this client has pushed onto the wire. `-1` if the producer has
     /// never sent. Mirrors Java's `Producer#getLastSequenceId` (which counts pushes,
     /// not broker acknowledgements).
