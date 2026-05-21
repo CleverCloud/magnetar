@@ -358,6 +358,19 @@ impl PulsarClient {
         crate::PartitionedConsumerBuilder::new(self, topic.into())
     }
 
+    /// Query the broker for the partition count of `topic`. Returns `0` for non-partitioned
+    /// topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulsarError::Client`] if the broker refuses the metadata lookup.
+    pub async fn partitions_for_topic(&self, topic: &str) -> Result<u32> {
+        self.inner
+            .partitioned_topic_metadata(topic)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
     /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
     /// this pattern right now" workflows. Live updates are emitted by the connection as
