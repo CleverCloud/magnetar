@@ -281,6 +281,79 @@ impl MultiTopicsConsumer {
         }
         first_err
     }
+
+    /// Unsubscribe every child subscription. Mirrors Java `Consumer#unsubscribe` at the
+    /// multi-topic / partitioned scope. Returns the first error encountered; the rest are
+    /// dropped (every child still gets a chance to issue its unsubscribe).
+    pub async fn unsubscribe(&self, force: bool) -> Result<(), PulsarError> {
+        let mut first_err: Result<(), PulsarError> = Ok(());
+        for nc in &self.inner.consumers {
+            if let Err(e) = nc.consumer.unsubscribe(force).await {
+                if first_err.is_ok() {
+                    first_err = Err(PulsarError::Client(e));
+                }
+            }
+        }
+        first_err
+    }
+
+    /// Seek every child consumer to the given publish-time deadline. Mirrors Java
+    /// `Consumer#seek(long)` at the multi-topic scope.
+    pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
+        let mut first_err: Result<(), PulsarError> = Ok(());
+        for nc in &self.inner.consumers {
+            if let Err(e) = nc.consumer.seek_to_timestamp(publish_time_ms).await {
+                if first_err.is_ok() {
+                    first_err = Err(PulsarError::Client(e));
+                }
+            }
+        }
+        first_err
+    }
+
+    /// Seek every child consumer to the earliest message. Mirrors Java
+    /// `Consumer#seek(MessageId.earliest)` at the multi-topic scope.
+    pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
+        let mut first_err: Result<(), PulsarError> = Ok(());
+        for nc in &self.inner.consumers {
+            if let Err(e) = nc.consumer.seek_to_earliest().await {
+                if first_err.is_ok() {
+                    first_err = Err(PulsarError::Client(e));
+                }
+            }
+        }
+        first_err
+    }
+
+    /// Seek every child consumer to the latest (head) position. Mirrors Java
+    /// `Consumer#seek(MessageId.latest)` at the multi-topic scope.
+    pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
+        let mut first_err: Result<(), PulsarError> = Ok(());
+        for nc in &self.inner.consumers {
+            if let Err(e) = nc.consumer.seek_to_latest().await {
+                if first_err.is_ok() {
+                    first_err = Err(PulsarError::Client(e));
+                }
+            }
+        }
+        first_err
+    }
+
+    /// Ask the broker for each topic's last-published message id. Returns one `(topic, id)`
+    /// per child consumer, in the order supplied to the builder. Mirrors Java
+    /// `Consumer#getLastMessageIds` for partitioned/multi-topic consumers.
+    pub async fn last_message_ids(&self) -> Result<Vec<(String, MessageId)>, PulsarError> {
+        let mut out = Vec::with_capacity(self.inner.consumers.len());
+        for nc in &self.inner.consumers {
+            let id = nc
+                .consumer
+                .last_message_id()
+                .await
+                .map_err(PulsarError::Client)?;
+            out.push((nc.topic.clone(), id));
+        }
+        Ok(out)
+    }
 }
 
 impl Clone for MultiTopicsConsumer {
