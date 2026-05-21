@@ -106,6 +106,50 @@ impl MultiTopicsConsumer {
         Ok(())
     }
 
+    /// Negatively acknowledge with an explicit per-message redelivery delay. Mirrors
+    /// Java's PIP-37 backoff path at the multi-topic / partitioned scope. The caller
+    /// supplies the topic the message came from so the nack routes to the correct child.
+    pub fn negative_ack_with_delay(
+        &self,
+        topic: &str,
+        message_id: MessageId,
+        delay: std::time::Duration,
+    ) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| {
+                PulsarError::Config(format!("negative_ack_with_delay for unknown topic {topic}"))
+            })?;
+        consumer.consumer.negative_ack_with_delay(message_id, delay);
+        Ok(())
+    }
+
+    /// Cumulative ack. The caller supplies the topic the message came from so the ack
+    /// routes to the correct child. Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId)` at the multi-topic scope.
+    pub async fn ack_cumulative(
+        &self,
+        topic: &str,
+        message_id: MessageId,
+    ) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| {
+                PulsarError::Config(format!("ack_cumulative for unknown topic {topic}"))
+            })?;
+        consumer
+            .consumer
+            .ack_cumulative(message_id)
+            .await
+            .map_err(PulsarError::Client)
+    }
+
     /// Tell the broker to redeliver every unacked message across every child consumer.
     /// Mirrors Java `Consumer#redeliverUnacknowledgedMessages` at the multi-topic scope.
     pub fn redeliver_unacked(&self) {
