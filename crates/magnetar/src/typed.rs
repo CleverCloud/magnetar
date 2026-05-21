@@ -77,6 +77,63 @@ impl<S: Schema> TypedProducer<S> {
     pub async fn close(self) -> Result<(), PulsarError> {
         self.inner.close().await.map_err(PulsarError::Client)
     }
+
+    /// Topic this producer is bound to. Mirrors Java `Producer#getTopic`.
+    #[must_use]
+    pub fn topic(&self) -> String {
+        self.inner.topic()
+    }
+
+    /// Producer name (broker-assigned if not user-supplied). Mirrors Java
+    /// `Producer#getProducerName`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    /// `true` while the broker connection is up. Mirrors Java `Producer#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    /// `true` once [`Self::close`] has been called.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Cumulative producer counters snapshot. Mirrors Java `Producer#getStats`.
+    #[must_use]
+    pub fn stats(&self) -> magnetar_proto::ProducerStats {
+        self.inner.stats()
+    }
+
+    /// Wall-clock instant of the most-recent connection drop. Mirrors Java
+    /// `Producer#getLastDisconnectedTimestamp`.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.inner.last_disconnected_timestamp()
+    }
+
+    /// Last sequence id pushed onto the wire. Mirrors Java `Producer#getLastSequenceId`.
+    #[must_use]
+    pub fn last_sequence_id(&self) -> i64 {
+        self.inner.last_sequence_id()
+    }
+
+    /// Last sequence id the broker has acknowledged. Mirrors Java
+    /// `Producer#getLastSequenceIdPublished`.
+    #[must_use]
+    pub fn last_sequence_id_published(&self) -> i64 {
+        self.inner.last_sequence_id_published()
+    }
+
+    /// Flush pending batches and await every in-flight send. Mirrors Java
+    /// `Producer#flushAsync`.
+    pub async fn flush(&self) -> Result<(), PulsarError> {
+        self.inner.flush().await.map_err(PulsarError::Client)
+    }
 }
 
 /// Builder for a [`TypedProducer`]. The schema is required; the topic comes from the parent
@@ -307,6 +364,96 @@ impl<S: Schema> TypedConsumer<S> {
     /// Close the underlying consumer.
     pub async fn close(self) -> Result<(), PulsarError> {
         self.inner.close().await.map_err(PulsarError::Client)
+    }
+
+    /// Topic this consumer is bound to. Mirrors Java `Consumer#getTopic`.
+    #[must_use]
+    pub fn topic(&self) -> String {
+        self.inner.topic()
+    }
+
+    /// Subscription name. Mirrors Java `Consumer#getSubscription`.
+    #[must_use]
+    pub fn subscription(&self) -> String {
+        self.inner.subscription()
+    }
+
+    /// Consumer name. Mirrors Java `Consumer#getConsumerName`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    /// `true` while the broker connection is up. Mirrors Java `Consumer#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    /// `true` once [`Self::close`] / `unsubscribe` has completed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Cumulative consumer counters snapshot. Mirrors Java `Consumer#getStats`.
+    #[must_use]
+    pub fn stats(&self) -> magnetar_proto::ConsumerStats {
+        self.inner.stats()
+    }
+
+    /// Wall-clock instant of the most-recent connection drop. Mirrors Java
+    /// `Consumer#getLastDisconnectedTimestamp`.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.inner.last_disconnected_timestamp()
+    }
+
+    /// Negative-ack a message. Mirrors Java `Consumer#negativeAcknowledge`.
+    pub fn negative_ack(&self, message_id: MessageId) {
+        self.inner.negative_ack(message_id);
+    }
+
+    /// Tell the broker to redeliver every unacked message. Mirrors Java
+    /// `Consumer#redeliverUnacknowledgedMessages`.
+    pub fn redeliver_unacked(&self) {
+        self.inner.redeliver_unacked();
+    }
+
+    /// Pause delivery. Mirrors Java `Consumer#pause`.
+    pub fn pause(&self) {
+        self.inner.pause();
+    }
+
+    /// Resume delivery. Mirrors Java `Consumer#resume`.
+    pub fn resume(&self) {
+        self.inner.resume();
+    }
+
+    /// `true` after [`Self::pause`] until [`Self::resume`]. Mirrors Java
+    /// `Consumer#isPaused` semantics.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.inner.is_paused()
+    }
+
+    /// `true` once the broker has signalled end-of-topic. Mirrors Java
+    /// `Consumer#hasReachedEndOfTopic`.
+    #[must_use]
+    pub fn has_reached_end_of_topic(&self) -> bool {
+        self.inner.has_reached_end_of_topic()
+    }
+
+    /// Buffered message count. Mirrors Java `Consumer#getNumMessagesInQueue`.
+    #[must_use]
+    pub fn available_in_queue(&self) -> usize {
+        self.inner.available_in_queue()
+    }
+
+    /// Outstanding broker permits. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    #[must_use]
+    pub fn available_permits(&self) -> u32 {
+        self.inner.available_permits()
     }
 }
 
