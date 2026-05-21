@@ -216,4 +216,138 @@ mod tests {
             .expect("cumulative ack");
         assert_eq!(cumulative_id.entry_id, 7);
     }
+
+    /// Java `AcknowledgementsGroupingTrackerTest#testAckTracker` lines 117-149: after a
+    /// cumulative ack arrives, subsequent individual acks for ids beyond the cumulative
+    /// position remain pending in the same group until the window elapses.
+    #[test]
+    fn individual_after_cumulative_stays_grouped() {
+        let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        assert!(t.add_cumulative(mid(5, 5), t0).is_empty());
+        assert!(t.add_individual(mid(5, 6), t0).is_empty());
+        // Still within the grouping window — nothing emitted.
+        assert!(t.poll(t0 + Duration::from_millis(50)).is_empty());
+    }
+
+    /// Java `testAckTracker` line 127, 140, 150: a `flush` must surface both the pending
+    /// cumulative ack AND the pending individual acks. Mirrors `PersistentAcknowledgments
+    /// GroupingTracker#flush` writing one `CommandAck` per ack type.
+    #[test]
+    fn flush_emits_cumulative_and_individuals() {
+        let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let now = Instant::now();
+        let _ = t.add_individual(mid(5, 1), now);
+        let _ = t.add_cumulative(mid(5, 5), now);
+        let _ = t.add_individual(mid(5, 6), now);
+        let actions = t.flush();
+        let mut saw_cumulative = false;
+        let mut individual_ids: Vec<MessageId> = Vec::new();
+        for a in &actions {
+            match a {
+                AckAction::SendCumulativeAck { message_id, .. } => {
+                    assert_eq!(message_id.entry_id, 5);
+                    saw_cumulative = true;
+                }
+                AckAction::SendIndividualAck { message_ids, .. } => {
+                    individual_ids.extend_from_slice(message_ids);
+                }
+            }
+        }
+        assert!(saw_cumulative, "flush must emit pending cumulative ack");
+        assert_eq!(individual_ids.len(), 2);
+        // Sort guarantee from `flush`: ids must come out ascending.
+        let mut sorted = individual_ids.clone();
+        sorted.sort();
+        assert_eq!(individual_ids, sorted);
+    }
+
+    /// A freshly constructed tracker has no scheduled flush. Mirrors Java where the timer is
+    /// not armed until the first ack arrives.
+    #[test]
+    fn next_deadline_is_none_when_empty() {
+        let t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        assert!(t.next_deadline().is_none());
+    }
+
+    /// After `flush` drains everything, the next `add_*` must restart the timing window — not
+    /// keep firing on the previous schedule. Java `PersistentAcknowledgmentsGroupingTracker`
+    /// reschedules its timer after every flush; we mirror that by clearing `last_flush`.
+    #[test]
+    fn flush_resets_window() {
+        let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        let _ = t.add_individual(mid(1, 1), t0);
+        assert_eq!(t.flush().len(), 1);
+        assert!(t.next_deadline().is_none());
+        // After flush, the tracker behaves like a fresh one for the next add.
+        let t1 = t0 + Duration::from_millis(500);
+        let _ = t.add_individual(mid(1, 2), t1);
+        // The deadline must be t1 + 100ms, not t0 + 100ms.
+        let deadline = t.next_deadline().expect("deadline after re-add");
+        assert!(deadline >= t1 + Duration::from_millis(100));
+        // Polling before the new window elapses must not emit anything.
+        assert!(t.poll(t1 + Duration::from_millis(50)).is_empty());
+    }
+
+    /// Java `testAckTracker` lines 113-115: `isDuplicate(msg1)` must return `true` after the
+    /// individual ack is recorded but before flush, AND `isDuplicate(msg2)` must remain
+    /// `false`. Without exposing `isDuplicate` directly, we verify the underlying invariant:
+    /// individual acks accumulate and only flush emits them.
+    #[test]
+    fn individual_acks_accumulate_until_window() {
+        let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        for entry in 1..=4 {
+            let actions = t.add_individual(mid(5, entry), t0);
+            assert!(actions.is_empty(), "no immediate emission within window");
+        }
+        assert!(t.poll(t0 + Duration::from_millis(99)).is_empty());
+        let actions = t.poll(t0 + Duration::from_millis(101));
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            AckAction::SendIndividualAck { message_ids, .. } => {
+                assert_eq!(message_ids.len(), 4);
+            }
+            other => panic!("expected SendIndividualAck, got {other:?}"),
+        }
+    }
+
+    /// A zero-window cumulative ack flushes immediately, mirroring Java
+    /// `testImmediateAckingTracker` for the cumulative path: when `ackGroupTimeMicros == 0`,
+    /// the tracker fires the ack synchronously rather than queueing it.
+    #[test]
+    fn zero_window_cumulative_flushes_immediately() {
+        let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::ZERO);
+        let actions = t.add_cumulative(mid(5, 3), Instant::now());
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            AckAction::SendCumulativeAck { message_id, .. } => {
+                assert_eq!(message_id.entry_id, 3);
+            }
+            other => panic!("expected SendCumulativeAck, got {other:?}"),
+        }
+    }
+
+    /// Cumulative-ack ordering across ledgers: a cumulative ack pointing at a higher ledger
+    /// supersedes one in a lower ledger even when the lower ledger's entry id is numerically
+    /// larger. Mirrors `MessageIdImpl#compareTo` in Java where ledger id is the primary key.
+    #[test]
+    fn cumulative_uses_ledger_then_entry_ordering() {
+        let mut t = AckGroupingTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let now = Instant::now();
+        let _ = t.add_cumulative(mid(1, 100), now); // small ledger, big entry
+        let _ = t.add_cumulative(mid(2, 1), now); // bigger ledger wins
+        let _ = t.add_cumulative(mid(2, 0), now); // smaller entry within same ledger — no-op
+        let actions = t.flush();
+        let cumulative_id = actions
+            .iter()
+            .find_map(|a| match a {
+                AckAction::SendCumulativeAck { message_id, .. } => Some(*message_id),
+                _ => None,
+            })
+            .expect("cumulative ack");
+        assert_eq!(cumulative_id.ledger_id, 2);
+        assert_eq!(cumulative_id.entry_id, 1);
+    }
 }
