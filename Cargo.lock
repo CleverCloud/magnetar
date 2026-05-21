@@ -1464,11 +1464,14 @@ dependencies = [
 name = "magnetar-auth-oauth2"
 version = "0.1.0-dev.0"
 dependencies = [
+ "bytes",
  "magnetar-proto",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "url",
 ]

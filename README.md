@@ -546,7 +546,7 @@ known-missing feature.
 | --- | --- | --- | --- |
 | Token auth | ✅ | ✅ | `magnetar_proto::auth::TokenAuth`. |
 | mTLS | ✅ | ✅ | `magnetar_proto::auth::TlsAuth` + `tls_trust_certs_pem` / `tls_trust_certs_file_path`. |
-| OAuth2 ClientCredentialsFlow | ✅ | 🟡 | Crate scaffolded (`magnetar-auth-oauth2`); flow integration is pre-alpha. |
+| OAuth2 ClientCredentialsFlow | ✅ | ✅ | `magnetar_auth_oauth2::ClientCredentialsFlow` — POSTs `grant_type=client_credentials` to the IDP, caches the JWT, refreshes within 30 s of expiry. Reports `auth_method_name = "token"`. |
 | SASL (Kerberos) | ✅ | 🟡 | Crate scaffolded (`magnetar-auth-sasl`); pre-alpha. |
 | Athenz | ✅ | 🟡 | Crate scaffolded (`magnetar-auth-athenz`); pre-alpha. |
 | In-band `AUTH_CHALLENGE` refresh (PIP-30 / PIP-292) | ✅ | ✅ | Driver consults the configured `AuthProvider` and submits `CommandAuthResponse`. |
