@@ -400,7 +400,7 @@ known-missing feature.
 | `getLastDisconnectedTimestamp` | ✅ | ✅ | `Producer::last_disconnected_timestamp`. |
 | `flush()` | ✅ | ✅ | `Producer::flush`. |
 | `close()` | ✅ | ✅ | `Producer::close`. |
-| `getStats` | ✅ | ✅ | `Producer::stats` (counters today; hdrhistogram rolling windows pending). |
+| `getStats` | ✅ | ✅ | `Producer::stats` — counters + `send_latency_{p50,p99,max}_ms` via `hdrhistogram`. Rolling per-second windows still pending. |
 | `getCompressionType` getter | ✅ | ✅ | `Producer::compression`. |
 | Per-message `key` / `orderingKey` | ✅ | ✅ | `OutgoingMessage::key` / `ordering_key`. |
 | Per-message `eventTime` | ✅ | ✅ | `OutgoingMessage::event_time_ms`. |
@@ -447,7 +447,7 @@ known-missing feature.
 | `getLastMessageId` | ✅ | ✅ | `Consumer::last_message_id`. |
 | `getStats` (counters) | ✅ | ✅ | `Consumer::stats`. Includes `total_chunked_msgs_received`. |
 | Stats: rolling windows (msgs/sec, bytes/sec) | ✅ | 🟡 | Cumulative only today; rolling-window tick pending. |
-| Stats: latency hdrhistogram (p50/p99/max) | ✅ | ❌ | Pending — `hdrhistogram` is on the allow-list pathway. |
+| Stats: latency hdrhistogram (p50/p99/max) | ✅ | ✅ | `Consumer::stats` exposes `receive_latency_{p50,p99,max}_ms`; `Producer::stats` exposes `send_latency_{p50,p99,max}_ms`. |
 | `subscriptionProperties` | ✅ | ✅ | `ConsumerBuilder::subscription_property`. |
 | `replicateSubscriptionState` | ✅ | ✅ | `ConsumerBuilder::replicate_subscription_state`. |
 | `priorityLevel` | ✅ | ✅ | `ConsumerBuilder::priority_level`. |
@@ -572,7 +572,7 @@ known-missing feature.
 | `ProtobufSchema` (descriptor) | ✅ | ✅ | |
 | `ProtobufNativeSchema` | ✅ | ✅ | Byte-identical Java `FileDescriptorSet` output. |
 | `KeyValueSchema` | ✅ | ✅ | Byte-identical canonical JSON wrapper. |
-| `AutoConsumeSchema` (broker lookup) | ✅ | 🟡 | Trait surface only; broker-driven lookup pending. |
+| `AutoConsumeSchema` (broker lookup) | ✅ | ✅ | `TypedConsumer::receive` auto-fetches the broker schema on first call via `Connection::get_schema`; the result is cached on the schema's `Arc<Mutex<Option<pb::Schema>>>`. |
 | `AutoProduceBytesSchema` | ✅ | 🟡 | Trait surface only. |
 | Int8 / Int16 / Int32 / Int64 / Float / Double / Bool | ✅ | ✅ | |
 | Date / Time / Timestamp / LocalDate / LocalTime / Instant / LocalDateTime | ✅ | ✅ | |
@@ -600,8 +600,7 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Latency histograms.** No p50/p99/max stats — pending `hdrhistogram` adoption.
-- **Stats rolling windows.** Cumulative-only counters; the broker dashboard expects msgs/sec, bytes/sec.
+- **Stats rolling windows.** Cumulative-only counters today; the broker dashboard expects msgs/sec, bytes/sec rolling windows. `hdrhistogram` p50/p99/max has shipped (`Consumer::stats` + `Producer::stats`).
 - **PIP-121 cluster failover.** `ServiceUrlProvider` + `ControlledClusterFailover` policy in flight; today the driver reconnects to the same `service_url`.
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180 shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33 replicated subscriptions** are scoped for the M9 milestone.
 
