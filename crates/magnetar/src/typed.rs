@@ -619,6 +619,18 @@ impl<S: Schema> TypedConsumer<S> {
             .map_err(PulsarError::Client)
     }
 
+    /// Fire-and-forget ack into the consumer's ack-grouping tracker (opt-in via
+    /// `TypedConsumerBuilder::ack_group_time`). See
+    /// [`magnetar_runtime_tokio::Consumer::ack_grouped`].
+    pub fn ack_grouped(&self, message_id: MessageId) {
+        self.inner.ack_grouped(message_id);
+    }
+
+    /// Fire-and-forget cumulative ack into the consumer's ack-grouping tracker.
+    pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        self.inner.ack_grouped_cumulative(message_id);
+    }
+
     /// Unsubscribe this consumer's subscription from the broker. Mirrors Java
     /// `Consumer#unsubscribe`. `force=true` (PIP-313) drops the subscription even when
     /// other consumers are still attached to the same subscription name.
@@ -870,6 +882,7 @@ pub struct TypedConsumerBuilder<'a, S: Schema> {
     read_compacted: bool,
     negative_ack_redelivery_delay: Option<std::time::Duration>,
     ack_timeout: Option<std::time::Duration>,
+    ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
     key_shared: Option<magnetar_proto::KeySharedConfig>,
     start_message_id: Option<magnetar_proto::MessageId>,
@@ -908,6 +921,7 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
             read_compacted: false,
             negative_ack_redelivery_delay: None,
             ack_timeout: None,
+            ack_group_time: None,
             dlq_policy: None,
             key_shared: None,
             start_message_id: None,
@@ -969,6 +983,14 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
     #[must_use]
     pub fn ack_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.ack_timeout = Some(timeout);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::ack_group_time`. Coalesces fire-and-forget acks emitted
+    /// via [`TypedConsumer::ack_grouped`] / [`TypedConsumer::ack_grouped_cumulative`].
+    #[must_use]
+    pub fn ack_group_time(mut self, window: std::time::Duration) -> Self {
+        self.ack_group_time = Some(window);
         self
     }
 
@@ -1093,6 +1115,9 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
         }
         if let Some(t) = self.ack_timeout {
             builder = builder.ack_timeout(t);
+        }
+        if let Some(w) = self.ack_group_time {
+            builder = builder.ack_group_time(w);
         }
         if let Some((max, topic_opt)) = self.dlq_policy {
             builder = builder.dead_letter_policy(max, topic_opt);

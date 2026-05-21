@@ -34,6 +34,7 @@ pub struct PartitionedConsumerBuilder<'a> {
     read_compacted: bool,
     negative_ack_redelivery_delay: Option<std::time::Duration>,
     ack_timeout: Option<std::time::Duration>,
+    ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
     key_shared: Option<magnetar_proto::KeySharedConfig>,
     replicate_subscription_state: Option<bool>,
@@ -67,6 +68,7 @@ impl<'a> PartitionedConsumerBuilder<'a> {
             read_compacted: false,
             negative_ack_redelivery_delay: None,
             ack_timeout: None,
+            ack_group_time: None,
             dlq_policy: None,
             key_shared: None,
             replicate_subscription_state: None,
@@ -163,6 +165,13 @@ impl<'a> PartitionedConsumerBuilder<'a> {
         self
     }
 
+    /// Mirrors `ConsumerBuilder::ack_group_time`. Applied to every per-partition child.
+    #[must_use]
+    pub fn ack_group_time(mut self, window: std::time::Duration) -> Self {
+        self.ack_group_time = Some(window);
+        self
+    }
+
     /// Mirrors `ConsumerBuilder::dead_letter_policy`.
     #[must_use]
     pub fn dead_letter_policy(
@@ -244,6 +253,9 @@ impl<'a> PartitionedConsumerBuilder<'a> {
         }
         if let Some(t) = self.ack_timeout {
             builder = builder.ack_timeout(t);
+        }
+        if let Some(w) = self.ack_group_time {
+            builder = builder.ack_group_time(w);
         }
         if let Some((max, topic_opt)) = self.dlq_policy {
             builder = builder.dead_letter_policy(max, topic_opt);

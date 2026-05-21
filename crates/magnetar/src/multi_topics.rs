@@ -150,6 +150,40 @@ impl MultiTopicsConsumer {
             .map_err(PulsarError::Client)
     }
 
+    /// Fire-and-forget ack into the per-topic child's ack-grouping tracker (opt-in via
+    /// `MultiTopicsConsumerBuilder::ack_group_time`). The caller supplies the topic the
+    /// message came from so the ack routes to the correct child. See
+    /// [`magnetar_runtime_tokio::Consumer::ack_grouped`].
+    pub fn ack_grouped(&self, topic: &str, message_id: MessageId) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| PulsarError::Config(format!("ack_grouped for unknown topic {topic}")))?;
+        consumer.consumer.ack_grouped(message_id);
+        Ok(())
+    }
+
+    /// Fire-and-forget cumulative ack into the per-topic child's ack-grouping tracker.
+    /// See [`Self::ack_grouped`] for the routing semantics.
+    pub fn ack_grouped_cumulative(
+        &self,
+        topic: &str,
+        message_id: MessageId,
+    ) -> Result<(), PulsarError> {
+        let consumer = self
+            .inner
+            .consumers
+            .iter()
+            .find(|c| c.topic == topic)
+            .ok_or_else(|| {
+                PulsarError::Config(format!("ack_grouped_cumulative for unknown topic {topic}"))
+            })?;
+        consumer.consumer.ack_grouped_cumulative(message_id);
+        Ok(())
+    }
+
     /// Republish `msg` via `retry_producer` with a delay, then ack the original on the
     /// per-topic child. Mirrors Java `Consumer#reconsumeLater` at the multi-topic scope.
     /// The caller supplies the topic the message came from (returned alongside the
@@ -458,6 +492,7 @@ pub struct MultiTopicsConsumerBuilder<'a> {
     properties: Vec<(String, String)>,
     negative_ack_redelivery_delay: Option<std::time::Duration>,
     ack_timeout: Option<std::time::Duration>,
+    ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
     read_compacted: bool,
     priority_level: Option<i32>,
@@ -481,6 +516,7 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             properties: Vec::new(),
             negative_ack_redelivery_delay: None,
             ack_timeout: None,
+            ack_group_time: None,
             dlq_policy: None,
             read_compacted: false,
             priority_level: None,
@@ -566,6 +602,13 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
     #[must_use]
     pub fn ack_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.ack_timeout = Some(timeout);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::ack_group_time`. Applied to every per-topic child.
+    #[must_use]
+    pub fn ack_group_time(mut self, window: std::time::Duration) -> Self {
+        self.ack_group_time = Some(window);
         self
     }
 
@@ -668,6 +711,9 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             }
             if let Some(t) = self.ack_timeout {
                 builder = builder.ack_timeout(t);
+            }
+            if let Some(w) = self.ack_group_time {
+                builder = builder.ack_group_time(w);
             }
             if let Some((max, topic_opt)) = &self.dlq_policy {
                 builder = builder.dead_letter_policy(*max, topic_opt.clone());
