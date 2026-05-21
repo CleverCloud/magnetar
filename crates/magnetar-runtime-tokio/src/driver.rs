@@ -26,7 +26,8 @@
 //!    cleanly;
 //! 3. otherwise reads [`magnetar_proto::SupervisorConfig`] off the state machine, builds a
 //!    [`magnetar_proto::Backoff`], and sleeps for the next backoff interval;
-//! 4. reconnects via [`crate::transport::Transport::connect`], calls
+//! 4. reconnects via [`crate::transport::Transport::connect_with_resolver`] (routing through the
+//!    optional `dns_resolver` carried on [`ReconnectContext`]), calls
 //!    [`magnetar_proto::Connection::reset`] (which fails every in-flight op with
 //!    [`magnetar_proto::OpOutcome::SessionLost`]), restarts the handshake, and resumes step 1.
 //!
@@ -49,6 +50,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 use crate::ConnectionShared;
+use crate::dns::DnsResolver;
 use crate::error::ClientError;
 use crate::transport::Transport;
 use crate::url_parse::ParsedUrl;
@@ -180,6 +182,11 @@ pub(crate) struct ReconnectContext {
     /// Optional PIP-121 provider polled on every reconnect attempt. When `None`, the cached
     /// `url` is reused (matches the pre-PIP-121 behaviour).
     pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+    /// Optional pluggable DNS resolver invoked on every reconnect attempt before dialling
+    /// the broker. When `None`, the runtime falls back to tokio's built-in
+    /// [`tokio::net::lookup_host`] via [`Transport::connect`]. Mirrors Java's
+    /// `ClientBuilder#dnsResolver`.
+    pub(crate) dns_resolver: Option<Arc<dyn DnsResolver>>,
 }
 
 impl std::fmt::Debug for ReconnectContext {
@@ -191,6 +198,7 @@ impl std::fmt::Debug for ReconnectContext {
                 "has_service_url_provider",
                 &self.service_url_provider.is_some(),
             )
+            .field("has_dns_resolver", &self.dns_resolver.is_some())
             .finish()
     }
 }
@@ -308,7 +316,14 @@ async fn supervised_driver_loop(
                     None => std::borrow::Cow::Borrowed(&reconnect_ctx.url),
                 };
 
-            match Transport::connect(&target_url, reconnect_ctx.tls_config.clone()).await {
+            let resolver = reconnect_ctx.dns_resolver.as_deref();
+            match Transport::connect_with_resolver(
+                &target_url,
+                reconnect_ctx.tls_config.clone(),
+                resolver,
+            )
+            .await
+            {
                 Ok(t) => break t,
                 Err(err) => {
                     let (host, port) = target_url.socket_addr();

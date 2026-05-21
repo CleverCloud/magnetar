@@ -1202,6 +1202,11 @@ impl ClientBuilder {
     /// Returns [`PulsarError::Config`] if the service URL is missing, or
     /// [`PulsarError::Client`] if the underlying tokio engine fails to
     /// connect.
+    // The function is a flat config-translation: tls flavour cases on top, then config field
+    // copies, then the connect-flavour dispatch. Inlined for readability — each branch is
+    // straight-line and the dispatch is easier to follow without an extracted helper that
+    // would have to forward every config field anyway.
+    #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Result<PulsarClient> {
         let service_url = match (&self.service_url_provider, &self.service_url) {
             (Some(provider), _) => provider.get_service_url(),
@@ -1248,6 +1253,11 @@ impl ClientBuilder {
         if let Some(data) = self.auth_data {
             config.auth_data = Some(data);
         }
+        // Java `ClientBuilder#dnsResolver` — when configured, every reconnect (including the
+        // initial dial) routes through `provider.resolve(host, port)` via
+        // `Client::connect_with_resolver_and_provider`. When unset, the runtime falls back to
+        // tokio's built-in `lookup_host` (and we can keep using the lighter `connect_auth`
+        // shortcut when none of TLS / provider / resolver is configured).
         let inner = if self.tls_allow_insecure_connection {
             let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
             let tls_config = match parsed.scheme {
@@ -1256,12 +1266,13 @@ impl ClientBuilder {
                 }
                 magnetar_runtime_tokio::Scheme::Plain => None,
             };
-            Client::connect_with_provider(
+            Client::connect_with_resolver_and_provider(
                 parsed,
                 tls_config,
                 config,
                 self.auth_provider,
                 self.service_url_provider,
+                self.dns_resolver,
             )
             .await?
         } else if let Some(pem) = self.tls_trust_certs_pem {
@@ -1278,18 +1289,19 @@ impl ClientBuilder {
                 }
                 magnetar_runtime_tokio::Scheme::Plain => None,
             };
-            Client::connect_with_provider(
+            Client::connect_with_resolver_and_provider(
                 parsed,
                 tls_config,
                 config,
                 self.auth_provider,
                 self.service_url_provider,
+                self.dns_resolver,
             )
             .await?
-        } else if self.service_url_provider.is_some() {
-            // Provider configured but no explicit TLS / PEM. Go through the provider-aware
-            // path so PIP-121 rotation works on reconnect — `connect_auth` doesn't accept the
-            // provider arg.
+        } else if self.service_url_provider.is_some() || self.dns_resolver.is_some() {
+            // Provider OR resolver configured but no explicit TLS / PEM. Go through the
+            // provider+resolver-aware path so PIP-121 rotation AND custom DNS work on
+            // reconnect — `connect_auth` doesn't accept either arg.
             let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
             let tls_config = match parsed.scheme {
                 magnetar_runtime_tokio::Scheme::Tls => {
@@ -1297,12 +1309,13 @@ impl ClientBuilder {
                 }
                 magnetar_runtime_tokio::Scheme::Plain => None,
             };
-            Client::connect_with_provider(
+            Client::connect_with_resolver_and_provider(
                 parsed,
                 tls_config,
                 config,
                 self.auth_provider,
                 self.service_url_provider,
+                self.dns_resolver,
             )
             .await?
         } else {

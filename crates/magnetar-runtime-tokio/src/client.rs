@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 
 use crate::ConnectionShared;
 use crate::consumer::Consumer;
+use crate::dns::DnsResolver;
 use crate::driver::{
     DriverHandle, ReconnectContext, spawn as spawn_driver,
     spawn_supervised as spawn_supervised_driver,
@@ -132,7 +133,34 @@ impl Client {
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
         service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     ) -> Result<Self, ClientError> {
-        let socket = Transport::connect(&url, tls_config.clone()).await?;
+        Self::connect_with_resolver_and_provider(
+            url,
+            tls_config,
+            config,
+            auth_provider,
+            service_url_provider,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`Self::connect_with_provider`] but also threads a pluggable DNS resolver
+    /// (Java `ClientBuilder#dnsResolver`) through to [`Transport::connect_with_resolver`].
+    /// When `dns_resolver` is `Some`, every initial and reconnect dial routes the
+    /// `(host, port)` lookup through `resolver.resolve(...)`; when `None`, the runtime
+    /// falls back to tokio's built-in [`tokio::net::lookup_host`] — identical to
+    /// [`Self::connect_with_provider`].
+    pub async fn connect_with_resolver_and_provider(
+        url: ParsedUrl,
+        tls_config: Option<Arc<rustls::ClientConfig>>,
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+        dns_resolver: Option<Arc<dyn DnsResolver>>,
+    ) -> Result<Self, ClientError> {
+        let socket =
+            Transport::connect_with_resolver(&url, tls_config.clone(), dns_resolver.as_deref())
+                .await?;
         Self::start_supervised_handshake(
             socket,
             url,
@@ -140,6 +168,7 @@ impl Client {
             config,
             auth_provider,
             service_url_provider,
+            dns_resolver,
         )
         .await
     }
@@ -193,6 +222,7 @@ impl Client {
         config: ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
         service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+        dns_resolver: Option<Arc<dyn DnsResolver>>,
     ) -> Result<Self, ClientError> {
         let shared = ConnectionShared::with_auth(config, auth_provider);
 
@@ -203,6 +233,7 @@ impl Client {
             url,
             tls_config,
             service_url_provider,
+            dns_resolver,
         };
         let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
 

@@ -594,7 +594,7 @@ known-missing feature.
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
 | `memoryLimit` | ✅ | ✅ | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` enforced at runtime via `AtomicU64` CAS reservation in `Producer::send` (Java's `FailImmediately` semantics). `ProducerBlock` (block until budget frees) is the planned follow-up. |
-| `dnsResolver` customisation | ✅ | 🟡 | `ClientBuilder::dns_resolver(Arc<dyn DnsResolver>)` trait + `TokioDnsResolver` default impl shipped; routing through `Transport::connect` is the planned follow-up (same pattern ServiceUrlProvider followed). |
+| `dnsResolver` customisation | ✅ | ✅ | `ClientBuilder::dns_resolver(Arc<dyn DnsResolver>)` — when set, `Transport::connect_with_resolver` calls `resolver.resolve(host, port)` and dials the returned `SocketAddr` candidates in order on every initial and reconnect attempt; when unset, the runtime falls back to tokio's built-in `lookup_host` via `TokioDnsResolver`. The TLS server-name keeps coming from the URL host so SNI / hostname verification stay correct when the resolver pins a specific IP. |
 | `isClosed` / `shutdown` / `getLastDisconnectedTimestamp` | ✅ | ✅ | All exposed on `PulsarClient`. |
 | Cluster failover (PIP-121) | ✅ | ✅ | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ControlledClusterFailover` (in `magnetar-proto`) + `AutoClusterFailover` (in `magnetar-runtime-tokio`, with user-supplied `HealthProbe` callback + background tokio task). All three plug into `ClientBuilder::service_url_provider`. |
 
