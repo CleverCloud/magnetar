@@ -269,6 +269,106 @@ pub async fn send_with_interceptors(
     mapped
 }
 
+/// Java `ConsumerInterceptor` SPI. Plug receive-side hooks behind `Consumer::receive`
+/// to inspect / mutate incoming messages and observe ack outcomes. Mirrors
+/// `org.apache.pulsar.client.api.interceptor.ConsumerInterceptor`:
+/// - `before_consume` runs on every received message and may mutate it.
+/// - `on_acknowledge` fires on every individual / batch ack.
+/// - `on_acknowledge_cumulative` fires on every cumulative ack.
+/// - `on_negative_acks_send` fires when the runtime forwards a redeliver-unacknowledged command
+///   (negative ack with delay or immediate).
+///
+/// Each callback runs on the receive / ack path — keep them fast and non-blocking. Use
+/// [`receive_with_interceptors`] to chain a list against a [`magnetar_runtime_tokio::Consumer`].
+pub trait ConsumerInterceptor: Send + Sync + std::fmt::Debug {
+    /// Inspect and optionally mutate the incoming message before it is handed back to
+    /// the user. Mirrors Java `ConsumerInterceptor#beforeConsume`.
+    fn before_consume(&self, msg: &mut IncomingMessage);
+
+    /// Fired after an individual or batch ack completes (success or error). Mirrors Java
+    /// `ConsumerInterceptor#onAcknowledge`.
+    fn on_acknowledge(
+        &self,
+        _message_id: magnetar_proto::MessageId,
+        _outcome: Result<(), &PulsarError>,
+    ) {
+    }
+
+    /// Fired after a cumulative ack completes. Mirrors Java
+    /// `ConsumerInterceptor#onAcknowledgeCumulative`.
+    fn on_acknowledge_cumulative(
+        &self,
+        _message_id: magnetar_proto::MessageId,
+        _outcome: Result<(), &PulsarError>,
+    ) {
+    }
+
+    /// Fired when the runtime forwards a `CommandRedeliverUnacknowledgedMessages` for one
+    /// or more message ids. Mirrors Java `ConsumerInterceptor#onNegativeAcksSend`.
+    fn on_negative_acks_send(&self, _message_ids: &[magnetar_proto::MessageId]) {}
+}
+
+/// Receive the next message via `consumer`, running every [`ConsumerInterceptor`] in
+/// `interceptors` against the payload before it is returned. Mirrors Java's interceptor
+/// chain on the receive path — every interceptor's `before_consume` runs in order on a
+/// single progressively-mutated message.
+///
+/// # Errors
+///
+/// Propagates the underlying receive error wrapped in [`PulsarError::Client`].
+pub async fn receive_with_interceptors(
+    consumer: &magnetar_runtime_tokio::Consumer,
+    interceptors: &[std::sync::Arc<dyn ConsumerInterceptor>],
+) -> Result<IncomingMessage, PulsarError> {
+    let raw = consumer.receive().await.map_err(PulsarError::Client)?;
+    let mut msg: IncomingMessage = raw.into();
+    for i in interceptors {
+        i.before_consume(&mut msg);
+    }
+    Ok(msg)
+}
+
+/// Ack via `consumer` and notify every interceptor of the outcome. Mirrors Java's
+/// post-ack callback chain. Returns whatever the runtime ack returned, mapped into a
+/// [`PulsarError`].
+pub async fn ack_with_interceptors(
+    consumer: &magnetar_runtime_tokio::Consumer,
+    message_id: magnetar_proto::MessageId,
+    interceptors: &[std::sync::Arc<dyn ConsumerInterceptor>],
+) -> Result<(), PulsarError> {
+    let result: Result<(), PulsarError> =
+        consumer.ack(message_id).await.map_err(PulsarError::Client);
+    for i in interceptors {
+        let outcome: Result<(), &PulsarError> = match &result {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err),
+        };
+        i.on_acknowledge(message_id, outcome);
+    }
+    result
+}
+
+/// Cumulative ack variant of [`ack_with_interceptors`]. Notifies via
+/// `on_acknowledge_cumulative` instead of `on_acknowledge`.
+pub async fn ack_cumulative_with_interceptors(
+    consumer: &magnetar_runtime_tokio::Consumer,
+    message_id: magnetar_proto::MessageId,
+    interceptors: &[std::sync::Arc<dyn ConsumerInterceptor>],
+) -> Result<(), PulsarError> {
+    let result: Result<(), PulsarError> = consumer
+        .ack_cumulative(message_id)
+        .await
+        .map_err(PulsarError::Client);
+    for i in interceptors {
+        let outcome: Result<(), &PulsarError> = match &result {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err),
+        };
+        i.on_acknowledge_cumulative(message_id, outcome);
+    }
+    result
+}
+
 /// Extension trait that gives [`magnetar_runtime_tokio::Producer`] the Java-symmetric
 /// `producer.new_message().key(..).value(..).send().await` entry point.
 ///
@@ -1797,5 +1897,24 @@ mod outgoing_message_tests {
         assert_eq!(msg.properties[0].0, "trace-id");
         assert_eq!(msg.properties[0].1, "abc");
         assert_eq!(i.applied.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct StampSeenInterceptor {
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConsumerInterceptor for StampSeenInterceptor {
+        fn before_consume(&self, _msg: &mut IncomingMessage) {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn consumer_interceptor_before_consume_runs_on_messages() {
+        let i = StampSeenInterceptor::default();
+        let mut msg = message_with(pb::MessageMetadata::default());
+        i.before_consume(&mut msg);
+        assert_eq!(i.seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
