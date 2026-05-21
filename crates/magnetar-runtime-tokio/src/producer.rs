@@ -38,6 +38,15 @@ impl Producer {
         self.handle
     }
 
+    /// `true` if this producer has been closed (locally via [`Self::close`] or remotely
+    /// via a broker `CloseProducer`). Mirrors Java `ProducerImpl#getState() == CLOSED`.
+    /// Use [`Self::is_connected`] for the live test — `is_closed` only flips after a
+    /// terminal close, not on transient disconnects.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared.inner.lock().producer_is_closed(self.handle)
+    }
+
     /// Last sequence id this client has pushed onto the wire. Returns `-1` if the producer
     /// has never sent. Mirrors `org.apache.pulsar.client.api.Producer#getLastSequenceId`.
     pub fn last_sequence_id(&self) -> i64 {

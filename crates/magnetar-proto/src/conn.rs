@@ -1579,6 +1579,25 @@ impl Connection {
         self.consumers.get(&handle).map(ConsumerState::stats)
     }
 
+    /// `true` if the producer with this handle has been closed (locally via
+    /// [`Self::close_producer`] or remotely via a broker `CloseProducer`). Returns `true`
+    /// for unknown handles so callers can treat "handle dropped" as "closed". Mirrors Java
+    /// `Producer#isConnected` inversion — Pulsar Java has no direct `isClosed` on
+    /// Producer, but ProducerImpl exposes `getState() == CLOSED` for this exact purpose.
+    #[must_use]
+    pub fn producer_is_closed(&self, handle: ProducerHandle) -> bool {
+        self.producers.get(&handle).is_none_or(|p| p.closed)
+    }
+
+    /// `true` if the consumer with this handle has been closed (locally via
+    /// [`Self::close_consumer`] / [`Self::unsubscribe`] or remotely via a broker
+    /// `CloseConsumer`). Returns `true` for unknown handles. Mirrors Java
+    /// `Consumer#isClosed` semantics via ConsumerImpl's `getState() == CLOSED`.
+    #[must_use]
+    pub fn consumer_is_closed(&self, handle: ConsumerHandle) -> bool {
+        self.consumers.get(&handle).is_none_or(|c| c.closed)
+    }
+
     fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.

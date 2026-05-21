@@ -36,6 +36,15 @@ impl Consumer {
         self.handle
     }
 
+    /// `true` if this consumer has been closed (locally via [`Self::close`] /
+    /// [`Self::unsubscribe`] or remotely via a broker `CloseConsumer`). Mirrors Java
+    /// `ConsumerImpl#getState() == CLOSED`. Use [`Self::is_connected`] for the live test
+    /// — `is_closed` only flips after a terminal close, not on transient disconnects.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.shared.inner.lock().consumer_is_closed(self.handle)
+    }
+
     /// Receive the next message, bounded by `timeout`. Returns `Ok(None)` if the deadline
     /// elapses with no message. Mirrors Java `Consumer#receive(int timeout, TimeUnit unit)`.
     pub async fn receive_with_timeout(
