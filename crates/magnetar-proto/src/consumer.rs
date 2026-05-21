@@ -42,6 +42,10 @@ pub struct ConsumerState {
     pub topic: String,
     /// Subscription name.
     pub subscription: String,
+    /// Caller-supplied consumer name advertised on `CommandSubscribe.consumer_name`.
+    /// `None` means the broker is free to assign one. Mirrors Java
+    /// `Consumer#getConsumerName`.
+    pub consumer_name: Option<String>,
     /// Max receiver queue size — the consumer asks the broker for permits in batches of
     /// `receiver_queue_size / 2` once half of the queue has been consumed.
     pub receiver_queue_size: usize,
@@ -150,6 +154,7 @@ impl ConsumerState {
             handle,
             topic,
             subscription,
+            consumer_name: None,
             receiver_queue_size,
             available_permits: 0,
             consumed_since_flow: 0,

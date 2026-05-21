@@ -391,6 +391,18 @@ impl Consumer {
             .to_owned()
     }
 
+    /// Caller-supplied consumer name. Empty string if no name was supplied at subscribe
+    /// time, or if the consumer is no longer registered. Mirrors Java
+    /// `Consumer#getConsumerName`.
+    pub fn name(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .consumer_name(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
+
     /// Drain every message the state machine has flagged as dead-letter (redelivery count
     /// greater than the configured `max_redeliver_count`). The caller is responsible for
     /// republishing them to the configured DLQ topic. Returns an empty `Vec` when DLQ

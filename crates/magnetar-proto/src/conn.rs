@@ -1367,6 +1367,7 @@ impl Connection {
             req.receiver_queue_size,
         );
         state.max_redeliver_count = req.max_redeliver_count;
+        state.consumer_name = req.consumer_name.clone();
         if let Some(delay) = req.negative_ack_redelivery_delay {
             state.nack_tracker = Some(crate::trackers::NegativeAcksTracker::new(handle, delay));
         }
@@ -1650,6 +1651,15 @@ impl Connection {
     #[must_use]
     pub fn consumer_subscription(&self, handle: ConsumerHandle) -> Option<&str> {
         self.consumers.get(&handle).map(|c| c.subscription.as_str())
+    }
+
+    /// Caller-supplied consumer name advertised at subscribe time. Returns `None` if the
+    /// consumer handle is unknown or no name was supplied.
+    #[must_use]
+    pub fn consumer_name(&self, handle: ConsumerHandle) -> Option<&str> {
+        self.consumers
+            .get(&handle)
+            .and_then(|c| c.consumer_name.as_deref())
     }
 
     /// Topic name this producer is bound to. Returns `None` if the producer handle is
