@@ -70,6 +70,10 @@ pub struct ConsumerState {
     /// stops emitting flow commands so the broker stops dispatching new messages. Already
     /// buffered messages can still be popped via [`Self::pop_message`].
     pub paused: bool,
+    /// Set to `true` when the broker sends `CommandReachedEndOfTopic` for this consumer,
+    /// indicating no more messages will ever be dispatched. Mirrors Java
+    /// `Consumer#hasReachedEndOfTopic`.
+    pub reached_end_of_topic: bool,
     /// Cumulative count of logical messages delivered to the user-facing queue. Mirrors
     /// Java `ConsumerStats#getTotalMsgsReceived`.
     pub total_msgs_received: u64,
@@ -157,6 +161,7 @@ impl ConsumerState {
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
             paused: false,
+            reached_end_of_topic: false,
             total_msgs_received: 0,
             total_bytes_received: 0,
             total_acks_sent: 0,

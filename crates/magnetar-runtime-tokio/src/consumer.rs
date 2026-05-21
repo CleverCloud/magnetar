@@ -360,6 +360,16 @@ impl Consumer {
             .unwrap_or(false)
     }
 
+    /// Returns `true` once the broker has indicated end-of-topic for this consumer (no
+    /// further messages will be dispatched). Mirrors Java
+    /// `Consumer#hasReachedEndOfTopic`.
+    pub fn has_reached_end_of_topic(&self) -> bool {
+        self.shared
+            .inner
+            .lock()
+            .consumer_reached_end_of_topic(self.handle)
+    }
+
     /// Topic name this consumer is bound to. Returns an empty string if the consumer is
     /// no longer registered (closed).
     pub fn topic(&self) -> String {

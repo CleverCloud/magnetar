@@ -986,6 +986,12 @@ impl Connection {
                         "missing CommandReachedEndOfTopic",
                     ))?;
                 let handle = ConsumerHandle(rc.consumer_id);
+                if let Some(consumer) = self.consumers.get_mut(&handle) {
+                    consumer.reached_end_of_topic = true;
+                    if let Some(w) = consumer.receive_waker.take() {
+                        w.wake();
+                    }
+                }
                 self.events
                     .push_back(ConnectionEvent::ReachedEndOfTopic { handle });
             }
@@ -1621,6 +1627,16 @@ impl Connection {
     #[must_use]
     pub fn is_paused(&self, handle: ConsumerHandle) -> Option<bool> {
         self.consumers.get(&handle).map(|c| c.paused)
+    }
+
+    /// Returns `true` once the broker has sent `CommandReachedEndOfTopic` for this
+    /// consumer. Mirrors Java `Consumer#hasReachedEndOfTopic`.
+    #[must_use]
+    pub fn consumer_reached_end_of_topic(&self, handle: ConsumerHandle) -> bool {
+        self.consumers
+            .get(&handle)
+            .map(|c| c.reached_end_of_topic)
+            .unwrap_or(false)
     }
 
     /// Topic name this consumer is bound to. Returns `None` if the consumer handle is
