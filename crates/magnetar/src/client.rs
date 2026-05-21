@@ -752,6 +752,15 @@ impl PulsarClient {
         crate::MultiTopicsConsumerBuilder::new(self)
     }
 
+    /// Open a [`crate::PatternConsumerBuilder`] that subscribes to every topic in a namespace
+    /// matching a broker-side regex pattern (PIP-145). Reconciles against `TopicListChanged`
+    /// deltas on demand via [`crate::PatternConsumer::update`]. Mirrors Java's
+    /// `PulsarClient#newConsumer().topicsPattern(...)`.
+    #[must_use]
+    pub fn pattern_consumer(&self) -> crate::PatternConsumerBuilder<'_> {
+        crate::PatternConsumerBuilder::new(self)
+    }
+
     /// Open a [`crate::PartitionedProducerBuilder`] for the given topic. The builder queries
     /// the broker for the partition count and opens one child producer per partition.
     /// Mirrors Java's `PulsarClient#newProducer()` against a partitioned topic.

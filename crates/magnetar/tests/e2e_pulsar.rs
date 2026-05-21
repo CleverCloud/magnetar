@@ -173,6 +173,62 @@ async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Err
 
 #[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_pattern_consumer_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    // Pre-publish a sentinel to two topics that share a prefix so the pattern matches.
+    let topic_a = "persistent://public/default/magnetar-e2e-pattern-aa";
+    let topic_b = "persistent://public/default/magnetar-e2e-pattern-bb";
+    let unrelated = "persistent://public/default/magnetar-e2e-other-cc";
+    for topic in [topic_a, topic_b, unrelated] {
+        let producer = client.producer(topic).create().await?;
+        producer
+            .send(OutgoingMessage::with_payload(topic.as_bytes().to_vec()).into())
+            .await?;
+        producer.close().await?;
+    }
+
+    // Subscribe via the regex pattern. The broker filters server-side, so we trust the snapshot.
+    let pattern = client
+        .pattern_consumer()
+        .namespace("public/default")
+        .pattern("persistent://public/default/magnetar-e2e-pattern-.*")
+        .subscription("magnetar-e2e-pattern")
+        .subscribe()
+        .await?;
+
+    let mut topics = pattern.topics();
+    topics.sort();
+    let mut expected = vec![topic_a.to_owned(), topic_b.to_owned()];
+    expected.sort();
+    assert_eq!(
+        topics, expected,
+        "pattern snapshot must match both prefix topics only"
+    );
+
+    // Drain one message from each subscribed topic — the pre-published sentinels.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(10), pattern.receive()).await??;
+        seen.insert(msg.topic.clone());
+        pattern.ack(&msg.topic, msg.message.message_id).await?;
+    }
+    pattern.close().await?;
+    client.close().await;
+
+    let mut got: Vec<String> = seen.into_iter().collect();
+    got.sort();
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+#[ignore = "e2e: requires Docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_key_shared_dispatch() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
 

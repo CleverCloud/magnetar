@@ -66,6 +66,8 @@ mod partitioned_consumer;
 #[cfg(feature = "tokio")]
 mod partitioned_producer;
 #[cfg(feature = "tokio")]
+mod pattern_consumer;
+#[cfg(feature = "tokio")]
 mod table_view;
 #[cfg(feature = "tokio")]
 mod transaction;
@@ -86,6 +88,10 @@ pub use partitioned_consumer::{PartitionedConsumer, PartitionedConsumerBuilder};
 pub use partitioned_producer::{
     MessageRouter, MessageRoutingMode, PartitionedMessageBuilder, PartitionedProducer,
     PartitionedProducerBuilder,
+};
+#[cfg(feature = "tokio")]
+pub use pattern_consumer::{
+    PatternConsumer, PatternConsumerBuilder, PatternMessage, ReconcileReport,
 };
 #[cfg(feature = "tokio")]
 pub use table_view::{
