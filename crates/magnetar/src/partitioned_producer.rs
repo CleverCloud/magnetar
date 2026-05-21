@@ -10,12 +10,16 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use magnetar_proto::types::CompressionKind;
 use magnetar_proto::{CreateProducerRequest, MessageId, pb};
 use magnetar_runtime_tokio::Producer;
 use parking_lot::Mutex;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::PulsarClient;
 use crate::client::{OutgoingMessage, PulsarError};
@@ -269,6 +273,133 @@ pub struct PartitionedProducer {
     /// every send.
     router: Option<std::sync::Arc<dyn MessageRouter>>,
     cursor: Mutex<u64>,
+    /// Optional background partition-watcher task. `Some` when the builder configured
+    /// [`PartitionedProducerBuilder::auto_update_partitions_interval`], `None`
+    /// otherwise (default). The task is a pure timer that signals
+    /// [`Self::partitions_changed_notify`] every interval; the actual
+    /// `partitions_for_topic` call is driven by user code via
+    /// [`Self::refresh_partitions`]. Dropping the [`PartitionedProducer`] aborts the
+    /// task.
+    auto_update: Option<Arc<AutoUpdateTask>>,
+}
+
+/// Background partition-watcher (Java parity:
+/// `ProducerBuilder#autoUpdatePartitionsInterval`).
+///
+/// Spawned by [`PartitionedProducerBuilder::create`] when the builder records a
+/// non-zero interval via
+/// [`PartitionedProducerBuilder::auto_update_partitions_interval`]. The spawned task
+/// is a pure timer that signals [`Self::changed`] every `interval`; the actual
+/// `PulsarClient::partitions_for_topic` call is driven by user code via
+/// [`PartitionedProducer::refresh_partitions`] (the crate-wide
+/// `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into a
+/// `'static` spawn).
+///
+/// Lifetime is bounded by the [`PartitionedProducer`]: dropping the producer drops
+/// the `Arc<AutoUpdateTask>`, which aborts the spawned tokio task in [`Drop`]. No
+/// channels — coordination is `Arc<Mutex<...>>` + [`tokio::sync::Notify`] +
+/// [`tokio::time::interval`] (per the project's "no channels in Rust async code"
+/// policy).
+#[derive(Debug)]
+struct AutoUpdateTask {
+    /// Base topic the producer was created against. Reused by
+    /// [`PartitionedProducer::refresh_partitions`] so callers don't have to remember
+    /// it.
+    topic: String,
+    /// Last partition count observed by the watcher. Seeded with the count discovered
+    /// at create time. Updated by [`PartitionedProducer::refresh_partitions`] when
+    /// called.
+    observed_partitions: Arc<Mutex<u32>>,
+    /// Monotonic counter of "partition count changed" events. Useful for tests and
+    /// "did anything change since I last looked?" probes. Bumped by
+    /// [`PartitionedProducer::refresh_partitions`] when a different count is observed.
+    change_count: Arc<Mutex<u64>>,
+    /// Signalled every time the internal timer fires, and every time
+    /// [`PartitionedProducer::refresh_partitions`] detects a real partition-count
+    /// change.
+    changed: Arc<Notify>,
+    /// Signalled on drop to cooperatively wake the loop sleeping on [`Notify`] so it
+    /// can notice it has been aborted promptly. The `handle.abort()` is the source of
+    /// truth; the notify is only there to short-circuit a long `tick().await`.
+    shutdown: Arc<Notify>,
+    /// The spawned task. Held in a [`tokio::sync::Mutex`] so [`Drop`] can take it on
+    /// the best-effort path without blocking.
+    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for AutoUpdateTask {
+    fn drop(&mut self) {
+        // Best-effort wake of the loop, then abort. If the lock is contended the abort
+        // still happens once `Mutex<Option<JoinHandle>>` is dropped via the inner Option,
+        // but the JoinHandle's own `Drop` does not abort by itself — only the explicit
+        // `abort()` here does — so this `try_lock` matters for prompt teardown.
+        self.shutdown.notify_waiters();
+        if let Ok(mut g) = self.handle.try_lock()
+            && let Some(h) = g.take()
+        {
+            h.abort();
+        }
+    }
+}
+
+/// Spawn the partition-watcher *timer* task.
+///
+/// The task is intentionally minimal: it ticks every `interval` and signals the
+/// `Notify` returned via [`PartitionedProducer::partitions_changed_notify`]. It does
+/// **not** itself call into the [`PulsarClient`] — that requires a `'static` clone of
+/// the client which the current `PulsarClient` API does not yet expose, and going via
+/// `unsafe` would break the crate-wide `#![forbid(unsafe_code)]` invariant.
+///
+/// Callers wire the timer to an actual partition refresh by spawning a small loop:
+///
+/// ```ignore
+/// let tick = producer.partitions_changed_notify().unwrap();
+/// loop {
+///     tick.notified().await;
+///     producer.refresh_partitions(&client).await?;
+/// }
+/// ```
+///
+/// or by calling [`PartitionedProducer::refresh_partitions`] directly on every tick.
+///
+/// The `Arc<AutoUpdateTask>` returned wraps a [`Drop`] that aborts the spawned task,
+/// so the timer is bounded by the [`PartitionedProducer`]'s lifetime.
+fn spawn_auto_update_task(
+    topic: String,
+    interval: Duration,
+    initial_partitions: u32,
+) -> Arc<AutoUpdateTask> {
+    let observed_partitions = Arc::new(Mutex::new(initial_partitions));
+    let change_count = Arc::new(Mutex::new(0u64));
+    let changed = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+
+    let changed_task = changed.clone();
+    let shutdown_task = shutdown.clone();
+
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate tick so the first real signal happens after one interval.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown_task.notified() => break,
+                _ = ticker.tick() => {}
+            }
+            changed_task.notify_waiters();
+        }
+    });
+
+    Arc::new(AutoUpdateTask {
+        topic,
+        observed_partitions,
+        change_count,
+        changed,
+        shutdown,
+        handle: tokio::sync::Mutex::new(Some(handle)),
+    })
 }
 
 impl PartitionedProducer {
@@ -477,6 +608,90 @@ impl PartitionedProducer {
             .map(magnetar_runtime_tokio::Producer::batch_bytes)
             .sum()
     }
+
+    /// Returns `true` if a background partition-watcher was spawned for this
+    /// producer (i.e.
+    /// [`PartitionedProducerBuilder::auto_update_partitions_interval`] was set on
+    /// the builder). Defaults to `false` — current Java-parity behaviour when the
+    /// user did not opt in.
+    #[must_use]
+    pub fn has_auto_update_partitions(&self) -> bool {
+        self.auto_update.is_some()
+    }
+
+    /// Most recent partition count observed by the background partition watcher.
+    /// `None` when
+    /// [`PartitionedProducerBuilder::auto_update_partitions_interval`] was not set
+    /// (no watcher spawned). Mirrors the read side of Java's
+    /// `ProducerBuilder#autoUpdatePartitionsInterval` behaviour — Java rebuilds
+    /// internally; we expose the observation so callers can react.
+    #[must_use]
+    pub fn observed_partitions(&self) -> Option<u32> {
+        self.auto_update
+            .as_ref()
+            .map(|t| *t.observed_partitions.lock())
+    }
+
+    /// Monotonic count of partition-change events observed by the background
+    /// watcher. Returns `None` when no watcher was configured. The counter starts
+    /// at `0` and is bumped every time [`Self::refresh_partitions`] detects a
+    /// different partition count than the previous observation.
+    #[must_use]
+    pub fn partition_change_count(&self) -> Option<u64> {
+        self.auto_update.as_ref().map(|t| *t.change_count.lock())
+    }
+
+    /// `Arc<Notify>` signalled by the background partition-watcher on every timer
+    /// tick (i.e. every `auto_update_partitions_interval`) and on every observed
+    /// partition-count change driven by [`Self::refresh_partitions`]. Returns
+    /// `None` when no watcher was configured. Callers may `await` `notified()` on
+    /// the returned handle to react to ticks without polling
+    /// [`Self::partition_change_count`].
+    #[must_use]
+    pub fn partitions_changed_notify(&self) -> Option<Arc<Notify>> {
+        self.auto_update.as_ref().map(|t| t.changed.clone())
+    }
+
+    /// Query the broker for the current partition count of the topic this producer
+    /// was opened against, and update [`Self::observed_partitions`] /
+    /// [`Self::partition_change_count`] in place if the count differs from the
+    /// last observation.
+    ///
+    /// This is the user-driven half of the
+    /// [`PartitionedProducerBuilder::auto_update_partitions_interval`] machinery:
+    /// the timer task signals [`Self::partitions_changed_notify`]; the user calls
+    /// this method in response (or independently) to actually refresh the count.
+    /// Returns the freshly-observed count on success, or `Ok(None)` if no watcher
+    /// was configured (no topic recorded). Errors are surfaced via [`PulsarError`].
+    ///
+    /// **Note**: this method only updates the observed count. It does *not* itself
+    /// add new child producers to match a grown partition count — that is a
+    /// follow-up. Callers that need to expand the producer set can detect the
+    /// change via [`Self::observed_partitions`] / [`Self::partitions`] divergence
+    /// and rebuild the producer.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`PulsarError::Client`] when the broker metadata lookup fails.
+    pub async fn refresh_partitions(
+        &self,
+        client: &PulsarClient,
+    ) -> Result<Option<u32>, PulsarError> {
+        let Some(task) = self.auto_update.as_ref() else {
+            return Ok(None);
+        };
+        let count = client.partitions_for_topic(&task.topic).await?;
+        let mut observed = task.observed_partitions.lock();
+        if *observed != count {
+            *observed = count;
+            drop(observed);
+            let mut cnt = task.change_count.lock();
+            *cnt = cnt.saturating_add(1);
+            drop(cnt);
+            task.changed.notify_waiters();
+        }
+        Ok(Some(count))
+    }
 }
 
 /// Builder for [`PartitionedProducer`]. Mirrors Java's `ProducerBuilder` at the partitioned
@@ -499,6 +714,7 @@ pub struct PartitionedProducerBuilder<'a> {
     schema: Option<pb::Schema>,
     encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
     router: Option<std::sync::Arc<dyn MessageRouter>>,
+    auto_update_partitions_interval: Option<Duration>,
 }
 
 impl std::fmt::Debug for PartitionedProducerBuilder<'_> {
@@ -531,6 +747,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
             schema: None,
             encryptor: None,
             router: None,
+            auto_update_partitions_interval: None,
         }
     }
 
@@ -639,6 +856,34 @@ impl<'a> PartitionedProducerBuilder<'a> {
         self
     }
 
+    /// Enable a background timer that signals every `interval`, intended to drive
+    /// re-checks of the topic's partition count. Mirrors Java
+    /// `ProducerBuilder#autoUpdatePartitionsInterval`.
+    ///
+    /// The internal timer task signals
+    /// [`PartitionedProducer::partitions_changed_notify`] on every tick. Callers
+    /// run [`PartitionedProducer::refresh_partitions`] in response to the signal
+    /// (or on their own cadence) to actually call
+    /// [`PulsarClient::partitions_for_topic`] — the timer itself is decoupled from
+    /// the client so the watcher stays compatible with the crate-wide
+    /// `#![forbid(unsafe_code)]` invariant.
+    ///
+    /// Default `None` — no timer is spawned and a [`PartitionedProducer`] over a
+    /// partitioned topic will not notice partitions added after construction. Pass
+    /// a non-zero `Duration` to opt in. The timer is aborted when the
+    /// [`PartitionedProducer`] is dropped.
+    ///
+    /// Setting a zero `interval` is treated as "disable" — same as the default.
+    #[must_use]
+    pub fn auto_update_partitions_interval(mut self, interval: Duration) -> Self {
+        self.auto_update_partitions_interval = if interval.is_zero() {
+            None
+        } else {
+            Some(interval)
+        };
+        self
+    }
+
     /// Query partition count, then open one producer per partition. If the broker reports
     /// `0` partitions, fall back to a single producer on the original topic.
     pub async fn create(self) -> Result<PartitionedProducer, PulsarError> {
@@ -689,14 +934,31 @@ impl<'a> PartitionedProducerBuilder<'a> {
             }
         }
 
+        // Spawn the partition-watcher timer iff the builder configured a non-zero
+        // interval. The timer itself only emits ticks via `Notify`; callers drive the
+        // actual `partitions_for_topic` call via
+        // [`PartitionedProducer::refresh_partitions`] (the crate-wide
+        // `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into
+        // a `'static` spawn).
+        let auto_update = self
+            .auto_update_partitions_interval
+            .map(|interval| spawn_auto_update_task(self.topic.clone(), interval, partitions_count));
+
         Ok(PartitionedProducer {
             partitions: child_producers,
             base_topic: self.topic,
             routing: self.routing,
             router: self.router,
             cursor: Mutex::new(0),
+            auto_update,
         })
     }
+}
+
+// helper to avoid unused-import warning if Bytes isn't needed here
+#[allow(dead_code)]
+fn _bytes_in_use() -> Bytes {
+    Bytes::new()
 }
 
 #[cfg(test)]
@@ -711,6 +973,7 @@ mod tests {
             routing: MessageRoutingMode::KeyHashOrRoundRobin,
             router: None,
             cursor: Mutex::new(0),
+            auto_update: None,
         };
         // We can't actually run pick_partition with 0 partitions; emulate by injecting a
         // fake stub: route fn is pure given the routing mode + cursor state.

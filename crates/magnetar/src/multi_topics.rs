@@ -22,12 +22,15 @@
 //! [`crate::PatternConsumer`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
 use magnetar_runtime_tokio::Consumer;
 use parking_lot::Mutex;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::PulsarClient;
 use crate::client::{PulsarError, SeekTarget};
@@ -54,6 +57,104 @@ struct Inner {
     /// [`crate::ConsumerBuilder`] knob the user set on the original
     /// [`MultiTopicsConsumerBuilder`].
     template: ConsumerTemplate,
+    /// Optional background partition-watcher task. `Some` when the builder
+    /// configured
+    /// [`MultiTopicsConsumerBuilder::auto_update_partitions_interval`], `None`
+    /// otherwise (default). Tracks one watched topic — the "base" topic used by a
+    /// [`crate::PartitionedConsumer`] (the underlying surface). Aborts on drop.
+    auto_update: Option<Arc<AutoUpdateTask>>,
+}
+
+/// Background partition-watcher (Java parity:
+/// `ConsumerBuilder#autoUpdatePartitionsInterval`).
+///
+/// Spawned by [`MultiTopicsConsumerBuilder::subscribe`] /
+/// [`crate::PartitionedConsumerBuilder::subscribe`] when the builder records a
+/// non-zero interval via
+/// [`MultiTopicsConsumerBuilder::auto_update_partitions_interval`]. The spawned task
+/// is a pure timer that signals [`Self::changed`] every `interval`; the actual
+/// `PulsarClient::partitions_for_topic` call is driven by user code via
+/// [`MultiTopicsConsumer::refresh_partitions`] (the crate-wide
+/// `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into a
+/// `'static` spawn).
+///
+/// Lifetime is bounded by the [`MultiTopicsConsumer`]: dropping every clone of the
+/// consumer drops the `Arc<Inner>`, which drops the `Arc<AutoUpdateTask>`, which
+/// aborts the spawned tokio task in [`Drop`]. No channels — coordination is
+/// `Arc<Mutex<...>>` + [`tokio::sync::Notify`] + [`tokio::time::interval`] (per the
+/// project's "no channels in Rust async code" policy).
+#[derive(Debug)]
+struct AutoUpdateTask {
+    /// Topic the watcher polls — typically the base topic the
+    /// [`crate::PartitionedConsumer`] was built against (without the
+    /// `-partition-N` suffix).
+    topic: String,
+    /// Last partition count observed by the watcher.
+    observed_partitions: Arc<Mutex<u32>>,
+    /// Monotonic counter of "partition count changed" events. Useful for tests and
+    /// "did anything change since I last looked?" probes.
+    change_count: Arc<Mutex<u64>>,
+    /// Signalled every time the internal timer fires, and every time
+    /// [`MultiTopicsConsumer::refresh_partitions`] detects a real partition-count
+    /// change.
+    changed: Arc<Notify>,
+    /// Signalled on drop to cooperatively wake the loop sleeping on [`Notify`] so it
+    /// can notice it has been aborted promptly.
+    shutdown: Arc<Notify>,
+    /// The spawned task. Held in a [`tokio::sync::Mutex`] so [`Drop`] can take it on
+    /// the best-effort path without blocking.
+    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for AutoUpdateTask {
+    fn drop(&mut self) {
+        self.shutdown.notify_waiters();
+        if let Ok(mut g) = self.handle.try_lock()
+            && let Some(h) = g.take()
+        {
+            h.abort();
+        }
+    }
+}
+
+/// Spawn the partition-watcher *timer* task. See the doc on
+/// [`crate::partitioned_producer::spawn_auto_update_task`] for the shape — same
+/// pattern.
+fn spawn_auto_update_task(
+    topic: String,
+    interval: Duration,
+    initial_partitions: u32,
+) -> Arc<AutoUpdateTask> {
+    let observed_partitions = Arc::new(Mutex::new(initial_partitions));
+    let change_count = Arc::new(Mutex::new(0u64));
+    let changed = Arc::new(Notify::new());
+    let shutdown = Arc::new(Notify::new());
+
+    let changed_task = changed.clone();
+    let shutdown_task = shutdown.clone();
+
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown_task.notified() => break,
+                _ = ticker.tick() => {}
+            }
+            changed_task.notify_waiters();
+        }
+    });
+
+    Arc::new(AutoUpdateTask {
+        topic,
+        observed_partitions,
+        change_count,
+        changed,
+        shutdown,
+        handle: tokio::sync::Mutex::new(Some(handle)),
+    })
 }
 
 /// Frozen [`crate::ConsumerBuilder`] template propagated to every per-topic child. Stored
@@ -664,6 +765,87 @@ impl MultiTopicsConsumer {
             .map(|c| c.consumer.clone())
             .ok_or_else(|| format!("unknown topic {topic} on multi-consumer"))
     }
+
+    /// Returns `true` if a background partition-watcher was spawned for this
+    /// consumer (i.e.
+    /// [`MultiTopicsConsumerBuilder::auto_update_partitions_interval`] was set on
+    /// the builder, or the surface was opened as a
+    /// [`crate::PartitionedConsumer`] with
+    /// [`crate::PartitionedConsumerBuilder::auto_update_partitions_interval`]).
+    #[must_use]
+    pub fn has_auto_update_partitions(&self) -> bool {
+        self.inner.auto_update.is_some()
+    }
+
+    /// Most recent partition count observed by the background partition watcher.
+    /// `None` when no watcher was configured.
+    #[must_use]
+    pub fn observed_partitions(&self) -> Option<u32> {
+        self.inner
+            .auto_update
+            .as_ref()
+            .map(|t| *t.observed_partitions.lock())
+    }
+
+    /// Monotonic count of partition-change events observed by the background
+    /// watcher. Returns `None` when no watcher was configured.
+    #[must_use]
+    pub fn partition_change_count(&self) -> Option<u64> {
+        self.inner
+            .auto_update
+            .as_ref()
+            .map(|t| *t.change_count.lock())
+    }
+
+    /// `Arc<Notify>` signalled by the background partition-watcher on every timer
+    /// tick and on every observed partition-count change driven by
+    /// [`Self::refresh_partitions`]. Returns `None` when no watcher was
+    /// configured. Callers may `await` `notified()` on the returned handle to
+    /// react to ticks without polling [`Self::partition_change_count`].
+    #[must_use]
+    pub fn partitions_changed_notify(&self) -> Option<Arc<Notify>> {
+        self.inner.auto_update.as_ref().map(|t| t.changed.clone())
+    }
+
+    /// Query the broker for the current partition count of the topic this
+    /// consumer was opened against (the base topic, for a
+    /// [`crate::PartitionedConsumer`]), and update [`Self::observed_partitions`] /
+    /// [`Self::partition_change_count`] in place if the count differs from the
+    /// last observation.
+    ///
+    /// This is the user-driven half of the
+    /// [`MultiTopicsConsumerBuilder::auto_update_partitions_interval`] machinery.
+    /// Returns the freshly-observed count on success, or `Ok(None)` if no watcher
+    /// was configured.
+    ///
+    /// **Note**: this method only updates the observed count. It does *not*
+    /// itself subscribe to new per-partition topics that show up after creation —
+    /// the surface still subscribes to its initial set. Callers that need the
+    /// expanded set should add the new per-partition topics via
+    /// [`Self::add_topic`] in response to the signal.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`PulsarError::Client`] when the broker metadata lookup fails.
+    pub async fn refresh_partitions(
+        &self,
+        client: &PulsarClient,
+    ) -> Result<Option<u32>, PulsarError> {
+        let Some(task) = self.inner.auto_update.as_ref() else {
+            return Ok(None);
+        };
+        let count = client.partitions_for_topic(&task.topic).await?;
+        let mut observed = task.observed_partitions.lock();
+        if *observed != count {
+            *observed = count;
+            drop(observed);
+            let mut cnt = task.change_count.lock();
+            *cnt = cnt.saturating_add(1);
+            drop(cnt);
+            task.changed.notify_waiters();
+        }
+        Ok(Some(count))
+    }
 }
 
 impl Clone for MultiTopicsConsumer {
@@ -697,6 +879,12 @@ pub struct MultiTopicsConsumerBuilder<'a> {
     replicate_subscription_state: Option<bool>,
     force_topic_creation: Option<bool>,
     start_message_rollback_duration_sec: Option<u64>,
+    auto_update_partitions_interval: Option<Duration>,
+    /// Base topic recorded for the partition-watcher when this builder is driven by
+    /// [`crate::PartitionedConsumerBuilder`]. `None` for direct multi-topic use —
+    /// callers there pass the explicit topic list, so there is no single base topic
+    /// to watch.
+    auto_update_base_topic: Option<String>,
 }
 
 impl<'a> MultiTopicsConsumerBuilder<'a> {
@@ -721,6 +909,8 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
+            auto_update_partitions_interval: None,
+            auto_update_base_topic: None,
         }
     }
 
@@ -874,6 +1064,46 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
         self
     }
 
+    /// Enable a background timer that signals every `interval`, intended to drive
+    /// re-checks of the topic's partition count. Mirrors Java
+    /// `ConsumerBuilder#autoUpdatePartitionsInterval`.
+    ///
+    /// The internal timer task signals
+    /// [`MultiTopicsConsumer::partitions_changed_notify`] on every tick. Callers
+    /// run [`MultiTopicsConsumer::refresh_partitions`] in response to the signal
+    /// (or on their own cadence) to actually call
+    /// [`PulsarClient::partitions_for_topic`].
+    ///
+    /// Default `None` — no timer is spawned. Pass a non-zero `Duration` to opt
+    /// in. The timer is aborted when the [`MultiTopicsConsumer`] (and every
+    /// clone) is dropped.
+    ///
+    /// Setting a zero `interval` is treated as "disable" — same as the default.
+    ///
+    /// **Note**: for direct multi-topic use, the watcher polls the *first* topic
+    /// supplied to the builder (single watched topic is sufficient for the
+    /// partitioned-consumer case which is the main use site).
+    #[must_use]
+    pub fn auto_update_partitions_interval(mut self, interval: Duration) -> Self {
+        self.auto_update_partitions_interval = if interval.is_zero() {
+            None
+        } else {
+            Some(interval)
+        };
+        self
+    }
+
+    /// Record the base topic the partition watcher should poll. Called by
+    /// [`crate::PartitionedConsumerBuilder::subscribe`] so the watcher polls the
+    /// base topic (e.g. `persistent://t`) rather than the first partition topic
+    /// (`persistent://t-partition-0`). Crate-internal — direct multi-topic users
+    /// don't need this knob; the watcher falls back to the first topic.
+    #[must_use]
+    pub(crate) fn auto_update_base_topic(mut self, topic: String) -> Self {
+        self.auto_update_base_topic = Some(topic);
+        self
+    }
+
     /// Open every per-topic subscription concurrently. If any subscribe fails the others
     /// that already succeeded are torn down before the error is returned.
     pub async fn subscribe(self) -> Result<MultiTopicsConsumer, PulsarError> {
@@ -927,11 +1157,26 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
             }
         }
 
+        // Spawn the partition-watcher timer iff the builder configured a non-zero
+        // interval. The timer itself only emits ticks via `Notify`; callers drive
+        // the actual `partitions_for_topic` call via
+        // [`MultiTopicsConsumer::refresh_partitions`].
+        let auto_update = self.auto_update_partitions_interval.map(|interval| {
+            let watched_topic = self
+                .auto_update_base_topic
+                .unwrap_or_else(|| self.topics[0].clone());
+            // We do not have an initial partition count for the direct multi-topic
+            // case (each topic was passed explicitly); seed with 0 so the first
+            // refresh always logs a change.
+            spawn_auto_update_task(watched_topic, interval, 0)
+        });
+
         Ok(MultiTopicsConsumer {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(consumers),
                 cursor: Mutex::new(0),
                 template,
+                auto_update,
             }),
         })
     }
@@ -978,6 +1223,7 @@ mod tests {
             consumers: Mutex::new(Vec::new()),
             cursor: Mutex::new(0),
             template: empty_template(),
+            auto_update: None,
         });
         let consumer = MultiTopicsConsumer {
             inner: inner.clone(),

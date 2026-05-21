@@ -40,6 +40,7 @@ pub struct PartitionedConsumerBuilder<'a> {
     replicate_subscription_state: Option<bool>,
     force_topic_creation: Option<bool>,
     start_message_rollback_duration_sec: Option<u64>,
+    auto_update_partitions_interval: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for PartitionedConsumerBuilder<'_> {
@@ -74,6 +75,7 @@ impl<'a> PartitionedConsumerBuilder<'a> {
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
+            auto_update_partitions_interval: None,
         }
     }
 
@@ -211,6 +213,31 @@ impl<'a> PartitionedConsumerBuilder<'a> {
         self
     }
 
+    /// Enable a background timer that signals every `interval`, intended to drive
+    /// re-checks of the topic's partition count. Mirrors Java
+    /// `ConsumerBuilder#autoUpdatePartitionsInterval`.
+    ///
+    /// The internal timer task signals
+    /// [`PartitionedConsumer::partitions_changed_notify`] on every tick. Callers
+    /// run [`PartitionedConsumer::refresh_partitions`] in response to the signal
+    /// (or on their own cadence) to actually call
+    /// [`PulsarClient::partitions_for_topic`].
+    ///
+    /// Default `None` — no timer is spawned. Pass a non-zero `Duration` to opt
+    /// in. The timer is aborted when the [`PartitionedConsumer`] (and every
+    /// clone) is dropped.
+    ///
+    /// Setting a zero `interval` is treated as "disable" — same as the default.
+    #[must_use]
+    pub fn auto_update_partitions_interval(mut self, interval: std::time::Duration) -> Self {
+        self.auto_update_partitions_interval = if interval.is_zero() {
+            None
+        } else {
+            Some(interval)
+        };
+        self
+    }
+
     /// Query partition count, then open one per-partition consumer. If the broker reports
     /// `0` partitions the builder falls back to a single consumer on the original topic.
     pub async fn subscribe(self) -> Result<PartitionedConsumer, PulsarError> {
@@ -271,6 +298,11 @@ impl<'a> PartitionedConsumerBuilder<'a> {
         }
         if let Some(sec) = self.start_message_rollback_duration_sec {
             builder = builder.start_message_rollback_duration(sec);
+        }
+        if let Some(interval) = self.auto_update_partitions_interval {
+            builder = builder
+                .auto_update_partitions_interval(interval)
+                .auto_update_base_topic(self.topic.clone());
         }
         builder.subscribe().await
     }
