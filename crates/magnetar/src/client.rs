@@ -962,7 +962,7 @@ pub struct MemoryLimit {
 }
 
 /// Builder for [`PulsarClient`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ClientBuilder {
     service_url: Option<String>,
     service_url_provider: Option<std::sync::Arc<dyn magnetar_proto::ServiceUrlProvider>>,
@@ -973,10 +973,34 @@ pub struct ClientBuilder {
     auth_data: Option<Vec<u8>>,
     auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
     tls_trust_certs_pem: Option<Vec<u8>>,
+    tls_allow_insecure_connection: bool,
+    tls_hostname_verification_enable: bool,
     default_max_message_size: Option<usize>,
     proxy_to_broker_url: Option<String>,
     supervisor: Option<magnetar_proto::SupervisorConfig>,
     memory_limit: Option<MemoryLimit>,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self {
+            service_url: None,
+            service_url_provider: None,
+            client_version: None,
+            keepalive: None,
+            operation_timeout: None,
+            auth_method_name: None,
+            auth_data: None,
+            auth_provider: None,
+            tls_trust_certs_pem: None,
+            tls_allow_insecure_connection: false,
+            tls_hostname_verification_enable: true,
+            default_max_message_size: None,
+            proxy_to_broker_url: None,
+            supervisor: None,
+            memory_limit: None,
+        }
+    }
 }
 
 impl ClientBuilder {
@@ -1110,6 +1134,42 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// Mirror of Java `ClientBuilder#tlsAllowInsecureConnection`. When `true`,
+    /// the TLS handshake accepts any server certificate without verifying its
+    /// trust chain — useful for local development against a self-signed broker
+    /// or for CI / e2e against an ephemeral container. **Insecure for
+    /// production**: the client cannot tell a real broker from a MITM.
+    ///
+    /// Default: `false`. Only honoured for `pulsar+ssl://` URLs. Overrides any
+    /// `tls_trust_certs_pem` chain when set.
+    #[must_use]
+    pub fn tls_allow_insecure_connection(mut self, on: bool) -> Self {
+        self.tls_allow_insecure_connection = on;
+        self
+    }
+
+    /// Mirror of Java `ClientBuilder#enableTlsHostnameVerification`. When
+    /// `true` (the default), the handshake additionally checks the server
+    /// certificate's CN / SAN matches the broker hostname from the URL. When
+    /// `false`, the chain is still verified but the hostname mismatch is
+    /// tolerated.
+    ///
+    /// Default: `true` (matches Java's secure default). When
+    /// [`Self::tls_allow_insecure_connection`] is `true` this flag is moot —
+    /// the verifier already accepts everything.
+    ///
+    /// **Note**: today only the "off + insecure both true" combination is
+    /// runtime-enforced via [`magnetar_runtime_tokio::insecure_tls_config`].
+    /// A hostname-only-skip verifier (chain on, hostname off) is a planned
+    /// follow-up; passing `false` without also enabling
+    /// `tls_allow_insecure_connection` is currently treated as the default
+    /// (hostname verification stays on).
+    #[must_use]
+    pub fn tls_hostname_verification_enable(mut self, on: bool) -> Self {
+        self.tls_hostname_verification_enable = on;
+        self
+    }
+
     /// Build and connect the client.
     ///
     /// # Errors
@@ -1151,7 +1211,16 @@ impl ClientBuilder {
         if let Some(data) = self.auth_data {
             config.auth_data = Some(data);
         }
-        let inner = if let Some(pem) = self.tls_trust_certs_pem {
+        let inner = if self.tls_allow_insecure_connection {
+            let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
+            let tls_config = match parsed.scheme {
+                magnetar_runtime_tokio::Scheme::Tls => {
+                    Some(magnetar_runtime_tokio::insecure_tls_config())
+                }
+                magnetar_runtime_tokio::Scheme::Plain => None,
+            };
+            Client::connect_with(parsed, tls_config, config, self.auth_provider).await?
+        } else if let Some(pem) = self.tls_trust_certs_pem {
             let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
             let tls_config = match parsed.scheme {
                 magnetar_runtime_tokio::Scheme::Tls => Some(Client::tls_config_from_pem(&pem)?),

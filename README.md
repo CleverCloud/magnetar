@@ -588,7 +588,8 @@ known-missing feature.
 | `operationTimeout` | ✅ | ✅ | `ClientBuilder::operation_timeout`. |
 | `maxMessageSize` | ✅ | ✅ | `ClientBuilder::max_message_size`. |
 | `tlsTrustCertsFilePath` | ✅ | ✅ | `ClientBuilder::tls_trust_certs_file_path`. |
-| `tlsAllowInsecureConnection` | ✅ | ❌ | Use a custom rustls config (workaround). |
+| `tlsAllowInsecureConnection` | ✅ | ✅ | `ClientBuilder::tls_allow_insecure_connection(true)` — accepts any server cert via a custom rustls verifier. **Insecure**, do not use in production. |
+| `enableTlsHostnameVerification` | ✅ | 🟡 | `ClientBuilder::tls_hostname_verification_enable(bool)`; the "chain on + hostname off" combination is the planned follow-up (today honoured only via the `tls_allow_insecure_connection` blanket override). |
 | `serviceUrlProvider` (URL rotation) | ✅ | 🟡 | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)`; runtime URL rotation on reconnect pending. |
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
