@@ -33,11 +33,12 @@
 //! The relevant invariant is also tracked in `GUIDELINES.md` ("Protocol-correctness invariants",
 //! point 6) and `ARCHITECTURE.md` ("Schema-registry parity").
 //!
-//! # Stub status
+//! # Implementation status
 //!
-//! - Fully implemented: [`BytesSchema`], [`StringSchema`], [`JsonSchema`], [`AvroSchema`],
-//!   [`ProtobufSchema`], [`ProtobufNativeSchema`], [`KeyValueSchema`].
-//! - Trait surface only (broker-driven lookup wired up in the runtime engines):
+//! - Fully implemented (inline schema data): [`BytesSchema`], [`StringSchema`], [`JsonSchema`],
+//!   [`AvroSchema`], [`ProtobufSchema`], [`ProtobufNativeSchema`], [`KeyValueSchema`].
+//! - Broker-driven schema lookup (PIP-87 — schema cached in an `Arc<Mutex<Option<pb::Schema>>>`
+//!   populated by [`Connection::get_schema`](crate::conn::Connection::get_schema)):
 //!   [`AutoConsumeSchema`], [`AutoProduceBytesSchema`].
 
 use bytes::Bytes;

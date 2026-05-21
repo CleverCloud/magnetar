@@ -17,6 +17,13 @@ use crate::pb;
 use crate::txn::{TxnError, TxnId, TxnState};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
 
+/// Outcome of a `CommandGetSchema` round-trip (PIP-87 broker-side schema lookup).
+///
+/// `Ok((schema, version))` on success — the broker-resolved [`pb::Schema`] and the optional
+/// schema version assigned by the registry. `Err((code, message))` carries the wire-protocol
+/// `ServerError` code and broker-supplied message on failure (e.g. `TopicNotFound`).
+pub type GetSchemaResult = Result<(pb::Schema, Option<Vec<u8>>), (i32, String)>;
+
 /// Result variants of one round-trip against the Transaction Coordinator.
 ///
 /// Mirrors PIP-31's response set. The `Result` shape carries either the
@@ -215,6 +222,19 @@ pub enum ConnectionEvent {
         request_id: RequestId,
         /// The transactional outcome.
         outcome: TxnRoundTrip,
+    },
+
+    /// Response to a `CommandGetSchema` request (PIP-87 broker-side schema lookup).
+    ///
+    /// Emitted after the runtime calls
+    /// [`Connection::get_schema`](crate::Connection::get_schema) and the broker replies. The
+    /// payload is a [`GetSchemaResult`] — `Ok` carries the registry-resolved [`pb::Schema`] and
+    /// schema version, `Err` carries the broker's `ServerError` code and message.
+    GetSchemaResponse {
+        /// Request id correlating the response to the originating `CommandGetSchema`.
+        request_id: RequestId,
+        /// The schema-registry round-trip outcome.
+        result: GetSchemaResult,
     },
 }
 
