@@ -623,6 +623,15 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#sendTimeout`. When set, in-flight sends past
+    /// `enqueued_at + timeout` resolve with a synthetic `SendError` carrying
+    /// `code=-1, message="send timeout"` on the next state-machine tick.
+    #[must_use]
+    pub fn send_timeout(mut self, timeout: Duration) -> Self {
+        self.req.send_timeout = Some(timeout);
+        self
+    }
+
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload. Pass an
     /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the

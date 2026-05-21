@@ -245,6 +245,11 @@ pub struct CreateProducerRequest {
     /// Mirrors `CommandProducer.metadata` — broker-side KV metadata advertised at producer
     /// open. Surfaces on the broker dashboard alongside the producer.
     pub producer_metadata: Vec<(String, String)>,
+    /// Mirrors Java `ProducerBuilder#sendTimeout`. When set, any in-flight send whose
+    /// `enqueued_at + timeout` has elapsed surfaces a synthetic
+    /// `SendError(code=11008, "send timeout")` on the next `Connection::handle_timeout`
+    /// tick. `None` disables the sweep (the default).
+    pub send_timeout: Option<Duration>,
 }
 
 impl Default for CreateProducerRequest {
@@ -261,6 +266,7 @@ impl Default for CreateProducerRequest {
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
             producer_metadata: Vec::new(),
+            send_timeout: None,
         }
     }
 }
@@ -1228,6 +1234,11 @@ impl Connection {
                 }
             }
         }
+        for producer in self.producers.values() {
+            if let Some(d) = producer.next_send_deadline() {
+                consider(d);
+            }
+        }
         next
     }
 
@@ -1271,6 +1282,42 @@ impl Connection {
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
+        }
+
+        // Per-producer send-timeout sweep. Surface each timed-out send as an
+        // `OpOutcome::SendError` so the caller's send future resolves with the configured
+        // timeout error.
+        let mut send_timeouts: Vec<(ProducerHandle, SequenceId, Option<Waker>)> = Vec::new();
+        for (handle, producer) in &mut self.producers {
+            for (seq, waker) in producer.drain_timed_out_sends(now) {
+                producer.total_send_failed = producer.total_send_failed.saturating_add(1);
+                send_timeouts.push((*handle, seq, waker));
+            }
+        }
+        for (handle, seq, waker) in send_timeouts {
+            let key = PendingOpKey::Send(handle, seq);
+            // Pulsar's ServerError enum has no TimeoutError; use the same `-1` sentinel
+            // Java surfaces as TimeoutException with a descriptive message so callers can
+            // pattern-match on the error string.
+            self.outcomes.insert(
+                key,
+                OpOutcome::SendError {
+                    sequence_id: seq,
+                    code: -1,
+                    message: "send timeout".to_owned(),
+                },
+            );
+            if let Some(w) = waker {
+                w.wake();
+            } else if let Some(w) = self.wakers.remove(&key) {
+                w.wake();
+            }
+            self.events.push_back(ConnectionEvent::SendError {
+                handle,
+                sequence_id: seq,
+                code: -1,
+                message: "send timeout".to_owned(),
+            });
         }
     }
 
@@ -1317,6 +1364,7 @@ impl Connection {
         if let Some(initial) = req.initial_sequence_id {
             state.set_initial_sequence_id(initial);
         }
+        state.send_timeout = req.send_timeout;
         self.producers.insert(handle, state);
 
         let producer_metadata: Vec<pb::KeyValue> = req

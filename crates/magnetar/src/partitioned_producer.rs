@@ -186,6 +186,7 @@ pub struct PartitionedProducerBuilder<'a> {
     initial_sequence_id: Option<u64>,
     access_mode: pb::ProducerAccessMode,
     producer_metadata: Vec<(String, String)>,
+    send_timeout: Option<std::time::Duration>,
     schema: Option<pb::Schema>,
     encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
@@ -215,6 +216,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
             producer_metadata: Vec::new(),
+            send_timeout: None,
             schema: None,
             encryptor: None,
         }
@@ -281,6 +283,15 @@ impl<'a> PartitionedProducerBuilder<'a> {
         self
     }
 
+    /// Mirrors Java `ProducerBuilder#sendTimeout` — applied to every per-partition child.
+    /// In-flight sends past their `enqueued_at + timeout` deadline resolve with a
+    /// synthetic `code=-1, message="send timeout"` `SendError`.
+    #[must_use]
+    pub fn send_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.send_timeout = Some(timeout);
+        self
+    }
+
     /// Advertise a schema on every per-partition `CommandProducer`.
     #[must_use]
     pub fn schema(mut self, schema: pb::Schema) -> Self {
@@ -329,6 +340,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
                 initial_sequence_id: self.initial_sequence_id,
                 access_mode: self.access_mode,
                 producer_metadata: self.producer_metadata.clone(),
+                send_timeout: self.send_timeout,
             };
             let result = self
                 .client

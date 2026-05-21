@@ -96,6 +96,9 @@ pub struct OpSend {
     pub receipt: Option<MessageId>,
     /// `None` if no error; `Some` if the broker returned a `CommandSendError`.
     pub error: Option<(i32, String)>,
+    /// Wall-clock instant the send was enqueued. Used by the send-timeout sweep on
+    /// [`crate::Connection::handle_timeout`].
+    pub enqueued_at: std::time::Instant,
 }
 
 /// Per-producer state.
@@ -148,6 +151,11 @@ pub struct ProducerState {
     pub total_send_failed: u64,
     /// Cumulative count of `CommandSendReceipt` responses correlated against this producer.
     pub total_acks_received: u64,
+    /// Optional per-send timeout. When `Some(d)`, the Connection's `handle_timeout` sweep
+    /// surfaces a synthetic `OpOutcome::SendError` for any in-flight `OpSend` whose
+    /// `enqueued_at + d` has elapsed. Mirrors Java `ProducerBuilder#sendTimeout`. `None`
+    /// disables the sweep.
+    pub send_timeout: Option<std::time::Duration>,
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
@@ -275,6 +283,7 @@ impl ProducerState {
             total_bytes_sent: 0,
             total_send_failed: 0,
             total_acks_received: 0,
+            send_timeout: None,
         }
     }
 
@@ -291,6 +300,37 @@ impl ProducerState {
             self.last_sequence_id_published = (next as i64).saturating_sub(1);
             self.last_sequence_id_pushed = self.last_sequence_id_published;
         }
+    }
+
+    /// Deadline of the earliest pending send (`enqueued_at + send_timeout`), or `None` if
+    /// the producer has no send-timeout configured or no in-flight sends.
+    #[must_use]
+    pub fn next_send_deadline(&self) -> Option<std::time::Instant> {
+        let timeout = self.send_timeout?;
+        self.pending.front().map(|op| op.enqueued_at + timeout)
+    }
+
+    /// Drain every in-flight `OpSend` whose `enqueued_at + send_timeout` has passed.
+    /// Returns the `(sequence_id, waker)` pairs the caller should wake — each one's
+    /// corresponding `OpOutcome::SendError` is registered by the connection layer.
+    /// Mirrors Java's `ClientCnx#timedOutSendOps` sweep.
+    pub fn drain_timed_out_sends(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<(SequenceId, Option<Waker>)> {
+        let Some(timeout) = self.send_timeout else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Some(front) = self.pending.front() {
+            if now < front.enqueued_at + timeout {
+                break;
+            }
+            let mut op = self.pending.pop_front().expect("front exists");
+            self.pending_index.remove(&op.sequence_id);
+            out.push((op.sequence_id, op.waker.take()));
+        }
+        out
     }
 
     /// Snapshot of cumulative counters. Mirrors Java `ProducerStats`.
@@ -456,6 +496,7 @@ impl ProducerState {
             waker: None,
             receipt: None,
             error: None,
+            enqueued_at: std::time::Instant::now(),
         };
         self.pending_index.insert(seq, self.pending.len());
         self.pending.push_back(op);
@@ -589,6 +630,7 @@ impl ProducerState {
             waker: None,
             receipt: None,
             error: None,
+            enqueued_at: std::time::Instant::now(),
         };
         self.pending_index.insert(lowest_seq, self.pending.len());
         self.pending.push_back(op);
@@ -685,6 +727,7 @@ impl ProducerState {
             waker: None,
             receipt: None,
             error: None,
+            enqueued_at: std::time::Instant::now(),
         };
         self.pending_index
             .insert(ctx.sequence_id, self.pending.len());
