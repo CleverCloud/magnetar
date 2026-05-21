@@ -1034,11 +1034,18 @@ impl ClientBuilder {
     /// `ClientBuilder#memoryLimit(long, MemoryLimitPolicy)`. `bytes = 0`
     /// disables the limit (matches Java default).
     ///
-    /// **Storage today**: the configured limit + policy are stored on the
-    /// resulting [`PulsarClient`] and retrievable via
-    /// [`PulsarClient::memory_limit`]. Enforcement (accounting against
-    /// in-flight publish bytes, blocking on `ProducerBlock`, failing on
-    /// `FailImmediately`) is a planned follow-up.
+    /// **Enforcement**: under `MemoryLimitPolicy::FailImmediately`, every
+    /// `Producer::send` reserves the payload bytes against the budget via
+    /// an `AtomicU64` CAS loop on `ConnectionShared::memory_used` BEFORE
+    /// the payload reaches the sans-io state machine. Sends that would
+    /// push past the limit are rejected synchronously with
+    /// [`magnetar_runtime_tokio::ClientError::MemoryLimitExceeded`]. The
+    /// reservation is released on `SendFut` completion (success or
+    /// error) and on cancellation (via `Drop`).
+    ///
+    /// **Note**: `MemoryLimitPolicy::ProducerBlock` (Java's alternate
+    /// semantics that blocks the send future until budget frees up via a
+    /// `Notify`-based wait) is the planned follow-up.
     #[must_use]
     pub fn memory_limit(mut self, bytes: usize, policy: MemoryLimitPolicy) -> Self {
         self.memory_limit = Some(MemoryLimit { bytes, policy });
@@ -1223,6 +1230,17 @@ impl ClientBuilder {
         }
         if let Some(sv) = self.supervisor {
             config.supervisor = Some(sv);
+        }
+        // Java `ClientBuilder#memoryLimit` — wire the configured budget into the runtime so
+        // `Producer::send` reserves payload bytes against `ConnectionShared::memory_limit_bytes`
+        // before queueing. Only `FailImmediately` is enforced today; `ProducerBlock` is
+        // planned follow-up (it would park the send future until the budget frees up via
+        // `tokio::sync::Notify`).
+        if let Some(limit) = self.memory_limit {
+            // Cast saturates rather than truncates so a 64-bit limit on a 32-bit usize host
+            // (effectively impossible — magnetar requires 64-bit pointers — but cheap to
+            // future-proof) stays correct.
+            config.memory_limit_bytes = limit.bytes as u64;
         }
         if let Some(name) = self.auth_method_name {
             config.auth_method_name = name;

@@ -593,7 +593,7 @@ known-missing feature.
 | `serviceUrlProvider` (URL rotation) | ✅ | ✅ | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)` — the supervised reconnect path calls `provider.get_service_url()` on every reconnect attempt, so cluster-failover policies can swap broker URLs between attempts. |
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
-| `memoryLimit` | ✅ | 🟡 | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` + `PulsarClient::memory_limit` getter; runtime enforcement (accounting + blocking on `ProducerBlock`) pending. |
+| `memoryLimit` | ✅ | ✅ | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` enforced at runtime via `AtomicU64` CAS reservation in `Producer::send` (Java's `FailImmediately` semantics). `ProducerBlock` (block until budget frees) is the planned follow-up. |
 | `dnsResolver` customisation | ✅ | 🟡 | `ClientBuilder::dns_resolver(Arc<dyn DnsResolver>)` trait + `TokioDnsResolver` default impl shipped; routing through `Transport::connect` is the planned follow-up (same pattern ServiceUrlProvider followed). |
 | `isClosed` / `shutdown` / `getLastDisconnectedTimestamp` | ✅ | ✅ | All exposed on `PulsarClient`. |
 | Cluster failover (PIP-121) | ✅ | 🟡 | `ServiceUrlProvider` trait + `StaticServiceUrlProvider` + `ClientBuilder::service_url_provider`; `AutoClusterFailover` and `ControlledClusterFailover` policies pending. |

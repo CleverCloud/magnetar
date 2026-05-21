@@ -105,6 +105,16 @@ pub struct ConnectionConfig {
     /// exits on the first I/O error. Mirrors Java's `PulsarClientImpl` reconnect
     /// loop.
     pub supervisor: Option<crate::supervisor::SupervisorConfig>,
+    /// Global publish memory budget in bytes. `0` (the default) disables
+    /// the limit. Runtime engines that honour this enforce a CAS-reserve on
+    /// every `Producer::send` before queueing into the sans-io state
+    /// machine; sends that would push the in-flight bytes past the limit
+    /// are rejected with a `MemoryLimitExceeded` error (Java's
+    /// `MemoryLimitPolicy.FailImmediately`). The companion
+    /// `MemoryLimitPolicy.ProducerBlock` variant — which blocks the
+    /// caller until the budget frees up — is planned follow-up. Mirrors
+    /// Java `ClientBuilder#memoryLimit`.
+    pub memory_limit_bytes: u64,
 }
 
 impl Default for ConnectionConfig {
@@ -121,6 +131,7 @@ impl Default for ConnectionConfig {
             default_max_message_size: 5 * 1024 * 1024,
             proxy_to_broker_url: None,
             supervisor: None,
+            memory_limit_bytes: 0,
         }
     }
 }

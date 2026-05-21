@@ -68,6 +68,23 @@ pub enum ClientError {
     #[error("timed out: {0}")]
     Timeout(String),
 
+    /// Configured global publish memory budget exhausted. Mirrors Java
+    /// `MemoryLimitController` rejecting a send under
+    /// `MemoryLimitPolicy.FailImmediately`. `current` + `requested` would
+    /// push past `limit`; the caller can retry later (the counter drains
+    /// as outstanding sends complete).
+    #[error(
+        "memory limit exceeded: current={current} bytes, requested={requested} bytes, limit={limit} bytes"
+    )]
+    MemoryLimitExceeded {
+        /// Bytes already reserved by in-flight sends at the moment of the check.
+        current: u64,
+        /// The configured budget.
+        limit: u64,
+        /// The size of the send that triggered the overflow.
+        requested: u64,
+    },
+
     /// Catch-all for engine-internal misconfiguration.
     #[error("other: {0}")]
     Other(String),

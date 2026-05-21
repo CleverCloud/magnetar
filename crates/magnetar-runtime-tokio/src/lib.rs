@@ -77,7 +77,7 @@ mod transport;
 mod url_parse;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -124,6 +124,18 @@ pub struct ConnectionShared {
     /// the flag so the rebuild fires exactly once per reconnect. Stage 3 of the supervisor
     /// work: transparent producer / consumer replay on session loss.
     pub pending_rebuild: AtomicBool,
+    /// Configured global publish memory budget in bytes. `0` disables the limit
+    /// (matches `ConnectionConfig::memory_limit_bytes` default). Mirrors Java's
+    /// `ClientBuilder#memoryLimit`. Reservations against this budget happen in
+    /// [`crate::Producer::send`] BEFORE the payload reaches the sans-io state
+    /// machine; sends that would push `memory_used` past the limit are rejected
+    /// synchronously with [`ClientError::MemoryLimitExceeded`].
+    pub memory_limit_bytes: u64,
+    /// Current in-flight publish bytes reserved by [`crate::Producer::send`] calls
+    /// that have not yet seen their [`magnetar_proto::OpOutcome::SendReceipt`] /
+    /// `SendError`. Bumped in `send` (CAS against `memory_limit_bytes`); decremented
+    /// in [`crate::SendFut::poll`] when the future returns `Poll::Ready`.
+    pub memory_used: AtomicU64,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -152,11 +164,71 @@ impl ConnectionShared {
         Self::with_auth(config, None)
     }
 
+    /// Try to reserve `bytes` against the configured memory budget. Returns
+    /// `Ok(())` when the reservation succeeds (or no limit is configured —
+    /// `memory_limit_bytes = 0`); returns `Err(ClientError::MemoryLimitExceeded
+    /// { current, limit, requested })` when the reservation would push
+    /// `memory_used` past `memory_limit_bytes`.
+    ///
+    /// Lock-free: a CAS loop on `memory_used`. Mirrors Java's
+    /// `MemoryLimitController` (in `MemoryLimitPolicy.FailImmediately`
+    /// mode).
+    ///
+    /// See [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)
+    /// — `AtomicU64` is not a channel; it's the right primitive for this counter.
+    pub fn try_reserve_memory(&self, bytes: u64) -> Result<(), ClientError> {
+        if self.memory_limit_bytes == 0 {
+            return Ok(());
+        }
+        loop {
+            let current = self.memory_used.load(Ordering::Acquire);
+            let next = current.saturating_add(bytes);
+            if next > self.memory_limit_bytes {
+                return Err(ClientError::MemoryLimitExceeded {
+                    current,
+                    limit: self.memory_limit_bytes,
+                    requested: bytes,
+                });
+            }
+            // Acquire-Release CAS so that releases on other threads are visible.
+            if self
+                .memory_used
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(());
+            }
+            // Lost the race; retry with the fresh value.
+        }
+    }
+
+    /// Release a previous reservation. Called by [`crate::SendFut`] when the
+    /// send completes (success or error). Saturating sub so a buggy
+    /// over-release can't underflow the counter.
+    pub fn release_memory(&self, bytes: u64) {
+        if bytes == 0 || self.memory_limit_bytes == 0 {
+            return;
+        }
+        // `fetch_sub` wraps on underflow; guard manually with a CAS loop.
+        loop {
+            let current = self.memory_used.load(Ordering::Acquire);
+            let next = current.saturating_sub(bytes);
+            if self
+                .memory_used
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
     /// Construct with an auth provider for in-band challenge refresh.
     pub fn with_auth(
         config: magnetar_proto::ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     ) -> Arc<Self> {
+        let memory_limit_bytes = config.memory_limit_bytes;
         Arc::new(Self {
             inner: Mutex::new(magnetar_proto::Connection::new(config)),
             driver_waker: Notify::new(),
@@ -164,6 +236,8 @@ impl ConnectionShared {
             topic_list_changes: Mutex::new(std::collections::VecDeque::new()),
             topic_list_notify: Notify::new(),
             pending_rebuild: AtomicBool::new(false),
+            memory_limit_bytes,
+            memory_used: AtomicU64::new(0),
         })
     }
 }
@@ -198,5 +272,57 @@ mod tests {
         let second = s.topic_list_changes.lock().pop_front().unwrap();
         assert_eq!(second.removed, vec!["b".to_owned()]);
         assert!(s.topic_list_changes.lock().is_empty());
+    }
+
+    #[test]
+    fn memory_limit_zero_disables_enforcement() {
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        assert_eq!(s.memory_limit_bytes, 0);
+        assert!(s.try_reserve_memory(u64::MAX).is_ok());
+        // No-op release.
+        s.release_memory(u64::MAX);
+    }
+
+    #[test]
+    fn memory_limit_reserve_and_release_round_trip() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 1024,
+            ..ConnectionConfig::default()
+        };
+        let s = ConnectionShared::new(cfg);
+
+        assert!(s.try_reserve_memory(400).is_ok());
+        assert!(s.try_reserve_memory(400).is_ok());
+        assert_eq!(s.memory_used.load(super::Ordering::Acquire), 800);
+
+        // Overflow: 800 + 300 > 1024.
+        match s.try_reserve_memory(300) {
+            Err(super::ClientError::MemoryLimitExceeded {
+                current,
+                limit,
+                requested,
+            }) => {
+                assert_eq!(current, 800);
+                assert_eq!(limit, 1024);
+                assert_eq!(requested, 300);
+            }
+            other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+        }
+
+        // Releasing makes room.
+        s.release_memory(400);
+        assert!(s.try_reserve_memory(300).is_ok());
+    }
+
+    #[test]
+    fn memory_limit_release_is_saturating() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 1024,
+            ..ConnectionConfig::default()
+        };
+        let s = ConnectionShared::new(cfg);
+        // Over-release must not underflow.
+        s.release_memory(1_000_000);
+        assert_eq!(s.memory_used.load(super::Ordering::Acquire), 0);
     }
 }

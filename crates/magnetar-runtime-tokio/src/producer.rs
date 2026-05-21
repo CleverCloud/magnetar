@@ -141,6 +141,7 @@ impl Producer {
                         state: SendState::Failed {
                             error: Some(ClientError::Other(format!("compress: {err}"))),
                         },
+                        reserved_bytes: 0,
                     };
                 }
             }
@@ -159,9 +160,24 @@ impl Producer {
                         state: SendState::Failed {
                             error: Some(ClientError::Other(format!("encrypt: {err}"))),
                         },
+                        reserved_bytes: 0,
                     };
                 }
             }
+        }
+
+        // Reserve memory against the configured global budget BEFORE handing the payload to
+        // the sans-io state machine. Mirrors Java `MemoryLimitController.reserveMemory(...)`
+        // under `MemoryLimitPolicy.FailImmediately`. `try_reserve_memory` is a no-op when
+        // `memory_limit_bytes = 0` (the default).
+        let reserved_bytes = msg.payload.len() as u64;
+        if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
+            return SendFut {
+                shared: self.shared.clone(),
+                handle: self.handle,
+                state: SendState::Failed { error: Some(err) },
+                reserved_bytes: 0,
+            };
         }
 
         let result = {
@@ -173,15 +189,26 @@ impl Producer {
         // Wake the driver so it can drain the freshly-queued frame.
         self.shared.driver_waker.notify_one();
 
-        SendFut {
-            shared: self.shared.clone(),
-            handle: self.handle,
-            state: match result {
-                Ok(seq) => SendState::Pending { sequence_id: seq },
-                Err(err) => SendState::Failed {
-                    error: Some(ClientError::Protocol(err)),
-                },
+        match result {
+            Ok(seq) => SendFut {
+                shared: self.shared.clone(),
+                handle: self.handle,
+                state: SendState::Pending { sequence_id: seq },
+                reserved_bytes,
             },
+            Err(err) => {
+                // The state machine rejected the send (e.g. producer not yet open); release
+                // the reservation so the budget reflects only actually-in-flight bytes.
+                self.shared.release_memory(reserved_bytes);
+                SendFut {
+                    shared: self.shared.clone(),
+                    handle: self.handle,
+                    state: SendState::Failed {
+                        error: Some(ClientError::Protocol(err)),
+                    },
+                    reserved_bytes: 0,
+                }
+            }
         }
     }
 
@@ -328,11 +355,30 @@ async fn wait_request(
 ///
 /// Polls until the matching [`OpOutcome::SendReceipt`] / [`OpOutcome::SendError`] lands inside
 /// the sans-io state machine. NO oneshot channel.
+///
+/// Holds the memory-budget reservation taken in [`Producer::send`] and releases it on
+/// completion (success OR error). Mirrors Java `MemoryLimitController.releaseMemory(...)`.
 #[derive(Debug)]
 pub struct SendFut {
     shared: Arc<ConnectionShared>,
     handle: ProducerHandle,
     state: SendState,
+    /// Bytes reserved against `shared.memory_limit_bytes` for this send. Released
+    /// exactly once when the future returns `Poll::Ready`. `0` when no reservation
+    /// was taken (the budget is unlimited, or the send failed synchronously and the
+    /// reservation was already released in `send()`).
+    reserved_bytes: u64,
+}
+
+impl Drop for SendFut {
+    fn drop(&mut self) {
+        // The future may be dropped before completion (caller cancelled). Release
+        // the reservation so the budget doesn't permanently leak.
+        if self.reserved_bytes > 0 {
+            self.shared.release_memory(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -354,7 +400,7 @@ impl Future for SendFut {
         // Snapshot fields before borrowing `state` mutably to keep the borrow checker happy.
         let handle = self.handle;
         let shared = self.shared.clone();
-        match &mut self.state {
+        let outcome = match &mut self.state {
             SendState::Failed { error } => {
                 let err = error
                     .take()
@@ -366,12 +412,21 @@ impl Future for SendFut {
                 let mut conn = shared.inner.lock();
                 if let Some(outcome) = conn.take_outcome(key) {
                     drop(conn);
-                    return Poll::Ready(translate_send_outcome(outcome));
+                    Poll::Ready(translate_send_outcome(outcome))
+                } else {
+                    conn.register_waker(key, cx.waker().clone());
+                    Poll::Pending
                 }
-                conn.register_waker(key, cx.waker().clone());
-                Poll::Pending
             }
+        };
+        if matches!(outcome, Poll::Ready(_)) && self.reserved_bytes > 0 {
+            // Release the budget reservation. `Drop` would also catch the cancellation
+            // path; this branch covers the normal completion path so the count is
+            // current the instant the user observes the result.
+            self.shared.release_memory(self.reserved_bytes);
+            self.reserved_bytes = 0;
         }
+        outcome
     }
 }
 
