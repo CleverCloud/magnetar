@@ -45,6 +45,25 @@ impl Consumer {
         self.shared.inner.lock().consumer_is_closed(self.handle)
     }
 
+    /// Number of messages currently buffered in this consumer's receiver queue, waiting
+    /// for a `receive()` call to pull them out. Mirrors Java
+    /// `Consumer#getNumMessagesInQueue`.
+    #[must_use]
+    pub fn available_in_queue(&self) -> usize {
+        self.shared.inner.lock().consumer_queue_len(self.handle)
+    }
+
+    /// Number of dispatch permits this consumer still has with the broker — i.e. messages
+    /// it has authorised the broker to push without an explicit `CommandFlow`. Mirrors
+    /// Java `ConsumerBase#getAvailablePermits`.
+    #[must_use]
+    pub fn available_permits(&self) -> u32 {
+        self.shared
+            .inner
+            .lock()
+            .consumer_available_permits(self.handle)
+    }
+
     /// Receive the next message, bounded by `timeout`. Returns `Ok(None)` if the deadline
     /// elapses with no message. Mirrors Java `Consumer#receive(int timeout, TimeUnit unit)`.
     pub async fn receive_with_timeout(

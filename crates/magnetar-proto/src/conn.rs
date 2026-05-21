@@ -1598,6 +1598,24 @@ impl Connection {
         self.consumers.get(&handle).is_none_or(|c| c.closed)
     }
 
+    /// Number of messages currently buffered in the consumer's receiver queue, waiting for
+    /// a `receive()` call to pull them out. Returns `0` for unknown handles. Mirrors Java
+    /// `ConsumerImpl#numMessagesInQueue` / `getTotalIncomingMessages` (the in-memory side).
+    #[must_use]
+    pub fn consumer_queue_len(&self, handle: ConsumerHandle) -> usize {
+        self.consumers.get(&handle).map_or(0, |c| c.queue.len())
+    }
+
+    /// Number of dispatch permits the consumer still has with the broker — i.e. messages
+    /// it has authorised the broker to push without an explicit `CommandFlow`. Returns `0`
+    /// for unknown handles. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    #[must_use]
+    pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
+        self.consumers
+            .get(&handle)
+            .map_or(0, |c| c.available_permits)
+    }
+
     fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.
