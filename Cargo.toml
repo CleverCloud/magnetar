@@ -7,6 +7,7 @@ members = [
     "crates/magnetar-auth-oauth2",
     "crates/magnetar-auth-sasl",
     "crates/magnetar-cli",
+    "crates/magnetar-differential",
     "crates/magnetar-fakes",
     "crates/magnetar-messagecrypto",
     "crates/magnetar-proto",
@@ -34,6 +35,7 @@ magnetar-admin           = { version = "0.1.0-dev.0", path = "crates/magnetar-ad
 magnetar-auth-athenz     = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-athenz" }
 magnetar-auth-oauth2     = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-oauth2" }
 magnetar-auth-sasl       = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-sasl" }
+magnetar-differential    = { version = "0.1.0-dev.0", path = "crates/magnetar-differential" }
 magnetar-fakes           = { version = "0.1.0-dev.0", path = "crates/magnetar-fakes" }
 magnetar-messagecrypto   = { version = "0.1.0-dev.0", path = "crates/magnetar-messagecrypto" }
 magnetar-proto           = { version = "0.1.0-dev.0", path = "crates/magnetar-proto" }

@@ -1,0 +1,30 @@
+[package]
+name        = "magnetar-differential"
+description = "Tokio ↔ moonpool differential equivalence harness for magnetar — trace model, scripted broker, golden traces. Test-only."
+version       = { workspace = true }
+edition       = { workspace = true }
+rust-version  = { workspace = true }
+license       = { workspace = true }
+authors       = { workspace = true }
+repository    = { workspace = true }
+homepage      = { workspace = true }
+readme        = "../../README.md"
+keywords      = { workspace = true }
+categories    = { workspace = true }
+publish       = false
+
+[lints]
+workspace = true
+
+[dependencies]
+magnetar-proto            = { workspace = true }
+magnetar-runtime-tokio    = { workspace = true }
+magnetar-runtime-moonpool = { workspace = true }
+bytes                     = { workspace = true }
+moonpool-core             = { workspace = true }
+parking_lot               = { workspace = true }
+tokio                     = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tracing                   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "test-util", "time", "sync"] }

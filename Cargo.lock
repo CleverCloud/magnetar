@@ -1539,6 +1539,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-differential"
+version = "0.1.0-dev.0"
+dependencies = [
+ "bytes",
+ "magnetar-proto",
+ "magnetar-runtime-moonpool",
+ "magnetar-runtime-tokio",
+ "moonpool-core",
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "magnetar-fakes"
 version = "0.1.0-dev.0"
 dependencies = [
