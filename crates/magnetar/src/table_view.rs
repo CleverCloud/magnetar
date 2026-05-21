@@ -86,6 +86,25 @@ impl TableView {
         self.state.read().clone()
     }
 
+    /// Snapshot every currently-known key. Mirrors Java `TableView#keySet`.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.state.read().keys().cloned().collect()
+    }
+
+    /// Snapshot every currently-known value. Mirrors Java `TableView#values`.
+    #[must_use]
+    pub fn values(&self) -> Vec<Bytes> {
+        self.state.read().values().cloned().collect()
+    }
+
+    /// Returns `true` if any key maps to a value equal to `value`. Mirrors Java
+    /// `TableView#containsValue`.
+    #[must_use]
+    pub fn contains_value(&self, value: &[u8]) -> bool {
+        self.state.read().values().any(|v| v.as_ref() == value)
+    }
+
     /// Iterate every currently-known (key, value) pair under a shared read lock. The
     /// callback must not call back into the [`TableView`] or it will deadlock.
     pub fn for_each<F: FnMut(&str, &Bytes)>(&self, mut f: F) {
