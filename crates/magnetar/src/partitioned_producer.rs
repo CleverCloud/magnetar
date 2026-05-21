@@ -133,6 +133,42 @@ impl PartitionedProducer {
         }
         first_err
     }
+
+    /// Flush every child producer in parallel. Mirrors Java
+    /// `Producer#flushAsync` semantics — resolves once each per-partition pending queue
+    /// drains. Returns the first error encountered.
+    pub async fn flush(&self) -> Result<(), PulsarError> {
+        let mut first_err: Result<(), PulsarError> = Ok(());
+        for p in &self.partitions {
+            if let Err(e) = p.flush().await {
+                if first_err.is_ok() {
+                    first_err = Err(PulsarError::Client(e));
+                }
+            }
+        }
+        first_err
+    }
+
+    /// `true` while every child producer reports the underlying connection is up. Mirrors
+    /// Java `Producer#isConnected` at the partitioned scope — Java returns true iff every
+    /// partition's underlying producer is connected.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.partitions
+            .iter()
+            .all(magnetar_runtime_tokio::Producer::is_connected)
+    }
+
+    /// Earliest wall-clock disconnect timestamp across all child producers, or `None` if
+    /// no child has ever disconnected. Useful for "when did we last see a connection
+    /// drop?" health probes.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.partitions
+            .iter()
+            .filter_map(magnetar_runtime_tokio::Producer::last_disconnected_timestamp)
+            .min()
+    }
 }
 
 /// Builder for [`PartitionedProducer`]. Mirrors Java's `ProducerBuilder` at the partitioned
