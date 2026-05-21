@@ -136,12 +136,35 @@ impl DriverHandle {
 
 /// Reconnect context passed to the supervised driver. Lets the supervisor re-open the TCP
 /// (and optionally TLS) connection to the broker after a transient drop.
-#[derive(Debug, Clone)]
+///
+/// When `service_url_provider` is set, every reconnect attempt re-resolves the broker URL
+/// via [`magnetar_proto::ServiceUrlProvider::get_service_url`] instead of reusing the cached
+/// `url`. This is the runtime hook that makes PIP-121 cluster failover policies
+/// (`AutoClusterFailover`, `ControlledClusterFailover`) able to swap broker URLs between
+/// reconnect attempts without re-building the client. See the PIP-121 row in `README.md`.
+#[derive(Clone)]
 pub(crate) struct ReconnectContext {
     /// Parsed Pulsar URL — `pulsar://` or `pulsar+ssl://` + host + port.
+    /// Cached at start; refreshed via `service_url_provider` on every reconnect.
     pub(crate) url: ParsedUrl,
     /// `rustls::ClientConfig` for `pulsar+ssl://`. `None` for plaintext.
     pub(crate) tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Optional PIP-121 provider polled on every reconnect attempt. When `None`, the cached
+    /// `url` is reused (matches the pre-PIP-121 behaviour).
+    pub(crate) service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+}
+
+impl std::fmt::Debug for ReconnectContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReconnectContext")
+            .field("url", &self.url)
+            .field("tls_enabled", &self.tls_config.is_some())
+            .field(
+                "has_service_url_provider",
+                &self.service_url_provider.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Spawn the driver loop on the current tokio runtime — generic-socket flavour for
@@ -233,11 +256,37 @@ async fn supervised_driver_loop(
                 return last_inner_result;
             }
 
-            match Transport::connect(&reconnect_ctx.url, reconnect_ctx.tls_config.clone()).await {
+            // PIP-121 cluster failover — re-resolve the broker URL via the provider on every
+            // attempt before dialling. The provider is sync + cheap by contract (see
+            // `magnetar_proto::ServiceUrlProvider` doc); a provider that wants to do I/O must
+            // park the work on a separate task and stamp its result into shared state. If no
+            // provider is configured, fall back to the cached URL captured at start time.
+            let target_url: std::borrow::Cow<'_, ParsedUrl> =
+                match reconnect_ctx.service_url_provider.as_ref() {
+                    Some(provider) => {
+                        let raw = provider.get_service_url();
+                        match ParsedUrl::parse(&raw) {
+                            Ok(parsed) => std::borrow::Cow::Owned(parsed),
+                            Err(err) => {
+                                tracing::warn!(
+                                    "supervisor: service-url provider returned an unparseable URL \
+                                 {raw:?} on attempt {attempt}: {err}; falling back to the \
+                                 cached URL"
+                                );
+                                std::borrow::Cow::Borrowed(&reconnect_ctx.url)
+                            }
+                        }
+                    }
+                    None => std::borrow::Cow::Borrowed(&reconnect_ctx.url),
+                };
+
+            match Transport::connect(&target_url, reconnect_ctx.tls_config.clone()).await {
                 Ok(t) => break t,
                 Err(err) => {
+                    let (host, port) = target_url.socket_addr();
                     tracing::warn!(
-                        "supervisor: reconnect attempt {attempt} failed: {err}; will retry"
+                        "supervisor: reconnect attempt {attempt} failed (url={host}:{port}): \
+                         {err}; will retry"
                     );
                     // Loop and back off again.
                 }

@@ -590,7 +590,7 @@ known-missing feature.
 | `tlsTrustCertsFilePath` | ✅ | ✅ | `ClientBuilder::tls_trust_certs_file_path`. |
 | `tlsAllowInsecureConnection` | ✅ | ✅ | `ClientBuilder::tls_allow_insecure_connection(true)` — accepts any server cert via a custom rustls verifier. **Insecure**, do not use in production. |
 | `enableTlsHostnameVerification` | ✅ | 🟡 | `ClientBuilder::tls_hostname_verification_enable(bool)`; the "chain on + hostname off" combination is the planned follow-up (today honoured only via the `tls_allow_insecure_connection` blanket override). |
-| `serviceUrlProvider` (URL rotation) | ✅ | 🟡 | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)`; runtime URL rotation on reconnect pending. |
+| `serviceUrlProvider` (URL rotation) | ✅ | ✅ | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)` — the supervised reconnect path calls `provider.get_service_url()` on every reconnect attempt, so cluster-failover policies can swap broker URLs between attempts. |
 | `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
 | `memoryLimit` | ✅ | 🟡 | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` + `PulsarClient::memory_limit` getter; runtime enforcement (accounting + blocking on `ProducerBlock`) pending. |

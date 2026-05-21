@@ -89,6 +89,7 @@ pub use crate::driver::DriverHandle;
 pub use crate::error::ClientError;
 pub use crate::producer::{Producer, SendFut};
 pub use crate::tls_insecure::insecure_tls_config;
+pub use crate::transport::default_tls_config;
 pub use crate::url_parse::{ParsedUrl, Scheme};
 
 /// Shared connection state — the lock-protected sans-io state machine + a single-cell driver

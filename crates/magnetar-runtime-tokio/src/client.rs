@@ -114,8 +114,34 @@ impl Client {
         config: ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_provider(url, tls_config, config, auth_provider, None).await
+    }
+
+    /// Same as [`Self::connect_with`] but also threads a PIP-121
+    /// [`magnetar_proto::ServiceUrlProvider`] through to the auto-reconnect supervisor. When
+    /// `service_url_provider` is `Some`, the supervisor re-resolves the broker URL via
+    /// `provider.get_service_url()` on every reconnect attempt — so cluster-failover policies
+    /// can swap broker addresses without the client being rebuilt.
+    ///
+    /// `service_url_provider = None` matches [`Self::connect_with`] exactly: the cached `url`
+    /// is reused for every reconnect.
+    pub async fn connect_with_provider(
+        url: ParsedUrl,
+        tls_config: Option<Arc<rustls::ClientConfig>>,
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
+    ) -> Result<Self, ClientError> {
         let socket = Transport::connect(&url, tls_config.clone()).await?;
-        Self::start_supervised_handshake(socket, url, tls_config, config, auth_provider).await
+        Self::start_supervised_handshake(
+            socket,
+            url,
+            tls_config,
+            config,
+            auth_provider,
+            service_url_provider,
+        )
+        .await
     }
 
     /// Drive the handshake against an already-connected socket. Useful for tests and for
@@ -166,13 +192,18 @@ impl Client {
         tls_config: Option<Arc<rustls::ClientConfig>>,
         config: ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+        service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     ) -> Result<Self, ClientError> {
         let shared = ConnectionShared::with_auth(config, auth_provider);
 
         shared.inner.lock().begin_handshake()?;
         shared.driver_waker.notify_one();
 
-        let ctx = ReconnectContext { url, tls_config };
+        let ctx = ReconnectContext {
+            url,
+            tls_config,
+            service_url_provider,
+        };
         let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
 
         match wait_connected(shared.clone()).await {

@@ -1219,14 +1219,47 @@ impl ClientBuilder {
                 }
                 magnetar_runtime_tokio::Scheme::Plain => None,
             };
-            Client::connect_with(parsed, tls_config, config, self.auth_provider).await?
+            Client::connect_with_provider(
+                parsed,
+                tls_config,
+                config,
+                self.auth_provider,
+                self.service_url_provider,
+            )
+            .await?
         } else if let Some(pem) = self.tls_trust_certs_pem {
             let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
             let tls_config = match parsed.scheme {
                 magnetar_runtime_tokio::Scheme::Tls => Some(Client::tls_config_from_pem(&pem)?),
                 magnetar_runtime_tokio::Scheme::Plain => None,
             };
-            Client::connect_with(parsed, tls_config, config, self.auth_provider).await?
+            Client::connect_with_provider(
+                parsed,
+                tls_config,
+                config,
+                self.auth_provider,
+                self.service_url_provider,
+            )
+            .await?
+        } else if self.service_url_provider.is_some() {
+            // Provider configured but no explicit TLS / PEM. Go through the provider-aware
+            // path so PIP-121 rotation works on reconnect — `connect_auth` doesn't accept the
+            // provider arg.
+            let parsed = magnetar_runtime_tokio::ParsedUrl::parse(&service_url)?;
+            let tls_config = match parsed.scheme {
+                magnetar_runtime_tokio::Scheme::Tls => {
+                    Some(magnetar_runtime_tokio::default_tls_config()?)
+                }
+                magnetar_runtime_tokio::Scheme::Plain => None,
+            };
+            Client::connect_with_provider(
+                parsed,
+                tls_config,
+                config,
+                self.auth_provider,
+                self.service_url_provider,
+            )
+            .await?
         } else {
             Client::connect_auth(&service_url, config, self.auth_provider).await?
         };

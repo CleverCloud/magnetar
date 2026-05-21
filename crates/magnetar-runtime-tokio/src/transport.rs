@@ -110,7 +110,7 @@ impl AsyncWrite for Transport {
 /// # Errors
 ///
 /// Returns [`ClientError::Other`] if the system root certificates cannot be loaded.
-pub(crate) fn default_tls_config() -> Result<Arc<rustls::ClientConfig>, ClientError> {
+pub fn default_tls_config() -> Result<Arc<rustls::ClientConfig>, ClientError> {
     let mut roots = rustls::RootCertStore::empty();
     // rustls-native-certs 0.8 returns a `CertificateResult` that surfaces both the parsed
     // certificates and any per-cert errors. Mirror rustls' own guidance: individual parse
