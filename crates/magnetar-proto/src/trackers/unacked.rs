@@ -350,4 +350,104 @@ mod tests {
         let next = t.next_deadline().unwrap();
         assert!(next <= t0 + Duration::from_millis(20));
     }
+
+    /// Java `UnAckedMessageTrackerTest#testAddAndRemove` lines 69-71: a second `add` for the
+    /// same message id is a no-op (`assertFalse(tracker.add(mid))`). Here we observe the
+    /// invariant indirectly: a duplicate add must not produce two ids in the next redelivery.
+    #[test]
+    fn duplicate_add_is_ignored() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        t.add(mid(1), t0);
+        t.add(mid(1), t0 + Duration::from_millis(10));
+        let actions = t.poll(t0 + Duration::from_millis(101));
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            UnackedAction::RedeliverExpired { message_ids, .. } => {
+                assert_eq!(message_ids.len(), 1, "duplicate add must not double-track");
+            }
+        }
+    }
+
+    /// After a bucket is reaped (`poll` returns its ids), tracking state for those ids must be
+    /// fully cleared so a subsequent broker redelivery + `add` re-enters the window. Mirrors
+    /// the Java flow where `timePartitions.removeFirst()` followed by a fresh `add(mid)`
+    /// succeeds.
+    #[test]
+    fn re_add_after_expiry_is_tracked_again() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        let first = t.poll(t0 + Duration::from_millis(101));
+        assert_eq!(first.len(), 1);
+        // Broker re-delivers; we add the same id again at a later time.
+        let t1 = t0 + Duration::from_millis(150);
+        t.add(mid(1), t1);
+        assert!(t.poll(t1 + Duration::from_millis(50)).is_empty());
+        let second = t.poll(t1 + Duration::from_millis(101));
+        assert_eq!(second.len(), 1);
+        match &second[0] {
+            UnackedAction::RedeliverExpired { message_ids, .. } => {
+                assert_eq!(message_ids, &vec![mid(1)]);
+            }
+        }
+    }
+
+    /// An empty tracker has no scheduled work. Mirrors the Java tracker's empty-state where
+    /// `timePartitions` holds no due entries.
+    #[test]
+    fn next_deadline_is_none_when_empty() {
+        let t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        assert!(t.next_deadline().is_none());
+    }
+
+    /// Removing an id that was never tracked must be a safe no-op. Java's
+    /// `tracker.remove(mid)` returns `false` rather than throwing; the Rust API has no return
+    /// value but must not panic or corrupt state.
+    #[test]
+    fn remove_unknown_id_is_safe() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        t.remove(&mid(999));
+        // Tracker remains usable.
+        let t0 = Instant::now();
+        t.add(mid(1), t0);
+        let actions = t.poll(t0 + Duration::from_millis(101));
+        assert_eq!(actions.len(), 1);
+    }
+
+    /// Multiple messages added within the same window share a single bucket and are emitted
+    /// together as one `RedeliverExpired` action — mirrors Java where `timePartitions.peek()`
+    /// returns a single `HashSet<MessageId>` flushed in one go.
+    #[test]
+    fn messages_in_same_window_redeliver_together() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_millis(100));
+        let t0 = Instant::now();
+        for entry in 1..=5 {
+            t.add(mid(entry), t0 + Duration::from_millis(entry * 5));
+        }
+        let actions = t.poll(t0 + Duration::from_millis(200));
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            UnackedAction::RedeliverExpired { message_ids, .. } => {
+                assert_eq!(message_ids.len(), 5);
+                // Sort guarantee from `poll`: ids must come out ascending.
+                let mut sorted = message_ids.clone();
+                sorted.sort();
+                assert_eq!(message_ids, &sorted);
+            }
+        }
+    }
+
+    /// A disabled tracker must accept `remove` without panicking and without ever producing
+    /// actions. Defensive parity with Java where `UNACKED_MESSAGE_TRACKER_DISABLED` returns
+    /// `false` for every mutator.
+    #[test]
+    fn disabled_tracker_remove_is_safe() {
+        let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::ZERO);
+        t.add(mid(1), Instant::now());
+        t.remove(&mid(1));
+        t.remove(&mid(999));
+        assert!(t.poll(Instant::now() + Duration::from_secs(60)).is_empty());
+    }
 }
