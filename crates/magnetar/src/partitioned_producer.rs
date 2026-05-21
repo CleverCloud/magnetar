@@ -169,6 +169,41 @@ impl PartitionedProducer {
             .filter_map(magnetar_runtime_tokio::Producer::last_disconnected_timestamp)
             .min()
     }
+
+    /// `true` once every child producer is closed. Mirrors Java `Producer#isClosed` at the
+    /// partitioned scope. Pair with [`Self::is_connected`] for the live test — `is_closed`
+    /// only flips after a terminal close, not on transient disconnects.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.partitions
+            .iter()
+            .all(magnetar_runtime_tokio::Producer::is_closed)
+    }
+
+    /// Max `last_sequence_id` across every child producer (i.e. the largest sequence id
+    /// this client has pushed onto the wire on any partition). Returns `-1` when no
+    /// partition has sent yet. Useful for at-least-once resume-on-restart at the
+    /// partitioned scope. Mirrors Java `Producer#getLastSequenceId` aggregated.
+    #[must_use]
+    pub fn last_sequence_id(&self) -> i64 {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::last_sequence_id)
+            .max()
+            .unwrap_or(-1)
+    }
+
+    /// Max `last_sequence_id_published` across every child producer. Returns `-1` when no
+    /// partition has been acknowledged yet. Mirrors Java
+    /// `Producer#getLastSequenceIdPublished` aggregated.
+    #[must_use]
+    pub fn last_sequence_id_published(&self) -> i64 {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::last_sequence_id_published)
+            .max()
+            .unwrap_or(-1)
+    }
 }
 
 /// Builder for [`PartitionedProducer`]. Mirrors Java's `ProducerBuilder` at the partitioned
