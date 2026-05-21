@@ -400,6 +400,27 @@ impl IncomingMessage {
         self.metadata.replicated_from.as_deref()
     }
 
+    /// Mirrors Java `Message#isReplicated`. `true` if this message was geo-replicated from
+    /// another cluster — equivalent to `replicated_from().is_some()`.
+    #[must_use]
+    pub fn is_replicated(&self) -> bool {
+        self.metadata.replicated_from.is_some()
+    }
+
+    /// `true` if the message arrived as part of a batched entry. The position within the
+    /// batch is on `id.batch_index`. Useful for partial-batch ack logic and telemetry.
+    #[must_use]
+    pub fn is_batched(&self) -> bool {
+        self.id.batch_index >= 0
+    }
+
+    /// `true` if the message arrived on a partitioned topic. The partition index is on
+    /// `id.partition`.
+    #[must_use]
+    pub fn is_partitioned(&self) -> bool {
+        self.id.partition >= 0
+    }
+
     /// Mirrors Java `Message#hasReplicateTo`. `true` when the producer stamped an explicit
     /// replication cluster list (via `OutgoingMessage::replication_clusters` /
     /// `disable_replication`).
@@ -1560,5 +1581,47 @@ mod outgoing_message_tests {
         });
         assert_eq!(msg.broker_publish_time_ms(), Some(1_700_000_000_000));
         assert_eq!(msg.broker_index(), Some(42));
+    }
+
+    #[test]
+    fn is_replicated_tracks_metadata() {
+        let unset = message_with(pb::MessageMetadata::default());
+        assert!(!unset.is_replicated());
+
+        let stamped = message_with(pb::MessageMetadata {
+            replicated_from: Some("us-east".to_owned()),
+            ..pb::MessageMetadata::default()
+        });
+        assert!(stamped.is_replicated());
+        assert_eq!(stamped.replicated_from(), Some("us-east"));
+    }
+
+    #[test]
+    fn is_batched_and_is_partitioned_track_id_fields() {
+        let single = message_with(pb::MessageMetadata::default());
+        assert!(!single.is_batched());
+        assert!(!single.is_partitioned());
+
+        let mut batched = message_with(pb::MessageMetadata::default());
+        batched.id = magnetar_proto::types::MessageId {
+            ledger_id: 1,
+            entry_id: 2,
+            partition: -1,
+            batch_index: 3,
+            batch_size: 10,
+        };
+        assert!(batched.is_batched());
+        assert!(!batched.is_partitioned());
+
+        let mut partitioned = message_with(pb::MessageMetadata::default());
+        partitioned.id = magnetar_proto::types::MessageId {
+            ledger_id: 1,
+            entry_id: 2,
+            partition: 4,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        assert!(!partitioned.is_batched());
+        assert!(partitioned.is_partitioned());
     }
 }
