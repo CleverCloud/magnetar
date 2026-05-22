@@ -16,6 +16,10 @@ publish     = true
 [[bin]]
 name = "magnetar"
 path = "src/main.rs"
+# The `magnetar` lib crate also emits rustdoc into `target/doc/magnetar/`.
+# Disabling rustdoc on the binary avoids the documented output collision
+# (cargo issue #6313) without renaming the user-visible CLI.
+doc  = false
 
 [lints]
 workspace = true

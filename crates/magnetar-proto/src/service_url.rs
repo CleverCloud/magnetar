@@ -79,7 +79,10 @@ impl ServiceUrlProvider for StaticServiceUrlProvider {
 }
 
 /// Convenience constructor: wrap a single URL in an [`Arc<dyn ServiceUrlProvider>`] so callers
-/// can hand the result directly to [`crate::conn::ConnectionConfig::service_url_provider`].
+/// can hand the result directly to the runtime client builder
+/// (`ClientBuilder::service_url_provider` in the `magnetar` facade crate, or
+/// the `service_url_provider` parameter on `Client::connect_with_provider`
+/// in `magnetar-runtime-tokio`).
 #[must_use]
 pub fn static_service_url_provider(url: impl Into<String>) -> Arc<dyn ServiceUrlProvider> {
     Arc::new(StaticServiceUrlProvider::new(url))

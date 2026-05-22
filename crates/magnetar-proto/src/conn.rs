@@ -126,7 +126,7 @@ pub struct ConnectionConfig {
 ///
 /// The proto crate exposes this enum so the runtime engines can read the
 /// policy from [`ConnectionConfig`] without going through a higher-level
-/// re-export. The user-facing [`magnetar::MemoryLimitPolicy`] re-export
+/// re-export. The user-facing `magnetar::MemoryLimitPolicy` re-export
 /// in the facade crate is the same shape and converts 1:1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryLimitPolicy {

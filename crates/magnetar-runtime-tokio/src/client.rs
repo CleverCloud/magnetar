@@ -145,10 +145,11 @@ impl Client {
     }
 
     /// Same as [`Self::connect_with_provider`] but also threads a pluggable DNS resolver
-    /// (Java `ClientBuilder#dnsResolver`) through to [`Transport::connect_with_resolver`].
-    /// When `dns_resolver` is `Some`, every initial and reconnect dial routes the
-    /// `(host, port)` lookup through `resolver.resolve(...)`; when `None`, the runtime
-    /// falls back to tokio's built-in [`tokio::net::lookup_host`] — identical to
+    /// (Java `ClientBuilder#dnsResolver`) through to the internal
+    /// `Transport::connect_with_resolver` entry. When `dns_resolver` is `Some`,
+    /// every initial and reconnect dial routes the `(host, port)` lookup through
+    /// `resolver.resolve(...)`; when `None`, the runtime falls back to tokio's
+    /// built-in [`tokio::net::lookup_host`] — identical to
     /// [`Self::connect_with_provider`].
     pub async fn connect_with_resolver_and_provider(
         url: ParsedUrl,

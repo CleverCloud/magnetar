@@ -31,8 +31,8 @@
 //! TLS for the moonpool engine is the `option (d)` adapter ([`tls`]): drive
 //! [`rustls::ClientConnection`] (itself sans-io) over the moonpool-supplied
 //! byte pipe. The TLS handshake therefore survives `moonpool-sim` chaos with
-//! the same determinism as `magnetar-proto` itself. The
-//! [`crate::transport::Transport`] enum exposes a `Tls` variant that the
+//! the same determinism as `magnetar-proto` itself. The internal
+//! `crate::transport::Transport` enum exposes a `Tls` variant that the
 //! driver loop drives identically to the plaintext path —
 //! [`MoonpoolEngine::connect_tls`] runs the handshake inline before handing
 //! the transport to the driver task.

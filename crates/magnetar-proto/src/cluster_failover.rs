@@ -9,7 +9,7 @@
 //! URL. The supervised reconnect path picks it up on the next attempt
 //! (see `magnetar-runtime-tokio::driver::supervised_driver_loop`).
 //!
-//! [`AutoClusterFailover`] (in `magnetar-runtime-tokio`) builds on this
+//! `AutoClusterFailover` (in `magnetar-runtime-tokio`) builds on this
 //! shape with a background tokio task that runs user-supplied health
 //! probes and flips the active URL automatically.
 //!

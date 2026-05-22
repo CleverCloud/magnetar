@@ -438,7 +438,8 @@ impl ClientCredentialsFlow {
         Ok(parsed)
     }
 
-    /// Refresh the cached token if it is missing or within [`Self::leeway`] of expiry.
+    /// Refresh the cached token if it is missing or within the configured
+    /// refresh leeway of expiry (see [`ClientCredentialsFlowBuilder::refresh_leeway`]).
     pub async fn ensure_fresh(&self) -> Result<(), OAuth2Error> {
         if self.needs_refresh() {
             self.fetch_token().await?;

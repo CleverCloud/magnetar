@@ -6,9 +6,9 @@
 //! producer/consumer [`Trace`] (a sequence of operations) and runs it
 //! against BOTH engines:
 //!
-//! - the tokio engine ([`magnetar-runtime-tokio`]) against a scripted in-process broker bound to
+//! - the tokio engine ([`magnetar_runtime_tokio`]) against a scripted in-process broker bound to
 //!   `127.0.0.1`,
-//! - the moonpool engine ([`magnetar-runtime-moonpool`]) with [`moonpool_core::TokioProviders`]
+//! - the moonpool engine ([`magnetar_runtime_moonpool`]) with [`moonpool_core::TokioProviders`]
 //!   against the same scripted broker,
 //!
 //! then compares user-visible [`EventStream`]s for equivalence.
@@ -24,7 +24,7 @@
 //! ## Why both engines run on `TokioProviders`
 //!
 //! `moonpool-sim` (the deterministic-chaos provider bundle) is not yet
-//! a workspace dependency — only [`moonpool-core`] is. With
+//! a workspace dependency — only [`moonpool_core`] is. With
 //! `TokioProviders` plugged in, the moonpool engine still drives the
 //! same façade types (`Client<P>`, `Producer<P>`, `Consumer<P>`) the
 //! sim path uses, so the harness exercises the engine surface that

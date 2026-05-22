@@ -145,7 +145,7 @@ impl<P: Providers> Consumer<P> {
     ///
     /// Multiple concurrent `receive()` calls on the same consumer are
     /// supported: each future installs its own waker into the per-consumer
-    /// slab on [`magnetar_proto::ConsumerState`]; arrival drains the slab and
+    /// slab on [`magnetar_proto::consumer::ConsumerState`]; arrival drains the slab and
     /// every parked future is re-polled. The first to acquire the connection
     /// lock pops the message; the others observe an empty queue and re-park.
     ///

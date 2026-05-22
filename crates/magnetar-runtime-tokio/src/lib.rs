@@ -43,7 +43,7 @@
 //!
 //! - User-facing futures lock `Arc<parking_lot::Mutex<magnetar_proto::Connection>>` directly.
 //! - Driver wake-ups travel through a single-cell [`tokio::sync::Notify`].
-//! - Future completion uses [`Waker`](core::task::Waker) slabs inside the sans-io state machine,
+//! - Future completion uses [`core::task::Waker`] slabs inside the sans-io state machine,
 //!   registered via [`magnetar_proto::Connection::register_waker`] and dispatched when the matching
 //!   [`magnetar_proto::OpOutcome`] lands.
 //!
@@ -273,8 +273,8 @@ impl ConnectionShared {
     ///
     /// This is the building block of
     /// [`magnetar_proto::MemoryLimitPolicy::ProducerBlock`]. The
-    /// [`MemoryReserveFut`](crate::producer::MemoryReserveFut) future polls
-    /// this method until it succeeds; on `Drop` it calls
+    /// `SendFut` future in `crate::producer` polls this method until it
+    /// succeeds; on `Drop` it calls
     /// [`Self::cancel_memory_waker`] to evict the stale waker slot.
     ///
     /// Re-checking after registration closes the lost-wakeup window: a
@@ -300,7 +300,7 @@ impl ConnectionShared {
     }
 
     /// Remove a previously-registered waker. Called from the
-    /// [`MemoryReserveFut`](crate::producer::MemoryReserveFut) `Drop` impl
+    /// `SendFut` `Drop` impl in `crate::producer`
     /// and on the "won the recheck" path of
     /// [`Self::try_reserve_memory_or_register`]. Idempotent — a missing slot
     /// is a no-op (a concurrent [`Self::release_memory`] may have drained it

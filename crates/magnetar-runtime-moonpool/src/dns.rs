@@ -2,17 +2,17 @@
 
 //! Pluggable DNS resolver — moonpool engine flavour.
 //!
-//! Mirrors [`magnetar_runtime_tokio::dns::DnsResolver`] but lives behind the
-//! `magnetar-runtime-moonpool` `Providers`-generic transport so the
-//! deterministic-simulation substrate can plug in a virtual resolver. Java
-//! parity: `ClientBuilder#dnsResolver`. Lives in the runtime crate (not
+//! Mirrors the `magnetar_runtime_tokio::dns::DnsResolver` trait but lives
+//! behind the `magnetar-runtime-moonpool` `Providers`-generic transport so
+//! the deterministic-simulation substrate can plug in a virtual resolver.
+//! Java parity: `ClientBuilder#dnsResolver`. Lives in the runtime crate (not
 //! `magnetar-proto`) because DNS is, by definition, I/O — see
 //! [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md).
 //!
 //! # Default
 //!
-//! When no resolver is configured on the [`crate::Transport`] connect path,
-//! the engine falls back to whatever the configured
+//! When no resolver is configured on the internal `crate::transport::Transport`
+//! connect path, the engine falls back to whatever the configured
 //! [`moonpool_core::NetworkProvider::connect`] does with a `host:port`
 //! string — which is `tokio::net::TcpStream::connect` for
 //! `TokioNetworkProvider` and the in-memory virtual fabric for a moonpool
@@ -26,8 +26,8 @@
 //!
 //! # Determinism
 //!
-//! The resolver is consulted **before** [`crate::Transport`] hands the
-//! `(host, port)` pair to the moonpool [`moonpool_core::NetworkProvider`].
+//! The resolver is consulted **before** the internal `crate::transport::Transport`
+//! hands the `(host, port)` pair to the moonpool [`moonpool_core::NetworkProvider`].
 //! Inside `moonpool-sim`, that lets the resolver hand back a virtual
 //! `127.0.x.y:port` address that the simulator's network fabric routes
 //! deterministically. The [`StaticDnsResolver`] helper below is the
@@ -48,7 +48,7 @@ pub type DnsResolveFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, EngineError>> + Send + 'a>>;
 
 /// Async DNS resolver — moonpool flavour. Mirrors the tokio engine's
-/// [`magnetar_runtime_tokio::dns::DnsResolver`] but returns
+/// `magnetar_runtime_tokio::dns::DnsResolver` but returns
 /// [`EngineError`] so callers can `?` straight from the moonpool transport
 /// layer.
 ///
