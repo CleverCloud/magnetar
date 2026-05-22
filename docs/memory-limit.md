@@ -138,7 +138,20 @@ loop and the slab drain order live next to the implementations.
 
 ## Moonpool engine
 
-The moonpool engine implements `FailImmediately` only. `ProducerBlock`
-parity on moonpool is tracked in [`follow-ups.md`](follow-ups.md) — the
-slab+waker fan-out is sans-io-clean but the drain-order determinism
-story under `SimProviders` is not yet specified.
+The moonpool engine implements both `FailImmediately` and
+`ProducerBlock` with the same `Slab<Waker>` machinery as the tokio
+engine. The fairness contract under `moonpool_core::Providers` is
+specified in
+[ADR-0022](../specs/adr/0022-memory-limit-producer-block-moonpool.md):
+the slab drains in insertion order, but `Waker::wake()` then hands
+off to the wrapping `Providers::task` runtime, so tests must depend
+on *eventual* progress (every parked send eventually observes either
+a successful reservation or its own cancellation) rather than a
+specific wake order across multiple producers.
+
+The runtime fields live on
+[`crates/magnetar-runtime-moonpool/src/lib.rs`](../crates/magnetar-runtime-moonpool/src/lib.rs)
+(`ConnectionShared::memory_limit_policy`,
+`ConnectionShared::memory_wakers`); the `SendFut` retry path lives in
+[`crates/magnetar-runtime-moonpool/src/producer.rs`](../crates/magnetar-runtime-moonpool/src/producer.rs)
+(`SendState::Reserving`).

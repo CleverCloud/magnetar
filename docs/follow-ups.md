@@ -25,21 +25,6 @@ every attempt, so the trait wiring is in place.
 
 See [ADR-0016](../specs/adr/0016-pip-121-cluster-failover.md).
 
-### `MemoryLimitPolicy::ProducerBlock` on moonpool
-
-**Status.** Tokio-only. The moonpool engine returns
-`EngineError::MemoryLimitExceeded` synchronously on overflow
-regardless of policy.
-
-**Unblock.** The `Waker` slab fan-out is sans-io-clean
-([ADR-0020](../specs/adr/0020-memory-limit-producer-block.md)), but
-the drain-order determinism story under `moonpool_core::SimProviders`
-is not yet specified. Either confirm that the slab drain order is
-stable under sim, or document a moonpool-native equivalent of Java's
-`MemoryLimitController` fairness contract.
-
-See [`memory-limit.md`](memory-limit.md).
-
 ### Façade surface bound to `PulsarClient<MoonpoolEngine<P>>`
 
 **Status.** Partitioned producer / partitioned consumer /

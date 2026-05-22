@@ -1609,6 +1609,7 @@ dependencies = [
  "moonpool-core",
  "parking_lot",
  "rustls",
+ "slab",
  "thiserror",
  "tokio",
  "tracing",
