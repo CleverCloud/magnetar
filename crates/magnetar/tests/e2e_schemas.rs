@@ -25,6 +25,7 @@ use std::time::Duration;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_proto::schema::{BytesSchema, Int32Schema, JsonSchema, StringSchema};
+use schemars::JsonSchema as SchemarsJsonSchema;
 use serde::{Deserialize, Serialize};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -172,7 +173,7 @@ async fn e2e_schema_string_roundtrip() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SchemarsJsonSchema)]
 struct Person {
     name: String,
     age: u32,

@@ -26,6 +26,7 @@ uuid         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 apache-avro  = { workspace = true }
+schemars     = { workspace = true }
 hdrhistogram = { workspace = true }
 
 [dev-dependencies]

@@ -288,12 +288,13 @@ fn base64_encode(out: &mut String, input: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use schemars::JsonSchema as SchemarsJsonSchema;
     use serde::{Deserialize, Serialize};
 
     use super::*;
     use crate::schema::{JsonSchema, StringSchema};
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SchemarsJsonSchema)]
     struct Person {
         name: String,
         age: u32,
@@ -321,12 +322,67 @@ mod tests {
     }
 
     #[test]
-    fn base64_round_trip_marker() {
-        // The Json child carries `{}` as its schema_data. Base64("{}") = "e30=".
+    fn child_schema_data_base64_round_trips() {
+        // The Json child now carries a full JSON-Schema document (via schemars) as its schema_data.
+        // Decode the base64-encoded `schema` field and assert it round-trips byte-for-byte to the
+        // child schema's `schema_data()` — that's the broker-side de-duplication invariant.
         let schema = make();
         let data = schema.schema_data();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert!(s.contains(r#""value":{"type":"Json","schema":"e30="}"#));
+        let envelope: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let encoded_b64 = envelope
+            .get("value")
+            .and_then(|v| v.get("schema"))
+            .and_then(serde_json::Value::as_str)
+            .expect("envelope must carry value.schema");
+        let decoded = base64_decode(encoded_b64).expect("value.schema must be valid base64");
+        let value_schema_data = JsonSchema::<Person>::new().schema_data();
+        assert_eq!(decoded.as_slice(), value_schema_data.as_ref());
+        // Smoke-check: the decoded payload is a JSON document describing a `Person`.
+        let document: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("decoded schema must be valid JSON");
+        assert!(
+            document.get("properties").is_some(),
+            "decoded schema document should have a `properties` field; got {document}"
+        );
+    }
+
+    /// Minimal base64 decoder (standard alphabet, no padding tolerance) for tests only.
+    fn base64_decode(input: &str) -> Option<Vec<u8>> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut lookup = [255u8; 256];
+        for (i, &b) in ALPHABET.iter().enumerate() {
+            lookup[b as usize] = u8::try_from(i).ok()?;
+        }
+        let bytes = input.as_bytes();
+        if !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks_exact(4) {
+            let (a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            let av = lookup[a as usize];
+            let bv = lookup[b as usize];
+            if av == 255 || bv == 255 {
+                return None;
+            }
+            out.push((av << 2) | (bv >> 4));
+            if c != b'=' {
+                let cv = lookup[c as usize];
+                if cv == 255 {
+                    return None;
+                }
+                out.push((bv << 4) | (cv >> 2));
+                if d != b'=' {
+                    let dv = lookup[d as usize];
+                    if dv == 255 {
+                        return None;
+                    }
+                    out.push((cv << 6) | dv);
+                }
+            }
+        }
+        Some(out)
     }
 
     #[test]

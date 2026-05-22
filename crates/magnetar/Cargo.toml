@@ -60,6 +60,7 @@ uuid                       = { workspace = true }
 # heavy dep — encryption itself lives in `magnetar-messagecrypto`.
 aws-lc-rs          = { workspace = true }
 reqwest            = { workspace = true }
+schemars           = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 testcontainers     = { workspace = true }
