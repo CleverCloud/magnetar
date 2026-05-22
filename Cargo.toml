@@ -68,7 +68,7 @@ rustls-native-certs  = "0.8"
 tokio-rustls         = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Compression — Pulsar's four codecs
-lz4_flex   = { version = "0.11", default-features = false, features = ["std"] }
+lz4_flex   = { version = "0.13", default-features = false, features = ["std"] }
 zstd       = { version = "0.13", default-features = false }
 snap       = "1"
 flate2     = { version = "1", default-features = false, features = ["zlib"] }
