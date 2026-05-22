@@ -17,40 +17,10 @@ use magnetar_runtime_tokio::{Client, ClientError, ConnectionShared, Consumer, Pr
 use crate::trace::{Event, EventStream, Op, Trace};
 
 /// Frequency at which the kicker pulses `driver_waker.notify_one()`.
-///
-/// The engine's user-facing futures (`wait_producer_ready`,
-/// `EventWaitFut`, etc.) spawn one-shot "orphan" tasks that race for
-/// `driver_waker.notified()` permits with the driver loop. In real
-/// e2e against a live Pulsar broker, periodic PINGs and ack traffic
-/// keep wake-ups flowing through the system. Against the scripted
-/// differential broker — which only speaks the bare protocol subset
-/// the harness needs and never emits PINGs / acks of its own —
-/// orphan tasks can starve and stall a future indefinitely.
-///
-/// Commit `c983026e3521` made the production driver loop call
-/// `driver_waker.notify_waiters()` after every `handle_bytes`. That
-/// is sufficient for the short `broker_smoke` handshake +
-/// producer-open round-trip (which now passes without any kicker —
-/// verified by removing the in-test kicker on 2026-05-22; the test
-/// stays green and `[broker]` traces show a normal frame sequence).
-///
-/// However the longer `golden_traces` multi-op sequences (`Recv`
-/// with 2 s timeouts, seek replay, nack redelivery) regress to a
-/// ~30 s wall-clock run when the kicker is removed — the
-/// `consumer.receive()` futures observe the queued message only
-/// after the per-op `tokio::time::timeout` eventually re-polls,
-/// which is a separate orphan-task latency leak on the
-/// consumer-receive path (the consumer's per-message slab is not
-/// yet wired to wake the `Recv` future directly on delivery).
-///
-/// Until that consumer-side wake path is closed, the kicker stays
-/// in for safety. 25 ms is fast enough to keep golden-trace latency
-/// in the millisecond range (a 5-op trace adds ~125 ms of kicker
-/// overhead worst case) and slow enough that it doesn't dominate
-/// the runtime. The long-term fix is to register the `Recv`
-/// future's waker against the consumer's per-message waker slab so
-/// the sans-io layer wakes it directly on delivery, after which the
-/// kicker can be removed.
+/// Retained for the longer `golden_traces` `Recv` paths — see
+/// "Consumer-receive orphan-task wake path" in
+/// [`docs/follow-ups.md`](../../../docs/follow-ups.md) for the
+/// rationale and the long-term fix.
 const KICKER_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Spawn a background kicker. Drop the returned handle to stop it.
