@@ -5,7 +5,7 @@
 //!
 //! Mirrors Java `org.apache.pulsar.client.api.AutoClusterFailover` and the
 //! tokio-engine counterpart in
-//! [`magnetar_runtime_tokio::auto_cluster_failover`] one-for-one. The
+//! `magnetar_runtime_tokio::auto_cluster_failover` one-for-one. The
 //! moonpool variant is generic over
 //! [`moonpool_core::Providers`] so the probe loop, the TCP probe socket
 //! dance, and the deadline plumbing all run through the simulator under
@@ -291,7 +291,7 @@ impl<P: Providers> ServiceUrlProvider for AutoClusterFailover<P> {
 /// the moonpool single-threaded `?Send` providers into the synchronous
 /// poll contract requires owning per-endpoint state across multiple polls
 /// without holding a non-`Send` future across an `.await`. The
-/// [`ProbeSlot`] pattern stores the verdict + the parked
+/// `ProbeSlot` pattern stores the verdict + the parked
 /// [`Waker`] in a [`parking_lot::Mutex`]; the spawned task writes the
 /// verdict and wakes the parked waker through a
 /// [`tokio::sync::Notify`]-free path (we wake the [`Waker`] directly to

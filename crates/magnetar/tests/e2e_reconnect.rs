@@ -275,10 +275,9 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
         let outcome = tokio::time::timeout(Duration::from_secs(120), fut)
             .await
             .unwrap_or_else(|_| panic!("send {i} did not resolve within 2 min"))?;
-        outcome
-            .as_ref()
-            .map(|_| ())
-            .unwrap_or_else(|e| panic!("send {i} failed after transparent replay: {e:?}"));
+        if let Err(e) = outcome.as_ref() {
+            panic!("send {i} failed after transparent replay: {e:?}");
+        }
     }
 
     // Drain the consumer — the broker eventually delivers every replayed

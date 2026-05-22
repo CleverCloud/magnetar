@@ -219,12 +219,12 @@ async fn seek_to_start_then_replay() {
 
 /// Golden 5 — many small publishes back-to-back, exercising the replay-frame
 /// storage path on each publish (Stage 3 transparent in-flight publish replay landed
-/// `OpSend::replay_frames` so reset → rebuild_producers can re-issue every unconfirmed
+/// `OpSend::replay_frames` so reset → `rebuild_producers` can re-issue every unconfirmed
 /// publish on the new session). This golden does NOT trigger a reset — the differential
 /// harness has no public hook to do so today (see follow-ups), so the new replay branch
 /// is exercised by the unit + integration tests in the proto, tokio, and moonpool crates.
 /// What this golden DOES guarantee: the post-replay-frame-storage code path produces
-/// byte-identical EventStreams across the tokio and moonpool engines. Catches the easy
+/// byte-identical `EventStream`s across the tokio and moonpool engines. Catches the easy
 /// regression where the new path diverges between engines without altering
 /// user-visible semantics.
 #[tokio::test(flavor = "current_thread")]

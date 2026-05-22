@@ -781,14 +781,13 @@ impl Connection {
     /// 1. Bump [`Self::session_epoch`].
     /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
     ///    round-trip, …). The corresponding user futures are woken with that outcome.
-    /// 3. Snapshot every in-flight producer publish into [`Self::in_flight_publish_snapshots`] (key
-    ///    = `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each
-    ///    original send-future waker exactly once — but do *not* install a `SessionLost` outcome on
-    ///    the publish key. The user future re-polls, finds no outcome, re-registers, and stays
-    ///    pending until the replayed [`crate::producer::OpSend`] surfaces its eventual
-    ///    `CommandSendReceipt` (transparent at-least-once replay). Clear every producer's batch
-    ///    container so unflushed partial batches do not survive the reconnect — the caller is
-    ///    responsible for those.
+    /// 3. Snapshot every in-flight producer publish into `in_flight_publish_snapshots` (key =
+    ///    `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each original
+    ///    send-future waker exactly once — but do *not* install a `SessionLost` outcome on the
+    ///    publish key. The user future re-polls, finds no outcome, re-registers, and stays pending
+    ///    until the replayed [`crate::producer::OpSend`] surfaces its eventual `CommandSendReceipt`
+    ///    (transparent at-least-once replay). Clear every producer's batch container so unflushed
+    ///    partial batches do not survive the reconnect — the caller is responsible for those.
     /// 4. Reset every consumer's queue + pending seek + ack tracker. Producers and consumers
     ///    themselves are *not* removed — [`Self::rebuild_producers`] and
     ///    [`Self::rebuild_consumers`] replay their `CommandProducer` / `CommandSubscribe` against
@@ -913,7 +912,7 @@ impl Connection {
     /// the broker can detect — and accept — the re-attach (rejecting stale reconnects of older
     /// epochs). Mirrors Java `ProducerImpl#reconnectLater`.
     ///
-    /// Snapshotted publishes (see [`Self::in_flight_publish_snapshots`]) are replayed onto
+    /// Snapshotted publishes (see `in_flight_publish_snapshots`) are replayed onto
     /// `producer.outbound` in their original FIFO order with their original sequence ids, then
     /// drained onto the connection's outbound buffer. Each replayed [`crate::producer::OpSend`]
     /// goes back into the producer's `pending` queue verbatim — its `waker` field is `None`

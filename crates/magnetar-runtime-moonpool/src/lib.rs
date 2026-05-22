@@ -305,7 +305,7 @@ impl ConnectionShared {
     ///
     /// This is the building block of
     /// [`magnetar_proto::MemoryLimitPolicy::ProducerBlock`]. The
-    /// [`SendFut`] future in [`crate::producer`] polls this method until
+    /// [`SendFut`] future in `crate::producer` polls this method until
     /// it succeeds; on `Drop` it calls
     /// [`Self::cancel_memory_waker`] to evict the stale waker slot.
     ///
@@ -336,7 +336,7 @@ impl ConnectionShared {
     }
 
     /// Remove a previously-registered waker. Called from the
-    /// [`SendFut`] `Drop` impl in [`crate::producer`] and on the "won the
+    /// [`SendFut`] `Drop` impl in `crate::producer` and on the "won the
     /// recheck" path of [`Self::try_reserve_memory_or_register`].
     /// Idempotent — a missing slot is a no-op (a concurrent
     /// [`Self::release_memory`] may have drained it already).

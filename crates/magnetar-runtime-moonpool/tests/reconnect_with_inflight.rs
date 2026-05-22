@@ -36,6 +36,9 @@ use crate::common::{handshake_complete_shared, open_producer_ready, send_receipt
 
 const INFLIGHT_COUNT: u64 = 10;
 
+// End-to-end snapshot-and-replay scenario. Linear by design — wire-trace
+// readability beats artificial sharding. Silence the per-function line cap.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     let t0 = Instant::now();

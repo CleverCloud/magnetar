@@ -115,6 +115,10 @@ fn send_receipt_bytes(producer: ProducerHandle, sequence_id: SequenceId) -> Byte
     buf
 }
 
+// End-to-end snapshot-and-replay scenario. The flow is linear by design
+// (wire trace stays readable in one body); splitting would obscure the
+// scenario. Silence the per-function line cap.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     const INFLIGHT_COUNT: u64 = 5;
