@@ -515,6 +515,15 @@ impl Future for ProducerReadyFut {
                         return Poll::Ready(Err(ClientError::Closed));
                     }
                 }
+                Some(ConnectionEvent::ProducerOpenFailed {
+                    handle,
+                    code,
+                    message,
+                }) => {
+                    if handle == self.handle {
+                        return Poll::Ready(Err(ClientError::Broker { code, message }));
+                    }
+                }
                 Some(ConnectionEvent::Closed { reason }) => {
                     return Poll::Ready(Err(ClientError::Other(
                         reason.unwrap_or_else(|| "connection closed".into()),
@@ -879,5 +888,60 @@ mod tests {
             0,
             "rejected sends must not bump the budget counter"
         );
+    }
+
+    /// Regression for the CLI "produce hangs against fresh broker" bug: when the broker
+    /// rejects a producer-open with `CommandError` (e.g. `ServiceNotReady` because the
+    /// namespace bundle has not yet been activated), the moonpool engine's
+    /// `wait_producer_ready` must surface a `ClientError::Broker { code, message }` rather
+    /// than parking on the driver waker forever. Mirrors the proto-level
+    /// `command_error_on_producer_open_emits_producer_open_failed` test, but covers the
+    /// engine-side bridge from event to future-result.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_producer_ready_surfaces_broker_error() {
+        let shared = handshake_complete_shared();
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/no-bundle".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "redo the lookup".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle CommandError");
+        }
+
+        // The fix replaces an unbounded wait with a typed Broker error. Hard-cap the await
+        // with a tight timeout so a regression would surface as `Elapsed`, not as a hung
+        // test process.
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::wait_producer_ready(&shared, handle),
+        )
+        .await
+        .expect("producer-ready future must resolve (regression: previously hung)");
+        match res {
+            Err(super::ClientError::Broker { code, message }) => {
+                assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
+                assert_eq!(message, "redo the lookup");
+            }
+            other => panic!("expected ClientError::Broker, got {other:?}"),
+        }
     }
 }

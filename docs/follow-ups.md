@@ -99,19 +99,22 @@ Once this lands on tokio, the moonpool engine inherits it for free
 
 ## Differential equivalence harness
 
-### Scripted broker handshake stall
+### Scripted broker — `Kicker` workaround in `runner_tokio.rs`
 
-**Status.** The scripted broker in
-[`crates/magnetar-differential/src/broker.rs`](../crates/magnetar-differential/src/broker.rs)
-stalls the producer-open round-trip in one fixture, so
+**Status.** Both runners drive the scripted broker through
 [`tests/broker_smoke.rs`](../crates/magnetar-differential/tests/broker_smoke.rs)
-is `#[ignore]`-marked with a TODO per
-[ADR-0021](../specs/adr/0021-no-silent-test-ignore-or-remove.md). The
-trace model, both runners, and the `golden_traces.rs` tests all pass.
+and the `golden_traces.rs` suite. The smoke test still depends on a
+background `Kicker` task that pulses `driver_waker.notify_one()` every
+25 ms so orphan tasks spawned by `EventWaitFut::poll` get a chance to
+drain; without it, the producer-open round-trip stalled in CI on slow
+runners. The lookup-driven path (added with the CLI hang fix) does not
+regress this — the scripted broker now answers `CommandLookupTopic`
+with a `Connect` response in one round-trip — but the workaround
+remains.
 
-**Unblock.** Tighten the broker's `CommandProducer` response timing;
-revisit the `Kicker` workaround in `runner_tokio.rs` once the broker
-stops needing periodic driver-waker nudges.
+**Unblock.** Tighten the wait futures' wakeup contract so they no
+longer need the periodic kick. Once that lands the `Kicker` task in
+`runner_tokio.rs` can be deleted.
 
 ### Expand the golden-trace catalog
 
@@ -164,6 +167,25 @@ priority because `AutoConsumeSchema` covers the common Pulsar use
 case; producers usually know their schema at construction time.
 
 ## Protocol
+
+### Moonpool engine: lookup before producer/consumer open
+
+**Status.** The tokio engine issues `CommandLookupTopic` before every
+`open_producer` / `subscribe` so the broker activates the topic's
+namespace bundle (Java parity). The moonpool engine still calls
+`Connection::create_producer` / `Connection::subscribe` directly. This
+is fine for deterministic-simulation tests that script the broker side
+explicitly, but diverges from Java + tokio engine behaviour.
+
+**Unblock.** Mirror
+[`crates/magnetar-runtime-tokio/src/client.rs`](../crates/magnetar-runtime-tokio/src/client.rs)'s
+`lookup_topic` step into the moonpool `Client::open_producer` /
+`subscribe`. Tests under
+[`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/)
+that drive the proto state machine synthetically will need to also
+feed a synthetic `CommandLookupTopicResponse` (the moonpool engine
+exposes `Client::lookup_topic` already; the change is wiring it into
+the open paths).
 
 ### PIP-415 `getMessageIdByIndex`
 

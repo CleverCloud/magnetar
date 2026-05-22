@@ -1211,7 +1211,7 @@ impl Connection {
                     .error
                     .ok_or(ProtocolError::InvariantViolation("missing CommandError"))?;
                 let request_id = RequestId(err.request_id);
-                self.pending_requests.remove(&request_id);
+                let kind = self.pending_requests.remove(&request_id);
                 self.outcomes.insert(
                     PendingOpKey::Request(request_id),
                     OpOutcome::Error {
@@ -1221,6 +1221,35 @@ impl Connection {
                     },
                 );
                 self.wake_for_request(request_id);
+                // When the failing request id correlates with a pending producer-open /
+                // consumer-subscribe, surface a typed failure event so event-stream waiters
+                // (`EventWaitFut::ProducerReady` / `EventWaitFut::SubscribeAcked` in the
+                // tokio engine, and the moonpool engine's equivalent) observe the rejection
+                // instead of hanging forever. The success-side paths (`ProducerSuccess`,
+                // `Success`) already push `ProducerReady` / `SubscribeAcked`; we mirror that
+                // shape for failures, and drop the matching state so the dead handle is not
+                // re-emitted on reconnect.
+                match kind {
+                    Some(PendingRequestKind::ProducerOpen { handle }) => {
+                        self.producers.remove(&handle);
+                        self.producer_create_requests.remove(&handle);
+                        self.events.push_back(ConnectionEvent::ProducerOpenFailed {
+                            handle,
+                            code: err.error,
+                            message: err.message.clone(),
+                        });
+                    }
+                    Some(PendingRequestKind::ConsumerSubscribe { handle }) => {
+                        self.consumers.remove(&handle);
+                        self.consumer_subscribe_requests.remove(&handle);
+                        self.events.push_back(ConnectionEvent::SubscribeFailed {
+                            handle,
+                            code: err.error,
+                            message: err.message,
+                        });
+                    }
+                    _ => {}
+                }
             }
             pb::base_command::Type::AckResponse => {
                 let ack = command
@@ -3846,5 +3875,118 @@ mod conn_state_tests {
             .find_map(|c| c.producer.as_ref())
             .expect("CommandProducer re-emitted");
         assert_eq!(cmd.epoch, Some(2));
+    }
+
+    /// A `CommandError` correlated with a pending producer-open must surface a
+    /// `ProducerOpenFailed` event (and clear the producer state) so engines waiting on the
+    /// event stream observe the rejection instead of hanging. Regression for the CLI
+    /// "produce hangs against fresh broker" bug: the broker rejects with
+    /// `ServiceNotReady`/"Please redo the lookup", and the engine must surface it as a
+    /// hard error rather than waiting indefinitely on a `ProducerReady` that will never come.
+    #[test]
+    fn command_error_on_producer_open_emits_producer_open_failed() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        let _ = drain_outbound_commands(&mut conn);
+
+        let request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/no-bundle".to_owned(),
+            ..Default::default()
+        });
+        assert!(conn.has_pending_request_for_test(request_id));
+        assert!(conn.producer(handle).is_some());
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: request_id.0,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "namespace bundle not served".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        match conn.poll_event() {
+            Some(ConnectionEvent::ProducerOpenFailed {
+                handle: ev_handle,
+                code,
+                message,
+            }) => {
+                assert_eq!(ev_handle, handle);
+                assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
+                assert_eq!(message, "namespace bundle not served");
+            }
+            other => panic!("expected ProducerOpenFailed event, got {other:?}"),
+        }
+        assert!(
+            conn.producer(handle).is_none(),
+            "producer state must be cleared after broker rejection so reconnect replay does \
+             not re-issue the dead open"
+        );
+        assert!(
+            !conn.has_pending_request_for_test(request_id),
+            "pending request slot freed"
+        );
+    }
+
+    /// Same shape as the producer-open case but on the subscribe path. The matching outcome
+    /// for `ConsumerSubscribe { handle }` must surface a `SubscribeFailed` event with the
+    /// broker's code + message and drop the consumer state.
+    #[test]
+    fn command_error_on_subscribe_emits_subscribe_failed() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        let _ = drain_outbound_commands(&mut conn);
+
+        let request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/no-bundle".to_owned(),
+            subscription: "regression".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        assert!(conn.has_pending_request_for_test(request_id));
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: request_id.0,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "namespace bundle not served".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        match conn.poll_event() {
+            Some(ConnectionEvent::SubscribeFailed {
+                handle: ev_handle,
+                code,
+                message,
+            }) => {
+                assert_eq!(ev_handle, handle);
+                assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
+                assert_eq!(message, "namespace bundle not served");
+            }
+            other => panic!("expected SubscribeFailed event, got {other:?}"),
+        }
+        assert!(
+            !conn.has_pending_request_for_test(request_id),
+            "pending request slot freed"
+        );
     }
 }

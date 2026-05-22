@@ -479,6 +479,13 @@ impl Future for SubscribeAckedFut {
                     {
                         return Poll::Ready(Err(ClientError::Closed));
                     }
+                    Some(ConnectionEvent::SubscribeFailed {
+                        handle,
+                        code,
+                        message,
+                    }) if handle == self.handle => {
+                        return Poll::Ready(Err(ClientError::Broker { code, message }));
+                    }
                     Some(ConnectionEvent::TopicListChanged { added, removed }) => {
                         // Forward to the per-client buffer + waker so we don't
                         // accidentally swallow a PIP-145 delta while waiting
@@ -814,5 +821,67 @@ mod tests {
             0,
             "the cancelled receive's slab slot must be evicted",
         );
+    }
+
+    /// Regression for the CLI "consume hangs against fresh broker" bug: when the broker
+    /// rejects a subscribe with `CommandError` (`ServiceNotReady` / "redo the lookup"),
+    /// the moonpool engine's `SubscribeAckedFut` must surface a `ClientError::Broker`
+    /// rather than parking on the driver waker forever. Mirrors the proto-level
+    /// `command_error_on_subscribe_emits_subscribe_failed` test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_acked_fut_surfaces_broker_error() {
+        use std::time::Duration;
+
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+                .expect("connected");
+            let _ = conn.poll_event();
+        }
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/no-bundle".to_owned(),
+                subscription: "regression".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "redo the lookup".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle CommandError");
+        }
+
+        let fut = super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+        };
+        let res = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("subscribe-acked future must resolve (regression: previously hung)");
+        match res {
+            Err(crate::ClientError::Broker { code, message }) => {
+                assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
+                assert_eq!(message, "redo the lookup");
+            }
+            other => panic!("expected ClientError::Broker, got {other:?}"),
+        }
     }
 }

@@ -226,6 +226,11 @@ fn handle_frame(
     match kind {
         pb::base_command::Type::Connect => emit_connected(out),
         pb::base_command::Type::Ping => emit_pong(out),
+        pb::base_command::Type::Lookup => {
+            if let Some(l) = &frame.command.lookup_topic {
+                emit_lookup_response(out, l.request_id);
+            }
+        }
         pb::base_command::Type::Producer => {
             if let Some(p) = &frame.command.producer {
                 let mut g = state.lock();
@@ -434,6 +439,29 @@ fn emit_producer_success(out: &mut BytesMut, request_id: u64, _topic: &str) {
             schema_version: None,
             topic_epoch: Some(0),
             producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_lookup_response(out: &mut BytesMut, request_id: u64) {
+    // Scripted broker speaks the single-broker contract: every lookup resolves
+    // to "use the current connection". `broker_service_url=None` mirrors what
+    // standalone Pulsar returns when the lookup target IS the current broker —
+    // the proto layer treats that as `LookupOutcome::Connect` with no rebind
+    // needed.
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::LookupResponse as i32,
+        lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+            broker_service_url: None,
+            broker_service_url_tls: None,
+            response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+            request_id,
+            authoritative: Some(true),
+            error: None,
+            message: None,
+            proxy_through_service_url: Some(false),
         }),
         ..Default::default()
     };

@@ -273,6 +273,13 @@ impl Client {
         encryptor: Option<Arc<dyn crate::crypto::MessageEncryptor>>,
     ) -> Result<Producer, ClientError> {
         let compression = req.compression;
+        // Pulsar requires a `CommandLookupTopic` round-trip before opening a producer or
+        // consumer: lookup is what triggers the broker to acquire ownership of the topic's
+        // namespace bundle. Skipping it works only when the bundle has already been activated
+        // by some prior operation; a fresh broker rejects `CommandProducer` with
+        // `ServerError::ServiceNotReady` ("not served by this instance, please redo the
+        // lookup"). Java's `PulsarClientImpl#createProducerAsync` does the same lookup.
+        self.lookup_topic(&req.topic).await?;
         let handle = {
             let mut conn = self.shared.inner.lock();
             conn.create_producer(req)
@@ -285,6 +292,68 @@ impl Client {
             compression,
             encryptor,
         })
+    }
+
+    /// Issue a `CommandLookupTopic` for `topic` and await its resolution.
+    ///
+    /// Standalone clusters resolve the topic to the same broker we are already connected to,
+    /// so the call's only side effect is forcing the broker to activate the topic's
+    /// namespace bundle. A multi-broker redirect (where the returned `broker_service_url`
+    /// names a different broker) is logged as a warning and treated as success — the actual
+    /// "reconnect to that broker" follow-up is tracked in `docs/follow-ups.md`. Until that
+    /// lands, the user still hits the bundle-not-served path if the resolved broker differs
+    /// from the current one, but the failure surfaces as a `ClientError::Broker` thanks to
+    /// the `ProducerOpenFailed` / `SubscribeFailed` events instead of hanging.
+    async fn lookup_topic(&self, topic: &str) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.lookup(topic, false)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::LookupResponse { outcome, .. } => match outcome {
+                magnetar_proto::LookupOutcome::Connect {
+                    broker_service_url,
+                    broker_service_url_tls,
+                    ..
+                } => {
+                    tracing::debug!(
+                        topic,
+                        broker_service_url = broker_service_url.as_deref(),
+                        broker_service_url_tls = broker_service_url_tls.as_deref(),
+                        "lookup resolved"
+                    );
+                    Ok(())
+                }
+                magnetar_proto::LookupOutcome::Redirected {
+                    broker_service_url,
+                    broker_service_url_tls,
+                } => {
+                    // The proto layer already chases redirects internally and only surfaces
+                    // `Redirected` for observability after the redirect chain has settled.
+                    // Treat as success.
+                    tracing::warn!(
+                        topic,
+                        broker_service_url = broker_service_url.as_deref(),
+                        broker_service_url_tls = broker_service_url_tls.as_deref(),
+                        "broker redirected lookup; multi-broker redirect is follow-up work"
+                    );
+                    Ok(())
+                }
+                magnetar_proto::LookupOutcome::Failed { code, message } => {
+                    Err(ClientError::Broker { code, message })
+                }
+            },
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected lookup outcome: {other:?}"
+            ))),
+        }
     }
 
     /// Open a new Pulsar transaction at the broker-side transaction coordinator (PIP-31).
@@ -500,6 +569,8 @@ impl Client {
         decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
     ) -> Result<Consumer, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
+        // See `open_producer_with`: subscribe also needs lookup-driven bundle activation.
+        self.lookup_topic(&req.topic).await?;
         let handle = {
             let mut conn = self.shared.inner.lock();
             conn.subscribe(req)
@@ -722,10 +793,32 @@ impl Future for EventWaitFut {
                         }
                     }
                 }
+                Some(ConnectionEvent::ProducerOpenFailed {
+                    handle,
+                    code,
+                    message,
+                }) => {
+                    if let EventMatcher::ProducerReady(h) = self.matcher {
+                        if h == handle {
+                            return Poll::Ready(Err(ClientError::Broker { code, message }));
+                        }
+                    }
+                }
                 Some(ConnectionEvent::ConsumerClosedByBroker { handle, .. }) => {
                     if let EventMatcher::SubscribeAcked(h) = self.matcher {
                         if h == handle {
                             return Poll::Ready(Err(ClientError::Closed));
+                        }
+                    }
+                }
+                Some(ConnectionEvent::SubscribeFailed {
+                    handle,
+                    code,
+                    message,
+                }) => {
+                    if let EventMatcher::SubscribeAcked(h) = self.matcher {
+                        if h == handle {
+                            return Poll::Ready(Err(ClientError::Broker { code, message }));
                         }
                     }
                 }
@@ -739,12 +832,11 @@ impl Future for EventWaitFut {
             }
         }
 
-        // Also check the outcome slab — we may have an Error outcome correlated with an open
-        // request. We don't have direct access to the request id here, but the connection emits
-        // ProducerReady/SubscribeAcked alongside any successful outcome, so the event path is
-        // sufficient. For error paths, the matching `Error` outcome is enqueued without a
-        // dedicated event; future iterations should surface those — until then we time-out via
-        // the connection-level operation_timeout, which the state machine enforces.
+        // Success-side: `ProducerSuccess` / `Success` in the sans-io layer push
+        // `ProducerReady` / `SubscribeAcked` events. Failure-side: a `CommandError` correlated
+        // with the pending producer-open / subscribe pushes the matching
+        // `ProducerOpenFailed` / `SubscribeFailed` event. Both paths are observed by the match
+        // arms above, so we never need to peek at the request-id-keyed outcome slab here.
 
         drop(conn);
 

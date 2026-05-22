@@ -76,10 +76,41 @@ pub enum ConnectionEvent {
         schema_version: Vec<u8>,
     },
 
+    /// The broker rejected a `CommandProducer` open with `CommandError`.
+    ///
+    /// Emitted from the `CommandError` handler when the failing request id correlates with a
+    /// pending producer-open. The corresponding producer state has already been dropped from
+    /// the connection — the user-facing handle is dead. Pair with
+    /// [`ConnectionEvent::ProducerReady`] as the success/failure split for an `open_producer`
+    /// round-trip.
+    ProducerOpenFailed {
+        /// The producer that failed to open.
+        handle: ProducerHandle,
+        /// Pulsar wire-protocol `ServerError` code (`pb::ServerError`).
+        code: i32,
+        /// Human-readable error from the broker.
+        message: String,
+    },
+
     /// A subscribe request was acknowledged by the broker.
     SubscribeAcked {
         /// The consumer handle this event refers to.
         handle: ConsumerHandle,
+    },
+
+    /// The broker rejected a `CommandSubscribe` with `CommandError`.
+    ///
+    /// Emitted from the `CommandError` handler when the failing request id correlates with a
+    /// pending subscribe. The corresponding consumer state has already been dropped from the
+    /// connection. Pair with [`ConnectionEvent::SubscribeAcked`] as the success/failure split
+    /// for a `subscribe` round-trip.
+    SubscribeFailed {
+        /// The consumer that failed to subscribe.
+        handle: ConsumerHandle,
+        /// Pulsar wire-protocol `ServerError` code (`pb::ServerError`).
+        code: i32,
+        /// Human-readable error from the broker.
+        message: String,
     },
 
     /// An incoming message was delivered by the broker.
