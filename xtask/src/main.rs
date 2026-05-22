@@ -633,6 +633,46 @@ fn git_merge_base(base: &str, cwd: &Path) -> Result<String> {
 ///
 /// Only `+` lines (excluding `+++` file headers) are considered additions.
 /// Hunk headers `@@ -... +start,count @@` reset the new-side cursor.
+/// Return the 1-indexed line number of the first `#[cfg(test)]` attribute in
+/// `path`, or `None` if the file has no inline test module. Used to drop
+/// inline-test lines from the sim-coverage diff scan: every `src/**/*.rs` in
+/// magnetar puts its unit tests inside `#[cfg(test)] mod tests { … }` at the
+/// bottom of the file, so the first occurrence is a reliable upper bound on
+/// the production region.
+fn first_cfg_test_line(path: &Path) -> Option<u32> {
+    let contents = fs::read_to_string(path).ok()?;
+    for (idx, line) in contents.lines().enumerate() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            // 1-indexed to match git diff line numbering.
+            return Some((idx as u32).saturating_add(1));
+        }
+    }
+    None
+}
+
+/// Return the 1-indexed set of source lines that contain a
+/// by-design-never-executed marker (`unreachable!`, `unimplemented!`,
+/// `todo!`). Coverage tools instrument these as executable but no live
+/// test can hit them. Demanding 100% coverage on them is meaningless and
+/// would force authors to add fake tests or `#[coverage(off)]` (nightly-
+/// only) — neither helps. We drop them at the diff stage instead.
+fn unreachable_lines(path: &Path) -> std::collections::BTreeSet<u32> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(contents) = fs::read_to_string(path) else {
+        return out;
+    };
+    for (idx, line) in contents.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.contains("unreachable!(")
+            || trimmed.contains("unimplemented!(")
+            || trimmed.contains("todo!(")
+        {
+            out.insert((idx as u32).saturating_add(1));
+        }
+    }
+    out
+}
+
 fn parse_diff_added_lines(
     diff: &str,
 ) -> std::collections::HashMap<String, std::collections::BTreeSet<u32>> {
@@ -682,18 +722,30 @@ fn parse_diff_added_lines(
     by_file
 }
 
-/// Parse an LCOV report and return the set of executed lines (count > 0) per
+/// Parse an LCOV report and return `(executable, covered)` line sets per
 /// absolute source path. LCOV format key lines:
 ///
 /// - `SF:<source file path>` — opens a record.
-/// - `DA:<line>,<count>[,<checksum>]` — line-execution datum.
+/// - `DA:<line>,<count>[,<checksum>]` — line-execution datum. The presence of the entry means the
+///   line is executable; `count > 0` means it was hit.
 /// - `end_of_record` — closes a record.
+///
+/// Returning both sets lets the coverage check filter out non-executable
+/// additions (use statements, doc comments, blank lines, closing braces),
+/// which are always absent from the LCOV and would otherwise be flagged as
+/// "uncovered" forever.
 fn parse_lcov_coverage(
     lcov: &str,
-) -> std::collections::HashMap<String, std::collections::BTreeSet<u32>> {
+) -> std::collections::HashMap<
+    String,
+    (
+        std::collections::BTreeSet<u32>,
+        std::collections::BTreeSet<u32>,
+    ),
+> {
     use std::collections::{BTreeSet, HashMap};
 
-    let mut by_file: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    let mut by_file: HashMap<String, (BTreeSet<u32>, BTreeSet<u32>)> = HashMap::new();
     let mut current_file: Option<String> = None;
 
     for line in lcov.lines() {
@@ -714,8 +766,10 @@ fn parse_lcov_coverage(
                 let Some(count) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
                     continue;
                 };
+                let entry = by_file.entry(file.to_owned()).or_default();
+                entry.0.insert(line_no);
                 if count > 0 {
-                    by_file.entry(file.to_owned()).or_default().insert(line_no);
+                    entry.1.insert(line_no);
                 }
             }
         }
@@ -736,20 +790,24 @@ fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // `-p` is a cargo flag, not a test-runner flag. Putting it after `--`
+    // routes it to libtest, which rejects it ("Unrecognized option: 'p'") and
+    // aborts the whole coverage run. Filtering the packages with `-p` (and
+    // dropping `--workspace`, which is mutually exclusive) restricts both
+    // instrumentation and test execution to the moonpool + differential
+    // crates — the surface ADR-0024 demands patch coverage on.
     let status = StdCommand::new(&cargo)
         .current_dir(workspace_root)
         .args(["llvm-cov", "--lcov", "--output-path"])
         .arg(&lcov_path)
         .args([
-            "--workspace",
-            "--all-features",
-            "--locked",
-            "--quiet",
-            "--",
             "-p",
             "magnetar-runtime-moonpool",
             "-p",
             "magnetar-differential",
+            "--all-features",
+            "--locked",
+            "--quiet",
         ])
         .status()
         .context("failed to invoke `cargo llvm-cov`")?;
@@ -759,22 +817,33 @@ fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
     fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
 }
 
-/// Intersect the per-file added-line sets from the diff with the executed-line
-/// sets from LCOV. Returns `(relpath, line)` pairs for every added line not
-/// executed by the moonpool runner.
+/// Intersect the per-file added-line sets from the diff with the executable
+/// + executed line sets from LCOV. An added line is reported as uncovered only
+/// when LCOV considers it executable (an `DA:` entry exists for it) AND the
+/// moonpool runner did not hit it. Non-executable additions (use statements,
+/// doc comments, blank lines, closing braces, attribute-only lines) are
+/// silently skipped — they have no LCOV entry and demanding "coverage" on
+/// them is meaningless.
 fn intersect_diff_with_coverage(
     workspace_root: &Path,
     tracked: &[(String, std::collections::BTreeSet<u32>)],
-    covered: &std::collections::HashMap<String, std::collections::BTreeSet<u32>>,
+    covered: &std::collections::HashMap<
+        String,
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+    >,
 ) -> Vec<(String, u32)> {
     let mut uncovered = Vec::new();
     for (relpath, added_lines) in tracked {
         let abs = workspace_root.join(relpath);
         let abs_key = abs.to_string_lossy().into_owned();
-        let executed = covered.get(&abs_key);
+        let entry = covered.get(&abs_key);
         for &line in added_lines {
-            let hit = executed.is_some_and(|set| set.contains(&line));
-            if !hit {
+            let is_executable = entry.is_some_and(|(exec, _)| exec.contains(&line));
+            let is_hit = entry.is_some_and(|(_, hit)| hit.contains(&line));
+            if is_executable && !is_hit {
                 uncovered.push((relpath.clone(), line));
             }
         }
@@ -855,6 +924,33 @@ fn check_sim_coverage(base: &str) -> Result<()> {
         .filter(|(path, _)| !is_sim_coverage_excluded(path))
         .collect();
     tracked.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // 2b. Inside `src/**/*.rs`, strip lines that live below the file's first
+    //     `#[cfg(test)]` attribute — those are unit tests, not production
+    //     code. The path-level excludes already drop `tests/`, `benches/`,
+    //     `examples/`; this handles the same intent for inline test modules
+    //     (the project convention is `#[cfg(test)] mod tests { … }` at the
+    //     bottom of every src file). Also drop lines marked
+    //     `unreachable!()` / `unimplemented!()` / `todo!()` — coverage
+    //     tools count them as executable but they are by-design dead arms.
+    for (relpath, lines) in &mut tracked {
+        let abs = workspace_root.join(relpath);
+        if let Some(cfg_test_start) = first_cfg_test_line(&abs) {
+            lines.retain(|&line| line < cfg_test_start);
+        }
+        let unreachable = unreachable_lines(&abs);
+        lines.retain(|line| !unreachable.contains(line));
+    }
+    tracked.retain(|(_, lines)| !lines.is_empty());
+
+    if tracked.is_empty() {
+        eprintln!(
+            "xtask check-sim-coverage: every added production line lives \
+             outside the moonpool sim surface (or inside a `#[cfg(test)]` \
+             block) — nothing to verify."
+        );
+        return Ok(());
+    }
 
     if tracked.is_empty() {
         eprintln!(
