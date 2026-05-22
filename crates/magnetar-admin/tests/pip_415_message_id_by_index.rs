@@ -149,3 +149,33 @@ async fn get_message_id_by_index_rejects_malformed_topic() {
         .unwrap_err();
     assert!(matches!(err, AdminError::InvalidName(_)));
 }
+
+#[tokio::test]
+async fn get_message_id_by_index_rejects_negative_ledger_id() {
+    // Java's MessageIdImpl can't represent a negative ledger / entry id either;
+    // a broker emitting one is a protocol violation and must surface as such
+    // rather than silently wrapping into u64::MAX-ish junk that would tie
+    // with MessageId::EARLIEST and corrupt downstream comparisons.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/persistent/public/default/topic/getMessageIdByIndex",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ledgerId": -1,
+            "entryId": 0,
+            "partitionIndex": 0,
+        })))
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let err = admin
+        .topic_get_message_id_by_index("public/default/topic", 0)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AdminError::Protocol(ref msg) if msg.contains("ledgerId")),
+        "expected AdminError::Protocol on negative ledgerId, got {err:?}",
+    );
+}
