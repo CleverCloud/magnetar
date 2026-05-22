@@ -45,7 +45,7 @@ magnetar-runtime-tokio   = { version = "0.1.0-dev.0", path = "crates/magnetar-ru
 # Codec
 prost           = "0.13"
 prost-build     = "0.13"
-prost-types     = "0.13"
+prost-types     = "0.14"
 bytes           = "1"
 crc32c          = "0.6"
 
