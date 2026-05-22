@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::types::CompressionKind;
-use magnetar_proto::{MessageId, OpOutcome, PendingOpKey, ProducerHandle, SequenceId};
+use magnetar_proto::{MessageId, OpOutcome, PendingOpKey, ProducerHandle, SequenceId, pb};
 
 use crate::ConnectionShared;
 use crate::crypto::MessageEncryptor;
@@ -385,6 +385,55 @@ impl Producer {
             .unwrap_or("")
             .to_owned()
     }
+
+    /// Look up the broker-registered schema for the producer's topic (PIP-87).
+    ///
+    /// Issues a `CommandGetSchema` for the topic this producer is bound to and awaits the
+    /// `CommandGetSchemaResponse`. Returns the registry-resolved [`pb::Schema`] on success or
+    /// [`ClientError::Broker`] when the broker rejects the lookup (e.g. `TopicNotFound`).
+    /// Mirrors Java `PulsarClientImpl#getSchema(TopicName, Optional<byte[]>)`, used on the
+    /// producer side by `AutoProduceBytesSchema` to warm its diagnostic cache on first send.
+    ///
+    /// `version = None` asks the broker for the topic's current schema; pass
+    /// `Some(schema_version_bytes)` to re-resolve a historical schema.
+    ///
+    /// The result is **not** cached here — callers that need a per-instance cache (e.g.
+    /// [`magnetar_proto::schema::AutoProduceBytesSchema`]) push the resolved schema into
+    /// their own `Arc<Mutex<…>>` after this future resolves.
+    pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
+        let topic = self
+            .shared
+            .inner
+            .lock()
+            .producer_topic(self.handle)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ClientError::Other(format!(
+                    "get_schema: producer handle {:?} is no longer registered",
+                    self.handle
+                ))
+            })?;
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_schema(&topic, version)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::GetSchemaResponse { result, .. } => match result {
+                Ok((schema, _version)) => Ok(schema),
+                Err((code, message)) => Err(ClientError::Broker { code, message }),
+            },
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected get_schema outcome: {other:?}"
+            ))),
+        }
+    }
 }
 
 async fn wait_request(
@@ -705,5 +754,245 @@ mod tests {
             .flush_with_timeout(Duration::from_secs(5))
             .await
             .expect("idempotent flush on quiescent producer must succeed");
+    }
+
+    fn get_schema_response_bytes(request_id: u64, schema: Option<pb::Schema>) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetSchemaResponse as i32,
+            get_schema_response: Some(pb::CommandGetSchemaResponse {
+                request_id,
+                schema,
+                schema_version: Some(b"v1".to_vec()),
+                error_code: None,
+                error_message: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandGetSchemaResponse");
+        buf
+    }
+
+    fn get_schema_error_bytes(request_id: u64, code: i32, message: &str) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::GetSchemaResponse as i32,
+            get_schema_response: Some(pb::CommandGetSchemaResponse {
+                request_id,
+                schema: None,
+                schema_version: None,
+                error_code: Some(code),
+                error_message: Some(message.to_owned()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandGetSchemaResponse error");
+        buf
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_get_schema_round_trip_resolves_with_cached_schema() {
+        // End-to-end: Producer::get_schema issues a CommandGetSchema, the broker replies with a
+        // CommandGetSchemaResponse, and the future resolves with the broker-resolved pb::Schema.
+        // Mirrors the PIP-87 runtime path used by AutoProduceBytesSchema's on-first-send lookup.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/auto-produce-ok".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let response_schema = pb::Schema {
+            name: "persistent://public/default/auto-produce-ok-schema".to_owned(),
+            schema_data: b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}".to_vec(),
+            r#type: pb::schema::Type::Avro as i32,
+            properties: Vec::new(),
+        };
+
+        let injector_shared = shared.clone();
+        let injector_schema = response_schema.clone();
+        let injector = tokio::spawn(async move {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+                let has_pending = injector_shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                if has_pending {
+                    let frame = get_schema_response_bytes(request_id, Some(injector_schema));
+                    injector_shared
+                        .inner
+                        .lock()
+                        .handle_bytes(Instant::now(), &frame)
+                        .expect("handle CommandGetSchemaResponse");
+                    return;
+                }
+            }
+            panic!("pending get_schema request was never registered");
+        });
+
+        let resolved = producer
+            .get_schema(None)
+            .await
+            .expect("get_schema resolves with broker reply");
+        injector.await.expect("injector task completes");
+
+        assert_eq!(resolved.name, response_schema.name);
+        assert_eq!(resolved.schema_data, response_schema.schema_data);
+        assert_eq!(resolved.r#type, response_schema.r#type);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_get_schema_surfaces_broker_error() {
+        // Error path: broker returns CommandGetSchemaResponse with error_code set —
+        // Producer::get_schema surfaces a ClientError::Broker carrying both code and message.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/auto-produce-missing".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let injector_shared = shared.clone();
+        let injector = tokio::spawn(async move {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+                let has_pending = injector_shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                if has_pending {
+                    let frame = get_schema_error_bytes(request_id, 13, "TopicNotFound");
+                    injector_shared
+                        .inner
+                        .lock()
+                        .handle_bytes(Instant::now(), &frame)
+                        .expect("handle CommandGetSchemaResponse error");
+                    return;
+                }
+            }
+            panic!("pending get_schema request was never registered");
+        });
+
+        let err = producer
+            .get_schema(None)
+            .await
+            .expect_err("get_schema must surface broker error");
+        injector.await.expect("injector task completes");
+        match err {
+            crate::error::ClientError::Broker { code, message } => {
+                assert_eq!(
+                    code, 13,
+                    "code propagates from CommandGetSchemaResponse.error_code"
+                );
+                assert_eq!(
+                    message, "TopicNotFound",
+                    "message propagates from CommandGetSchemaResponse.error_message"
+                );
+            }
+            other => panic!("expected ClientError::Broker, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_get_schema_caches_into_auto_produce_bytes_schema() {
+        // Integration with the proto-side `AutoProduceBytesSchema`: the runtime `get_schema`
+        // future resolves, the caller pushes the schema into the schema's cache via the
+        // `Schema::store_resolved_schema` hook, and subsequent calls to
+        // `needs_broker_schema()` correctly report `false`. This is the exact sequence the
+        // `TypedProducer::send` warm-up path runs on first send.
+        use magnetar_proto::schema::{AutoProduceBytesSchema, Schema as SchemaTrait};
+
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/auto-produce-cache".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+        let schema = AutoProduceBytesSchema::new();
+        assert!(
+            schema.needs_broker_schema(),
+            "fresh AutoProduceBytesSchema must require a broker lookup"
+        );
+
+        let request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let response_schema = pb::Schema {
+            name: "persistent://public/default/auto-produce-cache-schema".to_owned(),
+            schema_data: b"avro-schema-bytes".to_vec(),
+            r#type: pb::schema::Type::Avro as i32,
+            properties: Vec::new(),
+        };
+
+        let injector_shared = shared.clone();
+        let injector_schema = response_schema.clone();
+        let injector = tokio::spawn(async move {
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+                let has_pending = injector_shared
+                    .inner
+                    .lock()
+                    .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                if has_pending {
+                    let frame = get_schema_response_bytes(request_id, Some(injector_schema));
+                    injector_shared
+                        .inner
+                        .lock()
+                        .handle_bytes(Instant::now(), &frame)
+                        .expect("handle CommandGetSchemaResponse");
+                    return;
+                }
+            }
+            panic!("pending get_schema request was never registered");
+        });
+
+        let resolved = producer
+            .get_schema(None)
+            .await
+            .expect("get_schema resolves with broker reply");
+        injector.await.expect("injector task completes");
+        schema.store_resolved_schema(resolved);
+
+        assert!(
+            !schema.needs_broker_schema(),
+            "cache must be populated after store_resolved_schema"
+        );
+        assert_eq!(
+            schema.schema_data().as_ref(),
+            response_schema.schema_data.as_slice(),
+            "cached schema_data must round-trip from the broker reply"
+        );
+        // Encode remains pass-through whether or not the cache is populated (Java parity).
+        let payload = bytes::Bytes::from_static(b"already-encoded-bytes");
+        let encoded = schema.encode(&payload).expect("encode pass-through");
+        assert_eq!(
+            encoded, payload,
+            "AutoProduceBytesSchema::encode is pure pass-through"
+        );
     }
 }
