@@ -24,3 +24,11 @@ rustls         = { workspace = true }
 tokio          = { workspace = true, features = ["sync", "macros", "rt", "time", "io-util"] }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
+
+[dev-dependencies]
+# Integration-test surface (crates/magnetar-runtime-moonpool/tests/**). The
+# M7 chaos pack drives the sans-io state machine through `ConnectionShared`
+# with synthetic broker frames and synthetic `Instant`s — no listener, no
+# wall-clock, no Docker. tokio's paused-time runtime supplies the virtual
+# clock for `send_timeout` / `ack_timeout` / OAuth refresh-edge scenarios.
+tokio          = { workspace = true, features = ["sync", "macros", "rt", "time", "io-util", "test-util"] }
