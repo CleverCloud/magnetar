@@ -78,6 +78,22 @@ These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
    `#[ignore]` is reserved for environment dependencies (Docker, network)
    or follow-ups tracked in [`docs/follow-ups.md`](docs/follow-ups.md).
    ([ADR-0021](specs/adr/0021-no-silent-test-ignore-or-remove.md))
+9. **Cross-runtime test + coverage policy.** Every behavioral change
+   (runtime behavior, public API, wire format) and every change inside
+   `magnetar-proto` ships with **all four** test layers in the same
+   commit: (a) `magnetar-proto` unit test, (b) `magnetar-runtime-tokio`
+   integration test, (c) `magnetar-runtime-moonpool` integration test,
+   (d) `magnetar-differential` equivalence test asserting tokio ↔
+   moonpool `EventStream` parity, plus an end-to-end test under
+   `crates/magnetar/tests/e2e_*.rs`. Moonpool sim coverage is **100% on
+   the diff** (`cargo xtask check-sim-coverage`, `cargo-llvm-cov`
+   patch-coverage style). `magnetar-runtime-tokio` and
+   `magnetar-runtime-moonpool` keep a **strict 1:1 test count**
+   (`cargo xtask check-runtime-test-parity`). Both checks are
+   hard-failing in the local + CI validation chain. Exemptions:
+   docs-only, comment-only, formatter-only, and dependency bumps with
+   no functional impact — justify in the commit message.
+   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md))
 
 ## Workflow
 
@@ -109,13 +125,22 @@ cargo +nightly fmt --all
 cargo build --workspace --all-features
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features
+# Moonpool seed sweep — catches seed-dependent flakiness in the
+# deterministic-simulation suite. Hard requirement per ADR-0024.
+for seed in $(seq 1 32); do
+  MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
+    --all-features --locked -- --quiet \
+    || { echo "seed $seed FAILED"; exit 1; }
+done
 cargo deny check
 RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
   cargo doc --workspace --all-features --no-deps --locked
-cargo xtask check-no-channels       # banned-channel grep
-cargo xtask check-no-io-deps        # magnetar-proto = zero I/O deps
-cargo xtask check-no-internal-clock # Instant::now() / SystemTime::now() outside the allowlist
-cargo xtask codegen --check         # proto codegen drift
+cargo xtask check-no-channels         # banned-channel grep
+cargo xtask check-no-io-deps          # magnetar-proto = zero I/O deps
+cargo xtask check-no-internal-clock   # Instant::now() / SystemTime::now() outside the allowlist
+cargo xtask codegen --check           # proto codegen drift
+cargo xtask check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
+cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 ```
 
 E2e against a live broker (Docker + `apachepulsar/pulsar:4.0.4`):

@@ -195,3 +195,23 @@ adopted verbatim" per
 
 **Unblock.** Scoped for v0.2.0. PIP-460 carries an experimental tag in
 Apache Pulsar itself.
+
+## Testing + coverage
+
+### Cross-runtime test + coverage closure (ADR-0024)
+
+**Status.** [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
+landed 2026-05-22 with both `cargo xtask check-sim-coverage` and
+`cargo xtask check-runtime-test-parity` enabled and hard-failing. On
+landing day the baseline is `tokio=65 moonpool=61` (gap of 4) and
+moonpool patch-coverage of pre-existing surface is unmeasured. Every
+merge to `main` that touches production code fails the validation
+chain until both gaps close — by design.
+
+**Unblock.** Dedicated session driven by the local prompt at
+`tasks/coverage-closure-prompt.md` (gitignored). Phases:
+(1) bring tokio↔moonpool counts to 1:1 — easiest;
+(2) close pre-existing moonpool coverage gaps file by file using the
+`cargo llvm-cov --html` report; (3) full validation chain green
+including 32-seed sweep. ADR-0021 still applies — failing tests are
+fixed, not `#[ignore]`-d.

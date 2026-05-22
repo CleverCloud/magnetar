@@ -60,8 +60,15 @@ cargo build --workspace --all-features
 cargo clippy --workspace --all-features -- -D warnings
 cargo +nightly fmt --check
 cargo test --workspace
+for seed in $(seq 1 32); do                              # ADR-0024 seed sweep
+  MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
+    --all-features --locked -- --quiet \
+    || { echo "seed $seed FAILED"; exit 1; }
+done
 cargo deny check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo xtask check-sim-coverage        # ADR-0024: 100% moonpool coverage on diff
+cargo xtask check-runtime-test-parity # ADR-0024: tokio ↔ moonpool 1:1 test count
 ```
 
 Plus when `magnetar-proto` changes:
@@ -77,6 +84,50 @@ Mutation testing (M5/M6+):
 ```
 cargo mutants --package magnetar-proto --timeout 60 --shard 1/4
 ```
+
+## Cross-runtime test + coverage policy
+
+Any change that alters runtime behavior, public API, wire format, or
+touches `magnetar-proto` MUST land with the full four-layer test set
+in the same commit:
+
+1. **`magnetar-proto` unit test** — sans-io state-machine behavior in
+   isolation (feed bytes, assert events / transmit / state).
+2. **`magnetar-runtime-tokio` integration test** under
+   `crates/magnetar-runtime-tokio/tests/`.
+3. **`magnetar-runtime-moonpool` integration test** under
+   `crates/magnetar-runtime-moonpool/tests/`.
+4. **`magnetar-differential` equivalence test** asserting tokio ↔
+   moonpool user-visible `EventStream` parity.
+5. **Docker end-to-end test** under `crates/magnetar/tests/e2e_*.rs`
+   (`#[cfg(feature = "e2e")] + #[ignore = "e2e: requires Docker"]`).
+
+**Sim coverage** — `magnetar-runtime-moonpool` must hit **100% line
+coverage on the diff** (`merge-base origin/main HEAD`). Enforced by
+`cargo xtask check-sim-coverage`, which wraps `cargo-llvm-cov --json`
+on the moonpool test runner and diffs against the merge base. Hard
+requirement in local + CI.
+
+**Runtime parity** — `magnetar-runtime-tokio` and
+`magnetar-runtime-moonpool` keep **strict 1:1 test count** (`#[test]`
++ `#[tokio::test]` + `#[moonpool::test]`). Enforced by
+`cargo xtask check-runtime-test-parity`. Hard requirement.
+
+**Seed sweep** — every validation pass runs
+`MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool` for
+`seed ∈ 1..32`. Catches seed-dependent flakiness in the
+deterministic-simulation suite.
+
+**Exemptions** — docs-only, comment-only, formatter-only, and
+dependency bumps with no functional impact. Author justifies in the
+commit message; reviewer enforces.
+
+**Why**: the parity matrix in
+[`README.md`](README.md#java-client-parity-matrix) is the
+v0.1.0 contract. Without coverage + count parity, moonpool silently
+falls behind tokio and the differential harness loses its value as an
+equivalence oracle. See
+[ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md).
 
 ## Naming
 

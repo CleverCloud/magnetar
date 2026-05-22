@@ -38,6 +38,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0020](adr/0020-memory-limit-producer-block.md) | `MemoryLimitPolicy::ProducerBlock` back-pressure via Waker slab | Accepted |
 | [0021](adr/0021-no-silent-test-ignore-or-remove.md) | Tests are fixed, not silently ignored or removed | Accepted |
 | [0023](adr/0023-health-probe-trait-extraction.md) | Extract sans-io `HealthProbe` trait into `magnetar-proto`; tokio engine uses it | Accepted |
+| [0024](adr/0024-cross-runtime-test-and-coverage-policy.md) | Cross-runtime test + coverage policy: four-layer test set, 100% diff sim coverage, 1:1 runtime parity | Accepted |
 
 ## How to add an ADR
 

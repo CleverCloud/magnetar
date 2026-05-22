@@ -9,6 +9,12 @@
 //! - `check-no-internal-clock`: assert `magnetar-proto/src/**` never reads the host clock
 //!   (`Instant::now()` / `SystemTime::now()`) outside the two documented leak files. Mirrors
 //!   ADR-0011.
+//! - `check-sim-coverage`: assert that every line added relative to `git merge-base origin/main
+//!   HEAD` is executed by at least one moonpool test (`cargo-llvm-cov` patch-coverage style).
+//!   Mirrors ADR-0024.
+//! - `check-runtime-test-parity`: assert `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`
+//!   carry the same number of `#[test]` / `#[tokio::test]` / `#[moonpool::test]` items. Mirrors
+//!   ADR-0024.
 //! - `vendor-proto --rev <sha>`: refresh vendored `PulsarApi.proto`.
 //!
 //! Codegen drives `prost-build` against `crates/magnetar-proto/proto/`, writes
@@ -77,6 +83,26 @@ enum Cmd {
     /// [`std::time::SystemTime::now`] outside `#[cfg(test)]` blocks and
     /// outside the two documented leak files. See ADR-0011.
     CheckNoInternalClock,
+    /// Assert that every line added relative to the merge base is covered
+    /// by at least one `magnetar-runtime-moonpool` test.
+    ///
+    /// Runs `cargo llvm-cov --json -p magnetar-runtime-moonpool` and
+    /// intersects the LCOV-equivalent JSON with `git diff
+    /// merge-base...HEAD` line ranges. Any added line not executed under
+    /// the moonpool runner fails the check. See ADR-0024.
+    CheckSimCoverage {
+        /// Base ref to diff against. Defaults to `origin/main`.
+        #[arg(long, default_value = "origin/main")]
+        base: String,
+    },
+    /// Assert tokio ↔ moonpool runtime crates carry the same number of
+    /// test items.
+    ///
+    /// Counts `#[test]`, `#[tokio::test]`, and `#[moonpool::test]`
+    /// attributes under `crates/magnetar-runtime-tokio/{src,tests}` and
+    /// `crates/magnetar-runtime-moonpool/{src,tests}`. Strict equality
+    /// required. See ADR-0024.
+    CheckRuntimeTestParity,
     /// Refresh the vendored Pulsar proto from a given upstream commit.
     VendorProto {
         /// Apache Pulsar commit SHA to vendor from.
@@ -105,6 +131,8 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoChannels => check_no_channels(),
         Cmd::CheckNoIoDeps => check_no_io_deps(),
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
+        Cmd::CheckSimCoverage { base } => check_sim_coverage(&base),
+        Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
         Cmd::VendorProto { rev, source: _ } => {
             bail!("xtask vendor-proto: not implemented yet (lands in M1). Requested rev: {rev}");
         }
@@ -527,5 +555,419 @@ fn visit(root: &Path, callback: &mut dyn FnMut(&Path, &str)) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Production-source paths excluded from sim-coverage requirements. Generated
+/// proto, test scaffolds, and tooling don't carry the load-bearing semantics
+/// ADR-0024 is asserting equivalence over; demanding 100% on them would only
+/// chase noise.
+///
+/// Matched by `Path::starts_with` against workspace-relative paths.
+const SIM_COVERAGE_EXCLUDE_PREFIXES: &[&str] = &[
+    "crates/magnetar-proto/src/pb/",
+    "xtask/",
+    "docs/",
+    "specs/",
+    "tasks/",
+    ".claude/",
+    ".github/",
+];
+
+/// File-name fragments excluded from sim-coverage (test files and benches).
+const SIM_COVERAGE_EXCLUDE_FRAGMENTS: &[&str] = &["/tests/", "/benches/", "/examples/"];
+
+/// Returns true if `relpath` (workspace-relative, forward slashes) is excluded
+/// from sim-coverage enforcement.
+fn is_sim_coverage_excluded(relpath: &str) -> bool {
+    if SIM_COVERAGE_EXCLUDE_PREFIXES
+        .iter()
+        .any(|prefix| relpath.starts_with(prefix))
+    {
+        return true;
+    }
+    if SIM_COVERAGE_EXCLUDE_FRAGMENTS
+        .iter()
+        .any(|frag| relpath.contains(frag))
+    {
+        return true;
+    }
+    !Path::new(relpath)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+}
+
+/// Run `git` with the given arguments at `cwd`. Returns stdout on success;
+/// bails with stderr on failure.
+fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
+    let output = StdCommand::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to invoke `git {}`", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`git {}` failed (status {}):\n{stderr}",
+            args.join(" "),
+            output.status
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("`git {}` produced non-utf8 output", args.join(" ")))
+}
+
+/// Resolve `git merge-base <base> HEAD`. Returns the commit SHA as a String.
+fn git_merge_base(base: &str, cwd: &Path) -> Result<String> {
+    let raw = run_git(&["merge-base", base, "HEAD"], cwd).with_context(|| {
+        format!(
+            "could not resolve merge-base against `{base}` — \
+             does the ref exist? Try `git fetch origin` first."
+        )
+    })?;
+    Ok(raw.trim().to_owned())
+}
+
+/// Parse a unified-diff blob produced by `git diff --unified=0` and return
+/// the set of added new-side line numbers per workspace-relative file path.
+///
+/// Only `+` lines (excluding `+++` file headers) are considered additions.
+/// Hunk headers `@@ -... +start,count @@` reset the new-side cursor.
+fn parse_diff_added_lines(
+    diff: &str,
+) -> std::collections::HashMap<String, std::collections::BTreeSet<u32>> {
+    use std::collections::{BTreeSet, HashMap};
+
+    let mut by_file: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    let mut current_file: Option<String> = None;
+    let mut cursor: u32 = 0;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            // "+++ b/path/to/file" or "+++ /dev/null" (file deleted — ignored).
+            current_file = rest
+                .strip_prefix("b/")
+                .filter(|p| !p.is_empty() && *p != "/dev/null")
+                .map(str::to_owned);
+            cursor = 0;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            // Header: "@@ -<old> +<new_start>[,<new_count>] @@ context"
+            // Extract the new-side start. Format is "+<n>" or "+<n>,<m>".
+            if let Some(plus_idx) = rest.find('+') {
+                let after = &rest[plus_idx + 1..];
+                let end = after.find([' ', ',']).unwrap_or(after.len());
+                if let Ok(start) = after[..end].parse::<u32>() {
+                    cursor = start;
+                }
+            }
+            continue;
+        }
+        if line.starts_with("---") {
+            continue; // old-side file header
+        }
+        if let Some(file) = current_file.as_deref() {
+            if let Some(_added) = line.strip_prefix('+') {
+                by_file.entry(file.to_owned()).or_default().insert(cursor);
+                cursor = cursor.saturating_add(1);
+            } else if line.starts_with('-') {
+                // removed line — does not advance the new-side cursor
+            } else {
+                // context line (rare with unified=0) or empty — advance cursor
+                cursor = cursor.saturating_add(1);
+            }
+        }
+    }
+    by_file
+}
+
+/// Parse an LCOV report and return the set of executed lines (count > 0) per
+/// absolute source path. LCOV format key lines:
+///
+/// - `SF:<source file path>` — opens a record.
+/// - `DA:<line>,<count>[,<checksum>]` — line-execution datum.
+/// - `end_of_record` — closes a record.
+fn parse_lcov_coverage(
+    lcov: &str,
+) -> std::collections::HashMap<String, std::collections::BTreeSet<u32>> {
+    use std::collections::{BTreeSet, HashMap};
+
+    let mut by_file: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    let mut current_file: Option<String> = None;
+
+    for line in lcov.lines() {
+        if let Some(path) = line.strip_prefix("SF:") {
+            current_file = Some(path.to_owned());
+            continue;
+        }
+        if line == "end_of_record" {
+            current_file = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("DA:") {
+            if let Some(file) = current_file.as_deref() {
+                let mut parts = rest.split(',');
+                let Some(line_no) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                let Some(count) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
+                    continue;
+                };
+                if count > 0 {
+                    by_file.entry(file.to_owned()).or_default().insert(line_no);
+                }
+            }
+        }
+    }
+    by_file
+}
+
+/// Run `cargo llvm-cov` against the moonpool runtime + differential test
+/// crates and return the emitted LCOV report as a string.
+///
+/// The whole workspace is instrumented (so coverage attributes to the
+/// originating crate, e.g. `magnetar-proto`), but only the moonpool /
+/// differential test binaries execute — that's the surface ADR-0024 demands
+/// patch coverage on.
+fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
+    let lcov_path = workspace_root.join("target/sim-coverage.lcov");
+    if let Some(parent) = lcov_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = StdCommand::new(&cargo)
+        .current_dir(workspace_root)
+        .args(["llvm-cov", "--lcov", "--output-path"])
+        .arg(&lcov_path)
+        .args([
+            "--workspace",
+            "--all-features",
+            "--locked",
+            "--quiet",
+            "--",
+            "-p",
+            "magnetar-runtime-moonpool",
+            "-p",
+            "magnetar-differential",
+        ])
+        .status()
+        .context("failed to invoke `cargo llvm-cov`")?;
+    if !status.success() {
+        bail!("`cargo llvm-cov` exited with status {status}");
+    }
+    fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
+}
+
+/// Intersect the per-file added-line sets from the diff with the executed-line
+/// sets from LCOV. Returns `(relpath, line)` pairs for every added line not
+/// executed by the moonpool runner.
+fn intersect_diff_with_coverage(
+    workspace_root: &Path,
+    tracked: &[(String, std::collections::BTreeSet<u32>)],
+    covered: &std::collections::HashMap<String, std::collections::BTreeSet<u32>>,
+) -> Vec<(String, u32)> {
+    let mut uncovered = Vec::new();
+    for (relpath, added_lines) in tracked {
+        let abs = workspace_root.join(relpath);
+        let abs_key = abs.to_string_lossy().into_owned();
+        let executed = covered.get(&abs_key);
+        for &line in added_lines {
+            let hit = executed.is_some_and(|set| set.contains(&line));
+            if !hit {
+                uncovered.push((relpath.clone(), line));
+            }
+        }
+    }
+    uncovered
+}
+
+/// Print per-file uncovered ranges and bail with a summary. Always returns
+/// `Err` — the caller relies on `?` to surface the failure.
+fn report_uncovered(workspace_root: &Path, uncovered: &[(String, u32)]) -> Result<()> {
+    let mut by_file: std::collections::BTreeMap<&str, Vec<u32>> = std::collections::BTreeMap::new();
+    for (path, line) in uncovered {
+        by_file.entry(path.as_str()).or_default().push(*line);
+    }
+    for (path, lines) in &by_file {
+        eprintln!(
+            "uncovered (moonpool runner): {}: {} line(s) — {}",
+            path,
+            lines.len(),
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    bail!(
+        "xtask check-sim-coverage: {} added line(s) across {} file(s) not \
+         executed by `magnetar-runtime-moonpool` / `magnetar-differential` \
+         tests (workspace root: {}). Patch coverage must be 100% — see ADR-0024.",
+        uncovered.len(),
+        by_file.len(),
+        workspace_root.display(),
+    );
+}
+
+/// Verify `cargo-llvm-cov` is installed. Returns the resolved cargo invocation
+/// command on success; bails with install instructions otherwise.
+fn ensure_cargo_llvm_cov() -> Result<()> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = StdCommand::new(&cargo)
+        .args(["llvm-cov", "--version"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        _ => bail!(
+            "cargo-llvm-cov not found — required by `xtask check-sim-coverage`. \
+             Install with: cargo install cargo-llvm-cov"
+        ),
+    }
+}
+
+fn check_sim_coverage(base: &str) -> Result<()> {
+    ensure_cargo_llvm_cov()?;
+
+    let workspace_root = workspace_root()?;
+    let merge_base = git_merge_base(base, &workspace_root)?;
+
+    // 1. Collect added new-side line ranges relative to merge-base, scoped to `.rs` files.
+    //    `--unified=0` keeps the hunk headers strict so the cursor advance in
+    //    `parse_diff_added_lines` stays correct.
+    let diff = run_git(
+        &[
+            "diff",
+            "--unified=0",
+            "--no-color",
+            &format!("{merge_base}..HEAD"),
+            "--",
+            "*.rs",
+        ],
+        &workspace_root,
+    )?;
+    let added = parse_diff_added_lines(&diff);
+
+    // 2. Drop excluded paths (generated proto, tests, tooling, docs).
+    let mut tracked: Vec<(String, std::collections::BTreeSet<u32>)> = added
+        .into_iter()
+        .filter(|(path, _)| !is_sim_coverage_excluded(path))
+        .collect();
+    tracked.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if tracked.is_empty() {
+        eprintln!(
+            "xtask check-sim-coverage: no production-surface .rs additions \
+             relative to {base} — nothing to verify."
+        );
+        return Ok(());
+    }
+
+    // 3. Run moonpool-side coverage and emit LCOV. We run the moonpool runtime crate's tests + the
+    //    differential harness, both gated on `--all-features` so chaos-pack scenarios participate.
+    //    The whole workspace is instrumented so coverage attributes to the originating crate (e.g.
+    //    magnetar-proto), not just the runner.
+    let lcov = run_moonpool_lcov(&workspace_root)?;
+    let covered = parse_lcov_coverage(&lcov);
+
+    // 4. Intersect: for every added line in a tracked file, check that the moonpool runner reached
+    //    it. LCOV emits absolute paths; the diff surfaces workspace-relative paths, so we resolve
+    //    both to absolutes.
+    let uncovered = intersect_diff_with_coverage(&workspace_root, &tracked, &covered);
+
+    if !uncovered.is_empty() {
+        report_uncovered(&workspace_root, &uncovered)?;
+    }
+
+    eprintln!(
+        "xtask check-sim-coverage: all added lines across {} file(s) are \
+         covered by the moonpool runner.",
+        tracked.len()
+    );
+    Ok(())
+}
+
+/// Count test attributes (`#[test]`, `#[tokio::test]`, `#[moonpool::test]`)
+/// inside a crate's `src` and `tests` directories.
+///
+/// Attributes are recognised by trimmed-line prefix. Composite attributes
+/// like `#[tokio::test(flavor = "multi_thread")]` are matched on the
+/// `#[tokio::test` prefix so they count once.
+fn count_test_attributes(crate_root: &Path) -> Result<usize> {
+    let mut total = 0usize;
+    for subdir in ["src", "tests"] {
+        let dir = crate_root.join(subdir);
+        if !dir.exists() {
+            continue;
+        }
+        visit(&dir, &mut |path, contents| {
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                return;
+            }
+            for line in contents.lines() {
+                let trimmed = line.trim_start();
+                let is_plain = trimmed == "#[test]" || trimmed.starts_with("#[test(");
+                let is_tokio =
+                    trimmed.starts_with("#[tokio::test]") || trimmed.starts_with("#[tokio::test(");
+                let is_moonpool = trimmed.starts_with("#[moonpool::test]")
+                    || trimmed.starts_with("#[moonpool::test(");
+                if is_plain || is_tokio || is_moonpool {
+                    total += 1;
+                }
+            }
+        })?;
+    }
+    Ok(total)
+}
+
+fn check_runtime_test_parity() -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let tokio_crate = workspace_root.join("crates/magnetar-runtime-tokio");
+    let moonpool_crate = workspace_root.join("crates/magnetar-runtime-moonpool");
+
+    if !tokio_crate.exists() {
+        bail!(
+            "magnetar-runtime-tokio not found at {} — workspace layout drift?",
+            tokio_crate.display()
+        );
+    }
+    if !moonpool_crate.exists() {
+        bail!(
+            "magnetar-runtime-moonpool not found at {} — workspace layout drift?",
+            moonpool_crate.display()
+        );
+    }
+
+    let tokio_count = count_test_attributes(&tokio_crate)?;
+    let moonpool_count = count_test_attributes(&moonpool_crate)?;
+
+    if tokio_count != moonpool_count {
+        let (leader, leader_count, lagger, lagger_count) = if tokio_count > moonpool_count {
+            (
+                "magnetar-runtime-tokio",
+                tokio_count,
+                "magnetar-runtime-moonpool",
+                moonpool_count,
+            )
+        } else {
+            (
+                "magnetar-runtime-moonpool",
+                moonpool_count,
+                "magnetar-runtime-tokio",
+                tokio_count,
+            )
+        };
+        let gap = leader_count - lagger_count;
+        bail!(
+            "xtask check-runtime-test-parity: tokio={tokio_count} moonpool={moonpool_count} \
+             — {leader} is ahead by {gap} test(s). Add equivalent tests to {lagger} \
+             before merging. See ADR-0024."
+        );
+    }
+
+    eprintln!(
+        "xtask check-runtime-test-parity: tokio={tokio_count} moonpool={moonpool_count} (parity ok)."
+    );
     Ok(())
 }
