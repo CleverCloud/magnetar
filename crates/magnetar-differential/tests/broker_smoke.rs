@@ -28,17 +28,6 @@ async fn tokio_client_handshakes() {
     eprintln!("[test] connected, is_connected={}", client.is_connected());
     assert!(client.is_connected());
 
-    // Background kicker — periodically pulses `driver_waker.notify_one()`
-    // so orphan tasks spawned by the engine's wait_* futures get a
-    // chance to drain. See runner_tokio::Kicker for rationale.
-    let shared = client.shared().clone();
-    let kicker = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            shared.driver_waker.notify_one();
-        }
-    });
-
     // Try opening a producer.
     eprintln!("[test] opening producer");
     let producer = tokio::time::timeout(
@@ -75,7 +64,6 @@ async fn tokio_client_handshakes() {
 
     // Don't call close — just drop and let the broker session task be reaped.
     drop(producer);
-    kicker.abort();
     if let Some(d) = client.take_driver() {
         d.abort();
     }

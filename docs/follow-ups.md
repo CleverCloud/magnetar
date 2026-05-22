@@ -99,19 +99,22 @@ Once this lands on tokio, the moonpool engine inherits it for free
 
 ## Differential equivalence harness
 
-### Scripted broker handshake stall
+### Consumer-receive orphan-task wake path
 
-**Status.** The scripted broker in
-[`crates/magnetar-differential/src/broker.rs`](../crates/magnetar-differential/src/broker.rs)
-stalls the producer-open round-trip in one fixture, so
-[`tests/broker_smoke.rs`](../crates/magnetar-differential/tests/broker_smoke.rs)
-is `#[ignore]`-marked with a TODO per
-[ADR-0021](../specs/adr/0021-no-silent-test-ignore-or-remove.md). The
-trace model, both runners, and the `golden_traces.rs` tests all pass.
+**Status.** `broker_smoke` passes without any test-local kicker — the
+production driver loop's `driver_waker.notify_waiters()` after every
+`handle_bytes` is sufficient for the handshake + producer-open
+round-trip. The `Kicker` in
+[`crates/magnetar-differential/src/runner_tokio.rs`](../crates/magnetar-differential/src/runner_tokio.rs)
+stays in for the longer `golden_traces` multi-op sequences (`Recv` with
+2 s timeouts, seek replay, nack redelivery) which regress to ~30 s
+wall-clock runs without the 25 ms pulse: `consumer.receive()` futures
+observe a queued message only when the per-op `tokio::time::timeout`
+re-polls, not at delivery time.
 
-**Unblock.** Tighten the broker's `CommandProducer` response timing;
-revisit the `Kicker` workaround in `runner_tokio.rs` once the broker
-stops needing periodic driver-waker nudges.
+**Unblock.** Register the `Recv` future's waker against the consumer's
+per-message waker slab so the sans-io layer wakes it directly on
+delivery. Once that lands, both runners can drop the `Kicker` entirely.
 
 ### Expand the golden-trace catalog
 

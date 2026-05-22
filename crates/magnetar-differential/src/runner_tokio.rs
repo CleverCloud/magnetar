@@ -24,16 +24,33 @@ use crate::trace::{Event, EventStream, Op, Trace};
 /// e2e against a live Pulsar broker, periodic PINGs and ack traffic
 /// keep wake-ups flowing through the system. Against the scripted
 /// differential broker — which only speaks the bare protocol subset
-/// the harness needs — there is no such traffic, so orphan tasks
-/// can starve and stall a future indefinitely.
+/// the harness needs and never emits PINGs / acks of its own —
+/// orphan tasks can starve and stall a future indefinitely.
 ///
-/// The kicker emits a low-frequency pulse that drains any lingering
-/// orphan tasks and ensures every user-facing future eventually
-/// observes the state it's polling for. 25ms is fast enough to keep
-/// the harness latency bounded (a 5-op trace adds ~125ms of kicker
-/// overhead worst case) and slow enough that it doesn't dominate the
-/// runtime. Remove the kicker once the runtime moves its event-wait
-/// futures off the orphan-task pattern.
+/// Commit `c983026e3521` made the production driver loop call
+/// `driver_waker.notify_waiters()` after every `handle_bytes`. That
+/// is sufficient for the short `broker_smoke` handshake +
+/// producer-open round-trip (which now passes without any kicker —
+/// verified by removing the in-test kicker on 2026-05-22; the test
+/// stays green and `[broker]` traces show a normal frame sequence).
+///
+/// However the longer `golden_traces` multi-op sequences (`Recv`
+/// with 2 s timeouts, seek replay, nack redelivery) regress to a
+/// ~30 s wall-clock run when the kicker is removed — the
+/// `consumer.receive()` futures observe the queued message only
+/// after the per-op `tokio::time::timeout` eventually re-polls,
+/// which is a separate orphan-task latency leak on the
+/// consumer-receive path (the consumer's per-message slab is not
+/// yet wired to wake the `Recv` future directly on delivery).
+///
+/// Until that consumer-side wake path is closed, the kicker stays
+/// in for safety. 25 ms is fast enough to keep golden-trace latency
+/// in the millisecond range (a 5-op trace adds ~125 ms of kicker
+/// overhead worst case) and slow enough that it doesn't dominate
+/// the runtime. The long-term fix is to register the `Recv`
+/// future's waker against the consumer's per-message waker slab so
+/// the sans-io layer wakes it directly on delivery, after which the
+/// kicker can be removed.
 const KICKER_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Spawn a background kicker. Drop the returned handle to stop it.
