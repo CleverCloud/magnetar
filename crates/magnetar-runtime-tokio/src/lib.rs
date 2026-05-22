@@ -86,7 +86,7 @@ use parking_lot::Mutex;
 use slab::Slab;
 use tokio::sync::Notify;
 
-pub use crate::auto_cluster_failover::{AutoClusterFailover, HealthProbe, HealthProbeFuture};
+pub use crate::auto_cluster_failover::{AutoClusterFailover, TokioHealthProbe};
 pub use crate::client::Client;
 pub use crate::compress::CompressionError;
 pub use crate::consumer::{Consumer, ReceiveFut};
