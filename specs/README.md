@@ -37,6 +37,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0019](adr/0019-engine-scope-and-moonpool-parity.md) | Engine scope for v0.1.0 parity; moonpool parity as follow-up train | Accepted |
 | [0020](adr/0020-memory-limit-producer-block.md) | `MemoryLimitPolicy::ProducerBlock` back-pressure via Waker slab | Accepted |
 | [0021](adr/0021-no-silent-test-ignore-or-remove.md) | Tests are fixed, not silently ignored or removed | Accepted |
+| [0023](adr/0023-health-probe-trait-extraction.md) | Extract sans-io `HealthProbe` trait into `magnetar-proto`; tokio engine uses it | Accepted |
 
 ## How to add an ADR
 

@@ -70,6 +70,7 @@ pub mod consumer;
 pub mod error;
 pub mod event;
 pub mod frame;
+pub mod health_probe;
 pub mod lookup;
 pub mod producer;
 pub mod schema;
@@ -109,6 +110,7 @@ pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
 };
+pub use crate::health_probe::HealthProbe;
 pub use crate::producer::ProducerStats;
 pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
