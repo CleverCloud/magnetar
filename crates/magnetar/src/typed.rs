@@ -50,11 +50,19 @@ impl<S: Schema> TypedProducer<S> {
 
     /// Encode `value` with the schema and publish it. `key` (optional) becomes the message's
     /// `partition_key`, which the broker uses for compaction and `key_shared` routing.
+    ///
+    /// PIP-87 [`AutoProduceBytesSchema`](magnetar_proto::schema::AutoProduceBytesSchema)
+    /// producers transparently warm their schema cache on first send via
+    /// [`Schema::needs_broker_schema`](magnetar_proto::schema::Schema::needs_broker_schema) +
+    /// [`Schema::store_resolved_schema`](magnetar_proto::schema::Schema::store_resolved_schema).
+    /// Encoding is pass-through whether or not the cache is populated (Java parity); the lookup
+    /// is purely diagnostic / cache-warming and subsequent sends skip the round-trip.
     pub async fn send(
         &self,
         value: &S::Owned,
         key: Option<String>,
     ) -> Result<MessageId, PulsarError> {
+        self.warm_broker_schema().await?;
         let bytes = self.schema.encode(value).map_err(schema_to_pulsar)?;
         let mut metadata = pb::MessageMetadata::default();
         if let Some(k) = key {
@@ -71,6 +79,22 @@ impl<S: Schema> TypedProducer<S> {
         };
         let id = self.inner.send(msg).await?;
         Ok(id)
+    }
+
+    /// Warm the schema cache by issuing a `CommandGetSchema` for the producer's topic if the
+    /// schema reports `needs_broker_schema()`. Pure no-op for inline schemas (Avro / JSON /
+    /// primitives). Used on every send path so PIP-87 `AutoProduceBytesSchema` producers cache
+    /// the broker-resolved schema after the first successful round-trip.
+    async fn warm_broker_schema(&self) -> Result<(), PulsarError> {
+        if self.schema.needs_broker_schema() {
+            let resolved = self
+                .inner
+                .get_schema(None)
+                .await
+                .map_err(PulsarError::Client)?;
+            self.schema.store_resolved_schema(resolved);
+        }
+        Ok(())
     }
 
     /// Start a Java-symmetric `TypedMessageBuilder`. Mirrors `producer.newMessage()` —
@@ -245,8 +269,11 @@ impl<S: Schema> TypedMessageBuilder<'_, S> {
     }
 
     /// Encode `value` with the producer's schema and submit. Mirrors Java's
-    /// terminal `TypedMessageBuilder#send`.
+    /// terminal `TypedMessageBuilder#send`. PIP-87 `AutoProduceBytesSchema` producers warm
+    /// their broker-schema cache on first invocation via the same path as
+    /// [`TypedProducer::send`].
     pub async fn send(self, value: &S::Owned) -> Result<MessageId, PulsarError> {
+        self.producer.warm_broker_schema().await?;
         let bytes = self
             .producer
             .schema
