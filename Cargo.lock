@@ -1477,12 +1477,15 @@ name = "magnetar-admin"
 version = "0.1.0-dev.0"
 dependencies = [
  "http",
+ "magnetar-proto",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]

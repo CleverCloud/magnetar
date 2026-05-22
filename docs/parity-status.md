@@ -61,7 +61,6 @@ Everything else with a `🟡` or `❌` in the README parity matrix is one of:
 | **PIP-460** — Scalable topics | ❌ | Experimental in Apache Pulsar. |
 | **PIP-466** — V5 client surface | ❌ | Inspired by, not adopted verbatim. |
 | **PIP-180** — Shadow topic | ❌ | v0.2.0. |
-| **PIP-415** — `getMessageIdByIndex` | ❌ | Blocked on vendored proto bump. |
 | **PIP-33** — Replicated subscriptions | ❌ | v0.2.0. |
 
 These are not required for v0.1.0 under

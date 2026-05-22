@@ -40,6 +40,7 @@
 
 use std::time::Duration;
 
+use magnetar_proto::MessageId;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,45 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    /// Resolve a broker-entry-metadata `index` to a [`MessageId`] (PIP-415).
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/getMessageIdByIndex?index={index}`.
+    /// Per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md)
+    /// this is **REST-only** — the spec's "Binary protocol" section is
+    /// intentionally empty and the canonical implementation PR
+    /// [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222)
+    /// (merged 2025-06-23) touches only admin / broker / CLI Java code.
+    ///
+    /// Java:
+    /// `pulsar-broker/src/main/java/org/apache/pulsar/broker/admin/v2/PersistentTopics.java`
+    /// (`@GET @Path("/{tenant}/{namespace}/{topic}/getMessageIdByIndex")`,
+    /// `@QueryParam("index") long`); admin-client side is
+    /// `pulsar-client-admin/src/main/java/org/apache/pulsar/client/admin/internal/
+    /// TopicsImpl.java#getMessageIdByIndexAsync` which deserialises the
+    /// response into `MessageIdImpl` (i.e. `{ledgerId, entryId, partitionIndex}`).
+    ///
+    /// `topic` follows the same rule as every other topic-scoped method:
+    /// either `persistent://tenant/ns/topic` or `tenant/ns/topic`. For a
+    /// partitioned topic, pass the specific partition (`my-topic-partition-0`).
+    ///
+    /// The response carries only `(ledgerId, entryId, partitionIndex)`. The
+    /// returned [`MessageId`] sets `batch_index = -1` and `batch_size = -1`
+    /// because the broker resolves at entry granularity — see PIP-415 §"Why
+    /// Precise Index Matching Isn't Implemented on the Broker Side".
+    pub async fn topic_get_message_id_by_index(
+        &self,
+        topic: &str,
+        index: i64,
+    ) -> Result<MessageId, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&["persistent", tenant, namespace, name, "getMessageIdByIndex"])?;
+        url.query_pairs_mut()
+            .append_pair("index", &index.to_string());
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        let dto: MessageIdResponse = json_ok(resp).await?;
+        dto.try_into_message_id()
+    }
+
     // --- Internal --------------------------------------------------------
 
     /// Build a request URL by joining `segments` onto `base_url`. Each segment
@@ -254,6 +294,13 @@ impl AdminClient {
             let mut path = url
                 .path_segments_mut()
                 .map_err(|()| AdminError::Builder("base url is cannot-be-a-base".into()))?;
+            // `base_url` is anchored at `/admin/v2/` (trailing slash), so the
+            // segments iterator carries a sentinel empty trailing segment.
+            // Drop it before appending API segments — otherwise pushes land
+            // after the empty, producing `/admin/v2//persistent/...`. Real
+            // brokers tolerate the double slash; strict mocks (wiremock) do
+            // not, and Java's `PulsarAdmin` emits the single-slash form.
+            path.pop_if_empty();
             for segment in segments {
                 path.push(segment);
             }
@@ -290,6 +337,56 @@ pub struct TenantInfo {
     /// Cluster names the tenant may use.
     #[serde(rename = "allowedClusters")]
     pub allowed_clusters: Vec<String>,
+}
+
+/// Wire shape of the PIP-415 `getMessageIdByIndex` response.
+///
+/// Mirrors Java's `MessageIdImpl` JSON shape (Jackson default property-name
+/// serialisation): `{ledgerId, entryId, partitionIndex}`. See
+/// `pulsar-client/src/main/java/org/apache/pulsar/client/impl/MessageIdImpl.java`.
+///
+/// Kept as a deserialise-only DTO and converted into
+/// [`magnetar_proto::MessageId`] at the boundary so callers do not see this
+/// wire detail. Not exposed publicly.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageIdResponse {
+    ledger_id: i64,
+    entry_id: i64,
+    #[serde(default = "default_partition_index")]
+    partition_index: i32,
+}
+
+fn default_partition_index() -> i32 {
+    -1
+}
+
+impl MessageIdResponse {
+    /// Convert the REST response into the canonical [`MessageId`]. The broker
+    /// resolves at entry granularity, so `batch_index` / `batch_size` are not
+    /// part of the JSON — they default to `-1` (the same sentinel
+    /// `MessageId::from_pb` uses for `MessageIdData` without batch fields).
+    ///
+    /// Returns `AdminError::Protocol` if the broker emits a negative
+    /// `ledgerId` or `entryId` — both fields are `u64` in the canonical type
+    /// (matching the proto wire format) and Java's `MessageIdImpl` cannot
+    /// represent negative values either, so a negative wire value is a
+    /// broker bug we must surface rather than silently wrap.
+    fn try_into_message_id(self) -> Result<MessageId, AdminError> {
+        let ledger_id = u64::try_from(self.ledger_id).map_err(|_| {
+            AdminError::Protocol(format!("negative ledgerId from broker: {}", self.ledger_id))
+        })?;
+        let entry_id = u64::try_from(self.entry_id).map_err(|_| {
+            AdminError::Protocol(format!("negative entryId from broker: {}", self.entry_id))
+        })?;
+        Ok(MessageId {
+            ledger_id,
+            entry_id,
+            partition: self.partition_index,
+            batch_index: -1,
+            batch_size: -1,
+        })
+    }
 }
 
 /// Topic stats. Intentionally permissive: the Java
@@ -395,6 +492,11 @@ pub enum AdminError {
     /// Caller passed a namespace or topic name that the client could not parse.
     #[error("invalid name: {0}")]
     InvalidName(String),
+    /// Broker returned a response that violates the documented wire contract
+    /// (e.g. negative `ledgerId` from `getMessageIdByIndex`, which Java
+    /// `MessageIdImpl` cannot represent either).
+    #[error("broker protocol violation: {0}")]
+    Protocol(String),
 }
 
 /// Decode a non-error JSON response body.
@@ -429,6 +531,34 @@ async fn ensure_status(resp: Response) -> Result<Response, AdminError> {
 }
 
 /// Split a `tenant/namespace` string into its two segments.
+/// Reject path segments the `url` crate would silently rewrite. `.` and `..`
+/// disappear under RFC 3986 dot-segment normalisation; percent-encoded slash
+/// (`%2F` / `%2f`) lets a hostile name escape its segment; NUL / ASCII
+/// control bytes have no place in an admin path. Refusing all of these at
+/// the input boundary keeps the URL the client builds in lock-step with the
+/// path the broker eventually parses.
+fn validate_segment(segment: &str) -> Result<(), AdminError> {
+    if segment.is_empty() {
+        return Err(AdminError::InvalidName("empty path segment".into()));
+    }
+    if segment == "." || segment == ".." {
+        return Err(AdminError::InvalidName(format!(
+            "dot segment is not a valid name: {segment:?}",
+        )));
+    }
+    if segment.contains("%2F") || segment.contains("%2f") {
+        return Err(AdminError::InvalidName(format!(
+            "percent-encoded slash in segment: {segment:?}",
+        )));
+    }
+    if segment.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(AdminError::InvalidName(format!(
+            "control byte in segment: {segment:?}",
+        )));
+    }
+    Ok(())
+}
+
 fn split_namespace(ns: &str) -> Result<(&str, &str), AdminError> {
     let (tenant, namespace) = ns.split_once('/').ok_or_else(|| {
         AdminError::InvalidName(format!("expected tenant/namespace, got {ns:?} (no '/')"))
@@ -438,6 +568,8 @@ fn split_namespace(ns: &str) -> Result<(&str, &str), AdminError> {
             "expected tenant/namespace, got {ns:?}"
         )));
     }
+    validate_segment(tenant)?;
+    validate_segment(namespace)?;
     Ok((tenant, namespace))
 }
 
@@ -455,6 +587,9 @@ fn split_topic(topic: &str) -> Result<(&str, &str, &str), AdminError> {
             "expected [persistent://]tenant/namespace/topic, got {topic:?}"
         )));
     }
+    validate_segment(tenant)?;
+    validate_segment(namespace)?;
+    validate_segment(name)?;
     Ok((tenant, namespace, name))
 }
 
@@ -530,6 +665,84 @@ mod tests {
     fn split_topic_rejects_short_name() {
         assert!(matches!(
             split_topic("acme/svc"),
+            Err(AdminError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn message_id_response_deserialises_java_camelcase() {
+        // The exact body shape upstream PIP-415 §"Success Response" advertises.
+        let json = r#"{"ledgerId":12345,"entryId":67890,"partitionIndex":0}"#;
+        let dto: MessageIdResponse = serde_json::from_str(json).unwrap();
+        let msg = dto.try_into_message_id().unwrap();
+        assert_eq!(msg.ledger_id, 12345);
+        assert_eq!(msg.entry_id, 67890);
+        assert_eq!(msg.partition, 0);
+        // The broker resolves at entry granularity — batch fields are absent
+        // from the JSON and must default to -1 to match the canonical sentinel.
+        assert_eq!(msg.batch_index, -1);
+        assert_eq!(msg.batch_size, -1);
+    }
+
+    #[test]
+    fn message_id_response_defaults_partition_for_non_partitioned_topic() {
+        // PIP-415 §"Success Response": `partitionIndex: -1` for non-partitioned
+        // topics. Some broker versions omit the field entirely on
+        // non-partitioned topics; serde default keeps us correct in either case.
+        let json = r#"{"ledgerId":1,"entryId":2}"#;
+        let dto: MessageIdResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(dto.try_into_message_id().unwrap().partition, -1);
+    }
+
+    #[test]
+    fn url_helper_emits_single_slash_after_admin_v2() {
+        // Regression guard: the previous url() helper appended segments after
+        // the trailing-slash sentinel of /admin/v2/, producing
+        // /admin/v2//persistent/... — real brokers tolerated it but strict
+        // mocks (and Java's PulsarAdmin) emit the single-slash form. Pin the
+        // current behaviour so we notice any future regression.
+        let client = AdminClient::builder()
+            .service_url("http://broker.example:8080".parse().unwrap())
+            .build()
+            .unwrap();
+        let url = client.url(&["clusters"]).unwrap();
+        assert_eq!(url.as_str(), "http://broker.example:8080/admin/v2/clusters");
+        let url2 = client
+            .url(&["persistent", "public", "default", "topic", "stats"])
+            .unwrap();
+        assert_eq!(
+            url2.as_str(),
+            "http://broker.example:8080/admin/v2/persistent/public/default/topic/stats"
+        );
+    }
+
+    #[test]
+    fn split_topic_rejects_dot_segments() {
+        // LISA-001: `..` / `.` in any segment would silently normalise out via
+        // url::Url::path_segments_mut, producing a client/server URL parser
+        // differential. Refuse them at the input boundary.
+        assert!(matches!(
+            split_topic("persistent://../foo/bar"),
+            Err(AdminError::InvalidName(_))
+        ));
+        assert!(matches!(
+            split_topic("./foo/bar"),
+            Err(AdminError::InvalidName(_))
+        ));
+        assert!(matches!(
+            split_topic("tenant/./topic"),
+            Err(AdminError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn split_topic_rejects_control_bytes_and_percent_encoded_slash() {
+        assert!(matches!(
+            split_topic("tenant/ns/topic%2Fevil"),
+            Err(AdminError::InvalidName(_))
+        ));
+        assert!(matches!(
+            split_topic("tenant/ns/top\0ic"),
             Err(AdminError::InvalidName(_))
         ));
     }
