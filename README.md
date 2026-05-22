@@ -625,8 +625,8 @@ known-missing feature.
   [`docs/parity-status.md`](docs/parity-status.md) and
   [`docs/follow-ups.md`](docs/follow-ups.md).
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180
-  shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33
-  replicated subscriptions** are scoped for v0.2.0.
+  shadow topic** + **PIP-33 replicated subscriptions** are scoped for
+  v0.2.0.
 - **SASL (Kerberos)** + **Athenz** auth providers are pre-alpha
   scaffolds; full GSSAPI / ZTS plumbing is deferred to v0.2.0.
 - **`AutoProduceBytesSchema`** trait surface only; the common case
@@ -658,7 +658,7 @@ known-missing feature.
 | PIP-460 | Scalable topics | ❌ | Scoped for v0.2.0 (experimental) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim — magnetar ships its own idiomatic surface |
 | PIP-180 | Shadow topic | ❌ | v0.2.0 |
-| PIP-415 | `getMessageIdByIndex` | ❌ | v0.2.0 (blocked on vendored proto bump) |
+| PIP-415 | `getMessageIdByIndex` | ✅ | `magnetar-admin::AdminClient::topic_get_message_id_by_index` — REST-only per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) (binary-protocol section intentionally empty; canonical implementation [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin / broker / CLI only) |
 | PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
 | PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime with `HealthProbe`). Active URL re-resolved on every supervised-reconnect attempt. |
 
@@ -716,9 +716,8 @@ moonpool engine reaches feature parity with tokio on a follow-up train.
 
 The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
 Deferred-scope items (PIP-460 scalable topics, PIP-466 V5 surface,
-PIP-180 shadow topic, PIP-415 `getMessageIdByIndex`, PIP-33 replicated
-subscriptions, SASL/Athenz full plumbing, `AutoProduceBytesSchema`) ship
-in v0.2.0.
+PIP-180 shadow topic, PIP-33 replicated subscriptions, SASL/Athenz full
+plumbing, `AutoProduceBytesSchema`) ship in v0.2.0.
 
 ---
 

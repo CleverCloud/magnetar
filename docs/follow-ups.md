@@ -165,14 +165,6 @@ case; producers usually know their schema at construction time.
 
 ## Protocol
 
-### PIP-415 `getMessageIdByIndex`
-
-**Status.** Not implemented.
-
-**Unblock.** Vendored `PulsarApi.proto` snapshot is missing the
-opcode. Bump the vendored proto, regenerate via `cargo xtask codegen`,
-then wire the consumer-side surface.
-
 ### PIP-460 scalable topics, PIP-466 V5 surface, PIP-180 shadow topic, PIP-33 replicated subscriptions
 
 **Status.** Out of scope for v0.1.0. PIP-466 is "inspired by, not

@@ -1312,7 +1312,7 @@ The schema is advertised on `CommandProducer.schema` /
 | PIP-460 | Scalable topics | ❌ | v0.2.0 (experimental upstream) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim |
 | PIP-180 | Shadow topic | ❌ | v0.2.0 |
-| PIP-415 | `getMessageIdByIndex` | ❌ | v0.2.0 (blocked on vendored proto bump) |
+| PIP-415 | `getMessageIdByIndex` | ✅ | `crates/magnetar-admin/src/lib.rs::AdminClient::topic_get_message_id_by_index` — REST-only ([PIP-415 spec](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) leaves "Binary protocol" empty; canonical impl [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin/broker/CLI only) |
 | PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
 
 ---

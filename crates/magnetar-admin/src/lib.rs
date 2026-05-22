@@ -40,6 +40,7 @@
 
 use std::time::Duration;
 
+use magnetar_proto::MessageId;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,45 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    /// Resolve a broker-entry-metadata `index` to a [`MessageId`] (PIP-415).
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/getMessageIdByIndex?index={index}`.
+    /// Per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md)
+    /// this is **REST-only** — the spec's "Binary protocol" section is
+    /// intentionally empty and the canonical implementation PR
+    /// [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222)
+    /// (merged 2025-06-23) touches only admin / broker / CLI Java code.
+    ///
+    /// Java:
+    /// `pulsar-broker/src/main/java/org/apache/pulsar/broker/admin/v2/PersistentTopics.java`
+    /// (`@GET @Path("/{tenant}/{namespace}/{topic}/getMessageIdByIndex")`,
+    /// `@QueryParam("index") long`); admin-client side is
+    /// `pulsar-client-admin/src/main/java/org/apache/pulsar/client/admin/internal/
+    /// TopicsImpl.java#getMessageIdByIndexAsync` which deserialises the
+    /// response into `MessageIdImpl` (i.e. `{ledgerId, entryId, partitionIndex}`).
+    ///
+    /// `topic` follows the same rule as every other topic-scoped method:
+    /// either `persistent://tenant/ns/topic` or `tenant/ns/topic`. For a
+    /// partitioned topic, pass the specific partition (`my-topic-partition-0`).
+    ///
+    /// The response carries only `(ledgerId, entryId, partitionIndex)`. The
+    /// returned [`MessageId`] sets `batch_index = -1` and `batch_size = -1`
+    /// because the broker resolves at entry granularity — see PIP-415 §"Why
+    /// Precise Index Matching Isn't Implemented on the Broker Side".
+    pub async fn topic_get_message_id_by_index(
+        &self,
+        topic: &str,
+        index: i64,
+    ) -> Result<MessageId, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&["persistent", tenant, namespace, name, "getMessageIdByIndex"])?;
+        url.query_pairs_mut()
+            .append_pair("index", &index.to_string());
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        let dto: MessageIdResponse = json_ok(resp).await?;
+        Ok(dto.into_message_id())
+    }
+
     // --- Internal --------------------------------------------------------
 
     /// Build a request URL by joining `segments` onto `base_url`. Each segment
@@ -254,6 +294,13 @@ impl AdminClient {
             let mut path = url
                 .path_segments_mut()
                 .map_err(|()| AdminError::Builder("base url is cannot-be-a-base".into()))?;
+            // `base_url` is anchored at `/admin/v2/` (trailing slash), so the
+            // segments iterator carries a sentinel empty trailing segment.
+            // Drop it before appending API segments — otherwise pushes land
+            // after the empty, producing `/admin/v2//persistent/...`. Real
+            // brokers tolerate the double slash; strict mocks (wiremock) do
+            // not, and Java's `PulsarAdmin` emits the single-slash form.
+            path.pop_if_empty();
             for segment in segments {
                 path.push(segment);
             }
@@ -290,6 +337,46 @@ pub struct TenantInfo {
     /// Cluster names the tenant may use.
     #[serde(rename = "allowedClusters")]
     pub allowed_clusters: Vec<String>,
+}
+
+/// Wire shape of the PIP-415 `getMessageIdByIndex` response.
+///
+/// Mirrors Java's `MessageIdImpl` JSON shape (Jackson default property-name
+/// serialisation): `{ledgerId, entryId, partitionIndex}`. See
+/// `pulsar-client/src/main/java/org/apache/pulsar/client/impl/MessageIdImpl.java`.
+///
+/// Kept as a deserialise-only DTO and converted into
+/// [`magnetar_proto::MessageId`] at the boundary so callers do not see this
+/// wire detail. Not exposed publicly.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageIdResponse {
+    ledger_id: i64,
+    entry_id: i64,
+    #[serde(default = "default_partition_index")]
+    partition_index: i32,
+}
+
+fn default_partition_index() -> i32 {
+    -1
+}
+
+impl MessageIdResponse {
+    /// Convert the REST response into the canonical [`MessageId`]. The broker
+    /// resolves at entry granularity, so `batch_index` / `batch_size` are not
+    /// part of the JSON — they default to `-1` (the same sentinel
+    /// `MessageId::from_pb` uses for `MessageIdData` without batch fields).
+    fn into_message_id(self) -> MessageId {
+        MessageId {
+            // The broker emits positive ledger / entry ids; reinterpret the
+            // signed wire value as unsigned to match the canonical type.
+            ledger_id: self.ledger_id as u64,
+            entry_id: self.entry_id as u64,
+            partition: self.partition_index,
+            batch_index: -1,
+            batch_size: -1,
+        }
+    }
 }
 
 /// Topic stats. Intentionally permissive: the Java
@@ -532,5 +619,30 @@ mod tests {
             split_topic("acme/svc"),
             Err(AdminError::InvalidName(_))
         ));
+    }
+
+    #[test]
+    fn message_id_response_deserialises_java_camelcase() {
+        // The exact body shape upstream PIP-415 §"Success Response" advertises.
+        let json = r#"{"ledgerId":12345,"entryId":67890,"partitionIndex":0}"#;
+        let dto: MessageIdResponse = serde_json::from_str(json).unwrap();
+        let msg = dto.into_message_id();
+        assert_eq!(msg.ledger_id, 12345);
+        assert_eq!(msg.entry_id, 67890);
+        assert_eq!(msg.partition, 0);
+        // The broker resolves at entry granularity — batch fields are absent
+        // from the JSON and must default to -1 to match the canonical sentinel.
+        assert_eq!(msg.batch_index, -1);
+        assert_eq!(msg.batch_size, -1);
+    }
+
+    #[test]
+    fn message_id_response_defaults_partition_for_non_partitioned_topic() {
+        // PIP-415 §"Success Response": `partitionIndex: -1` for non-partitioned
+        // topics. Some broker versions omit the field entirely on
+        // non-partitioned topics; serde default keeps us correct in either case.
+        let json = r#"{"ledgerId":1,"entryId":2}"#;
+        let dto: MessageIdResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(dto.into_message_id().partition, -1);
     }
 }
