@@ -1138,14 +1138,21 @@ impl Connection {
                         payload.body.clone(),
                         now,
                     );
-                    if let Ok(crate::consumer::DeliverOutcome::Delivered { .. }) = outcome {
-                        // Emit one event per delivered message — easier for the driver to
-                        // surface to its waker pool than batching here.
-                        while let Some(im) = consumer.pop_front_clone() {
-                            self.events.push_back(ConnectionEvent::Message {
-                                handle,
-                                message: im,
-                            });
+                    if let Ok(crate::consumer::DeliverOutcome::Delivered { count }) = outcome {
+                        // Emit one observational `Message` event per newly delivered payload
+                        // by *cloning* the tail of the queue — the runtime drains the actual
+                        // payloads via `Connection::pop_message`, so the queue must remain
+                        // intact for `ReceiveFut::poll`. The newly delivered messages are the
+                        // last `count` entries (`deliver` appends in order).
+                        let queue_len = consumer.queue.len();
+                        let start = queue_len.saturating_sub(count);
+                        for idx in start..queue_len {
+                            if let Some(im) = consumer.queue.get(idx) {
+                                self.events.push_back(ConnectionEvent::Message {
+                                    handle,
+                                    message: im.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -3028,18 +3035,6 @@ impl Connection {
     #[must_use]
     pub fn has_pending_request_for_test(&self, id: RequestId) -> bool {
         self.pending_requests.contains_key(&id)
-    }
-}
-
-// We use a small helper on ConsumerState to clone-pop the front message without leaving the
-// crate's public API to expose all of ConsumerState's internals. The runtime crate goes through
-// `Connection::pop_message`; this path is for the internal "burst-emit on dispatch" code path
-// in `handle_frame`.
-impl ConsumerState {
-    pub(crate) fn pop_front_clone(&mut self) -> Option<IncomingMessage> {
-        let msg = self.queue.pop_front()?;
-        self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
-        Some(msg)
     }
 }
 
