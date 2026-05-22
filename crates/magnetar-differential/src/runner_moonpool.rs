@@ -25,9 +25,7 @@ use moonpool_core::TokioProviders;
 use crate::trace::{Event, EventStream, Op, Trace};
 
 /// Frequency at which the kicker pulses `driver_waker.notify_one()`.
-/// See the equivalently-named const in [`crate::runner_tokio`] for
-/// rationale — both engines share the orphan-task pattern in their
-/// event-wait futures.
+/// See the equivalently-named const in [`crate::runner_tokio`].
 const KICKER_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Spawn a background kicker. Drop the returned handle to stop it.

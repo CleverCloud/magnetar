@@ -17,23 +17,10 @@ use magnetar_runtime_tokio::{Client, ClientError, ConnectionShared, Consumer, Pr
 use crate::trace::{Event, EventStream, Op, Trace};
 
 /// Frequency at which the kicker pulses `driver_waker.notify_one()`.
-///
-/// The engine's user-facing futures (`wait_producer_ready`,
-/// `EventWaitFut`, etc.) spawn one-shot "orphan" tasks that race for
-/// `driver_waker.notified()` permits with the driver loop. In real
-/// e2e against a live Pulsar broker, periodic PINGs and ack traffic
-/// keep wake-ups flowing through the system. Against the scripted
-/// differential broker — which only speaks the bare protocol subset
-/// the harness needs — there is no such traffic, so orphan tasks
-/// can starve and stall a future indefinitely.
-///
-/// The kicker emits a low-frequency pulse that drains any lingering
-/// orphan tasks and ensures every user-facing future eventually
-/// observes the state it's polling for. 25ms is fast enough to keep
-/// the harness latency bounded (a 5-op trace adds ~125ms of kicker
-/// overhead worst case) and slow enough that it doesn't dominate the
-/// runtime. Remove the kicker once the runtime moves its event-wait
-/// futures off the orphan-task pattern.
+/// Retained for the longer `golden_traces` `Recv` paths — see
+/// "Consumer-receive orphan-task wake path" in
+/// [`docs/follow-ups.md`](../../../docs/follow-ups.md) for the
+/// rationale and the long-term fix.
 const KICKER_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Spawn a background kicker. Drop the returned handle to stop it.

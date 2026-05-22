@@ -99,22 +99,22 @@ Once this lands on tokio, the moonpool engine inherits it for free
 
 ## Differential equivalence harness
 
-### Scripted broker — `Kicker` workaround in `runner_tokio.rs`
+### Consumer-receive orphan-task wake path
 
-**Status.** Both runners drive the scripted broker through
-[`tests/broker_smoke.rs`](../crates/magnetar-differential/tests/broker_smoke.rs)
-and the `golden_traces.rs` suite. The smoke test still depends on a
-background `Kicker` task that pulses `driver_waker.notify_one()` every
-25 ms so orphan tasks spawned by `EventWaitFut::poll` get a chance to
-drain; without it, the producer-open round-trip stalled in CI on slow
-runners. The lookup-driven path (added with the CLI hang fix) does not
-regress this — the scripted broker now answers `CommandLookupTopic`
-with a `Connect` response in one round-trip — but the workaround
-remains.
+**Status.** `broker_smoke` passes without any test-local kicker — the
+production driver loop's `driver_waker.notify_waiters()` after every
+`handle_bytes` is sufficient for the handshake + producer-open
+round-trip. The `Kicker` in
+[`crates/magnetar-differential/src/runner_tokio.rs`](../crates/magnetar-differential/src/runner_tokio.rs)
+stays in for the longer `golden_traces` multi-op sequences (`Recv` with
+2 s timeouts, seek replay, nack redelivery) which regress to ~30 s
+wall-clock runs without the 25 ms pulse: `consumer.receive()` futures
+observe a queued message only when the per-op `tokio::time::timeout`
+re-polls, not at delivery time.
 
-**Unblock.** Tighten the wait futures' wakeup contract so they no
-longer need the periodic kick. Once that lands the `Kicker` task in
-`runner_tokio.rs` can be deleted.
+**Unblock.** Register the `Recv` future's waker against the consumer's
+per-message waker slab so the sans-io layer wakes it directly on
+delivery. Once that lands, both runners can drop the `Kicker` entirely.
 
 ### Expand the golden-trace catalog
 
