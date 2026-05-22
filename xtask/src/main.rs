@@ -328,7 +328,7 @@ fn check_no_io_deps() -> Result<()> {
 
 /// File paths inside `magnetar-proto/src/` that are *explicitly* allowed to
 /// touch the host clock, mirroring the "Known non-determinism leaks" list in
-/// [`ARCHITECTURE.md`] + ADR-0011. Every other file under
+/// the workspace `ARCHITECTURE.md` + ADR-0011. Every other file under
 /// `crates/magnetar-proto/src/` must drive time through the injected
 /// `now: Instant` / `wall_clock` parameters.
 ///
