@@ -545,6 +545,7 @@ impl ConsumerState {
                 self.total_chunked_msgs_received =
                     self.total_chunked_msgs_received.saturating_add(1);
                 let trigger = self.classify_and_queue(im, redelivery_count, now);
+                self.wake_receivers();
                 return Ok(trigger);
             }
         }
@@ -1419,5 +1420,150 @@ mod tests {
         // should leave the previous rate untouched.
         c.record_rate_window(t0);
         assert!(c.current_msgs_per_sec.is_finite());
+    }
+
+    /// Counter-backed `Wake` implementation used by the
+    /// receive-waker-slab tests. `wake` and `wake_by_ref` both bump the
+    /// underlying `AtomicUsize` so the tests can assert how many times
+    /// the slab drained their waker.
+    struct CountingWake(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Build a [`std::task::Waker`] that increments a shared counter on
+    /// every `wake` / `wake_by_ref` invocation, plus the counter itself
+    /// so the test body can observe wake/cancel semantics without
+    /// spinning up an executor.
+    fn counting_waker() -> (std::task::Waker, std::sync::Arc<CountingWake>) {
+        let inner = std::sync::Arc::new(CountingWake(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(std::sync::Arc::clone(&inner));
+        (waker, inner)
+    }
+
+    #[test]
+    fn receive_waker_slab_drains_on_message_delivery() {
+        use std::sync::atomic::Ordering;
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let (w1, count1) = counting_waker();
+        let (w2, count2) = counting_waker();
+        let k1 = c.register_receive_waker(w1);
+        let k2 = c.register_receive_waker(w2);
+        assert_ne!(k1, k2, "each registration gets a distinct slab key");
+        assert_eq!(c.receive_wakers.len(), 2);
+
+        // Deliver a single message — both parked receivers should be woken,
+        // and the slab should be drained.
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { .. }));
+        assert_eq!(count1.0.load(Ordering::SeqCst), 1);
+        assert_eq!(count2.0.load(Ordering::SeqCst), 1);
+        assert_eq!(c.receive_wakers.len(), 0);
+
+        // Subsequent cancel of already-drained keys is idempotent.
+        c.cancel_receive_waker(k1);
+        c.cancel_receive_waker(k2);
+    }
+
+    #[test]
+    fn receive_waker_slab_drains_on_close() {
+        use std::sync::atomic::Ordering;
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let (w, count) = counting_waker();
+        let _key = c.register_receive_waker(w);
+
+        c.close();
+        assert!(c.closed);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert_eq!(c.receive_wakers.len(), 0);
+    }
+
+    #[test]
+    fn receive_waker_slab_cancels_without_waking() {
+        use std::sync::atomic::Ordering;
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let (w, count) = counting_waker();
+        let key = c.register_receive_waker(w);
+
+        // Cancel before any delivery — the waker must NOT be invoked.
+        c.cancel_receive_waker(key);
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+        assert_eq!(c.receive_wakers.len(), 0);
+
+        // Subsequent deliveries with no parked wakers must not panic.
+        let _ = c
+            .deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+
+        // Cancel of an already-cancelled key is idempotent.
+        c.cancel_receive_waker(key);
+    }
+
+    #[test]
+    fn receive_waker_slab_wakes_chunked_path_on_final_chunk() {
+        // Regression: prior to the per-Recv waker fix, the chunked-message
+        // path in `deliver` queued the reassembled message but did not
+        // call `wake_receivers`, so parked receivers would only observe
+        // the message on the next poll cycle. The fix invokes
+        // `wake_receivers` on the chunked path, mirroring the
+        // single-message and batched paths.
+        use std::sync::atomic::Ordering;
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        let (w, count) = counting_waker();
+        let _key = c.register_receive_waker(w);
+
+        let make_chunk = |idx: i32, payload: &'static [u8]| {
+            let mut meta = pb::MessageMetadata {
+                producer_name: "p".to_owned(),
+                sequence_id: 1,
+                publish_time: 1_700_000_000,
+                ..Default::default()
+            };
+            meta.num_chunks_from_msg = Some(2);
+            meta.chunk_id = Some(idx);
+            meta.uuid = Some("u-wake".to_owned());
+            meta.total_chunk_msg_size = Some(4);
+            (meta, Bytes::from_static(payload))
+        };
+        for (meta, body) in [make_chunk(0, b"aa"), make_chunk(1, b"bb")] {
+            let _ = c
+                .deliver(&message_cmd(0), meta, None, body, std::time::Instant::now())
+                .unwrap();
+        }
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            1,
+            "chunked delivery must wake parked receivers"
+        );
+        let msg = c.pop_message().expect("reassembled message");
+        assert_eq!(msg.payload.as_ref(), b"aabb");
     }
 }

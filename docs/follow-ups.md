@@ -84,22 +84,38 @@ Once this lands on tokio, the moonpool engine inherits it for free
 
 ## Differential equivalence harness
 
-### Consumer-receive orphan-task wake path
+### Moonpool runner LocalSet pump
 
-**Status.** `broker_smoke` passes without any test-local kicker — the
-production driver loop's `driver_waker.notify_waiters()` after every
-`handle_bytes` is sufficient for the handshake + producer-open
-round-trip. The `Kicker` in
-[`crates/magnetar-differential/src/runner_tokio.rs`](../crates/magnetar-differential/src/runner_tokio.rs)
-stays in for the longer `golden_traces` multi-op sequences (`Recv` with
-2 s timeouts, seek replay, nack redelivery) which regress to ~30 s
-wall-clock runs without the 25 ms pulse: `consumer.receive()` futures
-observe a queued message only when the per-op `tokio::time::timeout`
-re-polls, not at delivery time.
+**Status.** The consumer-receive orphan-task wake path is closed at the
+sans-io layer:
+[`magnetar_proto::consumer::ConsumerState`](../crates/magnetar-proto/src/consumer.rs)
+exposes a per-consumer `Slab<Waker>` populated by
+`register_consumer_receive_waker` / drained by `wake_receivers` on every
+delivery, close, and end-of-topic. Both the tokio and moonpool runtime
+`Consumer::receive()` futures register their `cx.waker()` into that slab
+on first poll and evict it on `Drop`. The tokio differential runner's
+`Kicker` is gone — `golden_traces` runs sub-millisecond on the tokio
+engine.
 
-**Unblock.** Register the `Recv` future's waker against the consumer's
-per-message waker slab so the sans-io layer wakes it directly on
-delivery. Once that lands, both runners can drop the `Kicker` entirely.
+What remains is structural to the differential moonpool runner: its
+driver task is `spawn_local`'d into a
+[`tokio::task::LocalSet`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html)
+because [`moonpool_core::TokioProviders`]'s `TaskProvider` uses
+`tokio::task::Builder::new().spawn_local(...)`. While the test outer
+task is parked on `consumer.receive()`, the spawn_local'd driver task
+only runs when the LocalSet's `run_until` is polled — and the proto
+slab waker that we now fire on delivery is dispatched from the driver
+task, which itself isn't being polled. The result is a ~30 s stall per
+`Recv` until the proto keepalive deadline elapses and pumps the chain.
+[`crates/magnetar-differential/src/runner_moonpool.rs`](../crates/magnetar-differential/src/runner_moonpool.rs)
+keeps a 25 ms `Kicker` to pulse `driver_waker.notify_one()` and bridge
+the LocalSet pump gap.
+
+**Unblock.** Either (a) swap `TokioProviders` for `SimProviders` in the
+moonpool runner so the simulator's deterministic scheduler drives both
+sides without `spawn_local` (already tracked below), or (b) restructure
+the runner to spawn the driver via plain `tokio::spawn`, giving up
+moonpool-sim compatibility for the differential harness specifically.
 
 ### Expand the golden-trace catalog
 

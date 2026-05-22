@@ -24,11 +24,20 @@ use moonpool_core::TokioProviders;
 
 use crate::trace::{Event, EventStream, Op, Trace};
 
-/// Frequency at which the kicker pulses `driver_waker.notify_one()`.
-/// See the equivalently-named const in [`crate::runner_tokio`].
+/// Frequency at which the `LocalSet` pump pulses `driver_waker.notify_one()`.
+/// Retained after the sans-io waker slab refactor: the moonpool driver is
+/// `spawn_local`'d into a [`tokio::task::LocalSet`] (required by
+/// [`moonpool_core::TokioProviders`]), and the outer test task and driver
+/// task only see each other's wakeups when the `LocalSet` itself is polled.
+/// The `Recv` future's waker now fires via
+/// `magnetar_proto::consumer::ConsumerState::wake_receivers` on delivery,
+/// but the fire originates from the driver task — which never runs unless
+/// the `LocalSet` is pumped. This 25 ms tick keeps the `LocalSet` alive
+/// while the outer task is parked on a `consumer.receive()`. Removing it
+/// is tracked in `docs/follow-ups.md` (`Moonpool` runner `LocalSet` pump).
 const KICKER_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Spawn a background kicker. Drop the returned handle to stop it.
+/// Periodic `LocalSet` pump. Drop the returned handle to stop it.
 struct Kicker {
     handle: tokio::task::JoinHandle<()>,
 }

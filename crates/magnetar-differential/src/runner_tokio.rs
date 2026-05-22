@@ -6,50 +6,24 @@
 //! [`magnetar_runtime_tokio::Client`] and returns the resulting
 //! [`EventStream`].
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{CreateProducerRequest, MessageId, SubscribeRequest};
-use magnetar_runtime_tokio::{Client, ClientError, ConnectionShared, Consumer, Producer};
+use magnetar_runtime_tokio::{Client, ClientError, Consumer, Producer};
 
 use crate::trace::{Event, EventStream, Op, Trace};
-
-/// Frequency at which the kicker pulses `driver_waker.notify_one()`.
-/// Retained for the longer `golden_traces` `Recv` paths — see
-/// "Consumer-receive orphan-task wake path" in
-/// [`docs/follow-ups.md`](../../../docs/follow-ups.md) for the
-/// rationale and the long-term fix.
-const KICKER_INTERVAL: Duration = Duration::from_millis(25);
-
-/// Spawn a background kicker. Drop the returned handle to stop it.
-struct Kicker {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl Kicker {
-    fn spawn(shared: Arc<ConnectionShared>) -> Self {
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(KICKER_INTERVAL).await;
-                shared.driver_waker.notify_one();
-            }
-        });
-        Self { handle }
-    }
-}
-
-impl Drop for Kicker {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
-}
 
 /// Run `trace` against the tokio engine talking to `pulsar_url`.
 ///
 /// The runner opens **one** producer and (lazily) **one** consumer for
 /// the duration of the trace. `Close` closes both.
+///
+/// `consumer.receive()` futures register their `Waker` against the
+/// per-consumer slab on [`magnetar_proto::consumer::ConsumerState`] and
+/// the sans-io layer wakes them directly on message arrival — no
+/// background poll-pulse task is required.
 ///
 /// # Errors
 /// Returns the last engine-level error if the initial connect /
@@ -59,7 +33,6 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
     let mut stream = EventStream::empty();
 
     let client = Client::connect(pulsar_url, magnetar_proto::ConnectionConfig::default()).await?;
-    let _kicker = Kicker::spawn(client.shared().clone());
 
     let producer = client
         .open_producer_with(
