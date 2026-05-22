@@ -28,16 +28,19 @@
 //!    [`magnetar_proto::Backoff`], and sleeps for the next backoff interval;
 //! 4. reconnects via [`crate::transport::Transport::connect_with_resolver`] (routing through the
 //!    optional `dns_resolver` carried on [`ReconnectContext`]), calls
-//!    [`magnetar_proto::Connection::reset`] (which fails every in-flight op with
-//!    [`magnetar_proto::OpOutcome::SessionLost`]), restarts the handshake, and resumes step 1.
+//!    [`magnetar_proto::Connection::reset`] (which fails request-bound ops with
+//!    [`magnetar_proto::OpOutcome::SessionLost`] and snapshots in-flight publishes for transparent
+//!    replay), restarts the handshake, and resumes step 1.
 //!
 //! Stage 3 (producer / consumer state replay) wires in here too: after the new socket completes
 //! its handshake, the inner loop calls [`magnetar_proto::Connection::rebuild_producers`] and
 //! [`magnetar_proto::Connection::rebuild_consumers`], which re-emit every still-open producer's
 //! `CommandProducer` (with a bumped `epoch`) and every still-open consumer's `CommandSubscribe`
-//! plus `CommandFlow` (resuming from `last_acked_message_id` when known). In-flight publishes
-//! severed by the reset still surface `SessionLost` — full at-least-once replay is follow-up
-//! work.
+//! plus `CommandFlow` (resuming from `last_acked_message_id` when known). The producer rebuild
+//! also re-issues every snapshotted in-flight publish onto the new session — user-facing send
+//! futures stay pending until the replayed `CommandSendReceipt` arrives, never observing the
+//! reset. This delivers at-least-once publish parity with the Java client (mirrors
+//! `ProducerImpl#resendMessages`).
 //!
 //! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
 

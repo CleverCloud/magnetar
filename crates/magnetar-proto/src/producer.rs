@@ -99,6 +99,16 @@ pub struct OpSend {
     /// Wall-clock instant the send was enqueued. Used by the send-timeout sweep on
     /// [`crate::Connection::handle_timeout`].
     pub enqueued_at: std::time::Instant,
+    /// Snapshot of the wire frame(s) emitted for this publish, kept so the supervisor can
+    /// re-issue the publish on a freshly-handshaked session after a
+    /// [`crate::Connection::reset`]. A single-frame publish (regular or batched) carries one
+    /// [`OutboundFrame`]; a chunked publish carries one entry per chunk (every chunk shares
+    /// `sequence_id`). Mirrors Java `ProducerImpl#pendingMessages` which preserves the
+    /// composed payload so reconnect can replay each `OpSend` verbatim.
+    ///
+    /// Payload bytes inside [`OutboundFrame`] are `bytes::Bytes`, so cloning the vector
+    /// is refcounted and cheap.
+    pub replay_frames: Vec<OutboundFrame>,
 }
 
 /// Per-producer state.
@@ -620,12 +630,16 @@ impl ProducerState {
         self.total_bytes_sent = self
             .total_bytes_sent
             .saturating_add(msg.payload.len() as u64);
-        self.outbound.push_back(OutboundFrame {
+        let frame = OutboundFrame {
             command: cmd,
             metadata: msg.metadata,
             payload: msg.payload,
             sequence_id: seq,
-        });
+        };
+        // Stash a clone for replay before pushing onto `outbound`. `Bytes` is refcounted so
+        // the payload clone shares the underlying buffer.
+        let replay_frames = vec![frame.clone()];
+        self.outbound.push_back(frame);
         let op = OpSend {
             sequence_id: seq,
             num_messages,
@@ -633,6 +647,7 @@ impl ProducerState {
             receipt: None,
             error: None,
             enqueued_at: now,
+            replay_frames,
         };
         self.pending_index.insert(seq, self.pending.len());
         self.pending.push_back(op);
@@ -779,12 +794,14 @@ impl ProducerState {
             ..Default::default()
         };
         let payload_len = payload.len();
-        self.outbound.push_back(OutboundFrame {
+        let frame = OutboundFrame {
             command: cmd,
             metadata,
             payload,
             sequence_id: lowest_seq,
-        });
+        };
+        let replay_frames = vec![frame.clone()];
+        self.outbound.push_back(frame);
         self.total_msgs_sent = self.total_msgs_sent.saturating_add(num_messages as u64);
         self.total_bytes_sent = self.total_bytes_sent.saturating_add(payload_len as u64);
         let op = OpSend {
@@ -794,6 +811,7 @@ impl ProducerState {
             receipt: None,
             error: None,
             enqueued_at: now,
+            replay_frames,
         };
         self.pending_index.insert(lowest_seq, self.pending.len());
         self.pending.push_back(op);
@@ -848,6 +866,7 @@ impl ProducerState {
 
         // Emit each chunk frame eagerly into the outbound queue.
         let mut emitted = 0;
+        let mut replay_frames: Vec<OutboundFrame> = Vec::with_capacity(ctx.total_chunks as usize);
         for chunk_idx in 0..ctx.total_chunks {
             let start = (chunk_idx as usize) * ctx.max_chunk_size;
             let end = ((chunk_idx as usize + 1) * ctx.max_chunk_size).min(ctx.payload.len());
@@ -871,12 +890,14 @@ impl ProducerState {
                 ..Default::default()
             };
             let chunk_payload_len = chunk_payload.len();
-            self.outbound.push_back(OutboundFrame {
+            let frame = OutboundFrame {
                 command: cmd,
                 metadata: chunk_meta,
                 payload: chunk_payload,
                 sequence_id: ctx.sequence_id,
-            });
+            };
+            replay_frames.push(frame.clone());
+            self.outbound.push_back(frame);
             self.total_msgs_sent = self.total_msgs_sent.saturating_add(1);
             self.total_bytes_sent = self
                 .total_bytes_sent
@@ -892,6 +913,7 @@ impl ProducerState {
             receipt: None,
             error: None,
             enqueued_at: now,
+            replay_frames,
         };
         self.pending_index
             .insert(ctx.sequence_id, self.pending.len());
@@ -990,6 +1012,72 @@ impl ProducerState {
         self.batch = BatchContainer::default();
         self.outbound.clear();
         out
+    }
+
+    /// Drain every in-flight [`OpSend`] but preserve the publish data for replay on the
+    /// freshly-handshaked session. Returns:
+    ///
+    /// - `wakers`: the user-facing send-future wakers we removed from each [`OpSend`] so the caller
+    ///   can wake them exactly once *after* the snapshot has been stashed.
+    /// - `snapshots`: the drained [`OpSend`] entries, in original FIFO order, each with its `waker`
+    ///   field already cleared. Sequence ids, num-messages, and the cached [`OutboundFrame`] vector
+    ///   are preserved so [`Self::replay_snapshots`] can re-issue the publish verbatim on the new
+    ///   session.
+    ///
+    /// Also clears the batch container — unflushed batched messages are the caller's
+    /// responsibility to re-send (matches Java `ProducerImpl#connectionClosed` which drops
+    /// the in-progress batch). The outbound frame queue is cleared too.
+    ///
+    /// Mirrors the snapshot half of Java `ProducerImpl#resendMessages`, which keeps
+    /// `pendingMessages` around across the reconnect and re-issues each `OpSendMsg`
+    /// onto the new connection. Sans-io: this state machine never reaches for a clock —
+    /// `enqueued_at` on each snapshot is preserved from the original send, so the
+    /// post-rebuild send-timeout sweep still uses the original deadline.
+    pub fn snapshot_pending_sends(&mut self) -> (Vec<(SequenceId, Option<Waker>)>, Vec<OpSend>) {
+        let mut wakers = Vec::with_capacity(self.pending.len());
+        let mut snapshots = Vec::with_capacity(self.pending.len());
+        while let Some(mut op) = self.pending.pop_front() {
+            self.pending_index.remove(&op.sequence_id);
+            // Take the waker — the caller wakes the future exactly once with the
+            // pre-reset outcome (transparent replay = no outcome stored). Clearing here
+            // also prevents `apply_receipt` from later double-waking the same future
+            // when the replayed receipt lands.
+            let w = op.waker.take();
+            wakers.push((op.sequence_id, w));
+            snapshots.push(op);
+        }
+        self.batch = BatchContainer::default();
+        self.outbound.clear();
+        (wakers, snapshots)
+    }
+
+    /// Re-issue a vector of [`OpSend`] snapshots produced by
+    /// [`Self::snapshot_pending_sends`]. For each snapshot:
+    ///
+    /// 1. Every cached [`OutboundFrame`] is pushed back onto the producer's outbound queue
+    ///    (preserving wire order; a chunked publish replays N frames in the same relative order as
+    ///    the original emit).
+    /// 2. The snapshot's [`OpSend`] is re-inserted into `pending` with `waker: None`. The user's
+    ///    send future re-registers on the next `poll` after the wake-up.
+    ///
+    /// Counter side-effects (`total_msgs_sent`, `total_bytes_sent`) are NOT incremented
+    /// — the original emit already counted them; a re-send is not "new" traffic from a
+    /// per-producer-stats perspective.
+    ///
+    /// Sequence ids on the replayed `OpSend`s are preserved verbatim. The broker's
+    /// dedup window (mirrors Java `ProducerImpl#epoch` + the on-wire `CommandProducer.epoch`
+    /// bump) rejects stale re-attaches; `last_sequence_id_pushed` is already pinned to
+    /// the highest sent id and is left untouched here. Mirrors Java
+    /// `ProducerImpl#resendMessages`'s `pendingMessages` walk.
+    pub fn replay_snapshots(&mut self, snapshots: Vec<OpSend>) {
+        for snapshot in snapshots {
+            for frame in &snapshot.replay_frames {
+                self.outbound.push_back(frame.clone());
+            }
+            self.pending_index
+                .insert(snapshot.sequence_id, self.pending.len());
+            self.pending.push_back(snapshot);
+        }
     }
 
     /// Mark the producer closed. New sends return [`ProducerError::Closed`].
@@ -1720,5 +1808,108 @@ mod tests {
         assert!(p.send_latency_max_ms() >= 1);
         let stats = p.stats();
         assert_eq!(stats.send_latency_max_ms, p.send_latency_max_ms());
+    }
+
+    /// Snapshot / replay round-trip — single-frame publish. Mirrors
+    /// `Connection::reset` → `Connection::rebuild_producers` on the proto side.
+    #[test]
+    fn snapshot_then_replay_round_trips_single_send() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let _ = p
+            .queue_send(small_message(b"hi"), 100, std::time::Instant::now())
+            .unwrap();
+        // Drain the original outbound frame (the wire send happened).
+        let _ = p.next_outbound_frame();
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending[0].replay_frames.len(), 1);
+
+        let (wakers, snapshots) = p.snapshot_pending_sends();
+        assert_eq!(snapshots.len(), 1, "one OpSend captured");
+        assert_eq!(wakers.len(), 1, "one waker slot returned (None inside)");
+        assert!(
+            wakers[0].1.is_none(),
+            "no waker was registered for this send"
+        );
+        assert_eq!(p.pending.len(), 0, "pending drained into the snapshot");
+
+        // Replay: the OpSend goes back into pending, and the cached wire frame is
+        // re-emitted into the producer's outbound queue.
+        p.replay_snapshots(snapshots);
+        assert_eq!(p.pending.len(), 1, "replay re-installs the OpSend");
+        assert_eq!(p.outbound_len(), 1, "replay re-enqueues the wire frame");
+        let frame = p.next_outbound_frame().expect("replay produces a frame");
+        assert_eq!(frame.payload.as_ref(), b"hi");
+        assert_eq!(frame.sequence_id, SequenceId(0));
+    }
+
+    /// Snapshot / replay round-trip — chunked publish. A single `OpSend` captures all
+    /// chunk frames; replay re-emits them all in order.
+    #[test]
+    fn snapshot_then_replay_round_trips_chunked_send() {
+        let mut p = ProducerState::new(ProducerHandle(1), "t".to_owned(), CompressionKind::None, 4);
+        p.chunking_enabled = true;
+        let payload = vec![b'z'; 10];
+        let _ = p
+            .queue_send(small_message(&payload), 100, std::time::Instant::now())
+            .unwrap();
+        // Drain the three chunk frames the producer just queued.
+        for _ in 0..3 {
+            let _ = p.next_outbound_frame();
+        }
+        // One OpSend covers all chunks; replay_frames carries all three.
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending[0].replay_frames.len(), 3);
+
+        let (_wakers, snapshots) = p.snapshot_pending_sends();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].replay_frames.len(), 3);
+
+        // Replay re-emits all three chunk frames in the original order.
+        p.replay_snapshots(snapshots);
+        assert_eq!(p.outbound_len(), 3, "all three chunks re-queued");
+        for chunk_idx in 0..3i32 {
+            let f = p.next_outbound_frame().expect("chunk");
+            assert_eq!(f.metadata.chunk_id, Some(chunk_idx));
+        }
+    }
+
+    /// Snapshot drains and clears the in-progress batch container so unflushed batched
+    /// stragglers do not survive the reconnect. Mirrors Java
+    /// `ProducerImpl#connectionClosed` which drops the batch on the floor.
+    #[test]
+    fn snapshot_clears_in_progress_batch_container() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            4096,
+        );
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 100;
+        p.max_batch_size_bytes = 4096;
+        // Two batched sends — they accumulate in the batch container, not in `pending`.
+        let _ = p
+            .queue_send(small_message(b"a"), 100, std::time::Instant::now())
+            .unwrap();
+        let _ = p
+            .queue_send(small_message(b"b"), 100, std::time::Instant::now())
+            .unwrap();
+        assert!(!p.batch.is_empty());
+        assert_eq!(p.pending.len(), 0);
+
+        let (_wakers, snapshots) = p.snapshot_pending_sends();
+        assert!(
+            snapshots.is_empty(),
+            "in-progress batched messages are not snapshotted (no OpSend yet)"
+        );
+        assert!(
+            p.batch.is_empty(),
+            "the batch container is dropped on snapshot"
+        );
     }
 }

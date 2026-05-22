@@ -3,24 +3,26 @@
 //! Chaos scenario: a producer has 10 in-flight publishes that the broker
 //! has not yet acknowledged. The supervised driver loop trips into the
 //! reconnect path (`Connection::reset` + new socket + re-handshake +
-//! `rebuild_producers`). The contract:
+//! `rebuild_producers`). The contract — Stage 3 transparent replay
+//! (mirrors Java `ProducerImpl#resendMessages`):
 //!
-//! 1. Every in-flight publish must surface
-//!    [`OpOutcome::SessionLost`](magnetar_proto::OpOutcome::SessionLost) so the caller's `SendFut`
-//!    resolves with a typed signal that the publish was *not* observed by the broker. The caller is
-//!    then free to retry (PIP-31 idempotent retry, at-most-once vs. at-least-once semantics belong
-//!    to the user).
-//! 2. The producer handle survives — the user does not need to recreate it. `rebuild_producers`
-//!    reissues `CommandProducer` on the new session and returns the originating request id. The
-//!    user's next `send()` lands on the rebuilt session.
-//! 3. The session epoch is bumped by exactly one, so callers that snapshot the epoch before issuing
-//!    an op can detect the reset on completion.
+//! 1. `Connection::reset` does **not** install
+//!    [`OpOutcome::SessionLost`](magnetar_proto::OpOutcome::SessionLost) on the publish key. The
+//!    user-facing `SendFut` polls, finds no outcome, re-registers its waker, and stays pending
+//!    across the reconnect.
+//! 2. The in-flight publishes are snapshotted on the connection
+//!    ([`magnetar_proto::Connection::in_flight_publish_snapshot_len`]) and `rebuild_producers`
+//!    replays them onto the new session in original FIFO order with their original sequence ids.
+//! 3. The producer handle survives — the user does not need to recreate it. Future `send()` calls
+//!    allocate from the post-replay `last_sequence_id_pushed` so monotonicity is preserved.
+//! 4. The session epoch is bumped by exactly one, so callers that snapshot the epoch before issuing
+//!    an op can still detect the reset on completion.
 //!
 //! Why this is moonpool territory: `testcontainers` cannot enumerate the
 //! reset → rebuild sequence with N in-flight ops. The proto layer
-//! exposes the hooks directly; this test pins the invariant that all N
-//! pending publishes get a typed `SessionLost` outcome, not silently
-//! dropped, on every supervised reset.
+//! exposes the hooks directly; this test pins the invariant that the
+//! N pending publishes survive the reset transparently, with no
+//! `SessionLost` outcome ever surfacing to the caller.
 
 mod common;
 
@@ -30,12 +32,12 @@ use bytes::Bytes;
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{OpOutcome, PendingOpKey, SequenceId, pb};
 
-use crate::common::{handshake_complete_shared, open_producer_ready};
+use crate::common::{handshake_complete_shared, open_producer_ready, send_receipt_bytes};
 
 const INFLIGHT_COUNT: u64 = 10;
 
 #[test]
-fn reset_surfaces_session_lost_for_every_inflight_publish() {
+fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     let t0 = Instant::now();
     let shared = handshake_complete_shared(t0);
     let handle = open_producer_ready(&shared, "persistent://public/default/inflight", t0);
@@ -87,29 +89,33 @@ fn reset_surfaces_session_lost_for_every_inflight_publish() {
         shared.inner.lock().reset();
     }
 
-    // Every pending publish must now carry a SessionLost outcome keyed by
-    // its sequence id. The pending-publish slab is emptied; the producer
-    // handle survives.
+    // Stage 3 transparent replay: NO SessionLost outcome lands on the
+    // publish key. The user-facing SendFut would re-poll, find the slot
+    // empty, re-register its waker, and stay pending until the replayed
+    // receipt arrives on the new session.
     for seq in &seqs {
         let key = PendingOpKey::Send(handle, *seq);
         let outcome = shared.inner.lock().take_outcome(key);
-        match outcome {
-            Some(OpOutcome::SessionLost { key: returned_key }) => {
-                assert_eq!(returned_key, key, "SessionLost must echo back the op key");
-            }
-            other => panic!("expected SessionLost for {seq:?}, got {other:?}"),
-        }
+        assert!(
+            outcome.is_none(),
+            "transparent replay must not install SessionLost on the publish key (got {outcome:?})"
+        );
     }
 
     // The producer's pending queue is empty (every in-flight was drained
-    // by `reset`), but the handle itself is still registered with the
-    // connection.
+    // into the snapshot), and the snapshot now holds all N publishes
+    // ready for `rebuild_producers` to re-issue.
     {
         let conn = shared.inner.lock();
         assert_eq!(
             conn.producer_pending_count(handle),
             0,
-            "reset must drain every in-flight publish"
+            "reset must drain every in-flight publish into the snapshot"
+        );
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(handle),
+            INFLIGHT_COUNT as usize,
+            "the snapshot must preserve every in-flight publish until rebuild consumes it"
         );
     }
 
@@ -121,14 +127,9 @@ fn reset_surfaces_session_lost_for_every_inflight_publish() {
         "reset must bump session_epoch exactly once"
     );
 
-    // The producer survives — issuing rebuild_producers reissues
-    // `CommandProducer` on the new session. The handle is still valid for
-    // the next `send()`. This is the Stage 3 contract: user-facing
-    // `Producer` handles do not need to be recreated across reconnects.
+    // Walk through a synthetic re-handshake and rebuild.
     {
         let mut conn = shared.inner.lock();
-        // We need to re-handshake first; rebuild_producers operates on a
-        // freshly-connected session. Walk a synthetic Connected through.
         conn.begin_handshake().expect("re-handshake");
         let frame = common::handshake_response_bytes();
         conn.handle_bytes(t0, &frame).expect("Connected on retry");
@@ -141,10 +142,24 @@ fn reset_surfaces_session_lost_for_every_inflight_publish() {
         );
     }
 
-    // The producer is once again usable for a fresh send. Sequence ids
-    // resume from where the producer left off — the slab's
-    // `last_sequence_id_pushed` is preserved across the reset, so a fresh
-    // `send` allocates `INFLIGHT_COUNT` (the next available id).
+    // Post-rebuild: the snapshot is drained into the producer's `pending` queue, and
+    // the wire-frame queue has been re-emitted into the connection's outbound buffer.
+    {
+        let conn = shared.inner.lock();
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(handle),
+            0,
+            "rebuild_producers must consume the snapshot"
+        );
+        assert_eq!(
+            conn.producer_pending_count(handle),
+            INFLIGHT_COUNT as usize,
+            "rebuild_producers must reinstall every snapshotted OpSend into pending"
+        );
+    }
+
+    // A fresh post-reset `send` continues monotonically from where the producer
+    // left off (the replay does not bump `last_sequence_id_pushed`).
     let next_seq = {
         let mut conn = shared.inner.lock();
         conn.send(
@@ -165,5 +180,244 @@ fn reset_surfaces_session_lost_for_every_inflight_publish() {
         next_seq,
         SequenceId(INFLIGHT_COUNT),
         "sequence ids must continue monotonically across the reset"
+    );
+}
+
+/// Replayed publishes still resolve their user-facing futures when the broker's
+/// `CommandSendReceipt` arrives on the new session. This is the second half of the
+/// transparent-replay contract: not only must the publish data survive the reconnect,
+/// the eventual receipt must flow through `apply_receipt` and land an
+/// `OpOutcome::SendReceipt` on the connection's outcome slab keyed by the original
+/// `(producer, sequence_id)` — i.e. the user's `SendFut` resolves exactly as if the
+/// original session had simply lasted longer. Mirrors Java
+/// `ProducerImpl#ackReceived` against a `resendMessages`-replayed `OpSendMsg`.
+#[test]
+fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+    let handle = open_producer_ready(&shared, "persistent://public/default/replay-ok", t0);
+
+    // Single in-flight publish, no receipt yet.
+    let seq = {
+        let mut conn = shared.inner.lock();
+        conn.send(
+            handle,
+            OutgoingMessage {
+                payload: Bytes::from_static(b"survive-me"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 10,
+                num_messages: 1,
+                txn_id: None,
+            },
+            0,
+            t0,
+        )
+        .expect("queue send")
+    };
+
+    // Drain the pre-reset wire frame.
+    {
+        let mut conn = shared.inner.lock();
+        let mut tx_buf: Vec<u8> = Vec::new();
+        let _ = conn.poll_transmit(&mut tx_buf);
+    }
+
+    // Supervised reset: the snapshot is taken, no outcome lands on the publish key.
+    shared.inner.lock().reset();
+    let key = PendingOpKey::Send(handle, seq);
+    assert!(
+        shared.inner.lock().take_outcome(key).is_none(),
+        "transparent replay: no SessionLost outcome installed"
+    );
+
+    // Re-handshake + rebuild on the new session.
+    {
+        let mut conn = shared.inner.lock();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(t0, &common::handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = conn.poll_event();
+        let _ = conn.rebuild_producers();
+    }
+
+    // Drain the post-rebuild wire frames so the publish is "on the wire" of the new
+    // session.
+    {
+        let mut conn = shared.inner.lock();
+        let mut tx_buf: Vec<u8> = Vec::new();
+        let _ = conn.poll_transmit(&mut tx_buf);
+    }
+
+    // Feed the broker's CommandSendReceipt — the replayed OpSend resolves.
+    {
+        let mut conn = shared.inner.lock();
+        let receipt = send_receipt_bytes(handle, seq, 99, seq.0);
+        conn.handle_bytes(t0, &receipt).expect("apply receipt");
+    }
+
+    // The outcome lands keyed by the original (producer, sequence_id), and the
+    // producer's pending queue is now empty.
+    match shared.inner.lock().take_outcome(key) {
+        Some(OpOutcome::SendReceipt {
+            sequence_id,
+            message_id,
+        }) => {
+            assert_eq!(sequence_id, seq);
+            assert_eq!(message_id.ledger_id, 99);
+            assert_eq!(message_id.entry_id, seq.0);
+        }
+        other => panic!("expected SendReceipt for replayed send, got {other:?}"),
+    }
+    assert_eq!(
+        shared.inner.lock().producer_pending_count(handle),
+        0,
+        "the replayed OpSend drains on receipt"
+    );
+}
+
+/// FIFO ordering invariant — three publishes in a row, reset mid-flight, rebuild
+/// must replay them onto the new session in original order with their original
+/// sequence ids. The Java client documents (and the tests in
+/// `ProducerImplTest#testRecreateProducerOnReconnect` assert) that publish ordering is
+/// preserved across the reconnect; this test mirrors that guarantee on the moonpool
+/// engine surface.
+#[test]
+fn replay_preserves_fifo_ordering_across_rebuild() {
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+    let handle = open_producer_ready(&shared, "persistent://public/default/replay-fifo", t0);
+
+    let payloads: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
+    let mut seqs: Vec<SequenceId> = Vec::with_capacity(3);
+    {
+        let mut conn = shared.inner.lock();
+        for p in &payloads {
+            let seq = conn
+                .send(
+                    handle,
+                    OutgoingMessage {
+                        payload: Bytes::from(p.to_vec()),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: p.len() as u32,
+                        num_messages: 1,
+                        txn_id: None,
+                    },
+                    0,
+                    t0,
+                )
+                .expect("queue");
+            seqs.push(seq);
+        }
+        // Drain pre-reset wire frames so the post-rebuild drain is isolated.
+        let mut tx_buf: Vec<u8> = Vec::new();
+        let _ = conn.poll_transmit(&mut tx_buf);
+    }
+
+    // Reset + rebuild.
+    shared.inner.lock().reset();
+    {
+        let mut conn = shared.inner.lock();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(t0, &common::handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = conn.poll_event();
+        let _ = conn.rebuild_producers();
+    }
+
+    // Drain post-rebuild wire frames and inspect the CommandSend ordering.
+    let raw_bytes = {
+        let mut conn = shared.inner.lock();
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = conn.poll_transmit(&mut buf);
+        buf
+    };
+    let mut cursor = Bytes::copy_from_slice(&raw_bytes);
+    let mut send_seqs: Vec<u64> = Vec::new();
+    let mut send_payloads: Vec<Vec<u8>> = Vec::new();
+    while !cursor.is_empty() {
+        let frame = magnetar_proto::frame::decode_one(&mut cursor).expect("decode frame");
+        if frame.command.r#type == pb::base_command::Type::Send as i32 {
+            if let Some(s) = frame.command.send.as_ref() {
+                send_seqs.push(s.sequence_id);
+            }
+            if let Some(body) = frame.payload.as_ref() {
+                send_payloads.push(body.body.to_vec());
+            }
+        }
+    }
+    assert_eq!(
+        send_seqs,
+        seqs.iter().map(|s| s.0).collect::<Vec<u64>>(),
+        "rebuild must replay the OpSends in their original sequence-id order"
+    );
+    let expected_payloads: Vec<Vec<u8>> = payloads.iter().map(|p| p.to_vec()).collect();
+    assert_eq!(
+        send_payloads, expected_payloads,
+        "rebuild must replay the OpSends in their original payload order"
+    );
+}
+
+/// `session_epoch` monotonicity across a double reset → rebuild cycle. Mirrors Java
+/// `ClientCnx#getEpoch` which is bumped exactly once per `connectionClosed`. The
+/// transparent-replay path must not double-bump or skip the counter, since callers
+/// snapshot the epoch before issuing an op and compare on completion.
+#[test]
+fn session_epoch_bumps_exactly_once_per_reset_in_replay_cycle() {
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+    let handle = open_producer_ready(&shared, "persistent://public/default/replay-epoch", t0);
+
+    // One publish, two reset+rebuild cycles, expect epoch == 2 at the end.
+    {
+        let mut conn = shared.inner.lock();
+        let _ = conn
+            .send(
+                handle,
+                OutgoingMessage {
+                    payload: Bytes::from_static(b"epoch-test"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 10,
+                    num_messages: 1,
+                    txn_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue");
+        let mut tx_buf: Vec<u8> = Vec::new();
+        let _ = conn.poll_transmit(&mut tx_buf);
+    }
+    let epoch_before = shared.inner.lock().session_epoch();
+
+    for _ in 0..2 {
+        shared.inner.lock().reset();
+        let mut conn = shared.inner.lock();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(t0, &common::handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = conn.poll_event();
+        let _ = conn.rebuild_producers();
+        // Drain the wire frames so the next reset's snapshot is the only OpSend in flight.
+        let mut tx_buf: Vec<u8> = Vec::new();
+        let _ = conn.poll_transmit(&mut tx_buf);
+    }
+
+    let epoch_after = shared.inner.lock().session_epoch();
+    assert_eq!(
+        epoch_after,
+        epoch_before.wrapping_add(2),
+        "session_epoch must bump by exactly 1 per reset across two reset+rebuild cycles"
+    );
+    // The OpSend survives both cycles — it's still in the producer's pending queue,
+    // ready to resolve when the broker's receipt finally arrives.
+    assert_eq!(
+        shared.inner.lock().producer_pending_count(handle),
+        1,
+        "the OpSend survives both reset+rebuild cycles"
+    );
+    assert_eq!(
+        shared.inner.lock().in_flight_publish_snapshot_len(handle),
+        0,
+        "the snapshot bucket is empty after both rebuild_producers calls"
     );
 }

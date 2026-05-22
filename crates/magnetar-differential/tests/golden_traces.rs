@@ -216,3 +216,58 @@ async fn seek_to_start_then_replay() {
         .collect();
     assert_eq!(pre, post, "post-seek replay should match pre-seek sequence");
 }
+
+/// Golden 5 — many small publishes back-to-back, exercising the replay-frame
+/// storage path on each publish (Stage 3 transparent in-flight publish replay landed
+/// `OpSend::replay_frames` so reset → rebuild_producers can re-issue every unconfirmed
+/// publish on the new session). This golden does NOT trigger a reset — the differential
+/// harness has no public hook to do so today (see follow-ups), so the new replay branch
+/// is exercised by the unit + integration tests in the proto, tokio, and moonpool crates.
+/// What this golden DOES guarantee: the post-replay-frame-storage code path produces
+/// byte-identical EventStreams across the tokio and moonpool engines. Catches the easy
+/// regression where the new path diverges between engines without altering
+/// user-visible semantics.
+#[tokio::test(flavor = "current_thread")]
+async fn many_publishes_round_trip() {
+    let mut ops = Vec::new();
+    for i in 0..7u8 {
+        ops.push(Op::Send {
+            payload: vec![b'm', b'-', b'0' + i],
+        });
+    }
+    for _ in 0..7 {
+        ops.push(Op::Recv {
+            timeout: Duration::from_secs(2),
+        });
+    }
+    for i in 0..7 {
+        ops.push(Op::Ack {
+            message_id: mid(1, i),
+        });
+    }
+    ops.push(Op::Close);
+    let trace = Trace::new(
+        "persistent://public/default/diff-many-publishes",
+        "sub-many",
+        ops,
+    );
+    let stream = assert_equivalent(&trace).await;
+    let sent = stream
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::Sent { .. }))
+        .count();
+    let received = stream
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::Received { .. }))
+        .count();
+    let acked = stream
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::Acked))
+        .count();
+    assert_eq!(sent, 7);
+    assert_eq!(received, 7);
+    assert_eq!(acked, 7);
+}

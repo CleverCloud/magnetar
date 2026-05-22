@@ -556,6 +556,16 @@ pub struct Connection {
     /// freshly-handshaked transport via [`Self::rebuild_producers`]. Mirrors the parameters
     /// Java keeps inside `ProducerImpl#conf` for the same purpose.
     producer_create_requests: HashMap<ProducerHandle, CreateProducerRequest>,
+    /// In-flight publish snapshots — populated by [`Self::reset`] and consumed by
+    /// [`Self::rebuild_producers`]. Keyed by producer handle; each value is the in-FIFO-order
+    /// list of [`crate::producer::OpSend`] entries that were unconfirmed at reset time, with
+    /// their wakers already cleared. Mirrors Java `ProducerImpl#pendingMessages` which is
+    /// preserved across the reconnect so `resendMessages()` can re-issue each `OpSendMsg`
+    /// verbatim onto the new session. Implements at-least-once publish parity (the
+    /// `OpOutcome::SessionLost` short-circuit is *not* installed on the outcome slab for
+    /// snapshotted sends — the user-facing future sees the eventual `CommandSendReceipt`
+    /// without ever observing the reset).
+    in_flight_publish_snapshots: HashMap<ProducerHandle, Vec<crate::producer::OpSend>>,
     /// Open consumers.
     consumers: HashMap<ConsumerHandle, ConsumerState>,
     /// Original [`SubscribeRequest`] for every still-open consumer. Stashed at
@@ -654,6 +664,7 @@ impl Connection {
             pending_requests: HashMap::new(),
             producers: HashMap::new(),
             producer_create_requests: HashMap::new(),
+            in_flight_publish_snapshots: HashMap::new(),
             consumers: HashMap::new(),
             consumer_subscribe_requests: HashMap::new(),
             lookup: LookupRegistry::default(),
@@ -769,15 +780,21 @@ impl Connection {
     ///
     /// 1. Bump [`Self::session_epoch`].
     /// 2. Emit [`OpOutcome::SessionLost`] for every pending request (lookup, seek, ack, transaction
-    ///    round-trip, …) and every in-flight producer publish. The corresponding user futures are
-    ///    woken with that outcome.
-    /// 3. Reset every producer's in-flight `OpSend` queue and batch container, and clear every
-    ///    consumer's queue + pending seek + ack tracker. Producers and consumers themselves are
-    ///    *not* removed — Stage 3 of the supervisor work will replay their `CommandProducer` /
-    ///    `CommandSubscribe` against the new transport. Until then, callers must reopen them by
-    ///    hand.
-    /// 4. Clear connection-level outbound + inbound byte buffers; flush queued events.
-    /// 5. Snap the state machine back to [`HandshakeState::Uninitialized`] so
+    ///    round-trip, …). The corresponding user futures are woken with that outcome.
+    /// 3. Snapshot every in-flight producer publish into [`Self::in_flight_publish_snapshots`] (key
+    ///    = `ProducerHandle`, value = ordered `Vec<OpSend>` with wakers cleared). Wake each
+    ///    original send-future waker exactly once — but do *not* install a `SessionLost` outcome on
+    ///    the publish key. The user future re-polls, finds no outcome, re-registers, and stays
+    ///    pending until the replayed [`crate::producer::OpSend`] surfaces its eventual
+    ///    `CommandSendReceipt` (transparent at-least-once replay). Clear every producer's batch
+    ///    container so unflushed partial batches do not survive the reconnect — the caller is
+    ///    responsible for those.
+    /// 4. Reset every consumer's queue + pending seek + ack tracker. Producers and consumers
+    ///    themselves are *not* removed — [`Self::rebuild_producers`] and
+    ///    [`Self::rebuild_consumers`] replay their `CommandProducer` / `CommandSubscribe` against
+    ///    the new transport.
+    /// 5. Clear connection-level outbound + inbound byte buffers; flush queued events.
+    /// 6. Snap the state machine back to [`HandshakeState::Uninitialized`] so
     ///    [`Self::begin_handshake`] can fire again on the new socket.
     pub fn reset(&mut self) {
         self.session_epoch = self.session_epoch.wrapping_add(1);
@@ -797,22 +814,37 @@ impl Connection {
         }
         self.pending_requests.clear();
 
-        // Fail every in-flight publish across every producer.
+        // (3) Snapshot every in-flight publish so [`rebuild_producers`] can replay it on
+        // the freshly-handshaked session. We pluck the wakers out of each `OpSend` (so we
+        // wake the user's future without double-firing on the replayed receipt) and stash
+        // the now-wakerless `OpSend` under its producer's snapshot bucket. We deliberately
+        // do *not* install a `SessionLost` outcome on the Send key — the user future polls
+        // after the wake-up, finds the slot empty, re-registers, and will eventually see
+        // the receipt from the replayed publish.
+        self.in_flight_publish_snapshots.clear();
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
             if let Some(producer) = self.producers.get_mut(&handle) {
-                let drained = producer.drain_pending_sends();
-                for (seq, waker_opt) in drained {
-                    let key = PendingOpKey::Send(handle, seq);
-                    self.outcomes.insert(key, OpOutcome::SessionLost { key });
+                let (wakers, snapshots) = producer.snapshot_pending_sends();
+                for (seq, waker_opt) in wakers {
                     // Prefer the producer-stored waker (registered via
                     // ProducerState::register_waker); fall back to the connection-level
-                    // slab when no producer-stored waker was set.
+                    // slab when no producer-stored waker was set. Wake exactly once —
+                    // no outcome is installed, so the future will re-register on its
+                    // next poll and stay pending until the replayed receipt lands.
+                    let key = PendingOpKey::Send(handle, seq);
                     if let Some(w) = waker_opt {
+                        // Drop the connection-level waker too so the next call to
+                        // `register_waker` from the re-polling future is the one that
+                        // gets fired on receipt — no stale wakers linger.
+                        let _ = self.wakers.remove(&key);
                         w.wake();
                     } else if let Some(w) = self.wakers.remove(&key) {
                         w.wake();
                     }
+                }
+                if !snapshots.is_empty() {
+                    self.in_flight_publish_snapshots.insert(handle, snapshots);
                 }
             }
         }
@@ -871,7 +903,8 @@ impl Connection {
     }
 
     /// Re-emit a `CommandProducer` for every still-open producer that was created before the
-    /// most recent [`Self::reset`]. The supervisor calls this after the new socket's handshake
+    /// most recent [`Self::reset`], then re-issue every in-flight publish snapshotted by that
+    /// reset onto the new session. The supervisor calls this after the new socket's handshake
     /// completes so user-facing producer handles transparently survive the reconnect — once each
     /// returned [`RequestId`] surfaces an [`OpOutcome::Success`], the producer is "live" again
     /// and queued sends can flow on the new transport.
@@ -880,8 +913,17 @@ impl Connection {
     /// the broker can detect — and accept — the re-attach (rejecting stale reconnects of older
     /// epochs). Mirrors Java `ProducerImpl#reconnectLater`.
     ///
+    /// Snapshotted publishes (see [`Self::in_flight_publish_snapshots`]) are replayed onto
+    /// `producer.outbound` in their original FIFO order with their original sequence ids, then
+    /// drained onto the connection's outbound buffer. Each replayed [`crate::producer::OpSend`]
+    /// goes back into the producer's `pending` queue verbatim — its `waker` field is `None`
+    /// (cleared by [`Self::reset`]) so the user-facing send future re-registers on its next
+    /// poll and the eventual `CommandSendReceipt` resolves the future normally.
+    /// Mirrors Java `ProducerImpl#resendMessages`.
+    ///
     /// Producers explicitly closed via [`Self::close_producer`] (or by the broker via
-    /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured.
+    /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured. Any snapshot
+    /// for a now-closed producer is discarded along with the rest of its state.
     pub fn rebuild_producers(&mut self) -> Vec<RequestId> {
         // Snapshot the (handle, request) pairs we want to replay so the borrow of
         // `producer_create_requests` doesn't conflict with `emit_command_producer`'s mutable
@@ -892,6 +934,8 @@ impl Connection {
             .filter(|(handle, _)| self.producers.get(*handle).is_some_and(|p| !p.closed))
             .map(|(handle, req)| (*handle, req.clone()))
             .collect();
+        let live_handles: std::collections::HashSet<ProducerHandle> =
+            pending.iter().map(|(h, _)| *h).collect();
         let mut request_ids = Vec::with_capacity(pending.len());
         for (handle, req) in pending {
             if let Some(p) = self.producers.get_mut(&handle) {
@@ -899,8 +943,38 @@ impl Connection {
             }
             let request_id = self.emit_command_producer(handle, &req);
             request_ids.push(request_id);
+            // Replay any snapshotted in-flight publishes onto this producer's outbound queue
+            // and reinstall them in `pending`. The wire-frame data was captured at
+            // emit time so the replay is byte-for-byte identical to the original publish
+            // (apart from the freshly-bumped `CommandProducer.epoch` that the broker now
+            // associates with this producer).
+            if let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle)
+                && let Some(producer) = self.producers.get_mut(&handle)
+            {
+                producer.replay_snapshots(snapshots);
+            }
         }
+        // Drop any snapshots that belong to producers we did NOT rebuild (e.g. ones closed
+        // between reset and rebuild). Their `OpSend`s never reach a future — the user-facing
+        // close path is responsible for surfacing the disposition (`Closed` error).
+        self.in_flight_publish_snapshots
+            .retain(|h, _| live_handles.contains(h));
+        // Drain the freshly-replayed outbound frames onto the wire — same path the regular
+        // `Connection::send` uses after a `queue_send`.
+        self.drain_producer_outbound();
         request_ids
+    }
+
+    /// Number of in-flight publish snapshots stashed for `handle` by the most recent
+    /// [`Self::reset`]. Returns `0` when the snapshot has already been drained by
+    /// [`Self::rebuild_producers`] or the producer never had any in-flight publish at
+    /// reset time. Test-facing observability hook — runtimes do not call this in the
+    /// hot path.
+    #[must_use]
+    pub fn in_flight_publish_snapshot_len(&self, handle: ProducerHandle) -> usize {
+        self.in_flight_publish_snapshots
+            .get(&handle)
+            .map_or(0, Vec::len)
     }
 
     /// Re-emit a `CommandSubscribe` + initial `CommandFlow` for every still-open consumer that
@@ -3355,7 +3429,8 @@ mod conn_state_tests {
             "send must produce a pending OpSend"
         );
 
-        // Now reset — every pending op must surface SessionLost and the epoch must bump.
+        // Now reset — request-bound ops must surface SessionLost; in-flight publishes are
+        // snapshotted for transparent replay (no SessionLost outcome installed).
         conn.reset();
         assert_eq!(conn.session_epoch(), epoch_before + 1);
         assert!(
@@ -3365,12 +3440,17 @@ mod conn_state_tests {
             ),
             "request-bound op fails with SessionLost after reset"
         );
+        // Transparent publish replay: no `SessionLost` outcome lands on the publish key.
+        // The user-facing send future re-polls after the wake-up, finds the slot empty,
+        // re-registers, and stays pending until the replayed `CommandSendReceipt`.
         assert!(
-            matches!(
-                conn.take_outcome(send_key),
-                Some(OpOutcome::SessionLost { key: k }) if k == send_key
-            ),
-            "in-flight publish fails with SessionLost after reset"
+            conn.take_outcome(send_key).is_none(),
+            "in-flight publish is snapshotted for replay — no SessionLost outcome installed"
+        );
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            1,
+            "the snapshot must hold the one in-flight publish until rebuild consumes it",
         );
         assert_eq!(
             conn.state(),
@@ -3988,5 +4068,477 @@ mod conn_state_tests {
             !conn.has_pending_request_for_test(request_id),
             "pending request slot freed"
         );
+    }
+
+    // ============================================================================
+    // Stage 3 — transparent in-flight publish replay across reconnect
+    //
+    // Pins the contract that `Connection::reset` snapshots in-flight publishes (rather than
+    // discarding them with a `SessionLost` outcome), and `Connection::rebuild_producers`
+    // re-issues them onto the freshly-handshaked session preserving ordering and sequence
+    // ids. Mirrors Java `ProducerImpl#resendMessages`.
+    // ============================================================================
+
+    /// Build a `CommandSendReceipt` wire frame for the given producer + sequence id.
+    /// Returns the frame-encoded bytes (a single `BaseCommand` ready to feed into
+    /// `Connection::handle_bytes`).
+    fn send_receipt_bytes(producer: ProducerHandle, sequence_id: SequenceId) -> bytes::BytesMut {
+        let receipt = pb::CommandSendReceipt {
+            producer_id: producer.0,
+            sequence_id: sequence_id.0,
+            message_id: Some(pb::MessageIdData {
+                ledger_id: 1,
+                entry_id: sequence_id.0,
+                ..Default::default()
+            }),
+            highest_sequence_id: None,
+        };
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::SendReceipt as i32,
+            send_receipt: Some(receipt),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandSendReceipt");
+        buf
+    }
+
+    /// (a) Snapshot formation: a publish in-flight at reset time is moved into
+    /// `in_flight_publish_snapshots` and OUT of the producer's `pending` queue, with no
+    /// `SessionLost` outcome installed on the publish key.
+    #[test]
+    fn reset_snapshots_in_flight_publishes_keyed_by_producer_handle() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let producer_a = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-a".to_owned(),
+            ..Default::default()
+        });
+        let producer_b = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-b".to_owned(),
+            ..Default::default()
+        });
+
+        // Queue three in-flight publishes on A, one on B.
+        let mut seqs_a: Vec<SequenceId> = Vec::new();
+        for payload in [&b"a0"[..], &b"a1"[..], &b"a2"[..]] {
+            let seq = conn
+                .send(
+                    producer_a,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::copy_from_slice(payload),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: payload.len() as u32,
+                        num_messages: 1,
+                        txn_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue A");
+            seqs_a.push(seq);
+        }
+        let seq_b = conn
+            .send(
+                producer_b,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"b0"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 2,
+                    num_messages: 1,
+                    txn_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue B");
+
+        assert_eq!(conn.producer_pending_count(producer_a), 3);
+        assert_eq!(conn.producer_pending_count(producer_b), 1);
+        // Reset → snapshot.
+        conn.reset();
+        // No `SessionLost` outcomes for the snapshotted sends (transparent replay).
+        for seq in &seqs_a {
+            assert!(
+                conn.take_outcome(PendingOpKey::Send(producer_a, *seq))
+                    .is_none(),
+                "no SessionLost outcome for snapshotted send seq={seq:?}"
+            );
+        }
+        assert!(
+            conn.take_outcome(PendingOpKey::Send(producer_b, seq_b))
+                .is_none(),
+            "no SessionLost outcome for snapshotted send on producer B"
+        );
+        // Snapshot bucket per producer carries the publishes in original FIFO order.
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer_a), 3);
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer_b), 1);
+        // Producer-side pending queue is now empty (drained into the snapshot).
+        assert_eq!(conn.producer_pending_count(producer_a), 0);
+        assert_eq!(conn.producer_pending_count(producer_b), 0);
+    }
+
+    /// (a) SessionLost wake fires exactly once: the user-registered waker on each in-flight
+    /// publish is fired by `reset`, and is NOT fired again when the eventual receipt arrives
+    /// after the rebuild (the waker is cleared from the snapshot before storage).
+    #[test]
+    fn reset_wakes_send_future_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn counting_waker() -> (Arc<CountingWake>, Waker) {
+            let inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+            let waker: Waker = Arc::clone(&inner).into();
+            (inner, waker)
+        }
+
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-wake".to_owned(),
+            ..Default::default()
+        });
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send");
+
+        let (counter, waker) = counting_waker();
+        let key = PendingOpKey::Send(producer, seq);
+        // Register the waker on the connection-level slab (the path that the runtime's
+        // SendFut uses; the producer-side `register_waker` path is exercised via
+        // `apply_receipt` in another test).
+        conn.register_waker(key, waker);
+
+        // Reset → exactly one wake fires.
+        conn.reset();
+        let after_reset = counter.0.load(Ordering::SeqCst);
+        assert_eq!(after_reset, 1, "reset must wake the registered waker once");
+
+        // Re-handshake + rebuild → re-issues the publish on the new session.
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = drain_outbound_commands(&mut conn);
+        conn.rebuild_producers();
+        let _ = drain_outbound_commands(&mut conn);
+
+        // The future "re-polled" — the runtime SendFut would register a fresh waker now.
+        let (counter2, waker2) = counting_waker();
+        conn.register_waker(key, waker2);
+
+        // Feed the broker's CommandSendReceipt — the replayed OpSend resolves.
+        let receipt_bytes = send_receipt_bytes(producer, seq);
+        conn.handle_bytes(Instant::now(), &receipt_bytes)
+            .expect("handle SendReceipt");
+
+        // Original counter is still at 1 (no double-fire); new counter fired once.
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the original waker must NOT fire again — it was cleared from the snapshot"
+        );
+        assert_eq!(
+            counter2.0.load(Ordering::SeqCst),
+            1,
+            "the freshly-registered waker fires exactly once on the replayed receipt"
+        );
+    }
+
+    /// (a) Rebuild re-populates pending: after `rebuild_producers`, the snapshot bucket is
+    /// drained and the producer's `pending` queue contains the same OpSends in the same
+    /// order. The replayed `CommandSend` frames hit the outbound buffer.
+    #[test]
+    fn rebuild_producers_replays_snapshotted_publishes_with_original_sequence_ids() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-pending".to_owned(),
+            ..Default::default()
+        });
+        // Discard initial `CommandProducer` frame.
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Queue three publishes and drain their wire frames so the post-replay drain is
+        // isolated.
+        let mut seqs: Vec<SequenceId> = Vec::new();
+        for i in 0..3 {
+            let seq = conn
+                .send(
+                    producer,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::copy_from_slice(format!("p{i}").as_bytes()),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: 2,
+                        num_messages: 1,
+                        txn_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue");
+            seqs.push(seq);
+        }
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Snapshot, re-handshake, rebuild.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        let _ = drain_outbound_commands(&mut conn);
+
+        conn.rebuild_producers();
+
+        // The snapshot is consumed; pending now holds the three replayed OpSends in
+        // original order.
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 0);
+        assert_eq!(conn.producer_pending_count(producer), 3);
+
+        // The outbound buffer now carries one `CommandProducer` (the rebuild) followed by
+        // three `CommandSend` frames in the original `[0, 1, 2]` sequence-id order.
+        let cmds = drain_outbound_commands(&mut conn);
+        let sends: Vec<&pb::CommandSend> = cmds
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Send as i32)
+            .filter_map(|c| c.send.as_ref())
+            .collect();
+        assert_eq!(sends.len(), 3, "three sends must be re-issued");
+        let observed_seqs: Vec<u64> = sends.iter().map(|s| s.sequence_id).collect();
+        let expected_seqs: Vec<u64> = seqs.iter().map(|s| s.0).collect();
+        assert_eq!(
+            observed_seqs, expected_seqs,
+            "replay preserves FIFO + original sequence ids"
+        );
+    }
+
+    /// (a) `apply_receipt` resolves the re-issued send: after rebuild, feeding a
+    /// `CommandSendReceipt` for one of the replayed sequence ids drops it from `pending`
+    /// and surfaces the `OpOutcome::SendReceipt` on the outcome slab — the user-facing
+    /// SendFut observes the outcome as if the original session had simply lasted longer.
+    #[test]
+    fn apply_receipt_resolves_replayed_send_after_rebuild() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-receipt".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"hi"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 2,
+                    num_messages: 1,
+                    txn_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue");
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Snapshot + replay.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = drain_outbound_commands(&mut conn);
+        conn.rebuild_producers();
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Replayed OpSend is back in pending.
+        assert_eq!(conn.producer_pending_count(producer), 1);
+        let key = PendingOpKey::Send(producer, seq);
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no outcome before broker receipt lands"
+        );
+
+        // Feed the receipt for the replayed sequence id — pending drains and the outcome
+        // lands.
+        let receipt_bytes = send_receipt_bytes(producer, seq);
+        conn.handle_bytes(Instant::now(), &receipt_bytes)
+            .expect("handle SendReceipt");
+
+        assert_eq!(
+            conn.producer_pending_count(producer),
+            0,
+            "the replayed OpSend must drain on receipt"
+        );
+        match conn.take_outcome(key) {
+            Some(OpOutcome::SendReceipt {
+                sequence_id,
+                message_id,
+            }) => {
+                assert_eq!(sequence_id, seq);
+                assert_eq!(message_id.entry_id, seq.0);
+            }
+            other => panic!("expected SendReceipt for the replayed send, got {other:?}"),
+        }
+    }
+
+    /// Ordering invariant: when a producer has multiple in-flight publishes with
+    /// non-contiguous sequence ids (one batched + one single), the snapshot replays them
+    /// in original FIFO order, preserving the per-producer wire ordering.
+    #[test]
+    fn replay_preserves_ordering_across_rebuild() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-order".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Three single sends — sequence ids 0, 1, 2.
+        let mut expected_payloads: Vec<&'static [u8]> = Vec::new();
+        for payload in [&b"first"[..], &b"second"[..], &b"third"[..]] {
+            let _ = conn
+                .send(
+                    producer,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::from_static(payload),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: payload.len() as u32,
+                        num_messages: 1,
+                        txn_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue");
+            expected_payloads.push(payload);
+        }
+        let _ = drain_outbound_commands(&mut conn);
+
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect");
+        let _ = drain_outbound_commands(&mut conn);
+        conn.rebuild_producers();
+
+        // The post-rebuild outbound buffer carries the CommandProducer first, then the
+        // three replayed CommandSend frames in FIFO order. Decode payloads to verify.
+        let raw_bytes = {
+            let mut buf: Vec<u8> = Vec::new();
+            let _ = conn.poll_transmit(&mut buf);
+            buf
+        };
+        let mut cursor = bytes::Bytes::copy_from_slice(&raw_bytes);
+        let mut send_payloads: Vec<Vec<u8>> = Vec::new();
+        while !cursor.is_empty() {
+            let frame = crate::frame::decode_one(&mut cursor).expect("decode frame");
+            if frame.command.r#type == pb::base_command::Type::Send as i32 {
+                let body = frame
+                    .payload
+                    .as_ref()
+                    .expect("SEND frame must carry a payload region")
+                    .body
+                    .clone();
+                send_payloads.push(body.to_vec());
+            }
+        }
+        assert_eq!(send_payloads.len(), 3, "all three replayed sends present");
+        for (i, expected) in expected_payloads.iter().enumerate() {
+            assert_eq!(
+                send_payloads[i].as_slice(),
+                *expected,
+                "replay preserves original payload at position {i}"
+            );
+        }
+    }
+
+    /// Batch cleared on reset: messages buffered in the producer's batch container (i.e.
+    /// not yet flushed to a wire frame) do not survive the reset — caller is responsible
+    /// for re-sending those (matches Java `ProducerImpl#connectionClosed` which drops the
+    /// in-progress batch). Only frames that already hit the wire's pending queue replay.
+    #[test]
+    fn reset_clears_batch_container_does_not_replay_unbatched_stragglers() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/replay-batch".to_owned(),
+            enable_batching: true,
+            max_batch_size_bytes: 4096,
+            max_messages_in_batch: 100,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Two batched (un-flushed) sends — neither hits the wire.
+        for payload in [&b"a"[..], &b"b"[..]] {
+            let _ = conn
+                .send(
+                    producer,
+                    crate::producer::OutgoingMessage {
+                        payload: bytes::Bytes::from_static(payload),
+                        metadata: pb::MessageMetadata::default(),
+                        uncompressed_size: 1,
+                        num_messages: 1,
+                        txn_id: None,
+                    },
+                    0,
+                    Instant::now(),
+                )
+                .expect("queue");
+        }
+        // Batched, so no pending OpSend (Java sense — these live in the batch container
+        // until a flush). The batch holds two messages.
+        assert_eq!(conn.producer_pending_count(producer), 0);
+        assert_eq!(conn.producer_batch_len(producer), 2);
+
+        // Reset: the batch is dropped; no snapshot entry is recorded (nothing was in
+        // pending).
+        conn.reset();
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            0,
+            "unflushed batched sends are NOT replayed — caller's responsibility"
+        );
+        assert_eq!(conn.producer_batch_len(producer), 0);
     }
 }

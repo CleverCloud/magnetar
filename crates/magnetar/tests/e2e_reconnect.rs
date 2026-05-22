@@ -194,3 +194,121 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     client.close().await;
     Ok(())
 }
+
+/// Stage 3 transparent in-flight publish replay: queue several publishes while the
+/// broker is stopped, then verify they all transparently complete on the user-facing
+/// `SendFut`s after the broker restarts (no `Err` surfacing to the caller). Mirrors
+/// Java `ProducerImpl#resendMessages` at-least-once parity: the user sees one
+/// `SendFut` per call, and each one resolves with the broker-assigned `MessageId`
+/// once the new session ack-cycles the replayed publish.
+///
+/// The publishes are issued *while the broker is stopped*. The driver enqueues each
+/// one into the `ProducerState::pending` slab (after the `Producer` handle's send
+/// future resolves the reservation half — see `ProducerImpl#sendAsync`). The reset
+/// path on the next reconnect attempt snapshots them, and the post-handshake
+/// `rebuild_producers` re-issues them onto the new session. The user's
+/// `SendFut::poll` returns `Pending` across the whole cycle and resolves with
+/// `Ok(MessageId)` when the broker's `CommandSendReceipt` arrives on the new
+/// session.
+#[ignore = "e2e: requires Docker"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, container) = start_pulsar().await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .enable_reconnect(supervisor_for_e2e())
+        .operation_timeout(Duration::from_secs(120))
+        .build()
+        .await?;
+
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-inflight-{}",
+        Uuid::new_v4()
+    );
+    let subscription = format!("magnetar-e2e-inflight-sub-{}", Uuid::new_v4());
+
+    let producer = client.producer(&topic).create().await?;
+    let consumer = client
+        .consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Exclusive)
+        .subscribe()
+        .await?;
+
+    // Sanity: pre-restart round-trip so we know the producer + consumer pair
+    // is wired up.
+    producer
+        .send(OutgoingMessage::with_payload(b"sanity".to_vec()).into())
+        .await?;
+    let sanity = tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await??;
+    assert_eq!(sanity.payload.as_ref(), b"sanity");
+    consumer.ack(sanity.message_id).await?;
+
+    // Now stop the broker and fire several publishes while it's down. The driver
+    // accepts them into `ProducerState::pending`; the reconnect path snapshots
+    // them and rebuild_producers replays them on the new session.
+    tracing::info!("stopping pulsar container to force in-flight replay");
+    container.stop_with_timeout(Some(5)).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Spawn `N` concurrent send futures. None of them complete until the
+    // broker returns + replays.
+    let n: usize = 5;
+    let mut send_futs = Vec::with_capacity(n);
+    for i in 0..n {
+        let p = producer.clone();
+        let payload = format!("replay-{i}").into_bytes();
+        send_futs.push(tokio::spawn(async move {
+            p.send(OutgoingMessage::with_payload(payload).into()).await
+        }));
+    }
+
+    // Restart the broker — supervised reconnect path kicks in.
+    tracing::info!("starting pulsar container to validate transparent replay");
+    container.start().await?;
+
+    // Each `SendFut` MUST resolve `Ok(_)` — no `Err` surfaces to the caller.
+    // Stage 3 transparent replay = the user's future never observed the reset.
+    for (i, fut) in send_futs.into_iter().enumerate() {
+        let outcome = tokio::time::timeout(Duration::from_secs(120), fut)
+            .await
+            .unwrap_or_else(|_| panic!("send {i} did not resolve within 2 min"))?;
+        outcome
+            .as_ref()
+            .map(|_| ())
+            .unwrap_or_else(|e| panic!("send {i} failed after transparent replay: {e:?}"));
+    }
+
+    // Drain the consumer — the broker eventually delivers every replayed
+    // payload (potentially with duplicates if the broker had already
+    // persisted a publish before the disconnect; at-least-once semantics).
+    // We assert that at minimum every replay-{i} payload arrives.
+    let mut received: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while received.len() < n && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await {
+            Ok(Ok(msg)) => {
+                let s = String::from_utf8_lossy(msg.payload.as_ref()).to_string();
+                if s.starts_with("replay-") {
+                    received.insert(s);
+                }
+                consumer.ack(msg.message_id).await?;
+            }
+            _ => break,
+        }
+    }
+    for i in 0..n {
+        let expected = format!("replay-{i}");
+        assert!(
+            received.contains(&expected),
+            "broker must deliver every replayed payload {expected}, received={received:?}"
+        );
+    }
+
+    consumer.close().await?;
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}
