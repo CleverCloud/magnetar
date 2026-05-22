@@ -460,13 +460,28 @@ impl<P: Providers> MoonpoolEngine<P> {
 /// Drive the byte pump until the handshake completes.
 ///
 /// Kept private to the crate — the public surface goes through
-/// [`MoonpoolEngine::connect_plain`].
+/// [`MoonpoolEngine::connect_plain`]. Idempotently calls
+/// [`magnetar_proto::Connection::begin_handshake`] on entry when the state
+/// machine is still `Uninitialized`, so callers don't have to remember to
+/// seed the `CommandConnect` themselves. Mirrors the tokio engine's
+/// `start_handshake`, which calls `begin_handshake` before spawning the
+/// driver. Without this, `poll_transmit` returns no bytes and the loop
+/// parks on `read_buf` forever (the M8 differential `golden_traces`
+/// regression).
 async fn handshake_plain<P: Providers>(
     shared: &Arc<ConnectionShared>,
     transport: &mut Transport<P>,
 ) -> Result<(), EngineError> {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
     let mut write_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+
+    {
+        let mut conn = shared.inner.lock();
+        if matches!(conn.state(), magnetar_proto::HandshakeState::Uninitialized) {
+            conn.begin_handshake()
+                .map_err(|err| EngineError::Config(format!("begin_handshake failed: {err}")))?;
+        }
+    }
 
     loop {
         // 1. Drain outbound bytes the state machine has queued.

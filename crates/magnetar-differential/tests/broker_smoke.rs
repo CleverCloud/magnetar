@@ -11,13 +11,6 @@ use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{ConnectionConfig, CreateProducerRequest};
 use magnetar_runtime_tokio::Client;
 
-// TODO(m8-followup): the scripted broker handshake currently stalls the
-// producer-open round-trip (kicker workaround was mid-debug when the agent
-// ran out of budget — see the runner_tokio module for the Kicker rationale).
-// The trace model + runners + golden_traces tests all pass; only this smoke
-// test is gated until the broker's CommandProducer response timing is
-// tightened.
-#[ignore = "m8-followup: producer-open stalls under scripted broker; see TODO above"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tokio_client_handshakes() {
     let broker = ScriptedBroker::bind().await.expect("broker bind");

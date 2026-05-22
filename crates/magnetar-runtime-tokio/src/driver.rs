@@ -55,12 +55,27 @@ use crate::error::ClientError;
 use crate::transport::Transport;
 use crate::url_parse::ParsedUrl;
 
-/// Drain the connection's semantic event queue and react to events that need
-/// runtime-layer work (currently only `AuthChallenge` — every other event is
-/// handled inline by the sans-io layer's per-future Waker dispatch).
+/// Drain the connection's semantic event queue of events the *driver* must
+/// react to, leaving every other event (e.g. `ProducerReady`,
+/// `SubscribeAcked`, `Connected`) in the queue for user-facing futures to
+/// observe.
+///
+/// We use [`magnetar_proto::Connection::poll_event_if`] with an explicit
+/// allow-list rather than draining the whole queue: an unconditional
+/// `poll_event` loop would silently consume the `ProducerReady` /
+/// `SubscribeAcked` events that `EventWaitFut::poll` is parked on and
+/// stall every open-producer / subscribe round-trip (regressed in the
+/// M8 differential `broker_smoke` test on 2026-05-22; see ADR-0021).
 fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientError> {
     loop {
-        let event = shared.inner.lock().poll_event();
+        let event = shared.inner.lock().poll_event_if(|ev| {
+            matches!(
+                ev,
+                ConnectionEvent::AuthChallenge { .. }
+                    | ConnectionEvent::TopicListChanged { .. }
+                    | ConnectionEvent::TopicMigrated { .. }
+            )
+        });
         let Some(event) = event else {
             return Ok(());
         };
@@ -496,11 +511,15 @@ where
                         shared.driver_waker.notify_one();
                     }
                 }
-                // After handling bytes, drain semantic events. Most go to per-future Wakers
-                // already (the sans-io layer wakes them inline), but `AuthChallenge` requires
-                // the runtime to invoke the configured AuthProvider and submit the response.
-                // PIP-30 / PIP-292.
+                // After handling bytes, drain only the driver-actionable subset of
+                // semantic events (AuthChallenge / TopicListChanged / TopicMigrated).
+                // Per-future Wakers registered via [`Connection::register_waker`] are
+                // already woken inline by the sans-io layer; event-stream-watching
+                // futures (`EventWaitFut` for ProducerReady / SubscribeAcked) get
+                // pulsed via `driver_waker.notify_waiters()` below so they re-poll
+                // and observe the freshly-pushed event.
                 handle_pending_events(shared)?;
+                shared.driver_waker.notify_waiters();
             }
 
             // Timer fired.

@@ -1621,6 +1621,26 @@ impl Connection {
         self.events.pop_front()
     }
 
+    /// Pop the first [`ConnectionEvent`] that satisfies `predicate`,
+    /// leaving non-matching events at their original positions in the
+    /// queue.
+    ///
+    /// Intended for the runtime driver, which only acts on a small
+    /// subset of event variants (`AuthChallenge`, `TopicListChanged`,
+    /// `TopicMigrated`) and must *not* swallow events
+    /// (`ProducerReady`, `SubscribeAcked`, …) that user-facing
+    /// futures are parked on. See the M8 differential broker_smoke
+    /// regression: a driver that blindly drained the queue would race
+    /// every event-based wait future and stall the producer-open
+    /// round-trip.
+    pub fn poll_event_if<F>(&mut self, predicate: F) -> Option<ConnectionEvent>
+    where
+        F: Fn(&ConnectionEvent) -> bool,
+    {
+        let idx = self.events.iter().position(predicate)?;
+        self.events.remove(idx)
+    }
+
     /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
     /// per-consumer tracker deadline (negative-ack delay + unacked-message timeout).
     pub fn poll_timeout(&self) -> Option<Instant> {

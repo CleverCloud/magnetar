@@ -68,14 +68,27 @@ use crate::{ConnectionShared, EngineError, TopicListChange};
 /// grows.
 const READ_BUFFER_CAPACITY: usize = 64 * 1024;
 
-/// Drain the connection's semantic event queue and react to events that need
-/// runtime-layer work. Most events (`Connected`, `SendReceipt`, `Message`,
-/// …) are routed back to user-facing futures by the sans-io layer itself
-/// through `Waker` slabs; only `AuthChallenge`, `TopicListChanged`, and
-/// `TopicMigrated` require the driver to do anything.
+/// Drain the connection's semantic event queue of events the *driver* must
+/// react to, leaving every other event (`Connected`, `SendReceipt`,
+/// `Message`, `ProducerReady`, `SubscribeAcked`, …) in the queue for
+/// user-facing futures to observe.
+///
+/// We use [`magnetar_proto::Connection::poll_event_if`] with an explicit
+/// allow-list rather than draining the whole queue: an unconditional
+/// `poll_event` loop would silently consume the `ProducerReady` /
+/// `SubscribeAcked` events that user futures (`ProducerReadyFut`, the
+/// moonpool consumer's subscribe wait) are parked on and stall every
+/// open-producer / subscribe round-trip.
 fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineError> {
     loop {
-        let event = shared.inner.lock().poll_event();
+        let event = shared.inner.lock().poll_event_if(|ev| {
+            matches!(
+                ev,
+                ConnectionEvent::AuthChallenge { .. }
+                    | ConnectionEvent::TopicListChanged { .. }
+                    | ConnectionEvent::TopicMigrated { .. }
+            )
+        });
         let Some(event) = event else {
             return Ok(());
         };
@@ -588,6 +601,10 @@ where
                     }
                 }
                 handle_pending_events(&shared)?;
+                // Wake event-stream-watching futures (e.g. `ProducerReadyFut`)
+                // that parked on `driver_waker.notified()` so they re-poll and
+                // observe the freshly-pushed event.
+                shared.driver_waker.notify_waiters();
             }
 
             // Timer fired. `sleep_or_pending` only returns once the duration

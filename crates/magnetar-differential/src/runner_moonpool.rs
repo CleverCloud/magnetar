@@ -57,10 +57,23 @@ impl Drop for Kicker {
 /// (e.g. `127.0.0.1:7654`). Note: the moonpool engine takes a bare
 /// `host:port` string, NOT a `pulsar://` URL.
 ///
+/// Internally wraps the engine work in a [`tokio::task::LocalSet`]
+/// because moonpool's [`TokioProviders`] task provider uses
+/// `tokio::task::spawn_local` to remain compatible with `moonpool-sim`'s
+/// single-thread simulator. Differential tests run on
+/// `flavor = "current_thread"` runtimes which do **not** ship a
+/// pre-installed `LocalSet`, so the wrapper is required to keep the
+/// driver task alive.
+///
 /// # Errors
 /// Returns the last engine-level error if the initial connect /
 /// producer / consumer open fails.
 pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientError> {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(run_inner(host_port, trace)).await
+}
+
+async fn run_inner(host_port: &str, trace: &Trace) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
     let engine = MoonpoolEngine::new(TokioProviders::new());
     let client = Client::connect_plain(&engine, host_port, ConnectionConfig::default()).await?;
