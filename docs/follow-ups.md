@@ -35,15 +35,6 @@ single seed. Multi-seed scheduling is a manual loop today
 `proptest` so seed sweeping happens inside the test binary). Decide
 the budget: ~32 seeds in PR mode, ~512 nightly.
 
-### TLS handshake byte-level chaos
-
-**Status.** Handshake correctness is verified end-to-end; adversarial
-byte mutations (corrupted handshake records, partial-read sequencing)
-are not yet swept.
-
-**Unblock.** Extend the chaos pack with a fixture that drives
-mid-handshake byte mutation via `moonpool_core::NetworkProvider`.
-
 ## Reconnect / supervision
 
 ### Transparent in-flight publish replay across reconnect
