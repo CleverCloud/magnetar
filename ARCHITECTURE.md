@@ -62,7 +62,8 @@ ergonomics layer.
 | tokio + tokio-rustls.     |       moonpool-core `Providers` (Network,    |
 | One driver task per       |       Time, Task, Random, Storage).          |
 | Connection.               |       Custom rustls-over-bytepipe adapter.   |
-|                           |       Currently handshake-only (M1 scope).   |
+|                           |       Same driver loop + supervisor as the   |
+|                           |       tokio engine.                          |
 +--------------------------------------------------------------------------+
                                     |
                                     v
@@ -441,8 +442,8 @@ exhaustion it propagates the last `EngineError::Io` upward and the
 
 ## Protocol state machine (`magnetar-proto`)
 
-`magnetar-proto::Connection` is ~2,600 lines of state machine plus its
-satellites. Top-level types live at [`crates/magnetar-proto/src/conn.rs`].
+`magnetar-proto::Connection` is the central state machine. Top-level
+types live at [`crates/magnetar-proto/src/conn.rs`].
 
 ### Handshake state
 
@@ -899,12 +900,14 @@ incoming message.
 
 ### Dynamic membership
 
-- `MultiTopicsConsumer` is currently static (Arc<Inner> immutability) —
-  dynamic `add_topic` / `remove_topic` is a known parity gap.
+- `MultiTopicsConsumer::add_topic` / `remove_topic` subscribe and
+  unsubscribe at runtime.
 - `PatternConsumer` reconciles topic list deltas on demand via
   `update(&client)`. The driver pushes `TopicListChanged` deltas into
   `ConnectionShared.topic_list_changes`; `update()` drains the buffer,
   diffs against `topics()`, and spawns / closes child consumers.
+  `start_auto_reconcile(client, interval)` does the same on a
+  `tokio::time::interval` schedule.
 
 ---
 
@@ -943,58 +946,71 @@ incoming message.
                   emit a ReconcileReport
 ```
 
-Auto-update on a background ticker is a known gap — the architecture
-allows it (wrap `Client` in `Arc`, spawn a tokio task that polls
-`next_topic_list_change` or a `tokio::time::interval`), but
-`Client::is_clone` is currently false. Tracked internally.
+`PatternConsumer::start_auto_reconcile(client, interval)` spawns a
+`tokio::time::interval` loop that calls `update(&client)` on every
+tick; the returned `JoinHandle` is used for clean shutdown. Same
+pattern as the partitioned producer / consumer auto-update tickers.
 
 ---
 
 ## Runtime engines
 
-### `magnetar-runtime-tokio` — production (~2,950 LOC)
+The façade exposes `PulsarClient<E: Engine = TokioEngine>`. `Engine` is
+a marker trait selecting per-engine storage; engine-specific methods
+live in concrete `impl PulsarClient<TokioEngine>` /
+`impl PulsarClient<MoonpoolEngine<P>>` blocks rather than on the trait
+([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md);
+source: [`crates/magnetar/src/engine.rs`](crates/magnetar/src/engine.rs)).
 
-| File | Lines | Role |
-| --- | --- | --- |
-| `client.rs` | 654 | `Client::connect` + `connect_auth` + `connect_with` + transaction-coordinator helpers (`new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`), partitioned metadata lookup, topic-list watcher entry point. |
-| `consumer.rs` | 937 | `Consumer` façade — `receive`, `receive_with_timeout`, `receive_batch_with_bytes_cap`, ack variants (individual / cumulative / batch / with-properties / with-txn / partial-batch), nack, seek (id / timestamp / earliest / latest), pause / resume, DLQ drain, stats, `last_message_id`, `close`. |
-| `producer.rs` | 382 | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters, `access_mode` / `compression` getters, `last_disconnected_timestamp`. |
-| `driver.rs` | 239 | The driver loop + auth-challenge dispatch + PIP-145 forwarding. |
-| `compress.rs` | 210 | Encode + decode for `None` / `Lz4` / `Zlib` / `Zstd` / `Snappy`. |
-| `transport.rs` | 125 | TCP connect + optional `tokio-rustls` wrap. |
-| `lib.rs` | 182 | `ConnectionShared` + `TopicListChange`. |
-| `url_parse.rs` | 113 | `pulsar://` / `pulsar+ssl://` URL parsing. |
-| `error.rs` | 67 | `ClientError` enum. |
-| `crypto.rs` | 48 | `MessageEncryptor` + `MessageDecryptor` traits. |
+### `magnetar-runtime-tokio` — production (default)
 
-### `magnetar-runtime-moonpool` — deterministic simulation (~2,740 LOC, M1 → M4 landed)
+| File | Role |
+| --- | --- |
+| [`client.rs`](crates/magnetar-runtime-tokio/src/client.rs) | `Client::connect` + `connect_auth` + `connect_with` + transaction-coordinator helpers, partitioned-metadata lookup, topic-list watcher entry point. |
+| [`consumer.rs`](crates/magnetar-runtime-tokio/src/consumer.rs) | `Consumer` façade — `receive`, `receive_with_timeout`, `receive_batch_with_bytes_cap`, ack variants (individual / cumulative / batch / with-properties / with-txn / partial-batch), nack, seek, pause/resume, DLQ drain, stats. |
+| [`producer.rs`](crates/magnetar-runtime-tokio/src/producer.rs) | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters, `MemoryReserveFut` for `ProducerBlock` policy. |
+| [`driver.rs`](crates/magnetar-runtime-tokio/src/driver.rs) | Driver loop + supervised reconnect + auth-challenge dispatch + PIP-145 + PIP-188 forwarding. |
+| [`auto_cluster_failover.rs`](crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs) | PIP-121 `AutoClusterFailover` with a `HealthProbe` trait + background prober. |
+| [`compress.rs`](crates/magnetar-runtime-tokio/src/compress.rs) | Encode + decode for `None` / `Lz4` / `Zlib` / `Zstd` / `Snappy`. |
+| [`transport.rs`](crates/magnetar-runtime-tokio/src/transport.rs) | TCP connect + optional `tokio-rustls` wrap, `connect_with_resolver` for `DnsResolver` plumbing. |
+| [`tls_insecure.rs`](crates/magnetar-runtime-tokio/src/tls_insecure.rs) | `tls_allow_insecure_connection(true)` blanket override. |
+| [`tls_no_hostname.rs`](crates/magnetar-runtime-tokio/src/tls_no_hostname.rs) | `tls_hostname_verification_enable(false)` chain-on / hostname-off. |
+| [`dns.rs`](crates/magnetar-runtime-tokio/src/dns.rs) | `DnsResolver` trait + `TokioDnsResolver`. |
+| [`lib.rs`](crates/magnetar-runtime-tokio/src/lib.rs) | `ConnectionShared` (state, atomic counters, `memory_used` + `memory_wakers` slab) + `TopicListChange`. |
 
-| File | Lines | Role |
-| --- | --- | --- |
-| `lib.rs` | 343 | `ConnectionShared` (no `Notify` — single-task pattern), `MoonpoolEngine<P>` generic over `moonpool_core::Providers`, `connect_plain` handshake driver. |
-| `driver.rs` | 295 | Driver loop mirroring `magnetar-runtime-tokio::driver` over the moonpool byte pipe. |
-| `client.rs` | 414 | `Client` façade — `connect`, `connect_with`, partitioned metadata lookup, txn coordinator helpers. |
-| `producer.rs` | 701 | `Producer` façade — `send`, `flush`, `close`, stats, sequence-id getters. Surface mirrors `magnetar-runtime-tokio::producer`. |
-| `consumer.rs` | 670 | `Consumer` façade — `receive`, ack variants, nack, seek, pause/resume, DLQ drain. |
-| `tls.rs` | 215 | `RustlsByteAdapter` — drives `rustls::ClientConnection` over a `moonpool_core::NetworkProvider`-supplied byte pipe (`read_tls` / `process_new_packets` / `write_tls`). Sans-io composition end to end. |
-| `transport.rs` | 104 | Plaintext byte pipe over the configured `NetworkProvider::TcpStream`. |
+### `magnetar-runtime-moonpool` — deterministic simulation
+
+| File | Role |
+| --- | --- |
+| [`lib.rs`](crates/magnetar-runtime-moonpool/src/lib.rs) | `ConnectionShared`, `MoonpoolEngine<P>` generic over `moonpool_core::Providers`, `connect_plain` / `connect_plain_with_resolver` / `connect_plain_supervised` / `connect_tls`. |
+| [`driver.rs`](crates/magnetar-runtime-moonpool/src/driver.rs) | Driver loop + supervised reconnect over the moonpool byte pipe. Mirrors `magnetar-runtime-tokio::driver`. |
+| [`client.rs`](crates/magnetar-runtime-moonpool/src/client.rs) | `Client<P>` façade — `connect_plain`, `connect_plain_supervised`, partitioned-metadata lookup, txn coordinator helpers. |
+| [`producer.rs`](crates/magnetar-runtime-moonpool/src/producer.rs) | `Producer<P>` façade — `send`, `flush`, `close`, stats. Surface mirrors `magnetar-runtime-tokio::producer` (1:1 method set; `FailImmediately` only on the memory-limit knob). |
+| [`consumer.rs`](crates/magnetar-runtime-moonpool/src/consumer.rs) | `Consumer<P>` façade — `receive`, ack variants, nack, seek, pause/resume, DLQ drain. |
+| [`tls.rs`](crates/magnetar-runtime-moonpool/src/tls.rs) | `RustlsByteAdapter` — drives sans-io `rustls::ClientConnection` over a `NetworkProvider`-supplied byte pipe. Sans-io composition end to end. |
+| [`transport.rs`](crates/magnetar-runtime-moonpool/src/transport.rs) | Plaintext byte pipe over the configured `NetworkProvider::TcpStream`. |
+| [`dns.rs`](crates/magnetar-runtime-moonpool/src/dns.rs) | `DnsResolver` trait + `StaticDnsResolver` + `arc_dns_resolver` helper. |
 
 Key properties:
 
 - The engine is generic over `moonpool_core::Providers`, which bundles
   `NetworkProvider`, `TimeProvider`, `TaskProvider`, `RandomProvider`,
   `StorageProvider`. Plug `TokioProviders` for production-style runs
-  against a real broker; plug a sim bundle for reproducible chaos under
-  `moonpool-sim`.
+  against a real broker; plug a `moonpool-sim` bundle for reproducible
+  chaos under a seed.
 - The driver consumes the same `magnetar-proto::Connection` state machine
-  as the tokio engine — the only differences are which byte pipe runs
-  the I/O and which clock source the engine snapshots into
+  as the tokio engine — the differences are which byte pipe carries the
+  I/O and which clock source the engine snapshots into
   `Connection::send(now, …)` / `flush_producer(now, …)` and into the
   `with_wall_clock_provider` slot.
-- TLS handshakes survive `moonpool-sim` chaos with the same determinism
-  as `magnetar-proto` itself — the adapter never blocks on a network
-  call inside `process_new_packets`; reads and writes go through the
-  byte pipe under sim control.
+- TLS handshakes survive chaos with the same determinism as
+  `magnetar-proto` itself — the adapter never blocks on a network call
+  inside `process_new_packets`; reads and writes go through the byte
+  pipe under simulation control.
+
+The full moonpool engine surface (supervised reconnect, chaos pack,
+differential equivalence harness) is covered in
+[`docs/moonpool-engine.md`](docs/moonpool-engine.md).
 
 ---
 
@@ -1113,9 +1129,11 @@ SendFut::poll -> Ready -> release_memory(self.reserved_bytes)
 SendFut::drop -> release if not already released (caller cancelled)
 ```
 
-`ProducerBlock` policy semantics (block until budget frees up) is the
-planned follow-up — would park the future on a `Notify` keyed on the
-budget counter.
+`MemoryLimitPolicy::ProducerBlock` is the other half: on overflow,
+`Producer::send` parks on a `Waker` slab inside `ConnectionShared`;
+`release_memory` drains the slab so parked producers re-poll the CAS.
+See [`docs/memory-limit.md`](docs/memory-limit.md) and
+[ADR-0020](specs/adr/0020-memory-limit-producer-block.md).
 
 ---
 
@@ -1291,53 +1309,52 @@ The schema is advertised on `CommandProducer.schema` /
 | PIP-34 / 119 / 282 / 379 | Key_Shared family | ✅ | `magnetar_proto::KeySharedConfig` + builder routing |
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
 | PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
-| PIP-460 | Scalable topics | ❌ | M9 scope (experimental) |
+| PIP-460 | Scalable topics | ❌ | v0.2.0 (experimental upstream) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim |
-| PIP-180 | Shadow topic | ❌ | M9 |
-| PIP-415 | `getMessageIdByIndex` | ❌ | M9 (blocked on vendored proto bump) |
-| PIP-33 | Replicated subscriptions | ❌ | M9 |
+| PIP-180 | Shadow topic | ❌ | v0.2.0 |
+| PIP-415 | `getMessageIdByIndex` | ❌ | v0.2.0 (blocked on vendored proto bump) |
+| PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
 
 ---
 
 ## Tests
 
-### Unit + integration (220+ tests)
+See [`docs/testing.md`](docs/testing.md) for the full reference (unit,
+integration, deterministic chaos, differential equivalence, e2e, mutation,
+fuzz). High-level summary:
 
-```sh
-cargo test --workspace --all-features
-```
+- **Unit + integration**: `cargo test --workspace --all-features`. Every
+  sans-io behavior is exercised by feeding bytes, asserting events /
+  transmit / state. Trackers ship 13 ported behavioral cases from Java's
+  `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`; the producer
+  ships 6 ported cases from `BatchMessageContainerImplTest`.
+- **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)):
+  the moonpool engine drives the supervised reconnect path, PIP-121,
+  PIP-188, virtual-clock timers, and OAuth2 refresh edges under
+  reproducible seeds.
+- **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)):
+  tokio + moonpool engines run the same `Trace` against a scripted
+  in-process broker; user-visible `EventStream`s must agree.
+- **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)):
+  gated on `--features e2e` + `#[ignore = "e2e: requires Docker"]`.
+  Spins `apachepulsar/pulsar:4.0.4` via `testcontainers`. Covers
+  schemas, DLQ, batching+chunking, interceptors, transactions,
+  subscription types, partitioned, compacted+TableView, encryption,
+  OAuth2, DNS resolver, force unsubscribe, memory limit, pattern
+  auto-reconcile, supervised reconnect, rolling stats, per-partition
+  seek, PIP-121 cluster failover.
 
-Every sans-io behaviour is exercised in isolation: feed bytes, assert
-events / transmit / state. Trackers ship 13 ported behavioural cases
-from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`. The
-producer ships 6 ported cases from `BatchMessageContainerImplTest`.
+Run them: `cargo test --workspace --features e2e -- --include-ignored`
+(requires Docker).
 
-### End-to-end (5 tests, behind `--features e2e`)
-
-Requires Docker. Image: `apachepulsar/pulsar:4.0.4`.
-
-```sh
-cargo test --workspace --features e2e
-```
-
-Tests:
-
-- `e2e_produce_consume_roundtrip` — basic producer + consumer round-trip.
-- `e2e_partitioned_topic_roundtrip` — partitioned producer + consumer
-  across N partitions.
-- `e2e_key_shared_dispatch` — Key_Shared sticky-hash dispatch (PIP-34).
-- `e2e_pattern_consumer_snapshot` — PIP-145 regex discovery snapshot.
-- (one further — count tracked internally).
-
-### Mutation testing (scoped for M5/M6)
+### Mutation testing (scoped)
 
 ```sh
 cargo mutants --package magnetar-proto --timeout 60 --shard 1/4
 ```
 
 Targets: frame decode, request correlation, resend / dedup, flow
-permits, chunk metadata, timeout transitions. Promoted from v0.2.0
-plans to v0.1.0 deliverable.
+permits, chunk metadata, timeout transitions.
 
 ### Fuzz (`magnetar-proto/fuzz`)
 

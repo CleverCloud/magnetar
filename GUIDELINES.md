@@ -88,7 +88,7 @@ cargo mutants --package magnetar-proto --timeout 60 --shard 1/4
 
 All new dependencies go through these steps:
 
-1. Check it's in the allow-list (`tasks/decisions.md` §"Final dependency allow-list").
+1. Check it's in the allow-list (the `deny.toml` `[bans]` allow-list governs which crates may appear in `Cargo.toml`).
 2. If not, propose to Florentin with: crate name, version, why it's needed, what it replaces, license, maintenance signal.
 3. Wait for explicit approval before adding to `Cargo.toml`.
 4. After adding, run `cargo deny check bans licenses sources` and verify.

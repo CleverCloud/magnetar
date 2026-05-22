@@ -9,9 +9,9 @@
 
 > **Status: pre-alpha.** The wire protocol layer is feature-rich, the tokio
 > engine is usable end-to-end with supervised reconnect + transparent
-> producer/consumer rebuild, and the moonpool engine ships the full
-> client/producer/consumer/reader façade family for deterministic-simulation
-> testing. API is unstable. Do not depend on this in production.
+> producer/consumer rebuild, and the moonpool engine carries
+> client/producer/consumer for deterministic-simulation testing. API is
+> unstable. Do not depend on this in production.
 
 ---
 
@@ -90,7 +90,7 @@ client at v0.1.0.
 - **Admin REST client**: a `reqwest`-backed admin client lives in
   `magnetar-admin`.
 - **CLI**: `magnetar` binary in `magnetar-cli` covers admin lookups and stats
-  today; data-plane subcommands ship in M9.
+  today; data-plane subcommands ship in v0.2.0.
 
 ---
 
@@ -617,14 +617,16 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Moonpool engine parity train.** v0.1.0 Java parity is satisfied by
+- **Moonpool engine parity.** v0.1.0 Java parity is satisfied by
   the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
-  Moonpool reaches feature parity with tokio in milestones M5–M8 (see
-  [`docs/parity-status.md`](docs/parity-status.md) "Moonpool parity
-  train").
+  The façade surface bound to `PulsarClient<TokioEngine>` (partitioned,
+  multi-topics, pattern, reader, table-view, transactions, typed schemas)
+  does not yet compile against `PulsarClient<MoonpoolEngine<P>>`. See
+  [`docs/parity-status.md`](docs/parity-status.md) and
+  [`docs/follow-ups.md`](docs/follow-ups.md).
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180
   shadow topic** + **PIP-415 `getMessageIdByIndex`** + **PIP-33
-  replicated subscriptions** are scoped for the M9 milestone.
+  replicated subscriptions** are scoped for v0.2.0.
 - **SASL (Kerberos)** + **Athenz** auth providers are pre-alpha
   scaffolds; full GSSAPI / ZTS plumbing is deferred to v0.2.0.
 - **`AutoProduceBytesSchema`** trait surface only; the common case
@@ -653,11 +655,11 @@ known-missing feature.
 | PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
 | PIP-188 | `TOPIC_MIGRATED` | ✅ | Wire opcode decoded; tokio driver's event loop catches `ConnectionEvent::TopicMigrated`, logs the new-broker hint, and returns an error from `driver_loop_inner` so the supervisor triggers `Connection::reset` + reconnect. `rebuild_producers` / `rebuild_consumers` re-attach every still-open handle on the new socket. |
-| PIP-460 | Scalable topics | ❌ | Scoped for M9 (experimental) |
+| PIP-460 | Scalable topics | ❌ | Scoped for v0.2.0 (experimental) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim — magnetar ships its own idiomatic surface |
-| PIP-180 | Shadow topic | ❌ | M9 |
-| PIP-415 | `getMessageIdByIndex` | ❌ | M9 |
-| PIP-33 | Replicated subscriptions | ❌ | M9 |
+| PIP-180 | Shadow topic | ❌ | v0.2.0 |
+| PIP-415 | `getMessageIdByIndex` | ❌ | v0.2.0 (blocked on vendored proto bump) |
+| PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
 | PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime with `HealthProbe`). Active URL re-resolved on every supervised-reconnect attempt. |
 
 ---
@@ -669,10 +671,6 @@ Pick at compile time via feature flags.
 
 ### `magnetar-runtime-tokio` — production (default)
 
-- ~2,950 lines of code across `client.rs` (654), `consumer.rs` (937),
-  `producer.rs` (382), `driver.rs` (239), `compress.rs` (210),
-  `transport.rs` (125), `url_parse.rs` (113), `crypto.rs` (48),
-  `error.rs` (67), `lib.rs` (182).
 - TLS via [`tokio-rustls`](https://crates.io/crates/tokio-rustls) (ring
   backend); no `native-tls`, no `openssl`.
 - One driver task per connection — see
@@ -680,23 +678,23 @@ Pick at compile time via feature flags.
 - The user-facing futures (`Consumer::receive`, `Producer::send`, …) lock
   the shared state machine, register their `Waker` in a slab, and wait. The
   driver picks them up as the matching `OpOutcome` lands.
-- This is what `magnetar::PulsarClient` wires by default.
+- This is what `magnetar::PulsarClient` wires by default
+  (`PulsarClient<TokioEngine>`).
 
 ### `magnetar-runtime-moonpool` — deterministic simulation
 
-- ~2,740 lines of code across `client.rs` (414), `consumer.rs` (670),
-  `driver.rs` (295), `lib.rs` (343), `producer.rs` (701), `tls.rs` (215),
-  `transport.rs` (104). The M1 → M4 milestones (engine, client, producer,
-  consumer) have all landed; the surface mirrors the tokio engine 1:1 so
-  the same `magnetar::PulsarClient`-style usage compiles under the
-  `moonpool` feature.
-- TLS uses a local `rustls::ClientConnection` adapter (`tls.rs`) that drives
+- Drives the same sans-io state machine as the tokio engine over
+  `moonpool_core::Providers` (a bundle of `NetworkProvider`,
+  `TimeProvider`, `TaskProvider`, `RandomProvider`, `StorageProvider`).
+  Plug `TokioProviders` for production-style runs against a real broker,
+  or a `moonpool-sim` provider bundle for reproducible chaos under a seed.
+- TLS uses a local `rustls::ClientConnection` adapter
+  ([`tls.rs`](crates/magnetar-runtime-moonpool/src/tls.rs)) that drives
   `read_tls` / `process_new_packets` / `write_tls` over the moonpool byte
-  pipe. The handshake is therefore deterministic under `moonpool-sim` chaos.
-- Generic over `moonpool_core::Providers` (`NetworkProvider`, `TimeProvider`,
-  `TaskProvider`, `RandomProvider`, `StorageProvider`). Plug `TokioProviders`
-  for production-style runs against a real broker, or a sim bundle for
-  reproducible chaos under `moonpool-sim` seeds.
+  pipe — the handshake stays deterministic under chaos.
+- See [`docs/moonpool-engine.md`](docs/moonpool-engine.md) for the
+  engine's surface, supervised reconnect, chaos test pack, and the
+  tokio ↔ moonpool differential equivalence harness.
 
 ---
 
@@ -711,29 +709,16 @@ Pick at compile time via feature flags.
 
 ## Roadmap
 
-Magnetar tracks v0.1.0 against true Java parity. Open work is segmented
-into milestones M0 through M9; M9 wraps with the admin client + CLI +
-PIP-121 / PIP-33 / PIP-460 / PIP-180 / PIP-415 / replicated subscriptions
-+ shadow topic. Milestone + gap tracking is internal-only.
+v0.1.0 targets full Java client parity on the tokio engine
+([ADR-0010](specs/adr/0010-v0-1-full-java-parity.md),
+[ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)). The
+moonpool engine reaches feature parity with tokio on a follow-up train.
 
-Top open items at the time of this writing:
-
-1. **PIP-121 cluster failover** — `ServiceUrlProvider` URL rotation +
-   `ControlledClusterFailover` policy.
-2. **PatternConsumer auto-update ticker** (broker pushes `TopicListChanged`
-   but reconcile is caller-driven today).
-3. **PIP-415 `getMessageIdByIndex`** — blocked on vendored proto bump
-   (opcode missing from the current `PulsarApi.proto` snapshot).
-4. **PIP-460 scalable topics / PIP-466 V5 surface / PIP-180 shadow
-   topic / PIP-33 replicated subscriptions** — scoped for M9.
-
-`hdrhistogram` latency stats (p50/p99/max) and the
-`MultiTopicsConsumer::add_topic` / `remove_topic` mutators have already
-landed.
-
-The supervised reconnect (Stage 2) and transparent in-flight producer +
-consumer rebuild (Stage 3, `Connection::rebuild_producers` /
-`rebuild_consumers`) have landed and run on every disconnect.
+The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
+Deferred-scope items (PIP-460 scalable topics, PIP-466 V5 surface,
+PIP-180 shadow topic, PIP-415 `getMessageIdByIndex`, PIP-33 replicated
+subscriptions, SASL/Athenz full plumbing, `AutoProduceBytesSchema`) ship
+in v0.2.0.
 
 ---
 
