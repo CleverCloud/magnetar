@@ -29,7 +29,7 @@
 //! lives in the proto crate, which keeps moonpool free to ship its own
 //! probe impl without dragging tokio into `magnetar-proto`.
 //! See [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
-//! and [ADR-0022](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0022-health-probe-trait-extraction.md).
+//! and [ADR-0023](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md).
 
 use std::collections::HashMap;
 use std::future::{Future as _, poll_fn};

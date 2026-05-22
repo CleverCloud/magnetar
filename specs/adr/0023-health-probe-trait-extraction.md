@@ -1,4 +1,4 @@
-# ADR-0022 — Extract sans-io `HealthProbe` trait into `magnetar-proto`
+# ADR-0023 — Extract sans-io `HealthProbe` trait into `magnetar-proto`
 
 - **Status**: Accepted
 - **Date**: 2026-05-22
