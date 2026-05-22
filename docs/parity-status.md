@@ -24,7 +24,7 @@ follow-up train; the gap is tracked below.
 | `memory_limit` atomic-CAS reservation ([ADR-0017](../specs/adr/0017-memory-limit-atomic-reservation.md)) | ✅ | ✅ |
 | `MemoryLimitPolicy::ProducerBlock` ([ADR-0020](../specs/adr/0020-memory-limit-producer-block.md), [ADR-0022](../specs/adr/0022-memory-limit-producer-block-moonpool.md)) | ✅ | ✅ |
 | `ServiceUrlProvider` + `ControlledClusterFailover` ([ADR-0016](../specs/adr/0016-pip-121-cluster-failover.md)) | ✅ | ✅ |
-| `AutoClusterFailover` (PIP-121 with `HealthProbe`) | ✅ | ❌ |
+| `AutoClusterFailover` (PIP-121 with `HealthProbe`) | ✅ | ✅ |
 | PIP-188 `TOPIC_MIGRATED` → reconnect ([ADR-0018](../specs/adr/0018-pip-188-reconnect-on-migrate.md)) | ✅ | ✅ |
 | Generic `PulsarClient<E: Engine>` ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)) | ✅ | ✅ |
 | Partitioned producer / consumer | ✅ | ❌ |

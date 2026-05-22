@@ -9,22 +9,6 @@ For the public-facing parity status, see
 
 ## Moonpool engine
 
-### `AutoClusterFailover` (PIP-121, health-probe-driven)
-
-**Status.** Tokio-only. The moonpool engine ships
-`StaticServiceUrlProvider` and `ControlledClusterFailover` (both in
-`magnetar-proto`); the auto variant lives in
-[`crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs`](../crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs)
-and spawns its own probe loop on `tokio::spawn`.
-
-**Unblock.** Define a `HealthProbe` abstraction the moonpool runtime
-can stub deterministically (no real DNS, no real TCP), plus a
-`moonpool_core::TaskProvider`-driven probe loop with backoff. The
-supervised reconnect path already pulls `service_url_provider` on
-every attempt, so the trait wiring is in place.
-
-See [ADR-0016](../specs/adr/0016-pip-121-cluster-failover.md).
-
 ### Façade surface bound to `PulsarClient<MoonpoolEngine<P>>`
 
 **Status.** Partitioned producer / partitioned consumer /

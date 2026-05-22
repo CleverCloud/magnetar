@@ -15,12 +15,14 @@
 //! `Arc<dyn ServiceUrlProvider>` exactly so a synthetic probe can drive
 //! the URL slot from outside the runtime.
 //!
-//! `AutoClusterFailover` (the tokio-only health-probe background task) is
-//! intentionally NOT ported to the moonpool engine — see
-//! [`docs/m5b-deferrals.md`]. The chaos contract for moonpool is therefore
-//! against [`ControlledClusterFailover`] driven by a test-owned probe loop;
-//! the URL slot is what the supervised driver dials on every reconnect,
-//! and that is the contract this test pins.
+//! `AutoClusterFailover` is now ALSO ported to the moonpool engine
+//! ([`magnetar_runtime_moonpool::auto_cluster_failover::AutoClusterFailover`])
+//! — its probe-loop dynamics are pinned by
+//! `crates/magnetar-runtime-moonpool/tests/pip_121_auto_failover.rs`
+//! and `crates/magnetar-differential/tests/auto_failover_equivalence.rs`.
+//! This file remains focused on the [`ControlledClusterFailover`] slot
+//! semantics: a test-owned probe loop drives URL swaps, and the URL slot
+//! is what the supervised driver dials on every reconnect attempt.
 //!
 //! ## Shape
 //!

@@ -61,6 +61,7 @@
     clippy::doc_markdown
 )]
 
+pub mod auto_cluster_failover;
 mod client;
 mod consumer;
 pub mod dns;
@@ -82,12 +83,16 @@ use magnetar_proto::{Connection, ConnectionConfig};
 /// parity: `org.apache.pulsar.client.api.ServiceUrlProvider`. See
 /// [ADR-0016](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0016-pip-121-cluster-failover.md).
 ///
-/// `AutoClusterFailover` (the health-probe-driven background policy) is
-/// **not** ported to the moonpool engine — it requires a tokio-driven
-/// probe loop tightly coupled to the runtime. See
-/// `docs/m5b-deferrals.md` for the rationale. Use
-/// [`magnetar_proto::ControlledClusterFailover`] for moonpool — set the
-/// URL from your own task or test harness.
+/// The health-probe-driven [`AutoClusterFailover`] policy now also has a
+/// moonpool-native implementation in
+/// [`crate::auto_cluster_failover`]; it is generic over
+/// [`moonpool_core::Providers`] so the probe loop and the TCP probe
+/// socket dance run through the moonpool task / network providers and
+/// stay deterministic under `moonpool-sim`. See
+/// [ADR-0023](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md)
+/// for the trait extraction that made this possible.
+///
+/// [`AutoClusterFailover`]: crate::auto_cluster_failover::AutoClusterFailover
 pub use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider, StaticServiceUrlProvider};
 use moonpool_core::Providers;
 use parking_lot::Mutex;
