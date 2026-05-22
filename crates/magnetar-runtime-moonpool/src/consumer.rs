@@ -9,7 +9,7 @@
 //! ## M4 surface
 //!
 //! - [`Consumer::receive`] — pop the next [`IncomingMessage`] from the per-consumer queue, parking
-//!   on the driver wakeup until one arrives.
+//!   on the per-consumer waker slab until one arrives.
 //! - [`Consumer::ack`] / [`Consumer::ack_cumulative`] — request-id-correlated acks that resolve
 //!   once the broker confirms (`CommandAckResponse`).
 //! - [`Consumer::negative_ack`] — fire-and-forget redelivery request.
@@ -33,9 +33,11 @@
 //! Futures here follow the same pattern as the rest of the moonpool engine:
 //! park on the sans-io `Connection`'s `Waker` slab via
 //! [`magnetar_proto::Connection::register_waker`] for request-id-correlated
-//! work, and on the shared [`tokio::sync::Notify`] driver wakeup for
-//! handle-correlated work (subscribe ack, message arrival). No `mpsc` /
-//! `oneshot` / `watch` / `broadcast` channels of any flavour. See
+//! work, on the per-consumer waker slab via
+//! [`magnetar_proto::Connection::register_consumer_receive_waker`] for message
+//! arrival, and on the shared [`tokio::sync::Notify`] driver wakeup for
+//! the small remaining set of handle-correlated events (subscribe ack). No
+//! `mpsc` / `oneshot` / `watch` / `broadcast` channels of any flavour. See
 //! `GUIDELINES.md` §"No-channels rule".
 
 use std::future::Future;
@@ -141,11 +143,11 @@ impl<P: Providers> Consumer<P> {
     /// `CommandMessage` and the state machine emits it into this consumer's
     /// queue.
     ///
-    /// TODO(M4 follow-up): the state machine currently exposes only
-    /// per-request waker slots; per-consumer message-arrival wakers will land
-    /// alongside flow-control work in a later milestone. For now we park on
-    /// the connection-level driver wakeup, which means `receive()` can
-    /// spuriously wake but never misses a message.
+    /// Multiple concurrent `receive()` calls on the same consumer are
+    /// supported: each future installs its own waker into the per-consumer
+    /// slab on [`magnetar_proto::ConsumerState`]; arrival drains the slab and
+    /// every parked future is re-polled. The first to acquire the connection
+    /// lock pops the message; the others observe an empty queue and re-park.
     ///
     /// # Errors
     /// - [`ClientError::Closed`] if the connection has been closed before a message arrives.
@@ -153,6 +155,7 @@ impl<P: Providers> Consumer<P> {
         ReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
+            slab_key: None,
         }
         .await
     }
@@ -368,39 +371,72 @@ impl Future for RequestFut {
 }
 
 /// Future returned by [`Consumer::receive`]. Pops the next message from the
-/// per-consumer queue, parking on the driver wakeup until one arrives.
+/// per-consumer queue, parking on the per-consumer waker slab exposed by
+/// [`magnetar_proto::Connection::register_consumer_receive_waker`] until a
+/// message arrives or the consumer is closed.
 ///
-/// Mirrors the tokio engine's `ReceiveFut`. See the TODO on
-/// [`Consumer::receive`] for the per-consumer waker plan.
+/// On drop the future evicts its slab slot via
+/// [`magnetar_proto::Connection::cancel_consumer_receive_waker`] so cancelled
+/// receives don't leak entries until the next arrival.
 struct ReceiveFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
+    /// Slab key of the currently-installed waker, if any.
+    slab_key: Option<usize>,
+}
+
+impl Drop for ReceiveFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            let mut conn = self.shared.inner.lock();
+            conn.cancel_consumer_receive_waker(self.handle, key);
+        }
+    }
 }
 
 impl Future for ReceiveFut {
     type Output = Result<IncomingMessage, ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.shared.inner.lock();
-        if let Some(msg) = conn.pop_message(self.handle) {
+        let this = self.get_mut();
+        let handle = this.handle;
+        let shared = this.shared.clone();
+        let mut conn = shared.inner.lock();
+        if let Some(msg) = conn.pop_message(handle) {
+            // Clear any stale slab entry; we resolved successfully.
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(handle, key);
+            }
             drop(conn);
             // pop_message may have queued FLOW frames; wake the driver to flush.
-            self.shared.driver_waker.notify_one();
+            shared.driver_waker.notify_one();
             return Poll::Ready(Ok(msg));
         }
         // Closed connection with no buffered message → terminal.
-        if conn.is_closed() || conn.consumer_is_closed(self.handle) {
+        if conn.is_closed() || conn.consumer_is_closed(handle) {
             return Poll::Ready(Err(ClientError::Closed));
         }
-        drop(conn);
-        // Re-arm via the driver wake-up. The driver task notifies *all* parked
-        // tasks after any inbound bytes are processed.
-        let notified = self.shared.driver_waker.notified();
-        tokio::pin!(notified);
-        if notified.as_mut().enable() {
-            // Already notified: poll immediately.
-            cx.waker().wake_by_ref();
+        // Refresh the slab registration so the current task is the one woken.
+        if let Some(old_key) = this.slab_key.take() {
+            conn.cancel_consumer_receive_waker(handle, old_key);
         }
+        if let Some(key) = conn.register_consumer_receive_waker(handle, cx.waker().clone()) {
+            // Close the race where a message arrives between the
+            // pop_message check above and the slab insert.
+            if conn.peek_message_payload_size(handle).is_some() {
+                conn.cancel_consumer_receive_waker(handle, key);
+                drop(conn);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            this.slab_key = Some(key);
+            drop(conn);
+            return Poll::Pending;
+        }
+        // Consumer was removed in the meantime; surface as closed on the
+        // next poll.
+        drop(conn);
+        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }
@@ -648,6 +684,7 @@ mod tests {
         let fut = ReceiveFut {
             shared: shared.clone(),
             handle,
+            slab_key: None,
         };
         let msg = fut.await.expect("receive must succeed");
         assert_eq!(msg.payload.as_ref(), b"hello");
@@ -663,8 +700,119 @@ mod tests {
         let fut = ReceiveFut {
             shared,
             handle: magnetar_proto::ConsumerHandle(9999),
+            slab_key: None,
         };
         let err = fut.await.expect_err("receive must surface Closed");
         assert!(matches!(err, crate::client::ClientError::Closed));
+    }
+
+    // ── per-consumer waker slab ───────────────────────────────────────────
+
+    /// Two concurrent `receive()` futures on the same consumer must both
+    /// resolve when two messages arrive — the slab fans out independently
+    /// of which future polled first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_concurrent_receives_both_fan_out() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/fanout".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let c1: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let c2: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+
+        let t1 = tokio::spawn(async move { c1.receive().await });
+        let t2 = tokio::spawn(async move { c2.receive().await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Slab should hold both registrations.
+        assert_eq!(
+            shared
+                .inner
+                .lock()
+                .consumer(handle)
+                .unwrap()
+                .receive_wakers
+                .len(),
+            2,
+        );
+
+        // Deliver two messages.
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..2_u64 {
+                let bytes = command_message_bytes(handle.0, 200 + i, format!("m{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+
+        let m1 = tokio::time::timeout(std::time::Duration::from_secs(1), t1)
+            .await
+            .expect("first receive must not hang")
+            .expect("join")
+            .expect("receive ok");
+        let m2 = tokio::time::timeout(std::time::Duration::from_secs(1), t2)
+            .await
+            .expect("second receive must not hang")
+            .expect("join")
+            .expect("receive ok");
+        assert_ne!(
+            m1.message_id, m2.message_id,
+            "the two receives must each get a different message"
+        );
+    }
+
+    /// Dropping a `ReceiveFut` before it resolves must evict its slab slot,
+    /// so a later arrival doesn't leak the entry / wake a dead task.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_receive_future_evicts_slab_slot() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/cancel".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let c: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+
+        let task = tokio::spawn(async move { c.receive().await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            shared
+                .inner
+                .lock()
+                .consumer(handle)
+                .unwrap()
+                .receive_wakers
+                .len(),
+            1,
+        );
+
+        task.abort();
+        let _ = task.await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            shared
+                .inner
+                .lock()
+                .consumer(handle)
+                .unwrap()
+                .receive_wakers
+                .len(),
+            0,
+            "the cancelled receive's slab slot must be evicted",
+        );
     }
 }

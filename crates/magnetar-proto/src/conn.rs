@@ -840,10 +840,11 @@ impl Connection {
             consumer.consumed_since_flow = 0;
             consumer.dead_letter_pending.clear();
             consumer.batch_ack_tracker.clear();
-            if let Some(receive_waker) = consumer.receive_waker.take() {
-                // Wake any in-flight receive so it observes the queue is empty and
-                // re-registers on the freshly-handshaked connection.
-                receive_waker.wake();
+            // Wake every in-flight receive so they observe the queue is empty
+            // and re-register on the freshly-handshaked connection.
+            let wakers: Vec<std::task::Waker> = consumer.receive_wakers.drain().collect();
+            for w in wakers {
+                w.wake();
             }
         }
 
@@ -1380,7 +1381,10 @@ impl Connection {
                 let handle = ConsumerHandle(rc.consumer_id);
                 if let Some(consumer) = self.consumers.get_mut(&handle) {
                     consumer.reached_end_of_topic = true;
-                    if let Some(w) = consumer.receive_waker.take() {
+                    // Wake every parked receive so they can observe the
+                    // terminal end-of-topic flag instead of waiting forever.
+                    let wakers: Vec<std::task::Waker> = consumer.receive_wakers.drain().collect();
+                    for w in wakers {
                         w.wake();
                     }
                 }
@@ -2990,6 +2994,33 @@ impl Connection {
             .get(&handle)
             .and_then(|c| c.queue.front())
             .map(|m| m.payload.len())
+    }
+
+    /// Register a per-consumer receive waker. Returns `Some(slab_key)` if the
+    /// consumer is alive (the caller MUST evict the slot via
+    /// [`Self::cancel_consumer_receive_waker`] on drop), or `None` if the
+    /// consumer has been closed in the meantime.
+    ///
+    /// This is the per-consumer waker slab the runtime crates park
+    /// `receive()` futures on. Multiple in-flight receives on the same
+    /// consumer get independent slab slots and all fan out on message arrival
+    /// (see [`ConsumerState::register_receive_waker`]).
+    pub fn register_consumer_receive_waker(
+        &mut self,
+        handle: ConsumerHandle,
+        waker: Waker,
+    ) -> Option<usize> {
+        let consumer = self.consumers.get_mut(&handle)?;
+        Some(consumer.register_receive_waker(waker))
+    }
+
+    /// Evict a previously-registered per-consumer receive waker. Idempotent —
+    /// safe to call from a `Drop` impl even if the consumer has been removed
+    /// or the slot already drained.
+    pub fn cancel_consumer_receive_waker(&mut self, handle: ConsumerHandle, slab_key: usize) {
+        if let Some(consumer) = self.consumers.get_mut(&handle) {
+            consumer.cancel_receive_waker(slab_key);
+        }
     }
 
     /// Drain a single message from the given consumer's queue.

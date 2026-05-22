@@ -26,6 +26,7 @@ use std::task::Waker;
 
 use bytes::{Buf, Bytes};
 use prost::Message as _;
+use slab::Slab;
 
 use crate::error::ConsumerError;
 use crate::event::IncomingMessage;
@@ -62,8 +63,16 @@ pub struct ConsumerState {
     chunk_reassembly: HashMap<String, ChunkBuffer>,
     /// In-flight `CommandSeek` request id, if any. While `Some`, the queue is frozen.
     pub pending_seek: Option<RequestId>,
-    /// Waker for the next `poll_receive`-style future.
-    pub receive_waker: Option<Waker>,
+    /// Per-consumer waker slab. Each in-flight `receive()` future registers a
+    /// `Waker` here via [`Self::register_receive_waker`] and evicts it on `Drop`
+    /// via [`Self::cancel_receive_waker`]. When a new message arrives (or the
+    /// consumer is closed / has reached end-of-topic), every parked waker is
+    /// drained and woken — this lets multiple concurrent receivers fan out
+    /// cleanly without one waker clobbering another.
+    ///
+    /// Not a channel — a `Slab<Waker>` is the canonical no-channel wake pattern
+    /// (see [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+    pub receive_wakers: Slab<Waker>,
     /// Closed flag.
     pub closed: bool,
     /// Configured max redelivery before DLQ routing kicks in (`0` disables DLQ routing).
@@ -287,7 +296,7 @@ impl ConsumerState {
             queue: VecDeque::new(),
             chunk_reassembly: HashMap::new(),
             pending_seek: None,
-            receive_waker: None,
+            receive_wakers: Slab::new(),
             closed: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
@@ -637,8 +646,15 @@ impl ConsumerState {
         }
     }
 
+    /// Drain every parked receive waker and wake it. Called on message arrival,
+    /// close, end-of-topic, and supervised reset. Drain-all (rather than wake-one)
+    /// matches the fan-out semantic users expect: any number of concurrent
+    /// `receive()` futures get re-polled, and the first one to acquire the
+    /// connection lock pops the message; the others observe the empty queue and
+    /// re-park themselves.
     fn wake_receivers(&mut self) {
-        if let Some(w) = self.receive_waker.take() {
+        let wakers: Vec<Waker> = self.receive_wakers.drain().collect();
+        for w in wakers {
             w.wake();
         }
     }
@@ -655,17 +671,31 @@ impl ConsumerState {
         self.pending_seek.take()
     }
 
-    /// Register a waker that fires when a new message arrives.
-    pub fn register_receive_waker(&mut self, waker: Waker) {
-        self.receive_waker = Some(waker);
+    /// Register a waker that fires when a new message arrives, the consumer is
+    /// closed, or end-of-topic is signaled. Returns a slab key that the caller
+    /// MUST pass to [`Self::cancel_receive_waker`] if the future is dropped
+    /// before observing the wake — otherwise the slab leaks the entry until the
+    /// next drain.
+    ///
+    /// Multiple in-flight `receive()` futures on the same consumer register
+    /// independent slots; arrival drains all of them.
+    pub fn register_receive_waker(&mut self, waker: Waker) -> usize {
+        self.receive_wakers.insert(waker)
     }
 
-    /// Mark the consumer closed.
+    /// Evict a previously-registered receive waker. Idempotent — a missing slot
+    /// is a no-op (a concurrent wake may already have drained it).
+    pub fn cancel_receive_waker(&mut self, slab_key: usize) {
+        if self.receive_wakers.contains(slab_key) {
+            self.receive_wakers.remove(slab_key);
+        }
+    }
+
+    /// Mark the consumer closed. Wakes every parked receive future so they can
+    /// observe the terminal state.
     pub fn close(&mut self) {
         self.closed = true;
-        if let Some(w) = self.receive_waker.take() {
-            w.wake();
-        }
+        self.wake_receivers();
     }
 }
 

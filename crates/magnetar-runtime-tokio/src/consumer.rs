@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use magnetar_proto::{
     AckRequest, ConsumerHandle, IncomingMessage, MessageId, OpOutcome, PendingOpKey, SeekTarget, pb,
@@ -120,18 +120,18 @@ impl Consumer {
 
     /// Receive the next message. Resolves when the broker delivers a `CommandMessage` and the
     /// state machine emits it into this consumer's queue.
+    ///
+    /// Multiple concurrent `receive()` calls on the same consumer are
+    /// supported: each future installs its own waker into the per-consumer
+    /// slab on [`magnetar_proto::ConsumerState`]; arrival drains the slab and
+    /// every parked future is re-polled. The first to acquire the connection
+    /// lock pops the message; the others observe an empty queue and re-park.
     pub fn receive(&self) -> ReceiveFut {
         ReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
             decryptor: self.decryptor.clone(),
-            // We register a per-handle waker via this op key when no message is ready.
-            //
-            // TODO(M2 follow-up): the state machine currently exposes only per-request waker
-            // slots; per-consumer message-arrival wakers will land alongside flow-control work
-            // in a later milestone. For now we poll-park via the connection-level driver
-            // waker, which means receive() can spuriously wake but never misses a message.
-            registered_waker: None,
+            slab_key: None,
         }
     }
 
@@ -978,50 +978,79 @@ fn post_process_message(
 }
 
 /// Future returned by [`Consumer::receive`].
+///
+/// Parks on the per-consumer waker slab exposed by
+/// [`magnetar_proto::Connection::register_consumer_receive_waker`]. On drop,
+/// the future evicts its slot via
+/// [`magnetar_proto::Connection::cancel_consumer_receive_waker`] so cancelled
+/// receives don't leak entries until the next arrival.
 #[derive(Debug)]
 pub struct ReceiveFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
     decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
-    /// Tracks whether we've already installed a connection-level waker to avoid leaking entries
-    /// across polls.
-    registered_waker: Option<Waker>,
+    /// Slab key of the currently-installed waker, if any. `Some` once we've
+    /// registered on the per-consumer slab; cleared on cancel / wake.
+    slab_key: Option<usize>,
+}
+
+impl Drop for ReceiveFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            // Cancel the slab registration so a future arrival doesn't wake a
+            // dropped task. Idempotent on the proto side.
+            let mut conn = self.shared.inner.lock();
+            conn.cancel_consumer_receive_waker(self.handle, key);
+        }
+    }
 }
 
 impl Future for ReceiveFut {
     type Output = Result<IncomingMessage, ClientError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Loop so that PIP-4 `Discard` can ack the undecryptable message and immediately try
         // the next queued one without bouncing back to the executor — otherwise the caller
         // would need to re-poll just to skip a single dropped message.
+        let this = self.get_mut();
+        let handle = this.handle;
+        let shared = this.shared.clone();
         loop {
-            let mut conn = self.shared.inner.lock();
-            let Some(mut msg) = conn.pop_message(self.handle) else {
-                drop(conn);
-                // Drain any state-machine events that may have arrived; we keep events queued
-                // but no typed waker channel for arrival yet. The driver loop's `notify_one`
-                // after handling bytes will re-poll us.
-                //
-                // Re-arm the per-future driver wake-up. We piggyback on
-                // `driver_waker.notified()` via a future-local notification subscription: the
-                // driver task notifies *all* parked tasks after any inbound bytes are
-                // processed.
-                //
-                // TODO(M3 follow-up): wire a dedicated per-consumer waker slab into
-                // `Connection` so receive() resolves exactly when a `CommandMessage` is
-                // delivered, instead of being re-polled on every inbound packet. Until then
-                // this is correct but not maximally efficient.
-                self.registered_waker = Some(cx.waker().clone());
-                let notified = self.shared.driver_waker.notified();
-                tokio::pin!(notified);
-                // Register interest so the next `notify_one` wakes our task.
-                if notified.as_mut().enable() {
-                    // Already notified: poll immediately.
-                    cx.waker().wake_by_ref();
+            let mut conn = shared.inner.lock();
+            let Some(mut msg) = conn.pop_message(handle) else {
+                // No message ready. Install (or refresh) our per-consumer waker
+                // slab slot so the state machine wakes us when a new
+                // `CommandMessage` arrives. If the consumer has been closed
+                // since we last polled, register_consumer_receive_waker returns
+                // `None` and we surface the terminal state immediately.
+                if let Some(old_key) = this.slab_key.take() {
+                    conn.cancel_consumer_receive_waker(handle, old_key);
                 }
+                if let Some(key) = conn.register_consumer_receive_waker(handle, cx.waker().clone())
+                {
+                    // Re-check the queue under the lock so an arrival that
+                    // landed between the pop_message above and the slab
+                    // insert doesn't wake a (now-evicted) earlier slot.
+                    if conn.peek_message_payload_size(handle).is_some() {
+                        // Cancel our just-installed slot and loop to pop.
+                        conn.cancel_consumer_receive_waker(handle, key);
+                        continue;
+                    }
+                    this.slab_key = Some(key);
+                    drop(conn);
+                    return Poll::Pending;
+                }
+                // Consumer removed (closed connection). Fall through to the
+                // closed-handling path: a follow-up poll will observe the
+                // closed event and resolve.
+                drop(conn);
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             };
+            // We popped a message; clear any stale slab registration.
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(handle, key);
+            }
             drop(conn);
             // Decompress the payload if the broker stamped a compression kind on it. Producer-
             // side compression lives in `producer::Producer::send`; this is the symmetric
@@ -1065,13 +1094,9 @@ impl Future for ReceiveFut {
                 // The decryption failure policy is per-consumer (PIP-4). We resolve it now —
                 // before attempting decrypt — so that even the "no decryptor configured" path
                 // can honor `Discard` / `Consume` instead of unconditionally failing.
-                let action = self
-                    .shared
-                    .inner
-                    .lock()
-                    .consumer_crypto_failure_action(self.handle);
+                let action = shared.inner.lock().consumer_crypto_failure_action(handle);
                 let decrypt_result: Result<bytes::Bytes, ClientError> =
-                    match self.decryptor.as_ref() {
+                    match this.decryptor.as_ref() {
                         Some(decryptor) => decryptor
                             .decrypt(&msg.payload, &msg.metadata)
                             .map_err(|err| ClientError::Other(format!("decrypt: {err}"))),
@@ -1095,9 +1120,9 @@ impl Future for ReceiveFut {
                             // Java's `ConsumerImpl#decryptPayloadIfNeeded` which calls
                             // `discardMessage(...)` (an explicit ack) when the policy is
                             // `DISCARD`.
-                            let mut conn = self.shared.inner.lock();
+                            let mut conn = shared.inner.lock();
                             let _ = conn.ack(
-                                self.handle,
+                                handle,
                                 magnetar_proto::AckRequest {
                                     message_ids: vec![msg.message_id],
                                     ack_type: magnetar_proto::pb::command_ack::AckType::Individual,
@@ -1106,7 +1131,7 @@ impl Future for ReceiveFut {
                                 },
                             );
                             drop(conn);
-                            self.shared.driver_waker.notify_one();
+                            shared.driver_waker.notify_one();
                             continue;
                         }
                         magnetar_proto::CryptoFailureAction::Consume => {
@@ -1449,5 +1474,132 @@ mod tests {
                 drained.len()
             );
         }
+    }
+
+    // ── per-consumer waker slab ───────────────────────────────────────────
+
+    /// Two concurrent `receive()` futures on the same consumer must both
+    /// resolve when two messages arrive — neither's waker may be clobbered
+    /// by the other's registration. Pre-slab implementation, this hung
+    /// indefinitely because the single `Option<Waker>` field on
+    /// `ConsumerState` was overwritten by the second poll.
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_concurrent_receives_both_fan_out() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/fanout".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+
+        // Spawn two parallel receive tasks before any message arrives so
+        // both park on the slab.
+        let c1 = consumer.clone();
+        let c2 = consumer.clone();
+        let t1 = tokio::spawn(async move { c1.receive().await });
+        let t2 = tokio::spawn(async move { c2.receive().await });
+        // Yield so the spawned tasks actually poll and register on the slab.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Slab should hold both registrations now.
+        {
+            let conn = shared.inner.lock();
+            let consumer_state = conn.consumer(handle).expect("consumer still alive");
+            assert_eq!(
+                consumer_state.receive_wakers.len(),
+                2,
+                "both in-flight receives must be parked on the slab",
+            );
+        }
+
+        // Deliver two messages; both receives must resolve.
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..2 {
+                let bytes = command_message_bytes(handle.0, 200 + i, format!("m{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+
+        let m1 = tokio::time::timeout(std::time::Duration::from_secs(1), t1)
+            .await
+            .expect("first receive must not hang")
+            .expect("join")
+            .expect("receive ok");
+        let m2 = tokio::time::timeout(std::time::Duration::from_secs(1), t2)
+            .await
+            .expect("second receive must not hang")
+            .expect("join")
+            .expect("receive ok");
+        assert_ne!(
+            m1.message_id, m2.message_id,
+            "the two receives must each get a different message"
+        );
+    }
+
+    /// Dropping a `ReceiveFut` before it resolves must evict its slab slot,
+    /// so a later arrival doesn't wake a dead task and leak the entry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_receive_future_evicts_slab_slot() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/cancel".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+
+        let c1 = consumer.clone();
+        let task = tokio::spawn(async move { c1.receive().await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Slab must have exactly one registration now.
+        assert_eq!(
+            shared
+                .inner
+                .lock()
+                .consumer(handle)
+                .unwrap()
+                .receive_wakers
+                .len(),
+            1,
+        );
+
+        // Cancel the receive; the Drop impl must evict the slab slot.
+        task.abort();
+        let _ = task.await; // wait for the cancel to actually run Drop
+        // Give the runtime a tick to settle.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            shared
+                .inner
+                .lock()
+                .consumer(handle)
+                .unwrap()
+                .receive_wakers
+                .len(),
+            0,
+            "the cancelled receive's slab slot must be evicted",
+        );
     }
 }
