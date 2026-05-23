@@ -275,6 +275,10 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// `true` once the producer has entered a terminal state.
     fn is_closed(&self) -> bool;
 
+    /// `true` while the broker connection is up. Mirrors Java
+    /// `Producer#isConnected`.
+    fn is_connected(&self) -> bool;
+
     /// Topic this producer publishes to.
     fn topic(&self) -> String;
 
@@ -372,8 +376,16 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// Subscription name this consumer holds.
     fn subscription(&self) -> String;
 
+    /// Broker-assigned consumer name. Empty string when not yet known.
+    /// Mirrors Java `Consumer#getConsumerName`.
+    fn name(&self) -> String;
+
     /// `true` once the consumer has entered a terminal state.
     fn is_closed(&self) -> bool;
+
+    /// `true` while the broker connection is up. Mirrors Java
+    /// `Consumer#isConnected`.
+    fn is_connected(&self) -> bool;
 }
 
 #[cfg(feature = "tokio")]
@@ -394,6 +406,10 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
 
     fn is_closed(&self) -> bool {
         magnetar_runtime_tokio::Producer::is_closed(self)
+    }
+
+    fn is_connected(&self) -> bool {
+        magnetar_runtime_tokio::Producer::is_connected(self)
     }
 
     fn topic(&self) -> String {
@@ -484,8 +500,16 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
         magnetar_runtime_tokio::Consumer::subscription(self)
     }
 
+    fn name(&self) -> String {
+        magnetar_runtime_tokio::Consumer::name(self)
+    }
+
     fn is_closed(&self) -> bool {
         magnetar_runtime_tokio::Consumer::is_closed(self)
+    }
+
+    fn is_connected(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::is_connected(self)
     }
 }
 
@@ -515,6 +539,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
 
     fn is_closed(&self) -> bool {
         magnetar_runtime_moonpool::Producer::is_closed(self)
+    }
+
+    fn is_connected(&self) -> bool {
+        magnetar_runtime_moonpool::Producer::is_connected(self)
     }
 
     fn topic(&self) -> String {
@@ -611,8 +639,16 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
         magnetar_runtime_moonpool::Consumer::subscription(self)
     }
 
+    fn name(&self) -> String {
+        magnetar_runtime_moonpool::Consumer::name(self)
+    }
+
     fn is_closed(&self) -> bool {
         magnetar_runtime_moonpool::Consumer::is_closed(self)
+    }
+
+    fn is_connected(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::is_connected(self)
     }
 }
 

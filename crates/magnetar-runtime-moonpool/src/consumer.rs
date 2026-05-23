@@ -117,6 +117,37 @@ impl<P: Providers> Consumer<P> {
         self.shared.inner.lock().consumer_is_closed(self.handle)
     }
 
+    /// Broker-assigned consumer name. Empty string if the consumer is no
+    /// longer registered. Mirrors Java `Consumer#getConsumerName`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.shared
+            .inner
+            .lock()
+            .consumer_name(self.handle)
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    /// `true` while the broker connection is up. Mirrors Java
+    /// `Consumer#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.shared.inner.lock().is_connected()
+    }
+
+    /// Cumulative consumer-side counters. Returns a zeroed snapshot
+    /// if the consumer handle is no longer registered. Mirrors Java
+    /// `Consumer#getStats`.
+    #[must_use]
+    pub fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
+        self.shared
+            .inner
+            .lock()
+            .consumer_stats(self.handle)
+            .unwrap_or_default()
+    }
+
     /// Stops automatic flow refills so the broker stops dispatching new
     /// messages once already-issued permits drain. Buffered messages remain
     /// receivable.

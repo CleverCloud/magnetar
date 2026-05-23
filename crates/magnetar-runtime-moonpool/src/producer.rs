@@ -138,6 +138,13 @@ impl<P: Providers> Producer<P> {
         self.shared.inner.lock().producer_is_closed(self.handle)
     }
 
+    /// `true` while the broker connection is up. Mirrors Java
+    /// `Producer#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.shared.inner.lock().is_connected()
+    }
+
     /// Number of in-flight sends (queued and not yet acked by the broker).
     /// Mirrors the un-batched view of Java
     /// `ProducerStats#getPendingQueueSize`.
