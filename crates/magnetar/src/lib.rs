@@ -63,7 +63,9 @@ pub use engine::MoonpoolEngine;
 #[cfg(feature = "tokio")]
 pub use engine::TokioEngine;
 #[cfg(feature = "tokio")]
-pub use engine::{ConsumerApi, ProducerApi};
+pub use engine::{
+    ConsumerApi, CreateProducerApi, OpenProducerFut, ProducerApi, SubscribeApi, SubscribeFut,
+};
 pub use engine::{Engine, TransactionApi};
 
 #[cfg(feature = "tokio")]
@@ -200,6 +202,45 @@ mod tests {
     fn consumer_api_is_implemented_by_moonpool_consumer() {
         assert_consumer_api_bound::<
             magnetar_runtime_moonpool::Consumer<moonpool_core::TokioProviders>,
+        >();
+    }
+
+    /// Compile-time witnesses for the Builder genericity extension
+    /// traits added alongside the Producer/Consumer foundation lift.
+    /// Each runtime's `Client` type satisfies both `SubscribeApi` and
+    /// `CreateProducerApi` so the upcoming Builder lift can dispatch
+    /// through them.
+    #[cfg(feature = "tokio")]
+    fn assert_subscribe_api_bound<T: crate::SubscribeApi>() {}
+
+    #[cfg(feature = "tokio")]
+    fn assert_create_producer_api_bound<T: crate::CreateProducerApi>() {}
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn subscribe_api_is_implemented_by_tokio_client() {
+        assert_subscribe_api_bound::<magnetar_runtime_tokio::Client>();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn create_producer_api_is_implemented_by_tokio_client() {
+        assert_create_producer_api_bound::<magnetar_runtime_tokio::Client>();
+    }
+
+    #[cfg(all(feature = "tokio", feature = "moonpool"))]
+    #[test]
+    fn subscribe_api_is_implemented_by_moonpool_client() {
+        assert_subscribe_api_bound::<
+            magnetar_runtime_moonpool::Client<moonpool_core::TokioProviders>,
+        >();
+    }
+
+    #[cfg(all(feature = "tokio", feature = "moonpool"))]
+    #[test]
+    fn create_producer_api_is_implemented_by_moonpool_client() {
+        assert_create_producer_api_bound::<
+            magnetar_runtime_moonpool::Client<moonpool_core::TokioProviders>,
         >();
     }
 }

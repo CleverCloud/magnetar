@@ -456,6 +456,132 @@ pub trait ConsumerApi: 'static + Send + Sync {
         Self: Sized;
 }
 
+/// Engine-side subscribe surface used by `ConsumerBuilder<E>` and the
+/// other consumer-spawning façade surfaces (`MultiTopicsConsumer`,
+/// `PatternConsumer`, `Reader`). Each runtime implements this on its
+/// concrete `Client` type with the runtime-specific `Consumer` type
+/// surfaced via the associated `Consumer` type.
+///
+/// Per ADR-0026 §D1: this is the next sub-PR after the per-surface
+/// lifts. Lifting `ConsumerBuilder<E>` to dispatch through this
+/// trait unblocks the impl-body lifts on the four phantom-lifted
+/// surfaces (`TypedSchemas`, `MultiTopicsConsumer` /
+/// `PartitionedConsumer`, `PatternConsumer`).
+#[cfg(feature = "tokio")]
+pub trait SubscribeApi: 'static + Send + Sync {
+    /// Concrete consumer type each runtime returns. Required to
+    /// implement [`ConsumerApi`] so generic surfaces can dispatch
+    /// further methods through that trait.
+    type Consumer: ConsumerApi;
+    /// Runtime client error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Issue a `CommandSubscribe` and resolve with the broker-side
+    /// `CommandSuccess` correlated with the request id (subscribe
+    /// ack). After this resolves the state machine has a fresh
+    /// per-consumer queue and the initial FLOW frame has been queued
+    /// for the driver.
+    fn subscribe(&self, req: magnetar_proto::SubscribeRequest) -> SubscribeFut<'_, Self>;
+}
+
+/// Helper alias: `SubscribeApi::subscribe` future return type.
+#[cfg(feature = "tokio")]
+pub type SubscribeFut<'a, S> = Pin<
+    Box<
+        dyn Future<Output = Result<<S as SubscribeApi>::Consumer, <S as SubscribeApi>::Error>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Engine-side producer-creation surface used by `ProducerBuilder<E>`
+/// and `PartitionedProducer<E>`. Same shape as [`SubscribeApi`] for
+/// the producer side.
+#[cfg(feature = "tokio")]
+pub trait CreateProducerApi: 'static + Send + Sync {
+    /// Concrete producer type each runtime returns.
+    type Producer: ProducerApi;
+    /// Runtime client error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Issue a `CommandProducer` and resolve with
+    /// `CommandProducerSuccess` correlated with the request id.
+    fn open_producer(
+        &self,
+        req: magnetar_proto::CreateProducerRequest,
+    ) -> OpenProducerFut<'_, Self>;
+}
+
+/// Helper alias: `CreateProducerApi::open_producer` future return type.
+#[cfg(feature = "tokio")]
+pub type OpenProducerFut<'a, P> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    <P as CreateProducerApi>::Producer,
+                    <P as CreateProducerApi>::Error,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+
+#[cfg(feature = "tokio")]
+impl SubscribeApi for magnetar_runtime_tokio::Client {
+    type Consumer = magnetar_runtime_tokio::Consumer;
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn subscribe(
+        &self,
+        req: magnetar_proto::SubscribeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Consumer, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Client::subscribe(self, req))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl CreateProducerApi for magnetar_runtime_tokio::Client {
+    type Producer = magnetar_runtime_tokio::Producer;
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn open_producer(
+        &self,
+        req: magnetar_proto::CreateProducerRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Producer, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Client::open_producer(self, req))
+    }
+}
+
+#[cfg(all(feature = "tokio", feature = "moonpool"))]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> SubscribeApi
+    for magnetar_runtime_moonpool::Client<P>
+{
+    type Consumer = magnetar_runtime_moonpool::Consumer<P>;
+    type Error = magnetar_runtime_moonpool::ClientError;
+
+    fn subscribe(
+        &self,
+        req: magnetar_proto::SubscribeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Consumer, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Client::subscribe(self, req))
+    }
+}
+
+#[cfg(all(feature = "tokio", feature = "moonpool"))]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> CreateProducerApi
+    for magnetar_runtime_moonpool::Client<P>
+{
+    type Producer = magnetar_runtime_moonpool::Producer<P>;
+    type Error = magnetar_runtime_moonpool::ClientError;
+
+    fn open_producer(
+        &self,
+        req: magnetar_proto::CreateProducerRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Producer, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Client::open_producer(self, req))
+    }
+}
+
 #[cfg(feature = "tokio")]
 impl ProducerApi for magnetar_runtime_tokio::Producer {
     type Error = magnetar_runtime_tokio::ClientError;
