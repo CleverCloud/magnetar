@@ -62,6 +62,8 @@ mod engine;
 pub use engine::MoonpoolEngine;
 #[cfg(feature = "tokio")]
 pub use engine::TokioEngine;
+#[cfg(feature = "tokio")]
+pub use engine::{ConsumerApi, ProducerApi};
 pub use engine::{Engine, TransactionApi};
 
 #[cfg(feature = "tokio")]
@@ -160,5 +162,44 @@ mod tests {
         // Mirror of the tokio bound check; asserts the moonpool side of
         // the D1 lift train compiles. ADR-0026 §D1.
         assert_transaction_api_bound::<crate::engine::MoonpoolClientState>();
+    }
+
+    /// Phase 1 of the Producer/Consumer foundational lift — see
+    /// ADR-0026 §D1 and `docs/follow-ups.md`. Each bound check fires
+    /// at typeck; if either runtime's `Producer` / `Consumer` regresses
+    /// the bound, the seven dependent façade lifts won't compile.
+    #[cfg(feature = "tokio")]
+    fn assert_producer_api_bound<T: crate::ProducerApi>() {}
+
+    #[cfg(feature = "tokio")]
+    fn assert_consumer_api_bound<T: crate::ConsumerApi>() {}
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn producer_api_is_implemented_by_tokio_producer() {
+        assert_producer_api_bound::<magnetar_runtime_tokio::Producer>();
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn consumer_api_is_implemented_by_tokio_consumer() {
+        assert_consumer_api_bound::<magnetar_runtime_tokio::Consumer>();
+    }
+
+    #[cfg(all(feature = "tokio", feature = "moonpool"))]
+    #[test]
+    fn producer_api_is_implemented_by_moonpool_producer() {
+        // Use `TokioProviders` to materialise the generic `Producer<P>`.
+        assert_producer_api_bound::<
+            magnetar_runtime_moonpool::Producer<moonpool_core::TokioProviders>,
+        >();
+    }
+
+    #[cfg(all(feature = "tokio", feature = "moonpool"))]
+    #[test]
+    fn consumer_api_is_implemented_by_moonpool_consumer() {
+        assert_consumer_api_bound::<
+            magnetar_runtime_moonpool::Consumer<moonpool_core::TokioProviders>,
+        >();
     }
 }

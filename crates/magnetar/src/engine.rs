@@ -233,6 +233,287 @@ impl TransactionApi for magnetar_runtime_tokio::Client {
     }
 }
 
+// `OutgoingMessage` + `IncomingMessage` currently live in
+// `client.rs` (tokio-gated). Until those move to a feature-
+// independent module, the `ProducerApi` / `ConsumerApi` traits also
+// gate on the same set of features. Phase 4 of the façade lift will
+// move the message types out of `client.rs` to drop this gate.
+
+/// Pulsar producer wire surface — implemented by each runtime on its
+/// `Producer` type. Foundational for the seven dependent façade lifts
+/// (`Reader`, `TypedSchemas`, `MultiTopicsConsumer`, `PartitionedProducer`,
+/// `PartitionedConsumer`, `PatternConsumer`, `TableView`) per ADR-0026 §D1.
+///
+/// **Sans-io.** Async methods return `Pin<Box<dyn Future + Send + '_>>`;
+/// no tokio / mio / socket types appear in the surface. Each impl drives
+/// the [`magnetar_proto::Connection`] state machine and wakes its
+/// runtime-specific driver.
+///
+/// The method set here is **wire-level**: `send` (the only wire-bound
+/// publish path), `flush` (drain pending), `is_closed`, `topic`, `name`,
+/// `last_sequence_id`. Higher-level helpers (`send_bytes`, `stats`,
+/// `batch_len`, `pending_count`, `get_schema`, `access_mode`) stay
+/// engine-specific until a façade caller needs them — extending this
+/// trait is a non-breaking change so the additive growth pattern is
+/// safe.
+#[cfg(feature = "tokio")]
+pub trait ProducerApi: 'static + Send + Sync {
+    /// Per-runtime client error type used by the wire calls.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Send a message. Resolves with the broker-assigned
+    /// [`magnetar_proto::MessageId`].
+    fn send(
+        &self,
+        msg: crate::OutgoingMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>;
+
+    /// Wait for every previously-queued send to be acknowledged or
+    /// fail. Mirrors Java `Producer#flush()`.
+    fn flush(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// `true` once the producer has entered a terminal state.
+    fn is_closed(&self) -> bool;
+
+    /// Topic this producer publishes to.
+    fn topic(&self) -> String;
+
+    /// Producer name advertised to the broker (broker-assigned if
+    /// the user didn't set one).
+    fn name(&self) -> String;
+
+    /// Latest sequence id the producer assigned. Mirrors Java
+    /// `Producer#getLastSequenceId`.
+    fn last_sequence_id(&self) -> i64;
+}
+
+/// Pulsar consumer wire surface — implemented by each runtime on its
+/// `Consumer` type. Foundational alongside [`ProducerApi`] per
+/// ADR-0026 §D1.
+///
+/// Same sans-io contract as [`ProducerApi`]. The method set covers
+/// the wire-level subscription lifecycle: `receive`, the ack family
+/// (`ack`, `ack_cumulative`, `ack_with_txn`, `ack_cumulative_with_txn`),
+/// `negative_ack`, plus topic / subscription / `is_closed` accessors.
+/// Helpers that touch tokio-specific futures (`ReceiveFut`,
+/// `receive_with_timeout`), the broader ack family
+/// (`ack_with_txn`, `ack_batch`, `ack_cumulative_with_txn`,
+/// `ack_with_properties`), `flow`, `redeliver_unacked`,
+/// `last_message_id`, `has_message_after`, `seek_*`, and `close` stay
+/// runtime-specific in Phase 1; the trait is additive so subsequent
+/// façade lifts grow it as they need the surface.
+#[cfg(feature = "tokio")]
+pub trait ConsumerApi: 'static + Send + Sync {
+    /// Per-runtime client error type used by the wire calls.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Receive the next message. Resolves once the broker has
+    /// delivered an entry.
+    fn receive(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::IncomingMessage, Self::Error>> + Send + '_>>;
+
+    /// Acknowledge `message_id` individually. Mirrors Java
+    /// `Consumer#acknowledge(MessageId)`.
+    fn ack(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Acknowledge all messages up to and including `message_id`.
+    /// Mirrors Java `Consumer#acknowledgeCumulative(MessageId)`.
+    fn ack_cumulative(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Negatively acknowledge `message_id`. Triggers a redelivery
+    /// after the configured `nackRedeliveryBackoff`. Mirrors Java
+    /// `Consumer#negativeAcknowledge`.
+    fn negative_ack(&self, message_id: magnetar_proto::MessageId);
+
+    /// Topic this consumer is subscribed to.
+    fn topic(&self) -> String;
+
+    /// Subscription name this consumer holds.
+    fn subscription(&self) -> String;
+
+    /// `true` once the consumer has entered a terminal state.
+    fn is_closed(&self) -> bool;
+}
+
+#[cfg(feature = "tokio")]
+impl ProducerApi for magnetar_runtime_tokio::Producer {
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn send(
+        &self,
+        msg: crate::OutgoingMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_tokio::Producer::send(self, msg.into()))
+    }
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Producer::flush(self))
+    }
+
+    fn is_closed(&self) -> bool {
+        magnetar_runtime_tokio::Producer::is_closed(self)
+    }
+
+    fn topic(&self) -> String {
+        magnetar_runtime_tokio::Producer::topic(self)
+    }
+
+    fn name(&self) -> String {
+        magnetar_runtime_tokio::Producer::name(self)
+    }
+
+    fn last_sequence_id(&self) -> i64 {
+        magnetar_runtime_tokio::Producer::last_sequence_id(self)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl ConsumerApi for magnetar_runtime_tokio::Consumer {
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn receive(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::IncomingMessage, Self::Error>> + Send + '_>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_tokio::Consumer::receive(self)
+                .await
+                .map(crate::IncomingMessage::from)
+        })
+    }
+
+    fn ack(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::ack(self, message_id))
+    }
+
+    fn ack_cumulative(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::ack_cumulative(
+            self, message_id,
+        ))
+    }
+
+    fn negative_ack(&self, message_id: magnetar_proto::MessageId) {
+        magnetar_runtime_tokio::Consumer::negative_ack(self, message_id);
+    }
+
+    fn topic(&self) -> String {
+        magnetar_runtime_tokio::Consumer::topic(self)
+    }
+
+    fn subscription(&self) -> String {
+        magnetar_runtime_tokio::Consumer::subscription(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::is_closed(self)
+    }
+}
+
+#[cfg(all(feature = "tokio", feature = "moonpool"))]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
+    for magnetar_runtime_moonpool::Producer<P>
+{
+    type Error = magnetar_runtime_moonpool::ClientError;
+
+    fn send(
+        &self,
+        msg: crate::OutgoingMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>
+    {
+        // The moonpool runtime's `Producer::send` returns its own
+        // `SendFut`; we drive it through `.await` and return a boxed
+        // future to keep the trait signature engine-agnostic. The
+        // moonpool `OutgoingMessage` is a re-export of the same proto
+        // type the façade carries.
+        let mp_msg: magnetar_proto::producer::OutgoingMessage = msg.into();
+        Box::pin(async move { magnetar_runtime_moonpool::Producer::send(self, mp_msg).await })
+    }
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Producer::flush(self))
+    }
+
+    fn is_closed(&self) -> bool {
+        magnetar_runtime_moonpool::Producer::is_closed(self)
+    }
+
+    fn topic(&self) -> String {
+        magnetar_runtime_moonpool::Producer::topic(self)
+    }
+
+    fn name(&self) -> String {
+        magnetar_runtime_moonpool::Producer::name(self)
+    }
+
+    fn last_sequence_id(&self) -> i64 {
+        magnetar_runtime_moonpool::Producer::last_sequence_id(self)
+    }
+}
+
+#[cfg(all(feature = "tokio", feature = "moonpool"))]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
+    for magnetar_runtime_moonpool::Consumer<P>
+{
+    type Error = magnetar_runtime_moonpool::ClientError;
+
+    fn receive(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::IncomingMessage, Self::Error>> + Send + '_>>
+    {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::Consumer::receive(self)
+                .await
+                .map(crate::IncomingMessage::from)
+        })
+    }
+
+    fn ack(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::ack(self, message_id))
+    }
+
+    fn ack_cumulative(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::ack_cumulative(
+            self, message_id,
+        ))
+    }
+
+    fn negative_ack(&self, message_id: magnetar_proto::MessageId) {
+        magnetar_runtime_moonpool::Consumer::negative_ack(self, message_id);
+    }
+
+    fn topic(&self) -> String {
+        magnetar_runtime_moonpool::Consumer::topic(self)
+    }
+
+    fn subscription(&self) -> String {
+        magnetar_runtime_moonpool::Consumer::subscription(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::is_closed(self)
+    }
+}
+
 #[cfg(feature = "moonpool")]
 impl TransactionApi for MoonpoolClientState {
     type Error = magnetar_runtime_moonpool::ClientError;
