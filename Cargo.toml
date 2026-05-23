@@ -87,6 +87,12 @@ aws-lc-rs  = { version = "1", default-features = false, features = ["aws-lc-sys"
 
 # moonpool engine
 moonpool-core = "=0.6"
+# moonpool-sim provides the deterministic SimProviders used by the
+# differential harness chaos pack (ADR-0024). Pinned to the same minor
+# as moonpool-core so the two crates stay version-compatible. Vendored
+# as a workspace dep but opted into per-crate (currently only the
+# differential harness needs it).
+moonpool-sim = "=0.6"
 
 # Admin REST + CLI
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
