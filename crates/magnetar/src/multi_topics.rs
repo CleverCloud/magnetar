@@ -35,20 +35,28 @@ use tokio::task::JoinHandle;
 use crate::PulsarClient;
 use crate::client::{PulsarError, SeekTarget};
 
-/// Multi-topics consumer. Each contained [`Consumer`] subscribes to one topic; `receive()`
+/// Multi-topics consumer. Each contained consumer subscribes to one topic; `receive()`
 /// returns the next message across the whole set.
+///
+/// Phantom-generic over `C: ConsumerApi` per ADR-0026 §D1 — the
+/// type parameter is present (defaulting to
+/// `magnetar_runtime_tokio::Consumer`) but the inherent impl is
+/// currently bound to the default. Full lift requires lifting
+/// `ConsumerBuilder` itself (which `add_topic` uses to subscribe
+/// new children), which is a separate sub-PR. See
+/// `docs/follow-ups.md`.
 #[derive(Debug)]
-pub struct MultiTopicsConsumer {
-    inner: Arc<Inner>,
+pub struct MultiTopicsConsumer<C: crate::ConsumerApi = Consumer> {
+    inner: Arc<Inner<C>>,
 }
 
 #[derive(Debug)]
-struct Inner {
+struct Inner<C: crate::ConsumerApi = Consumer> {
     /// Active consumer set. Held under a mutex so [`MultiTopicsConsumer::add_topic`] /
     /// [`MultiTopicsConsumer::remove_topic`] can mutate the set without rebuilding the
     /// consumer. Every other method snapshots the Vec under the lock and releases before
     /// awaiting — the mutex is never held across `.await`.
-    consumers: Mutex<Vec<NamedConsumer>>,
+    consumers: Mutex<Vec<NamedConsumer<C>>>,
     /// Round-robin cursor used by `receive` to record the index of the topic that produced
     /// the last message. Wrapped in a Mutex because [`MultiTopicsConsumer`] is `&self` —
     /// cloning the handle should not require mutable access.
@@ -229,9 +237,9 @@ impl ConsumerTemplate {
 }
 
 #[derive(Debug, Clone)]
-struct NamedConsumer {
+struct NamedConsumer<C: crate::ConsumerApi = Consumer> {
     topic: String,
-    consumer: Consumer,
+    consumer: C,
 }
 
 /// A message yielded by [`MultiTopicsConsumer::receive`], carrying the topic it came from.
