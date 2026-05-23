@@ -1377,8 +1377,8 @@ impl<E: crate::Engine> std::fmt::Debug for ProducerBuilder<'_, E> {
     }
 }
 
-impl<'a> ProducerBuilder<'a> {
-    fn new(client: &'a PulsarClient, topic: String) -> Self {
+impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
+    fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
         let req = CreateProducerRequest {
             topic,
             ..CreateProducerRequest::default()
@@ -1477,9 +1477,32 @@ impl<'a> ProducerBuilder<'a> {
     }
 
     /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
-    /// `send()` to wrap the (post-compression) payload. Pass an
-    /// [`Arc`](std::sync::Arc) of e.g. `magnetar::MessageCryptoBridge` from the
-    /// `encryption` feature.
+    /// Open the producer via the engine-generic
+    /// [`crate::CreateProducerApi`] trait. Returns the engine's
+    /// concrete `Producer` type. The encryptor (PIP-4) is **not**
+    /// consulted on this path — tokio-engine callers that need
+    /// encryption use [`Self::create_with_encryption`] on the tokio
+    /// specialisation.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn create(
+        self,
+    ) -> Result<<E::ClientState as crate::CreateProducerApi>::Producer, PulsarError>
+    where
+        E::ClientState: crate::CreateProducerApi,
+    {
+        crate::CreateProducerApi::open_producer(&self.client.inner, self.req)
+            .await
+            .map_err(|err| PulsarError::Other(format!("open_producer: {err}")))
+    }
+}
+
+/// Tokio-engine-specific `ProducerBuilder` methods that depend on the
+/// tokio `MessageEncryptor` extension (PIP-4 not yet wired on moonpool).
+impl ProducerBuilder<'_, crate::TokioEngine> {
+    /// Set the PIP-4 encryptor. The encryptor is consulted on every
+    /// `send()` to wrap the (post-compression) payload.
     #[must_use]
     pub fn encryption(
         mut self,
@@ -1489,8 +1512,13 @@ impl<'a> ProducerBuilder<'a> {
         self
     }
 
-    /// Open the producer.
-    pub async fn create(self) -> Result<magnetar_runtime_tokio::Producer> {
+    /// Open the producer honoring the configured encryptor (PIP-4).
+    /// Tokio-engine-only — use [`Self::create`] for the engine-generic
+    /// path that ignores the encryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Client`] on broker rejection or wire failure.
+    pub async fn create_with_encryption(self) -> Result<magnetar_runtime_tokio::Producer> {
         Ok(self
             .client
             .inner
@@ -1526,8 +1554,8 @@ impl<E: crate::Engine> std::fmt::Debug for ConsumerBuilder<'_, E> {
     }
 }
 
-impl<'a> ConsumerBuilder<'a> {
-    fn new(client: &'a PulsarClient, topic: String) -> Self {
+impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
+    fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
         let req = SubscribeRequest {
             topic,
             ..SubscribeRequest::default()
@@ -1579,17 +1607,6 @@ impl<'a> ConsumerBuilder<'a> {
     #[must_use]
     pub fn initial_position(mut self, position: pb::command_subscribe::InitialPosition) -> Self {
         self.req.initial_position = position;
-        self
-    }
-
-    /// Configure PIP-4 end-to-end decryption. The decryptor is consulted on every received
-    /// message whose `MessageMetadata.encryption_keys` is non-empty.
-    #[must_use]
-    pub fn encryption(
-        mut self,
-        decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
-    ) -> Self {
-        self.decryptor = Some(decryptor);
         self
     }
 
@@ -1766,8 +1783,47 @@ impl<'a> ConsumerBuilder<'a> {
         self
     }
 
-    /// Subscribe.
-    pub async fn subscribe(self) -> Result<magnetar_runtime_tokio::Consumer> {
+    /// Subscribe via the engine-generic [`crate::SubscribeApi`] trait.
+    /// Returns the engine's concrete `Consumer` type. The decryptor
+    /// (PIP-4) is **not** consulted on this path — for tokio-engine
+    /// callers that need decryption, use the tokio-specialised
+    /// `subscribe_with_decryption` method (`impl ConsumerBuilder<TokioEngine>`).
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn subscribe(
+        self,
+    ) -> Result<<E::ClientState as crate::SubscribeApi>::Consumer, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+    {
+        crate::SubscribeApi::subscribe(&self.client.inner, self.req)
+            .await
+            .map_err(|err| PulsarError::Other(format!("subscribe: {err}")))
+    }
+}
+
+/// Tokio-engine-specific `ConsumerBuilder` methods that depend on the
+/// tokio `MessageDecryptor` extension (PIP-4 not yet wired on moonpool).
+impl ConsumerBuilder<'_, crate::TokioEngine> {
+    /// Configure PIP-4 end-to-end decryption. The decryptor is consulted on every received
+    /// message whose `MessageMetadata.encryption_keys` is non-empty.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.decryptor = Some(decryptor);
+        self
+    }
+
+    /// Subscribe with the configured decryptor (PIP-4). Tokio-engine-only.
+    /// Use [`Self::subscribe`] for the engine-generic path that ignores
+    /// the decryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Client`] on broker rejection or wire failure.
+    pub async fn subscribe_with_decryption(self) -> Result<magnetar_runtime_tokio::Consumer> {
         Ok(self
             .client
             .inner
@@ -1798,8 +1854,8 @@ impl<E: crate::Engine> std::fmt::Debug for ReaderBuilder<'_, E> {
     }
 }
 
-impl<'a> ReaderBuilder<'a> {
-    fn new(client: &'a PulsarClient, topic: String) -> Self {
+impl<'a, E: crate::Engine> ReaderBuilder<'a, E> {
+    fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
         let subscription = format!("reader-{}", uuid::Uuid::new_v4().simple());
         let inner = ConsumerBuilder::new(client, topic)
             .subscription(subscription)
@@ -1855,17 +1911,6 @@ impl<'a> ReaderBuilder<'a> {
         self
     }
 
-    /// Mirrors Java `ReaderBuilder#cryptoKeyReader` — supplies a PIP-4 decryptor for the
-    /// reader's underlying subscription.
-    #[must_use]
-    pub fn encryption(
-        mut self,
-        decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
-    ) -> Self {
-        self.inner = self.inner.encryption(decryptor);
-        self
-    }
-
     /// Mirrors `ConsumerBuilder::property`. The reader's underlying consumer carries the
     /// (key, value) pair on its `CommandSubscribe.metadata`.
     #[must_use]
@@ -1882,13 +1927,41 @@ impl<'a> ReaderBuilder<'a> {
         self
     }
 
-    /// Create the reader.
-    pub async fn create(self) -> Result<Reader> {
+    /// Create the reader via the engine-generic
+    /// [`crate::SubscribeApi`] dispatch path. Returns
+    /// `Reader<<E::ClientState as SubscribeApi>::Consumer>` —
+    /// resolves to `Reader<magnetar_runtime_tokio::Consumer>` (the
+    /// default `Reader<>` alias) under the default
+    /// `E = TokioEngine`.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] on broker rejection or wire failure.
+    pub async fn create(
+        self,
+    ) -> Result<Reader<<E::ClientState as crate::SubscribeApi>::Consumer>, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+    {
         let consumer = self.inner.subscribe().await?;
         Ok(Reader {
             consumer,
             last_received: parking_lot::Mutex::new(None),
         })
+    }
+}
+
+/// Tokio-engine-specific `ReaderBuilder` methods that depend on the
+/// tokio `MessageDecryptor` extension (PIP-4).
+impl ReaderBuilder<'_, crate::TokioEngine> {
+    /// Mirrors Java `ReaderBuilder#cryptoKeyReader` — supplies a PIP-4 decryptor for the
+    /// reader's underlying subscription.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.inner = self.inner.encryption(decryptor);
+        self
     }
 }
 

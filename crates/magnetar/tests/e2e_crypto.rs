@@ -199,7 +199,7 @@ async fn e2e_crypto_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let producer = client
         .producer(&topic)
         .encryption(bridge.clone() as Arc<dyn MessageEncryptor>)
-        .create()
+        .create_with_encryption()
         .await?;
     let payload = b"hello PIP-4 world".to_vec();
     producer
@@ -212,7 +212,7 @@ async fn e2e_crypto_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         .subscription("magnetar-e2e-crypto-rt")
         .subscription_type(SubType::Exclusive)
         .encryption(bridge.clone() as Arc<dyn MessageDecryptor>)
-        .subscribe()
+        .subscribe_with_decryption()
         .await?;
 
     let msg = tokio::time::timeout(Duration::from_secs(30), consumer.receive()).await??;
@@ -243,7 +243,7 @@ async fn e2e_crypto_failure_action_fail() -> Result<(), Box<dyn std::error::Erro
     let producer = client
         .producer(&topic)
         .encryption(prod_bridge as Arc<dyn MessageEncryptor>)
-        .create()
+        .create_with_encryption()
         .await?;
     producer
         .send(OutgoingMessage::with_payload(b"opaque-payload".to_vec()).into())
@@ -256,7 +256,7 @@ async fn e2e_crypto_failure_action_fail() -> Result<(), Box<dyn std::error::Erro
         .subscription_type(SubType::Exclusive)
         .encryption(Arc::new(AlwaysFailDecryptor) as Arc<dyn MessageDecryptor>)
         .crypto_failure_action(CryptoFailureAction::Fail)
-        .subscribe()
+        .subscribe_with_decryption()
         .await?;
 
     let result = tokio::time::timeout(Duration::from_secs(30), consumer.receive()).await?;
@@ -292,7 +292,7 @@ async fn e2e_crypto_failure_action_discard() -> Result<(), Box<dyn std::error::E
         .subscription_type(SubType::Exclusive)
         .encryption(Arc::new(AlwaysFailDecryptor) as Arc<dyn MessageDecryptor>)
         .crypto_failure_action(CryptoFailureAction::Discard)
-        .subscribe()
+        .subscribe_with_decryption()
         .await?;
 
     // First: send an encrypted message that the consumer will fail to decrypt
@@ -300,7 +300,7 @@ async fn e2e_crypto_failure_action_discard() -> Result<(), Box<dyn std::error::E
     let enc_producer = client
         .producer(&topic)
         .encryption(prod_bridge as Arc<dyn MessageEncryptor>)
-        .create()
+        .create_with_encryption()
         .await?;
     enc_producer
         .send(OutgoingMessage::with_payload(b"undecryptable".to_vec()).into())
@@ -352,7 +352,7 @@ async fn e2e_crypto_failure_action_consume() -> Result<(), Box<dyn std::error::E
     let producer = client
         .producer(&topic)
         .encryption(prod_bridge as Arc<dyn MessageEncryptor>)
-        .create()
+        .create_with_encryption()
         .await?;
     let plaintext = b"distinctive-plaintext-payload-XYZ".to_vec();
     producer
@@ -366,7 +366,7 @@ async fn e2e_crypto_failure_action_consume() -> Result<(), Box<dyn std::error::E
         .subscription_type(SubType::Exclusive)
         .encryption(Arc::new(AlwaysFailDecryptor) as Arc<dyn MessageDecryptor>)
         .crypto_failure_action(CryptoFailureAction::Consume)
-        .subscribe()
+        .subscribe_with_decryption()
         .await?;
 
     let msg = tokio::time::timeout(Duration::from_secs(30), consumer.receive()).await??;
@@ -415,7 +415,7 @@ async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
         .chunking(true)
         .batching(0, 0)
         .encryption(bridge.clone() as Arc<dyn MessageEncryptor>)
-        .create()
+        .create_with_encryption()
         .await?;
 
     let consumer = client
@@ -423,7 +423,7 @@ async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
         .subscription("magnetar-e2e-crypto-chunk")
         .subscription_type(SubType::Exclusive)
         .encryption(bridge.clone() as Arc<dyn MessageDecryptor>)
-        .subscribe()
+        .subscribe_with_decryption()
         .await?;
 
     // ~6 MiB so the producer is forced to emit at least two chunks against

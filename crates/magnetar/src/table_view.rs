@@ -528,7 +528,12 @@ impl<'a> TableViewBuilder<'a> {
         if let Some(decryptor) = self.decryptor {
             builder = builder.encryption(decryptor);
         }
-        let consumer = builder.subscribe().await?;
+        // Use the tokio-specialised `subscribe_with_decryption` path
+        // to honor the decryptor configured above. Engine-generic
+        // callers (post-Builder-lift) use `.subscribe()` which
+        // dispatches through `SubscribeApi` and ignores the
+        // decryptor field (PIP-4 not yet wired on moonpool).
+        let consumer = builder.subscribe_with_decryption().await?;
 
         let state: Arc<RwLock<HashMap<String, Bytes>>> = Arc::new(RwLock::new(HashMap::new()));
         let state_drain = state.clone();

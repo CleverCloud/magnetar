@@ -458,7 +458,12 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
         if let Some(e) = self.encryptor {
             builder = builder.encryption(e);
         }
-        let inner = builder.create().await?;
+        // Use the tokio-specialised `create_with_encryption` path to
+        // honor the encryptor configured above. Engine-generic
+        // callers (post-Builder-lift) use `.create()` which dispatches
+        // through `CreateProducerApi` and ignores the encryptor field
+        // (PIP-4 not yet wired on moonpool).
+        let inner = builder.create_with_encryption().await?;
         Ok(TypedProducer {
             inner,
             schema: self.schema,
