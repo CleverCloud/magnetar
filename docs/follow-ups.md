@@ -7,59 +7,200 @@ For the public-facing parity status, see
 [`parity-status.md`](parity-status.md) and the
 [parity matrix in the README](../README.md#java-client-parity-matrix).
 
-## Moonpool engine
+This file is the **single source of truth** for what is intentionally
+deferred or blocked. Items with a `/goal …` block at the bottom of
+their entry are ready to be picked up by an agent team — copy the
+prompt verbatim into a fresh session.
+
+---
+
+## Pending design decisions (require Florentin's input before work proceeds)
+
+These items block follow-on implementation work. None of them can be
+unilaterally resolved by an agent — they need a deliberate call.
+
+### D1 — Engine trait extension (ADR-0025)
+
+**Decision needed.** What does `magnetar::Engine` grow to support the
+façade lift to `PulsarClient<MoonpoolEngine<P>>`?
+
+Three viable shapes:
+
+1. **Minimal.** Add `Engine::TaskHandle`, `Engine::Interval`,
+   `Engine::spawn`, `Engine::abort_task`, `Engine::new_interval`,
+   `Engine::interval_tick`. Six new methods. Lets the façade move
+   `tokio::spawn` / `tokio::time::interval` calls behind the trait so
+   `PartitionedProducer::health_loop`, `TableView::drain_task`,
+   `MultiTopicsConsumer::auto_update` compile against either engine.
+   Easiest to land, but the façade still needs `runtime_client()` to
+   return engine-specific types — meaning `Reader`, `Transaction`,
+   `TypedSchemas`, partitioned/multi-topics surfaces still hold
+   `magnetar_runtime_tokio::Consumer` directly.
+
+2. **Medium.** Minimal + `Engine::Producer`, `Engine::Consumer`
+   associated types. Both façade surfaces now hold `E::Producer<T>`
+   / `E::Consumer<T>` rather than tokio-specific types. The trade-off
+   is that the engine trait grows generic associated types (GAT-heavy
+   for typed schemas), and every façade method that touches producers
+   /consumers gets a `where E::Producer: …` bound. Loses some inference
+   ergonomics but each surface lift becomes a near-mechanical port.
+
+3. **Maximal.** Medium + per-surface associated types
+   (`E::PartitionedProducer`, `E::MultiTopicsConsumer`,
+   `E::PatternConsumer`, `E::Reader`, `E::TableView`,
+   `E::Transaction`, `E::TypedProducer`, `E::TypedConsumer`). Façade
+   becomes a thin re-export shell. Adds eight more associated types
+   to the engine trait; every engine implementor (tokio, moonpool,
+   any future engine) must produce the full surface set. Lowest
+   façade complexity, highest engine-impl ceiling.
+
+**Why this matters.** The 8-surface façade lift (Transaction →
+Reader → TypedSchemas → MultiTopicsConsumer → PartitionedProducer →
+PartitionedConsumer → PatternConsumer → TableView) is ~6.4k LOC plus
+matching test counts on each side per ADR-0024. The Engine trait
+extension shape determines whether every surface lift is a 100-LOC
+mechanical port (option 3) or a 500-LOC feature port (option 1). Pick
+once, ship the surface lifts sequentially after.
+
+**Rationale guide.**
+- Option 1 minimises trait surface but pushes complexity into each
+  façade method. Good if we expect a third engine (`magnetar-runtime-
+  glommio`?) and want to keep its impl small.
+- Option 2 is the JDK-style "interface segregation" middle ground;
+  each surface stays runtime-agnostic without forcing every engine to
+  reimplement table-view drain semantics.
+- Option 3 mirrors the Java client's `ClientImpl` shape exactly. Best
+  if magnetar's façade goal is "byte-identical user experience to the
+  Java client". Worst if we want to keep engine implementations
+  lightweight.
+
+**Recommendation.** Option 2 — associated `Producer<T>` / `Consumer<T>`
+types plus spawn/interval. It collapses every surface lift to a
+mechanical port while keeping the engine trait small enough that a
+follow-on engine doesn't need to fork the surface stack.
+
+```text
+/goal land ADR-0025 (Engine trait extension, option 2: spawn+interval+Producer+Consumer associated types) and the corresponding TokioEngine + MoonpoolEngine impls. Ship with 4 test layers per ADR-0024 (proto unit, tokio integration, moonpool integration, differential equivalence) plus the new ADR file and specs/README.md index row. No façade surface lift in this PR — that lands as a follow-up train.
+```
+
+---
+
+### D2 — Vendor `moonpool-sim` into the workspace
+
+**Decision needed.** Approve adding `moonpool-sim = "=0.6"` to
+`Cargo.toml`'s `[workspace.dependencies]` and the `deny.toml` allow-list,
+matching the existing `moonpool-core = "=0.6"` pin.
+
+**Why this matters.** Per ADR-0024 the chaos pack must run under
+deterministic seeds. Today `magnetar-differential`'s moonpool runner
+uses `moonpool_core::TokioProviders`, which inherits tokio's
+non-deterministic scheduling. Swapping to `SimProviders` unlocks
+reproducible chaos sweeps and is what closes the "Moonpool runner
+LocalSet pump" entry below: the simulator's deterministic scheduler
+drives both sides without `spawn_local`.
+
+**Rationale guide.** `moonpool-sim` is the deterministic-scheduler
+companion to `moonpool-core`, written by the same upstream. Adding
+it is one line plus the deny.toml entry; no transitive surprise (it
+pulls in the same `rand` family already in the lock).
+
+```text
+/goal vendor moonpool-sim 0.6 into the workspace: add to Cargo.toml [workspace.dependencies], deny.toml allow-list, and swap TokioProviders for SimProviders in crates/magnetar-differential/src/runner_moonpool.rs. Then enable the 32-seed sweep in the differential harness CI job. All four test layers per ADR-0024; no behaviour change beyond determinism.
+```
+
+---
+
+### D3 — SASL/Athenz scope for v0.1.0
+
+**Decision needed.** Ship the auth crates as **pre-alpha stubs** in
+v0.1.0 (current state), or invest in `libgssapi` (SASL/Kerberos) +
+ZTS-token / JWT signing (Athenz) to make them functional?
+
+**Why this matters.** `magnetar-auth-sasl` only implements
+`SaslPlain` (RFC 4616); `SaslKerberos` returns
+`AuthError::Unsupported`. `magnetar-auth-athenz` ships
+`AthenzProvider::with_role_token` (pre-fetched token) but
+`AthenzProvider::new` (ZTS round-trip) returns `Unsupported`. Full
+GSSAPI integration is ~600 LOC + cross-platform abstraction; full
+ZTS is ~400 LOC + RSA signing dep.
+
+**Rationale guide.**
+- v0.1.0 parity bar per ADR-0010 is "full Java parity on tokio". The
+  Java client treats SASL/Athenz as plug-in auth providers; shipping
+  the partial surfaces (PLAIN + pre-fetched token) is honest for
+  non-Kerberos / non-Athenz environments.
+- Full GSSAPI requires `libgssapi` ≈ 0.12.x (MIT, moderate maintenance,
+  non-trivial C FFI). Cross-platform support (Linux libkrb5, macOS
+  Heimdal, Windows SSPI) would need its own abstraction layer.
+- Full ZTS needs `ring` (already implicit via rustls) for RSA-SHA256
+  signing plus optional `jsonwebtoken` (or hand-coded JWT plumbing).
+
+**Recommendation.** Pre-alpha stubs for v0.1.0, full impl in v0.2.0
+behind a dedicated PR (the scoping report at the bottom of this file
+covers SCRAM-SHA-256 as a v0.2.0 stepping stone before Kerberos —
+medium complexity, no GSSAPI dep).
+
+```text
+/goal land SASL/Kerberos and Athenz/ZTS in v0.2.0. Phase 1: SCRAM-SHA-256 (~200 LOC, no GSSAPI). Phase 2: full GSSAPI via libgssapi (propose the dep first, await approval). Phase 3: Athenz ZTS round-trip + token refresh via wiremock-backed tests. All four test layers per ADR-0024; e2e against an unauthenticated broker with a mock auth server.
+```
+
+---
+
+### D4 — Vendored-proto bump cadence
+
+**Decision needed.** When do we refresh
+`crates/magnetar-proto/proto/PulsarApi.proto` from upstream?
+
+**Why this matters.** The current pin is `apache/pulsar@7735851`
+(2026-05-04). Several PIPs (PIP-415 was REST-only, but PIP-460 / 466 /
+180 / 33 — see "Out of scope for v0.1.0" below — will require proto
+bumps if they're brought in scope). `cargo run -p xtask -- vendor-proto`
+is not yet implemented (per `xtask/src/main.rs:108`); the refresh has
+to be manual today.
+
+**Rationale guide.** Bumping the vendored proto can introduce wire-
+breaking changes; we keep it pinned to a known-good commit. The
+`codegen --check` xtask gate catches drift if the proto changes
+without regenerating `magnetar-proto/src/pb/`.
+
+```text
+/goal implement xtask vendor-proto: clone apache/pulsar at --rev <SHA>, copy PulsarApi.proto + PulsarMarkers.proto into crates/magnetar-proto/proto/, run codegen, commit. Then schedule the next proto bump for the v0.2.0 cycle once PIP-460/466 stabilise upstream.
+```
+
+---
+
+## Moonpool engine — implementation backlog
 
 ### Façade surface bound to `PulsarClient<MoonpoolEngine<P>>`
 
 **Status.** Partitioned producer / partitioned consumer /
 MultiTopicsConsumer / PatternConsumer / Reader / TableView /
 transactions / typed schemas do not compile against the moonpool
-engine.
+engine. Each surface needs:
 
-**Unblock.** Lift each surface from
-[`crates/magnetar/src/*`](../crates/magnetar/src) into an engine-agnostic
-shape, or duplicate the façade for the moonpool engine. The constraint
-is keeping the user-visible API identical between
-`PulsarClient<TokioEngine>` and `PulsarClient<MoonpoolEngine<P>>`.
+1. The corresponding moonpool `Client` method ported from
+   `magnetar-runtime-tokio` (`new_txn`, `add_partition_to_txn`,
+   `end_txn`, partitioned-metadata lookup, etc.). ~150–300 LOC per
+   surface.
+2. The façade method made generic over `Engine`, dropping its
+   `impl PulsarClient<TokioEngine>` block.
+3. All four test layers per ADR-0024 + e2e where applicable.
+
+**Blocked on** [D1 — Engine trait extension](#d1--engine-trait-extension-adr-0025).
+Pick the trait shape first, then sequence the surface ports.
 
 See [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
 §Consequences.
 
-### Property-based seed sweeps in CI
+```text
+/goal once ADR-0025 lands, lift the 8 façade surfaces to PulsarClient<MoonpoolEngine<P>> in this order: Transaction → Reader → TypedSchemas → MultiTopicsConsumer → PartitionedProducer → PartitionedConsumer → PatternConsumer → TableView. One PR per surface. Each PR ships all four test layers per ADR-0024, plus a docs/parity-status.md row flip.
+```
 
-**Status.** The CI `moonpool-sim` job runs the chaos pack with a
-single seed. Multi-seed scheduling is a manual loop today
-(see [`testing.md`](testing.md)).
-
-**Unblock.** Add a CI matrix axis on `MOONPOOL_SEED` (or move to
-`proptest` so seed sweeping happens inside the test binary). Decide
-the budget: ~32 seeds in PR mode, ~512 nightly.
-
-## Reconnect / supervision
-
-### Transparent in-flight publish replay across reconnect
-
-**Status.** The sans-io machinery is there
-(`Connection::reset`, epoch bump,
-`Connection::rebuild_producers` / `rebuild_consumers`). In-flight
-publishes that the broker had not yet acked surface
-`OpOutcome::SessionLost`; the caller must retry. Java's at-least-once
-guarantee is **not** met on the publish side until the engine
-re-queues the unconfirmed sends on the new session.
-
-**Unblock.** Implement Stage 3 follow-up: on reset, snapshot the
-in-flight publish slab keyed by `(producer_handle, sequence_id)`,
-re-issue the sends with the original sequence ids on the new session,
-and re-resolve the future when the new `CommandSendReceipt` arrives.
-Broker-side dedup (sequence-id ordering) handles the
-de-duplication.
-
-Once this lands on tokio, the moonpool engine inherits it for free
-(the supervised driver loop is shared logic).
+---
 
 ## Differential equivalence harness
 
-### Moonpool runner LocalSet pump
+### Moonpool runner `LocalSet` pump
 
 **Status.** The consumer-receive orphan-task wake path is closed at the
 sans-io layer:
@@ -86,91 +227,34 @@ task, which itself isn't being polled. The result is a ~30 s stall per
 keeps a 25 ms `Kicker` to pulse `driver_waker.notify_one()` and bridge
 the LocalSet pump gap.
 
-**Unblock.** Either (a) swap `TokioProviders` for `SimProviders` in the
-moonpool runner so the simulator's deterministic scheduler drives both
-sides without `spawn_local` (already tracked below), or (b) restructure
-the runner to spawn the driver via plain `tokio::spawn`, giving up
-moonpool-sim compatibility for the differential harness specifically.
+**Unblock.** Closed by [D2 — vendor moonpool-sim](#d2--vendor-moonpool-sim-into-the-workspace);
+the simulator's deterministic scheduler drives both sides without
+`spawn_local`. An alternative is restructuring the runner to spawn the
+driver via plain `tokio::spawn`, giving up moonpool-sim compatibility
+for the differential harness specifically.
 
 ### Expand the golden-trace catalog
 
-**Status.** The harness ships four golden traces. They cover the basic
-producer / consumer / seek / close shapes but not the seek-per-
-partition flow, the transactional ack paths, or the
+**Status.** The harness ships six golden traces (round-trip, batch,
+nack-redelivery, seek-to-start, many-publishes, lookup-before-open).
+Missing: seek-per-partition, transactional ack paths, the
 `cryptoFailureAction` matrix.
 
 **Unblock.** Each new trace extends the scripted broker as needed (the
 broker speaks a deliberately minimal subset of the wire protocol; new
-opcodes get added per trace).
+opcodes get added per trace). Seek-per-partition is the smallest
+(~120 LOC; broker tracks partition id, dispatches `Seek` by partition).
+Transactional ack needs `CommandEndTxn` + per-txn ack ledger in the
+broker (~180 LOC); blocked on [D1](#d1--engine-trait-extension-adr-0025)
+because the txn façade only compiles on tokio today.
+`cryptoFailureAction` is the largest (~240 LOC) and needs the crypto
+bridge ported to moonpool first.
 
-### Swap `TokioProviders` for `SimProviders` in the moonpool runner
+```text
+/goal land golden-trace seek-per-partition in magnetar-differential. Single commit. Extends ScriptedBroker.SessionState with per-partition message_id routing, adds Op::SeekPartition variant + Event::SeekedPartition, and a 3-step trace asserting tokio and moonpool agree on per-partition seek replay. All four test layers per ADR-0024.
+```
 
-**Status.** Both engine runners drive the same scripted broker; the
-moonpool runner uses `moonpool_core::TokioProviders` because
-`moonpool-sim` is not yet a workspace dependency. The harness already
-exercises the engine surface that diverges between tokio and moonpool
-(memory-limit plumbing, future shapes, generic bounds).
-
-**Unblock.** Vendor `moonpool-sim` (one-line addition to the workspace
-`Cargo.toml` allow-list, followed by an `Arc<SimProviders>` swap in
-[`runner_moonpool.rs`](../crates/magnetar-differential/src/runner_moonpool.rs)).
-
-## Auth
-
-### SASL (Kerberos)
-
-**Status.** `magnetar-auth-sasl` is scaffolded; the public API surface
-is in place but the GSSAPI plumbing is pre-alpha.
-
-**Unblock.** Full GSSAPI integration. Large scope — pulls in
-`libgssapi` and the SASL token exchange wire format.
-
-### Athenz
-
-**Status.** `magnetar-auth-athenz` is scaffolded; pre-alpha.
-
-**Unblock.** ZTS/ZMS token plumbing.
-
-## Schemas
-
-### `AutoProduceBytesSchema`
-
-**Status.** Trait surface only. The consumer-side equivalent
-(`AutoConsumeSchema`) is shipped end-to-end with broker-driven lookup.
-
-**Unblock.** Implement producer-side schema-on-first-send. Lower
-priority because `AutoConsumeSchema` covers the common Pulsar use
-case; producers usually know their schema at construction time.
-
-## Protocol
-
-### Moonpool engine: lookup before producer/consumer open
-
-**Status.** The tokio engine issues `CommandLookupTopic` before every
-`open_producer` / `subscribe` so the broker activates the topic's
-namespace bundle (Java parity). The moonpool engine still calls
-`Connection::create_producer` / `Connection::subscribe` directly. This
-is fine for deterministic-simulation tests that script the broker side
-explicitly, but diverges from Java + tokio engine behaviour.
-
-**Unblock.** Mirror
-[`crates/magnetar-runtime-tokio/src/client.rs`](../crates/magnetar-runtime-tokio/src/client.rs)'s
-`lookup_topic` step into the moonpool `Client::open_producer` /
-`subscribe`. Tests under
-[`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/)
-that drive the proto state machine synthetically will need to also
-feed a synthetic `CommandLookupTopicResponse` (the moonpool engine
-exposes `Client::lookup_topic` already; the change is wiring it into
-the open paths).
-
-### PIP-460 scalable topics, PIP-466 V5 surface, PIP-180 shadow topic, PIP-33 replicated subscriptions
-
-**Status.** Out of scope for v0.1.0. PIP-466 is "inspired by, not
-adopted verbatim" per
-[ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md).
-
-**Unblock.** Scoped for v0.2.0. PIP-460 carries an experimental tag in
-Apache Pulsar itself.
+---
 
 ## Testing + coverage
 
@@ -178,16 +262,105 @@ Apache Pulsar itself.
 
 **Status.** [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
 landed 2026-05-22 with both `cargo xtask check-sim-coverage` and
-`cargo xtask check-runtime-test-parity` enabled and hard-failing. On
-landing day the baseline is `tokio=65 moonpool=61` (gap of 4) and
-moonpool patch-coverage of pre-existing surface is unmeasured. Every
-merge to `main` that touches production code fails the validation
-chain until both gaps close — by design.
+`cargo xtask check-runtime-test-parity` enabled and hard-failing. The
+2026-05-22 baseline was `tokio=65 moonpool=61` (gap of 4); subsequent
+landings (memory-limit slab, AutoClusterFailover moonpool port, TLS
+chaos fixtures, race-stress coverage, lookup-before-open) brought it
+to `tokio=91 moonpool=91`. Pre-existing moonpool patch-coverage of
+older surface lines is unmeasured today.
 
 **Unblock.** Dedicated session driven by the local prompt at
 `tasks/coverage-closure-prompt.md` (gitignored). Phases:
-(1) bring tokio↔moonpool counts to 1:1 — easiest;
+(1) bring tokio↔moonpool counts to 1:1 — **done**;
 (2) close pre-existing moonpool coverage gaps file by file using the
 `cargo llvm-cov --html` report; (3) full validation chain green
 including 32-seed sweep. ADR-0021 still applies — failing tests are
 fixed, not `#[ignore]`-d.
+
+```text
+/goal close the pre-existing moonpool coverage gap. Generate cargo llvm-cov --html, identify the largest uncovered hunks in crates/magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,transport}.rs, add targeted tests to crates/magnetar-runtime-moonpool/tests/ until check-sim-coverage reports no uncovered lines against origin/main. Keep test parity 1:1; mirror each new moonpool test on the tokio side so the gate stays green.
+```
+
+---
+
+## Auth
+
+### SASL (Kerberos) and Athenz
+
+See [D3 — SASL/Athenz scope for v0.1.0](#d3--saslathenz-scope-for-v010).
+The current state in `magnetar-auth-sasl` and `magnetar-auth-athenz`
+is pre-alpha stubs; full implementations are deferred to v0.2.0 pending
+the decision in D3.
+
+---
+
+## Protocol
+
+### PIP-460 scalable topics, PIP-466 V5 surface, PIP-180 shadow topic, PIP-33 replicated subscriptions
+
+**Status.** Out of scope for v0.1.0 per
+[ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md). PIP-466 is
+"inspired by, not adopted verbatim" — magnetar's public API takes
+PIP-466's clean-room style (immutable builders, no
+`with*` setter chains) without binding to its exact wire surface.
+
+**Rationale per PIP.**
+
+- **PIP-460 — Scalable subscription model.** Upstream itself carries
+  the **experimental** tag (Apache Pulsar 4.0.x). The wire surface
+  (`CommandTopicMigrated` variants, subscription-state metadata,
+  bundle-split coordination) is still iterating. Binding magnetar to
+  the current draft would tie the client to a moving target. **Defer
+  to v0.2.0** once upstream stabilises the surface.
+
+- **PIP-466 — V5 client surface.** This is an **API-shape decision**,
+  not a wire-protocol change. Magnetar's user-facing API
+  (`PulsarClient::builder()`, `ProducerBuilder`,
+  `ConsumerBuilder`, immutable configs, `Option<…>` over
+  default-bearing setters) already follows PIP-466's spirit. Verbatim
+  adoption would mean re-naming method receivers to match Java's V5
+  conventions (e.g. `Producer.newMessageAsync()` → `producer.send_async()`
+  vs current `producer.send()`). **No wire change required**; decision
+  is whether to chase the rename for surface parity.
+
+- **PIP-180 — Shadow topic.** Adds a read-only follower topic that
+  mirrors a primary. The wire surface is small (one new
+  subscription mode + a metadata flag on `CommandSubscribe`), but
+  the consumer-side semantics (no-acks, no-seek, redelivery rules)
+  are subtle. **Defer to v0.2.0** as a low-priority feature — primary
+  use case is cross-region read fan-out, which Clever Cloud's roadmap
+  has not asked for.
+
+- **PIP-33 — Replicated subscriptions.** Subscription state is
+  replicated across geo-replicated topics so a consumer can resume on
+  a different cluster after failover. Wire-protocol additions:
+  per-snapshot markers in the data stream + `CommandReplicatedSubscription
+  Snapshot{Request,Response}`. Substantial broker-side coupling.
+  **Defer to v0.2.0**; magnetar's geo-replication story (via
+  `ServiceUrlProvider` + `AutoClusterFailover`) covers most of the
+  use case at the cluster level without subscription-state replication.
+
+**Unblock.** Scoped for v0.2.0. None of these PIPs blocks v0.1.0
+parity per [ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md);
+all four can land independently as v0.2.0 follow-ups.
+
+```text
+/goal scope PIP-460 / PIP-466 / PIP-180 / PIP-33 for v0.2.0. Per PIP, produce: (1) the wire-protocol delta against the current vendored PulsarApi.proto, (2) the magnetar-proto state-machine additions, (3) the runtime-tokio + runtime-moonpool surface ports, (4) the four-layer test plan per ADR-0024, (5) the e2e plan against apachepulsar/pulsar:4.x. Produce one planning doc per PIP under specs/proposals/. No code yet — these are planning passes.
+```
+
+---
+
+## Notes on this file
+
+Items move from this file to git history when their commit lands. The
+expected churn pattern:
+
+1. New gap surfaces → entry added with **Status** + **Unblock** + a
+   `/goal …` block.
+2. Agent team picks up the `/goal …` block in a fresh session.
+3. PR merges → the entry is removed (or its **Status** is updated to
+   "landed by `<commit-sha>`" if a follow-on tracker is needed).
+
+Pending **decisions** (`D1` … `Dn`) live in this file until Florentin
+calls them. Once decided, the decision becomes an ADR (or a
+`/goal …` block) and the `D<n>` entry is removed.

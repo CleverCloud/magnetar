@@ -316,6 +316,9 @@ impl<P: Providers> Client<P> {
     /// - [`ClientError::Other`] on connection close before the subscribe acked.
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer<P>, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
+        // See `Client::open_producer`: subscribe also needs lookup-driven bundle
+        // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`.
+        let _ = self.lookup_topic(&req.topic, false).await?;
         let shared = self.shared().clone();
         let handle = {
             let mut conn = shared.inner.lock();

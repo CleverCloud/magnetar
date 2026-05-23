@@ -817,11 +817,14 @@ fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
     fs::read_to_string(&lcov_path).with_context(|| format!("reading {}", lcov_path.display()))
 }
 
-/// Intersect the per-file added-line sets from the diff with LCOV's
-/// executable + executed sets. A line is reported as uncovered only when
-/// LCOV considers it executable AND the moonpool runner did not hit it.
-/// Non-executable additions like `use` statements, doc comments, blank
-/// lines, and closing braces never have an LCOV entry and are skipped.
+/// Intersect the per-file added-line sets from the diff with the executable
+/// + executed line sets from LCOV.
+///
+/// An added line is reported as uncovered only when LCOV considers it
+/// executable (an `DA:` entry exists for it) AND the moonpool runner did not
+/// hit it. Non-executable additions (use statements, doc comments, blank
+/// lines, closing braces, attribute-only lines) are silently skipped — they
+/// have no LCOV entry and demanding "coverage" on them is meaningless.
 fn intersect_diff_with_coverage(
     workspace_root: &Path,
     tracked: &[(String, std::collections::BTreeSet<u32>)],

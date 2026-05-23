@@ -73,12 +73,21 @@ struct SessionState {
     consumers: HashMap<u64, (String, ConsumerState)>,
 }
 
+/// Cross-session log of received `BaseCommand` kinds, in arrival order.
+/// Mutated by every session task that the broker accepts; the equivalence
+/// harness reads it after each engine run to assert ordering invariants
+/// (e.g. lookup-before-producer-open).
+pub type FrameLog = Arc<Mutex<Vec<i32>>>;
+
 /// Handle to a running scripted broker. Drop to shut down.
 pub struct ScriptedBroker {
     /// `host:port` the broker is bound to.
     addr: SocketAddr,
     shutdown: Arc<Notify>,
     accept_task: Option<JoinHandle<()>>,
+    /// Shared, append-only log of every `BaseCommand` kind (as the
+    /// `pb::base_command::Type` integer tag) seen across every session.
+    frame_log: FrameLog,
 }
 
 impl std::fmt::Debug for ScriptedBroker {
@@ -100,6 +109,8 @@ impl ScriptedBroker {
         let addr = listener.local_addr()?;
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
+        let frame_log: FrameLog = Arc::new(Mutex::new(Vec::new()));
+        let frame_log_clone = frame_log.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let accept = listener.accept();
@@ -107,7 +118,8 @@ impl ScriptedBroker {
                     res = accept => {
                         match res {
                             Ok((stream, _)) => {
-                                tokio::spawn(handle_session(stream));
+                                let log = frame_log_clone.clone();
+                                tokio::spawn(handle_session(stream, log));
                             }
                             Err(_) => break,
                         }
@@ -120,7 +132,21 @@ impl ScriptedBroker {
             addr,
             shutdown,
             accept_task: Some(accept_task),
+            frame_log,
         })
+    }
+
+    /// Snapshot the frame log: every `BaseCommand` kind seen so far,
+    /// in arrival order, across all sessions.
+    #[must_use]
+    pub fn frame_log_snapshot(&self) -> Vec<i32> {
+        self.frame_log.lock().clone()
+    }
+
+    /// Clear the frame log. Useful between engine runs so the second
+    /// engine's snapshot doesn't include the first engine's frames.
+    pub fn clear_frame_log(&self) {
+        self.frame_log.lock().clear();
     }
 
     /// `pulsar://127.0.0.1:<port>` URL the engines should connect to.
@@ -156,7 +182,7 @@ impl Drop for ScriptedBroker {
     }
 }
 
-async fn handle_session(mut stream: TcpStream) {
+async fn handle_session(mut stream: TcpStream, frame_log: FrameLog) {
     let state = Arc::new(Mutex::new(SessionState::default()));
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let mut out_buf = BytesMut::with_capacity(64 * 1024);
@@ -184,6 +210,7 @@ async fn handle_session(mut stream: TcpStream) {
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
             eprintln!("[broker] decoded frame type={}", frame.command.r#type);
+            frame_log.lock().push(frame.command.r#type);
             handle_frame(&state, &frame, &mut out_buf);
         }
 

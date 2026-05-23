@@ -393,6 +393,14 @@ impl<P: Providers> Client<P> {
         req: CreateProducerRequest,
     ) -> Result<Producer<P>, ClientError> {
         let compression = req.compression;
+        // Pulsar requires a `CommandLookupTopic` round-trip before opening a producer or
+        // consumer: lookup is what triggers the broker to acquire ownership of the topic's
+        // namespace bundle. Skipping it works only when the bundle has already been activated
+        // by some prior operation; a fresh broker rejects `CommandProducer` with
+        // `ServerError::ServiceNotReady` ("not served by this instance, please redo the
+        // lookup"). Mirrors `magnetar-runtime-tokio`'s `Client::open_producer_with` and Java's
+        // `PulsarClientImpl#createProducerAsync`.
+        let _ = self.lookup_topic(&req.topic, false).await?;
         let handle = {
             let mut conn = self.shared().inner.lock();
             conn.create_producer(req)
@@ -699,12 +707,12 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use magnetar_proto::producer::OutgoingMessage;
-    use magnetar_proto::types::CompressionKind;
+    use magnetar_proto::types::{CompressionKind, ProducerHandle};
     use magnetar_proto::{ConnectionConfig, CreateProducerRequest, encode_command, pb};
     use moonpool_core::TokioProviders;
 
     use super::Producer;
-    use crate::client::Client;
+    use crate::client::{Client, ClientError};
     use crate::{ConnectionShared, MoonpoolEngine};
 
     fn handshake_response_bytes() -> BytesMut {
@@ -1285,6 +1293,196 @@ mod tests {
         // Drop releases the reservation back to zero.
         drop(fut);
         assert_eq!(shared.memory_used.load(Ordering::Acquire), 0);
+    }
+
+    /// `ProducerBlock`: fast-path success when the budget has room takes
+    /// the synchronous `queue_send` return on line 242 (no `SendFut` slow
+    /// path, no slab insert). Mirrors the `FailImmediately` fast path but
+    /// proves the early return on the `ProducerBlock` side.
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_block_fast_path_when_budget_available() {
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 1024,
+            memory_limit_policy: magnetar_proto::MemoryLimitPolicy::ProducerBlock,
+            ..ConnectionConfig::default()
+        };
+        let shared = ConnectionShared::new(cfg);
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/fast".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        // Budget has 1024 free bytes; the 4-byte payload reserves
+        // synchronously and takes the fast-path `queue_send` return.
+        let _fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"fast"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 4,
+            num_messages: 1,
+            txn_id: None,
+        });
+        assert_eq!(
+            shared
+                .memory_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            4,
+            "ProducerBlock fast path must reserve synchronously",
+        );
+        assert!(
+            shared.memory_wakers.lock().is_empty(),
+            "fast path must not register a waker slot",
+        );
+    }
+
+    /// `ProducerBlock`: when `conn.send` errors after a successful memory
+    /// reservation, [`SendFut::poll`] must release the reservation and
+    /// surface a [`ClientError::Other`] (the `Err` arm of the inner
+    /// `match result {}`). We force the error by sending against an
+    /// unregistered [`ProducerHandle`] — the proto layer rejects with
+    /// `ProtocolError::InvariantViolation("unknown producer handle")`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_block_send_error_releases_reservation() {
+        use std::future::Future as _;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 16,
+            memory_limit_policy: magnetar_proto::MemoryLimitPolicy::ProducerBlock,
+            ..ConnectionConfig::default()
+        };
+        let shared = ConnectionShared::new(cfg);
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        // Saturate the budget so the first `send` lands in `Reserving`,
+        // then release and re-poll: this drives the future through the
+        // `Reserving → Ok(()) → conn.send → Err(_)` path.
+        shared.try_reserve_memory(16).expect("seed budget");
+        // Fabricate a producer handle that the state machine does NOT know
+        // about. `ProducerHandle` is a transparent wrapper around `u64`; we
+        // pick an id that the `create_producer` path won't have allocated.
+        let bogus_handle = ProducerHandle(u64::MAX);
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle: bogus_handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        let mut fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"err"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 3,
+            num_messages: 1,
+            txn_id: None,
+        });
+        let waker = futures_task_waker();
+        let mut cx = Context::from_waker(&waker);
+        // First poll: budget full → register on slab → Pending.
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+
+        // Release the seed so the next poll proceeds through the success
+        // branch of `try_reserve_memory_or_register` AND lands the
+        // synchronous `conn.send` error.
+        shared.release_memory(16);
+        let outcome = Pin::new(&mut fut).poll(&mut cx);
+        match outcome {
+            Poll::Ready(Err(ClientError::Other(msg))) => {
+                assert!(
+                    msg.contains("send:"),
+                    "expected `send:` error prefix, got {msg:?}",
+                );
+            }
+            other => panic!("expected Ready(Err(Other(...))), got {other:?}"),
+        }
+        // The reservation must have been released along the error path.
+        assert_eq!(
+            shared
+                .memory_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "Err arm must release the reservation it took",
+        );
+    }
+
+    /// `ProducerBlock`: re-polling a `Reserving` future while the budget
+    /// is still full must evict the prior slab entry before inserting a
+    /// new one (line 549). Two polls park the same future twice; we
+    /// assert the slab carries exactly one entry after the second poll
+    /// (the prior slot must have been cancelled, not leaked).
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_block_re_park_cancels_prior_waker_slot() {
+        use std::future::Future as _;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        let cfg = ConnectionConfig {
+            memory_limit_bytes: 4,
+            memory_limit_policy: magnetar_proto::MemoryLimitPolicy::ProducerBlock,
+            ..ConnectionConfig::default()
+        };
+        let shared = ConnectionShared::new(cfg);
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("connected");
+        }
+        shared.try_reserve_memory(4).expect("seed budget");
+
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/repark".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        let mut fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"hi"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 2,
+            num_messages: 1,
+            txn_id: None,
+        });
+        let waker = futures_task_waker();
+        let mut cx = Context::from_waker(&waker);
+        // First poll: lands in `Reserving { slab_key: Some(_) }`.
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert_eq!(shared.memory_wakers.lock().len(), 1);
+        // Second poll: the budget is still full, so the slow path
+        // re-registers and evicts the prior slot (line 549).
+        assert!(matches!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending));
+        assert_eq!(
+            shared.memory_wakers.lock().len(),
+            1,
+            "re-park must cancel the prior waker before inserting a new one",
+        );
     }
 
     /// Build a no-op `Waker` suitable for synchronously polling futures

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use magnetar_differential::broker::ScriptedBroker;
 use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};
-use magnetar_proto::MessageId;
+use magnetar_proto::{MessageId, pb};
 
 /// Helper: build a message id with default partition/batch fields so
 /// tests can spell ids tersely.
@@ -270,4 +270,106 @@ async fn many_publishes_round_trip() {
     assert_eq!(sent, 7);
     assert_eq!(received, 7);
     assert_eq!(acked, 7);
+}
+
+/// Golden 6 — Java-parity lookup-before-open: both the tokio and moonpool
+/// engines MUST issue `CommandLookupTopic` before `CommandProducer` /
+/// `CommandSubscribe`. Pulsar's broker uses the lookup round-trip to
+/// activate the topic's namespace bundle; skipping it surfaces
+/// `ServerError::ServiceNotReady` against a fresh broker
+/// (see `docs/follow-ups.md`).
+///
+/// Drives the trace `Send → Recv → Close` against the scripted broker for
+/// each engine, snapshots the per-engine frame log on the broker side,
+/// and asserts:
+/// 1. each engine emitted a `Lookup` strictly before its `Producer`,
+/// 2. each engine emitted a `Lookup` strictly before its `Subscribe`,
+/// 3. the per-engine sequences of (Lookup, Producer, Subscribe) frame indices are equal — i.e.
+///    tokio and moonpool agree on the lookup-vs-open interleaving.
+#[tokio::test(flavor = "current_thread")]
+async fn lookup_before_open_parity() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-lookup",
+        "sub-lookup",
+        vec![
+            Op::Send {
+                payload: b"lookup-first".to_vec(),
+            },
+            Op::Recv {
+                timeout: Duration::from_secs(2),
+            },
+            Op::Close,
+        ],
+    );
+
+    // Tokio leg: bind a fresh broker so the recorded log isolates this engine.
+    let broker_t = ScriptedBroker::bind().await.expect("broker bind");
+    let tokio_url = broker_t.pulsar_url();
+    let _ = runner_tokio::run(&tokio_url, &trace)
+        .await
+        .expect("tokio runner");
+    let tokio_kinds = broker_t.frame_log_snapshot();
+    broker_t.shutdown().await;
+
+    // Moonpool leg: identical procedure on a fresh broker.
+    let broker_m = ScriptedBroker::bind().await.expect("broker bind");
+    let host_port = broker_m.host_port();
+    let _ = runner_moonpool::run(&host_port, &trace)
+        .await
+        .expect("moonpool runner");
+    let moonpool_kinds = broker_m.frame_log_snapshot();
+    broker_m.shutdown().await;
+
+    assert_lookup_strictly_before(&tokio_kinds, "tokio");
+    assert_lookup_strictly_before(&moonpool_kinds, "moonpool");
+
+    // Cross-engine parity on lookup-vs-open ordering: extract the indices
+    // of the first Lookup, first Producer, and first Subscribe per engine
+    // and compare. We intentionally check ordering, not absolute indices,
+    // because the two engines have slightly different transport-level
+    // preludes (handshake retry, keep-alive cadence) that don't matter
+    // for the lookup-before-open invariant.
+    let tokio_order = lookup_ordering(&tokio_kinds);
+    let moonpool_order = lookup_ordering(&moonpool_kinds);
+    assert_eq!(
+        tokio_order, moonpool_order,
+        "engines diverged on (lookup<producer, lookup<subscribe) ordering;\n  \
+         tokio_kinds={tokio_kinds:?}\n  moonpool_kinds={moonpool_kinds:?}",
+    );
+}
+
+fn assert_lookup_strictly_before(kinds: &[i32], engine: &str) {
+    let lookup_idx = kinds
+        .iter()
+        .position(|k| *k == pb::base_command::Type::Lookup as i32)
+        .unwrap_or_else(|| panic!("{engine}: expected CommandLookupTopic; saw {kinds:?}"));
+    let producer_idx = kinds
+        .iter()
+        .position(|k| *k == pb::base_command::Type::Producer as i32)
+        .unwrap_or_else(|| panic!("{engine}: expected CommandProducer; saw {kinds:?}"));
+    let subscribe_idx = kinds
+        .iter()
+        .position(|k| *k == pb::base_command::Type::Subscribe as i32)
+        .unwrap_or_else(|| panic!("{engine}: expected CommandSubscribe; saw {kinds:?}"));
+    assert!(
+        lookup_idx < producer_idx,
+        "{engine}: Lookup ({lookup_idx}) must precede Producer ({producer_idx}); kinds={kinds:?}",
+    );
+    assert!(
+        lookup_idx < subscribe_idx,
+        "{engine}: Lookup ({lookup_idx}) must precede Subscribe ({subscribe_idx}); kinds={kinds:?}",
+    );
+}
+
+/// Returns `(lookup_before_producer, lookup_before_subscribe)` — both
+/// `true` when the engine emitted a Lookup ahead of the relevant open.
+fn lookup_ordering(kinds: &[i32]) -> (bool, bool) {
+    let pos = |target: pb::base_command::Type| kinds.iter().position(|k| *k == target as i32);
+    let lookup = pos(pb::base_command::Type::Lookup);
+    let producer = pos(pb::base_command::Type::Producer);
+    let subscribe = pos(pb::base_command::Type::Subscribe);
+    (
+        matches!((lookup, producer), (Some(l), Some(p)) if l < p),
+        matches!((lookup, subscribe), (Some(l), Some(s)) if l < s),
+    )
 }

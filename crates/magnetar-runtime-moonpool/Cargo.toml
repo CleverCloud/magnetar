@@ -32,4 +32,4 @@ thiserror      = { workspace = true }
 # with synthetic broker frames and synthetic `Instant`s — no listener, no
 # wall-clock, no Docker. tokio's paused-time runtime supplies the virtual
 # clock for `send_timeout` / `ack_timeout` / OAuth refresh-edge scenarios.
-tokio          = { workspace = true, features = ["sync", "macros", "rt", "time", "io-util", "test-util"] }
+tokio          = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "io-util", "net", "test-util"] }
