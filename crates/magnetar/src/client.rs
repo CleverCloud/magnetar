@@ -1356,11 +1356,25 @@ impl ClientBuilder {
 }
 
 /// Builder for a producer.
-#[derive(Debug)]
-pub struct ProducerBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Phantom-generic over `E: Engine` per ADR-0026 §D1 — type
+/// parameter present (defaulting to [`TokioEngine`]). Same lift
+/// pattern as [`ConsumerBuilder`]; the inherent impl methods stay
+/// tokio-bound until the [`crate::CreateProducerApi`] dispatch
+/// path lands (foundation traits added in commit `cc61d4d`).
+pub struct ProducerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     req: CreateProducerRequest,
     encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
+}
+
+impl<E: crate::Engine> std::fmt::Debug for ProducerBuilder<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProducerBuilder")
+            .field("topic", &self.req.topic)
+            .field("producer_name", &self.req.producer_name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> ProducerBuilder<'a> {
@@ -1486,11 +1500,30 @@ impl<'a> ProducerBuilder<'a> {
 }
 
 /// Builder for a consumer.
-#[derive(Debug)]
-pub struct ConsumerBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Phantom-generic over `E: Engine` per ADR-0026 §D1 — the type
+/// parameter is present (defaulting to [`TokioEngine`]) so callers
+/// can name `ConsumerBuilder<'a, MoonpoolEngine<P>>` at the type
+/// level. The inherent impl methods (notably `subscribe()`) are
+/// currently bound to the tokio default; the full lift dispatches
+/// `subscribe()` through [`crate::SubscribeApi`] in a follow-on
+/// sub-PR (see `docs/follow-ups.md` "Next sub-PR — `ConsumerBuilder`
+/// / `ProducerBuilder` genericity"). The `SubscribeApi` extension
+/// trait + delegate impls on both runtimes already landed in
+/// commit `cc61d4d`.
+pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     req: SubscribeRequest,
     decryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
+}
+
+impl<E: crate::Engine> std::fmt::Debug for ConsumerBuilder<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerBuilder")
+            .field("topic", &self.req.topic)
+            .field("subscription", &self.req.subscription)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> ConsumerBuilder<'a> {
@@ -1748,9 +1781,21 @@ impl<'a> ConsumerBuilder<'a> {
 /// Mirrors `org.apache.pulsar.client.api.ReaderBuilder`. Internally a `Reader` is just a
 /// non-durable `Exclusive` consumer with an auto-generated subscription name — there's no
 /// dedicated wire command, so the protocol layer doesn't need any extra plumbing.
-#[derive(Debug)]
-pub struct ReaderBuilder<'a> {
-    inner: ConsumerBuilder<'a>,
+///
+/// Phantom-generic over `E: Engine` (defaults to [`TokioEngine`]).
+/// Wraps a [`ConsumerBuilder<E>`]; the impl methods stay tokio-bound
+/// until the `SubscribeApi` dispatch path lands in the Builder lift
+/// sub-PR.
+pub struct ReaderBuilder<'a, E: crate::Engine = crate::TokioEngine> {
+    inner: ConsumerBuilder<'a, E>,
+}
+
+impl<E: crate::Engine> std::fmt::Debug for ReaderBuilder<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderBuilder")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 impl<'a> ReaderBuilder<'a> {
