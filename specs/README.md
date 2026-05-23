@@ -41,6 +41,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0023](adr/0023-health-probe-trait-extraction.md) | Extract sans-io `HealthProbe` trait into `magnetar-proto`; tokio engine uses it | Accepted |
 | [0024](adr/0024-cross-runtime-test-and-coverage-policy.md) | Cross-runtime test + coverage policy: four-layer test set, 100% diff sim coverage, 1:1 runtime parity | Accepted |
 | [0025](adr/0025-engine-trait-task-and-timer-primitives.md) | Engine trait extension phase 1: `TaskHandle` + `Interval` + spawn / abort / interval primitives | Accepted |
+| [0026](adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) | D1–D4 design decisions (FDB / Pulsar Java / Codex synthesis): concrete generic surfaces (not GATs); pure-sim chaos; defer SASL/Athenz; implement vendor-proto | Accepted |
 
 ## How to add an ADR
 
