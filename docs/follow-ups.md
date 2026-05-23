@@ -14,34 +14,25 @@ prompt verbatim into a fresh session.
 
 ---
 
-## Closed design decisions — see ADR-0026
+## What landed (since the multi-source design synthesis)
 
-D1 (Engine trait extension), D2 (moonpool-sim wiring), D3 (SASL/Athenz
-scope), D4 (vendored-proto bump cadence) were all locked by
-[ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-on 2026-05-23 after multi-source synthesis (FoundationDB simulator
-docs, Apache Pulsar Java client architecture, Codex independent
-review). Summary:
+ADR-0026 locked four design decisions (D1–D4) on 2026-05-23. The
+binding rationale, sources, and decision text live in that ADR;
+this section only tracks shipping status:
 
-- **D1.** Façade surface lifts use **concrete generic types
-  `magnetar::<Surface><T, E: Engine>`**, not `Engine::Producer<T>` /
-  `Engine::Consumer<T>` GATs. The trait stays at ADR-0025 phase 1
-  (task + timer primitives). Matches Apache Pulsar Java client's
-  shape: shared infrastructure + concrete generic surfaces.
-- **D2.** Implement a **pure-sim chaos suite** at
-  `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs` using
-  `moonpool_sim::SimulationBuilder` + an in-simulator broker stub.
-  Differential harness untouched. ADR-0024 exemption rationale in
-  the commit message.
-- **D3.** SASL/Kerberos + Athenz/ZTS deferred to v0.2.0.
-  README parity matrix amended to surface partial coverage honestly
-  (PLAIN + pre-fetched token are ✅; full GSSAPI / ZTS are 🟡).
-- **D4.** Implement `xtask vendor-proto --rev <sha>` immediately;
-  proto bumps are milestone-driven, not rolling-master.
-
-The implementation work is queued in the "implementation backlog"
-sections below; each entry now carries a `/goal …` block ready to
-copy-paste into a fresh session.
+- **D4** — `xtask vendor-proto --rev <sha>` (commit `ac1420c`).
+- **D3** — SASL `PLAIN` ✅ + Athenz pre-fetched role token ✅ ship;
+  SASL Kerberos/GSSAPI 🟡 + Athenz ZTS round-trip 🟡 deferred to
+  v0.2.0 (commit `96d6f74`).
+- **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
+  first cut: BrokerWorkload + ClientWorkload under
+  `SimulationBuilder`, 16-seed sweep (commit `c23f6fd`). Follow-on:
+  extend broker workload with SEND / SUBSCRIBE / SEEK / ACK; add
+  invariants (at-least-once, monotonic message-id, no-dup-on-acked,
+  supervisor-recovers-within-N-ticks).
+- **D1 Transaction surface** — `impl<E: Engine + TransactionApi>
+  PulsarClient<E>` works on both engines (commits `1258b89` +
+  D1 phase 2-4 commit + `ab9041b` parity flip).
 
 
 ## Moonpool engine — implementation backlog

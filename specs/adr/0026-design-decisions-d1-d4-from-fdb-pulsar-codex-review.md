@@ -175,18 +175,43 @@ message; no automatic refresh.
 - Per-surface engine GATs (Option 3 from the follow-ups D1 menu).
   Revisit only if a third engine demands per-surface specialisation.
 
-## Implementation plan (post-ADR commits)
+## Implementation status
 
-1. **D4 first** — implement `xtask vendor-proto`. Smallest scope,
-   unblocks future proto bumps without committing to one.
-2. **D3 amendment** — update README parity matrix + ADR-0010
-   header to mark SASL/Athenz as deferred-to-v0.2.0 (not just
-   "🟡 pre-alpha").
-3. **D2 phase 2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
-   with `SimulationBuilder` + in-sim broker stub. Invariant-driven.
-4. **D1 phase 2** — `magnetar::Transaction<E: Engine>` as the first
-   surface lift; proves the concrete-generic shape; then Reader,
-   then the rest sequentially.
+All four decisions landed in commits between 2026-05-23 and
+2026-05-24:
+
+- **D4** — `xtask vendor-proto --rev <sha>` (commit `ac1420c`).
+  Refreshes `crates/magnetar-proto/proto/{PulsarApi,PulsarMarkers}.proto`
+  from a named upstream commit. Optional `--source <path>` reuses
+  an existing clone; otherwise the helper does a shallow
+  `--filter=blob:none` clone into a tempdir. Records the resolved
+  SHA + committer date in `proto/SOURCE`; reruns codegen.
+- **D3** — SASL/Athenz parity split (commit `96d6f74`). README
+  parity matrix now distinguishes landed mechanisms (PLAIN ✅,
+  Athenz pre-fetched role token ✅) from deferred (Kerberos/GSSAPI
+  🟡, Athenz ZTS round-trip 🟡). ADR-0010 §Decision spells out
+  the partial scope and rationale.
+- **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
+  (commit `c23f6fd`). `BrokerWorkload` binds a sim `TcpListener`
+  at the workload's assigned IP and replies to the minimum Pulsar
+  wire subset (CONNECT/CONNECTED, PING/PONG, LOOKUP, PRODUCER,
+  CLOSE_PRODUCER, CLOSE_CONSUMER); `ClientWorkload` drives
+  `MoonpoolEngine<SimProviders>` against it. `sim_handshake_smoke`
+  (1 iter) and `sim_handshake_sweep_16_seeds` (16 iter) run under
+  `SimulationBuilder`. ADR-0024 carve-out recorded in xtask's
+  `PARITY_EXEMPT_FILES` constant.
+- **D1 phase 1** — `magnetar::engine::TransactionApi` extension
+  trait + tokio delegate impl (commit `1258b89`).
+- **D1 phase 2-4** — moonpool port + `MoonpoolClientState` impl +
+  façade rewrite to
+  `impl<E: Engine + TransactionApi> PulsarClient<E>` + 4+4 mirror
+  tests + parity-status row flip (commit `ab9041b` + the
+  intervening commits). Sub-PR template for the remaining seven
+  surface lifts (Producer/Consumer foundational lift first, then
+  Reader → TypedSchemas → MultiTopics → PartitionedProducer →
+  PartitionedConsumer → PatternConsumer → TableView) documented
+  in `docs/follow-ups.md` under "Façade surface bound to
+  PulsarClient<MoonpoolEngine<P>>".
 
 Each commit ships its own validation chain per ADR-0024.
 
@@ -200,9 +225,10 @@ Each commit ships its own validation chain per ADR-0024.
 - [ADR-0025](0025-engine-trait-task-and-timer-primitives.md) —
   phase 1 of the trait extension; ADR-0026 declines to grow it
   further.
-- [`docs/follow-ups.md`](../../docs/follow-ups.md) §D1–D4 — the
-  open decisions this ADR closes. The follow-ups entries will be
-  retired in the same changeset that opens this ADR.
+- [`docs/follow-ups.md`](../../docs/follow-ups.md) — tracks the
+  sub-PR work that lands the decisions in this ADR. The "Closed
+  design decisions — see ADR-0026" preamble there is purely
+  informational; the binding design lives in this file.
 - Apache Pulsar Java client —
   `pulsar-client/src/main/java/org/apache/pulsar/client/impl/`
   ([PulsarClientImpl.java](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/PulsarClientImpl.java),
