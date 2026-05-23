@@ -55,13 +55,12 @@ Everything else with a `🟡` or `❌` in the README parity matrix is one of:
 
 | Item | Status | Why deferred |
 | --- | --- | --- |
-| **SASL (Kerberos)** | 🟡 pre-alpha | Crate scaffolded ([`magnetar-auth-sasl`](../crates/magnetar-auth-sasl)); full GSSAPI plumbing is large-scope. |
-| **Athenz** | 🟡 pre-alpha | Crate scaffolded ([`magnetar-auth-athenz`](../crates/magnetar-auth-athenz)); ZTS/ZMS plumbing is large-scope. |
-| **`AutoProduceBytesSchema`** | 🟡 trait surface | Less common than `AutoConsumeSchema` (✅); producer-side deferred to v0.2.0. |
-| **PIP-460** — Scalable topics | ❌ | Experimental in Apache Pulsar. |
-| **PIP-466** — V5 client surface | ❌ | Inspired by, not adopted verbatim. |
-| **PIP-180** — Shadow topic | ❌ | v0.2.0. |
-| **PIP-33** — Replicated subscriptions | ❌ | v0.2.0. |
+| **SASL (Kerberos)** | 🟡 pre-alpha | Crate scaffolded ([`magnetar-auth-sasl`](../crates/magnetar-auth-sasl)); full GSSAPI plumbing is large-scope. See `docs/follow-ups.md` §D3. |
+| **Athenz** | 🟡 pre-alpha | Crate scaffolded ([`magnetar-auth-athenz`](../crates/magnetar-auth-athenz)); ZTS/ZMS plumbing is large-scope. See `docs/follow-ups.md` §D3. |
+| **PIP-460** — Scalable topics | ❌ | Experimental in Apache Pulsar; surface still iterating upstream. v0.2.0. |
+| **PIP-466** — V5 client surface | ❌ | Inspired by, not adopted verbatim; magnetar already follows the spirit. v0.2.0 if verbatim adoption is desired. |
+| **PIP-180** — Shadow topic | ❌ | Low-priority cross-region read fan-out; v0.2.0. |
+| **PIP-33** — Replicated subscriptions | ❌ | Covered at the cluster level today via `ServiceUrlProvider` + `AutoClusterFailover`; v0.2.0 for subscription-state replication. |
 
 These are not required for v0.1.0 under
 [ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md), which v0.1.0

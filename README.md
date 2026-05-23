@@ -590,7 +590,7 @@ known-missing feature.
 | `ProtobufNativeSchema` | ✅ | ✅ | Byte-identical Java `FileDescriptorSet` output. |
 | `KeyValueSchema` | ✅ | ✅ | Byte-identical canonical JSON wrapper. |
 | `AutoConsumeSchema` (broker lookup) | ✅ | ✅ | `TypedConsumer::receive` auto-fetches the broker schema on first call via `Connection::get_schema`; the result is cached on the schema's `Arc<Mutex<Option<pb::Schema>>>`. |
-| `AutoProduceBytesSchema` | ✅ | 🟡 | Trait surface only. |
+| `AutoProduceBytesSchema` | ✅ | ✅ | `TypedProducer::send` warms the broker schema on first send via `Producer::get_schema`; `encode()` stays pass-through per Java parity. |
 | Int8 / Int16 / Int32 / Int64 / Float / Double / Bool | ✅ | ✅ | |
 | Date / Time / Timestamp / LocalDate / LocalTime / Instant / LocalDateTime | ✅ | ✅ | |
 | Schema-version negotiation | ✅ | ✅ | Sent on `CommandProducer` / `CommandSubscribe`. |
@@ -629,8 +629,6 @@ known-missing feature.
   v0.2.0.
 - **SASL (Kerberos)** + **Athenz** auth providers are pre-alpha
   scaffolds; full GSSAPI / ZTS plumbing is deferred to v0.2.0.
-- **`AutoProduceBytesSchema`** trait surface only; the common case
-  (`AutoConsumeSchema`) is ✅.
 
 ---
 
@@ -717,7 +715,7 @@ moonpool engine reaches feature parity with tokio on a follow-up train.
 The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
 Deferred-scope items (PIP-460 scalable topics, PIP-466 V5 surface,
 PIP-180 shadow topic, PIP-33 replicated subscriptions, SASL/Athenz full
-plumbing, `AutoProduceBytesSchema`) ship in v0.2.0.
+plumbing) ship in v0.2.0.
 
 ---
 
