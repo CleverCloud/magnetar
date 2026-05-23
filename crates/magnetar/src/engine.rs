@@ -285,6 +285,16 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// Latest sequence id the producer assigned. Mirrors Java
     /// `Producer#getLastSequenceId`.
     fn last_sequence_id(&self) -> i64;
+
+    /// Look up the broker-registered schema for the producer's topic
+    /// (PIP-87). Used by
+    /// `magnetar_proto::schema::AutoProduceBytesSchema` to warm its
+    /// cache on first send. `version = None` asks for the current
+    /// schema; pass `Some(schema_version_bytes)` to re-resolve.
+    fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>;
 }
 
 /// Pulsar consumer wire surface — implemented by each runtime on its
@@ -346,6 +356,16 @@ pub trait ConsumerApi: 'static + Send + Sync {
         cursor: magnetar_proto::MessageId,
     ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>>;
 
+    /// Look up the broker-registered schema for the consumer's topic
+    /// (PIP-87). Used by
+    /// `magnetar_proto::schema::AutoConsumeSchema` to warm its cache
+    /// on first receive. `version = None` asks for the current schema;
+    /// pass `Some(schema_version_bytes)` to re-resolve.
+    fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>;
+
     /// Topic this consumer is subscribed to.
     fn topic(&self) -> String;
 
@@ -386,6 +406,14 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
 
     fn last_sequence_id(&self) -> i64 {
         magnetar_runtime_tokio::Producer::last_sequence_id(self)
+    }
+
+    fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_tokio::Producer::get_schema(self, version))
     }
 }
 
@@ -440,6 +468,14 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
         ))
     }
 
+    fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_tokio::Consumer::get_schema(self, version))
+    }
+
     fn topic(&self) -> String {
         magnetar_runtime_tokio::Consumer::topic(self)
     }
@@ -491,6 +527,16 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
 
     fn last_sequence_id(&self) -> i64 {
         magnetar_runtime_moonpool::Producer::last_sequence_id(self)
+    }
+
+    fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_moonpool::Producer::get_schema(
+            self, version,
+        ))
     }
 }
 
@@ -544,6 +590,16 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
     ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_moonpool::Consumer::has_message_after(
             self, cursor,
+        ))
+    }
+
+    fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_moonpool::Consumer::get_schema(
+            self, version,
         ))
     }
 

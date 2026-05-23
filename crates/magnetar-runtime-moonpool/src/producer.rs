@@ -376,6 +376,57 @@ impl<P: Providers> Producer<P> {
             ))),
         }
     }
+
+    /// Look up the broker-registered schema for the producer's topic
+    /// (PIP-87). Mirrors Java
+    /// `PulsarClientImpl#getSchema(TopicName, Optional<byte[]>)`. Used
+    /// by `magnetar_proto::schema::AutoProduceBytesSchema` to warm its
+    /// cache on first send.
+    ///
+    /// `version = None` asks for the current schema; pass
+    /// `Some(schema_version_bytes)` to re-resolve a historical schema.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker rejects the lookup.
+    /// - [`ClientError::Other`] when the producer handle is no longer registered or an unexpected
+    ///   outcome arrives.
+    pub async fn get_schema(
+        &self,
+        version: Option<Vec<u8>>,
+    ) -> Result<magnetar_proto::pb::Schema, ClientError> {
+        let topic = self
+            .shared
+            .inner
+            .lock()
+            .producer_topic(self.handle)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ClientError::Other(format!(
+                    "get_schema: producer handle {:?} is no longer registered",
+                    self.handle
+                ))
+            })?;
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_schema(&topic, version)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        }
+        .await;
+        match outcome {
+            OpOutcome::GetSchemaResponse { result, .. } => match result {
+                Ok((schema, _version)) => Ok(schema),
+                Err((code, message)) => Err(ClientError::Broker { code, message }),
+            },
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected get_schema outcome: {other:?}"
+            ))),
+        }
+    }
 }
 
 impl<P: Providers> Client<P> {

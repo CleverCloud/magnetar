@@ -27,6 +27,12 @@ use crate::client::PulsarError;
 
 /// A schema-aware producer. Wraps a [`Producer`] and applies the configured schema to every
 /// outbound value.
+///
+/// Lift to `TypedProducer<S, P: ProducerApi>` is queued — requires
+/// `compression`, `is_connected`, `stats`, `pending_count`,
+/// `batch_len`, `batch_bytes`, `last_disconnected_timestamp`,
+/// `last_sequence_id_published` to land on `ProducerApi` first. See
+/// `docs/follow-ups.md`.
 pub struct TypedProducer<S: Schema> {
     inner: Producer,
     schema: Arc<S>,

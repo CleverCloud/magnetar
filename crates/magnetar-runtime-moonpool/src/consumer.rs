@@ -228,6 +228,54 @@ impl<P: Providers> Consumer<P> {
         self.shared.driver_waker.notify_one();
     }
 
+    /// Look up the broker-registered schema for the consumer's topic
+    /// (PIP-87). Mirrors Java
+    /// `PulsarClientImpl#getSchema(TopicName, Optional<byte[]>)`. Used
+    /// by `magnetar_proto::schema::AutoConsumeSchema` to warm its
+    /// cache on first receive.
+    ///
+    /// `version = None` asks for the current schema; pass
+    /// `Some(schema_version_bytes)` to re-resolve a historical schema.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker rejects the lookup (e.g. `TopicNotFound`).
+    /// - [`ClientError::Other`] when the consumer handle is no longer registered or an unexpected
+    ///   outcome arrives.
+    pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
+        let topic = self
+            .shared
+            .inner
+            .lock()
+            .consumer_topic(self.handle)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ClientError::Other(format!(
+                    "get_schema: consumer handle {:?} is no longer registered",
+                    self.handle
+                ))
+            })?;
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_schema(&topic, version)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::GetSchemaResponse { result, .. } => match result {
+                Ok((schema, _version)) => Ok(schema),
+                Err((code, message)) => Err(ClientError::Broker { code, message }),
+            },
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected get_schema outcome: {other:?}"
+            ))),
+        }
+    }
+
     /// Ask the broker for the topic's last-published message id.
     /// Mirrors Java `Consumer#getLastMessageId`.
     ///
