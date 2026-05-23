@@ -25,20 +25,25 @@ use magnetar_runtime_tokio::{Consumer, Producer};
 use crate::PulsarClient;
 use crate::client::PulsarError;
 
-/// A schema-aware producer. Wraps a [`Producer`] and applies the configured schema to every
+/// A schema-aware producer. Wraps a producer and applies the configured schema to every
 /// outbound value.
 ///
-/// Lift to `TypedProducer<S, P: ProducerApi>` is queued — requires
-/// `compression`, `is_connected`, `stats`, `pending_count`,
-/// `batch_len`, `batch_bytes`, `last_disconnected_timestamp`,
-/// `last_sequence_id_published` to land on `ProducerApi` first. See
-/// `docs/follow-ups.md`.
-pub struct TypedProducer<S: Schema> {
-    inner: Producer,
+/// Generic over `P: ProducerApi` per ADR-0026 §D1. The default
+/// (`P = magnetar_runtime_tokio::Producer`) keeps existing callers —
+/// `magnetar::TypedProducer<S>` without a producer type argument —
+/// pointing at the tokio specialisation. Moonpool callers name
+/// `TypedProducer<S, magnetar_runtime_moonpool::Producer<P>>`.
+///
+/// Methods that need helpers not on `ProducerApi` today
+/// (`compression`, `last_sequence_id_published`, `pending_count`,
+/// `batch_len`, `batch_bytes`) live in a separate
+/// `impl TypedProducer<S, magnetar_runtime_tokio::Producer>` block.
+pub struct TypedProducer<S: Schema, P: crate::ProducerApi = Producer> {
+    inner: P,
     schema: Arc<S>,
 }
 
-impl<S: Schema> std::fmt::Debug for TypedProducer<S> {
+impl<S: Schema, P: crate::ProducerApi + std::fmt::Debug> std::fmt::Debug for TypedProducer<S, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypedProducer")
             .field("inner", &self.inner)
@@ -488,14 +493,30 @@ where
     }
 }
 
-/// A schema-aware consumer. Wraps a [`Consumer`] and decodes every received payload with the
+/// A schema-aware consumer. Wraps a consumer and decodes every received payload with the
 /// configured schema before returning to the caller.
-pub struct TypedConsumer<S: Schema> {
-    inner: Consumer,
+///
+/// Generic over `C: ConsumerApi` per ADR-0026 §D1. The default
+/// (`C = magnetar_runtime_tokio::Consumer`) keeps existing callers —
+/// `magnetar::TypedConsumer<S>` without a consumer type argument —
+/// pointing at the tokio specialisation. Moonpool callers name
+/// `TypedConsumer<S, magnetar_runtime_moonpool::Consumer<P>>`.
+///
+/// Methods that need helpers not on `ConsumerApi` today
+/// (`ack_grouped` family, `available_in_queue`, `available_permits`,
+/// `drain_dead_letter`, `flow`, `has_reached_end_of_topic`,
+/// `has_received_any_message`, `is_inactive`, `is_paused`,
+/// `last_disconnected_timestamp`, `receive_batch`,
+/// `receive_with_timeout`, `redeliver_unacked`, `pause`, `resume`,
+/// the `ack_with_txn` family) stay on the tokio specialisation
+/// `impl TypedConsumer<S, magnetar_runtime_tokio::Consumer>` until
+/// the trait grows them.
+pub struct TypedConsumer<S: Schema, C: crate::ConsumerApi = Consumer> {
+    inner: C,
     schema: Arc<S>,
 }
 
-impl<S: Schema> std::fmt::Debug for TypedConsumer<S> {
+impl<S: Schema, C: crate::ConsumerApi + std::fmt::Debug> std::fmt::Debug for TypedConsumer<S, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypedConsumer")
             .field("inner", &self.inner)
