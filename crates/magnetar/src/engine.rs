@@ -81,7 +81,7 @@ pub trait Engine: 'static + Send + Sync + Debug {
 
     /// Spawn an async future on the engine's executor. Returns a cancel-
     /// safe [`Self::TaskHandle`]. Tokio wraps [`tokio::spawn`]; moonpool
-    /// delegates through its [`moonpool_core::Providers::TaskProvider`].
+    /// delegates through its `Providers::TaskProvider` (`moonpool_core`).
     fn spawn<F>(fut: F) -> Self::TaskHandle
     where
         F: Future<Output = ()> + Send + 'static;

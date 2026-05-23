@@ -55,8 +55,10 @@ Everything else with a `🟡` or `❌` in the README parity matrix is one of:
 
 | Item | Status | Why deferred |
 | --- | --- | --- |
-| **SASL (Kerberos)** | 🟡 pre-alpha | Crate scaffolded ([`magnetar-auth-sasl`](../crates/magnetar-auth-sasl)); full GSSAPI plumbing is large-scope. See `docs/follow-ups.md` §D3. |
-| **Athenz** | 🟡 pre-alpha | Crate scaffolded ([`magnetar-auth-athenz`](../crates/magnetar-auth-athenz)); ZTS/ZMS plumbing is large-scope. See `docs/follow-ups.md` §D3. |
+| **SASL `PLAIN` (RFC 4616)** | ✅ landed | `magnetar_auth_sasl::SaslPlain` emits the `\0<user>\0<pass>` payload. Useful for username/password broker auth in tests and for brokers configured without a token provider. |
+| **SASL Kerberos / GSSAPI** | 🟡 deferred to v0.2.0 | `magnetar_auth_sasl::SaslKerberos::initial` returns `AuthError::Unsupported`; the GSSAPI binding (`libgssapi`) is a multi-stakeholder dependency, deferred per [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
+| **Athenz (pre-fetched role token)** | ✅ landed | `AthenzProvider::with_role_token` uses the supplied token as the `auth_data` payload — useful when an out-of-band agent (`zts-agent`, sidecar) already mints the token. |
+| **Athenz (ZTS round-trip)** | 🟡 deferred to v0.2.0 | `AthenzProvider::new(...).initial` returns `AuthError::Unsupported`; the ZTS/ZMS client is deferred per [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
 | **PIP-460** — Scalable topics | ❌ | Experimental in Apache Pulsar; surface still iterating upstream. v0.2.0. |
 | **PIP-466** — V5 client surface | ❌ | Inspired by, not adopted verbatim; magnetar already follows the spirit. v0.2.0 if verbatim adoption is desired. |
 | **PIP-180** — Shadow topic | ❌ | Low-priority cross-region read fan-out; v0.2.0. |

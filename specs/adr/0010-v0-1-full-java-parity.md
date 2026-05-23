@@ -33,7 +33,15 @@ Florentin's signoff (2026-05-20) chose **full parity at v0.1**.
   PIP-460 / PIP-466 (scalable topics — experimental tag).
 - Admin REST client + `magnetar` CLI both ship in v0.1.0.
 - Auth providers in scope: Token, mTLS, OAuth2 (`ClientCredentialsFlow`),
-  SASL/Kerberos, Athenz.
+  SASL `PLAIN` (RFC 4616), Athenz with a pre-fetched role token
+  (`AthenzProvider::with_role_token`). SASL Kerberos / GSSAPI and the
+  Athenz ZTS round-trip are **deferred to v0.2.0** per
+  [ADR-0026](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+  §D3 — both are large, multi-stakeholder dependencies (`libgssapi`
+  for SASL, a full ZTS/ZMS client for Athenz) whose scope is not
+  proportional to the demand from Clever Cloud's v0.1.0 use cases.
+  Magnetar's stubs surface `AuthError::Unsupported` so callers see the
+  gap at the auth-method boundary rather than at the wire.
 - No PIP is deferred to a v0.2 / v0.3.
 
 ## Consequences

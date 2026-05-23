@@ -82,7 +82,10 @@ client at v0.1.0.
 - **Auth providers**: token, mTLS (the two stock providers in
   `magnetar-proto::auth`), OAuth2 `ClientCredentialsFlow` (working — fetches
   + caches + auto-refreshes JWTs against a standard OIDC token endpoint),
-  SASL and Athenz scaffolds.
+  SASL `PLAIN` (RFC 4616, working), Athenz with a pre-fetched role
+  token (`AthenzProvider::with_role_token`, working). SASL Kerberos /
+  GSSAPI and the Athenz ZTS round-trip return `AuthError::Unsupported`
+  and are deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
 - **Trackers**: ack grouping, unacked-message tracker (ack timeout +
   redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff`
   (PIP-37), batch-index ACK set (PIP-54).
@@ -563,8 +566,10 @@ known-missing feature.
 | Token auth | ✅ | ✅ | `magnetar_proto::auth::TokenAuth`. |
 | mTLS | ✅ | ✅ | `magnetar_proto::auth::TlsAuth` + `tls_trust_certs_pem` / `tls_trust_certs_file_path`. |
 | OAuth2 ClientCredentialsFlow | ✅ | ✅ | `magnetar_auth_oauth2::ClientCredentialsFlow` — POSTs `grant_type=client_credentials` to the IDP, caches the JWT, refreshes within 30 s of expiry. Reports `auth_method_name = "token"`. |
-| SASL (Kerberos) | ✅ | 🟡 | Crate scaffolded (`magnetar-auth-sasl`); pre-alpha. |
-| Athenz | ✅ | 🟡 | Crate scaffolded (`magnetar-auth-athenz`); pre-alpha. |
+| SASL `PLAIN` (RFC 4616) | ✅ | ✅ | `magnetar_auth_sasl::SaslPlain` — `\0<username>\0<password>` payload. |
+| SASL Kerberos / GSSAPI | ✅ | 🟡 | `magnetar_auth_sasl::SaslKerberos::initial` returns `AuthError::Unsupported`; libgssapi binding deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
+| Athenz (pre-fetched role token) | ✅ | ✅ | `AthenzProvider::with_role_token` — bypass the ZTS round-trip when the caller already holds a valid role token. |
+| Athenz (ZTS round-trip) | ✅ | 🟡 | `AthenzProvider::new(...).initial` returns `AuthError::Unsupported`; ZTS/ZMS client deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
 | In-band `AUTH_CHALLENGE` refresh (PIP-30 / PIP-292) | ✅ | ✅ | Driver consults the configured `AuthProvider` and submits `CommandAuthResponse`. |
 | `pulsar+ssl://` URLs | ✅ | ✅ | Built-in. |
 | Binary proxy (`proxy_to_broker_url`) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
@@ -627,8 +632,14 @@ known-missing feature.
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180
   shadow topic** + **PIP-33 replicated subscriptions** are scoped for
   v0.2.0.
-- **SASL (Kerberos)** + **Athenz** auth providers are pre-alpha
-  scaffolds; full GSSAPI / ZTS plumbing is deferred to v0.2.0.
+- **SASL** ships `PLAIN` (RFC 4616) wired end-to-end; the
+  Kerberos/GSSAPI mechanism is a stub that returns
+  `AuthError::Unsupported`. Full GSSAPI binding (`libgssapi`) is
+  deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
+- **Athenz** ships `with_role_token` (use a pre-fetched ZTS role token
+  directly); the `new()` path that contacts ZTS itself returns
+  `AuthError::Unsupported`. Full ZTS/ZMS client is deferred to v0.2.0
+  per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
 
 ---
 
@@ -714,8 +725,10 @@ moonpool engine reaches feature parity with tokio on a follow-up train.
 
 The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
 Deferred-scope items (PIP-460 scalable topics, PIP-466 V5 surface,
-PIP-180 shadow topic, PIP-33 replicated subscriptions, SASL/Athenz full
-plumbing) ship in v0.2.0.
+PIP-180 shadow topic, PIP-33 replicated subscriptions, SASL Kerberos /
+GSSAPI, Athenz ZTS round-trip) ship in v0.2.0 per
+[ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+§D3.
 
 ---
 

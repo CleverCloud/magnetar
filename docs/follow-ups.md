@@ -160,12 +160,42 @@ fixed, not `#[ignore]`-d.
 
 ## Auth
 
-### SASL (Kerberos) and Athenz
+### SASL Kerberos / GSSAPI
 
-See [D3 — SASL/Athenz scope for v0.1.0](#d3--saslathenz-scope-for-v010).
-The current state in `magnetar-auth-sasl` and `magnetar-auth-athenz`
-is pre-alpha stubs; full implementations are deferred to v0.2.0 pending
-the decision in D3.
+**Status.** `magnetar_auth_sasl::SaslKerberos::initial` returns
+`AuthError::Unsupported`. SASL `PLAIN` (RFC 4616) is fully wired and
+ships in v0.1.0; the Kerberos/GSSAPI mechanism is the deferred portion.
+
+**Unblock.** Deferred to v0.2.0 per
+[ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+§D3. The work item is binding `libgssapi-sys` (or the safer wrapper crate
+`libgssapi`) into `SaslKerberos::initial` and threading the
+`AUTH_CHALLENGE` continuation through the existing
+`AuthProvider::respond_to_challenge` surface. Scope is ~600–900 LOC plus
+a Dockerised KDC fixture for the e2e suite.
+
+```text
+/goal land SASL Kerberos / GSSAPI in magnetar-auth-sasl. Bind libgssapi to SaslKerberos::initial, thread AUTH_CHALLENGE continuations through AuthProvider::respond_to_challenge, add a Dockerised KDC fixture (testcontainers + bitnami/kerberos) behind the `e2e` feature, and flip the README parity matrix row from 🟡 to ✅. All four test layers per ADR-0024 — the GSSAPI calls themselves go behind a `kerberos` feature flag so the sans-io test layers can mock the wire bytes deterministically.
+```
+
+### Athenz ZTS round-trip
+
+**Status.** `AthenzProvider::with_role_token` ships in v0.1.0 (callers
+that already hold a valid ZTS role token can hand it directly to the
+provider). `AthenzProvider::new(...).initial` returns
+`AuthError::Unsupported`.
+
+**Unblock.** Deferred to v0.2.0 per
+[ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+§D3. The work item is implementing a minimal `reqwest`-backed ZTS
+client that exchanges the tenant private key for a role token,
+caches it with an expiry-aware refresh, and surfaces failures through
+`AuthError`. Scope is ~400–600 LOC plus a Dockerised ZTS fixture
+(`athenz/athenz-zts-server`) for the e2e suite.
+
+```text
+/goal land Athenz ZTS round-trip in magnetar-auth-athenz. Implement a reqwest-backed ZTS client that signs a token request with the tenant private key, caches the response with expiry-aware refresh, and uses it as the `auth_data` payload from `AthenzProvider::initial`. Add a Dockerised ZTS fixture behind the `e2e` feature, and flip the README parity matrix row from 🟡 to ✅. Test layers per ADR-0024.
+```
 
 ---
 
