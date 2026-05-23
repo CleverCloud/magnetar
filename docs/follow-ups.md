@@ -92,27 +92,61 @@ follow-on engine doesn't need to fork the surface stack.
 
 ---
 
-### D2 — Vendor `moonpool-sim` into the workspace
+### D2 — Wire `moonpool-sim` into a virtualized chaos harness
 
-**Decision needed.** Approve adding `moonpool-sim = "=0.6"` to
-`Cargo.toml`'s `[workspace.dependencies]` and the `deny.toml` allow-list,
-matching the existing `moonpool-core = "=0.6"` pin.
+**Status (2026-05-23).** **Phase 1 landed** in commit `b15c91d` —
+`moonpool-sim = "=0.6"` registered in `Cargo.toml`'s
+`[workspace.dependencies]`. The dep is available to any crate that
+opts in. **Phase 2 (consume the dep) is the remaining call below.**
 
-**Why this matters.** Per ADR-0024 the chaos pack must run under
-deterministic seeds. Today `magnetar-differential`'s moonpool runner
-uses `moonpool_core::TokioProviders`, which inherits tokio's
-non-deterministic scheduling. Swapping to `SimProviders` unlocks
-reproducible chaos sweeps and is what closes the "Moonpool runner
-LocalSet pump" entry below: the simulator's deterministic scheduler
-drives both sides without `spawn_local`.
+**Decision needed.** How do we put `moonpool-sim` to work?
+`SimProviders` is not a drop-in replacement for `TokioProviders`:
 
-**Rationale guide.** `moonpool-sim` is the deterministic-scheduler
-companion to `moonpool-core`, written by the same upstream. Adding
-it is one line plus the deny.toml entry; no transitive surprise (it
-pulls in the same `rand` family already in the lock).
+- `moonpool_sim::SimProviders::new(WeakSimWorld, seed, IpAddr)`
+  requires a reference to a `SimWorld` constructed by
+  `moonpool_sim::SimulationBuilder::run(|ctx| async { … })`.
+- The simulator owns a **virtual network** — `connect()` targets an
+  in-memory address, not a real TCP socket. Real `TcpListener::bind`
+  endpoints (the differential broker today) are not reachable from
+  inside the simulation.
+- The simulator owns **virtual time** — `tokio::time::sleep`
+  inside the workload yields virtual ticks, not wall-clock waits.
+
+So the originally-imagined "swap `TokioProviders` for `SimProviders`
+in `runner_moonpool.rs`" is technically misleading: the differential
+broker's `bind`-on-`127.0.0.1:0` model cannot be driven by the
+simulator without a fully-virtualized broker.
+
+Three realistic paths:
+
+1. **Pure-sim chaos suite** (new test target). Write a
+   `magnetar-runtime-moonpool/tests/sim_chaos.rs` that uses
+   `SimulationBuilder` to spawn an in-simulator broker stub +
+   `MoonpoolEngine<SimProviders>` clients. Exercises deterministic
+   chaos (packet loss, partitions, clock drift) under reproducible
+   seeds. Does **not** share the differential harness's broker.
+
+2. **Restructure the differential moonpool runner** to use plain
+   `tokio::spawn` instead of `spawn_local` (option (b) from the
+   "Moonpool runner LocalSet pump" entry below). Drops the
+   `Kicker` workaround without invoking `moonpool-sim`. Loses the
+   "differential harness runs under sim" goal entirely.
+
+3. **Virtualize the differential broker** (largest scope). Replace
+   `ScriptedBroker::bind` with a `SimWorld`-aware in-memory listener
+   so the differential harness runs entirely inside the simulator.
+   Both engine runners then use `SimProviders`. Closes the LocalSet
+   pump AND unlocks reproducible cross-engine chaos.
+
+**Recommendation.** Option **1** first — ships a new test target
+that proves `moonpool-sim` integration end-to-end without
+restructuring the differential harness. Option 2 as a
+follow-up if the `Kicker` workaround becomes maintenance pain.
+Option 3 is deferred to v0.2.0; it's the most thorough closure but
+the largest engineering investment.
 
 ```text
-/goal vendor moonpool-sim 0.6 into the workspace: add to Cargo.toml [workspace.dependencies], deny.toml allow-list, and swap TokioProviders for SimProviders in crates/magnetar-differential/src/runner_moonpool.rs. Then enable the 32-seed sweep in the differential harness CI job. All four test layers per ADR-0024; no behaviour change beyond determinism.
+/goal land magnetar-runtime-moonpool/tests/sim_chaos.rs: a moonpool_sim::SimulationBuilder workload that constructs MoonpoolEngine<SimProviders>, spawns an in-simulator broker stub (single-topic, send+recv+close), and asserts deterministic byte-identical EventStreams across 32 seeds. ADR-0024 four-layer test parity does not apply (this is a moonpool-only fixture by design — document the exemption in the commit message). Pre-existing differential harness untouched.
 ```
 
 ---
