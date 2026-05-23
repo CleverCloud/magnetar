@@ -44,27 +44,42 @@ bundle. `TokioProviders` runs it against a real broker;
 `moonpool-sim`'s `SimProviders` runs it under deterministic seeds
 ([`moonpool-engine.md`](moonpool-engine.md)).
 
-The façade surface bound to `PulsarClient<TokioEngine>`
-(partitioned, multi-topics, pattern, typed schemas) does not yet
-compile under `PulsarClient<MoonpoolEngine<P>>`. **Three of seven
-dependent surfaces lifted** per ADR-0026 §D1 and now work on both
-engines:
+**Four of seven dependent surfaces fully lifted** per ADR-0026 §D1
+and now work on both engines:
 
 - **Transaction (PIP-31)** via the `TransactionApi` extension
   trait.
 - **Reader** via `Reader<C: ConsumerApi>` (default
   `C = magnetar_runtime_tokio::Consumer`).
 - **TableView** via `TableView<C: ConsumerApi + Clone>`.
+- **PartitionedProducer** via `impl<P: ProducerApi>
+  PartitionedProducer<P>` (with tokio-only specialisation for
+  `refresh_partitions`, batch counters,
+  `last_sequence_id_published`).
 
-The remaining four surfaces (`MultiTopicsConsumer`,
-`PartitionedProducer`, `PartitionedConsumer`, `PatternConsumer`)
-and `TypedSchemas` hold concrete
-`magnetar_runtime_tokio::{Producer, Consumer}` instances and need
-additional helper methods surfaced on the API traits before the
-lift becomes mechanical. See `docs/follow-ups.md` for the per-
-surface helper list. Callers that reach for a tokio-only method
-on the moonpool engine still get a trait-bound compile error, not
-a silent fallback — see ADR-0019 §Consequences.
+**TypedProducer / TypedConsumer** are phantom-lifted: type
+parameters present on the structs (defaulting to the tokio
+runtime), but the impl-body lift is queued behind the remaining
+helper-method ports.
+
+The remaining three façade surfaces — **`MultiTopicsConsumer`**,
+**`PartitionedConsumer`** (type alias for `MultiTopicsConsumer`),
+**`PatternConsumer`** — hold `Vec<NamedConsumer>` /
+`Mutex<Vec<NamedConsumer>>` instances. The `ConsumerApi` trait
+surface is now comprehensive enough for the lift (receive, ack,
+ack_cumulative, negative_ack, negative_ack_with_delay,
+redeliver_unacked, unsubscribe, seek_to_earliest, seek_to_latest,
+get_schema, last_message_id, has_message_after,
+last_disconnected_timestamp, topic, subscription, name, is_closed,
+is_connected, stats, close_owned). The remaining work is
+structural restructuring of cascading generics in
+`crates/magnetar/src/multi_topics.rs` (`Inner<C>`,
+`NamedConsumer<C>`, `ConsumerTemplate` are tokio-bound today; the
+helper-method bottleneck is resolved).
+
+Callers that reach for a tokio-only method on the moonpool engine
+still get a trait-bound compile error, not a silent fallback —
+see ADR-0019 §Consequences.
 
 ## Genuine deferred-scope items
 
