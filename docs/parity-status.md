@@ -31,7 +31,7 @@ follow-up train; the gap is tracked below.
 | MultiTopicsConsumer | ✅ | ❌ |
 | PatternConsumer (PIP-145) | ✅ | ❌ |
 | Reader | ✅ | ✅ |
-| TableView | ✅ | ❌ |
+| TableView | ✅ | ✅ |
 | Transactions (PIP-31) | ✅ | ✅ |
 | Typed schemas | ✅ | ❌ |
 | Deterministic chaos pack | n/a | ✅ |

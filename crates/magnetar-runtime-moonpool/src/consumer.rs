@@ -69,6 +69,16 @@ pub struct Consumer<P: Providers> {
     _providers: std::marker::PhantomData<fn() -> P>,
 }
 
+impl<P: Providers> Clone for Consumer<P> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            _providers: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<P: Providers> std::fmt::Debug for Consumer<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Consumer")

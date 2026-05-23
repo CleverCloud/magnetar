@@ -29,8 +29,18 @@ use crate::client::PulsarError;
 pub type TableViewListener = Arc<dyn Fn(&str, Option<&Bytes>) + Send + Sync>;
 
 /// Compacted-topic key/value view.
+///
+/// Generic over `C: ConsumerApi + Clone` per ADR-0026 §D1. The default
+/// (`C = magnetar_runtime_tokio::Consumer`) keeps existing callers —
+/// `magnetar::TableView` without a type argument — pointing at the
+/// tokio specialisation. Moonpool callers name
+/// `TableView<magnetar_runtime_moonpool::Consumer<P>>` directly. The
+/// drain task uses `tokio::spawn` regardless of engine, which matches
+/// ADR-0025's note that both engines ultimately schedule on tokio
+/// (determinism comes from substituting the providers, not from
+/// replacing the executor).
 #[derive(Clone)]
-pub struct TableView {
+pub struct TableView<C: crate::ConsumerApi + Clone = magnetar_runtime_tokio::Consumer> {
     state: Arc<RwLock<HashMap<String, Bytes>>>,
     listeners: Arc<RwLock<Vec<TableViewListener>>>,
     drain: Arc<DrainTask>,
@@ -44,10 +54,10 @@ pub struct TableView {
     /// Clone of the underlying consumer kept for read-only introspection (stats,
     /// connection state, last message id). The drain task owns its own clone; both share
     /// the same `Arc<ConnectionShared>` so closes propagate.
-    consumer: magnetar_runtime_tokio::Consumer,
+    consumer: C,
 }
 
-impl std::fmt::Debug for TableView {
+impl<C: crate::ConsumerApi + Clone> std::fmt::Debug for TableView<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableView")
             .field("size", &self.state.read().len())
@@ -122,7 +132,7 @@ impl Drop for AutoUpdateTask {
     }
 }
 
-impl TableView {
+impl<C: crate::ConsumerApi + Clone> TableView<C> {
     /// Number of distinct keys currently materialised.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -294,25 +304,28 @@ impl TableView {
     /// `TableView#getStats` (the Java table view exposes its consumer's stats directly).
     #[must_use]
     pub fn stats(&self) -> magnetar_proto::ConsumerStats {
-        self.consumer.stats()
+        crate::ConsumerApi::stats(&self.consumer)
     }
 
     /// `true` while the broker connection backing the table view is up. Mirrors Java
     /// `TableView#isConnected`.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.consumer.is_connected()
+        crate::ConsumerApi::is_connected(&self.consumer)
     }
 
     /// Ask the broker for the underlying topic's last-published message id. Mirrors Java
     /// `TableView#getLastMessageId` — useful for "is the view caught up?" checks. The
     /// table view itself does not track its own cursor; pair this with the timestamps on
     /// the messages your listener observed.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] on broker rejection or wire failure (stringified from the runtime's
+    ///   `ConsumerApi::Error`).
     pub async fn last_message_id(&self) -> Result<magnetar_proto::MessageId, PulsarError> {
-        self.consumer
-            .last_message_id()
+        crate::ConsumerApi::last_message_id(&self.consumer)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(|err| PulsarError::Other(format!("last_message_id: {err}")))
     }
 }
 

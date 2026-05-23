@@ -386,6 +386,11 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `true` while the broker connection is up. Mirrors Java
     /// `Consumer#isConnected`.
     fn is_connected(&self) -> bool;
+
+    /// Cumulative consumer-side counters. Mirrors Java
+    /// `Consumer#getStats`. Returns a zeroed snapshot if the consumer
+    /// handle is no longer registered.
+    fn stats(&self) -> magnetar_proto::consumer::ConsumerStats;
 }
 
 #[cfg(feature = "tokio")]
@@ -510,6 +515,10 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn is_connected(&self) -> bool {
         magnetar_runtime_tokio::Consumer::is_connected(self)
+    }
+
+    fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
+        magnetar_runtime_tokio::Consumer::stats(self)
     }
 }
 
@@ -649,6 +658,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn is_connected(&self) -> bool {
         magnetar_runtime_moonpool::Consumer::is_connected(self)
+    }
+
+    fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
+        magnetar_runtime_moonpool::Consumer::stats(self)
     }
 }
 
