@@ -21,6 +21,13 @@ unilaterally resolved by an agent — they need a deliberate call.
 
 ### D1 — Engine trait extension (ADR-0025)
 
+**Status (2026-05-23).** **Phase 1 landed** as
+[ADR-0025](../specs/adr/0025-engine-trait-task-and-timer-primitives.md) —
+task + timer primitives (`TaskHandle`, `Interval`, `spawn`,
+`abort_task`, `new_interval`, `interval_tick`) implemented on both
+engines. Phase 2 (Producer/Consumer associated types) is the remaining
+open call below.
+
 **Decision needed.** What does `magnetar::Engine` grow to support the
 façade lift to `PulsarClient<MoonpoolEngine<P>>`?
 

@@ -40,6 +40,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0022](adr/0022-memory-limit-producer-block-moonpool.md) | `MemoryLimitPolicy::ProducerBlock` ported to the moonpool engine; fairness contract under `Providers` | Accepted |
 | [0023](adr/0023-health-probe-trait-extraction.md) | Extract sans-io `HealthProbe` trait into `magnetar-proto`; tokio engine uses it | Accepted |
 | [0024](adr/0024-cross-runtime-test-and-coverage-policy.md) | Cross-runtime test + coverage policy: four-layer test set, 100% diff sim coverage, 1:1 runtime parity | Accepted |
+| [0025](adr/0025-engine-trait-task-and-timer-primitives.md) | Engine trait extension phase 1: `TaskHandle` + `Interval` + spawn / abort / interval primitives | Accepted |
 
 ## How to add an ADR
 

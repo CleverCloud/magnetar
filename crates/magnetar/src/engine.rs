@@ -27,8 +27,11 @@
 //! with default `E = TokioEngine`" — for the rationale.
 
 use std::fmt::Debug;
+use std::future::Future;
 #[cfg(feature = "moonpool")]
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::time::Duration;
 
 /// Marker trait labelling a runtime engine. Implementations select the
 /// concrete storage type ([`Self::ClientState`]) that backs the engine's
@@ -37,6 +40,17 @@ use std::marker::PhantomData;
 /// `'static + Send + Sync` mirrors what we already require of producers and
 /// consumers; downstream users that hand `PulsarClient<E>` to a tokio
 /// `spawn` (or moonpool `spawn`) need at least that.
+///
+/// # Task and timer primitives (ADR-0025 phase 1)
+///
+/// The associated [`Self::TaskHandle`] and [`Self::Interval`] types plus the
+/// [`Self::spawn`] / [`Self::abort_task`] / [`Self::new_interval`] /
+/// [`Self::interval_tick`] methods give the façade an engine-agnostic way to
+/// spawn background tasks and drive periodic timers. They are the
+/// prerequisite for moving `PartitionedProducer::health_loop`,
+/// `TableView::drain_task`, `MultiTopicsConsumer::auto_update`, and the
+/// other surface lifts off `impl PulsarClient<TokioEngine>`. See
+/// [ADR-0025](../../specs/adr/0025-engine-trait-task-and-timer-primitives.md).
 pub trait Engine: 'static + Send + Sync + Debug {
     /// Per-engine state stored inside [`crate::PulsarClient<E>`]. The tokio
     /// engine plugs in [`magnetar_runtime_tokio::Client`]; the moonpool
@@ -44,6 +58,16 @@ pub trait Engine: 'static + Send + Sync + Debug {
     /// moonpool::DriverHandle)`. Both bundles are `'static + Send + Sync`
     /// so the façade can be moved across spawn boundaries unchanged.
     type ClientState: 'static + Send + Sync;
+
+    /// Opaque, cancel-safe handle to a background task spawned via
+    /// [`Self::spawn`]. Dropping the handle aborts the task on the tokio
+    /// engine; explicit [`Self::abort_task`] is the happens-before-Drop
+    /// path the façade uses on shutdown.
+    type TaskHandle: 'static + Send;
+
+    /// Opaque periodic timer created via [`Self::new_interval`]. The
+    /// façade drives ticks via [`Self::interval_tick`].
+    type Interval: 'static + Send;
 
     /// Human-readable engine name, surfaced in logs / panics / errors.
     /// Default returns the Rust type name — engines override to e.g.
@@ -54,6 +78,28 @@ pub trait Engine: 'static + Send + Sync + Debug {
     {
         std::any::type_name::<Self>()
     }
+
+    /// Spawn an async future on the engine's executor. Returns a cancel-
+    /// safe [`Self::TaskHandle`]. Tokio wraps [`tokio::spawn`]; moonpool
+    /// delegates through its [`moonpool_core::Providers::TaskProvider`].
+    fn spawn<F>(fut: F) -> Self::TaskHandle
+    where
+        F: Future<Output = ()> + Send + 'static;
+
+    /// Abort a spawned task. Idempotent: calling on an already-completed
+    /// or already-aborted handle is a no-op.
+    fn abort_task(handle: &mut Self::TaskHandle);
+
+    /// Create a periodic timer with `period` between ticks. The first
+    /// tick fires immediately (matches `tokio::time::interval`).
+    fn new_interval(period: Duration) -> Self::Interval;
+
+    /// Await the next tick. The returned future is `Send` and boxed so
+    /// the caller can `.await` from a generic context without exposing
+    /// the engine-specific timer shape.
+    fn interval_tick<'a>(
+        interval: &'a mut Self::Interval,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 /// Zero-sized marker for the tokio production engine. Default `E` on
@@ -67,9 +113,36 @@ pub struct TokioEngine;
 #[cfg(feature = "tokio")]
 impl Engine for TokioEngine {
     type ClientState = magnetar_runtime_tokio::Client;
+    type TaskHandle = tokio::task::JoinHandle<()>;
+    type Interval = tokio::time::Interval;
 
     fn name() -> &'static str {
         "tokio"
+    }
+
+    fn spawn<F>(fut: F) -> Self::TaskHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(fut)
+    }
+
+    fn abort_task(handle: &mut Self::TaskHandle) {
+        handle.abort();
+    }
+
+    fn new_interval(period: Duration) -> Self::Interval {
+        // tokio's `interval` fires immediately on the first tick; the
+        // ADR contract preserves that behaviour.
+        tokio::time::interval(period)
+    }
+
+    fn interval_tick<'a>(
+        interval: &'a mut Self::Interval,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            interval.tick().await;
+        })
     }
 }
 
@@ -114,9 +187,39 @@ impl<P: moonpool_core::Providers> Debug for MoonpoolEngine<P> {
 #[cfg(feature = "moonpool")]
 impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
     type ClientState = MoonpoolClientState;
+    // Under both TokioProviders and moonpool-sim's SimProviders the
+    // moonpool engine ultimately schedules onto tokio (determinism comes
+    // from substituting the providers, not from replacing tokio). The
+    // task handle and interval types are therefore the same tokio shapes
+    // as the TokioEngine — see ADR-0025 §Decision.
+    type TaskHandle = tokio::task::JoinHandle<()>;
+    type Interval = tokio::time::Interval;
 
     fn name() -> &'static str {
         "moonpool"
+    }
+
+    fn spawn<F>(fut: F) -> Self::TaskHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(fut)
+    }
+
+    fn abort_task(handle: &mut Self::TaskHandle) {
+        handle.abort();
+    }
+
+    fn new_interval(period: Duration) -> Self::Interval {
+        tokio::time::interval(period)
+    }
+
+    fn interval_tick<'a>(
+        interval: &'a mut Self::Interval,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            interval.tick().await;
+        })
     }
 }
 
@@ -181,5 +284,123 @@ mod tests {
         use moonpool_core::TokioProviders;
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MoonpoolEngine<TokioProviders>>();
+    }
+
+    // -------------------------------------------------------------
+    // ADR-0025 phase 1: task + timer primitive smoke tests. One pair
+    // per engine — keeps the per-engine test count balanced even
+    // though the new primitives don't yet have façade callers.
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tokio_engine_spawn_and_abort_round_trip() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let handle = <TokioEngine as Engine>::spawn(async move {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        // Drive the spawned task once.
+        tokio::task::yield_now().await;
+        // Awaiting the JoinHandle works on a non-aborted task.
+        handle.await.expect("spawned task ran to completion");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Spawn a second task that we abort before it can increment.
+        let c2 = counter.clone();
+        let mut handle2 = <TokioEngine as Engine>::spawn(async move {
+            // Sleep forever — abort wins.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        <TokioEngine as Engine>::abort_task(&mut handle2);
+        // Second abort is a no-op.
+        <TokioEngine as Engine>::abort_task(&mut handle2);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "aborted task must not run its body",
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tokio_engine_interval_first_tick_is_immediate() {
+        use std::time::Duration;
+
+        let mut interval = <TokioEngine as Engine>::new_interval(Duration::from_secs(10));
+        let start = tokio::time::Instant::now();
+        <TokioEngine as Engine>::interval_tick(&mut interval).await;
+        // First tick fires immediately per the tokio interval contract.
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(start),
+            Duration::ZERO,
+            "first interval tick must fire immediately on tokio",
+        );
+        // Second tick waits for the period.
+        <TokioEngine as Engine>::interval_tick(&mut interval).await;
+        assert!(
+            tokio::time::Instant::now().duration_since(start) >= Duration::from_secs(10),
+            "second tick must wait one period",
+        );
+    }
+
+    #[cfg(feature = "moonpool")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn moonpool_engine_spawn_and_abort_round_trip() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use moonpool_core::TokioProviders;
+
+        type E = MoonpoolEngine<TokioProviders>;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let handle = <E as Engine>::spawn(async move {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        handle.await.expect("spawned task ran to completion");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let c2 = counter.clone();
+        let mut handle2 = <E as Engine>::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        <E as Engine>::abort_task(&mut handle2);
+        <E as Engine>::abort_task(&mut handle2);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "aborted task must not run its body",
+        );
+    }
+
+    #[cfg(feature = "moonpool")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn moonpool_engine_interval_first_tick_is_immediate() {
+        use std::time::Duration;
+
+        use moonpool_core::TokioProviders;
+
+        type E = MoonpoolEngine<TokioProviders>;
+
+        let mut interval = <E as Engine>::new_interval(Duration::from_secs(10));
+        let start = tokio::time::Instant::now();
+        <E as Engine>::interval_tick(&mut interval).await;
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(start),
+            Duration::ZERO,
+            "first interval tick must fire immediately on moonpool",
+        );
+        <E as Engine>::interval_tick(&mut interval).await;
+        assert!(
+            tokio::time::Instant::now().duration_since(start) >= Duration::from_secs(10),
+            "second tick must wait one period",
+        );
     }
 }
