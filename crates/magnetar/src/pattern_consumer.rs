@@ -35,17 +35,25 @@ use parking_lot::Mutex;
 use crate::PulsarClient;
 use crate::client::PulsarError;
 
-/// Regex-pattern consumer. Holds one [`Consumer`] per matching topic and reconciles the set
+/// Regex-pattern consumer. Holds one consumer per matching topic and reconciles the set
 /// against PIP-145 deltas on `update()`.
+///
+/// Phantom-generic over `C: ConsumerApi` per ADR-0026 §D1 — type
+/// parameter present (defaulting to
+/// `magnetar_runtime_tokio::Consumer`) with the inherent impl
+/// bound to the default. Full impl-body lift is blocked on
+/// `ConsumerBuilder` becoming engine-aware (the reconciliation
+/// loop calls `client.consumer(topic).subscribe()` to subscribe
+/// newly-discovered topics).
 #[derive(Debug)]
-pub struct PatternConsumer {
-    inner: Arc<Inner>,
+pub struct PatternConsumer<C: crate::ConsumerApi = Consumer> {
+    inner: Arc<Inner<C>>,
 }
 
 #[derive(Debug)]
-struct Inner {
+struct Inner<C: crate::ConsumerApi = Consumer> {
     /// Active consumer set, keyed by topic name.
-    consumers: Mutex<Vec<NamedConsumer>>,
+    consumers: Mutex<Vec<NamedConsumer<C>>>,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
@@ -127,9 +135,9 @@ impl ConsumerTemplate {
 }
 
 #[derive(Debug, Clone)]
-struct NamedConsumer {
+struct NamedConsumer<C: crate::ConsumerApi = Consumer> {
     topic: String,
-    consumer: Consumer,
+    consumer: C,
 }
 
 /// A message yielded by [`PatternConsumer::receive`], carrying the topic it came from.
