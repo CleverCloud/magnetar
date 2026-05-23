@@ -314,6 +314,12 @@ pub trait ProducerApi: 'static + Send + Sync {
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
     where
         Self: Sized;
+
+    /// Wall-clock timestamp of the last broker disconnection observed
+    /// by this producer's connection, or `None` if no disconnect has
+    /// happened yet. Mirrors Java
+    /// `Producer#getLastDisconnectedTimestamp`.
+    fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime>;
 }
 
 /// Pulsar consumer wire surface — implemented by each runtime on its
@@ -458,6 +464,10 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
 
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(magnetar_runtime_tokio::Producer::close(self))
+    }
+
+    fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        magnetar_runtime_tokio::Producer::last_disconnected_timestamp(self)
     }
 }
 
@@ -605,6 +615,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
 
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(magnetar_runtime_moonpool::Producer::close(self))
+    }
+
+    fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        magnetar_runtime_moonpool::Producer::last_disconnected_timestamp(self)
     }
 }
 

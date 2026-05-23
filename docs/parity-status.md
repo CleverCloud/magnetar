@@ -27,7 +27,8 @@ follow-up train; the gap is tracked below.
 | `AutoClusterFailover` (PIP-121 with `HealthProbe`) | ✅ | ✅ |
 | PIP-188 `TOPIC_MIGRATED` → reconnect ([ADR-0018](../specs/adr/0018-pip-188-reconnect-on-migrate.md)) | ✅ | ✅ |
 | Generic `PulsarClient<E: Engine>` ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)) | ✅ | ✅ |
-| Partitioned producer / consumer | ✅ | ❌ |
+| Partitioned producer | ✅ | ✅ (engine-generic; tokio-only `refresh_partitions` + batch counters on specialisation) |
+| Partitioned consumer | ✅ | ❌ |
 | MultiTopicsConsumer | ✅ | ❌ |
 | PatternConsumer (PIP-145) | ✅ | ❌ |
 | Reader | ✅ | ✅ |

@@ -41,12 +41,12 @@ pub enum MessageRoutingMode {
 /// Partitioned-producer-bound counterpart to [`crate::MessageBuilder`]. Same chained
 /// setters; the terminal `.send().await` resolves the partition and dispatches.
 #[derive(Debug)]
-pub struct PartitionedMessageBuilder<'a> {
-    producer: &'a PartitionedProducer,
+pub struct PartitionedMessageBuilder<'a, P: crate::ProducerApi = Producer> {
+    producer: &'a PartitionedProducer<P>,
     msg: OutgoingMessage,
 }
 
-impl PartitionedMessageBuilder<'_> {
+impl<P: crate::ProducerApi> PartitionedMessageBuilder<'_, P> {
     /// See [`OutgoingMessage::key`].
     #[must_use]
     pub fn key(mut self, key: impl Into<String>) -> Self {
@@ -412,7 +412,7 @@ fn spawn_auto_update_task(
     })
 }
 
-impl PartitionedProducer {
+impl<P: crate::ProducerApi> PartitionedProducer<P> {
     /// Base topic name (without the `-partition-N` suffix).
     #[must_use]
     pub fn topic(&self) -> &str {
@@ -425,10 +425,10 @@ impl PartitionedProducer {
         self.partitions.len()
     }
 
-    /// Borrow the underlying per-partition [`Producer`]s. Useful for advanced operations
+    /// Borrow the underlying per-partition producers. Useful for advanced operations
     /// like per-partition flush.
     #[must_use]
-    pub fn child_producers(&self) -> &[Producer] {
+    pub fn child_producers(&self) -> &[P] {
         &self.partitions
     }
 
@@ -436,12 +436,16 @@ impl PartitionedProducer {
     /// [`MessageRoutingMode`] (or the custom `MessageRouter` when one was installed on the
     /// builder). Returns the broker-assigned message id (the routing layer is transparent
     /// — the id has a `partition` filled in by the broker).
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified from the runtime's `ProducerApi::Error`) on wire
+    ///   failure.
     pub async fn send(&self, msg: OutgoingMessage) -> Result<MessageId, PulsarError> {
         let idx = self.pick_partition(&msg);
         let producer = &self.partitions[idx];
-        let proto_msg: magnetar_proto::producer::OutgoingMessage = msg.into();
-        let id = producer.send(proto_msg).await?;
-        Ok(id)
+        crate::ProducerApi::send(producer, msg)
+            .await
+            .map_err(|err| PulsarError::Other(format!("send: {err}")))
     }
 
     /// Start a Java-symmetric `MessageBuilder` chain that ends with `.send().await`. The
@@ -449,7 +453,7 @@ impl PartitionedProducer {
     /// `.key(..)` participates in `MessageRoutingMode::KeyHashOrRoundRobin` and any
     /// installed `MessageRouter` sees the full message.
     #[must_use]
-    pub fn new_message(&self) -> PartitionedMessageBuilder<'_> {
+    pub fn new_message(&self) -> PartitionedMessageBuilder<'_, P> {
         PartitionedMessageBuilder {
             producer: self,
             msg: OutgoingMessage::default(),
@@ -496,7 +500,7 @@ impl PartitionedProducer {
     pub fn aggregate_stats(&self) -> magnetar_proto::ProducerStats {
         let mut agg = magnetar_proto::ProducerStats::default();
         for p in &self.partitions {
-            let s = p.stats();
+            let s = crate::ProducerApi::stats(p);
             agg.total_msgs_sent = agg.total_msgs_sent.saturating_add(s.total_msgs_sent);
             agg.total_bytes_sent = agg.total_bytes_sent.saturating_add(s.total_bytes_sent);
             agg.total_send_failed = agg.total_send_failed.saturating_add(s.total_send_failed);
@@ -509,13 +513,16 @@ impl PartitionedProducer {
     }
 
     /// Close every child producer. Returns the first error encountered.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified) on the first child failure.
     pub async fn close(self) -> Result<(), PulsarError> {
         let mut first_err: Result<(), PulsarError> = Ok(());
         for p in self.partitions {
-            if let Err(e) = p.close().await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = crate::ProducerApi::close_owned(p).await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("close: {e}")));
             }
         }
         first_err
@@ -524,13 +531,16 @@ impl PartitionedProducer {
     /// Flush every child producer in parallel. Mirrors Java
     /// `Producer#flushAsync` semantics — resolves once each per-partition pending queue
     /// drains. Returns the first error encountered.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified) on the first child failure.
     pub async fn flush(&self) -> Result<(), PulsarError> {
         let mut first_err: Result<(), PulsarError> = Ok(());
         for p in &self.partitions {
-            if let Err(e) = p.flush().await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = crate::ProducerApi::flush(p).await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("flush: {e}")));
             }
         }
         first_err
@@ -541,9 +551,7 @@ impl PartitionedProducer {
     /// partition's underlying producer is connected.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.partitions
-            .iter()
-            .all(magnetar_runtime_tokio::Producer::is_connected)
+        self.partitions.iter().all(crate::ProducerApi::is_connected)
     }
 
     /// Earliest wall-clock disconnect timestamp across all child producers, or `None` if
@@ -553,7 +561,7 @@ impl PartitionedProducer {
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         self.partitions
             .iter()
-            .filter_map(magnetar_runtime_tokio::Producer::last_disconnected_timestamp)
+            .filter_map(crate::ProducerApi::last_disconnected_timestamp)
             .min()
     }
 
@@ -562,9 +570,7 @@ impl PartitionedProducer {
     /// only flips after a terminal close, not on transient disconnects.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.partitions
-            .iter()
-            .all(magnetar_runtime_tokio::Producer::is_closed)
+        self.partitions.iter().all(crate::ProducerApi::is_closed)
     }
 
     /// Max `last_sequence_id` across every child producer (i.e. the largest sequence id
@@ -575,48 +581,9 @@ impl PartitionedProducer {
     pub fn last_sequence_id(&self) -> i64 {
         self.partitions
             .iter()
-            .map(magnetar_runtime_tokio::Producer::last_sequence_id)
+            .map(crate::ProducerApi::last_sequence_id)
             .max()
             .unwrap_or(-1)
-    }
-
-    /// Max `last_sequence_id_published` across every child producer. Returns `-1` when no
-    /// partition has been acknowledged yet. Mirrors Java
-    /// `Producer#getLastSequenceIdPublished` aggregated.
-    #[must_use]
-    pub fn last_sequence_id_published(&self) -> i64 {
-        self.partitions
-            .iter()
-            .map(magnetar_runtime_tokio::Producer::last_sequence_id_published)
-            .max()
-            .unwrap_or(-1)
-    }
-
-    /// Sum of in-flight sends across every child producer.
-    #[must_use]
-    pub fn pending_count(&self) -> usize {
-        self.partitions
-            .iter()
-            .map(magnetar_runtime_tokio::Producer::pending_count)
-            .sum()
-    }
-
-    /// Sum of batch-buffered messages across every child producer.
-    #[must_use]
-    pub fn batch_len(&self) -> usize {
-        self.partitions
-            .iter()
-            .map(magnetar_runtime_tokio::Producer::batch_len)
-            .sum()
-    }
-
-    /// Sum of batch-buffered payload bytes across every child producer.
-    #[must_use]
-    pub fn batch_bytes(&self) -> usize {
-        self.partitions
-            .iter()
-            .map(magnetar_runtime_tokio::Producer::batch_bytes)
-            .sum()
     }
 
     /// Returns `true` if a background partition-watcher was spawned for this
@@ -660,6 +627,54 @@ impl PartitionedProducer {
     #[must_use]
     pub fn partitions_changed_notify(&self) -> Option<Arc<Notify>> {
         self.auto_update.as_ref().map(|t| t.changed.clone())
+    }
+}
+
+/// Tokio-engine-specific `PartitionedProducer` methods that depend on
+/// either (a) `PulsarClient<TokioEngine>` (e.g. `refresh_partitions`
+/// which calls `client.partitions_for_topic`) or (b) Producer helpers
+/// not yet on `ProducerApi` (`last_sequence_id_published`,
+/// `batch_len`, `batch_bytes`, `pending_count`). Each of these
+/// methods can be lifted once the matching helper lands on
+/// `ProducerApi` / a future `EngineClient` trait.
+impl PartitionedProducer<Producer> {
+    /// Max `last_sequence_id_published` across every child producer. Returns `-1` when no
+    /// partition has been acknowledged yet. Mirrors Java
+    /// `Producer#getLastSequenceIdPublished` aggregated.
+    #[must_use]
+    pub fn last_sequence_id_published(&self) -> i64 {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::last_sequence_id_published)
+            .max()
+            .unwrap_or(-1)
+    }
+
+    /// Sum of in-flight sends across every child producer.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::pending_count)
+            .sum()
+    }
+
+    /// Sum of batch-buffered messages across every child producer.
+    #[must_use]
+    pub fn batch_len(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::batch_len)
+            .sum()
+    }
+
+    /// Sum of batch-buffered payload bytes across every child producer.
+    #[must_use]
+    pub fn batch_bytes(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(magnetar_runtime_tokio::Producer::batch_bytes)
+            .sum()
     }
 
     /// Query the broker for the current partition count of the topic this producer

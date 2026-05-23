@@ -145,6 +145,15 @@ impl<P: Providers> Producer<P> {
         self.shared.inner.lock().is_connected()
     }
 
+    /// Wall-clock timestamp of the last broker disconnection
+    /// observed by this connection, or `None` if no disconnect has
+    /// happened yet. Mirrors Java
+    /// `Producer#getLastDisconnectedTimestamp`.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.shared.inner.lock().last_disconnected_timestamp()
+    }
+
     /// Number of in-flight sends (queued and not yet acked by the broker).
     /// Mirrors the un-batched view of Java
     /// `ProducerStats#getPendingQueueSize`.
