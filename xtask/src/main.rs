@@ -133,9 +133,7 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
         Cmd::CheckSimCoverage { base } => check_sim_coverage(&base),
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
-        Cmd::VendorProto { rev, source: _ } => {
-            bail!("xtask vendor-proto: not implemented yet (lands in M1). Requested rev: {rev}");
-        }
+        Cmd::VendorProto { rev, source } => vendor_proto(&rev, source.as_deref()),
     }
 }
 
@@ -1067,4 +1065,197 @@ fn check_runtime_test_parity() -> Result<()> {
         "xtask check-runtime-test-parity: tokio={tokio_count} moonpool={moonpool_count} (parity ok)."
     );
     Ok(())
+}
+
+/// Files to copy from upstream into `crates/magnetar-proto/proto/`.
+/// Upstream path is `pulsar-common/src/main/proto/{name}`; local
+/// path is `crates/magnetar-proto/proto/{name}`. Update this list
+/// only when upstream adds or removes a load-bearing `.proto` file.
+const VENDORED_PROTOS: &[&str] = &["PulsarApi.proto", "PulsarMarkers.proto"];
+
+/// Refresh `crates/magnetar-proto/proto/{PulsarApi,PulsarMarkers}.proto`
+/// from `apache/pulsar` at the given commit SHA, then rerun codegen.
+///
+/// `source` is an optional local clone of `apache/pulsar`. When `None`,
+/// the helper shells out to `git clone --filter=blob:none --depth 1
+/// --branch <rev>` into a tempdir. When `Some`, the helper runs
+/// `git -C <source> fetch && git -C <source> checkout <rev>` and copies
+/// from there — useful when the operator already has a clone and wants
+/// to avoid the round-trip.
+///
+/// The function:
+///
+/// 1. Fetches the upstream tree at `rev`.
+/// 2. Copies each file in [`VENDORED_PROTOS`] into the local `crates/magnetar-proto/proto/`
+///    directory.
+/// 3. Rewrites `crates/magnetar-proto/proto/SOURCE` with the new commit SHA + date pulled from `git
+///    show -s --format=%ci`.
+/// 4. Re-runs `codegen` (without `--check`) so the generated `pb/` directory reflects the new
+///    proto.
+///
+/// The caller is expected to `git add` the resulting changes, review
+/// them, and commit. The function does NOT commit on its own.
+///
+/// # Errors
+/// Bubbles up any `git` / `fs::copy` / codegen failure with context.
+fn vendor_proto(rev: &str, source: Option<&Path>) -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let proto_dir = proto_dir()?;
+    if !proto_dir.exists() {
+        bail!(
+            "proto/ directory missing at {}; nothing to refresh",
+            proto_dir.display()
+        );
+    }
+
+    // 1. Resolve the upstream source — either user-supplied or a fresh shallow clone.
+    let (source_root, _scratch) = if let Some(local) = source {
+        ensure_git_clean(local)?;
+        run_git_in(local, &["fetch", "origin", rev])?;
+        run_git_in(local, &["checkout", rev])?;
+        (local.to_path_buf(), None)
+    } else {
+        let scratch = tempfile::tempdir().context("creating tempdir for upstream clone")?;
+        let scratch_root = scratch.path().to_path_buf();
+        eprintln!(
+            "xtask vendor-proto: cloning apache/pulsar @ {rev} into {}",
+            scratch_root.display()
+        );
+        let scratch_str = scratch_root
+            .to_str()
+            .ok_or_else(|| anyhow!("scratch tempdir path is not valid UTF-8"))?;
+        run_git_in(
+            Path::new("."),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                "https://github.com/apache/pulsar.git",
+                scratch_str,
+            ],
+        )?;
+        run_git_in(&scratch_root, &["fetch", "origin", rev])?;
+        run_git_in(&scratch_root, &["checkout", rev])?;
+        (scratch_root, Some(scratch))
+    };
+
+    // 2. Copy each vendored proto file.
+    let upstream_proto_dir = source_root.join("pulsar-common/src/main/proto");
+    if !upstream_proto_dir.exists() {
+        bail!(
+            "upstream proto dir missing at {} — wrong commit?",
+            upstream_proto_dir.display()
+        );
+    }
+    for name in VENDORED_PROTOS {
+        let src = upstream_proto_dir.join(name);
+        let dst = proto_dir.join(name);
+        if !src.exists() {
+            bail!(
+                "upstream is missing {} at commit {rev}; refusing to drop the local copy",
+                src.display()
+            );
+        }
+        fs::copy(&src, &dst)
+            .with_context(|| format!("copying {} → {}", src.display(), dst.display()))?;
+        eprintln!(
+            "xtask vendor-proto: copied {} ({} bytes)",
+            name,
+            fs::metadata(&dst).map_or(0, |m| m.len())
+        );
+    }
+
+    // 3. Refresh proto/SOURCE with the new commit + date. Use `%cs` (committer short ISO date,
+    //    YYYY-MM-DD) to match the format of the existing SOURCE file. Avoid `%ci` — that adds a
+    //    time and zone.
+    let resolved_rev = run_git_in_capture(&source_root, &["rev-parse", rev])?
+        .trim()
+        .to_owned();
+    let date = run_git_in_capture(&source_root, &["show", "-s", "--format=%cs", &resolved_rev])?
+        .trim()
+        .to_owned();
+    let source_path = proto_dir.join("SOURCE");
+    let source_contents = format!(
+        "Vendored from apache/pulsar:\n\
+         \n  \
+         Repository: https://github.com/apache/pulsar\n  \
+         Commit:     {resolved_rev}\n  \
+         Date:       {date}\n  \
+         Files:      pulsar-common/src/main/proto/PulsarApi.proto\n              \
+         pulsar-common/src/main/proto/PulsarMarkers.proto\n\
+         \nRefresh by running:\n\
+         \n  \
+         cargo run -p xtask -- vendor-proto --rev <sha>\n  \
+         cargo run -p xtask -- codegen\n\
+         \nDo not hand-edit. Upstream license: Apache-2.0.\n"
+    );
+    fs::write(&source_path, source_contents)
+        .with_context(|| format!("writing {}", source_path.display()))?;
+
+    // 4. Rerun codegen so the generated `pb/` reflects the new proto.
+    eprintln!("xtask vendor-proto: regenerating pb/ via codegen");
+    codegen(false)?;
+
+    eprintln!(
+        "xtask vendor-proto: done. Review `git diff -- crates/magnetar-proto/` and commit \
+         with a message naming the upstream commit + the feature it unblocks. \
+         Workspace root: {}",
+        workspace_root.display()
+    );
+    Ok(())
+}
+
+fn ensure_git_clean(repo: &Path) -> Result<()> {
+    let output = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("`git status` in {}", repo.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`git status` failed in {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !output.stdout.is_empty() {
+        bail!(
+            "{} has uncommitted changes; refusing to overwrite",
+            repo.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_git_in(repo: &Path, args: &[&str]) -> Result<()> {
+    let status = StdCommand::new("git")
+        .args(args)
+        .current_dir(repo)
+        .status()
+        .with_context(|| format!("`git {}` in {}", args.join(" "), repo.display()))?;
+    if !status.success() {
+        bail!(
+            "`git {}` in {} exited with {status}",
+            args.join(" "),
+            repo.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_git_in_capture(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = StdCommand::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("`git {}` in {}", args.join(" "), repo.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`git {}` in {} failed: {}",
+            args.join(" "),
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

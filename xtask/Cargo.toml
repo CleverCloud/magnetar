@@ -17,3 +17,4 @@ workspace = true
 anyhow      = { workspace = true }
 clap        = { workspace = true }
 prost-build = { workspace = true }
+tempfile    = { workspace = true }
