@@ -264,9 +264,19 @@ where
 }
 
 /// Partition-aware producer.
+///
+/// Phantom-generic over `P: ProducerApi` per ADR-0026 §D1 — the
+/// type parameter is present (defaulting to
+/// `magnetar_runtime_tokio::Producer`) but the inherent impl is
+/// currently bound to the default. Full lift of the inherent impl to
+/// `impl<P: ProducerApi> PartitionedProducer<P>` is queued in
+/// `docs/follow-ups.md`; this commit only widens the trait surface
+/// (`ProducerApi::stats` + `ProducerApi::close_owned`) so the
+/// follow-up can dispatch the `send` / `flush` / `close` / `stats`
+/// method bodies through the trait without further trait churn.
 #[derive(Debug)]
-pub struct PartitionedProducer {
-    partitions: Vec<Producer>,
+pub struct PartitionedProducer<P: crate::ProducerApi = Producer> {
+    partitions: Vec<P>,
     base_topic: String,
     routing: MessageRoutingMode,
     /// Optional custom router. When set, takes precedence over [`Self::routing`] for
@@ -967,7 +977,7 @@ mod tests {
 
     #[test]
     fn key_hash_is_deterministic_and_round_robin_advances() {
-        let pp = PartitionedProducer {
+        let pp: PartitionedProducer = PartitionedProducer {
             partitions: Vec::new(),
             base_topic: "t".into(),
             routing: MessageRoutingMode::KeyHashOrRoundRobin,

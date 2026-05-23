@@ -299,6 +299,21 @@ pub trait ProducerApi: 'static + Send + Sync {
         &self,
         version: Option<Vec<u8>>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>;
+
+    /// Cumulative producer-side counters. Mirrors Java
+    /// `Producer#getStats`. Returns a zeroed snapshot if the
+    /// producer handle is no longer registered.
+    fn stats(&self) -> magnetar_proto::producer::ProducerStats;
+
+    /// Consume the producer and tear down the broker-side resource
+    /// (`CommandCloseProducer`). Mirrors Java `Producer#close`.
+    /// Both runtime types implement close by consuming `self`; the
+    /// trait exposes the same shape so generic façade surfaces (e.g.
+    /// `PartitionedProducer<P>::close`) can fan out closes over a
+    /// `Vec<P>`.
+    fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
+    where
+        Self: Sized;
 }
 
 /// Pulsar consumer wire surface — implemented by each runtime on its
@@ -435,6 +450,14 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
     {
         Box::pin(magnetar_runtime_tokio::Producer::get_schema(self, version))
+    }
+
+    fn stats(&self) -> magnetar_proto::producer::ProducerStats {
+        magnetar_runtime_tokio::Producer::stats(self)
+    }
+
+    fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(magnetar_runtime_tokio::Producer::close(self))
     }
 }
 
@@ -574,6 +597,14 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
         Box::pin(magnetar_runtime_moonpool::Producer::get_schema(
             self, version,
         ))
+    }
+
+    fn stats(&self) -> magnetar_proto::producer::ProducerStats {
+        magnetar_runtime_moonpool::Producer::stats(self)
+    }
+
+    fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(magnetar_runtime_moonpool::Producer::close(self))
     }
 }
 
