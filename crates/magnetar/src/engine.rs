@@ -102,6 +102,137 @@ pub trait Engine: 'static + Send + Sync + Debug {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
+// ---------------------------------------------------------------------------
+// Per-surface extension traits — ADR-0026 §D1.
+//
+// The Engine trait stays at ADR-0025 phase 1 (task + timer primitives).
+// Each Pulsar surface family (transactions, reader, typed schemas, …)
+// instead defines its own extension trait implemented by each runtime
+// on its `Client` type. The façade then writes
+//   `impl<E: Engine> PulsarClient<E> where E::ClientState: TransactionApi`
+// and dispatches via `<E::ClientState as TransactionApi>::method(...)`.
+//
+// Why an extension trait, not a method on `Engine`:
+//   - Engine primitives are bounded (spawn / timer / clock).
+//   - Surface families grow with each PIP — putting them on `Engine` would mean every engine grows
+//     with the Pulsar wire surface.
+//   - Each engine implements only the families it supports. Moonpool can land Transaction before
+//     TableView without the trait fattening.
+//
+// Sans-io: every trait method here returns a `Future` that resolves into
+// a broker round-trip; the I/O lives in the runtime crates that
+// implement these traits. `magnetar-proto` carries no `TransactionApi`
+// dep — the protocol-level handshakes (`CommandNewTxn` →
+// `CommandNewTxnResponse`, etc.) already live on `Connection` and are
+// called via `shared.inner.lock(); conn.new_txn(...)` from inside the
+// runtime impl. The trait surface stays free of tokio / mio / socket
+// types. See [ADR-0004](../../specs/adr/0004-sans-io-protocol-core.md).
+// ---------------------------------------------------------------------------
+
+/// Pulsar transactions (PIP-31) — implemented by each runtime on its
+/// `Client` type. Phase 1 of the D1 lift train.
+///
+/// The façade's [`crate::PulsarClient::new_transaction`] +
+/// `commit_transaction` / `abort_transaction` + the two `register_*`
+/// methods dispatch through this trait once
+/// [`crate::PulsarClient<E>`]'s impl block carries the
+/// `where E::ClientState: TransactionApi` bound. Subsequent surface
+/// lifts (`Reader`, `TypedSchemas`, `TableView`, …) follow the same
+/// template — one extension trait per family.
+///
+/// **Sans-io.** Methods are `async fn` returning `impl Future + Send +
+/// '_`; no tokio / mio / socket types appear in the trait surface. The
+/// runtime impl is responsible for driving the
+/// [`magnetar_proto::Connection`] state machine and waking its driver.
+///
+/// See [ADR-0026](../../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+/// §D1 for the rationale (concrete-generic surfaces over GATs).
+pub trait TransactionApi {
+    /// Error surfaced by the runtime when a TC round-trip fails.
+    /// Each runtime maps this onto its own client-error variant.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Open a new transaction at the broker-side transaction coordinator
+    /// (`CommandNewTxn` → `CommandNewTxnResponse`). Returns the TC-assigned
+    /// [`magnetar_proto::TxnId`] on success.
+    fn new_txn(
+        &self,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnId, Self::Error>> + Send + '_>>;
+
+    /// Register a partition that the given transaction will write to
+    /// (`CommandAddPartitionToTxn` → `CommandAddPartitionToTxnResponse`).
+    fn add_partition_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Register a subscription that the given transaction will
+    /// acknowledge on
+    /// (`CommandAddSubscriptionToTxn` → `CommandAddSubscriptionToTxnResponse`).
+    fn add_subscription_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: String,
+        subscription: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Commit or abort an open transaction
+    /// (`CommandEndTxn` → `CommandEndTxnResponse`). Returns the final
+    /// transaction state reported by the TC.
+    fn end_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnState, Self::Error>> + Send + '_>>;
+}
+
+#[cfg(feature = "tokio")]
+impl TransactionApi for magnetar_runtime_tokio::Client {
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn new_txn(
+        &self,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnId, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Client::new_txn(self, timeout))
+    }
+
+    fn add_partition_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Client::add_partition_to_txn(
+            self, txn, topic,
+        ))
+    }
+
+    fn add_subscription_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: String,
+        subscription: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Client::add_subscription_to_txn(
+            self,
+            txn,
+            topic,
+            subscription,
+        ))
+    }
+
+    fn end_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnState, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_tokio::Client::end_txn(self, txn, action))
+    }
+}
+
 /// Zero-sized marker for the tokio production engine. Default `E` on
 /// [`crate::PulsarClient<E>`].
 ///

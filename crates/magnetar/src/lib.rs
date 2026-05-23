@@ -58,11 +58,11 @@ pub use magnetar_runtime_moonpool as runtime_moonpool;
 pub use magnetar_runtime_tokio as runtime_tokio;
 
 mod engine;
-pub use engine::Engine;
 #[cfg(feature = "moonpool")]
 pub use engine::MoonpoolEngine;
 #[cfg(feature = "tokio")]
 pub use engine::TokioEngine;
+pub use engine::{Engine, TransactionApi};
 
 #[cfg(feature = "tokio")]
 mod client;
@@ -135,5 +135,24 @@ mod tests {
     #[test]
     fn builder_compiles() {
         let _ = crate::PulsarClient::builder().service_url("pulsar://localhost:6650");
+    }
+
+    /// Compile-time witness that the [`crate::TransactionApi`] trait is
+    /// object-safe-compatible (all methods return `Pin<Box<dyn Future + Send>>`)
+    /// AND that
+    /// [`magnetar_runtime_tokio::Client`] satisfies the bound. Both
+    /// properties are load-bearing for the D1 façade lift; if either
+    /// regresses the generic `impl<E: Engine> PulsarClient<E> where
+    /// E::ClientState: TransactionApi` will fail to compile. Runs at
+    /// compile time only — no broker round-trip, no I/O.
+    #[cfg(feature = "tokio")]
+    fn assert_transaction_api_bound<T: crate::TransactionApi>() {}
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn transaction_api_is_implemented_by_tokio_client() {
+        // Statically assert the bound; this entire function body is
+        // dead at runtime — the assertion fires at typeck.
+        assert_transaction_api_bound::<magnetar_runtime_tokio::Client>();
     }
 }
