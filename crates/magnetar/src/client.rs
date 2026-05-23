@@ -791,24 +791,8 @@ impl PulsarClient<crate::TokioEngine> {
         self.memory_limit
     }
 
-    /// Open a `ProducerBuilder` for the given topic.
-    #[must_use]
-    pub fn producer(&self, topic: impl Into<String>) -> ProducerBuilder<'_> {
-        ProducerBuilder::new(self, topic.into())
-    }
-
-    /// Open a `ConsumerBuilder` for the given topic.
-    #[must_use]
-    pub fn consumer(&self, topic: impl Into<String>) -> ConsumerBuilder<'_> {
-        ConsumerBuilder::new(self, topic.into())
-    }
-
-    /// Open a [`ReaderBuilder`] for the given topic. A reader is a non-durable, exclusive
-    /// consumer with an auto-generated subscription — useful for log inspection and replay.
-    #[must_use]
-    pub fn reader(&self, topic: impl Into<String>) -> ReaderBuilder<'_> {
-        ReaderBuilder::new(self, topic.into())
-    }
+    // producer / consumer / reader are engine-generic — see the dedicated
+    // `impl<E: Engine> PulsarClient<E>` block below.
 
     /// Open a [`crate::TableViewBuilder`] for the given topic. A [`crate::TableView`] is a
     /// key/value snapshot built from a compacted topic — useful for config snapshots and
@@ -956,6 +940,30 @@ impl PulsarClient<crate::TokioEngine> {
     #[must_use]
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         self.inner.last_disconnected_timestamp()
+    }
+}
+
+impl<E: crate::Engine> PulsarClient<E> {
+    /// Open a [`ProducerBuilder`] for the given topic. Engine-generic — the
+    /// underlying transport is selected at construction time.
+    #[must_use]
+    pub fn producer(&self, topic: impl Into<String>) -> ProducerBuilder<'_, E> {
+        ProducerBuilder::new(self, topic.into())
+    }
+
+    /// Open a [`ConsumerBuilder`] for the given topic. Engine-generic — the
+    /// underlying transport is selected at construction time.
+    #[must_use]
+    pub fn consumer(&self, topic: impl Into<String>) -> ConsumerBuilder<'_, E> {
+        ConsumerBuilder::new(self, topic.into())
+    }
+
+    /// Open a [`ReaderBuilder`] for the given topic. A reader is a non-durable, exclusive
+    /// consumer with an auto-generated subscription — useful for log inspection and replay.
+    /// Engine-generic — the underlying transport is selected at construction time.
+    #[must_use]
+    pub fn reader(&self, topic: impl Into<String>) -> ReaderBuilder<'_, E> {
+        ReaderBuilder::new(self, topic.into())
     }
 }
 

@@ -1069,7 +1069,9 @@ mod tests {
     /// surface a [`ClientError::Other`] (the `Err` arm of the inner
     /// `match result {}`). We force the error by sending against an
     /// unregistered [`ProducerHandle`] — the proto layer rejects with
-    /// `ProtocolError::InvariantViolation("unknown producer handle")`.
+    /// `ProtocolError::InvariantViolation("unknown producer handle")`,
+    /// which the runtime wraps as `ClientError::Protocol(_)` along the
+    /// `Err` arm of [`super::SendFut::new`].
     #[tokio::test(flavor = "current_thread")]
     async fn producer_block_send_error_releases_reservation() {
         use std::future::Future as _;
@@ -1115,13 +1117,17 @@ mod tests {
         shared.release_memory(16);
         let outcome = Pin::new(&mut fut).poll(&mut cx);
         match outcome {
-            Poll::Ready(Err(ClientError::Other(msg))) => {
+            Poll::Ready(Err(ClientError::Protocol(
+                magnetar_proto::ProtocolError::InvariantViolation(msg),
+            ))) => {
                 assert!(
-                    msg.contains("send:"),
-                    "expected `send:` error prefix, got {msg:?}",
+                    msg.contains("unknown producer handle"),
+                    "expected `unknown producer handle` invariant, got {msg:?}",
                 );
             }
-            other => panic!("expected Ready(Err(Other(...))), got {other:?}"),
+            other => {
+                panic!("expected Ready(Err(Protocol(InvariantViolation(...)))), got {other:?}")
+            }
         }
         // The reservation must have been released along the error path.
         assert_eq!(
