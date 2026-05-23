@@ -73,43 +73,18 @@ See [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-re
 §D1 + [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
 §Consequences.
 
-#### First sub-PR — Transaction surface
+#### Landed — Transaction surface
 
-The Transaction token (`magnetar::Transaction`) is already 16-byte
-`Copy` plain data and engine-agnostic. The lift is the **methods
-that operate on it** (`new_transaction`, `register_partition_to_transaction`,
-`register_subscription_to_transaction`, `commit_transaction`,
-`abort_transaction`) — currently bound to `impl PulsarClient<TokioEngine>`
-via `runtime_client() -> &magnetar_runtime_tokio::Client`.
-
-The lift shape:
-
-1. Add a `magnetar::engine::TransactionApi` extension trait with five
-   async methods (mirroring the five façade methods). Implement it on
-   `magnetar_runtime_tokio::Client` (delegates to its existing inherent
-   methods) and on `magnetar_runtime_moonpool::Client` (ports the four
-   inherent methods from the tokio side, ~250 LOC: `new_txn`,
-   `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`). Both
-   implementations live in the runtime crates, not in `magnetar/`.
-2. Add `Engine::ClientState: TransactionApi` as a bound on the
-   `Engine` trait (no new associated type required — the bound is on
-   the existing `ClientState`).
-3. Rewrite the five `transaction.rs` methods to `impl<E: Engine>
-   PulsarClient<E>` and dispatch via `<E::ClientState as
-   TransactionApi>::method(...)`.
-4. Test layers per ADR-0024: proto-side TC round-trip already covered;
-   tokio runtime tests stay green by construction; moonpool runtime
-   adds four `tests/transaction_*.rs` files mirroring the existing
-   tokio txn tests; differential harness adds a `golden_transaction`
-   trace asserting commit-vs-abort wire equivalence.
-5. Flip the Transaction row in `docs/parity-status.md` from "moonpool
-   not wired" to "✅". Update `README.md` parity matrix.
-
-Subsequent sub-PRs (Reader → TypedSchemas → MultiTopicsConsumer →
-PartitionedProducer → PartitionedConsumer → PatternConsumer →
-TableView) follow the same template: one extension trait per family,
-implemented on each runtime's `Client`, dispatched via
-`<E::ClientState as Trait>::method`.
+`magnetar::Transaction` + `new_transaction` /
+`register_partition_to_transaction` /
+`register_subscription_to_transaction` / `commit_transaction` /
+`abort_transaction` lifted to `impl<E: Engine> PulsarClient<E>
+where E::ClientState: TransactionApi` in the D1 phase 2-4 commit.
+Both `PulsarClient<TokioEngine>` and
+`PulsarClient<MoonpoolEngine<P>>` carry the surface; parity-status
+flipped to ✅/✅; ADR-0024 test parity preserved (tokio=95
+moonpool=95, with 4 tokio + 4 moonpool + 1 magnetar-side compile-
+bound check added).
 
 #### Why an extension trait, not a method on `Engine`
 
@@ -120,10 +95,59 @@ on the engine trait would mean every engine grew a method per Pulsar
 PIP forever. An extension trait per surface family scales: each PIP
 adds at most one trait, each engine implements only the surfaces it
 supports, and the façade still gets `impl<E: Engine>` because the
-trait bound is `E::ClientState: TransactionApi + ReaderApi + ...`.
+trait bound is `E::ClientState: TransactionApi + ProducerApi + ...`.
+
+#### Next sub-PR — Producer + Consumer lift (prerequisite for the remaining seven surfaces)
+
+The remaining seven surfaces (Reader, TypedSchemas,
+MultiTopicsConsumer, PartitionedProducer, PartitionedConsumer,
+PatternConsumer, TableView) all hold concrete
+`magnetar_runtime_tokio::{Producer, Consumer}` instances. They
+cannot be lifted to `impl<E: Engine>` until Producer and Consumer
+themselves become engine-generic.
+
+The lift shape (applies to both Producer and Consumer):
+
+1. Define `magnetar::engine::ProducerApi` + `ConsumerApi` extension
+   traits carrying the wire-level round-trips the façade methods
+   consume (`send`, `receive`, `ack`, `ack_cumulative`, `flow`,
+   `seek`, `close`, `last_message_id`, `has_message_after`, …).
+   ~12–18 methods each.
+2. Implement on `magnetar_runtime_tokio::{Producer, Consumer}`
+   (delegate-only — methods exist) and on
+   `magnetar_runtime_moonpool::{Producer, Consumer}` (production
+   port; ~600–900 LOC per surface mirroring the tokio runtime's
+   send-loop and receive-slab mechanics over moonpool's
+   `ConnectionShared`).
+3. Add a façade-level `Producer<T = (), E: Engine>` /
+   `Consumer<T = (), E: Engine>` that holds
+   `<E::ClientState as ProducerApi>::Producer` /
+   `<E::ClientState as ConsumerApi>::Consumer` via the extension
+   trait's associated types and dispatches through them.
+4. Test layers per ADR-0024: 1:1 mirror tests on both runtime
+   crates plus a differential `golden_producer_consumer` trace
+   extending the existing differential broker.
+
+After Producer/Consumer land, the seven dependent surfaces lift
+mechanically — each becomes a thin façade over its
+`{Producer, Consumer}` plus a per-surface extension trait. Sub-PR
+order (each follows the same one-extension-trait-per-family template):
+
+1. **Producer + Consumer** (prerequisite for every other surface).
+2. **Reader** (holds a `Consumer`).
+3. **TypedSchemas** (`TypedProducer<T>` / `TypedConsumer<T>` — wrap
+   `Producer` / `Consumer` with a schema codec).
+4. **MultiTopicsConsumer** (holds a `Vec<Consumer>`).
+5. **PartitionedProducer** (holds a `Vec<Producer>` + a health loop
+   on `Engine::spawn` from ADR-0025 phase 1).
+6. **PartitionedConsumer** (holds a `Vec<Consumer>`).
+7. **PatternConsumer** (holds a `MultiTopicsConsumer` + a
+   reconciliation loop on `Engine::spawn`).
+8. **TableView** (holds a `Consumer` + a drain task on
+   `Engine::spawn`).
 
 ```text
-/goal lift the Transaction surface to `impl<E: Engine> PulsarClient<E>`. Phase 1: add `magnetar::engine::TransactionApi` extension trait with the five async methods. Phase 2: implement it on magnetar-runtime-tokio's Client (delegate-only — the inherent methods exist already) and on magnetar-runtime-moonpool's Client (port `new_txn` / `add_partition_to_txn` / `add_subscription_to_txn` / `end_txn` from the tokio side). Phase 3: rewrite `crates/magnetar/src/transaction.rs` to `impl<E: Engine + TransactionApi>` and route through the extension trait. Phase 4: test layers per ADR-0024 — 4 moonpool runtime tests mirroring the existing tokio ones, 1 differential golden trace `golden_transaction`. Phase 5: docs/parity-status.md row flip + README parity matrix update. Single PR; subsequent surface lifts follow the same template.
+/goal lift Producer + Consumer to impl<E: Engine + ProducerApi + ConsumerApi> PulsarClient<E>. Phase 1: define `magnetar::engine::{ProducerApi, ConsumerApi}` extension traits with associated `Producer` / `Consumer` types and ~12-18 methods each. Phase 2: implement on magnetar-runtime-tokio (delegate-only) and on magnetar-runtime-moonpool (full port: send-loop, receive-slab, ack pipeline, flow accounting, seek, close — ~600-900 LOC per surface). Phase 3: define façade `Producer<E: Engine>` / `Consumer<E: Engine>` types holding the associated-type instances; route the existing façade methods through them. Phase 4: ADR-0024 test layers — 4-8 mirror tests on each runtime side plus a `golden_producer_consumer` differential trace. Phase 5: docs/parity-status.md row flips + README parity matrix updates. After this lands, the seven follow-on surface lifts (Reader, TypedSchemas, MultiTopics, PartitionedProducer, PartitionedConsumer, PatternConsumer, TableView) become mechanical thin-façade wrappers over the lifted Producer/Consumer.
 ```
 
 ---

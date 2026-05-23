@@ -624,9 +624,13 @@ known-missing feature.
 
 - **Moonpool engine parity.** v0.1.0 Java parity is satisfied by
   the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
-  The façade surface bound to `PulsarClient<TokioEngine>` (partitioned,
-  multi-topics, pattern, reader, table-view, transactions, typed schemas)
-  does not yet compile against `PulsarClient<MoonpoolEngine<P>>`. See
+  Transactions (PIP-31) lifted to
+  `impl<E: Engine + TransactionApi> PulsarClient<E>` per ADR-0026
+  §D1 and work on both engines. The remaining façade surfaces bound
+  to `PulsarClient<TokioEngine>` (partitioned, multi-topics, pattern,
+  reader, table-view, typed schemas) hold concrete
+  `magnetar_runtime_tokio::{Producer, Consumer}` instances and are
+  blocked on a Producer/Consumer surface lift. See
   [`docs/parity-status.md`](docs/parity-status.md) and
   [`docs/follow-ups.md`](docs/follow-ups.md).
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180

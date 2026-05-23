@@ -32,7 +32,7 @@ follow-up train; the gap is tracked below.
 | PatternConsumer (PIP-145) | ✅ | ❌ |
 | Reader | ✅ | ❌ |
 | TableView | ✅ | ❌ |
-| Transactions (PIP-31) | ✅ | ❌ |
+| Transactions (PIP-31) | ✅ | ✅ |
 | Typed schemas | ✅ | ❌ |
 | Deterministic chaos pack | n/a | ✅ |
 | tokio ↔ moonpool differential equivalence harness | n/a | ✅ |
@@ -44,10 +44,16 @@ bundle. `TokioProviders` runs it against a real broker;
 ([`moonpool-engine.md`](moonpool-engine.md)).
 
 The façade surface bound to `PulsarClient<TokioEngine>` (partitioned,
-multi-topics, pattern, reader, table-view, transactions, typed schemas)
-does not compile under `PulsarClient<MoonpoolEngine<P>>`. Callers that
-reach for a tokio-only method on the moonpool engine get a trait-bound
-compile error, not a silent fallback — see ADR-0019 §Consequences.
+multi-topics, pattern, reader, table-view, typed schemas) does not
+yet compile under `PulsarClient<MoonpoolEngine<P>>`. Transactions
+(PIP-31) lifted to `impl<E: Engine + TransactionApi> PulsarClient<E>`
+in the D1 phase 2-4 commit (ADR-0026 §D1) and now work on both
+engines. The remaining surfaces are blocked on a Producer/Consumer
+lift to engine-generic types — they hold concrete
+`magnetar_runtime_tokio::{Producer, Consumer}` today. Callers that
+reach for a tokio-only method on the moonpool engine still get a
+trait-bound compile error, not a silent fallback — see ADR-0019
+§Consequences.
 
 ## Genuine deferred-scope items
 
