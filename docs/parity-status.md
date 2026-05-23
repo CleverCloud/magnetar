@@ -30,7 +30,7 @@ follow-up train; the gap is tracked below.
 | Partitioned producer / consumer | ✅ | ❌ |
 | MultiTopicsConsumer | ✅ | ❌ |
 | PatternConsumer (PIP-145) | ✅ | ❌ |
-| Reader | ✅ | ❌ |
+| Reader | ✅ | ✅ |
 | TableView | ✅ | ❌ |
 | Transactions (PIP-31) | ✅ | ✅ |
 | Typed schemas | ✅ | ❌ |
@@ -44,13 +44,16 @@ bundle. `TokioProviders` runs it against a real broker;
 ([`moonpool-engine.md`](moonpool-engine.md)).
 
 The façade surface bound to `PulsarClient<TokioEngine>` (partitioned,
-multi-topics, pattern, reader, table-view, typed schemas) does not
-yet compile under `PulsarClient<MoonpoolEngine<P>>`. Transactions
-(PIP-31) lifted to `impl<E: Engine + TransactionApi> PulsarClient<E>`
-in the D1 phase 2-4 commit (ADR-0026 §D1) and now work on both
-engines. The remaining surfaces are blocked on a Producer/Consumer
-lift to engine-generic types — they hold concrete
-`magnetar_runtime_tokio::{Producer, Consumer}` today. Callers that
+multi-topics, pattern, table-view, typed schemas) does not yet
+compile under `PulsarClient<MoonpoolEngine<P>>`. Transactions
+(PIP-31) and Reader lifted per ADR-0026 §D1 and work on both
+engines (Transaction via the `TransactionApi` extension trait;
+Reader via the `ConsumerApi` extension trait as
+`Reader<C: ConsumerApi>` with default `C = magnetar_runtime_tokio::Consumer`).
+The remaining five surfaces hold concrete
+`magnetar_runtime_tokio::{Producer, Consumer}` instances and need
+the same lift template: per-family extension trait + façade
+generic + per-runtime delegate. Callers that
 reach for a tokio-only method on the moonpool engine still get a
 trait-bound compile error, not a silent fallback — see ADR-0019
 §Consequences.
