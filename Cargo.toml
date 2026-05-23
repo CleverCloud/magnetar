@@ -113,6 +113,10 @@ rstest         = "0.21"
 proptest       = "1"
 tempfile       = "3"
 wiremock       = "0.6"
+# `async-trait` is needed by moonpool-sim's `Workload` trait, which uses
+# `#[async_trait(?Send)]`. Pinned to the major version moonpool-sim 0.6
+# transitively depends on.
+async-trait    = "0.1"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

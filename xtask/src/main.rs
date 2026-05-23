@@ -983,14 +983,31 @@ fn check_sim_coverage(base: &str) -> Result<()> {
     Ok(())
 }
 
+/// Files whose tests are intentionally one-sided per an ADR exception
+/// and so MUST be excluded from the runtime-test-parity count.
+///
+/// Each entry is `<crate>/<rel-path-from-crate-root>`. Add to this list
+/// only when the carve-out is justified in an ADR — e.g.
+/// `magnetar-runtime-moonpool/tests/sim_chaos.rs` is exempt per
+/// ADR-0026 §D2 (pure-sim chaos suite is engine-specific by design;
+/// the tokio engine has equivalent coverage via the differential
+/// broker tests in `magnetar-differential`).
+const PARITY_EXEMPT_FILES: &[&str] = &["magnetar-runtime-moonpool/tests/sim_chaos.rs"];
+
 /// Count test attributes (`#[test]`, `#[tokio::test]`, `#[moonpool::test]`)
 /// inside a crate's `src` and `tests` directories.
 ///
 /// Attributes are recognised by trimmed-line prefix. Composite attributes
 /// like `#[tokio::test(flavor = "multi_thread")]` are matched on the
-/// `#[tokio::test` prefix so they count once.
+/// `#[tokio::test` prefix so they count once. Files in
+/// [`PARITY_EXEMPT_FILES`] are skipped (see that constant for the rules
+/// around when a carve-out is justified).
 fn count_test_attributes(crate_root: &Path) -> Result<usize> {
     let mut total = 0usize;
+    let crate_name = crate_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     for subdir in ["src", "tests"] {
         let dir = crate_root.join(subdir);
         if !dir.exists() {
@@ -999,6 +1016,12 @@ fn count_test_attributes(crate_root: &Path) -> Result<usize> {
         visit(&dir, &mut |path, contents| {
             if path.extension().is_none_or(|ext| ext != "rs") {
                 return;
+            }
+            if let Ok(rel) = path.strip_prefix(crate_root) {
+                let key = format!("{crate_name}/{}", rel.display());
+                if PARITY_EXEMPT_FILES.iter().any(|exempt| *exempt == key) {
+                    return;
+                }
             }
             for line in contents.lines() {
                 let trimmed = line.trim_start();
