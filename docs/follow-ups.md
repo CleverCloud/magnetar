@@ -64,36 +64,45 @@ See [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-re
 §D1 + [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
 §Consequences.
 
-#### Landed — Transaction + Reader surfaces
+#### Landed — Transaction + Reader + TableView surfaces
 
 **Transaction (PIP-31).** `new_transaction` /
 `register_partition_to_transaction` /
 `register_subscription_to_transaction` / `commit_transaction` /
 `abort_transaction` lifted to `impl<E: Engine + TransactionApi>
-PulsarClient<E>` in the D1 phase 2-4 commit. Both
-`PulsarClient<TokioEngine>` and `PulsarClient<MoonpoolEngine<P>>`
-carry the surface.
+PulsarClient<E>`. Both `PulsarClient<TokioEngine>` and
+`PulsarClient<MoonpoolEngine<P>>` carry the surface.
 
 **Reader.** `Reader<C: ConsumerApi>` with default
 `C = magnetar_runtime_tokio::Consumer` (existing callers
 unchanged). Generic methods route through the trait;
 tokio-engine-specific methods (`read_next_with_timeout`,
 `read_next_fut`, `close`, `seek_to_earliest`) stay on the tokio
-specialisation. Moonpool callers name
-`Reader<magnetar_runtime_moonpool::Consumer<P>>`.
+specialisation.
+
+**TableView.** `TableView<C: ConsumerApi + Clone>` with the same
+default-type-arg pattern. The drain task uses `tokio::spawn`
+regardless of engine (per ADR-0025: both engines schedule on
+tokio; determinism comes from substituting providers, not from
+replacing the executor). `TableView::stats()`,
+`TableView::is_connected()`, `TableView::last_message_id()`
+dispatch through `ConsumerApi`.
 
 **Producer/Consumer extension traits.** `ProducerApi` + `ConsumerApi`
 defined in `magnetar::engine`, implemented by both runtimes on
-their `Producer<P>` / `Consumer<P>` types. Compile-time bound
-checks live in `magnetar/src/lib.rs` tests. The trait surface is
-intentionally minimum-viable today — `send` / `flush` /
-`is_closed` / `topic` / `name` / `last_sequence_id` for producers;
-`receive` / `ack` / `ack_cumulative` / `negative_ack` /
-`last_message_id` / `has_message_after` / `topic` / `subscription`
-/ `is_closed` for consumers. Additive growth as remaining surface
-lifts demand more methods.
+their `Producer<P>` / `Consumer<P>` types. Trait surface grew
+through the lift train; current methods:
 
-ADR-0024 test parity: tokio=95 moonpool=95 preserved.
+- `ProducerApi`: `send`, `flush`, `is_closed`, `is_connected`,
+  `topic`, `name`, `last_sequence_id`, `get_schema`.
+- `ConsumerApi`: `receive`, `ack`, `ack_cumulative`, `negative_ack`,
+  `last_message_id`, `has_message_after`, `get_schema`, `topic`,
+  `subscription`, `name`, `is_closed`, `is_connected`, `stats`.
+
+`magnetar_runtime_moonpool::Consumer` derives `Clone` (required by
+TableView). Compile-time bound checks live in
+`magnetar/src/lib.rs` tests. ADR-0024 test parity: tokio=95
+moonpool=95 preserved.
 
 #### Why an extension trait, not a method on `Engine`
 
@@ -106,11 +115,11 @@ adds at most one trait, each engine implements only the surfaces it
 supports, and the façade still gets `impl<E: Engine>` because the
 trait bound is `E::ClientState: TransactionApi + ProducerApi + ...`.
 
-#### Remaining surface lifts (5 of 7 left)
+#### Remaining surface lifts (4 of 7 left)
 
-The five remaining surfaces — TypedSchemas, MultiTopicsConsumer,
-PartitionedProducer, PartitionedConsumer, PatternConsumer, TableView
-— all hold concrete `magnetar_runtime_tokio::{Producer, Consumer}`
+The four remaining surfaces — TypedSchemas, MultiTopicsConsumer,
+PartitionedProducer, PartitionedConsumer, PatternConsumer — all
+hold concrete `magnetar_runtime_tokio::{Producer, Consumer}`
 today. Each lift follows the template Reader used:
 
 1. **Identify the extension-trait surface the lifted type needs.**

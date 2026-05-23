@@ -43,20 +43,27 @@ bundle. `TokioProviders` runs it against a real broker;
 `moonpool-sim`'s `SimProviders` runs it under deterministic seeds
 ([`moonpool-engine.md`](moonpool-engine.md)).
 
-The façade surface bound to `PulsarClient<TokioEngine>` (partitioned,
-multi-topics, pattern, table-view, typed schemas) does not yet
-compile under `PulsarClient<MoonpoolEngine<P>>`. Transactions
-(PIP-31) and Reader lifted per ADR-0026 §D1 and work on both
-engines (Transaction via the `TransactionApi` extension trait;
-Reader via the `ConsumerApi` extension trait as
-`Reader<C: ConsumerApi>` with default `C = magnetar_runtime_tokio::Consumer`).
-The remaining five surfaces hold concrete
+The façade surface bound to `PulsarClient<TokioEngine>`
+(partitioned, multi-topics, pattern, typed schemas) does not yet
+compile under `PulsarClient<MoonpoolEngine<P>>`. **Three of seven
+dependent surfaces lifted** per ADR-0026 §D1 and now work on both
+engines:
+
+- **Transaction (PIP-31)** via the `TransactionApi` extension
+  trait.
+- **Reader** via `Reader<C: ConsumerApi>` (default
+  `C = magnetar_runtime_tokio::Consumer`).
+- **TableView** via `TableView<C: ConsumerApi + Clone>`.
+
+The remaining four surfaces (`MultiTopicsConsumer`,
+`PartitionedProducer`, `PartitionedConsumer`, `PatternConsumer`)
+and `TypedSchemas` hold concrete
 `magnetar_runtime_tokio::{Producer, Consumer}` instances and need
-the same lift template: per-family extension trait + façade
-generic + per-runtime delegate. Callers that
-reach for a tokio-only method on the moonpool engine still get a
-trait-bound compile error, not a silent fallback — see ADR-0019
-§Consequences.
+additional helper methods surfaced on the API traits before the
+lift becomes mechanical. See `docs/follow-ups.md` for the per-
+surface helper list. Callers that reach for a tokio-only method
+on the moonpool engine still get a trait-bound compile error, not
+a silent fallback — see ADR-0019 §Consequences.
 
 ## Genuine deferred-scope items
 
