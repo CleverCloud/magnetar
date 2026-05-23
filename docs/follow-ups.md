@@ -61,14 +61,69 @@ engine. Each surface needs:
    `impl PulsarClient<TokioEngine>` block.
 3. All four test layers per ADR-0024 + e2e where applicable.
 
-**Blocked on** [D1 — Engine trait extension](#d1--engine-trait-extension-adr-0025).
-Pick the trait shape first, then sequence the surface ports.
+ADR-0026 §D1 locked the trait shape: **concrete generic types
+`magnetar::<Surface><T, E: Engine>`**, not `Engine::Producer<T>` /
+`Engine::Consumer<T>` GATs. The Engine trait stays at ADR-0025
+phase 1 surface (task + timer primitives); per-surface lifts add
+their own engine-agnostic indirection (e.g. an
+`EngineTransactionApi` extension trait implemented per engine on
+its own `Client` type).
 
-See [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
+See [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+§D1 + [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
 §Consequences.
 
+#### First sub-PR — Transaction surface
+
+The Transaction token (`magnetar::Transaction`) is already 16-byte
+`Copy` plain data and engine-agnostic. The lift is the **methods
+that operate on it** (`new_transaction`, `register_partition_to_transaction`,
+`register_subscription_to_transaction`, `commit_transaction`,
+`abort_transaction`) — currently bound to `impl PulsarClient<TokioEngine>`
+via `runtime_client() -> &magnetar_runtime_tokio::Client`.
+
+The lift shape:
+
+1. Add a `magnetar::engine::TransactionApi` extension trait with five
+   async methods (mirroring the five façade methods). Implement it on
+   `magnetar_runtime_tokio::Client` (delegates to its existing inherent
+   methods) and on `magnetar_runtime_moonpool::Client` (ports the four
+   inherent methods from the tokio side, ~250 LOC: `new_txn`,
+   `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`). Both
+   implementations live in the runtime crates, not in `magnetar/`.
+2. Add `Engine::ClientState: TransactionApi` as a bound on the
+   `Engine` trait (no new associated type required — the bound is on
+   the existing `ClientState`).
+3. Rewrite the five `transaction.rs` methods to `impl<E: Engine>
+   PulsarClient<E>` and dispatch via `<E::ClientState as
+   TransactionApi>::method(...)`.
+4. Test layers per ADR-0024: proto-side TC round-trip already covered;
+   tokio runtime tests stay green by construction; moonpool runtime
+   adds four `tests/transaction_*.rs` files mirroring the existing
+   tokio txn tests; differential harness adds a `golden_transaction`
+   trace asserting commit-vs-abort wire equivalence.
+5. Flip the Transaction row in `docs/parity-status.md` from "moonpool
+   not wired" to "✅". Update `README.md` parity matrix.
+
+Subsequent sub-PRs (Reader → TypedSchemas → MultiTopicsConsumer →
+PartitionedProducer → PartitionedConsumer → PatternConsumer →
+TableView) follow the same template: one extension trait per family,
+implemented on each runtime's `Client`, dispatched via
+`<E::ClientState as Trait>::method`.
+
+#### Why an extension trait, not a method on `Engine`
+
+Pulled forward from ADR-0026's rationale: the methods that operate on
+the client state are not "engine primitives" (those are spawn / timer /
+clock — ADR-0025 phase 1). They are **client surfaces**. Putting them
+on the engine trait would mean every engine grew a method per Pulsar
+PIP forever. An extension trait per surface family scales: each PIP
+adds at most one trait, each engine implements only the surfaces it
+supports, and the façade still gets `impl<E: Engine>` because the
+trait bound is `E::ClientState: TransactionApi + ReaderApi + ...`.
+
 ```text
-/goal once ADR-0025 lands, lift the 8 façade surfaces to PulsarClient<MoonpoolEngine<P>> in this order: Transaction → Reader → TypedSchemas → MultiTopicsConsumer → PartitionedProducer → PartitionedConsumer → PatternConsumer → TableView. One PR per surface. Each PR ships all four test layers per ADR-0024, plus a docs/parity-status.md row flip.
+/goal lift the Transaction surface to `impl<E: Engine> PulsarClient<E>`. Phase 1: add `magnetar::engine::TransactionApi` extension trait with the five async methods. Phase 2: implement it on magnetar-runtime-tokio's Client (delegate-only — the inherent methods exist already) and on magnetar-runtime-moonpool's Client (port `new_txn` / `add_partition_to_txn` / `add_subscription_to_txn` / `end_txn` from the tokio side). Phase 3: rewrite `crates/magnetar/src/transaction.rs` to `impl<E: Engine + TransactionApi>` and route through the extension trait. Phase 4: test layers per ADR-0024 — 4 moonpool runtime tests mirroring the existing tokio ones, 1 differential golden trace `golden_transaction`. Phase 5: docs/parity-status.md row flip + README parity matrix update. Single PR; subsequent surface lifts follow the same template.
 ```
 
 ---
