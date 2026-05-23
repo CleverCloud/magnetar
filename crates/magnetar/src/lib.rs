@@ -139,13 +139,11 @@ mod tests {
 
     /// Compile-time witness that the [`crate::TransactionApi`] trait is
     /// object-safe-compatible (all methods return `Pin<Box<dyn Future + Send>>`)
-    /// AND that
-    /// [`magnetar_runtime_tokio::Client`] satisfies the bound. Both
+    /// AND that the engine's `ClientState` satisfies the bound — both
     /// properties are load-bearing for the D1 façade lift; if either
     /// regresses the generic `impl<E: Engine> PulsarClient<E> where
-    /// E::ClientState: TransactionApi` will fail to compile. Runs at
-    /// compile time only — no broker round-trip, no I/O.
-    #[cfg(feature = "tokio")]
+    /// E::ClientState: TransactionApi` will fail to compile.
+    /// Runs at compile time only — no broker round-trip, no I/O.
     fn assert_transaction_api_bound<T: crate::TransactionApi>() {}
 
     #[cfg(feature = "tokio")]
@@ -154,5 +152,13 @@ mod tests {
         // Statically assert the bound; this entire function body is
         // dead at runtime — the assertion fires at typeck.
         assert_transaction_api_bound::<magnetar_runtime_tokio::Client>();
+    }
+
+    #[cfg(feature = "moonpool")]
+    #[test]
+    fn transaction_api_is_implemented_by_moonpool_client_state() {
+        // Mirror of the tokio bound check; asserts the moonpool side of
+        // the D1 lift train compiles. ADR-0026 §D1.
+        assert_transaction_api_bound::<crate::engine::MoonpoolClientState>();
     }
 }

@@ -331,6 +331,151 @@ impl<P: Providers> Client<P> {
     pub fn poll_topic_list_change(&self) -> Option<TopicListChange> {
         self.shared.topic_list_changes.lock().pop_front()
     }
+
+    // -----------------------------------------------------------------
+    // Transactions (PIP-31) — mirror `magnetar_runtime_tokio::Client`.
+    //
+    // Each method enqueues the sans-io frame via `Connection::*`,
+    // notifies the driver, parks on a `RequestFut`, and pattern-matches
+    // the resolved `OpOutcome`. The protocol-level handshakes already
+    // live in `magnetar_proto`; the runtime crate stays I/O-only.
+    // -----------------------------------------------------------------
+
+    /// Open a new Pulsar transaction at the broker-side transaction
+    /// coordinator (PIP-31). Mirrors Java
+    /// `PulsarClient#newTransaction()`. Returns the broker-assigned
+    /// [`magnetar_proto::TxnId`] once the TC acknowledges.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the TC rejects the request.
+    /// - [`ClientError::Other`] on an unexpected outcome (state-machine bug).
+    pub async fn new_txn(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<magnetar_proto::TxnId, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.new_txn(timeout)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::NewTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
+            }
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected new_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Register `topic` as a partition this transaction will write to
+    /// (PIP-31). Mirrors `Transaction#registerProducedTopic`.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the TC rejects the request.
+    /// - [`ClientError::Other`] on an unexpected outcome.
+    pub async fn add_partition_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.add_partition_to_txn(txn, topic.into())
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::AddPartitionToTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
+            }
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected add_partition_to_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Register a subscription this transaction will acknowledge on
+    /// (PIP-31). Mirrors `Transaction#registerSubscriptionToTxn`.
+    ///
+    /// Argument order matches the tokio engine's
+    /// `magnetar_runtime_tokio::Client::add_subscription_to_txn`
+    /// (`(txn, topic, subscription)`); internally we feed the proto layer
+    /// the sub-then-topic order it expects.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the TC rejects the request.
+    /// - [`ClientError::Other`] on an unexpected outcome.
+    pub async fn add_subscription_to_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        topic: impl Into<String>,
+        subscription: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.add_subscription_to_txn(txn, subscription.into(), topic.into())
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::AddSubscriptionToTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
+            }
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected add_subscription_to_txn outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Commit or abort an open transaction (PIP-31). Returns the final
+    /// transaction state reported by the TC. Mirrors
+    /// `Transaction#commit` / `#abort`.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the TC rejects the request.
+    /// - [`ClientError::Other`] on an unexpected outcome.
+    pub async fn end_txn(
+        &self,
+        txn: magnetar_proto::TxnId,
+        action: magnetar_proto::TxnAction,
+    ) -> Result<magnetar_proto::TxnState, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.end_txn(txn, action)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::EndTxn { result, .. } => {
+                result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
+            }
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected end_txn outcome: {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Future that resolves the [`OpOutcome`] correlated with a single

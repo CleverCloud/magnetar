@@ -31,6 +31,14 @@ pub enum PulsarError {
     /// Schema encode / decode error from a [`crate::TypedProducer`] / [`crate::TypedConsumer`].
     #[error("schema error: {0}")]
     Schema(#[from] magnetar_proto::schema::SchemaError),
+    /// Engine-agnostic error surfaced by a generic façade method that
+    /// dispatches through an extension trait (e.g.
+    /// [`crate::TransactionApi`]). Carries the runtime's error message
+    /// stringified — the per-engine error type is recovered through
+    /// the runtime crate when full-fidelity diagnostics are needed.
+    /// Phase 4 of the D1 lift train (ADR-0026 §D1).
+    #[error("engine error: {0}")]
+    Other(String),
 }
 
 /// Convenience alias for outgoing application messages.

@@ -152,6 +152,80 @@ pub fn send_receipt_bytes(
     buf
 }
 
+/// Encode a synthetic `CommandNewTxnResponse` for the given request id and
+/// txn id parts. PIP-31 — the broker echoes back the request id so the proto
+/// layer can route the result.
+pub fn new_txn_response_bytes(request_id: u64, txn_most: u64, txn_least: u64) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::NewTxnResponse as i32,
+        new_txn_response: Some(pb::CommandNewTxnResponse {
+            request_id,
+            txnid_most_bits: Some(txn_most),
+            txnid_least_bits: Some(txn_least),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandNewTxnResponse");
+    buf
+}
+
+/// Encode a `CommandAddPartitionToTxnResponse` for the given request id.
+pub fn add_partition_to_txn_response_bytes(request_id: u64) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AddPartitionToTxnResponse as i32,
+        add_partition_to_txn_response: Some(pb::CommandAddPartitionToTxnResponse {
+            request_id,
+            txnid_most_bits: None,
+            txnid_least_bits: None,
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandAddPartitionToTxnResponse");
+    buf
+}
+
+/// Encode a `CommandAddSubscriptionToTxnResponse` for the given request id.
+pub fn add_subscription_to_txn_response_bytes(request_id: u64) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AddSubscriptionToTxnResponse as i32,
+        add_subscription_to_txn_response: Some(pb::CommandAddSubscriptionToTxnResponse {
+            request_id,
+            txnid_most_bits: None,
+            txnid_least_bits: None,
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandAddSubscriptionToTxnResponse");
+    buf
+}
+
+/// Encode a `CommandEndTxnResponse` for the given request id.
+pub fn end_txn_response_bytes(request_id: u64) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::EndTxnResponse as i32,
+        end_txn_response: Some(pb::CommandEndTxnResponse {
+            request_id,
+            txnid_most_bits: None,
+            txnid_least_bits: None,
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandEndTxnResponse");
+    buf
+}
+
 /// Encode a `CommandTopicMigrated` for a producer. The PIP-188 flow surfaces
 /// a recoverable `EngineError::Config` from the moonpool driver loop, but
 /// the proto state machine accepts the frame and emits a `TopicMigrated`
