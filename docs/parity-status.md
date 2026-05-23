@@ -28,13 +28,13 @@ follow-up train; the gap is tracked below.
 | PIP-188 `TOPIC_MIGRATED` → reconnect ([ADR-0018](../specs/adr/0018-pip-188-reconnect-on-migrate.md)) | ✅ | ✅ |
 | Generic `PulsarClient<E: Engine>` ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)) | ✅ | ✅ |
 | Partitioned producer | ✅ | ✅ (engine-generic; tokio-only `refresh_partitions` + batch counters on specialisation) |
-| Partitioned consumer | ✅ | ❌ |
-| MultiTopicsConsumer | ✅ | ❌ |
-| PatternConsumer (PIP-145) | ✅ | ❌ |
+| Partitioned consumer | ✅ | 🟡 (phantom-lift via `MultiTopicsConsumer` alias; impl tokio-bound) |
+| MultiTopicsConsumer | ✅ | 🟡 (phantom-lift; impl tokio-bound) |
+| PatternConsumer (PIP-145) | ✅ | 🟡 (phantom-lift; impl tokio-bound) |
 | Reader | ✅ | ✅ |
 | TableView | ✅ | ✅ |
 | Transactions (PIP-31) | ✅ | ✅ |
-| Typed schemas | ✅ | ❌ |
+| Typed schemas | ✅ | 🟡 (phantom-lift; impl tokio-bound) |
 | Deterministic chaos pack | n/a | ✅ |
 | tokio ↔ moonpool differential equivalence harness | n/a | ✅ |
 
@@ -64,18 +64,30 @@ helper-method ports.
 
 The remaining three façade surfaces — **`MultiTopicsConsumer`**,
 **`PartitionedConsumer`** (type alias for `MultiTopicsConsumer`),
-**`PatternConsumer`** — hold `Vec<NamedConsumer>` /
-`Mutex<Vec<NamedConsumer>>` instances. The `ConsumerApi` trait
-surface is now comprehensive enough for the lift (receive, ack,
-ack_cumulative, negative_ack, negative_ack_with_delay,
-redeliver_unacked, unsubscribe, seek_to_earliest, seek_to_latest,
-get_schema, last_message_id, has_message_after,
-last_disconnected_timestamp, topic, subscription, name, is_closed,
-is_connected, stats, close_owned). The remaining work is
-structural restructuring of cascading generics in
-`crates/magnetar/src/multi_topics.rs` (`Inner<C>`,
-`NamedConsumer<C>`, `ConsumerTemplate` are tokio-bound today; the
-helper-method bottleneck is resolved).
+**`PatternConsumer`** — now carry the cascading type parameter
+(`Inner<C>`, `NamedConsumer<C>`, `MultiTopicsConsumer<C>` /
+`PatternConsumer<C>` all parameterized) so callers can name
+`MultiTopicsConsumer<MoonpoolConsumer<P>>` /
+`PatternConsumer<MoonpoolConsumer<P>>` at the type level. The
+inherent impl methods stay tokio-bound because the `add_topic` /
+PIP-145 reconciliation paths subscribe new children via
+`client.consumer(topic).subscribe()` — that calls into
+`PulsarClient::consumer(topic)` which today returns a
+tokio-engine `ConsumerBuilder` only.
+
+Full impl-body lift requires lifting `ConsumerBuilder` itself
+to be engine-aware (and the matching `ProducerBuilder` for the
+producer side). That sub-PR is queued in `docs/follow-ups.md` as
+the next surface-train task after this round of structural lifts.
+
+The `ConsumerApi` trait surface is comprehensive enough today
+(receive, ack, ack_cumulative, negative_ack,
+negative_ack_with_delay, redeliver_unacked, unsubscribe,
+seek_to_earliest, seek_to_latest, get_schema, last_message_id,
+has_message_after, last_disconnected_timestamp, topic,
+subscription, name, is_closed, is_connected, stats, close_owned)
+that no further trait-method ports are needed for the impl-body
+lift once the Builder genericity lands.
 
 Callers that reach for a tokio-only method on the moonpool engine
 still get a trait-bound compile error, not a silent fallback —
