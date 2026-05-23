@@ -412,6 +412,48 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `Consumer#getStats`. Returns a zeroed snapshot if the consumer
     /// handle is no longer registered.
     fn stats(&self) -> magnetar_proto::consumer::ConsumerStats;
+
+    /// Wall-clock timestamp of the last broker disconnection observed
+    /// by this consumer's connection, or `None` if no disconnect has
+    /// happened yet. Mirrors Java
+    /// `Consumer#getLastDisconnectedTimestamp`.
+    fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime>;
+
+    /// Ask the broker to redeliver every unacknowledged message on
+    /// this consumer. Mirrors Java
+    /// `Consumer#redeliverUnacknowledgedMessages`.
+    fn redeliver_unacked(&self);
+
+    /// Negatively acknowledge a single message with an explicit
+    /// per-message redelivery delay. PIP-37 backoff variant.
+    fn negative_ack_with_delay(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        delay: std::time::Duration,
+    );
+
+    /// Tear down this consumer's subscription on the broker. Mirrors
+    /// Java `Consumer#unsubscribe`. PIP-313's `force=true` variant
+    /// lives on the concrete runtime types as `unsubscribe_with_force`
+    /// (extension point, not on the trait yet).
+    fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Seek to the earliest available message. Mirrors Java
+    /// `Consumer#seek(MessageId.earliest)`.
+    fn seek_to_earliest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Seek to the latest available message. Mirrors Java
+    /// `Consumer#seek(MessageId.latest)`.
+    fn seek_to_latest(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Consume the consumer and tear down the broker-side resource
+    /// (`CommandCloseConsumer`). Mirrors Java `Consumer#close`. Both
+    /// runtime types implement close by consuming `self`.
+    fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
+    where
+        Self: Sized;
 }
 
 #[cfg(feature = "tokio")]
@@ -552,6 +594,40 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
         magnetar_runtime_tokio::Consumer::stats(self)
+    }
+
+    fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        magnetar_runtime_tokio::Consumer::last_disconnected_timestamp(self)
+    }
+
+    fn redeliver_unacked(&self) {
+        magnetar_runtime_tokio::Consumer::redeliver_unacked(self);
+    }
+
+    fn negative_ack_with_delay(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        delay: std::time::Duration,
+    ) {
+        magnetar_runtime_tokio::Consumer::negative_ack_with_delay(self, message_id, delay);
+    }
+
+    fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::unsubscribe(self, false))
+    }
+
+    fn seek_to_earliest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::seek_to_earliest(self))
+    }
+
+    fn seek_to_latest(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::seek_to_latest(self))
+    }
+
+    fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::close(self))
     }
 }
 
@@ -707,6 +783,40 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
         magnetar_runtime_moonpool::Consumer::stats(self)
+    }
+
+    fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        magnetar_runtime_moonpool::Consumer::last_disconnected_timestamp(self)
+    }
+
+    fn redeliver_unacked(&self) {
+        magnetar_runtime_moonpool::Consumer::redeliver_unacked(self);
+    }
+
+    fn negative_ack_with_delay(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        delay: std::time::Duration,
+    ) {
+        magnetar_runtime_moonpool::Consumer::negative_ack_with_delay(self, message_id, delay);
+    }
+
+    fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::unsubscribe(self))
+    }
+
+    fn seek_to_earliest(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::seek_to_earliest(self))
+    }
+
+    fn seek_to_latest(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::seek_to_latest(self))
+    }
+
+    fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::close(self))
     }
 }
 

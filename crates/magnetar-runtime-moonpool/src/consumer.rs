@@ -261,12 +261,105 @@ impl<P: Providers> Consumer<P> {
     ///
     /// Mirrors `org.apache.pulsar.client.api.Consumer#negativeAcknowledge`.
     pub fn negative_ack(&self, message_id: MessageId) {
+        self.negative_ack_many(vec![message_id]);
+    }
+
+    /// Negatively acknowledge a batch of messages. An empty
+    /// `message_ids` vector matches Pulsar's "all unacked" semantics
+    /// used by [`Self::redeliver_unacked`].
+    pub fn negative_ack_many(&self, message_ids: Vec<MessageId>) {
         let now = std::time::Instant::now();
         {
             let mut conn = self.shared.inner.lock();
-            conn.negative_ack(self.handle, vec![message_id], now);
+            conn.negative_ack(self.handle, message_ids, now);
         }
         self.shared.driver_waker.notify_one();
+    }
+
+    /// Negatively acknowledge a single message with an explicit
+    /// per-message redelivery delay. Mirrors Java's PIP-37 backoff
+    /// path.
+    pub fn negative_ack_with_delay(&self, message_id: MessageId, delay: std::time::Duration) {
+        let now = std::time::Instant::now();
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.negative_ack_with_delay(self.handle, message_id, delay, now);
+        }
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// Ask the broker to redeliver every unacknowledged message on
+    /// this consumer. Mirrors Java
+    /// `Consumer#redeliverUnacknowledgedMessages`. Implemented via the
+    /// "empty list = all unacked" semantics on the proto layer's
+    /// `negative_ack`.
+    pub fn redeliver_unacked(&self) {
+        self.negative_ack_many(Vec::new());
+    }
+
+    /// Unsubscribe — tear down this consumer's subscription on the
+    /// broker (deletes the cursor, not just the consumer handle).
+    /// Mirrors Java `Consumer#unsubscribe`. Callers typically follow
+    /// with [`Self::close`].
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker rejects the unsubscribe.
+    /// - [`ClientError::Other`] on an unexpected outcome.
+    pub async fn unsubscribe(&self) -> Result<(), ClientError> {
+        self.unsubscribe_with_force(false).await
+    }
+
+    /// `force=true` variant per PIP-313 — unsubscribe even when other
+    /// consumers are still attached to the subscription.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker rejects the unsubscribe.
+    /// - [`ClientError::Other`] on an unexpected outcome.
+    pub async fn unsubscribe_with_force(&self, force: bool) -> Result<(), ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.unsubscribe(self.handle, force)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected unsubscribe outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Seek to the earliest available message. Mirrors Java
+    /// `Consumer#seek(MessageId.earliest)`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::seek_to_message`] errors.
+    pub async fn seek_to_earliest(&self) -> Result<(), ClientError> {
+        self.seek_to_message(MessageId::EARLIEST).await
+    }
+
+    /// Seek to the latest available message. Mirrors Java
+    /// `Consumer#seek(MessageId.latest)`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::seek_to_message`] errors.
+    pub async fn seek_to_latest(&self) -> Result<(), ClientError> {
+        self.seek_to_message(MessageId::LATEST).await
+    }
+
+    /// Wall-clock timestamp of the last broker disconnection
+    /// observed by this connection, or `None` if no disconnect has
+    /// happened yet. Mirrors Java
+    /// `Consumer#getLastDisconnectedTimestamp`.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        self.shared.inner.lock().last_disconnected_timestamp()
     }
 
     /// Look up the broker-registered schema for the consumer's topic
