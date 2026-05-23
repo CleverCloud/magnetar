@@ -228,6 +228,56 @@ impl<P: Providers> Consumer<P> {
         self.shared.driver_waker.notify_one();
     }
 
+    /// Ask the broker for the topic's last-published message id.
+    /// Mirrors Java `Consumer#getLastMessageId`.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker rejects the request.
+    /// - [`ClientError::Other`] on an unexpected outcome.
+    pub async fn last_message_id(&self) -> Result<MessageId, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.get_last_message_id(self.handle)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = RequestFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::LastMessageId {
+                last_message_id, ..
+            } => Ok(last_message_id),
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            other => Err(ClientError::Other(format!(
+                "unexpected last_message_id outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// `true` if the broker has at least one message strictly past `cursor`
+    /// (i.e. there is at least one more message to receive). `cursor` is
+    /// typically the last [`MessageId`] this consumer received. Comparison
+    /// is `>` not `>=` (matches Java's `MessageId#compareTo`).
+    ///
+    /// # Errors
+    /// Propagates [`Self::last_message_id`] errors.
+    pub async fn has_message_after(&self, cursor: MessageId) -> Result<bool, ClientError> {
+        let last = self.last_message_id().await?;
+        Ok((
+            last.ledger_id,
+            last.entry_id,
+            last.partition,
+            last.batch_index,
+        ) > (
+            cursor.ledger_id,
+            cursor.entry_id,
+            cursor.partition,
+            cursor.batch_index,
+        ))
+    }
+
     /// Seek this consumer to a specific message id. The broker replays from
     /// there.
     ///

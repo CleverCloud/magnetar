@@ -332,6 +332,20 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `Consumer#negativeAcknowledge`.
     fn negative_ack(&self, message_id: magnetar_proto::MessageId);
 
+    /// Ask the broker for the topic's last-published message id.
+    /// Mirrors Java `Consumer#getLastMessageId`.
+    fn last_message_id(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>;
+
+    /// `true` if the broker has at least one message strictly past
+    /// `cursor`. Mirrors Java `Consumer#hasMessageAvailable` (with a
+    /// caller-supplied cursor variant).
+    fn has_message_after(
+        &self,
+        cursor: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>>;
+
     /// Topic this consumer is subscribed to.
     fn topic(&self) -> String;
 
@@ -408,6 +422,22 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn negative_ack(&self, message_id: magnetar_proto::MessageId) {
         magnetar_runtime_tokio::Consumer::negative_ack(self, message_id);
+    }
+
+    fn last_message_id(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_tokio::Consumer::last_message_id(self))
+    }
+
+    fn has_message_after(
+        &self,
+        cursor: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::has_message_after(
+            self, cursor,
+        ))
     }
 
     fn topic(&self) -> String {
@@ -499,6 +529,22 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn negative_ack(&self, message_id: magnetar_proto::MessageId) {
         magnetar_runtime_moonpool::Consumer::negative_ack(self, message_id);
+    }
+
+    fn last_message_id(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>
+    {
+        Box::pin(magnetar_runtime_moonpool::Consumer::last_message_id(self))
+    }
+
+    fn has_message_after(
+        &self,
+        cursor: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::has_message_after(
+            self, cursor,
+        ))
     }
 
     fn topic(&self) -> String {
