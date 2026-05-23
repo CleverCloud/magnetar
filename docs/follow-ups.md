@@ -115,56 +115,88 @@ adds at most one trait, each engine implements only the surfaces it
 supports, and the façade still gets `impl<E: Engine>` because the
 trait bound is `E::ClientState: TransactionApi + ProducerApi + ...`.
 
-#### Remaining surface lifts (4 of 7 left)
+#### Next sub-PR — ConsumerBuilder / ProducerBuilder genericity (unblocks 4 phantom-lifted surfaces)
 
-The four remaining surfaces — TypedSchemas, MultiTopicsConsumer,
-PartitionedProducer, PartitionedConsumer, PatternConsumer — all
-hold concrete `magnetar_runtime_tokio::{Producer, Consumer}`
-today. Each lift follows the template Reader used:
+All seven dependent façade surfaces now carry their engine-generic
+type parameter (Transaction, Reader, TableView, PartitionedProducer
+have full impl-body lifts; TypedProducer/TypedConsumer,
+MultiTopicsConsumer/PartitionedConsumer, PatternConsumer are
+phantom-lifted with impl-body still tokio-bound). The four
+phantom-lifted surfaces share one blocker:
+**`ConsumerBuilder` / `ProducerBuilder` are tokio-bound today**.
 
-1. **Identify the extension-trait surface the lifted type needs.**
-   Some surfaces (TypedConsumer, TableView) call methods not yet on
-   `ConsumerApi` (`get_schema`, `close`, `seek_*`, `is_connected`,
-   `name`). Add them to the trait — port to moonpool Consumer
-   first if absent — then implement on both runtimes.
-2. **Make the façade type generic** over the trait. Default to the
-   tokio specialisation (`type Reader = Reader<magnetar_runtime_tokio::Consumer>`)
-   for backward compatibility.
-3. **Move methods routing only through the trait into the generic
-   impl**; keep runtime-specific escape hatches (futures returning
-   `ReceiveFut`/`SendFut`, methods consuming `self`, `tokio::time::*`)
-   on a `impl Reader<magnetar_runtime_tokio::Consumer>` block.
-4. **Test parity per ADR-0024** — each new trait method needs a
-   matching test on both runtime sides.
-5. **Flip the parity-status.md row** + README parity matrix.
+The blocker shape — `MultiTopicsConsumer::add_topic` (and the
+PIP-145 reconciliation loop in `PatternConsumer::update`)
+subscribes new children via:
 
-Surface-specific notes:
+```rust,ignore
+let builder = self.inner.template.apply(client.consumer(topic.clone()));
+let consumer = builder.subscribe().await?;
+```
 
-- **TypedSchemas** (`TypedProducer<T>` / `TypedConsumer<T>`). Needs
-  `Producer::get_schema` + `Consumer::get_schema` for PIP-87
-  AutoConsume/AutoProduceBytes paths. Both need porting to moonpool
-  first (proto layer has `Connection::get_schema`; only tokio
-  Consumer/Producer wrap it). Then `TypedProducer<S, P: ProducerApi>`
-  + `TypedConsumer<S, C: ConsumerApi>`.
-- **MultiTopicsConsumer**. Holds `Vec<Consumer>` + a per-topic
-  routing map. Lift becomes `MultiTopicsConsumer<C: ConsumerApi>`
-  with `Vec<C>`. The `auto_update` task migrates to `Engine::spawn`
-  (ADR-0025 phase 1).
-- **PartitionedProducer**. Holds `Vec<Producer>` + a `health_loop`
-  task. Lift: `PartitionedProducer<P: ProducerApi, E: Engine>` so
-  the health loop can spawn via `E::spawn`. Routing logic
-  (Murmur3/JavaStringHash) is engine-agnostic and stays as-is.
-- **PartitionedConsumer**. Same shape as MultiTopics + partition
-  count discovery via `Client::partitioned_topic_metadata`.
-- **PatternConsumer**. Holds a `MultiTopicsConsumer` + the
-  reconciliation loop on `Engine::spawn`. Lifts only after
-  MultiTopicsConsumer lands.
-- **TableView**. Holds a `Consumer` + a drain task on
-  `Engine::spawn`. The k-v store stays engine-agnostic; the drain
-  task migrates via `E::spawn`.
+`client.consumer(topic)` is `PulsarClient<TokioEngine>::consumer()`
+which returns `ConsumerBuilder<'_>` — internally bound to the tokio
+`SubscribeRequest`, `MessageDecryptor`, and ultimately
+`magnetar_runtime_tokio::Client::subscribe()`. The Builder lift
+makes the entire chain engine-generic.
+
+**The lift template (mirrors the surface lifts already landed):**
+
+1. **Lift `ConsumerBuilder` to `ConsumerBuilder<'a, E: Engine>`**
+   parameterised over the engine, with default `E = TokioEngine`.
+   Existing callers (`client.consumer(topic)`) continue compiling
+   via the default-type-argument fallback.
+2. **Add a `SubscribeApi` extension trait on `E::ClientState`** with
+   one method:
+   `fn subscribe(&self, req: SubscribeRequest, decryptor: Option<...>)
+   -> impl Future<Output = Result<C, ClientError>>`. Implement on
+   both runtime `Client` types — both already have the equivalent
+   method.
+3. **`ConsumerBuilder::subscribe()`** dispatches through the trait.
+   Returns `impl Future<Output = Result<<E::ClientState as
+   SubscribeApi>::Consumer, ...>>`.
+4. **Same template for `ProducerBuilder`** with `CreateProducerApi`
+   trait + `Client::open_producer` delegate.
+5. **`Reader::create()`** (already lifted) becomes generic over the
+   Builder's `E`.
+6. **The four phantom-lifted surfaces' impl-body lifts**
+   (TypedSchemas, MultiTopicsConsumer, PartitionedConsumer,
+   PatternConsumer) become mechanical: each method that used to
+   call `client.consumer(topic).subscribe()` now dispatches
+   through `<E::ClientState as SubscribeApi>::subscribe`.
+7. **Test parity per ADR-0024** — each new trait method needs a
+   1:1 mirror test on both runtime sides.
+8. **Parity-status rows flip** to ✅/✅ once each surface's
+   impl-body is fully lifted.
+
+**Sans-io invariant**: same as the surface lifts — trait surface
+uses `Pin<Box<dyn Future + Send + '_>>` with no I/O types;
+`magnetar-proto` carries no new deps.
+
+Surface-specific notes (post-Builder genericity):
+
+- **TypedSchemas** (`TypedProducer<S, P>` / `TypedConsumer<S, C>`).
+  Phantom-lifted in commit `6a83ea2`. Helper methods needed on
+  trait surface: `compression`, `last_sequence_id_published`,
+  `pending_count`, `batch_len`, `batch_bytes` (Producer side);
+  `ack_grouped`, `ack_grouped_cumulative`, `available_in_queue`,
+  `available_permits`, `drain_dead_letter`,
+  `has_reached_end_of_topic`, `has_received_any_message`,
+  `is_inactive`, `is_paused`, `receive_batch`,
+  `receive_with_timeout`, the `ack_with_txn` family (Consumer
+  side). All need moonpool ports before adding to trait.
+- **MultiTopicsConsumer** (`MultiTopicsConsumer<C>`). Cascading
+  phantom-lift in commit `b51680a`. Needs Builder genericity for
+  `add_topic` and the `auto_update` reconciliation. The
+  `pause` / `resume` family is already on moonpool.
+- **PartitionedConsumer**. Type alias for `MultiTopicsConsumer`;
+  lifts transitively once `MultiTopicsConsumer` lifts.
+- **PatternConsumer** (`PatternConsumer<C>`). Cascading
+  phantom-lift in commit `31f9cbe`. Same blocker as
+  MultiTopicsConsumer.
 
 ```text
-/goal lift the next surface in the train — pick TypedSchemas (start with TypedProducer + TypedConsumer). Step 1: port `get_schema(version: Option<Vec<u8>>)` from magnetar-runtime-tokio to magnetar-runtime-moonpool's Producer + Consumer. Step 2: add `get_schema` to ProducerApi + ConsumerApi with delegate impls on both runtimes. Step 3: lift `TypedProducer<S>` to `TypedProducer<S, P: ProducerApi = magnetar_runtime_tokio::Producer>` and `TypedConsumer<S>` to `TypedConsumer<S, C: ConsumerApi = magnetar_runtime_tokio::Consumer>`. Step 4: mirror tests on both runtimes (4-6 each). Step 5: parity-status + README row flips. Validation: `cargo +nightly fmt && cargo build --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo run -p xtask -- check-runtime-test-parity && cargo run -p xtask -- check-no-channels && cargo run -p xtask -- check-no-io-deps && RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps`.
+/goal lift `ConsumerBuilder` + `ProducerBuilder` to be engine-generic. Step 1: add `SubscribeApi` extension trait (one method: `subscribe(req, decryptor) -> Result<Consumer, Error>`) and `CreateProducerApi` extension trait (one method: `open_producer(req) -> Result<Producer, Error>`) in `magnetar::engine`. Delegate impls on `magnetar_runtime_tokio::Client` (existing inherent methods) and `magnetar_runtime_moonpool::Client` (existing inherent methods). Step 2: lift `ConsumerBuilder<'a>` to `ConsumerBuilder<'a, E: Engine = TokioEngine>` and `ProducerBuilder<'a>` similarly; route `.subscribe()` / `.create()` through the new trait. Step 3: lift `Reader<C>::create` to be generic over `E`. Step 4: lift the impl-bodies of `TypedProducer<S, P>`, `TypedConsumer<S, C>`, `MultiTopicsConsumer<C>`, `PatternConsumer<C>` to dispatch via the new traits; for methods that need helpers not on `ConsumerApi`, split into tokio-specialisation impl blocks (same pattern PartitionedProducer used). Step 5: test parity per ADR-0024 — mirror tests on both runtime sides. Step 6: parity-status + README row flips for the four phantom-lifted surfaces. Validation: `cargo +nightly fmt && cargo build --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo run -p xtask -- check-runtime-test-parity && cargo run -p xtask -- check-no-channels && cargo run -p xtask -- check-no-io-deps && RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps`.
 ```
 
 ---
