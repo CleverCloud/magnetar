@@ -32,7 +32,7 @@ use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::rsa::{KeySize, PrivateDecryptingKey};
 use bytes::Bytes;
 use magnetar::proto::conn::CryptoFailureAction;
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::{EncryptError, MessageDecryptor, MessageEncryptor};
 use magnetar::{MessageCryptoBridge, OutgoingMessage, PulsarClient};
 use magnetar_messagecrypto::{CryptoError, CryptoKeyReader, KeyInfo, MessageCrypto};
@@ -213,6 +213,7 @@ async fn e2e_crypto_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         .consumer(&topic)
         .subscription("magnetar-e2e-crypto-rt")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .encryption(bridge.clone() as Arc<dyn MessageDecryptor>)
         .subscribe_with_decryption()
         .await?;
@@ -256,6 +257,7 @@ async fn e2e_crypto_failure_action_fail() -> Result<(), Box<dyn std::error::Erro
         .consumer(&topic)
         .subscription("magnetar-e2e-crypto-fail")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .encryption(Arc::new(AlwaysFailDecryptor) as Arc<dyn MessageDecryptor>)
         .crypto_failure_action(CryptoFailureAction::Fail)
         .subscribe_with_decryption()
@@ -292,6 +294,7 @@ async fn e2e_crypto_failure_action_discard() -> Result<(), Box<dyn std::error::E
         .consumer(&topic)
         .subscription("magnetar-e2e-crypto-discard")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .encryption(Arc::new(AlwaysFailDecryptor) as Arc<dyn MessageDecryptor>)
         .crypto_failure_action(CryptoFailureAction::Discard)
         .subscribe_with_decryption()
@@ -366,6 +369,7 @@ async fn e2e_crypto_failure_action_consume() -> Result<(), Box<dyn std::error::E
         .consumer(&topic)
         .subscription("magnetar-e2e-crypto-consume")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .encryption(Arc::new(AlwaysFailDecryptor) as Arc<dyn MessageDecryptor>)
         .crypto_failure_action(CryptoFailureAction::Consume)
         .subscribe_with_decryption()
@@ -424,6 +428,7 @@ async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
         .consumer(&topic)
         .subscription("magnetar-e2e-crypto-chunk")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .encryption(bridge.clone() as Arc<dyn MessageDecryptor>)
         .subscribe_with_decryption()
         .await?;
