@@ -136,6 +136,17 @@ pub trait Schema: Send + Sync + std::fmt::Debug {
     /// [`StringSchema`]).
     fn decode(&self, bytes: &[u8]) -> Result<Self::Owned, SchemaError>;
 
+    /// Optional schema-level metadata for the broker — surfaces in
+    /// `CommandProducer.schema.properties` and `CommandSubscribe.schema.properties`.
+    ///
+    /// Most schemas return an empty list (the default). KeyValue schemas use this to carry
+    /// `key.schema.name`, `key.schema.type`, `key.schema.properties`, the equivalent
+    /// `value.*` triple, and `kv.encoding.type` — Pulsar's broker only validates KeyValue
+    /// schemas when these properties are present.
+    fn properties(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Reports whether this schema still needs a broker-side `CommandGetSchema` round-trip
     /// before it can decode payloads. Default is `false` — inline schemas (Avro, JSON,
     /// primitives) carry their definition with them and never need a broker lookup.

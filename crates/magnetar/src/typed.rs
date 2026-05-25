@@ -428,7 +428,12 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
             name: self.topic.clone(),
             schema_data: self.schema.schema_data().to_vec(),
             r#type: self.schema.schema_type() as i32,
-            properties: Vec::new(),
+            properties: self
+                .schema
+                .properties()
+                .into_iter()
+                .map(|(key, value)| pb::KeyValue { key, value })
+                .collect(),
         };
         let mut builder = self
             .client
@@ -1181,7 +1186,12 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
             name: self.topic.clone(),
             schema_data: self.schema.schema_data().to_vec(),
             r#type: self.schema.schema_type() as i32,
-            properties: Vec::new(),
+            properties: self
+                .schema
+                .properties()
+                .into_iter()
+                .map(|(key, value)| pb::KeyValue { key, value })
+                .collect(),
         };
         let mut builder = self
             .client

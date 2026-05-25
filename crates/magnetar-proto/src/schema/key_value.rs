@@ -4,30 +4,37 @@
 //!
 //! Mirrors `org.apache.pulsar.client.impl.schema.KeyValueSchemaImpl`. A `KeyValueSchema<K, V>`
 //! composes two child schemas — one for the key, one for the value — into a single Pulsar schema
-//! whose `schema_data` is a small JSON document that the broker stores **verbatim** and compares
-//! by raw-byte equality (Codex Q4).
+//! whose `schema_data` is a small **binary** payload the broker stores verbatim and compares
+//! by raw-byte equality.
 //!
 //! # Wire shape of `schema_data`
 //!
-//! The Java client emits, in this exact key order:
+//! The Java client (`pulsar-common/.../KeyValueSchemaInfo.java::encodeKeyValueSchemaInfo`)
+//! emits the **binary** layout:
 //!
-//! ```json
-//! {
-//!   "key": {"name": "<keyName>", "type": "<KeyType>", "schema": "<base64-schema-data>",
-//!           "properties": {...}},
-//!   "value": {"name": "<valueName>", "type": "<ValueType>", "schema": "<base64-schema-data>",
-//!             "properties": {...}},
-//!   "type": "Separated" | "Inline"
-//! }
+//! ```text
+//! [key_schema_data.len: u32 big-endian]
+//! [key_schema_data bytes]    (raw bytes from key sub-schema's `schema_data()`)
+//! [value_schema_data.len: u32 big-endian]
+//! [value_schema_data bytes]  (raw bytes from value sub-schema's `schema_data()`)
 //! ```
 //!
-//! Magnetar must emit the same field order and value formatting or the broker will create a
-//! fresh schema version every (re)connect.
+//! Sub-schema **metadata** (name, type, properties, encoding mode) does NOT live inside
+//! `schema_data` — it goes into `CommandProducer.schema.properties` as a flat key-value map
+//! with these seven entries (Java constants verbatim):
 //!
-//! # Encoding mode
+//! - `key.schema.name`, `key.schema.type`, `key.schema.properties`
+//! - `value.schema.name`, `value.schema.type`, `value.schema.properties`
+//! - `kv.encoding.type` (= `SEPARATED` | `INLINE`, all caps)
 //!
-//! - [`KeyValueEncodingType::Separated`] (default): only the value bytes go in the payload; the key
-//!   bytes are carried in `MessageMetadata.partition_key`. Matches the Java default.
+//! See [`KeyValueSchema::properties`] for the map content. The broker's KeyValue producer
+//! validation reads these properties; a missing or mis-cased entry causes the broker to
+//! silently fail `CommandProducer` and the user's `producer.create().await` hangs.
+//!
+//! # Payload encoding mode
+//!
+//! - [`KeyValueEncodingType::Separated`] (default): only the value bytes go in the payload;
+//!   the key bytes are carried in `MessageMetadata.partition_key`. Matches the Java default.
 //! - [`KeyValueEncodingType::Inline`]: the wire payload is `[u32 key_len][key bytes][u32
 //!   value_len][value bytes]` (big-endian). The decoder reads the same shape back.
 
@@ -50,9 +57,13 @@ pub enum KeyValueEncodingType {
 
 impl KeyValueEncodingType {
     fn as_str(self) -> &'static str {
+        // Java emits `SEPARATED` / `INLINE` (all caps, no underscores) as the
+        // `kv.encoding.type` schema property and the broker validates the
+        // string match. Mismatching case ("Inline" vs "INLINE") makes the
+        // broker reject KeyValue producer creation.
         match self {
-            Self::Separated => "Separated",
-            Self::Inline => "Inline",
+            Self::Separated => "SEPARATED",
+            Self::Inline => "INLINE",
         }
     }
 }
@@ -130,6 +141,37 @@ where
 
     fn schema_data(&self) -> Bytes {
         self.schema_data.clone()
+    }
+
+    fn properties(&self) -> Vec<(String, String)> {
+        // Mirror Java's `KeyValueSchemaInfo.encodeKeyValueSchemaInfo`. The broker requires
+        // these seven keys when `Schema.type = KEY_VALUE`; without them it silently fails
+        // CommandProducer validation and the client's `producer.create().await` hangs.
+        vec![
+            (
+                "key.schema.name".to_owned(),
+                schema_type_name(self.key_schema.schema_type()),
+            ),
+            (
+                "key.schema.type".to_owned(),
+                schema_type_name(self.key_schema.schema_type()),
+            ),
+            // Java emits `{}` for empty property maps; mirror that.
+            ("key.schema.properties".to_owned(), "{}".to_owned()),
+            (
+                "value.schema.name".to_owned(),
+                schema_type_name(self.value_schema.schema_type()),
+            ),
+            (
+                "value.schema.type".to_owned(),
+                schema_type_name(self.value_schema.schema_type()),
+            ),
+            ("value.schema.properties".to_owned(), "{}".to_owned()),
+            (
+                "kv.encoding.type".to_owned(),
+                self.encoding.as_str().to_owned(),
+            ),
+        ]
     }
 
     fn encode(&self, value: &Self::Owned) -> Result<Bytes, SchemaError> {
@@ -217,39 +259,73 @@ where
     }
 }
 
-/// Render the broker-side `schema_data` JSON document.
+/// Render the broker-side `schema_data` bytes in the **binary** layout Pulsar's Java client
+/// emits for KeyValue schemas. The Java code path is
+/// `KeyValueSchemaInfo.encodeKeyValueSchemaInfo(...)` (branch-4.0,
+/// `pulsar-common/.../KeyValueSchemaInfo.java`):
 ///
-/// The field order matches the Java client (`KeyValueSchemaInfo.java::encodeKeyValueSchemaInfo`):
-/// `key` first, then `value`, then `type`. The schema-data payload for each child is base64-
-/// encoded (the Java client uses `Base64.getEncoder().encodeToString`). This keeps the document
-/// pure ASCII and avoids escaping issues with binary AVRO / FDS bytes.
+/// ```text
+/// [key_schema_data.len: i32 big-endian]
+/// [key_schema_data bytes — raw `SchemaInfo.getSchema()` of the key]
+/// [value_schema_data.len: i32 big-endian]
+/// [value_schema_data bytes — raw `SchemaInfo.getSchema()` of the value]
+/// ```
+///
+/// The sub-schemas' **metadata** (name, type, properties, encoding type) goes into
+/// `CommandProducer.schema.properties` as a flat map — see [`Self::sub_schema_properties`].
+/// Sending JSON here (the magnetar pre-fix shape) makes the broker silently drop the
+/// `CommandProducer` because Pulsar's broker validates the layout shape, not the JSON.
 fn build_schema_data(
-    key_type: pb::schema::Type,
+    _key_type: pb::schema::Type,
     key_data: &[u8],
-    value_type: pb::schema::Type,
+    _value_type: pb::schema::Type,
     value_data: &[u8],
-    encoding: KeyValueEncodingType,
+    _encoding: KeyValueEncodingType,
 ) -> Bytes {
-    let mut out = String::new();
-    out.push_str("{\"key\":");
-    render_child(&mut out, key_type, key_data);
-    out.push_str(",\"value\":");
-    render_child(&mut out, value_type, value_data);
-    out.push_str(",\"type\":\"");
-    out.push_str(encoding.as_str());
-    out.push_str("\"}");
-    Bytes::from(out.into_bytes())
+    let mut out = BytesMut::with_capacity(8 + key_data.len() + value_data.len());
+    out.put_u32(u32::try_from(key_data.len()).unwrap_or(u32::MAX));
+    out.extend_from_slice(key_data);
+    out.put_u32(u32::try_from(value_data.len()).unwrap_or(u32::MAX));
+    out.extend_from_slice(value_data);
+    out.freeze()
 }
 
-fn render_child(out: &mut String, ty: pb::schema::Type, data: &[u8]) {
-    // Emit `{"type":"<Type>","schema":"<base64>"}` — the minimum the Java reader expects. We
-    // intentionally exclude `properties` here because the Java emitter omits it when the map is
-    // empty (the broker accepts either shape, but Magnetar should mirror the empty-map default).
-    out.push_str("{\"type\":\"");
-    out.push_str(ty.as_str_name());
-    out.push_str("\",\"schema\":\"");
-    base64_encode(out, data);
-    out.push_str("\"}");
+/// Map [`pb::schema::Type`] to the **upper-case** name the Java client emits in
+/// `key.schema.name` / `value.schema.name` / `key.schema.type` / `value.schema.type`
+/// properties. Java's `SchemaType.name()` returns `STRING`, `INT32`, `JSON`,
+/// `KEY_VALUE`, etc. — all caps with underscores.
+///
+/// `prost::Enumeration::as_str_name()` returns the Rust-style title-case form
+/// (`"String"`, `"Json"`, `"KeyValue"`) which the broker's KeyValue schema
+/// validation rejects as "unknown schema type". Convert here.
+fn schema_type_name(ty: pb::schema::Type) -> String {
+    use pb::schema::Type;
+    match ty {
+        Type::None => "BYTES",
+        Type::String => "STRING",
+        Type::Json => "JSON",
+        Type::Protobuf => "PROTOBUF",
+        Type::Avro => "AVRO",
+        Type::Bool => "BOOLEAN",
+        Type::Int8 => "INT8",
+        Type::Int16 => "INT16",
+        Type::Int32 => "INT32",
+        Type::Int64 => "INT64",
+        Type::Float => "FLOAT",
+        Type::Double => "DOUBLE",
+        Type::Date => "DATE",
+        Type::Time => "TIME",
+        Type::Timestamp => "TIMESTAMP",
+        Type::KeyValue => "KEY_VALUE",
+        Type::Instant => "INSTANT",
+        Type::LocalDate => "LOCAL_DATE",
+        Type::LocalTime => "LOCAL_TIME",
+        Type::LocalDateTime => "LOCAL_DATE_TIME",
+        Type::ProtobufNative => "PROTOBUF_NATIVE",
+        Type::AutoConsume => "AUTO_CONSUME",
+        Type::External => "AUTO_PUBLISH",
+    }
+    .to_owned()
 }
 
 /// Standard base64 encoder (RFC 4648 alphabet, with `=` padding). Inlined to avoid pulling
@@ -310,40 +386,45 @@ mod tests {
 
     #[test]
     fn schema_data_shape() {
+        // Pulsar wire format: [u32 key_len BE][key bytes][u32 value_len BE][value bytes].
+        // String has empty schema_data; Json carries a non-empty schema-document.
         let schema = make();
         let data = schema.schema_data();
-        let s = std::str::from_utf8(&data).unwrap();
-        // Field order: key, value, type. The String child has empty schema_data ("").
-        assert!(s.starts_with(
-            r#"{"key":{"type":"String","schema":""},"value":{"type":"Json","schema":""#
-        ));
-        assert!(s.ends_with(r#""},"type":"Inline"}"#));
+        assert!(
+            data.len() >= 8,
+            "schema_data must be at least 8 header bytes"
+        );
+        let key_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        assert_eq!(key_len, 0, "String key schema has empty schema_data");
+        let value_len_offset = 4 + key_len;
+        let value_len = u32::from_be_bytes([
+            data[value_len_offset],
+            data[value_len_offset + 1],
+            data[value_len_offset + 2],
+            data[value_len_offset + 3],
+        ]) as usize;
+        let value_bytes = &data[value_len_offset + 4..value_len_offset + 4 + value_len];
+        let value_schema_data = JsonSchema::<Person>::new().schema_data();
+        assert_eq!(
+            value_bytes,
+            value_schema_data.as_ref(),
+            "value-schema bytes must match the child schema's schema_data verbatim"
+        );
         assert_eq!(schema.schema_type(), pb::schema::Type::KeyValue);
     }
 
     #[test]
-    fn child_schema_data_base64_round_trips() {
-        // The Json child now carries a full JSON-Schema document (via schemars) as its schema_data.
-        // Decode the base64-encoded `schema` field and assert it round-trips byte-for-byte to the
-        // child schema's `schema_data()` — that's the broker-side de-duplication invariant.
+    fn schema_properties_match_java_keys() {
         let schema = make();
-        let data = schema.schema_data();
-        let envelope: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        let encoded_b64 = envelope
-            .get("value")
-            .and_then(|v| v.get("schema"))
-            .and_then(serde_json::Value::as_str)
-            .expect("envelope must carry value.schema");
-        let decoded = base64_decode(encoded_b64).expect("value.schema must be valid base64");
-        let value_schema_data = JsonSchema::<Person>::new().schema_data();
-        assert_eq!(decoded.as_slice(), value_schema_data.as_ref());
-        // Smoke-check: the decoded payload is a JSON document describing a `Person`.
-        let document: serde_json::Value =
-            serde_json::from_slice(&decoded).expect("decoded schema must be valid JSON");
-        assert!(
-            document.get("properties").is_some(),
-            "decoded schema document should have a `properties` field; got {document}"
-        );
+        let props: std::collections::HashMap<String, String> =
+            schema.properties().into_iter().collect();
+        assert_eq!(props.get("key.schema.type"), Some(&"STRING".to_owned()));
+        assert_eq!(props.get("value.schema.type"), Some(&"JSON".to_owned()));
+        assert_eq!(props.get("kv.encoding.type"), Some(&"INLINE".to_owned()));
+        assert!(props.contains_key("key.schema.name"));
+        assert!(props.contains_key("value.schema.name"));
+        assert!(props.contains_key("key.schema.properties"));
+        assert!(props.contains_key("value.schema.properties"));
     }
 
     /// Minimal base64 decoder (standard alphabet, no padding tolerance) for tests only.
