@@ -1019,6 +1019,52 @@ impl Connection {
         request_ids
     }
 
+    /// Re-subscribe a single consumer after a successful seek. The Pulsar broker
+    /// **disconnects the consumer** as part of `CommandSeek` processing (it has to
+    /// quiesce the subscription before resetting the cursor) but does NOT send a
+    /// `CommandCloseConsumer` on the wire — the client is expected to know that
+    /// `seek` implies "consumer needs to be re-established". Without this step the
+    /// broker's internal consumer-id map no longer has this handle and subsequent
+    /// `CommandFlow`/dispatch silently no-op.
+    ///
+    /// Returns the new `CommandSubscribe` request id (so the caller can wait on a
+    /// `SubscribeAcked` event for it), or `None` if the handle is unknown or its
+    /// consumer is closed. An initial FLOW is queued alongside; the broker
+    /// processes commands in order so dispatch resumes as soon as the new
+    /// subscribe is acked.
+    /// Re-subscribe a single consumer after a successful seek.
+    ///
+    /// Pulsar broker behaviour: `CommandSeek` causes the broker to send
+    /// `CommandCloseConsumer` (it has to tear the dispatcher's consumer
+    /// down before resetting the cursor); the sans-io layer flips
+    /// `consumer.closed = true` AND queues a `ConsumerClosedByBroker`
+    /// event in response. Both have to be undone before we can
+    /// re-establish:
+    ///   1. Clear `closed=false` so subsequent `receive()` works and the ack-tracker doesn't drop
+    ///      incoming messages on the floor.
+    ///   2. Drop the stale `ConsumerClosedByBroker(handle)` events from the event queue — otherwise
+    ///      the runtime's wait-for-acked future trips on them before seeing the fresh
+    ///      `SubscribeAcked` we're about to enqueue.
+    ///
+    /// The new `CommandSubscribe` reuses the same `consumer_id`; the
+    /// broker treats it as a new subscription on the same connection.
+    /// Returns the new request id (so callers can wait on a
+    /// `SubscribeAcked` event for it), or `None` if the handle is
+    /// unknown.
+    pub fn resubscribe_consumer_after_seek(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
+        let req = self.consumer_subscribe_requests.get(&handle)?.clone();
+        let consumer = self.consumers.get_mut(&handle)?;
+        consumer.closed = false;
+        consumer.queue.clear();
+        self.events.retain(
+            |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
+        );
+        // `None` here = use the broker's persisted cursor (just reset by the seek).
+        let request_id = self.emit_command_subscribe(handle, &req, None);
+        self.initial_flow(handle);
+        Some(request_id)
+    }
+
     /// Returns the feature flags negotiated with the broker (empty until `Connected`).
     pub fn feature_flags(&self) -> &pb::FeatureFlags {
         &self.feature_flags

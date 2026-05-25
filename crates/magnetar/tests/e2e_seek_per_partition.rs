@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
-use magnetar::{OutgoingMessage, PulsarClient, SeekTarget};
+use magnetar::{MessageRoutingMode, OutgoingMessage, PulsarClient, SeekTarget};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -92,9 +92,21 @@ async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Err
         .build()
         .await?;
 
-    // First half: produce N messages per partition (keyed so each key lands on
-    // a single partition under the default hash router).
-    let producer = client.producer(topic).create().await?;
+    // Use the partitioned producer so messages fan out to
+    // `<topic>-partition-N`; a plain `client.producer(topic)` would create
+    // a single non-partitioned producer on the parent name and the
+    // partitioned consumer (which subscribes per-partition) would never
+    // see them.
+    //
+    // RoundRobin routing guarantees each of the 4 partitions gets the
+    // same number of messages. The default hash-by-key router collapses
+    // 4 keys onto fewer partitions when hashes collide — leaving some
+    // partitions empty and breaking the test's per-partition assertions.
+    let producer = client
+        .partitioned_producer(topic)
+        .routing(MessageRoutingMode::RoundRobin)
+        .create()
+        .await?;
     let half = 5usize;
     let partitions = 4usize;
     for i in 0..half {
@@ -102,8 +114,7 @@ async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Err
             producer
                 .send(
                     OutgoingMessage::with_payload(format!("first-{p}-{i}").into_bytes())
-                        .key(format!("key-{p}"))
-                        .into(),
+                        .key(format!("key-{p}")),
                 )
                 .await?;
         }
@@ -126,8 +137,7 @@ async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Err
             producer
                 .send(
                     OutgoingMessage::with_payload(format!("second-{p}-{i}").into_bytes())
-                        .key(format!("key-{p}"))
-                        .into(),
+                        .key(format!("key-{p}")),
                 )
                 .await?;
         }
@@ -166,8 +176,15 @@ async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Err
 
     let mut per_topic: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for _ in 0..expected_total {
-        let msg = tokio::time::timeout(Duration::from_secs(20), consumer.receive()).await??;
+    for i in 0..expected_total {
+        let msg = tokio::time::timeout(Duration::from_secs(20), consumer.receive())
+            .await
+            .map_err(|_| {
+                format!(
+                    "post-seek drain timed out at message {i} / {expected_total}; \
+                     per_topic so far = {per_topic:?}"
+                )
+            })??;
         let payload = String::from_utf8(msg.message.payload.to_vec())?;
         per_topic
             .entry(msg.topic.clone())

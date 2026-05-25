@@ -17,6 +17,7 @@ use magnetar_proto::{
 };
 
 use crate::ConnectionShared;
+use crate::client::wait_subscribe_acked;
 use crate::error::ClientError;
 
 /// User-facing consumer handle.
@@ -475,7 +476,26 @@ impl Consumer {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Pulsar's broker disconnects the consumer as part of `CommandSeek`
+                // processing (it has to quiesce the subscription before resetting
+                // the cursor) but does NOT send `CommandCloseConsumer` on the wire
+                // — the client is expected to re-establish. Without this, the
+                // broker's internal consumer-id map no longer has us, and any
+                // subsequent `CommandFlow` silently no-ops; `receive()` then hangs
+                // forever.
+                let resub_request_id = {
+                    let mut conn = self.shared.inner.lock();
+                    conn.resubscribe_consumer_after_seek(self.handle)
+                };
+                self.shared.driver_waker.notify_one();
+                if resub_request_id.is_some() {
+                    // Wait for the new `SubscribeAcked` event before returning so
+                    // callers can safely call `receive()` right after `seek*().await`.
+                    wait_subscribe_acked(&self.shared, self.handle).await?;
+                }
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
             other => Err(ClientError::Other(format!(
                 "unexpected seek outcome: {other:?}"

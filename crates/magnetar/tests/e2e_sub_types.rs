@@ -207,6 +207,7 @@ async fn e2e_shared_subscription_distributes_across_consumers()
 /// first batch and treat whichever one received as "active" for this run.
 #[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
 
@@ -266,8 +267,16 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
             false
         }
     };
-    let active_name = if active_is_a { "consumer-a" } else { "consumer-b" };
-    let standby_name = if active_is_a { "consumer-b" } else { "consumer-a" };
+    let active_name = if active_is_a {
+        "consumer-a"
+    } else {
+        "consumer-b"
+    };
+    let standby_name = if active_is_a {
+        "consumer-b"
+    } else {
+        "consumer-a"
+    };
     eprintln!("phase-1: broker elected {active_name} as active");
 
     // Drain the remaining 4 messages from the active side.
@@ -275,11 +284,15 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
         let msg = if active_is_a {
             tokio::time::timeout(Duration::from_secs(15), consumer_a.receive())
                 .await
-                .map_err(|_| format!("phase-1: {active_name} timed out at message {i} / {first_batch}"))??
+                .map_err(|_| {
+                    format!("phase-1: {active_name} timed out at message {i} / {first_batch}")
+                })??
         } else {
             tokio::time::timeout(Duration::from_secs(15), consumer_b.receive())
                 .await
-                .map_err(|_| format!("phase-1: {active_name} timed out at message {i} / {first_batch}"))??
+                .map_err(|_| {
+                    format!("phase-1: {active_name} timed out at message {i} / {first_batch}")
+                })??
         };
         if active_is_a {
             consumer_a.ack(msg.message_id).await?;
@@ -309,7 +322,11 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
     // Close the active consumer → broker promotes the stand-by. Failover
     // re-election delay (default 1 s) + close notification settle: sleep 5 s.
     eprintln!("phase-2: closing {active_name}, expecting {standby_name} to take over");
-    active_opt.take().expect("active was just set").close().await?;
+    active_opt
+        .take()
+        .expect("active was just set")
+        .close()
+        .await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let second_batch: usize = 3;
@@ -334,7 +351,11 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
         received_promoted.push(msg.payload.to_vec());
         promoted.ack(msg.message_id).await?;
     }
-    standby_opt.take().expect("standby was just set").close().await?;
+    standby_opt
+        .take()
+        .expect("standby was just set")
+        .close()
+        .await?;
     client.close().await;
 
     assert_eq!(

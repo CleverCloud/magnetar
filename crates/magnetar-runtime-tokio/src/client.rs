@@ -742,7 +742,7 @@ async fn wait_producer_ready(
     .await
 }
 
-async fn wait_subscribe_acked(
+pub(crate) async fn wait_subscribe_acked(
     shared: &Arc<ConnectionShared>,
     handle: magnetar_proto::ConsumerHandle,
 ) -> Result<(), ClientError> {
