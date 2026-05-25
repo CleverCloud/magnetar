@@ -480,6 +480,17 @@ impl ConsumerState {
         if self.closed {
             return Err(ConsumerError::Closed);
         }
+        // Java's `duringSeek` flag (apache/pulsar PR #21945, Jan 2024): while
+        // a seek is in flight (we've sent CommandSeek but haven't yet seen
+        // its CommandSuccess) the broker can keep dispatching pre-seek
+        // messages that were already in its TCP send buffer. Those are
+        // stale relative to the user's seek intent — they were dispatched
+        // by the **old** cursor position, not the seek target. Drop them
+        // here so they never reach the user-facing receive() and the
+        // post-seek backlog is the only content the consumer sees.
+        if self.pending_seek.is_some() {
+            return Ok(DeliverOutcome::Dropped);
+        }
         let redelivery = cmd.redelivery_count.unwrap_or(0);
         let mut message_id = MessageId::from_pb(&cmd.message_id);
 

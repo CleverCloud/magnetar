@@ -1034,34 +1034,54 @@ impl Connection {
     /// subscribe is acked.
     /// Re-subscribe a single consumer after a successful seek.
     ///
-    /// Pulsar broker behaviour: `CommandSeek` causes the broker to send
-    /// `CommandCloseConsumer` (it has to tear the dispatcher's consumer
-    /// down before resetting the cursor); the sans-io layer flips
-    /// `consumer.closed = true` AND queues a `ConsumerClosedByBroker`
-    /// event in response. Both have to be undone before we can
-    /// re-establish:
-    ///   1. Clear `closed=false` so subsequent `receive()` works and the ack-tracker doesn't drop
-    ///      incoming messages on the floor.
-    ///   2. Drop the stale `ConsumerClosedByBroker(handle)` events from the event queue — otherwise
-    ///      the runtime's wait-for-acked future trips on them before seeing the fresh
-    ///      `SubscribeAcked` we're about to enqueue.
+    /// Re-emit `CommandSubscribe` for a consumer after a successful seek,
+    /// in the case where the broker tore down the subscription as part of
+    /// resetting the cursor and did so via a wire-level
+    /// `CommandCloseConsumer` (some Pulsar broker versions disconnect the
+    /// consumer to quiesce the dispatcher before persisting the new
+    /// cursor position).
     ///
-    /// The new `CommandSubscribe` reuses the same `consumer_id`; the
-    /// broker treats it as a new subscription on the same connection.
+    /// Mirrors Java's `ConsumerImpl.connectionOpened` flow that
+    /// `seekAsync` triggers indirectly through the connection-level
+    /// supervisor — magnetar runs it inline because there is no
+    /// connection-level reconnect happening (the TCP socket is fine).
+    ///
     /// Returns the new request id (so callers can wait on a
     /// `SubscribeAcked` event for it), or `None` if the handle is
-    /// unknown.
+    /// unknown. Drops any stale `ConsumerClosedByBroker(handle)` events
+    /// from the queue first — those were emitted when the broker tore
+    /// the subscription down and would otherwise trip the runtime's
+    /// `wait_subscribe_acked` future before it sees the fresh
+    /// `SubscribeAcked`.
+    ///
+    /// Critically, does **NOT** clear `consumer.queue`: the broker may
+    /// have already dispatched messages from the just-reset cursor
+    /// position into the TCP buffer by the time this runs. Those
+    /// messages are post-seek and the user wants them. `begin_seek`
+    /// already cleared pre-seek messages at seek-issue time.
     pub fn resubscribe_consumer_after_seek(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
         let req = self.consumer_subscribe_requests.get(&handle)?.clone();
-        let consumer = self.consumers.get_mut(&handle)?;
-        consumer.closed = false;
-        consumer.queue.clear();
+        // `consumer.closed` is no longer flipped by `handle_close_consumer`
+        // (see the comment block in `CloseConsumer` branch above), so we
+        // don't need to reset it here. We only need to drain the stale
+        // close-by-broker events so the runtime's wait future doesn't trip
+        // on them.
+        let _ = self.consumers.get_mut(&handle)?;
         self.events.retain(
             |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
         );
         // `None` here = use the broker's persisted cursor (just reset by the seek).
         let request_id = self.emit_command_subscribe(handle, &req, None);
         self.initial_flow(handle);
+        // After cursor reset, the broker still tracks the consumer's
+        // pre-seek dispatched-but-not-acked messages as "in-flight" — it
+        // won't push **anything** new until those slots free up. Issue
+        // `CommandRedeliverUnacknowledgedMessages` (empty message_ids =
+        // redeliver all) to release the broker's tracking, then the post-
+        // seek cursor position can dispatch fresh entries. Mirrors what
+        // Java's `ConsumerImpl#redeliverUnacknowledgedMessages` does
+        // implicitly on the connection-reset path.
+        self.emit_redeliver_unacked(handle, Vec::new());
         Some(request_id)
     }
 
@@ -1530,9 +1550,27 @@ impl Connection {
                         "missing CommandCloseConsumer",
                     ))?;
                 let handle = ConsumerHandle(close.consumer_id);
-                if let Some(c) = self.consumers.get_mut(&handle) {
-                    c.close();
-                }
+                // Mirroring #56 (producer-side fix): the broker sends
+                // `CommandCloseConsumer` for several transient reasons —
+                // PIP-188 topic migration, broker restart, supervised
+                // failover, and as part of seek processing (the broker
+                // tears the dispatcher's consumer down before resetting
+                // the cursor; this fires for **every** seek). All these
+                // cases are transient at the protocol level; the
+                // supervised reconnect path (`Connection::reset` +
+                // `rebuild_consumers`) or the post-seek resubscribe
+                // (`resubscribe_consumer_after_seek`) re-attaches the
+                // consumer.
+                //
+                // Flipping `closed=true` here would make any subsequent
+                // `consumer.deliver()` call drop the broker's freshly
+                // dispatched post-seek messages on the floor — exactly
+                // the symptom Java's `duringSeek` flag was added to
+                // prevent (apache/pulsar PR #21945). Surface the event
+                // for observability but DO NOT mark the consumer
+                // closed.
+                //
+                // Refs: Task #65 (and the equivalent producer fix #56).
                 self.events
                     .push_back(ConnectionEvent::ConsumerClosedByBroker {
                         handle,
