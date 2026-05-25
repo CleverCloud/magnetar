@@ -1588,7 +1588,7 @@ dependencies = [
  "crc32c",
  "hdrhistogram",
  "proptest",
- "prost 0.13.5",
+ "prost 0.14.3",
  "rstest",
  "schemars 1.2.1",
  "serde",
