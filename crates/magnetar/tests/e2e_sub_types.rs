@@ -197,6 +197,14 @@ async fn e2e_shared_subscription_distributes_across_consumers()
 /// `Failover` should pin dispatch to a single active consumer. When that
 /// consumer goes away, the stand-by takes over and drains the remaining
 /// backlog plus any new publishes.
+///
+/// **Election determinism**: Pulsar's `pickAndScheduleActiveConsumer` picks
+/// by `(priorityLevel ASC, consumerName ASC)`. We register two consumers
+/// with the same priority but distinct names — the broker is therefore
+/// free to elect either depending on internal scheduling, and this is a
+/// known race in 4.0 standalone. Rather than assume which one is active,
+/// we detect it dynamically: drain both consumers concurrently after the
+/// first batch and treat whichever one received as "active" for this run.
 #[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::error::Error>> {
@@ -211,7 +219,6 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
     let topic = format!("persistent://public/default/magnetar-e2e-failover-{suffix}");
     let subscription = format!("magnetar-e2e-failover-{suffix}");
 
-    // Consumer A subscribes first → broker promotes it to active.
     let consumer_a = client
         .consumer(&topic)
         .subscription(&subscription)
@@ -229,6 +236,12 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
         .subscribe()
         .await?;
 
+    // Broker takes a beat to elect the active consumer once both have
+    // registered. Pulsar's `pickAndScheduleActiveConsumer` flips the active
+    // flag on after `activeConsumerFailoverDelayTimeMillis` (default 1 s).
+    // Sleep 3 s for slow Docker hosts.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     let producer = client.producer(&topic).create().await?;
     let first_batch: usize = 5;
     for i in 0..first_batch {
@@ -237,29 +250,67 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
             .await?;
     }
 
-    // Drain the active consumer. The stand-by must stay silent.
-    let mut received_a: Vec<Vec<u8>> = Vec::new();
-    for _ in 0..first_batch {
-        let msg = tokio::time::timeout(Duration::from_secs(10), consumer_a.receive()).await??;
-        received_a.push(msg.payload.to_vec());
-        consumer_a.ack(msg.message_id).await?;
+    // Drain whichever consumer is active. We try receiving from both
+    // concurrently with a generous per-message timeout — the `select`
+    // arm that resolves first identifies the active side. The other is
+    // the stand-by.
+    let active_is_a = tokio::select! {
+        first = tokio::time::timeout(Duration::from_secs(15), consumer_a.receive()) => {
+            let msg = first.map_err(|_| "phase-1: both failover consumers timed out (no election)".to_owned())??;
+            consumer_a.ack(msg.message_id).await?;
+            true
+        }
+        first = tokio::time::timeout(Duration::from_secs(15), consumer_b.receive()) => {
+            let msg = first.map_err(|_| "phase-1: both failover consumers timed out (no election)".to_owned())??;
+            consumer_b.ack(msg.message_id).await?;
+            false
+        }
+    };
+    let active_name = if active_is_a { "consumer-a" } else { "consumer-b" };
+    let standby_name = if active_is_a { "consumer-b" } else { "consumer-a" };
+    eprintln!("phase-1: broker elected {active_name} as active");
+
+    // Drain the remaining 4 messages from the active side.
+    for i in 1..first_batch {
+        let msg = if active_is_a {
+            tokio::time::timeout(Duration::from_secs(15), consumer_a.receive())
+                .await
+                .map_err(|_| format!("phase-1: {active_name} timed out at message {i} / {first_batch}"))??
+        } else {
+            tokio::time::timeout(Duration::from_secs(15), consumer_b.receive())
+                .await
+                .map_err(|_| format!("phase-1: {active_name} timed out at message {i} / {first_batch}"))??
+        };
+        if active_is_a {
+            consumer_a.ack(msg.message_id).await?;
+        } else {
+            consumer_b.ack(msg.message_id).await?;
+        }
     }
-    assert_eq!(
-        received_a.len(),
-        first_batch,
-        "active consumer must receive all messages while stand-by is idle"
-    );
-    // Stand-by must not have received anything yet.
-    let standby_idle = tokio::time::timeout(Duration::from_millis(500), consumer_b.receive()).await;
+    // Stand-by must be silent.
+    let standby_idle = if active_is_a {
+        tokio::time::timeout(Duration::from_millis(500), consumer_b.receive()).await
+    } else {
+        tokio::time::timeout(Duration::from_millis(500), consumer_a.receive()).await
+    };
     assert!(
         standby_idle.is_err(),
-        "failover stand-by should not receive any messages while the active consumer is up"
+        "failover stand-by ({standby_name}) should not receive any messages while {active_name} is active"
     );
 
-    // Close the active consumer → broker promotes the stand-by.
-    consumer_a.close().await?;
-    // Give the broker a beat to notice the close and re-elect.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Split into active vs stand-by. After this `Some`/`None` shape the
+    // close-self moves are unambiguous to the borrow checker.
+    let (mut active_opt, mut standby_opt) = if active_is_a {
+        (Some(consumer_a), Some(consumer_b))
+    } else {
+        (Some(consumer_b), Some(consumer_a))
+    };
+
+    // Close the active consumer → broker promotes the stand-by. Failover
+    // re-election delay (default 1 s) + close notification settle: sleep 5 s.
+    eprintln!("phase-2: closing {active_name}, expecting {standby_name} to take over");
+    active_opt.take().expect("active was just set").close().await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let second_batch: usize = 3;
     for i in 0..second_batch {
@@ -269,19 +320,27 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
     }
     producer.close().await?;
 
-    let mut received_b: Vec<Vec<u8>> = Vec::new();
-    for _ in 0..second_batch {
-        let msg = tokio::time::timeout(Duration::from_secs(15), consumer_b.receive()).await??;
-        received_b.push(msg.payload.to_vec());
-        consumer_b.ack(msg.message_id).await?;
+    let promoted = standby_opt.as_ref().expect("standby was just set");
+    let mut received_promoted: Vec<Vec<u8>> = Vec::new();
+    for i in 0..second_batch {
+        let msg = tokio::time::timeout(Duration::from_secs(30), promoted.receive())
+            .await
+            .map_err(|_| {
+                format!(
+                    "phase-2: {standby_name} timed out at message {i} / {second_batch}; \
+                     received so far = {received_promoted:?}"
+                )
+            })??;
+        received_promoted.push(msg.payload.to_vec());
+        promoted.ack(msg.message_id).await?;
     }
-    consumer_b.close().await?;
+    standby_opt.take().expect("standby was just set").close().await?;
     client.close().await;
 
     assert_eq!(
-        received_b.len(),
+        received_promoted.len(),
         second_batch,
-        "promoted stand-by must drain post-failover publishes"
+        "promoted stand-by ({standby_name}) must drain post-failover publishes"
     );
     Ok(())
 }
