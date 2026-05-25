@@ -383,194 +383,121 @@ all four can land independently as v0.2.0 follow-ups.
 
 ---
 
-## E2E-discovered runtime bugs (pending fix)
+## E2E-discovered runtime bugs
 
-Five magnetar-runtime bugs surfaced during the e2e sweep against
-`apachepulsar/pulsar:4.0.4` (after the test-fixture bootstrap fixes
-landed). Each one is reproducible by the named e2e test below; the
-fix lives in the runtime / proto layer, not the test fixture.
+After the test-fixture bootstrap fixes (#55) and the wire-protocol
+bugs surfaced by the e2e sweep, the state is:
 
-### #60 follow-up — broker doesn't re-dispatch post-seek on same consumer_id
+- **#56** producer rejected after broker reconnect — **PARTIAL** (commit
+  on main): broker-initiated `CommandCloseProducer` no longer flips
+  `closed=true`, so `rebuild_producers` can re-attach. Remaining
+  issue: post-restart send doesn't get a receipt — tracked as **#66**.
+- **#57** chunked send hangs — **FIXED**. Per-chunk payload size now
+  reserves 1 KiB for the wire-frame overhead (matches Java's
+  `chunkMaxMessageSize`).
+- **#58** KeyValue inline schema hangs — **FIXED**. Schema_data is now
+  emitted in the Java-compatible binary layout
+  (`[u32 len][bytes][u32 len][bytes]`) and the seven KeyValue
+  properties are populated on `CommandProducer.schema.properties`.
+- **#63** PIP-4 encryption (roundtrip / failure actions / chunking)
+  — **FIXED**. Combination of #57 (chunked frame size) + the
+  `InitialPosition::Earliest` test-fixture fix on the crypto e2e
+  tests.
+- **#65** seek_per_partition resubscribe — **PARTIAL** (commit on main).
+  Three coupled fixes landed: duringSeek drop in `Consumer::deliver`,
+  transient `CommandCloseConsumer` (matches #56), explicit
+  `CommandRedeliverUnacknowledgedMessages` after resubscribe. Broker
+  still doesn't dispatch post-seek backlog when the same `consumer_id`
+  re-subscribes — likely needs fresh `consumer_id` allocation, tracked
+  as **#67**.
 
-The seek-resubscribe fix (commit `d011875`) re-establishes the
-consumer-side subscription after the broker's seek-driven disconnect,
-but the broker does NOT re-dispatch post-seek messages to the
-re-attached consumer (same `consumer_id`). End result on
-`e2e_seek_per_partition_callback`:
-
-- With `queue.clear()` in `resubscribe_consumer_after_seek`: 0
-  messages delivered (broker won't re-dispatch).
-- Without `queue.clear()`: pre-seek messages that landed in the
-  queue between `begin_seek` and `seek_acked` survive, polluting
-  the post-seek view (test sees 10 messages on partition-0 instead
-  of the 5 post-seek tail).
-
-**Root cause (hypothesis).** The Pulsar broker tracks
-"messages dispatched to this consumer-id" at the dispatcher level.
-After a seek + reconnect with the SAME consumer-id, the broker's
-dispatcher considers the previously-dispatched-but-not-acked
-messages as "still owed" to the client and refuses to redeliver
-them. Java's `ConsumerImpl#seekAsync` doesn't re-subscribe — it
-relies on the connection-level supervisor to re-attach
-transparently, which uses a FRESH consumer-id under the hood.
-
-**Proper fix.** When `resubscribe_consumer_after_seek` re-attaches,
-allocate a fresh `consumer_id` (via `next_consumer_id`) instead of
-reusing the original. Re-key `self.consumers`, `self.consumer_subscribe_requests`,
-and any pending receive-wakers to the new handle. The user-facing
-`Consumer` keeps holding its old `ConsumerHandle` — we need an
-indirection (per-handle `current_remote_id`) so user code keeps
-working without breaking change.
-
-**Verified via diagnostics.** `magnetar_proto::conn::deliver`
-shows the broker dispatches 10 messages per partition exactly once
-(the initial pre-seek dispatch). After my resubscribe lands, no
-further `CommandMessage` arrives even though broker logs show
-`Created subscription` (post-seek) for each partition.
+### Remaining follow-ups
 
 ### #64 — PartitionedProducer RoundRobin (CLOSED — misdiagnosis)
 
 The earlier 0/20/20/0 distribution was caused by the e2e test
 using `client.producer(topic)` instead of
-`client.partitioned_producer(topic)`. With my landed test fix
-(`fix/seek-per-partition`) the broker shows backlog 10/10/10/10
-across all 4 partitions — `RoundRobin` works correctly. Closing
-#64 as misdiagnosis.
+`client.partitioned_producer(topic)`. With the corrected test
+producer (`fix/seek-per-partition`) the broker shows backlog
+10/10/10/10 across all 4 partitions — `RoundRobin` works correctly.
 
-### #56 — Producer rejected send after broker reconnect / restart (PARTIALLY LANDED)
+### #66 — Post-restart send doesn't get receipt
 
-**Symptom.** `e2e_cluster_failover_manual_swap`,
-`e2e_supervised_reconnect_across_broker_restart`,
-`e2e_transparent_inflight_publish_replay_across_broker_restart` failed
-with `Protocol(InvariantViolation("producer rejected send"))` on the
-first `send()` after a broker restart / failover.
+**Symptom.** `e2e_supervised_reconnect_across_broker_restart` no
+longer fast-fails (the #56 close-flag fix removed the
+`InvariantViolation`), but the post-restart `producer.send().await`
+hangs waiting for a `CommandSendReceipt` that never arrives. The
+test exhausts its 30 × 2 s retry budget on the send.
 
-**Landed fix.** `Connection::handle_close_producer` no longer flips
-`producer.closed = true` (commit on main, follow-up to #56). The
-broker uses `CommandCloseProducer` for transient close (PIP-188
-migration, broker restart, cluster swap) — all transient at the
-protocol level. Magnetar previously marked the producer
-permanently-closed, which blocked the supervised reconnect's
-`rebuild_producers` (line 933 filter `!p.closed`) from re-attaching.
+**Investigation done.**
+- TCP reconnect works: testcontainers `stop_with_timeout` + `start`
+  is observed by the supervised driver; `reset()` + `rebuild_producers`
+  is called after the new handshake (see `driver.rs:362, 502`).
+- Broker re-creates the producer (visible in broker logs).
+- The first `CommandSend` after reconnect carries the same
+  `producer_name` and an incremented `epoch`, but no receipt comes
+  back.
 
-**Remaining work (tracked as #66).** With the close flag fixed, the
-test no longer fails fast — but the post-restart send hangs waiting
-for a receipt. Likely a stale `in_flight_publish_snapshots`
-interaction in `Connection::reset` when the freshly-bumped producer
-epoch's first send collides with the snapshotted sequence_id. Needs
-wire-level trace of the post-restart send/receipt round-trip.
-
-**Repro.**
-
-```sh
-cargo test -p magnetar --features e2e --test e2e_reconnect -- --include-ignored --test-threads=1
-```
-
-### #57 — Chunked send hangs (`e2e_chunked_message_round_trip`)
-
-**Symptom.** A 6 MiB payload sent through
-`producer.chunking(true).batching(0,0)` never returns — the test
-hangs until `tokio::time::timeout(60s)` on `consumer.receive()`
-fires. The producer's `send().await` actually never resolves either
-(broker logs do not show `Created new producer` for the chunked
-path).
-
-**Root cause hypotheses (to verify with a wire-level capture).**
-- `magnetar_proto::producer::emit_chunked` (lines 824–921) sets
-  `is_chunk: Some(true)` per chunk but issues a single
-  `OpSend { sequence_id: ctx.sequence_id, .. }` for the whole
-  logical message. The broker may emit one `CommandSendReceipt` per
-  chunk, but `apply_receipt` removes the OpSend on the FIRST receipt
-  (`pending.remove(position)`) — subsequent receipts then no-op,
-  which would normally be benign… unless the broker is gating later
-  chunks on the previous receipt being correlated by a different
-  shape.
-- The producer may need `num_messages: total_chunks` on the first
-  chunk's `CommandSend`, not `Some(1)`. Java's
-  `ProducerImpl.java:696-704` is ambiguous on this — confirm against
-  a wireshark capture of the Java client doing the same publish.
+**Open hypotheses.**
+- `in_flight_publish_snapshots` (conn.rs:846) re-injects replay
+  frames with the original `sequence_id`. If the first new send
+  after reconnect happens BEFORE the replay drains, the broker may
+  see a `sequence_id` gap or duplicate.
+- Magnetar's `epoch` bump on `rebuild_producers` may not match what
+  the broker's `ProducerImpl.epoch` validation expects.
+- The reset path may be flushing the user's pre-reset `OpSend`
+  wakers in a way that the future re-registers but never gets fired
+  by the receipt (the receipt's `apply_receipt` finds nothing in
+  `pending` if the snapshot was already drained).
 
 **Fix steps.**
-1. Capture both magnetar and Java client wire frames for an
-   identical chunked publish; diff the `CommandSend` fields.
-2. Adjust `emit_chunked` to match the Java shape.
-3. Confirm `apply_receipt` is a no-op (matching Java's
-   per-chunk-receipt absorbing).
+1. Set up a TCP proxy between magnetar and the broker that logs
+   every frame in both directions.
+2. Compare the post-reconnect CommandSend wire bytes vs what Java's
+   `ProducerImpl#resendMessages` emits.
+3. Pay particular attention to `epoch`, `sequence_id`,
+   `highest_sequence_id`, and the `metadata.producer_name`.
 
 **Repro.**
 
 ```sh
-cargo test -p magnetar --features e2e --test e2e_batch_chunk -- --include-ignored --test-threads=1
+cargo test -p magnetar --features e2e --test e2e_reconnect -- --include-ignored --test-threads=1 --nocapture
 ```
 
-### #58 — KeyValue inline schema producer hangs at create
+### #67 — Fresh consumer_id refactor for post-seek resubscribe
 
-**Symptom.** `e2e_schema_key_value_string_int32_inline_roundtrip`
-hangs in `TypedProducer::create()` — broker logs show
-"Created topic persistent://public/default/magnetar-e2e-schema-kv-inline"
-but no follow-up "Created new producer" line, meaning the
-`CommandProducer` either does not reach the broker or its response
-does not reach magnetar.
+**Symptom.** After landing the three-part fix for #65 (duringSeek
+drop + transient close + redeliver), the broker confirms `backlog 5`
+on `partition-0` after the seek (cursor reset to mid_ms point), but
+no message dispatches to the re-subscribed consumer with the same
+`consumer_id`.
 
-**Root cause hypothesis.** The KeyValue schema-data JSON shape
-(`{"key":{...},"value":{...},"type":"INLINE"}`) may not match what
-the broker's `SchemaRegistry` expects. Java emits a slightly
-different shape (camelCased properties, key-schema/value-schema
-serialised through Jackson's own `JsonSchema`). Compare
-`magnetar-proto/src/schema/key_value.rs::build_schema_data` against
-`org.apache.pulsar.client.api.schema.KeyValueSchemaInfoTest` — the
-broker may silently drop the `CommandProducer` when the
-schema-validation path fails async.
+**Investigation done.** `magnetar_proto::conn::Consumer::deliver` is
+never called after the resubscribe — broker isn't dispatching even
+though `Created subscription` lands in the broker log post-resub.
+
+**Open hypothesis.** The Pulsar broker tracks "pending acks" per
+`consumer_id` even after the disconnect; on resubscribe with the
+same `consumer_id`, the broker thinks the previously-dispatched
+messages are still owed and refuses to push new ones from the
+just-reset cursor.
 
 **Fix steps.**
-1. Capture the Java-emitted `schema_data` bytes for
-   `Schema.KeyValue(STRING, INT32, INLINE)`.
-2. Diff against magnetar's emission; update `build_schema_data` to
-   match byte-for-byte (same approach as the JSON-schema
-   Jackson-compat fix landed in commit `3545d99` / #59).
-3. Validate via the e2e test.
+1. Refactor `resubscribe_consumer_after_seek` to allocate a fresh
+   `consumer_id` (via `next_consumer_id`).
+2. Re-key `Connection::consumers`, `consumer_subscribe_requests`,
+   and any pending receive-wakers to the new handle.
+3. Add a per-handle `current_remote_id` indirection so the
+   user-facing `Consumer` keeps holding its original
+   `ConsumerHandle` while incoming messages are routed to the new
+   id.
+4. Validate `e2e_seek_per_partition_callback` against
+   `apachepulsar/pulsar:4.0.4`.
 
 **Repro.**
 
 ```sh
-cargo test -p magnetar --features e2e --test e2e_schemas_extended -- --include-ignored --test-threads=1
-```
-
-### #63 — PIP-4 encryption suite: roundtrip + failure actions + chunking
-
-**Symptom.** Four of the five `e2e_crypto_*` tests fail:
-
-- `e2e_crypto_roundtrip` — encrypt/decrypt round-trip
-- `e2e_crypto_failure_action_consume` — `CryptoFailureAction::Consume`
-- `e2e_crypto_failure_action_fail` — `CryptoFailureAction::Fail`
-- `e2e_crypto_with_chunking` — chunked + encrypted, hangs (timeout)
-
-Only `e2e_crypto_failure_action_discard` passes.
-
-**Root cause hypotheses.**
-- The encryption-key metadata wire-format
-  (`MessageMetadata.encryption_keys[]`, `encryption_param`,
-  `encryption_algo`) may diverge from Java's emission shape — the
-  broker stores these bytes verbatim, the consumer reads them, so
-  any byte-level drift cascades through.
-- Chunking + encryption interaction (PIP-4 × PIP-37) was tested only
-  via unit tests so far; the chunk-replay path may strip
-  encryption metadata.
-
-**Fix steps.**
-1. Capture Java-encrypted payload bytes and metadata; diff vs
-   magnetar's `MessageCrypto` emission.
-2. Trace the consumer's decrypt path to confirm
-   `CryptoFailureAction` dispatch fires on `Consume` / `Fail`
-   variants (the `discard` test passes so the wiring exists; the
-   other variants likely fall through to a hang).
-3. Add unit tests for chunked + encrypted at the
-   `magnetar-proto` level so regressions are caught off-broker.
-
-**Repro.**
-
-```sh
-cargo test -p magnetar --features e2e,encryption --test e2e_crypto -- --include-ignored --test-threads=1
+cargo test -p magnetar --features e2e --test e2e_seek_per_partition -- --include-ignored --test-threads=1
 ```
 
 ---
