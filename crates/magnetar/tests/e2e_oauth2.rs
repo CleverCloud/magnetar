@@ -90,6 +90,13 @@ async fn start_pulsar()
 /// refresh behaviour by injecting a virtual clock.
 async fn start_idp(access_token: &str, expires_in: u64) -> MockServer {
     let mock = MockServer::start().await;
+    // First mock is **one-shot**. `wiremock`'s matcher list is
+    // first-match-wins by registration order, so without `up_to_n_times(1)`
+    // any subsequent `.mount()` of a second mock against the same
+    // `(method, path)` would never fire — the first mock would keep
+    // returning its body forever. By bounding it to one response we let
+    // `e2e_oauth2_refresh_on_expiry_reissues_token` mount a rotated-token
+    // mock that picks up the *next* `/token` POST.
     Mock::given(method("POST"))
         .and(path("/oauth/token"))
         .and(body_string_contains("grant_type=client_credentials"))
@@ -99,6 +106,7 @@ async fn start_idp(access_token: &str, expires_in: u64) -> MockServer {
             "token_type": "Bearer",
             "expires_in": expires_in,
         })))
+        .up_to_n_times(1)
         .mount(&mock)
         .await;
     mock
