@@ -109,7 +109,7 @@ hdrhistogram       = { version = "7", default-features = false }
 
 # Test infrastructure
 testcontainers = "0.27"
-rstest         = "0.21"
+rstest         = "0.26"
 proptest       = "1"
 tempfile       = "3"
 wiremock       = "0.6"
