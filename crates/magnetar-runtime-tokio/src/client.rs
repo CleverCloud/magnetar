@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use magnetar_proto::{
@@ -363,6 +364,7 @@ impl Client {
         &self,
         timeout: std::time::Duration,
     ) -> Result<magnetar_proto::TxnId, ClientError> {
+        self.ensure_txn_bootstrapped().await?;
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.new_txn(timeout)
@@ -381,6 +383,60 @@ impl Client {
                 "unexpected new_txn outcome: {other:?}"
             ))),
         }
+    }
+
+    /// Force the broker to load the TC partition we will talk to. Pulsar brokers only assign
+    /// a `TransactionMetadataStore` to a TC partition once a client explicitly handshakes via
+    /// `CommandTcClientConnectRequest` (or an internal subscription opens the
+    /// `__transaction_coordinator_assign-partition-N` topic). The Java client does that
+    /// handshake inside `TransactionMetaStoreHandler.connectionOpened` →
+    /// `Commands.newTcClientConnectRequest`. We mirror it on first use:
+    ///
+    /// 1. `CommandLookupTopic` on
+    ///    `persistent://pulsar/system/transaction_coordinator_assign-partition-0` — forces the
+    ///    broker to take ownership of the matching namespace bundle. Lookup alone is **not**
+    ///    enough: ownership transfer is asynchronous, and races with `CommandNewTxn` reach the
+    ///    broker before `handleMetadataStoreLoad(tcId)` finishes.
+    /// 2. `CommandTcClientConnectRequest(tc_id=0)` — the broker only acknowledges this once the TC
+    ///    metadata store for `tc_id` is fully loaded, which closes the race window.
+    ///
+    /// Subsequent `new_txn` calls observe `txn_bootstrapped` and skip the handshake. The flag
+    /// stays set across reconnects: the broker persists the TC store on disk, so once loaded
+    /// it survives the connection drop. magnetar currently pins the TC id to `0`
+    /// (`TxnClient::new(0)`); multi-TC support would need to fan this handshake out per
+    /// `tc_id`.
+    async fn ensure_txn_bootstrapped(&self) -> Result<(), ClientError> {
+        if self.shared.txn_bootstrapped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Step 1: lookup forces bundle ownership onto this broker.
+        self.lookup_topic("persistent://pulsar/system/transaction_coordinator_assign-partition-0")
+            .await?;
+        // Step 2: explicit TC handshake — broker only responds once the TC metadata store is
+        // loaded, eliminating the race between bundle-ownership-acquire and the first newTxn.
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.tc_client_connect(0)
+        };
+        self.shared.driver_waker.notify_one();
+        let outcome = PartitionedMetadataFut {
+            shared: self.shared.clone(),
+            request_id,
+        }
+        .await;
+        match outcome {
+            OpOutcome::Success { .. } => {}
+            OpOutcome::Error { code, message, .. } => {
+                return Err(ClientError::Broker { code, message });
+            }
+            other => {
+                return Err(ClientError::Other(format!(
+                    "unexpected tc_client_connect outcome: {other:?}"
+                )));
+            }
+        }
+        self.shared.txn_bootstrapped.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Register `topic` as a partition this transaction will write to (PIP-31).

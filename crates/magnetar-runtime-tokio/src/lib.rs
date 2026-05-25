@@ -165,6 +165,19 @@ pub struct ConnectionShared {
     /// the canonical no-channel wake pattern (see
     /// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub memory_wakers: Mutex<Slab<Waker>>,
+    /// Set to `true` after the first successful TC-partition lookup. Pulsar brokers do not
+    /// load the `__transaction_coordinator_assign-partition-N` topic until something forces
+    /// the namespace bundle onto them; the first `CommandLookupTopic` for the TC partition
+    /// is that trigger. Without this bootstrap, the first `CommandNewTxn` lands on a broker
+    /// whose `TransactionMetadataStoreService.stores.get(tcId)` returns `null` and the broker
+    /// replies `TransactionCoordinatorNotFound` (mapped to `TxnError::NotFound`). The Java
+    /// client side-steps the issue by eagerly opening one
+    /// `TransactionMetaStoreHandler` per TC partition during
+    /// `PulsarClientImpl.initTransactionCoordinatorClient()` — the handler itself does the
+    /// lookup. We mirror that lazily: the first `Client::new_txn` looks up the TC partition,
+    /// flips this flag, and subsequent calls skip the bootstrap. Persists across reconnects
+    /// (broker keeps the TC store loaded on disk).
+    pub txn_bootstrapped: AtomicBool,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -347,6 +360,7 @@ impl ConnectionShared {
             memory_used: AtomicU64::new(0),
             memory_limit_policy,
             memory_wakers: Mutex::new(Slab::new()),
+            txn_bootstrapped: AtomicBool::new(false),
         })
     }
 }

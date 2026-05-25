@@ -410,6 +410,45 @@ bugs surfaced by the e2e sweep, the state is:
   still doesn't dispatch post-seek backlog when the same `consumer_id`
   re-subscribes — likely needs fresh `consumer_id` allocation, tracked
   as **#67**.
+- **#68** e2e_transactions (PIP-31, all three tests) — **FIXED**. Four
+  Java-parity gaps closed in `fix/txn-ttl-millis`:
+  1. `txn_ttl_seconds` is actually milliseconds on the wire (Pulsar
+     `TransactionMetadataStoreService.newTransaction(tcId, timeoutInMills,
+     ...)` passes `command.getTxnTtlSeconds()` directly into
+     `timeoutInMills`). magnetar used to divide by 1000, so 30 s arrived
+     at the broker as 30 ms and the TC auto-aborted before the next
+     RPC. Fix: stop the conversion; the docstring on
+     `magnetar_proto::txn::TxnClient::new_txn` now warns about the
+     mis-named field.
+  2. The TC partition store is loaded on demand. The first
+     `CommandNewTxn` against a fresh broker hit
+     `TransactionMetadataStoreService.stores.get(tcId) == null` and
+     returned `TransactionCoordinatorNotFound`. Fix: new
+     `Connection::tc_client_connect(tc_id)` mirrors Java's
+     `TransactionMetaStoreHandler.connectionOpened` →
+     `Commands.newTcClientConnectRequest`. `Client::new_txn` runs a
+     one-shot bootstrap (`lookup_topic` then `tc_client_connect`)
+     guarded by `ConnectionShared::txn_bootstrapped`; subsequent calls
+     skip it. Lookup alone is not enough — bundle ownership transfer is
+     async; the `TC_CLIENT_CONNECT_REQUEST` round-trip is what waits for
+     `handleMetadataStoreLoad(tcId)`.
+  3. Batched sends dropped the txn id. The flush path hard-coded
+     `CommandSend.txnid_*: None`, so any `send().await` of a txn
+     message that hit `add_to_batch` bypassed `TransactionBuffer`.
+     `BatchContainer` now carries `txn_id`; `queue_send` flushes when
+     a non-matching `txn_id` arrives (mirrors Java
+     `ProducerImpl.canAddToBatch`).
+  4. Java's `TypedMessageBuilderImpl#beforeSend` also stamps the txn
+     bits on `MessageMetadata` — the broker's `TopicTransactionBuffer`
+     routes off the metadata, not `CommandSend`. Without those bits,
+     entries went straight to the dispatcher and aborts couldn't
+     suppress delivery (the failing
+     `e2e_txn_abort_drops_messages`). Fix: set
+     `metadata.txnid_least_bits` / `txnid_most_bits` in all three send
+     paths (`emit_single`, `flush_batch`, `emit_chunked`).
+
+  Result: `e2e_transactions` is 3/3 PASS. Implemented entirely on the
+  tokio runtime; moonpool simulator does not exercise PIP-31 today.
 
 ### Remaining follow-ups
 

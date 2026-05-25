@@ -33,8 +33,8 @@
 //!
 //! # Payload encoding mode
 //!
-//! - [`KeyValueEncodingType::Separated`] (default): only the value bytes go in the payload;
-//!   the key bytes are carried in `MessageMetadata.partition_key`. Matches the Java default.
+//! - [`KeyValueEncodingType::Separated`] (default): only the value bytes go in the payload; the key
+//!   bytes are carried in `MessageMetadata.partition_key`. Matches the Java default.
 //! - [`KeyValueEncodingType::Inline`]: the wire payload is `[u32 key_len][key bytes][u32
 //!   value_len][value bytes]` (big-endian). The decoder reads the same shape back.
 

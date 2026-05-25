@@ -251,6 +251,15 @@ pub struct BatchContainer {
     /// Wall-clock instant the first message was added to the current batch. Drives the
     /// `batching_max_publish_delay` deadline; `None` when the batch is empty.
     pub first_added_at: Option<std::time::Instant>,
+    /// Transaction id shared by every message in the current batch. Pulsar's
+    /// `TransactionBuffer` routes messages by the `txnid_*` fields on `CommandSend`, not on
+    /// `SingleMessageMetadata` — if a batch is emitted with `txnid_*: None`, the broker
+    /// publishes the entries directly through the dispatcher and bypasses
+    /// commit/abort markers, leaking aborted writes to consumers. The Java client refuses
+    /// to mix txn / non-txn or two different txn ids inside one batch
+    /// (`ProducerImpl.canAddToBatch`); we mirror that with [`Self::matches_txn`] +
+    /// caller-driven flush on mismatch.
+    pub txn_id: Option<crate::TxnId>,
 }
 
 impl BatchContainer {
@@ -271,6 +280,16 @@ impl BatchContainer {
         self.lowest_sequence_id = None;
         self.highest_sequence_id = None;
         self.first_added_at = None;
+        self.txn_id = None;
+    }
+
+    /// `true` if `incoming` would land in the same `TransactionBuffer` partition as the
+    /// messages already buffered. An empty batch matches every txn id. A non-empty batch
+    /// matches only when both ids agree (including `None == None` for non-txn writes).
+    /// Mirrors Java `ProducerImpl.canAddToBatch`.
+    #[must_use]
+    pub fn matches_txn(&self, incoming: Option<crate::TxnId>) -> bool {
+        self.is_empty() || self.txn_id == incoming
     }
 }
 
@@ -559,6 +578,13 @@ impl ProducerState {
         }
 
         let payload_size = msg.payload.len();
+        // The batch must be homogeneous per `txn_id` (see `BatchContainer::matches_txn`):
+        // mixing two txns — or a txn write with a non-txn write — in the same `CommandSend`
+        // sends the entries through the wrong `TransactionBuffer` routing path. Force a flush
+        // here so the next add starts a fresh batch tagged with `msg.txn_id`.
+        if self.batching_enabled && !self.batch.is_empty() && !self.batch.matches_txn(msg.txn_id) {
+            let _ = self.flush_batch(publish_time_ms, now);
+        }
         let can_batch = self.can_add_to_batch(payload_size, msg.num_messages);
 
         // Chunking path: too big AND we cannot batch it.
@@ -606,6 +632,16 @@ impl ProducerState {
         }
         if self.compression != CompressionKind::None {
             msg.metadata.compression = Some(self.compression.to_pb() as i32);
+        }
+        // Pulsar's `TopicTransactionBuffer.appendBufferToTxn` is keyed on the
+        // `txnid_*` fields of the **MessageMetadata**, not `CommandSend`. Java's
+        // `TypedMessageBuilderImpl#beforeSend` always copies the txn bits onto the metadata
+        // (`msgMetadata.setTxnidMostBits(txn.getTxnIdMostBits())`); omitting them makes the
+        // broker treat the publish as a non-txn send and route past the buffer, so aborted
+        // writes leak to consumers. We mirror Java by stamping the same fields here.
+        if let Some(t) = msg.txn_id {
+            msg.metadata.txnid_least_bits = Some(t.least_sig_bits);
+            msg.metadata.txnid_most_bits = Some(t.most_sig_bits);
         }
 
         let seq = self.assign_sequence_id(&mut msg.metadata, publish_time_ms);
@@ -685,6 +721,12 @@ impl ProducerState {
         }
 
         self.batch.current_size_bytes = self.batch.current_size_bytes.saturating_add(payload.len());
+        // Track the txn id on the first message so [`Self::queue_send`] can flush before
+        // mixing two distinct txns. Subsequent same-batch calls have already been gated by
+        // `matches_txn`, so we just keep the existing id.
+        if self.batch.is_empty() {
+            self.batch.txn_id = msg.txn_id;
+        }
         self.batch.messages.push((single, payload));
         // We assign sequence ids lazily at flush time so that we mint a contiguous range. The
         // Java client mints them per-message, but at flush time only the lowest is sent on the
@@ -760,6 +802,13 @@ impl ProducerState {
         if let Some(name) = &self.name {
             metadata.producer_name = name.clone();
         }
+        // Mirror Java `TypedMessageBuilderImpl#beforeSend`: stamp the per-message txn bits
+        // on the batch's MessageMetadata so the broker's `TopicTransactionBuffer` routes the
+        // whole batch through the buffer instead of straight to the dispatcher.
+        if let Some(t) = self.batch.txn_id {
+            metadata.txnid_least_bits = Some(t.least_sig_bits);
+            metadata.txnid_most_bits = Some(t.most_sig_bits);
+        }
         let lowest_seq = self.assign_sequence_id(&mut metadata, publish_time_ms);
         // For a multi-message batch we additionally bump the sequence counter by (num_messages-1)
         // so the next first-send picks up where the batch left off — matches Java
@@ -781,8 +830,13 @@ impl ProducerState {
             producer_id: self.handle.0,
             sequence_id: lowest_seq.0,
             num_messages: Some(num_messages),
-            txnid_least_bits: None,
-            txnid_most_bits: None,
+            // The TransactionBuffer is keyed on the `txnid_*` fields of `CommandSend`; missing
+            // them on a batched send routes every message in the batch through the dispatcher
+            // and bypasses commit/abort markers (aborted writes get delivered). `add_to_batch`
+            // stamps `self.batch.txn_id` from the first message and `queue_send` flushes when
+            // a different txn arrives, so the whole batch by construction shares one id.
+            txnid_least_bits: self.batch.txn_id.map(|t| t.least_sig_bits),
+            txnid_most_bits: self.batch.txn_id.map(|t| t.most_sig_bits),
             highest_sequence_id: metadata.highest_sequence_id,
             is_chunk: None,
             marker: None,
@@ -884,6 +938,13 @@ impl ProducerState {
         ctx.metadata.uuid = Some(uuid);
         ctx.metadata.num_chunks_from_msg = Some(ctx.total_chunks);
         ctx.metadata.total_chunk_msg_size = Some(payload.len() as i32);
+        // Every chunk shares the same MessageMetadata clone — stamp the txn bits here so
+        // each chunk-level MessageMetadata routes through Pulsar's `TopicTransactionBuffer`
+        // (see the metadata note on `emit_single`).
+        if let Some(t) = txn_id {
+            ctx.metadata.txnid_least_bits = Some(t.least_sig_bits);
+            ctx.metadata.txnid_most_bits = Some(t.most_sig_bits);
+        }
         self.last_sequence_id_pushed = ctx.sequence_id.0 as i64;
 
         // Emit each chunk frame eagerly into the outbound queue.

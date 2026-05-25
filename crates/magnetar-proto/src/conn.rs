@@ -644,6 +644,7 @@ enum PendingRequestKind {
     AddPartitionToTxn,
     AddSubscriptionToTxn,
     EndTxn,
+    TcClientConnect,
     GetSchema,
 }
 
@@ -1768,6 +1769,30 @@ impl Connection {
                     request_id,
                     outcome: TxnRoundTrip::EndTxn(result),
                 });
+            }
+            pb::base_command::Type::TcClientConnectResponse => {
+                let resp =
+                    command
+                        .tc_client_connect_response
+                        .ok_or(ProtocolError::InvariantViolation(
+                            "missing CommandTcClientConnectResponse",
+                        ))?;
+                let request_id = RequestId(resp.request_id);
+                self.pending_requests.remove(&request_id);
+                // Broker reports success by omitting `error` (`ServerError::None`); any other
+                // code maps to a generic `OpOutcome::Error` so the driver-side future can
+                // surface the broker message verbatim.
+                let outcome = match resp.error {
+                    None | Some(0) => OpOutcome::Success { request_id },
+                    Some(code) => OpOutcome::Error {
+                        request_id,
+                        code,
+                        message: resp.message.unwrap_or_default(),
+                    },
+                };
+                self.outcomes
+                    .insert(PendingOpKey::Request(request_id), outcome);
+                self.wake_for_request(request_id);
             }
             pb::base_command::Type::GetSchemaResponse => {
                 let resp = command
@@ -3054,6 +3079,32 @@ impl Connection {
     /// Read-only accessor for the embedded [`TxnClient`].
     pub fn txn_client(&self) -> &TxnClient {
         &self.txn_client
+    }
+
+    /// Issue a `CommandTcClientConnectRequest` for the given TC partition (`tc_id`). Pulsar's
+    /// broker only loads the per-partition transaction-metadata store on demand; without this
+    /// handshake, the first `CommandNewTxn` lands while `TransactionMetadataStoreService.stores
+    /// .get(tcId)` is still `null` and the broker replies `TransactionCoordinatorNotFound`.
+    ///
+    /// The matching response surfaces as [`OpOutcome::Success`] (on `ServerError::None`) or
+    /// [`OpOutcome::Error`] (with the broker-supplied code + message) and is consumed via
+    /// [`Self::take_outcome`]. Mirrors Java
+    /// `TransactionMetaStoreHandler.connectionOpened` →
+    /// `Commands.newTcClientConnectRequest`.
+    pub fn tc_client_connect(&mut self, tc_id: u64) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let base = pb::BaseCommand {
+            r#type: pb::base_command::Type::TcClientConnectRequest as i32,
+            tc_client_connect_request: Some(pb::CommandTcClientConnectRequest {
+                request_id: request_id.0,
+                tc_id,
+            }),
+            ..Default::default()
+        };
+        let _ = self.encode_command(&base);
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::TcClientConnect);
+        request_id
     }
 
     /// Open a new transaction at the broker-side transaction coordinator. Returns the request

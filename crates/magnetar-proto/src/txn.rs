@@ -324,6 +324,14 @@ impl TxnClient {
     /// The caller must wrap the result in a `BaseCommand` of type `NEW_TXN` and place it onto
     /// the connection's outbound buffer. The transaction-id and `Open` state are only recorded
     /// once the matching response is consumed via [`Self::handle_new_txn_response`].
+    ///
+    /// The protobuf field is named `txn_ttl_seconds` but the broker treats the value as
+    /// **milliseconds** — `TransactionMetadataStoreService.newTransaction(tcId, timeoutInMills,
+    /// owner)` is called with `command.getTxnTtlSeconds()` directly, no unit conversion. The
+    /// Java client mirrors this by passing `unit.toMillis(timeout)` into the field
+    /// (`TransactionMetaStoreHandler.newTxnAsync` → `Commands.newTxn`). Sending seconds here
+    /// (e.g. `30`) makes the broker interpret the txn as having a 30 ms TTL and abort it before
+    /// the next round-trip lands.
     pub fn new_txn(&mut self, request_id: u64, timeout_ms: u64) -> pb::CommandNewTxn {
         let waker_key = self.pending_new_txn.insert(noop_waker());
         let pending = PendingNewTxn {
@@ -334,7 +342,7 @@ impl TxnClient {
             .insert(RequestId(request_id), pending);
         pb::CommandNewTxn {
             request_id,
-            txn_ttl_seconds: Some(timeout_ms.div_ceil(1000)),
+            txn_ttl_seconds: Some(timeout_ms),
             tc_id: Some(self.coordinator_id),
         }
     }
@@ -612,7 +620,11 @@ mod tests {
         let cmd = client.new_txn(1, 30_000);
         assert_eq!(cmd.request_id, 1);
         assert_eq!(cmd.tc_id, Some(7));
-        assert_eq!(cmd.txn_ttl_seconds, Some(30));
+        // The protobuf field is mis-named: the broker reads it as milliseconds (see
+        // `TransactionMetadataStoreService.newTransaction(tcId, timeoutInMills, owner)` in
+        // pulsar-broker/src/main/java/org/apache/pulsar/broker/TransactionMetadataStoreService.
+        // java). Java client sends `unit.toMillis(timeout)` here, so we mirror that.
+        assert_eq!(cmd.txn_ttl_seconds, Some(30_000));
 
         let id = client
             .handle_new_txn_response(ok_new_txn_response(1, 99, 42))
