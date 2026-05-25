@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -53,7 +53,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -97,6 +97,7 @@ async fn e2e_dlq_max_redeliver_routes_to_dead_letter() -> Result<(), Box<dyn std
         .subscription("magnetar-dlq-sub")
         .subscription_type(SubType::Shared)
         .dead_letter_policy(1, Some(dlq_topic.clone()))
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -138,6 +139,7 @@ async fn e2e_dlq_max_redeliver_routes_to_dead_letter() -> Result<(), Box<dyn std
         .consumer(dlq_topic.clone())
         .subscription("magnetar-dlq-tail")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let dlq_msg = tokio::time::timeout(Duration::from_secs(10), dlq_consumer.receive()).await??;
@@ -178,6 +180,7 @@ async fn e2e_reconsume_later_round_trip() -> Result<(), Box<dyn std::error::Erro
         .consumer(topic.clone())
         .subscription("magnetar-retry-sub")
         .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let msg = consumer.receive().await?;
@@ -194,6 +197,7 @@ async fn e2e_reconsume_later_round_trip() -> Result<(), Box<dyn std::error::Erro
         .consumer(retry_topic.clone())
         .subscription("magnetar-retry-tail")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let redelivered =
@@ -245,6 +249,7 @@ async fn e2e_dlq_explicit_ack_terminates() -> Result<(), Box<dyn std::error::Err
         .consumer(dlq_topic.clone())
         .subscription("magnetar-dlq-terminal")
         .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let msg = consumer.receive().await?;

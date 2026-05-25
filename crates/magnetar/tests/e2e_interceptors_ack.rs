@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{
     ConsumerInterceptor, IncomingMessage, OutgoingMessage, ProducerInterceptor, PulsarClient,
     PulsarError, ack_with_interceptors, receive_with_interceptors, send_with_interceptors,
@@ -53,7 +53,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -199,6 +199,7 @@ async fn e2e_consumer_interceptor_observes_receive_ack() -> Result<(), Box<dyn s
         .consumer(topic.clone())
         .subscription("magnetar-e2e-interceptor-sub")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let interceptor = Arc::new(CountingConsumerInterceptor {
@@ -254,6 +255,7 @@ async fn e2e_ack_batch_terminates_redelivery() -> Result<(), Box<dyn std::error:
         .consumer(topic.clone())
         .subscription(sub)
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let mut ids = Vec::with_capacity(5);
@@ -269,6 +271,7 @@ async fn e2e_ack_batch_terminates_redelivery() -> Result<(), Box<dyn std::error:
         .consumer(topic.clone())
         .subscription(sub)
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let recv = tokio::time::timeout(Duration::from_secs(3), consumer2.receive()).await;
@@ -306,6 +309,7 @@ async fn e2e_ack_cumulative_terminates_prior() -> Result<(), Box<dyn std::error:
         .consumer(topic.clone())
         .subscription(sub)
         .subscription_type(SubType::Failover)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let mut last_id = None;
@@ -324,6 +328,7 @@ async fn e2e_ack_cumulative_terminates_prior() -> Result<(), Box<dyn std::error:
         .consumer(topic.clone())
         .subscription(sub)
         .subscription_type(SubType::Failover)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let recv = tokio::time::timeout(Duration::from_secs(3), consumer2.receive()).await;

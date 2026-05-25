@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::runtime_tokio::{ClientError, DnsResolveFuture, DnsResolver};
 use magnetar::{OutgoingMessage, PulsarClient};
 use parking_lot::Mutex;
@@ -66,7 +66,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -144,6 +144,7 @@ async fn e2e_custom_dns_resolver_invoked_and_roundtrip() -> Result<(), Box<dyn s
         .consumer(topic)
         .subscription("magnetar-e2e-dns-resolver")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 

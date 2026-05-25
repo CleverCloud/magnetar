@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -58,7 +58,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -91,6 +91,7 @@ async fn e2e_force_unsubscribe_leaves_other_consumer_alive()
         .subscription(subscription)
         .subscription_type(SubType::Shared)
         .name("consumer-a")
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let consumer_b = client
@@ -98,6 +99,7 @@ async fn e2e_force_unsubscribe_leaves_other_consumer_alive()
         .subscription(subscription)
         .subscription_type(SubType::Shared)
         .name("consumer-b")
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 

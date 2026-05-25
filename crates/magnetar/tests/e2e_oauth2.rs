@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_auth_oauth2::{ClientCredentialsFlow, Clock, Credentials, REFRESH_LEEWAY};
 use testcontainers::core::{ContainerPort, WaitFor};
@@ -72,7 +72,7 @@ async fn start_pulsar()
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -180,6 +180,7 @@ async fn e2e_oauth2_happy_path_produces_and_consumes() -> Result<(), Box<dyn std
         .consumer(topic)
         .subscription("magnetar-e2e-oauth2")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let msg = tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await??;

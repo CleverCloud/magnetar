@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use magnetar_proto::schema::{BytesSchema, Int32Schema, JsonSchema, StringSchema};
 use schemars::JsonSchema as SchemarsJsonSchema;
@@ -62,7 +62,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -101,6 +101,7 @@ async fn e2e_schema_bytes_roundtrip() -> Result<(), Box<dyn std::error::Error>> 
         .consumer(topic)
         .subscription("magnetar-e2e-bytes")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -157,6 +158,7 @@ async fn e2e_schema_string_roundtrip() -> Result<(), Box<dyn std::error::Error>>
         .typed_consumer(topic, Arc::new(StringSchema::new()))
         .subscription("magnetar-e2e-string")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -214,6 +216,7 @@ async fn e2e_schema_json_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         .typed_consumer(topic, Arc::new(JsonSchema::<Person>::new()))
         .subscription("magnetar-e2e-json")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -257,6 +260,7 @@ async fn e2e_schema_int32_roundtrip() -> Result<(), Box<dyn std::error::Error>> 
         .typed_consumer(topic, Arc::new(Int32Schema::new()))
         .subscription("magnetar-e2e-int32")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 

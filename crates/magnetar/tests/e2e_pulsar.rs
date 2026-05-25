@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -64,7 +64,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -101,6 +101,7 @@ async fn e2e_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Error
         .consumer(topic)
         .subscription("magnetar-e2e")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -155,6 +156,7 @@ async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Err
         .consumer(topic)
         .subscription("magnetar-e2e-partitioned")
         .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -199,6 +201,7 @@ async fn e2e_pattern_consumer_snapshot() -> Result<(), Box<dyn std::error::Error
         .namespace("public/default")
         .pattern("persistent://public/default/magnetar-e2e-pattern-.*")
         .subscription("magnetar-e2e-pattern")
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -244,6 +247,7 @@ async fn e2e_key_shared_dispatch() -> Result<(), Box<dyn std::error::Error>> {
         .subscription("magnetar-e2e-ks")
         .subscription_type(SubType::KeyShared)
         .name("consumer-a")
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let consumer_b = client
@@ -251,6 +255,7 @@ async fn e2e_key_shared_dispatch() -> Result<(), Box<dyn std::error::Error>> {
         .subscription("magnetar-e2e-ks")
         .subscription_type(SubType::KeyShared)
         .name("consumer-b")
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 

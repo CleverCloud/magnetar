@@ -27,6 +27,7 @@ use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
+use magnetar::proto::pb::command_subscribe::InitialPosition;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "4.0.4";
@@ -59,7 +60,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -113,6 +114,7 @@ async fn e2e_pattern_auto_reconcile_picks_up_new_topic() -> Result<(), Box<dyn s
         .namespace("public/default")
         .pattern(&pattern)
         .subscription(format!("magnetar-patrec-{suite}"))
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     assert_eq!(

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use magnetar::PulsarClient;
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar_proto::schema::{
     AvroSchema, DateSchema, Int32Schema, KeyValueEncodingType, KeyValuePair, KeyValueSchema,
     StringSchema, TimeSchema, TimestampSchema,
@@ -75,7 +75,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -143,6 +143,7 @@ async fn e2e_schema_avro_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         .typed_consumer(topic, consumer_schema)
         .subscription("magnetar-e2e-avro")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -216,6 +217,7 @@ async fn e2e_schema_key_value_string_int32_inline_roundtrip()
         .typed_consumer(topic, consumer_schema)
         .subscription("magnetar-e2e-kv")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -263,6 +265,7 @@ async fn e2e_schema_temporal_roundtrip() -> Result<(), Box<dyn std::error::Error
             .typed_consumer(topic, Arc::new(DateSchema::new()))
             .subscription("magnetar-e2e-date")
             .subscription_type(SubType::Exclusive)
+            .initial_position(InitialPosition::Earliest)
             .subscribe()
             .await?;
         let mut received = Vec::new();
@@ -297,6 +300,7 @@ async fn e2e_schema_temporal_roundtrip() -> Result<(), Box<dyn std::error::Error
             .typed_consumer(topic, Arc::new(TimeSchema::new()))
             .subscription("magnetar-e2e-time")
             .subscription_type(SubType::Exclusive)
+            .initial_position(InitialPosition::Earliest)
             .subscribe()
             .await?;
         let mut received = Vec::new();
@@ -326,6 +330,7 @@ async fn e2e_schema_temporal_roundtrip() -> Result<(), Box<dyn std::error::Error
             .typed_consumer(topic, Arc::new(TimestampSchema::new()))
             .subscription("magnetar-e2e-timestamp")
             .subscription_type(SubType::Exclusive)
+            .initial_position(InitialPosition::Earliest)
             .subscribe()
             .await?;
         let mut received = Vec::new();

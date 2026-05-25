@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -76,7 +76,7 @@ async fn start_pulsar_with_txn() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(180))
         .with_env_var("PULSAR_PREFIX_transactionCoordinatorEnabled", "true")
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
@@ -117,6 +117,7 @@ async fn e2e_txn_commit_produces_visible() -> Result<(), Box<dyn std::error::Err
         .consumer(&topic)
         .subscription(&subscription)
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let producer = client.producer(&topic).create().await?;
@@ -176,6 +177,7 @@ async fn e2e_txn_abort_drops_messages() -> Result<(), Box<dyn std::error::Error>
         .consumer(&topic)
         .subscription(&subscription)
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
     let producer = client.producer(&topic).create().await?;
@@ -253,6 +255,7 @@ async fn e2e_consumer_ack_with_txn_rolled_back_on_abort() -> Result<(), Box<dyn 
         .consumer(&topic)
         .subscription(&subscription)
         .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -283,6 +286,7 @@ async fn e2e_consumer_ack_with_txn_rolled_back_on_abort() -> Result<(), Box<dyn 
         .consumer(&topic)
         .subscription(&subscription)
         .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 

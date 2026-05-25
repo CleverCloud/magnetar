@@ -26,7 +26,7 @@
 
 use std::time::Duration;
 
-use magnetar::proto::pb::command_subscribe::SubType;
+use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -63,7 +63,7 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("messaging service is ready"))
+        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -106,6 +106,7 @@ async fn e2e_persistent_topic_round_trip() -> Result<(), Box<dyn std::error::Err
         .consumer(&topic)
         .subscription("magnetar-e2e-persistent")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -151,6 +152,7 @@ async fn e2e_non_persistent_topic_round_trip() -> Result<(), Box<dyn std::error:
         .consumer(&topic)
         .subscription("magnetar-e2e-non-persistent")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
@@ -216,6 +218,7 @@ async fn e2e_non_persistent_topic_drops_when_no_consumer() -> Result<(), Box<dyn
         .consumer(&topic)
         .subscription("magnetar-e2e-np-drop")
         .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;
 
