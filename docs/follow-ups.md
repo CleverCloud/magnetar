@@ -437,33 +437,28 @@ using `client.producer(topic)` instead of
 across all 4 partitions — `RoundRobin` works correctly. Closing
 #64 as misdiagnosis.
 
-### #56 — Producer rejected send after broker reconnect / restart
+### #56 — Producer rejected send after broker reconnect / restart (PARTIALLY LANDED)
 
 **Symptom.** `e2e_cluster_failover_manual_swap`,
 `e2e_supervised_reconnect_across_broker_restart`,
-`e2e_transparent_inflight_publish_replay_across_broker_restart` all
-fail with `Protocol(InvariantViolation("producer rejected send"))`
-on the first `send()` after a broker restart / failover.
+`e2e_transparent_inflight_publish_replay_across_broker_restart` failed
+with `Protocol(InvariantViolation("producer rejected send"))` on the
+first `send()` after a broker restart / failover.
 
-**Root cause.** The broker sends `CommandCloseProducer` to the client
-during the failover; magnetar's
-`Connection::handle_close_producer` calls `producer.close()` which
-flips `producer.closed = true`. The subsequent supervised reconnect
-goes through `rebuild_producers` — which **filters out** producers
-with `closed=true` (see `conn.rs:933`,
-`.filter(|(handle, _)| self.producers.get(*handle).is_some_and(|p| !p.closed))`).
-Net result: producer stays closed forever, every subsequent send
-errors with `ProducerError::Closed` → `InvariantViolation("producer
-rejected send")` in `conn.rs:2198`.
+**Landed fix.** `Connection::handle_close_producer` no longer flips
+`producer.closed = true` (commit on main, follow-up to #56). The
+broker uses `CommandCloseProducer` for transient close (PIP-188
+migration, broker restart, cluster swap) — all transient at the
+protocol level. Magnetar previously marked the producer
+permanently-closed, which blocked the supervised reconnect's
+`rebuild_producers` (line 933 filter `!p.closed`) from re-attaching.
 
-**Fix.** Mirror the seek-resubscribe pattern landed in commit
-`d011875` (#60). When `CommandCloseProducer` carries an
-`assigned_broker_service_url` (PIP-188 topic migration) or arrives
-during an in-flight reset, treat the close as **transient**: don't
-flip `closed=true` and let `rebuild_producers` re-emit the
-`CommandProducer` on the new connection. For permanent closes
-(broker-initiated forced delete, unknown producer), keep the
-existing flag-set path.
+**Remaining work (tracked as #66).** With the close flag fixed, the
+test no longer fails fast — but the post-restart send hangs waiting
+for a receipt. Likely a stale `in_flight_publish_snapshots`
+interaction in `Connection::reset` when the freshly-bumped producer
+epoch's first send collides with the snapshotted sequence_id. Needs
+wire-level trace of the post-restart send/receipt round-trip.
 
 **Repro.**
 
