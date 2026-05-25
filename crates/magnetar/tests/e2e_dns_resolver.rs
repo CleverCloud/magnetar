@@ -66,7 +66,9 @@ async fn start_pulsar() -> Result<
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
+        .with_wait_for(WaitFor::message_on_stdout(
+            "Created namespace public/default",
+        ))
         .with_startup_timeout(Duration::from_secs(120))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()

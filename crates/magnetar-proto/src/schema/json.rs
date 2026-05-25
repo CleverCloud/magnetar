@@ -46,22 +46,86 @@ where
 {
     /// Construct a new [`JsonSchema`], precomputing the JSON-Schema document for `T`.
     ///
+    /// The document is post-processed into the **pre-draft-04 Jackson `JsonSchema`** shape
+    /// the Apache Pulsar broker validates against. Apache Pulsar (through Java 4.x) parses
+    /// `schema_data` via `com.fasterxml.jackson.module.jsonSchema.types.ObjectSchema`,
+    /// which predates JSON Schema draft-04 and expects:
+    ///
+    /// - `required` is a **boolean** field on each individual property, NOT an array of required
+    ///   field names on the parent object.
+    /// - No `$schema`, `$id`, `title`, or other modern-draft meta-keywords on the root.
+    ///
+    /// `schemars` emits modern draft-2020-12 JSON Schema, so we convert it. Without this
+    /// the broker rejects every JSON schema with
+    /// `Cannot deserialize value of type java.lang.Boolean from Array value`
+    /// (the broker sees `required: [...]` and Jackson expects `required: bool`).
+    ///
     /// # Panics
     ///
-    /// Never panics in practice: `serde_json::to_vec` on a `schemars::Schema` only fails on
+    /// Never panics in practice: `serde_json::to_value` on a `schemars::Schema` only fails on
     /// non-string map keys or non-finite floats, neither of which `schemars` ever emits. If
     /// serialisation does fail we fall back to the empty document `{}` so the schema remains
     /// usable for producer/consumer wiring.
     #[must_use]
     pub fn new() -> Self {
         let schema = schemars::schema_for!(T);
-        let schema_bytes = serde_json::to_vec(&schema)
+        let mut value = serde_json::to_value(&schema).unwrap_or(serde_json::Value::Null);
+        rewrite_required_to_jackson_shape(&mut value);
+        let schema_bytes = serde_json::to_vec(&value)
             .map(Bytes::from)
             .unwrap_or_else(|_| Bytes::from_static(b"{}"));
         Self {
             schema_bytes,
             _marker: PhantomData,
         }
+    }
+}
+
+/// Walk a JSON-Schema document and rewrite the modern `required: [name1, name2]`
+/// array (placed on the parent object) into pre-draft-04 per-property `required: true`
+/// booleans on each named child of `properties`. Also strips meta-keywords Jackson's
+/// `ObjectSchema` rejects on parse (`$schema`, `$id`, `$defs`, `definitions`, `title`).
+pub(crate) fn rewrite_required_to_jackson_shape(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("$id");
+            map.remove("$defs");
+            map.remove("definitions");
+            map.remove("title");
+
+            // Lift required: [name1, name2] up out of this object into per-property bools.
+            let required_names: Option<Vec<String>> = match map.get("required") {
+                Some(Value::Array(items)) => Some(
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect(),
+                ),
+                _ => None,
+            };
+            if let Some(names) = required_names {
+                map.remove("required");
+                if let Some(Value::Object(props)) = map.get_mut("properties") {
+                    for name in names {
+                        if let Some(Value::Object(prop)) = props.get_mut(&name) {
+                            prop.insert("required".to_owned(), Value::Bool(true));
+                        }
+                    }
+                }
+            }
+
+            for v in map.values_mut() {
+                rewrite_required_to_jackson_shape(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                rewrite_required_to_jackson_shape(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -137,7 +201,22 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&raw).expect("schema_data must be valid JSON");
 
-        // schemars emits a top-level object whose `properties` describe each field.
+        // After the Jackson-compat rewrite the document is a top-level object whose
+        // `properties` map describes each field. No `$schema`/`title` meta-keywords
+        // (the broker's Jackson parser rejects them).
+        assert!(
+            value.get("$schema").is_none(),
+            "broker-side Jackson rejects $schema meta-keyword; full schema: {value}"
+        );
+        assert!(
+            value.get("title").is_none(),
+            "broker-side Jackson rejects title on root; full schema: {value}"
+        );
+        assert!(
+            value.get("required").is_none(),
+            "modern array-shape required must be lifted into per-property booleans; \
+             full schema: {value}"
+        );
         let properties = value
             .get("properties")
             .expect("schema document must carry a `properties` object");
@@ -150,22 +229,32 @@ mod tests {
             "expected `count` property in schema; got {properties}"
         );
 
-        // `name` is a string, `count` is an integer.
+        // `name` is a string, `count` is an integer; both are required → per-property bool.
+        let name_prop = properties.get("name").expect("name property must exist");
         assert_eq!(
-            properties
-                .get("name")
-                .and_then(|v| v.get("type"))
-                .and_then(serde_json::Value::as_str),
+            name_prop.get("type").and_then(serde_json::Value::as_str),
             Some("string"),
             "`name` should have JSON type \"string\"; full schema: {value}"
         );
         assert_eq!(
-            properties
-                .get("count")
-                .and_then(|v| v.get("type"))
-                .and_then(serde_json::Value::as_str),
+            name_prop
+                .get("required")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "`name` should carry per-property required=true; full schema: {value}"
+        );
+        let count_prop = properties.get("count").expect("count property must exist");
+        assert_eq!(
+            count_prop.get("type").and_then(serde_json::Value::as_str),
             Some("integer"),
             "`count` should have JSON type \"integer\"; full schema: {value}"
+        );
+        assert_eq!(
+            count_prop
+                .get("required")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "`count` should carry per-property required=true; full schema: {value}"
         );
 
         assert_eq!(schema.schema_type(), pb::schema::Type::Json);

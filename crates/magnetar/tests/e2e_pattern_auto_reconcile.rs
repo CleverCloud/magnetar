@@ -23,11 +23,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use magnetar::proto::pb::command_subscribe::InitialPosition;
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
-use magnetar::proto::pb::command_subscribe::InitialPosition;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "4.0.4";
