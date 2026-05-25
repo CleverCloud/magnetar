@@ -154,6 +154,34 @@ impl<P: Providers> Client<P> {
         })
     }
 
+    /// Wrap an existing `(shared, driver)` pair produced by
+    /// [`MoonpoolEngine::connect_plain`] (or its supervised / TLS
+    /// variants) into a [`Client`].
+    ///
+    /// Mirrors the inline construction inside [`Self::connect_plain`]
+    /// and friends — exposed so the `magnetar` façade can use a
+    /// [`Client`] as the engine's `ClientState` without going through
+    /// one of the connect helpers (e.g. when callers want full control
+    /// over which engine method connects, or want to test the surface
+    /// against a hand-rolled connection).
+    #[must_use]
+    pub fn from_parts(shared: Arc<ConnectionShared>, driver: DriverHandle) -> Self {
+        Self {
+            shared,
+            driver: Mutex::new(Some(driver)),
+            _providers: std::marker::PhantomData,
+        }
+    }
+
+    /// Surrender the driver handle, leaving the [`Client`] without a
+    /// driver to abort on [`Self::close`]. Mirrors
+    /// `PulsarClient::<MoonpoolEngine<P>>::take_driver` — exposed so the
+    /// façade can delegate without re-implementing the take.
+    #[must_use]
+    pub fn take_driver(&self) -> Option<DriverHandle> {
+        self.driver.lock().take()
+    }
+
     /// Borrow the shared connection state. Mostly useful for tests and
     /// instrumentation.
     #[must_use]

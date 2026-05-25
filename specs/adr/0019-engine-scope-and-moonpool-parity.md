@@ -1,6 +1,6 @@
 # ADR-0019 — Engine scope for v0.1.0 parity; moonpool parity as follow-up train
 
-- **Status**: Accepted
+- **Status**: Accepted (§gate (e) "façade surface stays bound to `PulsarClient<TokioEngine>`" partially superseded by [ADR-0027](0027-moonpool-engine-clientstate-is-runtime-client.md), 2026-05-23 — the engine-generic builder entry points now also dispatch on `MoonpoolEngine<P>`)
 - **Date**: 2026-05-21
 - **Decider**: Florentin Dubois
 - **Tags**: scope, engines, moonpool, v0.1.0, java-parity

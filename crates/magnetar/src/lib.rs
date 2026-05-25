@@ -160,10 +160,14 @@ mod tests {
 
     #[cfg(feature = "moonpool")]
     #[test]
-    fn transaction_api_is_implemented_by_moonpool_client_state() {
+    fn transaction_api_is_implemented_by_moonpool_client() {
         // Mirror of the tokio bound check; asserts the moonpool side of
         // the D1 lift train compiles. ADR-0026 §D1.
-        assert_transaction_api_bound::<crate::engine::MoonpoolClientState>();
+        // The runtime `Client<P>` now serves as the engine's
+        // `ClientState` (Task #54).
+        assert_transaction_api_bound::<
+            magnetar_runtime_moonpool::Client<moonpool_core::TokioProviders>,
+        >();
     }
 
     /// Phase 1 of the Producer/Consumer foundational lift — see

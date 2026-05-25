@@ -1366,7 +1366,7 @@ impl ClientBuilder {
 /// Builder for a producer.
 ///
 /// Phantom-generic over `E: Engine` per ADR-0026 §D1 — type
-/// parameter present (defaulting to [`TokioEngine`]). Same lift
+/// parameter present (defaulting to [`crate::TokioEngine`]). Same lift
 /// pattern as [`ConsumerBuilder`]; the inherent impl methods stay
 /// tokio-bound until the [`crate::CreateProducerApi`] dispatch
 /// path lands (foundation traits added in commit `cc61d4d`).
@@ -1538,7 +1538,7 @@ impl ProducerBuilder<'_, crate::TokioEngine> {
 /// Builder for a consumer.
 ///
 /// Phantom-generic over `E: Engine` per ADR-0026 §D1 — the type
-/// parameter is present (defaulting to [`TokioEngine`]) so callers
+/// parameter is present (defaulting to [`crate::TokioEngine`]) so callers
 /// can name `ConsumerBuilder<'a, MoonpoolEngine<P>>` at the type
 /// level. The inherent impl methods (notably `subscribe()`) are
 /// currently bound to the tokio default; the full lift dispatches
@@ -1846,7 +1846,7 @@ impl ConsumerBuilder<'_, crate::TokioEngine> {
 /// non-durable `Exclusive` consumer with an auto-generated subscription name — there's no
 /// dedicated wire command, so the protocol layer doesn't need any extra plumbing.
 ///
-/// Phantom-generic over `E: Engine` (defaults to [`TokioEngine`]).
+/// Phantom-generic over `E: Engine` (defaults to [`crate::TokioEngine`]).
 /// Wraps a [`ConsumerBuilder<E>`]; the impl methods stay tokio-bound
 /// until the `SubscribeApi` dispatch path lands in the Builder lift
 /// sub-PR.

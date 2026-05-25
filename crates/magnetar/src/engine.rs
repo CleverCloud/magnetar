@@ -947,14 +947,16 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 }
 
 #[cfg(feature = "moonpool")]
-impl TransactionApi for MoonpoolClientState {
+impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
+    for magnetar_runtime_moonpool::Client<P>
+{
     type Error = magnetar_runtime_moonpool::ClientError;
 
     fn new_txn(
         &self,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnId, Self::Error>> + Send + '_>> {
-        let shared = self.shared.clone();
+        let shared = self.shared().clone();
         Box::pin(async move {
             let request_id = {
                 let mut conn = shared.inner.lock();
@@ -981,7 +983,7 @@ impl TransactionApi for MoonpoolClientState {
         txn: magnetar_proto::TxnId,
         topic: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        let shared = self.shared.clone();
+        let shared = self.shared().clone();
         Box::pin(async move {
             let request_id = {
                 let mut conn = shared.inner.lock();
@@ -1013,7 +1015,7 @@ impl TransactionApi for MoonpoolClientState {
         topic: String,
         subscription: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        let shared = self.shared.clone();
+        let shared = self.shared().clone();
         Box::pin(async move {
             let request_id = {
                 let mut conn = shared.inner.lock();
@@ -1046,7 +1048,7 @@ impl TransactionApi for MoonpoolClientState {
         action: magnetar_proto::TxnAction,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::TxnState, Self::Error>> + Send + '_>>
     {
-        let shared = self.shared.clone();
+        let shared = self.shared().clone();
         Box::pin(async move {
             let request_id = {
                 let mut conn = shared.inner.lock();
@@ -1183,7 +1185,7 @@ impl<P: moonpool_core::Providers> Debug for MoonpoolEngine<P> {
 
 #[cfg(feature = "moonpool")]
 impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
-    type ClientState = MoonpoolClientState;
+    type ClientState = magnetar_runtime_moonpool::Client<P>;
     // Under both TokioProviders and moonpool-sim's SimProviders the
     // moonpool engine ultimately schedules onto tokio (determinism comes
     // from substituting the providers, not from replacing tokio). The
@@ -1220,30 +1222,14 @@ impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
     }
 }
 
-/// Per-engine storage for [`crate::PulsarClient<MoonpoolEngine<P>>`] — the
-/// shared connection state plus the driver join handle, in line with the
-/// pair the engine's `connect_*` calls return.
-///
-/// Lives at the façade boundary (not inside `magnetar-runtime-moonpool`) so
-/// the moonpool crate's public surface stays oriented around the engine's
-/// own `(Arc<ConnectionShared>, DriverHandle)` return shape rather than a
-/// façade-coupled bundle.
-#[cfg(feature = "moonpool")]
-#[derive(Debug)]
-pub struct MoonpoolClientState {
-    /// Shared connection state — the sans-io [`magnetar_proto::Connection`]
-    /// behind a non-async mutex plus the driver wakeup.
-    pub shared: std::sync::Arc<magnetar_runtime_moonpool::ConnectionShared>,
-    /// Driver-task handle returned by
-    /// [`magnetar_runtime_moonpool::MoonpoolEngine::connect_plain`]. The
-    /// façade keeps it alive for the lifetime of the
-    /// [`crate::PulsarClient`].
-    pub driver: parking_lot::Mutex<Option<magnetar_runtime_moonpool::DriverHandle>>,
-}
-
-// `PhantomData<fn() -> P>` keeps the engine `Send + Sync` regardless of
-// `P`'s thread-safety story. The marker is a witness type, not a value
-// holder — engine state actually lives on `PulsarClient<E>`.
+// Per-engine storage for [`crate::PulsarClient<MoonpoolEngine<P>>`] is
+// [`magnetar_runtime_moonpool::Client<P>`] directly — see
+// `Engine::ClientState` above. This mirrors the tokio engine
+// (`type ClientState = magnetar_runtime_tokio::Client`) so the existing
+// `SubscribeApi` / `CreateProducerApi` / `ConsumerApi` / `ProducerApi`
+// impls on the runtime `Client<P>` automatically satisfy the trait
+// bounds the façade builders dispatch through, without a parallel
+// state struct.
 
 #[cfg(test)]
 mod tests {
