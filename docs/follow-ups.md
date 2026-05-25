@@ -383,6 +383,192 @@ all four can land independently as v0.2.0 follow-ups.
 
 ---
 
+## E2E-discovered runtime bugs (pending fix)
+
+Five magnetar-runtime bugs surfaced during the e2e sweep against
+`apachepulsar/pulsar:4.0.4` (after the test-fixture bootstrap fixes
+landed). Each one is reproducible by the named e2e test below; the
+fix lives in the runtime / proto layer, not the test fixture.
+
+### #56 — Producer rejected send after broker reconnect / restart
+
+**Symptom.** `e2e_cluster_failover_manual_swap`,
+`e2e_supervised_reconnect_across_broker_restart`,
+`e2e_transparent_inflight_publish_replay_across_broker_restart` all
+fail with `Protocol(InvariantViolation("producer rejected send"))`
+on the first `send()` after a broker restart / failover.
+
+**Root cause.** The broker sends `CommandCloseProducer` to the client
+during the failover; magnetar's
+`Connection::handle_close_producer` calls `producer.close()` which
+flips `producer.closed = true`. The subsequent supervised reconnect
+goes through `rebuild_producers` — which **filters out** producers
+with `closed=true` (see `conn.rs:933`,
+`.filter(|(handle, _)| self.producers.get(*handle).is_some_and(|p| !p.closed))`).
+Net result: producer stays closed forever, every subsequent send
+errors with `ProducerError::Closed` → `InvariantViolation("producer
+rejected send")` in `conn.rs:2198`.
+
+**Fix.** Mirror the seek-resubscribe pattern landed in commit
+`d011875` (#60). When `CommandCloseProducer` carries an
+`assigned_broker_service_url` (PIP-188 topic migration) or arrives
+during an in-flight reset, treat the close as **transient**: don't
+flip `closed=true` and let `rebuild_producers` re-emit the
+`CommandProducer` on the new connection. For permanent closes
+(broker-initiated forced delete, unknown producer), keep the
+existing flag-set path.
+
+**Repro.**
+
+```sh
+cargo test -p magnetar --features e2e --test e2e_reconnect -- --include-ignored --test-threads=1
+```
+
+### #57 — Chunked send hangs (`e2e_chunked_message_round_trip`)
+
+**Symptom.** A 6 MiB payload sent through
+`producer.chunking(true).batching(0,0)` never returns — the test
+hangs until `tokio::time::timeout(60s)` on `consumer.receive()`
+fires. The producer's `send().await` actually never resolves either
+(broker logs do not show `Created new producer` for the chunked
+path).
+
+**Root cause hypotheses (to verify with a wire-level capture).**
+- `magnetar_proto::producer::emit_chunked` (lines 824–921) sets
+  `is_chunk: Some(true)` per chunk but issues a single
+  `OpSend { sequence_id: ctx.sequence_id, .. }` for the whole
+  logical message. The broker may emit one `CommandSendReceipt` per
+  chunk, but `apply_receipt` removes the OpSend on the FIRST receipt
+  (`pending.remove(position)`) — subsequent receipts then no-op,
+  which would normally be benign… unless the broker is gating later
+  chunks on the previous receipt being correlated by a different
+  shape.
+- The producer may need `num_messages: total_chunks` on the first
+  chunk's `CommandSend`, not `Some(1)`. Java's
+  `ProducerImpl.java:696-704` is ambiguous on this — confirm against
+  a wireshark capture of the Java client doing the same publish.
+
+**Fix steps.**
+1. Capture both magnetar and Java client wire frames for an
+   identical chunked publish; diff the `CommandSend` fields.
+2. Adjust `emit_chunked` to match the Java shape.
+3. Confirm `apply_receipt` is a no-op (matching Java's
+   per-chunk-receipt absorbing).
+
+**Repro.**
+
+```sh
+cargo test -p magnetar --features e2e --test e2e_batch_chunk -- --include-ignored --test-threads=1
+```
+
+### #58 — KeyValue inline schema producer hangs at create
+
+**Symptom.** `e2e_schema_key_value_string_int32_inline_roundtrip`
+hangs in `TypedProducer::create()` — broker logs show
+"Created topic persistent://public/default/magnetar-e2e-schema-kv-inline"
+but no follow-up "Created new producer" line, meaning the
+`CommandProducer` either does not reach the broker or its response
+does not reach magnetar.
+
+**Root cause hypothesis.** The KeyValue schema-data JSON shape
+(`{"key":{...},"value":{...},"type":"INLINE"}`) may not match what
+the broker's `SchemaRegistry` expects. Java emits a slightly
+different shape (camelCased properties, key-schema/value-schema
+serialised through Jackson's own `JsonSchema`). Compare
+`magnetar-proto/src/schema/key_value.rs::build_schema_data` against
+`org.apache.pulsar.client.api.schema.KeyValueSchemaInfoTest` — the
+broker may silently drop the `CommandProducer` when the
+schema-validation path fails async.
+
+**Fix steps.**
+1. Capture the Java-emitted `schema_data` bytes for
+   `Schema.KeyValue(STRING, INT32, INLINE)`.
+2. Diff against magnetar's emission; update `build_schema_data` to
+   match byte-for-byte (same approach as the JSON-schema
+   Jackson-compat fix landed in commit `3545d99` / #59).
+3. Validate via the e2e test.
+
+**Repro.**
+
+```sh
+cargo test -p magnetar --features e2e --test e2e_schemas_extended -- --include-ignored --test-threads=1
+```
+
+### #63 — PIP-4 encryption suite: roundtrip + failure actions + chunking
+
+**Symptom.** Four of the five `e2e_crypto_*` tests fail:
+
+- `e2e_crypto_roundtrip` — encrypt/decrypt round-trip
+- `e2e_crypto_failure_action_consume` — `CryptoFailureAction::Consume`
+- `e2e_crypto_failure_action_fail` — `CryptoFailureAction::Fail`
+- `e2e_crypto_with_chunking` — chunked + encrypted, hangs (timeout)
+
+Only `e2e_crypto_failure_action_discard` passes.
+
+**Root cause hypotheses.**
+- The encryption-key metadata wire-format
+  (`MessageMetadata.encryption_keys[]`, `encryption_param`,
+  `encryption_algo`) may diverge from Java's emission shape — the
+  broker stores these bytes verbatim, the consumer reads them, so
+  any byte-level drift cascades through.
+- Chunking + encryption interaction (PIP-4 × PIP-37) was tested only
+  via unit tests so far; the chunk-replay path may strip
+  encryption metadata.
+
+**Fix steps.**
+1. Capture Java-encrypted payload bytes and metadata; diff vs
+   magnetar's `MessageCrypto` emission.
+2. Trace the consumer's decrypt path to confirm
+   `CryptoFailureAction` dispatch fires on `Consume` / `Fail`
+   variants (the `discard` test passes so the wiring exists; the
+   other variants likely fall through to a hang).
+3. Add unit tests for chunked + encrypted at the
+   `magnetar-proto` level so regressions are caught off-broker.
+
+**Repro.**
+
+```sh
+cargo test -p magnetar --features e2e,encryption --test e2e_crypto -- --include-ignored --test-threads=1
+```
+
+### #64 — PartitionedProducer `RoundRobin` doesn't fan-out evenly
+
+**Symptom.** With `MessageRoutingMode::RoundRobin` on a 4-partition
+topic, 40 messages distribute as `0/20/20/0` (only partitions 1 and
+2 receive) instead of the expected `10/10/10/10`. Discovered while
+debugging #60.
+
+**Root cause hypothesis.** The routing-math in
+`crates/magnetar/src/partitioned_producer.rs:475-479` is correct
+(`pick = cursor % n; cursor += 1`). The bug is likely in how the
+chosen partition index is **dispatched** to a child producer — the
+`partitions[pick]` lookup may resolve to the wrong child, or two
+adjacent cursor values may collapse onto the same child producer
+during the partitioned-metadata refresh window.
+
+**Fix steps.**
+1. Add an inline trace log inside the routing path that records
+   `(cursor, pick, child_topic)` per send.
+2. Run a 40-message produce and confirm the cursor sequence is
+   `0,1,2,3,0,1,2,3,…` AND that each pick maps to a distinct child
+   topic.
+3. If both invariants hold, the bug is broker-side or in
+   `child_producers()` ordering — check the partitioned-metadata
+   lookup returns partitions in `-partition-0..N` order.
+
+**Repro.**
+
+```sh
+cargo test -p magnetar --features e2e --test e2e_seek_per_partition -- --include-ignored --test-threads=1
+```
+
+(The reproducer is `e2e_seek_per_partition_callback`; the test
+fails for #60 reasons too, but the broker-side partition backlogs
+0/20/20/0 are visible in the broker logs irrespective of the seek
+outcome.)
+
+---
+
 ## Notes on this file
 
 Items move from this file to git history when their commit lands. The
