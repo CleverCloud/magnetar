@@ -390,6 +390,53 @@ Five magnetar-runtime bugs surfaced during the e2e sweep against
 landed). Each one is reproducible by the named e2e test below; the
 fix lives in the runtime / proto layer, not the test fixture.
 
+### #60 follow-up — broker doesn't re-dispatch post-seek on same consumer_id
+
+The seek-resubscribe fix (commit `d011875`) re-establishes the
+consumer-side subscription after the broker's seek-driven disconnect,
+but the broker does NOT re-dispatch post-seek messages to the
+re-attached consumer (same `consumer_id`). End result on
+`e2e_seek_per_partition_callback`:
+
+- With `queue.clear()` in `resubscribe_consumer_after_seek`: 0
+  messages delivered (broker won't re-dispatch).
+- Without `queue.clear()`: pre-seek messages that landed in the
+  queue between `begin_seek` and `seek_acked` survive, polluting
+  the post-seek view (test sees 10 messages on partition-0 instead
+  of the 5 post-seek tail).
+
+**Root cause (hypothesis).** The Pulsar broker tracks
+"messages dispatched to this consumer-id" at the dispatcher level.
+After a seek + reconnect with the SAME consumer-id, the broker's
+dispatcher considers the previously-dispatched-but-not-acked
+messages as "still owed" to the client and refuses to redeliver
+them. Java's `ConsumerImpl#seekAsync` doesn't re-subscribe — it
+relies on the connection-level supervisor to re-attach
+transparently, which uses a FRESH consumer-id under the hood.
+
+**Proper fix.** When `resubscribe_consumer_after_seek` re-attaches,
+allocate a fresh `consumer_id` (via `next_consumer_id`) instead of
+reusing the original. Re-key `self.consumers`, `self.consumer_subscribe_requests`,
+and any pending receive-wakers to the new handle. The user-facing
+`Consumer` keeps holding its old `ConsumerHandle` — we need an
+indirection (per-handle `current_remote_id`) so user code keeps
+working without breaking change.
+
+**Verified via diagnostics.** `magnetar_proto::conn::deliver`
+shows the broker dispatches 10 messages per partition exactly once
+(the initial pre-seek dispatch). After my resubscribe lands, no
+further `CommandMessage` arrives even though broker logs show
+`Created subscription` (post-seek) for each partition.
+
+### #64 — PartitionedProducer RoundRobin (CLOSED — misdiagnosis)
+
+The earlier 0/20/20/0 distribution was caused by the e2e test
+using `client.producer(topic)` instead of
+`client.partitioned_producer(topic)`. With my landed test fix
+(`fix/seek-per-partition`) the broker shows backlog 10/10/10/10
+across all 4 partitions — `RoundRobin` works correctly. Closing
+#64 as misdiagnosis.
+
 ### #56 — Producer rejected send after broker reconnect / restart
 
 **Symptom.** `e2e_cluster_failover_manual_swap`,
@@ -530,42 +577,6 @@ Only `e2e_crypto_failure_action_discard` passes.
 ```sh
 cargo test -p magnetar --features e2e,encryption --test e2e_crypto -- --include-ignored --test-threads=1
 ```
-
-### #64 — PartitionedProducer `RoundRobin` doesn't fan-out evenly
-
-**Symptom.** With `MessageRoutingMode::RoundRobin` on a 4-partition
-topic, 40 messages distribute as `0/20/20/0` (only partitions 1 and
-2 receive) instead of the expected `10/10/10/10`. Discovered while
-debugging #60.
-
-**Root cause hypothesis.** The routing-math in
-`crates/magnetar/src/partitioned_producer.rs:475-479` is correct
-(`pick = cursor % n; cursor += 1`). The bug is likely in how the
-chosen partition index is **dispatched** to a child producer — the
-`partitions[pick]` lookup may resolve to the wrong child, or two
-adjacent cursor values may collapse onto the same child producer
-during the partitioned-metadata refresh window.
-
-**Fix steps.**
-1. Add an inline trace log inside the routing path that records
-   `(cursor, pick, child_topic)` per send.
-2. Run a 40-message produce and confirm the cursor sequence is
-   `0,1,2,3,0,1,2,3,…` AND that each pick maps to a distinct child
-   topic.
-3. If both invariants hold, the bug is broker-side or in
-   `child_producers()` ordering — check the partitioned-metadata
-   lookup returns partitions in `-partition-0..N` order.
-
-**Repro.**
-
-```sh
-cargo test -p magnetar --features e2e --test e2e_seek_per_partition -- --include-ignored --test-threads=1
-```
-
-(The reproducer is `e2e_seek_per_partition_callback`; the test
-fails for #60 reasons too, but the broker-side partition backlogs
-0/20/20/0 are visible in the broker logs irrespective of the seek
-outcome.)
 
 ---
 
