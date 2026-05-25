@@ -1495,9 +1495,28 @@ impl Connection {
                         "missing CommandCloseProducer",
                     ))?;
                 let handle = ProducerHandle(close.producer_id);
-                if let Some(p) = self.producers.get_mut(&handle) {
-                    p.close();
-                }
+                // Broker reasons for `CommandCloseProducer`:
+                //   - PIP-188 topic migration (`assigned_broker_service_url` set): producer is
+                //     supposed to reconnect on the new URL.
+                //   - Broker restart / failover / cluster swap via `ServiceUrlProvider`: TCP drops
+                //     next; supervised reconnect re-attaches via `rebuild_producers`.
+                //   - Admin-initiated forced delete: a subsequent send will surface a broker-side
+                //     rejection (`ProducerFenced`, etc.) which is the right place to surface the
+                //     error.
+                //
+                // All cases are *transient at the protocol level* — the
+                // user-facing producer handle keeps being valid. Mirroring
+                // Java's `ProducerImpl.connectionClosed`, we surface the
+                // event for observability but do NOT permanently mark
+                // `closed=true`. Marking it closed would cause
+                // `rebuild_producers` to filter it out (`!p.closed` at
+                // conn.rs:933), so the supervised reconnect would never
+                // re-establish the producer and the next user `send()`
+                // would surface `ProducerError::Closed →
+                // InvariantViolation("producer rejected send")` even
+                // though the broker is willing to re-accept it.
+                //
+                // Refs: Task #56.
                 self.events
                     .push_back(ConnectionEvent::ProducerClosedByBroker {
                         handle,
