@@ -1207,10 +1207,41 @@ impl Connection {
                     ))?;
                 if let Some(producer) = self.producers.get_mut(&ProducerHandle(receipt.producer_id))
                 {
-                    if let Some((seq, mid, waker)) = producer.apply_receipt(&receipt) {
+                    // Batched sends now mint a per-message `OpSend` (`add_to_batch`); a
+                    // single broker receipt with `sequence_id = lowest` and
+                    // `highest_sequence_id = highest` must fan out across every entry in
+                    // `[lowest, highest]`. Collect first (no nested mut-borrow of `self`),
+                    // then drain outside the producer borrow.
+                    let lowest = receipt.sequence_id;
+                    // Pulsar's broker uses the Java `-1L` sentinel for "no batch" on the
+                    // wire — `uint64` re-encodes `-1` as `u64::MAX`, so receipts for
+                    // single-message sends arrive with `highest_sequence_id == u64::MAX`.
+                    // Treat that AND any value strictly below `lowest` as "single
+                    // message"; only `highest >= lowest && highest != u64::MAX` is a real
+                    // batch range. Java client side: see `CommandSendReceipt` parsing in
+                    // `ClientCnx#handleSendReceipt` checking `highestSequenceId >= 0`.
+                    let highest_raw = receipt.highest_sequence_id.unwrap_or(0);
+                    let highest = if highest_raw >= lowest && highest_raw != u64::MAX {
+                        highest_raw
+                    } else {
+                        lowest
+                    };
+                    let handle = producer.handle;
+                    let mut resolved: Vec<(SequenceId, MessageId, Option<Waker>)> = Vec::new();
+                    for seq in lowest..=highest {
+                        let mut synth = receipt.clone();
+                        synth.sequence_id = seq;
+                        synth.highest_sequence_id = None;
+                        if let Some(tuple) = producer.apply_receipt(&synth) {
+                            resolved.push(tuple);
+                        }
+                    }
+                    let count = resolved.len() as u64;
+                    if count > 0 {
                         producer.total_acks_received =
-                            producer.total_acks_received.saturating_add(1);
-                        let handle = producer.handle;
+                            producer.total_acks_received.saturating_add(count);
+                    }
+                    for (seq, mid, waker) in resolved {
                         let key = PendingOpKey::Send(handle, seq);
                         self.outcomes.insert(
                             key,
@@ -4679,13 +4710,17 @@ mod conn_state_tests {
                 )
                 .expect("queue");
         }
-        // Batched, so no pending OpSend (Java sense — these live in the batch container
-        // until a flush). The batch holds two messages.
-        assert_eq!(conn.producer_pending_count(producer), 0);
+        // Batched: each send now mints its own per-message `OpSend` so the user-side
+        // `SendFut` has a unique key to wait on. The batch container also still holds the
+        // raw bytes until `flush_batch` builds the wire frame, so we expect two pending
+        // entries AND two batch entries.
+        assert_eq!(conn.producer_pending_count(producer), 2);
         assert_eq!(conn.producer_batch_len(producer), 2);
 
-        // Reset: the batch is dropped; no snapshot entry is recorded (nothing was in
-        // pending).
+        // Reset: the batch is dropped; the per-message `OpSend` entries are also dropped
+        // and carry no `replay_frames`, so `in_flight_publish_snapshot` is empty —
+        // matching Java `ProducerImpl#connectionClosed` which fails an in-progress batch
+        // rather than re-emitting the partial bytes.
         conn.reset();
         assert_eq!(
             conn.in_flight_publish_snapshot_len(producer),

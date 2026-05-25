@@ -601,16 +601,42 @@ impl ProducerState {
                 // can_batch returning true on a payload larger than max_message_size is
                 // possible only if max_batch_size_bytes >= max_message_size, which is rare but
                 // legal; the Java client honours the batch path in that case.
-                return self.add_to_batch(msg, publish_time_ms, now);
+                let decision = self.add_to_batch(msg, publish_time_ms, now)?;
+                self.flush_batch_if_full(publish_time_ms, now);
+                return Ok(decision);
             }
             return self.emit_chunked(msg, publish_time_ms, now);
         }
 
         if can_batch {
-            return self.add_to_batch(msg, publish_time_ms, now);
+            let decision = self.add_to_batch(msg, publish_time_ms, now)?;
+            self.flush_batch_if_full(publish_time_ms, now);
+            return Ok(decision);
         }
 
         self.emit_single(msg, publish_time_ms, now)
+    }
+
+    /// Force-flush the batch when adding the latest message hit
+    /// `max_messages_in_batch` (or pushed `current_size_bytes` past
+    /// `max_batch_size_bytes`). Mirrors Java
+    /// `BatchMessageContainerImpl.haveEnoughSpace` ⇒ trigger flush
+    /// inside `ProducerImpl.doBatchSendAndAdd`: once the container is full,
+    /// the very same send that filled it emits the batch synchronously
+    /// so the caller's `SendFut` does not stall waiting for
+    /// `batching_max_publish_delay` (default 1 min in this test). Without
+    /// this, max-messages-bound batches only flush when the deadline
+    /// elapses or another message arrives, and `producer.send().await` on
+    /// the message that filled the batch hangs.
+    fn flush_batch_if_full(&mut self, publish_time_ms: u64, now: std::time::Instant) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let count_reached = self.batch.messages.len() >= self.max_messages_in_batch;
+        let size_reached = self.batch.current_size_bytes >= self.max_batch_size_bytes;
+        if count_reached || size_reached {
+            let _ = self.flush_batch(publish_time_ms, now);
+        }
     }
 
     /// Emit a single SEND frame for a small, non-batched message.
@@ -728,13 +754,40 @@ impl ProducerState {
             self.batch.txn_id = msg.txn_id;
         }
         self.batch.messages.push((single, payload));
-        // We assign sequence ids lazily at flush time so that we mint a contiguous range. The
-        // Java client mints them per-message, but at flush time only the lowest is sent on the
-        // wire; emitting per-message ids on the wire would require us to splice them into each
-        // single-metadata, which the Java client does via `firstSequenceIdInBatch`.
         if self.batch.lowest_sequence_id.is_none() {
             self.batch.lowest_sequence_id = Some(self.next_sequence_id);
         }
+        // Mint a unique per-message sequence id NOW so each user-side `SendFut` waits on its
+        // own key. Without this, every batched send was returned the same `seq_id` from
+        // `Connection::send`, and the single `OpSend` pushed by `flush_batch` could only
+        // wake one of the N futures via `apply_receipt`; the other N-1 hung forever even
+        // after the broker acked the whole batch. Mirrors Java
+        // `ProducerImpl.serializeAndSendMessage` minting `msg.metadata.sequence_id` per
+        // message and bumping `msgIdGenerator`.
+        let msg_seq = self.next_sequence_id;
+        self.next_sequence_id = self.next_sequence_id.wrapping_add(1);
+        self.last_sequence_id_pushed = msg_seq as i64;
+        self.batch.highest_sequence_id = Some(msg_seq);
+        // Each batched message gets its own `OpSend` with `num_messages = 1` so
+        // `apply_receipt` (or `apply_send_error`) can resolve them individually. The
+        // `flush_batch` path emits a single wire frame with `sequence_id = lowest`
+        // and `highest_sequence_id = highest` — the inbound receipt then fans out over
+        // `[lowest, highest]` and each `OpSend` is removed in turn.
+        let op = OpSend {
+            sequence_id: SequenceId(msg_seq),
+            num_messages: 1,
+            waker: None,
+            receipt: None,
+            error: None,
+            enqueued_at: now,
+            // No per-message replay frame: replay on reconnect drains the still-buffered
+            // batch entries via `drain_pending_sends`, which already clears
+            // `BatchContainer`.
+            replay_frames: Vec::new(),
+        };
+        self.pending_index
+            .insert(SequenceId(msg_seq), self.pending.len());
+        self.pending.push_back(op);
         // First message in the current batch — stamp the monotonic timestamp so
         // `Connection::handle_timeout` can force a flush once
         // `batching_max_publish_delay` has elapsed. The caller-provided `now`
@@ -809,15 +862,24 @@ impl ProducerState {
             metadata.txnid_least_bits = Some(t.least_sig_bits);
             metadata.txnid_most_bits = Some(t.most_sig_bits);
         }
-        let lowest_seq = self.assign_sequence_id(&mut metadata, publish_time_ms);
-        // For a multi-message batch we additionally bump the sequence counter by (num_messages-1)
-        // so the next first-send picks up where the batch left off — matches Java
-        // `firstSequenceIdInBatch + numMessages`.
-        if num_messages > 1 {
-            let extra = (num_messages as u64).saturating_sub(1);
-            self.next_sequence_id = self.next_sequence_id.wrapping_add(extra);
-            self.last_sequence_id_pushed = self.next_sequence_id.wrapping_sub(1) as i64;
-            metadata.highest_sequence_id = Some(self.last_sequence_id_pushed as u64);
+        // Per-message sequence ids were already minted in `add_to_batch`; the wire frame
+        // uses the lowest as `sequence_id` and the highest as `highest_sequence_id`, and
+        // the per-message `OpSend` entries are already in `self.pending`. Re-bumping
+        // `next_sequence_id` here (as the pre-refactor flush did) would double-bump and
+        // skip ids on the next non-batched send.
+        let lowest = self
+            .batch
+            .lowest_sequence_id
+            .unwrap_or(self.next_sequence_id);
+        let highest = self
+            .batch
+            .highest_sequence_id
+            .unwrap_or(self.last_sequence_id_pushed.max(0) as u64);
+        let lowest_seq = SequenceId(lowest);
+        metadata.sequence_id = lowest;
+        metadata.publish_time = publish_time_ms;
+        if highest > lowest {
+            metadata.highest_sequence_id = Some(highest);
         }
         if self.compression != CompressionKind::None {
             metadata.compression = Some(self.compression.to_pb() as i32);
@@ -828,7 +890,7 @@ impl ProducerState {
 
         let send = pb::CommandSend {
             producer_id: self.handle.0,
-            sequence_id: lowest_seq.0,
+            sequence_id: lowest,
             num_messages: Some(num_messages),
             // The TransactionBuffer is keyed on the `txnid_*` fields of `CommandSend`; missing
             // them on a batched send routes every message in the batch through the dispatcher
@@ -854,21 +916,10 @@ impl ProducerState {
             payload,
             sequence_id: lowest_seq,
         };
-        let replay_frames = vec![frame.clone()];
+        let _ = now;
         self.outbound.push_back(frame);
         self.total_msgs_sent = self.total_msgs_sent.saturating_add(num_messages as u64);
         self.total_bytes_sent = self.total_bytes_sent.saturating_add(payload_len as u64);
-        let op = OpSend {
-            sequence_id: lowest_seq,
-            num_messages,
-            waker: None,
-            receipt: None,
-            error: None,
-            enqueued_at: now,
-            replay_frames,
-        };
-        self.pending_index.insert(lowest_seq, self.pending.len());
-        self.pending.push_back(op);
 
         self.batch.clear();
         1
@@ -1127,7 +1178,14 @@ impl ProducerState {
             // when the replayed receipt lands.
             let w = op.waker.take();
             wakers.push((op.sequence_id, w));
-            snapshots.push(op);
+            // Per-message batched `OpSend` entries (created by `add_to_batch`) carry no
+            // `replay_frames` because the wire frame only materialises at `flush_batch`
+            // time. Drop them on the floor (no replay) — matching Java
+            // `ProducerImpl#connectionClosed` which fails an in-progress batch instead of
+            // re-emitting the partial bytes.
+            if !op.replay_frames.is_empty() {
+                snapshots.push(op);
+            }
         }
         self.batch = BatchContainer::default();
         self.outbound.clear();
@@ -1975,7 +2033,9 @@ mod tests {
         p.batching_enabled = true;
         p.max_messages_in_batch = 100;
         p.max_batch_size_bytes = 4096;
-        // Two batched sends — they accumulate in the batch container, not in `pending`.
+        // Two batched sends — each mints its own `OpSend` in `pending` so the user-side
+        // `SendFut` has a unique key to wait on; the batch container still holds the raw
+        // bytes until `flush_batch` builds the wire frame.
         let _ = p
             .queue_send(small_message(b"a"), 100, std::time::Instant::now())
             .unwrap();
@@ -1983,12 +2043,17 @@ mod tests {
             .queue_send(small_message(b"b"), 100, std::time::Instant::now())
             .unwrap();
         assert!(!p.batch.is_empty());
-        assert_eq!(p.pending.len(), 0);
+        assert_eq!(p.pending.len(), 2);
 
         let (_wakers, snapshots) = p.snapshot_pending_sends();
+        // The pre-flush `OpSend` entries carry no `replay_frames` (the wire frame is built
+        // at flush time, not per-add), so reconnect replay is correctly empty for the
+        // in-progress batch — the entries surface in the wakers list so the caller can
+        // synthesise `Closed` errors, matching Java
+        // `ProducerImpl#connectionClosed` which fails the pending batch.
         assert!(
             snapshots.is_empty(),
-            "in-progress batched messages are not snapshotted (no OpSend yet)"
+            "in-progress batched messages have no replay frames"
         );
         assert!(
             p.batch.is_empty(),

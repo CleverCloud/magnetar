@@ -105,10 +105,17 @@ async fn e2e_producer_batching_flushes_on_max_msgs() -> Result<(), Box<dyn std::
     let payloads: Vec<Vec<u8>> = (0..5)
         .map(|i| format!("batch-msg-{i}").into_bytes())
         .collect();
-    for p in &payloads {
-        producer
-            .send(OutgoingMessage::with_payload(p.clone()).into())
-            .await?;
+    // Sequential await would never fill the batch (each send would wait on a
+    // receipt that arrives only after a flush). Mirror Java
+    // `BatchMessageTest`'s "fire all sendAsync, then join" pattern: enqueue
+    // every message before awaiting any, so the 5th send fills the batch and
+    // the broker emits one batched receipt that resolves all five futures.
+    let send_futures: Vec<_> = payloads
+        .iter()
+        .map(|p| producer.send(OutgoingMessage::with_payload(p.clone()).into()))
+        .collect();
+    for fut in send_futures {
+        fut.await?;
     }
     producer.close().await?;
 

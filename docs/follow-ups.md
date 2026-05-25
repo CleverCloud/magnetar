@@ -449,6 +449,36 @@ bugs surfaced by the e2e sweep, the state is:
 
   Result: `e2e_transactions` is 3/3 PASS. Implemented entirely on the
   tokio runtime; moonpool simulator does not exercise PIP-31 today.
+- **#69** e2e_batch_chunk (all three tests) — **FIXED**. Three batch-
+  related defects in `fix/batch-fullness-flush`:
+  1. `BatchContainer` never emitted on fullness. `add_to_batch`
+     buffered messages but the producer only flushed when
+     `batching_max_publish_delay` (60 s in the e2e test) elapsed.
+     Java's `ProducerImpl#doBatchSendAndAdd` triggers a flush the
+     moment the container fills — added `flush_batch_if_full` invoked
+     from `queue_send`.
+  2. Every batched send was returned the same `seq_id` (the prior
+     `last_sequence_id_pushed`), so the single `OpSend` pushed at flush
+     time could only wake one of the N user-side `SendFut`s.
+     `add_to_batch` now mints a per-message sequence id and pushes a
+     per-message `OpSend(num_messages=1, replay_frames=[])`;
+     `flush_batch` reuses `batch.lowest_sequence_id` /
+     `highest_sequence_id` for the wire frame instead of bumping the
+     counter again.
+  3. Pulsar's broker echoes `highest_sequence_id = -1L` (encoded as
+     `u64::MAX` over `optional uint64`) on receipts for non-batched
+     sends. A naive `for seq in lowest..=receipt.highest_sequence_id`
+     fan-out iterated up to `u64::MAX` and panicked with
+     `capacity overflow` on the second single send. The receipt handler
+     now treats `highest == u64::MAX || highest < lowest` as the
+     "no batch" sentinel and resolves a single entry; only
+     `highest >= lowest && highest != u64::MAX` triggers the real
+     fan-out.
+
+  The `e2e_producer_batching_flushes_on_max_msgs` test was also
+  re-shaped to enqueue all 5 sends before awaiting any — mirrors Java
+  `BatchMessageTest`'s "fire all `sendAsync`, then join" pattern; the
+  sequential `await` would never fill the batch.
 
 ### Remaining follow-ups
 
