@@ -62,7 +62,19 @@ async fn start_pulsar() -> Result<
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(120))
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
+        // The test pattern uses a UUID suffix that pushes the regex past the
+        // broker's default `subscriptionPatternMaxLength=50` limit. Bump it
+        // via PULSAR_PREFIX_; the image's CMD is `sh` (no entrypoint that
+        // wires the env-config helper), so we apply it explicitly before
+        // launching the broker.
+        .with_env_var("PULSAR_PREFIX_subscriptionPatternMaxLength", "200")
+        .with_cmd(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
+                 conf/standalone.conf && bin/pulsar standalone"
+                .to_owned(),
+        ])
         .start()
         .await?;
     let host = container.get_host().await?;

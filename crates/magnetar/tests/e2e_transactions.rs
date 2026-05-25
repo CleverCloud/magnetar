@@ -78,8 +78,31 @@ async fn start_pulsar_with_txn() -> Result<
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_secs(180))
+        // Transactions require three things the default standalone image
+        // does not wire up:
+        //   1. `transactionCoordinatorEnabled=true` in `standalone.conf`,
+        //      injected via `PULSAR_PREFIX_*` after running
+        //      `apply-config-from-env-with-prefix.py` (the image's CMD is
+        //      `sh` — no entrypoint).
+        //   2. Pre-bootstrap the transaction coordinator metadata via
+        //      `bin/pulsar initialize-transaction-coordinator-metadata`
+        //      BEFORE the broker grabs the RocksDB lock; otherwise the
+        //      first `new_txn` from the client fails with
+        //      "transaction not found" (the broker doesn't lazy-create
+        //      these on demand for the standalone image).
+        //   3. Then launch `bin/pulsar standalone` as usual.
         .with_env_var("PULSAR_PREFIX_transactionCoordinatorEnabled", "true")
-        .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
+        .with_cmd(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
+                 conf/standalone.conf && \
+             bin/pulsar initialize-transaction-coordinator-metadata \
+                 --cluster standalone \
+                 --configuration-store rocksdb:///pulsar/data/metadata && \
+             bin/pulsar standalone"
+                .to_owned(),
+        ])
         .start()
         .await?;
     let host = container.get_host().await?;
