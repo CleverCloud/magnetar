@@ -830,15 +830,37 @@ impl ProducerState {
         let txn_id = msg.txn_id;
         let payload = msg.payload;
         let uuid = uuid::Uuid::new_v4().to_string();
+        // Per-chunk PAYLOAD must leave room for the wire-frame overhead
+        // (BaseCommand header + per-chunk MessageMetadata + framing bytes)
+        // so the total frame stays under the broker's `maxMessageSize`
+        // limit. Pulsar's Java client uses `maxMessageSize -
+        // DEFAULT_METADATA_RESERVATION` (≈1 KiB) for `chunkMaxMessageSize`;
+        // mirror that here. Without this reservation, a chunk whose
+        // payload equals `max_message_size` would produce a frame
+        // `max_message_size + ~100 bytes` and the broker silently drops
+        // it (no error reaches the producer), leaving `send().await` to
+        // hang forever waiting for a receipt.
+        //
+        // We only apply the reservation when `max_message_size` is large
+        // enough for it to be meaningful (≥ 4× the reservation) — unit
+        // tests construct producers with `max_message_size=10` to exercise
+        // the chunking math and would otherwise see every chunk shrink
+        // to 1 byte.
+        const CHUNK_METADATA_RESERVATION: usize = 1024;
+        let max_chunk_payload = if self.max_message_size > CHUNK_METADATA_RESERVATION * 4 {
+            self.max_message_size - CHUNK_METADATA_RESERVATION
+        } else {
+            self.max_message_size
+        };
         let total_chunks =
-            ChunkedMessageContext::compute_total_chunks(payload.len(), self.max_message_size);
+            ChunkedMessageContext::compute_total_chunks(payload.len(), max_chunk_payload);
 
         let mut ctx = ChunkedMessageContext {
             payload: payload.clone(),
             uuid: uuid.clone(),
             total_chunks,
             next_chunk: 0,
-            max_chunk_size: self.max_message_size,
+            max_chunk_size: max_chunk_payload,
             sequence_id: SequenceId(0), // assigned below
             metadata: msg.metadata,
             uncompressed_size: msg.uncompressed_size,
