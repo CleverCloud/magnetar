@@ -67,8 +67,17 @@ These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
    and allowlisted in `xtask`. ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md))
 4. **CRC32C verify or drop.** Frames with magic `0x0e01` must pass
    CRC32C; mismatch → `ChecksumMismatch` event + drop.
-5. **`rustls` only.** No `native-tls`, no `openssl`, no `openssl-sys`.
-   Enforced via `deny.toml`. ([ADR-0005](specs/adr/0005-rustls-only-tls.md))
+5. **`rustls` only.** No `native-tls`. `openssl` / `openssl-sys` are
+   admitted only as transitive deps of `rustls-openssl` under the
+   `crypto-openssl` feature
+   ([ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)); the
+   active rustls crypto provider is picked at compile time via the
+   façade's mutually-pluggable `crypto-aws-lc-rs` (default) /
+   `crypto-ring` / `crypto-openssl` / `crypto-fips` features.
+   Enforced via `deny.toml`'s scoped `wrappers = ["rustls-openssl"]`
+   carve-out.
+   ([ADR-0005](specs/adr/0005-rustls-only-tls.md) amended,
+   [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md))
 6. **No panics in `magnetar-proto`** except inside `#[cfg(test)]`. All
    code paths return `Result` or `Option`.
 7. **Schema canonicalisation.** AVRO/JSON/PROTOBUF go through the broker
@@ -141,6 +150,7 @@ cargo xtask check-no-internal-clock   # Instant::now() / SystemTime::now() outsi
 cargo xtask codegen --check           # proto codegen drift
 cargo xtask check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
 cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
+cargo xtask check-crypto-matrix       # per-provider build matrix (ADR-0035)
 ```
 
 E2e against a live broker (Docker + `apachepulsar/pulsar:4.0.4`):

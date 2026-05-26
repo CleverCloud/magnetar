@@ -54,7 +54,8 @@ has a corresponding ADR.
 | No channel crates anywhere | [ADR-0003](../specs/adr/0003-no-channels-rule.md) | `cargo xtask check-no-channels` + `clippy.toml::disallowed-types` + `cargo deny bans` |
 | `magnetar-proto` does not read the host clock | [ADR-0011](../specs/adr/0011-clock-injection-sans-io.md) | `cargo xtask check-no-internal-clock` |
 | Generated proto code stays in lockstep with the vendored `.proto` | [ADR-0004](../specs/adr/0004-sans-io-protocol-core.md) | `cargo xtask codegen --check` |
-| `rustls` only | [ADR-0005](../specs/adr/0005-rustls-only-tls.md) | `deny.toml` bans `native-tls`, `openssl`, `openssl-sys` |
+| `rustls` only (openssl admitted only via `rustls-openssl`) | [ADR-0005](../specs/adr/0005-rustls-only-tls.md) amended by [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) | `deny.toml` bans `native-tls`; `openssl` / `openssl-sys` scoped via `wrappers = ["rustls-openssl"]` |
+| Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) | [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) | `cargo xtask check-crypto-matrix` + cfg-cascade `compile_error!` |
 
 The clock-injection check has two documented leak sites in
 [`crates/magnetar-proto`](../crates/magnetar-proto): the PIP-37
@@ -165,7 +166,12 @@ Three TLS sites in the workspace; all use `rustls`:
    `moonpool_core::NetworkProvider`. Source:
    [`crates/magnetar-runtime-moonpool/src/tls.rs`](../crates/magnetar-runtime-moonpool/src/tls.rs).
    See [ADR-0006](../specs/adr/0006-moonpool-tls-byte-pipe.md).
-3. **`magnetar-admin`** uses `reqwest` with the `rustls-tls` feature.
+3. **`magnetar-admin`** uses `reqwest`. The `rustls-tls` vs
+   `rustls-tls-no-provider` sub-feature is picked per `crypto-*`
+   selection — `aws-lc-rs` uses `rustls-tls` (which resolves to
+   aws-lc-rs internally), the other three providers use
+   `rustls-tls-no-provider` and rely on the engine boot's
+   `install_default_provider()` shim.
 
 The hostname-verification knob
 (`tls_hostname_verification_enable(false)`) is implemented in
@@ -174,6 +180,33 @@ by wrapping `WebPkiServerVerifier` so chain verification still runs but
 `NotValidForName` is intercepted. `tls_allow_insecure_connection(true)`
 is a blanket override in
 [`tls_insecure.rs`](../crates/magnetar-runtime-tokio/src/tls_insecure.rs).
+
+### Pluggable crypto provider (issue #9, ADR-0035)
+
+The rustls crypto primitives that back the handshake are selected at
+compile time on the `magnetar` façade via four mutually-pluggable
+features:
+
+| Feature              | Backend                                           |
+|----------------------|---------------------------------------------------|
+| `crypto-aws-lc-rs`   | `aws-lc-rs` (default; brings X25519MLKEM768)      |
+| `crypto-ring`        | `ring`                                            |
+| `crypto-openssl`     | `rustls-openssl` (wraps system OpenSSL)           |
+| `crypto-fips`        | `aws-lc-fips-sys` (FIPS-validated; needs cmake)   |
+
+Both runtime crates carry a sibling `tls_crypto` module that exposes
+`install_default_provider()` (idempotent) and `active_provider()`. The
+four production callsites
+(`tls_insecure.rs`, `tls_no_hostname.rs`, `transport.rs`, `client.rs`)
+go through `active_provider()` rather than the historical
+`CryptoProvider::get_default()` + `ring` fallback. Under
+`--all-features` the cfg cascade resolves to aws-lc-rs.
+
+`openssl` / `openssl-sys` are admitted only as transitive deps of
+`rustls-openssl` via `deny.toml`'s `wrappers = ["rustls-openssl"]`
+carve-out; the rest of [ADR-0005](../specs/adr/0005-rustls-only-tls.md)
+(no `native-tls`, rustls everywhere) stays in force. See
+[ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md).
 
 ## Memory accounting
 

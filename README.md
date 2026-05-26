@@ -118,6 +118,10 @@ The default feature set enables the tokio engine. The feature flags catalog:
 | `auth-athenz` | no | Pulls in `magnetar-auth-athenz`. |
 | `encryption` | no | Pulls in `magnetar-messagecrypto` plus the PIP-4 bridge type. |
 | `e2e` | no | Implies `tokio` + `admin`; flips on the `testcontainers`-backed end-to-end suite (requires Docker). |
+| `crypto-aws-lc-rs` | yes | rustls crypto provider: `aws-lc-rs`; brings post-quantum hybrid KEX (X25519MLKEM768). See [TLS crypto provider](#tls-crypto-provider). |
+| `crypto-ring` | no | rustls crypto provider: `ring`. |
+| `crypto-openssl` | no | rustls crypto provider: `rustls-openssl` (wraps system OpenSSL via `deny.toml` carve-out). |
+| `crypto-fips` | no | rustls crypto provider: aws-lc-rs FIPS-validated module (requires `cmake` + C toolchain). |
 
 The workspace ships eleven crates:
 
@@ -137,6 +141,46 @@ The workspace ships eleven crates:
 
 `xtask` is a workspace member but is **not published** — it hosts build
 helpers (`protoc` codegen, e2e driver, dependency audits).
+
+---
+
+## TLS crypto provider
+
+The rustls crypto backend is selected at compile time via four
+mutually-pluggable Cargo features on the `magnetar` façade. The wire
+protocol — TLS 1.3 (default) / TLS 1.2 — is identical across every
+provider; what differs is the audited / FIPS-validated / post-quantum
+posture of the underlying primitives.
+
+| Feature              | Backend           | Post-quantum KEX     | FIPS validated | Pure Rust | Default |
+|----------------------|-------------------|----------------------|----------------|-----------|---------|
+| `crypto-aws-lc-rs`   | aws-lc-rs         | yes (X25519MLKEM768) | no             | no (C)    | ✓       |
+| `crypto-ring`        | ring              | no                   | no             | no (C)    |         |
+| `crypto-openssl`     | rustls-openssl    | yes                  | depends on OpenSSL build | no | |
+| `crypto-fips`        | aws-lc-fips-sys   | (FIPS-approved only) | yes            | no (C)    |         |
+
+```bash
+# Pick a single provider (mutually exclusive at build time).
+cargo build -p magnetar --no-default-features --features tokio,crypto-aws-lc-rs
+cargo build -p magnetar --no-default-features --features tokio,crypto-ring
+cargo build -p magnetar --no-default-features --features tokio,crypto-openssl   # needs system OpenSSL
+cargo build -p magnetar --no-default-features --features tokio,crypto-fips      # needs cmake + C toolchain
+```
+
+Under `cargo build --workspace --all-features` the compile-time cfg
+cascade resolves to aws-lc-rs (highest priority). Single-provider builds
+go through `cargo xtask check-crypto-matrix`. A single `compile_error!`
+fires if no `crypto-*` feature is enabled.
+
+The `crypto-aws-lc-rs` default picks up rustls 0.23's built-in
+`prefer-post-quantum` feature, so the wire client negotiates the
+X25519MLKEM768 hybrid key exchange with brokers that support it.
+
+`openssl` / `openssl-sys` are admitted only as transitive deps of
+`rustls-openssl`; the rest of [ADR-0005](specs/adr/0005-rustls-only-tls.md)
+(no `native-tls`, rustls everywhere) stays in force. See
+[ADR-0035](specs/adr/0035-pluggable-crypto-provider.md) for the binding
+decision.
 
 ---
 
