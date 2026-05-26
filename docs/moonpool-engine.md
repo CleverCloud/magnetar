@@ -184,8 +184,19 @@ for seed in $(seq 1 32); do
 done
 ```
 
-A dedicated `moonpool-sim` job runs the suite on every push and PR
-([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
+In CI, the per-PR / per-push pipeline
+([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) exercises
+the moonpool suite under the default seed via the regular `test` job.
+A dedicated
+[`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml)
+workflow runs **daily** with **16 freshly-rolled random `u64` seeds in
+parallel** — see
+[ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) for
+the rationale (fixed seeds in per-PR CI are wasted compute since each
+`(commit, seed)` pair is bit-for-bit reproducible; random seeds rolled
+daily cover the seed space far better over time). Failing seeds are
+echoed in the run summary — reproduce locally with
+`MOONPOOL_SEED=<hex> cargo test -p magnetar-runtime-moonpool …`.
 
 ## Differential equivalence harness
 
@@ -223,9 +234,11 @@ explicitly `#[ignore]`-marked with a TODO per
 
 ## What is *not* yet exercised under simulation
 
-- **Property-based seed sweeps** are not part of the CI matrix. CI runs
-  the test binary with a single seed (the moonpool default). Multi-seed
-  scheduling is a manual loop today.
+- **Property-based seed sweeps** in per-PR CI: the per-PR pipeline runs
+  the test binary on the moonpool default seed only. Multi-seed
+  scheduling is covered by the daily 16-random-seed sweep
+  ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)),
+  not by per-PR CI.
 - **TLS handshake byte-level chaos** (corrupted handshake records) is
   not yet swept; handshake correctness is verified but adversarial
   byte mutations are open work.

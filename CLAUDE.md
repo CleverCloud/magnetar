@@ -135,7 +135,10 @@ cargo build --workspace --all-features
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
-# deterministic-simulation suite. Hard requirement per ADR-0024.
+# deterministic-simulation suite. Local-only per ADR-0036 (fixed seeds
+# in per-PR CI were wasted compute since each (commit, seed) pair is
+# bit-for-bit reproducible). CI runs a 16-random-seed sweep daily in
+# `.github/workflows/moonpool-seed-sweep.yml`.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
     --all-features --locked -- --quiet \

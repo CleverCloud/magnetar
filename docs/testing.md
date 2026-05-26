@@ -23,7 +23,8 @@ cargo test --workspace --all-features --locked
 # Moonpool deterministic-simulation suite (single seed; default).
 cargo test -p magnetar-runtime-moonpool --all-features --locked
 
-# Same, swept across seeds 1..32.
+# Same, swept across seeds 1..32 (local pre-flight; CI runs a 16-random-seed
+# sweep daily — see .github/workflows/moonpool-seed-sweep.yml / ADR-0036).
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
     --all-features --locked -- --quiet || echo "seed $seed FAILED"

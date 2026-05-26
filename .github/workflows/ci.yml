@@ -157,38 +157,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
 
-  moonpool-sim:
-    name: moonpool deterministic-simulation (seed=${{ matrix.seed }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      # Don't cancel sibling seeds when one fails — we want the full
-      # set of failing seeds visible in one CI run for diagnosis.
-      fail-fast: false
-      matrix:
-        # 32-seed sweep per ADR-0024 §"Cross-runtime test + coverage
-        # policy". Mirrors the local validation chain in CLAUDE.md.
-        # Nightly extends to 1..512 in a separate workflow.
-        # `matrix.seed` is a controlled literal integer from this
-        # workflow's own matrix axis — not untrusted user input — so
-        # interpolating it into `name:` and `env:` is safe.
-        seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-               17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build moonpool engine
-        run: cargo build -p magnetar-runtime-moonpool --all-features --locked
-      - name: Run moonpool-sim test suite
-        # The moonpool engine carries its own deterministic-simulation tests
-        # (driver + client + producer + consumer façades, TLS handshake under
-        # chaos). They are pure unit / integration tests inside
-        # `magnetar-runtime-moonpool` — no Docker needed and they reproduce
-        # bit-for-bit under a given seed.
-        env:
-          MOONPOOL_SEED: ${{ matrix.seed }}
-        run: cargo test -p magnetar-runtime-moonpool --all-features --locked
+  # NOTE: the moonpool deterministic-simulation seed sweep lives in its
+  # own workflow, `moonpool-seed-sweep.yml`, which runs daily on a cron
+  # schedule with 16 freshly-generated random seeds in parallel. Per
+  # ADR-0036, fixed seeds in per-PR / per-push CI are useless — they
+  # always cover the same scheduling — while random seeds over time
+  # cover the seed space much better. The regular `test` job above
+  # still exercises `magnetar-runtime-moonpool` under the default seed
+  # on every PR / push.
 
   e2e:
     name: e2e (Pulsar 4.x standalone)

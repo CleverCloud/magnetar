@@ -1,0 +1,79 @@
+name: Moonpool seed sweep
+
+# Daily random-seed sweep of `magnetar-runtime-moonpool`. Replaces the
+# fixed 32-seed sweep that used to run on every PR / push (ADR-0036).
+# Rationale: fixed seeds always exercise the same scheduling, so
+# repeating them on every commit is wasted runner time; random seeds
+# accumulating over days cover the seed space much better.
+#
+# A freshly-rolled set of 16 random `u64` seeds runs in parallel each
+# day. Any failure leaves the matrix entry red so the failing seed is
+# visible in the run summary — re-run the test locally with
+# `MOONPOOL_SEED=<seed>` to reproduce bit-for-bit.
+#
+# Security note: no `github.event.*` inputs are interpolated anywhere
+# in this workflow. The only matrix expansion comes from
+# `steps.roll.outputs.seeds`, which is produced by this workflow's own
+# `generate-seeds` job using Python's `secrets` module — controlled
+# input, not user-supplied.
+
+on:
+  schedule:
+    # 03:17 UTC daily. Off-the-hour to avoid contention with the GH
+    # Actions scheduler burst at :00.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings --cfg tokio_unstable"
+  RUSTDOCFLAGS: "-D warnings --cfg tokio_unstable"
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 5
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  generate-seeds:
+    name: roll 16 random seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      seeds: ${{ steps.roll.outputs.seeds }}
+    steps:
+      - id: roll
+        run: |
+          set -euo pipefail
+          seeds=$(python3 - <<'PY'
+          import json, secrets
+          print(json.dumps([f"0x{secrets.randbits(64):016x}" for _ in range(16)]))
+          PY
+          )
+          {
+            echo "seeds=${seeds}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Rolled seeds:"
+          echo "${seeds}"
+
+  moonpool-sim:
+    name: moonpool-sim (seed=${{ matrix.seed }})
+    needs: generate-seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON(needs.generate-seeds.outputs.seeds) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build moonpool engine
+        run: cargo build -p magnetar-runtime-moonpool --all-features --locked
+      - name: Run moonpool-sim test suite
+        env:
+          MOONPOOL_SEED: ${{ matrix.seed }}
+        run: cargo test -p magnetar-runtime-moonpool --all-features --locked

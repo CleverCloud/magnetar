@@ -1,6 +1,6 @@
 # ADR-0024 — Cross-runtime test + coverage policy
 
-- **Status**: Accepted
+- **Status**: Accepted — amended by [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) for the CI seed-sweep cadence (§"Decision" #3 only; the four-layer test policy, sim coverage, and 1:1 parity rules in §§1–2,4–8 stand)
 - **Date**: 2026-05-22
 - **Decider**: Florentin Dubois
 - **Tags**: testing, coverage, moonpool, tokio, differential, ci, process
@@ -99,9 +99,13 @@ Concretely, the binding rules are:
    equivalent count under `crates/magnetar-runtime-moonpool/{src,tests}`.
    Enforced by `cargo xtask check-runtime-test-parity`.
 
-3. **Seed sweep.** The validation chain runs
+3. **Seed sweep.** The local validation chain runs
    `MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool` for
-   `seed ∈ 1..32` on every pass. Any seed failure fails the chain.
+   `seed ∈ 1..32` on every pass. Any seed failure fails the chain. In
+   CI, the cadence is **daily, 16 random seeds in parallel**, per
+   [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) — fixed seeds
+   in the per-PR gate were wasted compute because each `(commit, seed)`
+   pair is bit-for-bit reproducible.
 
 4. **Coverage tool.** `cargo-llvm-cov` (LLVM source-based coverage),
    not `tarpaulin`. Reason: tracks features cleanly, works with
@@ -134,7 +138,11 @@ Concretely, the binding rules are:
 7. **CI mirror.** GitHub Actions runs the same xtask commands on
    every PR. The coverage report uploads (HTML + JSON) to the CI
    artifact store for inspection. Patch-coverage failure blocks the
-   merge.
+   merge. The seed sweep is the exception: per
+   [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) it runs daily
+   with 16 freshly-rolled random seeds in
+   [`.github/workflows/moonpool-seed-sweep.yml`](../../.github/workflows/moonpool-seed-sweep.yml),
+   not on every PR.
 
 8. **ADR-0021 still applies.** A failing test under the new rules is
    *not* a license to `#[ignore]` — the escape hatch is "stop and

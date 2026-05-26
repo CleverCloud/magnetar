@@ -39,7 +39,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0021](adr/0021-no-silent-test-ignore-or-remove.md) | Tests are fixed, not silently ignored or removed | Accepted |
 | [0022](adr/0022-memory-limit-producer-block-moonpool.md) | `MemoryLimitPolicy::ProducerBlock` ported to the moonpool engine; fairness contract under `Providers` | Accepted |
 | [0023](adr/0023-health-probe-trait-extraction.md) | Extract sans-io `HealthProbe` trait into `magnetar-proto`; tokio engine uses it | Accepted |
-| [0024](adr/0024-cross-runtime-test-and-coverage-policy.md) | Cross-runtime test + coverage policy: four-layer test set, 100% diff sim coverage, 1:1 runtime parity | Accepted |
+| [0024](adr/0024-cross-runtime-test-and-coverage-policy.md) | Cross-runtime test + coverage policy: four-layer test set, 100% diff sim coverage, 1:1 runtime parity | Amended by [ADR-0036](adr/0036-moonpool-seed-sweep-daily-random.md) (CI seed-sweep cadence only) |
 | [0025](adr/0025-engine-trait-task-and-timer-primitives.md) | Engine trait extension phase 1: `TaskHandle` + `Interval` + spawn / abort / interval primitives | Accepted |
 | [0026](adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) | D1–D4 design decisions (FDB / Pulsar Java / Codex synthesis): concrete generic surfaces (not GATs); pure-sim chaos; defer SASL/Athenz; implement vendor-proto | Accepted |
 | [0027](adr/0027-moonpool-engine-clientstate-is-runtime-client.md) | `MoonpoolEngine::ClientState` is `magnetar_runtime_moonpool::Client<P>` directly; drops `MoonpoolClientState` wrapper, partially supersedes ADR-0019 §gate (e) | Accepted |
@@ -51,6 +51,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0033](adr/0033-pip-180-shadow-topic-scope.md) | v0.2.0 scope for PIP-180 shadow topic — read-only follower subscription mode, no-ack/no-seek consumer semantics | Proposed |
 | [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Proposed |
 | [0035](adr/0035-pluggable-crypto-provider.md) | Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) — amends ADR-0005 openssl ban via `deny.toml` `wrappers = ["rustls-openssl"]` carve-out | Accepted |
+| [0036](adr/0036-moonpool-seed-sweep-daily-random.md) | Moonpool seed sweep: daily 16-random-seed sweep in a dedicated workflow, drop per-PR fixed 32-seed matrix — amends ADR-0024 §3 (CI cadence) | Accepted |
 
 ## How to add an ADR
 

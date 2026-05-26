@@ -203,8 +203,10 @@ older surface lines is unmeasured today.
 (1) bring tokio↔moonpool counts to 1:1 — **done**;
 (2) close pre-existing moonpool coverage gaps file by file using the
 `cargo llvm-cov --html` report; (3) full validation chain green
-including 32-seed sweep. ADR-0021 still applies — failing tests are
-fixed, not `#[ignore]`-d.
+including the local `1..32` seed sweep (ADR-0024 §3 / ADR-0036 — CI
+runs the equivalent as a daily 16-random-seed sweep in
+`.github/workflows/moonpool-seed-sweep.yml`). ADR-0021 still applies —
+failing tests are fixed, not `#[ignore]`-d.
 
 ```text
 /goal close the pre-existing moonpool coverage gap. Generate cargo llvm-cov --html, identify the largest uncovered hunks in crates/magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,transport}.rs, add targeted tests to crates/magnetar-runtime-moonpool/tests/ until check-sim-coverage reports no uncovered lines against origin/main. Keep test parity 1:1; mirror each new moonpool test on the tokio side so the gate stays green.
