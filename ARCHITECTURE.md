@@ -479,6 +479,36 @@ The transient path is independent of the full Stage 2 reset cycle:
 it keeps the existing connection alive and only rebuilds the
 specific handle that errored.
 
+#### Anti-thrash policy (opt-in, ADR-0028)
+
+Some broker conditions cause a different pathology: the broker
+**accepts** `CommandProducer` / `CommandSubscribe`, then drops the
+TCP connection within a few milliseconds. magnetar's retry path
+treats each drop as a transient error and re-attaches, which feeds
+the cascade. The observed trigger is post-restart bundle-ownership
+churn on `apachepulsar/pulsar:4.0.4` (Pulsar PR #14467 + #13428 +
+#12846 — `ServerCnx#handleProducer` ↔ `AbstractTopic#addProducer`
+race, amplified by the standalone-mode ZK session timeout).
+
+[`magnetar-proto::AntiThrashState`](crates/magnetar-proto/src/anti_thrash.rs)
+is a per-`Connection` bounded ring that records each re-attach
+outcome (`ReAttachOk { handle }`) and the TCP-drop deltas that
+follow within `drop_grace`. When `N` re-attaches inside a sliding
+window of `M` are all followed by `TcpDropAfterReAttach`, the state
+emits `ConnectionEvent::AntiThrashCooldown { until }`; the
+supervisor honours it by sleeping until `until` before the next
+`Transport::connect`. The detector resets on any re-attach that
+survives `drop_grace`.
+
+Default: **OFF** — `SupervisorConfig::anti_thrash_threshold: None`.
+Recommended opt-in values from
+[ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md):
+`(N = 5, M = 2 s, K = 50 ms, cooldown = 30 s)`. The
+`magnetar-runtime-moonpool` chaos pack ships a
+`DropsTcpAfterCreate { delay_ms }` `BrokerWorkload` variant so the
+behaviour is exercised under deterministic seeds (see
+[`tests/sim_chaos.rs`](crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)).
+
 ### Source
 
 [`crates/magnetar-runtime-tokio/src/driver.rs`](crates/magnetar-runtime-tokio/src/driver.rs)
