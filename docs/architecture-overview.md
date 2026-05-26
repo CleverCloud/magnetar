@@ -256,6 +256,32 @@ The schedule API lives on the relevant builder
 `TableViewBuilder::auto_update_partitions_interval`,
 `PatternConsumer::start_auto_reconcile`).
 
+## Receive-path classifiers
+
+The `ConnectionEvent` stream is a single ordered queue, but the
+receive dispatch in `magnetar-proto::Connection` runs a thin
+classifier before emitting so callers see the most specific variant
+that matches the inbound frame. Two features use this pattern:
+
+- **Shadow-topic dispatch (PIP-180 / ADR-0033)** — when a consumer is
+  shadow-attached via [`ConsumerState::set_shadow_metadata`](../crates/magnetar-proto/src/consumer.rs)
+  AND the inbound `MessageMetadata.replicated_from` is populated,
+  the classifier emits `ConnectionEvent::MessageReceivedFromShadow`
+  in place of `ConnectionEvent::Message`. Regular (non-shadow)
+  topics keep emitting `Message` — wire path is byte-identical to
+  v0.1.0. Full surface in [`shadow-topic.md`](shadow-topic.md).
+- **Replicated-subscription markers (PIP-33 / ADR-0034)** — markers
+  carried in the payload of a `CommandMessage` with magic type
+  `MarkerType::REPLICATED_SUBSCRIPTION_*` are intercepted by the
+  consumer's receive path and re-emitted as
+  `ConnectionEvent::ReplicatedSubscriptionMarkerObserved` rather
+  than surfaced to user code as a regular `Message`. Full surface in
+  [`replicated-subscriptions.md`](replicated-subscriptions.md).
+
+Both classifiers stay sans-io: they read only the per-consumer
+state cache (populated externally by the runtime engine at
+subscribe time) and the inbound metadata. No I/O, no clock reads.
+
 ## Where the rules are
 
 The binding rules are in:

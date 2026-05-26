@@ -27,7 +27,7 @@ Florentin's signoff (2026-05-20) chose **full parity at v0.1**.
   (chunking + redelivery backoff), PIP-54 (partial-batch ACK), PIP-58,
   PIP-68 (access modes), PIP-87 (AutoConsumeSchema lookup), PIP-90 (broker
   entry metadata), PIP-107, PIP-119, PIP-121 (cluster failover), PIP-124,
-  PIP-131, PIP-145 (topic-list watcher), PIP-180 (shadow topic), PIP-188
+  PIP-131, PIP-145 (topic-list watcher), PIP-180 (shadow topic)[^pip-180], PIP-188
   (`TOPIC_MIGRATED`), PIP-282, PIP-292, PIP-296, PIP-313 (force unsubscribe),
   PIP-344, PIP-379, PIP-391, PIP-409, PIP-415 (`getMessageIdByIndex`),
   PIP-460 / PIP-466 (scalable topics — experimental tag).
@@ -46,6 +46,14 @@ Florentin's signoff (2026-05-20) chose **full parity at v0.1**.
   `AuthError::Unsupported` so callers see the gap at the auth-method
   boundary rather than at the wire.
 - No PIP is deferred to a v0.2 / v0.3.
+
+[^pip-180]: Re-scoped to v0.2.0 by
+    [ADR-0033](0033-pip-180-shadow-topic-scope.md) (2026-05-26):
+    the shadow-topic surface turned out to span producer wire,
+    admin REST (three new endpoints), consumer event classification,
+    and a CLI surface — too large for the v0.1.0 finishing wave
+    without slipping the rest of the parity matrix. Implemented in
+    v0.2.0 commit `82ef01b`.
 
 ## Consequences
 

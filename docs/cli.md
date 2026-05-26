@@ -84,3 +84,38 @@ advertises in `CommandConnect.protocol_version`
 (`crates/magnetar-proto/src/conn.rs`). It is currently hard-coded in
 both places. Tracking issue: `docs/follow-ups.md` (expose as a typed
 constant from `magnetar-proto`).
+
+## Subcommands
+
+`magnetar --help` lists the full set. Documented surfaces that need
+more context than the help text provides:
+
+### `produce` / `consume`
+
+Data-plane operations. See `magnetar produce --help` /
+`magnetar consume --help` for the flag matrix.
+
+### `admin <verb>`
+
+Control-plane operations against `/admin/v2/...`. Wraps
+[`magnetar_admin::AdminClient`](../crates/magnetar-admin/src/lib.rs)
+(`cluster-list`, `tenant-{list,create,delete}`,
+`namespace-{list,create,delete}`, `topic-{list,create,delete,stats}`).
+Output is JSON to stdout; errors go to stderr with a non-zero exit
+code.
+
+### `shadow <verb>` (PIP-180)
+
+PIP-180 shadow-topic admin. See [`shadow-topic.md`](shadow-topic.md)
+for concepts + caveats.
+
+| Command | Effect |
+| --- | --- |
+| `magnetar shadow create <source> <shadow> [--property key=value]…` | `PUT /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics` — create a shadow topic on top of a source topic. |
+| `magnetar shadow delete <shadow> [--force]` | `DELETE /admin/v2/persistent/{tenant}/{namespace}/{shadow}` — remove a shadow topic. `--force` kicks off connected subscribers. |
+| `magnetar shadow list <source>` | `GET /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics` — list the shadows of a source topic. |
+| `magnetar shadow source <shadow>` | `GET /admin/v2/persistent/{tenant}/{namespace}/{shadow}/shadowSource` — resolve a shadow's source topic (returns `null` for a non-shadow topic). |
+
+All four commands share the global `--admin-url` / `--token` /
+`--admin-timeout-secs` flags with the `admin` subcommand and stream
+JSON output to stdout.

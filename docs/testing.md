@@ -65,7 +65,7 @@ runs and CI).
 
 ## Unit tests
 
-`magnetar-proto` ships 220+ unit tests that exercise sans-io behavior
+`magnetar-proto` ships 270+ unit tests that exercise sans-io behavior
 in isolation: feed bytes in, assert events / transmit / state. Every
 protocol bug is reproducible without sockets or async tasks. Ported
 behavioral cases include:
@@ -74,6 +74,25 @@ behavioral cases include:
   `AckGroupingTrackerTest` + `UnAckedMessageTrackerTest`.
 - 6 batch-container cases from Java's `BatchMessageContainerImplTest`.
 - ~14 schema codec cases.
+- 8 PIP-180 shadow-topic cases (3 producer encode-site guards including
+  the v0.1.0 byte-identical regression test, 1 `MessageId` structural
+  equality pin, 4 consumer-side classification cases).
+- 11 PIP-33 marker-decoder + filter cases.
+
+### Four-layer PIP coverage (ADR-0024)
+
+Every PIP-bearing change lands as the full
+[ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
+test set in the same commit. PIP-180 is a worked example:
+
+| Layer | File |
+| --- | --- |
+| (a) `magnetar-proto` unit | [`crates/magnetar-proto/src/{producer,consumer,types}.rs`](../crates/magnetar-proto/src/) `#[cfg(test)] mod tests` |
+| (b) `magnetar-runtime-tokio` integration | [`crates/magnetar-runtime-tokio/tests/shadow_topic.rs`](../crates/magnetar-runtime-tokio/tests/shadow_topic.rs) |
+| (c) `magnetar-runtime-moonpool` integration | [`crates/magnetar-runtime-moonpool/tests/shadow_topic.rs`](../crates/magnetar-runtime-moonpool/tests/shadow_topic.rs) |
+| (d) `magnetar-differential` equivalence | [`crates/magnetar-differential/tests/shadow_topic_equivalence.rs`](../crates/magnetar-differential/tests/shadow_topic_equivalence.rs) + golden trace [`tests/golden/shadow_send_with_source.json`](../crates/magnetar-differential/tests/golden/shadow_send_with_source.json) |
+| (admin REST) `magnetar-admin` wiremock | [`crates/magnetar-admin/tests/pip_180_shadow_topic.rs`](../crates/magnetar-admin/tests/pip_180_shadow_topic.rs) |
+| (e2e) Docker against `apachepulsar/pulsar:4.0.4` | [`crates/magnetar/tests/e2e_shadow_topic.rs`](../crates/magnetar/tests/e2e_shadow_topic.rs) |
 
 ## Integration tests
 

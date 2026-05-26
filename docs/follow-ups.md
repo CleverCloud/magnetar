@@ -367,6 +367,44 @@ Landed in v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md),
 `ConnectionEvent::MessageReceivedFromShadow`, and the structural
 `MessageId` equality contract.
 
+#### Post-landing follow-ups
+
+- **Subscribe-time admin REST hint integration (façade-level)** —
+  the runtime engines expose `Consumer::set_shadow_source(...)` but
+  do NOT call the admin REST `get_shadow_source(topic)` automatically
+  at `subscribe()` time. Today the caller threads the source-topic
+  hint in by hand (or via the magnetar façade above the runtime,
+  which has `magnetar-admin` available behind the `admin` feature).
+  A clean addition would be a `Client::subscribe_shadow_aware(...)`
+  on the magnetar façade that performs the lookup when the `admin`
+  feature is active. Track here as a quality-of-life follow-up.
+- **Post-subscribe shadow-metadata cache race** — the per-`Consumer`
+  shadow metadata is resolved once at subscribe time and cached
+  for the consumer's lifetime. If a shadow is created on a topic
+  AFTER a consumer subscribed to it, the consumer will not pick up
+  the new shadow attachment until it re-subscribes. Documented in
+  [`shadow-topic.md`](shadow-topic.md) §Caveats. Low priority —
+  operators inspect via `magnetar shadow list <source>`.
+- **Moonpool `BrokerWorkload::ShadowReceive`** — the differential
+  `ScriptedBroker` already echoes the client-asserted source id on
+  `CommandSendReceipt`, so the moonpool sim_chaos suite doesn't
+  need a separate `ShadowTopic` workload variant to exercise the
+  wire path. If a richer scenario lands later (e.g. shadow-aware
+  receive injection with `replicated_from` set on the inbound
+  `CommandMessage`), add a `BrokerWorkload::ShadowReceive {
+  source_topic }` variant.
+- **E2E replicator-side wire path** —
+  `crates/magnetar/tests/e2e_shadow_topic.rs` exercises the admin
+  REST cycle + a regular produce-on-source / consume-on-shadow
+  round-trip. The replicator-style `send_with_source_message_id`
+  path against a real broker is covered by the differential
+  equivalence test against the scripted broker that echoes the
+  source id back; against Pulsar 4.x, the broker's real authorisation
+  flow may reject a client-asserted source id that doesn't match a
+  registered replicator producer. Adding the e2e assertion would
+  need a Pulsar 4.x cluster with a registered replicator role —
+  defer until that fixture is available.
+
 ### PIP-466 — V5 client surface (🟠 DESIGN-PHASE, surface usable today)
 
 **Status.** Proposal accepted in [`specs/proposals/pip-466-v5-client-surface.md`](../specs/proposals/pip-466-v5-client-surface.md);

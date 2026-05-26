@@ -12,7 +12,7 @@
 //! [`AntiThrashState::tick`] to learn the current cooldown disposition.
 //!
 //! No channels, no I/O — the detector lives inside the sans-io
-//! `magnetar-proto::Connection` and shares its [`parking_lot::Mutex`].
+//! `magnetar-proto::Connection` and shares its `parking_lot::Mutex`.
 
 use core::time::Duration;
 use std::collections::VecDeque;

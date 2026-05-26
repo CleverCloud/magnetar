@@ -494,7 +494,7 @@ impl<P: Providers> Consumer<P> {
     ///
     /// The timeout source is `tokio::time::timeout`, which under
     /// `TokioProviders` measures wall time. Under
-    /// [`moonpool_core::SimProviders`] the timeout is still wall-time —
+    /// `moonpool_core::SimProviders` the timeout is still wall-time —
     /// pass-2 of the engine-generic surface lift will route this through
     /// `Providers::time` for full sim-determinism. Today's behavior matches
     /// the tokio engine's `Consumer::receive_with_timeout`.
