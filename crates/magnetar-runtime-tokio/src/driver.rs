@@ -155,20 +155,29 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 // Broker bounced the `CommandProducer` with a transient code
                 // (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) — typical
                 // post-`docker restart` window where the namespace bundle hasn't
-                // been re-acquired yet. magnetar keeps the producer state intact
-                // (`conn.rs` `CommandError` handler), so we just need to retry the
-                // attachment after a short delay. Spawn a tokio task instead of
-                // sleeping inline: blocking the driver loop here would freeze
-                // every other connection event for the backoff duration.
+                // been re-acquired yet. Pulsar's recommended recovery is "Please
+                // redo the lookup": a fresh `CommandLookupTopic` triggers the
+                // broker to (re)acquire bundle ownership, after which the
+                // `CommandProducer` retry actually succeeds. Mirrors Java's
+                // `ProducerImpl.connectionOpened` → `lookupRequest` flow.
                 tracing::info!(
                     ?handle,
                     code,
                     %message,
-                    "producer-open transient error; scheduling retry"
+                    "producer-open transient error; scheduling lookup + retry"
                 );
                 let shared_for_retry = shared.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let topic = shared_for_retry
+                        .inner
+                        .lock()
+                        .producer_topic(handle)
+                        .map(str::to_owned);
+                    let Some(topic) = topic else { return };
+                    if !lookup_then(&shared_for_retry, &topic).await {
+                        return;
+                    }
                     let request_id = {
                         let mut conn = shared_for_retry.inner.lock();
                         conn.retry_producer_open(handle)
@@ -187,11 +196,20 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     ?handle,
                     code,
                     %message,
-                    "consumer-subscribe transient error; scheduling retry"
+                    "consumer-subscribe transient error; scheduling lookup + retry"
                 );
                 let shared_for_retry = shared.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let topic = shared_for_retry
+                        .inner
+                        .lock()
+                        .consumer_topic(handle)
+                        .map(str::to_owned);
+                    let Some(topic) = topic else { return };
+                    if !lookup_then(&shared_for_retry, &topic).await {
+                        return;
+                    }
                     let request_id = {
                         let mut conn = shared_for_retry.inner.lock();
                         conn.retry_consumer_subscribe(handle)
@@ -203,6 +221,45 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
             }
             _ => {}
         }
+    }
+}
+
+/// Issue a `CommandLookupTopic` and await the broker's `CommandLookupTopicResponse` /
+/// `CommandError`. Returns `true` when the lookup landed any outcome (the actual
+/// broker disposition is logged but ignored — the caller's next step is a
+/// `retry_*` that will re-fail if the bundle is still not served). Used by the
+/// transient-error retry path (see #71 + #72) to force the broker to (re)acquire
+/// namespace bundle ownership before we re-attach the producer / consumer.
+async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    use magnetar_proto::{OpOutcome, PendingOpKey};
+
+    let request_id = {
+        let mut conn = shared.inner.lock();
+        conn.lookup(topic, false)
+    };
+    shared.driver_waker.notify_one();
+    let key = PendingOpKey::Request(request_id);
+    let outcome = poll_fn(|cx| {
+        let mut conn = shared.inner.lock();
+        if let Some(outcome) = conn.take_outcome(key) {
+            return Poll::Ready(outcome);
+        }
+        conn.register_waker(key, cx.waker().clone());
+        Poll::Pending
+    })
+    .await;
+    if matches!(
+        &outcome,
+        OpOutcome::LookupResponse { .. } | OpOutcome::Error { .. }
+    ) {
+        tracing::debug!(?outcome, %topic, "retry-path lookup completed");
+        true
+    } else {
+        tracing::warn!(?outcome, %topic, "retry-path lookup landed unexpected outcome");
+        false
     }
 }
 

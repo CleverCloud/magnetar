@@ -609,17 +609,30 @@ re-issues the attach command WITHOUT a fresh
 `CommandLookupTopic`. The broker only re-acquires bundle
 ownership when a lookup arrives.
 
-**Fix path.** In the tokio driver's `handle_pending_events`
-transient handlers (currently calling `retry_producer_open` /
-`retry_consumer_subscribe`), prepend a fresh `lookup_topic` for
-the affected handle's topic. After lookup completes, then call
-`retry_producer_open` / `retry_consumer_subscribe`. The topic
-name lives in `producer_create_requests` / `consumer_subscribe_requests`,
-so the driver can read it through the shared connection.
+**Done in `fix/retry-with-lookup`.** The tokio driver's
+transient-error handlers now run a `lookup_then(shared, topic)`
+helper before calling `retry_producer_open` /
+`retry_consumer_subscribe`. `lookup_then` issues a
+`CommandLookupTopic`, awaits the broker's
+`CommandLookupTopicResponse` via a `poll_fn` future bound to the
+existing `PendingOpKey::Request` slot, and only then signals the
+retry. Broker logs confirm the recovery — the topic is recreated,
+a fresh `CommandProducer` lands, broker emits "Created new
+producer", and the subscription is re-attached on the same
+connection.
 
-Alternative: make `rebuild_producers` / `rebuild_consumers` do
-the lookup themselves before re-emitting. Closer to Java's
-`ProducerImpl.connectionOpened` → `lookupRequest` flow.
+**Remaining (tracked as #73).** Even after the broker successfully
+re-attaches the producer + consumer, the user-side
+`producer.send().await` does not observe a `CommandSendReceipt`
+(broker logs show no inbound `CommandSend` after the re-attach).
+There's a subtle state-machine bug between the
+`ProducerOpenFailedTransient → retry_producer_open → CommandProducerSuccess`
+path and the user-facing `SendFut`: the future is parked but the
+re-attach doesn't kick the driver to flush a fresh CommandSend
+from the queued `OpSend`s. Needs investigation in the
+producer state machine — likely the producer's `Open` /
+`ReadyForSending` state never transitions back from the transient
+window.
 
 ### #67 — Fresh consumer_id refactor for post-seek resubscribe
 
