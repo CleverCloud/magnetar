@@ -26,6 +26,7 @@
 //!     uncompressed_size: 5,
 //!     num_messages: 1,
 //!     txn_id: None,
+//!     source_message_id: None,
 //! };
 //! msg.metadata.producer_name = "demo".to_owned();
 //! let _id = producer.send(msg).await?;

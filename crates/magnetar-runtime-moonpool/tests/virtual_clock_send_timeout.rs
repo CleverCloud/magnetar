@@ -104,6 +104,7 @@ fn send_timeout_fires_at_virtual_deadline() {
                 uncompressed_size: 13,
                 num_messages: 1,
                 txn_id: None,
+                source_message_id: None,
             },
             0,
             t0,

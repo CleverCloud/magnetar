@@ -712,9 +712,10 @@ known-missing feature.
   pending. See
   [`docs/parity-status.md`](docs/parity-status.md) and
   [`docs/follow-ups.md#per-surface-builder--impl-body-lifts`](docs/follow-ups.md#per-surface-builder--impl-body-lifts).
-- **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180
-  shadow topic** + **PIP-33 replicated subscriptions** are scoped for
-  v0.2.0.
+- **PIP-180 shadow topic** is in v0.2.0 ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md),
+  [`docs/shadow-topic.md`](docs/shadow-topic.md)).
+- **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-33
+  replicated subscriptions** are scoped for v0.2.0.
 - **SASL** ships `PLAIN` (RFC 4616) wired end-to-end; the
   Kerberos/GSSAPI mechanism is a stub that returns
   `AuthError::Unsupported`. Full GSSAPI binding (`libgssapi`) is
@@ -750,7 +751,7 @@ known-missing feature.
 | _local_ | Anti-thrash policy ([ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)) | ✅ (opt-in) | Per-handle ack-then-drop detector + connection-level cooldown. Mitigates broker-driven post-restart cascades (Pulsar PR #14467 / #13428 / #12846 — `ServerCnx#handleProducer` ↔ `AbstractTopic#addProducer` race). `SupervisorConfig::anti_thrash_threshold` default `None`. |
 | PIP-460 | Scalable topics | ❌ | Scoped for v0.2.0 (experimental) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim — magnetar ships its own idiomatic surface |
-| PIP-180 | Shadow topic | ❌ | v0.2.0 |
+| PIP-180 | Shadow topic | ✅ | v0.2.0 — admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
 | PIP-415 | `getMessageIdByIndex` | ✅ | `magnetar-admin::AdminClient::topic_get_message_id_by_index` — REST-only per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) (binary-protocol section intentionally empty; canonical implementation [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin / broker / CLI only) |
 | PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
 | PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime with `HealthProbe`). Active URL re-resolved on every supervised-reconnect attempt. |
@@ -808,9 +809,12 @@ v0.1.0 targets full Java client parity on the tokio engine
 moonpool engine reaches feature parity with tokio on a follow-up train.
 
 The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
-Deferred-scope items (PIP-460 scalable topics, PIP-466 V5 surface,
-PIP-180 shadow topic, PIP-33 replicated subscriptions, SASL Kerberos /
-GSSAPI, Athenz ZTS round-trip) ship in v0.2.0 per
+PIP-180 shadow topic landed in v0.2.0 (see
+[`docs/shadow-topic.md`](docs/shadow-topic.md) +
+[ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
+The remaining deferred-scope items (PIP-460 scalable topics, PIP-466 V5
+surface, PIP-33 replicated subscriptions, SASL Kerberos / GSSAPI, Athenz
+ZTS round-trip) ship in v0.2.0 per
 [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
 §D3.
 

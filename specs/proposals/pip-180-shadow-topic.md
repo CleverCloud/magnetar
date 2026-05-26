@@ -1,6 +1,6 @@
 # PIP-180 — Shadow topic (v0.2.0)
 
-- **Status**: Draft
+- **Status**: Implemented in v0.2.0 (see [docs/shadow-topic.md](../../docs/shadow-topic.md))
 - **ADR**: [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md)
 - **Target**: v0.2.0
 - **Date**: 2026-05-26

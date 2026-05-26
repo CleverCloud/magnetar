@@ -65,6 +65,15 @@ impl fmt::Display for SequenceId {
 ///
 /// Mirrors the Java `MessageId` interface. `partition` defaults to `-1` for non-partitioned
 /// topics; `batch_index` defaults to `-1` for non-batched messages.
+///
+/// # Structural equality (PIP-180)
+///
+/// Two `MessageId`s compare equal iff every structural field matches —
+/// `(ledger_id, entry_id, partition, batch_index, batch_size)`. On a shadow topic
+/// (PIP-180, ADR-0033) the broker presents messages with the **source** `MessageId`
+/// (same ledger/entry pointers as the original write), so a shadow-side reader
+/// observes ids that compare equal to the source-side reader's ids — "same
+/// message" is structurally evident and needs no out-of-band correlation key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId {
     /// Bookkeeper ledger id where the entry lives.
@@ -428,6 +437,48 @@ mod tests {
             MessageId::from_bytes(&earliest_bytes),
             Some(MessageId::EARLIEST)
         );
+    }
+
+    /// PIP-180 / ADR-0033: pins the documented structural-equality contract on
+    /// `MessageId`. The broker on a shadow topic presents messages with the **source**
+    /// `(ledger_id, entry_id, batch_index, partition)`; a structurally identical id
+    /// constructed on the source-side reader must compare `==` and hash to the same
+    /// bucket. Without this, callers cannot use `MessageId` as a deduplication key
+    /// across the source ⇄ shadow split.
+    #[test]
+    fn message_id_equality_shadow_vs_source() {
+        use std::collections::HashSet;
+        // Same physical entry observed on both sides — ledger/entry/partition/batch_index
+        // all match. PIP-180's "same message" contract.
+        let source_side = MessageId {
+            ledger_id: 42,
+            entry_id: 7,
+            partition: 0,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let shadow_side = MessageId {
+            ledger_id: 42,
+            entry_id: 7,
+            partition: 0,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        assert_eq!(source_side, shadow_side, "PIP-180 structural equality");
+        // Hash consistency — must collide so callers can use the id as a HashSet/HashMap key
+        // across the source ⇄ shadow boundary.
+        let mut set = HashSet::new();
+        set.insert(source_side);
+        assert!(set.contains(&shadow_side));
+        // A different ledger or entry breaks equality (sanity).
+        let other = MessageId {
+            ledger_id: 42,
+            entry_id: 8,
+            partition: 0,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        assert_ne!(source_side, other);
     }
 
     /// `CompressionKind::from_pb_i32` accepts unknown protobuf integers by falling through to

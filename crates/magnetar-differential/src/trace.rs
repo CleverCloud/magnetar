@@ -96,6 +96,18 @@ pub enum Op {
         /// Target message id (cursor reset point).
         message_id: MessageId,
     },
+    /// PIP-180 / ADR-0033: replicator-style send that propagates a
+    /// source-topic `MessageId` on the wire (`CommandSend.message_id`).
+    /// The scripted broker echoes the asserted id back on
+    /// `CommandSendReceipt` (round-trip preservation), so the resulting
+    /// [`Event::Sent`]'s `message_id` MUST equal `source_msg_id` on
+    /// both engines — that's the differential equivalence claim.
+    SendWithSourceId {
+        /// Source-topic `MessageId` to assert on the send.
+        source_msg_id: MessageId,
+        /// Raw payload bytes (uncompressed, unencrypted).
+        payload: Vec<u8>,
+    },
 }
 
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`

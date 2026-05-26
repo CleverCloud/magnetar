@@ -349,7 +349,17 @@ fn handle_frame(
                     .get(&s.producer_id)
                     .map(|(t, _)| t.clone());
                 if let Some(topic) = topic {
-                    let (ledger_id, entry_id) = {
+                    // PIP-180 / ADR-0033: if the client asserted a source-topic
+                    // `MessageId` via `CommandSend.message_id`, echo it back on
+                    // the receipt verbatim (mirrors the upstream broker's
+                    // shadow-topic replicator handling — the broker preserves
+                    // the source id chain). Without this round-trip, the
+                    // engine's `SendFut` would resolve to the broker-allocated
+                    // `(1, next_entry_id)` and shadow-side dedup would break.
+                    let (ledger_id, entry_id) = if let Some(asserted) = &s.message_id {
+                        // Round-trip preservation — use the client's id.
+                        (asserted.ledger_id, asserted.entry_id)
+                    } else {
                         let mut g = state.lock();
                         let prod = g
                             .producers

@@ -116,7 +116,7 @@ Everything else with a `🟡` or `❌` in the README parity matrix is one of:
 | **Athenz (ZTS round-trip)** | 🟡 deferred to v0.2.0 | `AthenzProvider::new(...).initial` returns `AuthError::Unsupported`; the ZTS/ZMS client is deferred per [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
 | **PIP-460** — Scalable topics | ❌ | Experimental in Apache Pulsar; surface still iterating upstream. v0.2.0. |
 | **PIP-466** — V5 client surface | ❌ | Inspired by, not adopted verbatim; magnetar already follows the spirit. v0.2.0 if verbatim adoption is desired. |
-| **PIP-180** — Shadow topic | ❌ | Low-priority cross-region read fan-out; v0.2.0. |
+| **PIP-180** — Shadow topic | ✅ landed | v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md), [`docs/shadow-topic.md`](shadow-topic.md)). Three admin REST methods (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` + `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. No proto bump. Caveat: source `MessageId` is client-asserted (broker validates write auth but does not prove the id is from a real source entry — upstream behaviour). |
 | **PIP-33** — Replicated subscriptions | ❌ | Covered at the cluster level today via `ServiceUrlProvider` + `AutoClusterFailover`; v0.2.0 for subscription-state replication. |
 
 These are not required for v0.1.0 under

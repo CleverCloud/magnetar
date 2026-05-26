@@ -127,6 +127,45 @@ impl<P: Providers> Consumer<P> {
         self.shared.inner.lock().consumer_is_closed(self.handle)
     }
 
+    /// PIP-180 / ADR-0033: pre-populate shadow-topic metadata on this
+    /// consumer. 1:1 mirror of
+    /// `magnetar_runtime_tokio::Consumer::set_shadow_source`. Once set,
+    /// the connection's receive dispatch emits
+    /// [`magnetar_proto::ConnectionEvent::MessageReceivedFromShadow`]
+    /// instead of the regular
+    /// [`magnetar_proto::ConnectionEvent::Message`] when the inbound entry
+    /// carries [`magnetar_proto::pb::MessageMetadata::replicated_from`].
+    pub fn set_shadow_source(&self, source_topic: impl Into<String>) {
+        let source = source_topic.into();
+        let mut conn = self.shared.inner.lock();
+        if let Some(c) = conn.consumer_mut(self.handle) {
+            c.set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
+                source_topic: source,
+            });
+        }
+    }
+
+    /// PIP-180 / ADR-0033: returns the cached source-topic name if this
+    /// consumer is shadow-attached, or `None` for a regular consumer.
+    /// 1:1 mirror of
+    /// `magnetar_runtime_tokio::Consumer::shadow_source_topic`.
+    #[must_use]
+    pub fn shadow_source_topic(&self) -> Option<String> {
+        self.shared
+            .inner
+            .lock()
+            .consumer(self.handle)
+            .and_then(|c| c.shadow_metadata.as_ref().map(|m| m.source_topic.clone()))
+    }
+
+    /// PIP-180 / ADR-0033: convenience predicate equivalent to
+    /// `shadow_source_topic().is_some()`. 1:1 mirror of
+    /// `magnetar_runtime_tokio::Consumer::is_shadow`.
+    #[must_use]
+    pub fn is_shadow(&self) -> bool {
+        self.shadow_source_topic().is_some()
+    }
+
     /// Broker-assigned consumer name. Empty string if the consumer is no
     /// longer registered. Mirrors Java `Consumer#getConsumerName`.
     #[must_use]
@@ -286,6 +325,7 @@ impl<P: Providers> Consumer<P> {
                 uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
                 num_messages: 1,
                 txn_id: None,
+                source_message_id: None,
             };
             dlq_producer.send(outgoing).await?;
             self.ack(msg.message_id).await?;
@@ -398,6 +438,7 @@ impl<P: Providers> Consumer<P> {
             uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         };
         retry_producer.send(outgoing).await?;
         self.ack(msg.message_id).await?;

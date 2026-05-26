@@ -1,6 +1,6 @@
 # ADR-0033 — PIP-180 shadow topic scope for v0.2.0
 
-- **Status**: Proposed
+- **Status**: Accepted (2026-05-26)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: pip-180, shadow-topic, admin, v0.2.0, scope
@@ -154,7 +154,18 @@ parity-matrix amendment lifting PIP-180 out of v0.1.0 scope.
 
 ## Status
 
-Proposed (awaiting Florentin sign-off, 2026-05-26)
+Accepted (2026-05-26). Implemented in `feat/pip-180-shadow-topic` —
+producer-side `send_with_source_message_id` propagating
+`CommandSend.message_id`, consumer-side
+`ConnectionEvent::MessageReceivedFromShadow` classification driven by a
+sans-io `ShadowTopicMetadata` cache, three admin REST methods
+(`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics`,
+plus the inverse `get_shadow_source`), `magnetar shadow {create,delete,
+list,source}` CLI subcommands, four-layer test set (proto unit, tokio
+integration, moonpool 1:1 mirror, differential equivalence) + e2e
+against `apachepulsar/pulsar:4.0.4`. No proto bump, no feature flag —
+regular sends remain byte-identical to v0.1.0. User-facing docs at
+[`docs/shadow-topic.md`](../../docs/shadow-topic.md).
 
 ## References
 

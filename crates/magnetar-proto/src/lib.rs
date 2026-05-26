@@ -119,7 +119,7 @@ pub use crate::conn::{
     HandshakeState, KeySharedConfig, MemoryLimitPolicy, OpOutcome, PendingOpKey, SeekTarget,
     SubscribeRequest,
 };
-pub use crate::consumer::ConsumerStats;
+pub use crate::consumer::{ConsumerStats, ShadowTopicMetadata};
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
 pub use crate::event::{ConnectionEvent, GetSchemaResult, IncomingMessage, LookupOutcome};
 pub use crate::frame::{

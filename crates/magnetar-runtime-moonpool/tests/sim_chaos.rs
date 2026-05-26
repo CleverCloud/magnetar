@@ -1062,6 +1062,7 @@ impl Workload for ProducerConsumerWorkload {
                 uncompressed_size: 4,
                 num_messages: 1,
                 txn_id: None,
+                source_message_id: None,
             };
             let _ = tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
             self.sent.borrow_mut().push(i);

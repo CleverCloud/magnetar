@@ -1451,19 +1451,41 @@ impl Connection {
                         now,
                     );
                     if let Ok(crate::consumer::DeliverOutcome::Delivered { count }) = outcome {
-                        // Emit one observational `Message` event per newly delivered payload
-                        // by *cloning* the tail of the queue — the runtime drains the actual
+                        // Emit one observational event per newly delivered payload by
+                        // *cloning* the tail of the queue — the runtime drains the actual
                         // payloads via `Connection::pop_message`, so the queue must remain
                         // intact for `ReceiveFut::poll`. The newly delivered messages are the
                         // last `count` entries (`deliver` appends in order).
+                        //
+                        // PIP-180 / ADR-0033: when the consumer is shadow-attached AND the
+                        // inbound entry carries `MessageMetadata.replicated_from`, the
+                        // classifier emits `MessageReceivedFromShadow` so callers see the
+                        // source-topic context without an out-of-band lookup. Regular
+                        // (non-shadow) topics keep emitting `Message` — receive-path
+                        // byte-identical to v0.1.0.
                         let queue_len = consumer.queue.len();
                         let start = queue_len.saturating_sub(count);
                         for idx in start..queue_len {
                             if let Some(im) = consumer.queue.get(idx) {
-                                self.events.push_back(ConnectionEvent::Message {
-                                    handle,
-                                    message: im.clone(),
-                                });
+                                if let Some((source_topic, source_message_id)) =
+                                    consumer.classify_for_shadow(im)
+                                {
+                                    let shadow_message_id = im.message_id;
+                                    self.events.push_back(
+                                        ConnectionEvent::MessageReceivedFromShadow {
+                                            handle,
+                                            source_topic,
+                                            source_message_id,
+                                            shadow_message_id,
+                                            message: im.clone(),
+                                        },
+                                    );
+                                } else {
+                                    self.events.push_back(ConnectionEvent::Message {
+                                        handle,
+                                        message: im.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -3900,6 +3922,7 @@ mod conn_state_tests {
                     uncompressed_size: 2,
                     num_messages: 1,
                     txn_id: None,
+                    source_message_id: None,
                 },
                 0,
                 Instant::now(),
@@ -4677,6 +4700,7 @@ mod conn_state_tests {
                         uncompressed_size: payload.len() as u32,
                         num_messages: 1,
                         txn_id: None,
+                        source_message_id: None,
                     },
                     0,
                     Instant::now(),
@@ -4693,6 +4717,7 @@ mod conn_state_tests {
                     uncompressed_size: 2,
                     num_messages: 1,
                     txn_id: None,
+                    source_message_id: None,
                 },
                 0,
                 Instant::now(),
@@ -4766,6 +4791,7 @@ mod conn_state_tests {
                     uncompressed_size: 1,
                     num_messages: 1,
                     txn_id: None,
+                    source_message_id: None,
                 },
                 0,
                 Instant::now(),
@@ -4844,6 +4870,7 @@ mod conn_state_tests {
                         uncompressed_size: 2,
                         num_messages: 1,
                         txn_id: None,
+                        source_message_id: None,
                     },
                     0,
                     Instant::now(),
@@ -4910,6 +4937,7 @@ mod conn_state_tests {
                     uncompressed_size: 2,
                     num_messages: 1,
                     txn_id: None,
+                    source_message_id: None,
                 },
                 0,
                 Instant::now(),
@@ -4985,6 +5013,7 @@ mod conn_state_tests {
                         uncompressed_size: payload.len() as u32,
                         num_messages: 1,
                         txn_id: None,
+                        source_message_id: None,
                     },
                     0,
                     Instant::now(),
@@ -5063,6 +5092,7 @@ mod conn_state_tests {
                         uncompressed_size: 1,
                         num_messages: 1,
                         txn_id: None,
+                        source_message_id: None,
                     },
                     0,
                     Instant::now(),

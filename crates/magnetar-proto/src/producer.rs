@@ -55,6 +55,18 @@ pub struct OutgoingMessage {
     /// transactional publish semantics (PIP-31). Mirrors Java
     /// `Producer#newMessage(Transaction).send()`.
     pub txn_id: Option<crate::txn::TxnId>,
+    /// Optional source-topic `MessageId` to propagate on `CommandSend.message_id`
+    /// (PIP-180 / ADR-0033). `None` for a regular publish — the encoder leaves the
+    /// optional field absent, byte-identical to v0.1.0. `Some(id)` is the
+    /// replicator-style write used by shadow-topic producers to preserve the
+    /// source-topic id chain.
+    ///
+    /// Mirrors Java `org.apache.pulsar.broker.service.persistent.Replicator`
+    /// (the broker-internal replicator stamps the original entry's `MessageIdData`
+    /// onto the outbound `CommandSend` when fanning out to a shadow). Replicator-
+    /// style sends are non-batched and chunking applies the same id to every
+    /// chunk (one logical message, multiple frames).
+    pub source_message_id: Option<MessageId>,
 }
 
 /// Result of [`ProducerState::queue_send`] — one or more frames the connection should emit.
@@ -585,7 +597,17 @@ impl ProducerState {
         if self.batching_enabled && !self.batch.is_empty() && !self.batch.matches_txn(msg.txn_id) {
             let _ = self.flush_batch(publish_time_ms, now);
         }
-        let can_batch = self.can_add_to_batch(payload_size, msg.num_messages);
+        // PIP-180 / ADR-0033: replicator-style sends propagate the source-topic
+        // `MessageId` on `CommandSend.message_id`. They are written one entry at a
+        // time (mirrors Java `org.apache.pulsar.broker.service.persistent.Replicator`,
+        // which has batching disabled), so route any send carrying
+        // `source_message_id` directly to the single / chunked path and force a
+        // flush of any in-flight batch first so wire order is preserved.
+        let has_source_id = msg.source_message_id.is_some();
+        if has_source_id && self.batching_enabled && !self.batch.is_empty() {
+            let _ = self.flush_batch(publish_time_ms, now);
+        }
+        let can_batch = !has_source_id && self.can_add_to_batch(payload_size, msg.num_messages);
 
         // Chunking path: too big AND we cannot batch it.
         if payload_size > self.max_message_size {
@@ -680,7 +702,10 @@ impl ProducerState {
             highest_sequence_id: None,
             is_chunk: None,
             marker: None,
-            message_id: None,
+            // PIP-180 / ADR-0033: shadow-topic replicator-style sends carry the
+            // source-topic `MessageId` on the optional `message_id` field. `None`
+            // for a regular publish — byte-identical to v0.1.0 on the wire.
+            message_id: msg.source_message_id.map(MessageId::to_pb),
         };
         let cmd = pb::BaseCommand {
             r#type: pb::base_command::Type::Send as i32,
@@ -902,6 +927,11 @@ impl ProducerState {
             highest_sequence_id: metadata.highest_sequence_id,
             is_chunk: None,
             marker: None,
+            // PIP-180 / ADR-0033: replicator-style sends bypass batching in
+            // `queue_send` (see `has_source_id` branch), so a batched
+            // `CommandSend` never carries a source `message_id` by
+            // construction. Left as `None` here to keep the wire bytes
+            // byte-identical to v0.1.0 on the batched path.
             message_id: None,
         };
         let cmd = pb::BaseCommand {
@@ -933,6 +963,10 @@ impl ProducerState {
         now: std::time::Instant,
     ) -> Result<SendDecision, ProducerError> {
         let txn_id = msg.txn_id;
+        // PIP-180 / ADR-0033: every chunk frame of a replicator-style chunked publish
+        // carries the same source-topic `MessageId` (one logical message, multiple
+        // frames). Captured before `msg` is consumed below.
+        let source_message_id = msg.source_message_id;
         let payload = msg.payload;
         let uuid = uuid::Uuid::new_v4().to_string();
         // Per-chunk PAYLOAD must leave room for the wire-frame overhead
@@ -1016,7 +1050,10 @@ impl ProducerState {
                 highest_sequence_id: None,
                 is_chunk: Some(true),
                 marker: None,
-                message_id: None,
+                // PIP-180 / ADR-0033: stamp the source-topic `MessageId` on every
+                // chunk of a replicator-style chunked publish. `None` for a regular
+                // (non-replicator) chunked send — byte-identical to v0.1.0.
+                message_id: source_message_id.map(MessageId::to_pb),
             };
             let cmd = pb::BaseCommand {
                 r#type: pb::base_command::Type::Send as i32,
@@ -1267,6 +1304,7 @@ mod tests {
             uncompressed_size: payload.len() as u32,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         }
     }
 
@@ -1798,6 +1836,7 @@ mod tests {
             },
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         }
     }
 
@@ -2081,5 +2120,118 @@ mod tests {
             p.batch.is_empty(),
             "the batch container is dropped on snapshot"
         );
+    }
+
+    // ---------- PIP-180 / ADR-0033: shadow-topic producer-side tests ----------
+
+    /// PIP-180: a replicator-style send populates `CommandSend.message_id` with
+    /// the caller-supplied source-topic `MessageId`, and the field round-trips
+    /// through prost encode/decode unchanged.
+    #[test]
+    fn command_send_with_message_id_roundtrip() {
+        use prost::Message as _;
+        let mut p = ProducerState::new(
+            ProducerHandle(7),
+            "shadow-t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let source_id = MessageId {
+            ledger_id: 99,
+            entry_id: 42,
+            partition: 1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let mut msg = small_message(b"replicated payload");
+        msg.source_message_id = Some(source_id);
+        let decision = p.queue_send(msg, 100, std::time::Instant::now()).unwrap();
+        assert!(matches!(decision, SendDecision::Emit { count: 1 }));
+        let frame = p.next_outbound_frame().expect("frame");
+        let send = frame.command.send.as_ref().expect("CommandSend");
+        let pb_mid = send.message_id.as_ref().expect("message_id stamped");
+        // The wire field matches the source id, byte-for-byte through prost.
+        let encoded = pb_mid.encode_to_vec();
+        let decoded = pb::MessageIdData::decode(&encoded[..]).unwrap();
+        assert_eq!(MessageId::from_pb(&decoded), source_id);
+    }
+
+    /// PIP-180 backward-compat guard: a regular send (without `source_message_id`)
+    /// produces a `CommandSend` whose encoded bytes are byte-identical to the
+    /// v0.1.0 baseline — `message_id` MUST be absent from the wire, not present
+    /// as a default-zeroed `MessageIdData`. This is the "no proto bump" promise.
+    #[test]
+    fn command_send_without_message_id_byte_identical_to_v01() {
+        use prost::Message as _;
+        let mut p = ProducerState::new(
+            ProducerHandle(7),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let decision = p
+            .queue_send(small_message(b"regular"), 100, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(decision, SendDecision::Emit { count: 1 }));
+        let frame = p.next_outbound_frame().expect("frame");
+        let send = frame.command.send.as_ref().expect("CommandSend");
+        assert!(
+            send.message_id.is_none(),
+            "regular send must leave CommandSend.message_id absent"
+        );
+        // Compare against an explicit v0.1.0-shape CommandSend (every PIP-180-added
+        // optional unset). Encoded bytes must match.
+        let v01 = pb::CommandSend {
+            producer_id: send.producer_id,
+            sequence_id: send.sequence_id,
+            num_messages: send.num_messages,
+            txnid_least_bits: send.txnid_least_bits,
+            txnid_most_bits: send.txnid_most_bits,
+            highest_sequence_id: send.highest_sequence_id,
+            is_chunk: send.is_chunk,
+            marker: send.marker,
+            message_id: None,
+        };
+        assert_eq!(send.encode_to_vec(), v01.encode_to_vec());
+    }
+
+    /// PIP-180: a `CommandSendReceipt` carrying a source-side `message_id`
+    /// decodes through `apply_receipt` and surfaces the broker-assigned id
+    /// verbatim. Pins the shadow-side "receipt round-trip" — the broker
+    /// echoes the producer-asserted id, so the runtime's `SendFut` resolves
+    /// to that id (not a synthesised one).
+    #[test]
+    fn command_send_receipt_with_message_id_roundtrip() {
+        let mut p = ProducerState::new(
+            ProducerHandle(7),
+            "shadow-t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let source_id = MessageId {
+            ledger_id: 12345,
+            entry_id: 678,
+            partition: 0,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let mut msg = small_message(b"x");
+        msg.source_message_id = Some(source_id);
+        let _ = p.queue_send(msg, 100, std::time::Instant::now()).unwrap();
+        let frame = p.next_outbound_frame().expect("frame");
+        let seq = frame.sequence_id;
+        // Broker replies with a CommandSendReceipt whose message_id == the
+        // client-asserted source id (round-trip preservation under
+        // `BrokerWorkload::ShadowTopic` in moonpool sim, and the real broker
+        // under PIP-180 §3 — see crates/magnetar/tests/e2e_shadow_topic.rs).
+        let receipt = pb::CommandSendReceipt {
+            producer_id: 7,
+            sequence_id: seq.0,
+            message_id: Some(source_id.to_pb()),
+            highest_sequence_id: None,
+        };
+        let outcome = p.apply_receipt(&receipt).expect("receipt resolves OpSend");
+        assert_eq!(outcome.0, seq);
+        assert_eq!(outcome.1, source_id);
     }
 }

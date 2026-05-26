@@ -55,6 +55,7 @@ async fn tokio_client_handshakes() {
             uncompressed_size: 5,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         }),
     )
     .await

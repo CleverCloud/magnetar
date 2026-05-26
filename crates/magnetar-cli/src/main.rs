@@ -24,7 +24,9 @@ use magnetar::proto::TokenAuth;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{OutgoingMessage, PulsarClient};
-use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
+use magnetar_admin::{
+    AdminClient, AdminClientBuilder, AdminError, ShadowTopicProperties, TenantInfo,
+};
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
 #[derive(Debug, Parser)]
@@ -109,6 +111,53 @@ pub(crate) enum Cmd {
     Admin {
         #[command(subcommand)]
         sub: AdminCmd,
+    },
+    /// Shadow-topic commands (PIP-180 / ADR-0033).
+    ///
+    /// Create, delete, or list shadow topics on the broker. A shadow topic
+    /// shares its ledger storage with a source topic and exposes a
+    /// read-only view of every entry to consumers — a lightweight fan-out
+    /// alternative to geo-replication. See `docs/shadow-topic.md`.
+    Shadow {
+        #[command(subcommand)]
+        sub: ShadowCmd,
+    },
+}
+
+/// `shadow` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ShadowCmd {
+    /// Create a shadow topic on top of a source topic.
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics`.
+    Create {
+        /// Source topic (`[persistent://]tenant/namespace/topic`).
+        source: String,
+        /// Shadow topic (`persistent://tenant/namespace/topic`).
+        shadow: String,
+        /// Optional shadow-topic property in `key=value` form. Repeatable.
+        #[arg(long = "property", value_parser = parse_property)]
+        properties: Vec<(String, String)>,
+    },
+    /// Delete a shadow topic.
+    /// `DELETE /admin/v2/persistent/{tenant}/{namespace}/{shadow}`.
+    Delete {
+        /// Shadow topic (`[persistent://]tenant/namespace/topic`).
+        shadow: String,
+        /// Force-delete (kicks off connected subscribers).
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the shadow topics created on a source topic.
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics`.
+    List {
+        /// Source topic (`[persistent://]tenant/namespace/topic`).
+        source: String,
+    },
+    /// Resolve the source topic of a shadow topic.
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{shadow}/shadowSource`.
+    Source {
+        /// Shadow topic (`[persistent://]tenant/namespace/topic`).
+        shadow: String,
     },
 }
 
@@ -260,6 +309,41 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Admin { sub } => {
             run_admin(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
         }
+        Cmd::Shadow { sub } => {
+            run_shadow(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
+        }
+    }
+}
+
+/// PIP-180 / ADR-0033: dispatch shadow-topic subcommands over the admin
+/// REST client. Wraps `magnetar_admin::AdminClient::{create,delete,
+/// get_shadow_topics, get_shadow_source}`.
+async fn run_shadow(
+    admin_url: &str,
+    token: Option<String>,
+    timeout_secs: u64,
+    cmd: ShadowCmd,
+) -> Result<(), CliError> {
+    let admin = build_admin(admin_url, token, timeout_secs)?;
+    match cmd {
+        ShadowCmd::Create {
+            source,
+            shadow,
+            properties,
+        } => {
+            let mut props = ShadowTopicProperties::default();
+            for (k, v) in properties {
+                props.properties.insert(k, v);
+            }
+            admin.create_shadow_topic(&source, &shadow, props).await?;
+            Ok(())
+        }
+        ShadowCmd::Delete { shadow, force } => {
+            admin.delete_shadow_topic(&shadow, force).await?;
+            Ok(())
+        }
+        ShadowCmd::List { source } => print_json(&admin.get_shadow_topics(&source).await?),
+        ShadowCmd::Source { shadow } => print_json(&admin.get_shadow_source(&shadow).await?),
     }
 }
 

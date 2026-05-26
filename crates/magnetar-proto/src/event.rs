@@ -151,6 +151,43 @@ pub enum ConnectionEvent {
         message: IncomingMessage,
     },
 
+    /// PIP-180 / ADR-0033: an incoming message was delivered by the broker on a
+    /// shadow topic, originating from a source topic. Emitted in place of
+    /// [`Self::Message`] when the consumer was subscribed to a shadow topic
+    /// (resolved at subscribe time via the admin REST `getShadowTopics(source)`
+    /// hint, see [`crate::consumer::ConsumerState::set_shadow_metadata`]) AND
+    /// the inbound entry's [`pb::MessageMetadata::replicated_from`] is set.
+    ///
+    /// `source_message_id` and `message.message_id` compare equal under the
+    /// PIP-180 structural-equality contract documented on
+    /// [`crate::types::MessageId`] — the broker presents shadow-side entries
+    /// with the source-topic `(ledger_id, entry_id, batch_index, partition)`,
+    /// so cross-side deduplication needs no out-of-band correlation key.
+    ///
+    /// Callers that don't care about the shadow context can collapse this
+    /// variant onto [`Self::Message`] by inspecting `message`. The variant
+    /// is non-breaking by convention (`ConnectionEvent` is treated as
+    /// `#[non_exhaustive]` per ADR-0033's "new sum-variant is additive" risk
+    /// note).
+    MessageReceivedFromShadow {
+        /// The consumer that received it.
+        handle: ConsumerHandle,
+        /// Source-topic name (resolved via admin REST `getShadowTopics(source)`
+        /// at subscribe time, cached on
+        /// [`crate::consumer::ConsumerState::shadow_metadata`]).
+        source_topic: String,
+        /// Source-topic `MessageId`. Equal to `message.message_id` under
+        /// [`crate::types::MessageId`]'s structural-equality contract.
+        source_message_id: MessageId,
+        /// Shadow-side `MessageId` — same fields as `source_message_id`, but
+        /// surfaced separately so callers don't have to derive it from
+        /// `message`.
+        shadow_message_id: MessageId,
+        /// The decoded message — same payload + metadata the consumer would
+        /// have surfaced via [`Self::Message`] on a non-shadow topic.
+        message: IncomingMessage,
+    },
+
     /// A `CommandSendReceipt` correlated with one of our pending publishes.
     SendReceipt {
         /// The producer that owns the publish.

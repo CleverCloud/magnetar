@@ -114,6 +114,46 @@ impl Producer {
             uncompressed_size,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
+        })
+    }
+
+    /// PIP-180 / ADR-0033: replicator-style send that propagates a source-topic
+    /// `MessageId` on the wire (`CommandSend.message_id`). Used by producers
+    /// writing to a shadow topic to preserve the source-topic id chain.
+    ///
+    /// The broker echoes the asserted source id back on the resulting
+    /// `CommandSendReceipt` (PIP-180 §"Wire protocol"), so the returned
+    /// [`SendFut`] resolves to a [`MessageId`] structurally equal to
+    /// `source_msg_id`.
+    ///
+    /// Bypasses batching by design — mirrors Java
+    /// `org.apache.pulsar.broker.service.persistent.Replicator` which writes
+    /// each replicated entry as an individual `CommandSend`. Chunking still
+    /// applies for payloads larger than `max_message_size`; in that case the
+    /// same `source_msg_id` is stamped on every chunk (one logical message,
+    /// multiple frames).
+    ///
+    /// Caveat: the source id is **client-asserted** — the broker validates
+    /// write authorisation on the shadow topic but does not cryptographically
+    /// prove the source-message-id matches a real source entry (upstream
+    /// PIP-180 behaviour, mirrored verbatim — see
+    /// [`docs/shadow-topic.md`](../../docs/shadow-topic.md)).
+    pub fn send_with_source_message_id(
+        &self,
+        source_msg_id: MessageId,
+        payload: impl Into<bytes::Bytes>,
+        metadata: pb::MessageMetadata,
+    ) -> SendFut {
+        let payload = payload.into();
+        let uncompressed_size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        self.send(OutgoingMessage {
+            payload,
+            metadata,
+            uncompressed_size,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: Some(source_msg_id),
         })
     }
 
@@ -703,6 +743,7 @@ mod tests {
                     uncompressed_size: 1,
                     num_messages: 1,
                     txn_id: None,
+                    source_message_id: None,
                 },
                 1_700_000_000_000,
                 std::time::Instant::now(),
@@ -1050,6 +1091,7 @@ mod tests {
             uncompressed_size: 4,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         assert_eq!(
             shared
@@ -1105,6 +1147,7 @@ mod tests {
             uncompressed_size: 3,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);
@@ -1184,6 +1227,7 @@ mod tests {
             uncompressed_size: 2,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);

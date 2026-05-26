@@ -305,6 +305,36 @@ impl<P: Providers> Producer<P> {
         }
     }
 
+    /// PIP-180 / ADR-0033: replicator-style send that propagates a
+    /// source-topic `MessageId` on the wire (`CommandSend.message_id`).
+    /// 1:1 mirror of `magnetar_runtime_tokio::Producer::send_with_source_message_id`.
+    /// Used by producers writing to a shadow topic to preserve the
+    /// source-topic id chain.
+    ///
+    /// Bypasses batching by design — mirrors Java
+    /// `org.apache.pulsar.broker.service.persistent.Replicator`. The broker
+    /// echoes the asserted source id back on the resulting
+    /// `CommandSendReceipt`, so the returned [`SendFut`] resolves to a
+    /// [`MessageId`](magnetar_proto::MessageId) structurally equal to
+    /// `source_msg_id`.
+    pub fn send_with_source_message_id(
+        &self,
+        source_msg_id: magnetar_proto::MessageId,
+        payload: impl Into<bytes::Bytes>,
+        metadata: magnetar_proto::pb::MessageMetadata,
+    ) -> SendFut {
+        let payload = payload.into();
+        let uncompressed_size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        self.send(OutgoingMessage {
+            payload,
+            metadata,
+            uncompressed_size,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: Some(source_msg_id),
+        })
+    }
+
     /// Hand the (compressed/encrypted) message to the sans-io state
     /// machine. Assumes the `reserved_bytes` reservation has already been
     /// taken; releases it on synchronous failure so the budget reflects
@@ -895,6 +925,7 @@ mod tests {
             uncompressed_size: 5,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         assert!(
             producer.pending_count() >= 1,
@@ -930,6 +961,7 @@ mod tests {
                 uncompressed_size: 5,
                 num_messages: 1,
                 txn_id: None,
+                source_message_id: None,
             })
             .await;
         let err = res.expect_err("expected error for unwired compression");
@@ -1050,6 +1082,7 @@ mod tests {
             uncompressed_size: 6,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         assert_eq!(
             shared
@@ -1105,6 +1138,7 @@ mod tests {
                 uncompressed_size: 15,
                 num_messages: 1,
                 txn_id: None,
+                source_message_id: None,
             })
             .await;
         assert!(matches!(
@@ -1228,6 +1262,7 @@ mod tests {
             uncompressed_size: 8,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         // Poll once: the future must register on the waker slab and
         // return `Poll::Pending`.
@@ -1298,6 +1333,7 @@ mod tests {
             uncompressed_size: 2,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);
@@ -1361,6 +1397,7 @@ mod tests {
             uncompressed_size: 2,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);
@@ -1433,6 +1470,7 @@ mod tests {
             uncompressed_size: 4,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         assert_eq!(
             shared
@@ -1492,6 +1530,7 @@ mod tests {
             uncompressed_size: 3,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);
@@ -1567,6 +1606,7 @@ mod tests {
             uncompressed_size: 2,
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         });
         let waker = futures_task_waker();
         let mut cx = Context::from_waker(&waker);

@@ -115,6 +115,14 @@ async fn run_inner(host_port: &str, trace: &Trace) -> Result<EventStream, Client
                 let event = run_send(&producer, bytes).await;
                 stream.push(event);
             }
+            Op::SendWithSourceId {
+                source_msg_id,
+                payload,
+            } => {
+                let bytes = Bytes::from(payload.clone());
+                let event = run_send_with_source_id(&producer, *source_msg_id, bytes).await;
+                stream.push(event);
+            }
             Op::Recv { timeout } => {
                 match ensure_consumer(&client, &mut consumer, &trace.topic, &trace.subscription)
                     .await
@@ -308,6 +316,7 @@ async fn run_send_partition(
         uncompressed_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
         num_messages: 1,
         txn_id: None,
+        source_message_id: None,
     };
     match producer.send(msg).await {
         Ok(message_id) => Event::SentPartition {
@@ -383,8 +392,28 @@ async fn run_send(producer: &Producer<TokioProviders>, payload: Bytes) -> Event 
         uncompressed_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
         num_messages: 1,
         txn_id: None,
+        source_message_id: None,
     };
     match producer.send(msg).await {
+        Ok(message_id) => Event::Sent { message_id },
+        Err(e) => Event::SendError { kind: classify(&e) },
+    }
+}
+
+/// PIP-180 / ADR-0033: replicator-style send. The scripted broker echoes
+/// the source id back on `CommandSendReceipt` so the resulting
+/// `Event::Sent` carries `message_id == source_msg_id`.
+async fn run_send_with_source_id(
+    producer: &Producer<TokioProviders>,
+    source_msg_id: MessageId,
+    payload: Bytes,
+) -> Event {
+    let fut = producer.send_with_source_message_id(
+        source_msg_id,
+        payload,
+        magnetar_proto::pb::MessageMetadata::default(),
+    );
+    match fut.await {
         Ok(message_id) => Event::Sent { message_id },
         Err(e) => Event::SendError { kind: classify(&e) },
     }

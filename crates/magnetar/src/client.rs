@@ -202,6 +202,7 @@ impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
             uncompressed_size,
             num_messages: 1,
             txn_id: msg.txn_id,
+            source_message_id: None,
         }
     }
 }

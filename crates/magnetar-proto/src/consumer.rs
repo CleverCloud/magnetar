@@ -34,6 +34,27 @@ use crate::pb;
 use crate::trackers::{NegativeAcksTracker, UnackedMessageTracker};
 use crate::types::{ConsumerHandle, MessageId, RequestId};
 
+/// PIP-180 / ADR-0033 shadow-topic metadata cached on a [`ConsumerState`].
+///
+/// Populated at subscribe time by the runtime engine via
+/// [`ConsumerState::set_shadow_metadata`]. Once set, the connection's
+/// receive path classifies every incoming message: if
+/// [`pb::MessageMetadata::replicated_from`] is also set, the message is a
+/// shadow-presented copy of an entry from `source_topic` and the connection
+/// emits [`crate::event::ConnectionEvent::MessageReceivedFromShadow`]
+/// instead of [`crate::event::ConnectionEvent::Message`].
+///
+/// `magnetar-proto` does no admin REST itself — the metadata arrives via
+/// the sans-io setter described above (per ADR-0004's zero-I/O constraint).
+#[derive(Debug, Clone)]
+pub struct ShadowTopicMetadata {
+    /// Fully-qualified source topic name (e.g. `persistent://public/default/orders`).
+    /// The broker presents shadow-side messages with the source-topic ledger/entry
+    /// pointers; this string lets the runtime surface the original topic to the
+    /// user without re-resolving it from each message.
+    pub source_topic: String,
+}
+
 /// Per-consumer state.
 #[derive(Debug)]
 pub struct ConsumerState {
@@ -157,6 +178,17 @@ pub struct ConsumerState {
     /// Most recent rolling-window rate: bytes-per-second delivered. Mirrors Java
     /// `ConsumerStats#getRateBytesReceived`.
     pub current_bytes_per_sec: f64,
+    /// PIP-180 / ADR-0033 shadow-topic metadata. `None` for a regular consumer
+    /// (the default — byte-identical receive path to v0.1.0). `Some(meta)` is
+    /// injected by the runtime engine at subscribe time when the admin REST
+    /// `getShadowTopics(source)` lookup resolves the consumer's topic as a
+    /// shadow of another. The connection's receive dispatch (see
+    /// [`crate::Connection::poll_event`]) reads this and emits the
+    /// [`crate::event::ConnectionEvent::MessageReceivedFromShadow`] variant
+    /// instead of the regular [`crate::event::ConnectionEvent::Message`]
+    /// when the inbound entry's [`pb::MessageMetadata::replicated_from`] is
+    /// also populated.
+    pub shadow_metadata: Option<ShadowTopicMetadata>,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -321,7 +353,45 @@ impl ConsumerState {
             last_rate_snapshot: None,
             current_msgs_per_sec: 0.0,
             current_bytes_per_sec: 0.0,
+            shadow_metadata: None,
         }
+    }
+
+    /// PIP-180 / ADR-0033: install shadow-topic metadata on this consumer.
+    ///
+    /// Called by the runtime engine at subscribe time after the admin REST
+    /// `getShadowTopics(source)` lookup resolves this consumer's topic as a
+    /// shadow of `meta.source_topic`. Once set, the connection's receive
+    /// dispatch emits [`crate::event::ConnectionEvent::MessageReceivedFromShadow`]
+    /// for every inbound entry whose [`pb::MessageMetadata::replicated_from`]
+    /// is populated, instead of the regular
+    /// [`crate::event::ConnectionEvent::Message`].
+    ///
+    /// Sans-io: the metadata is supplied externally so `magnetar-proto` has
+    /// no admin-REST dependency ([ADR-0004](../adr/0004-sans-io-protocol-core.md)).
+    pub fn set_shadow_metadata(&mut self, meta: ShadowTopicMetadata) {
+        self.shadow_metadata = Some(meta);
+    }
+
+    /// PIP-180 / ADR-0033: pure classifier — returns
+    /// `Some((source_topic, source_message_id))` when this consumer is
+    /// shadow-attached AND the inbound entry carries
+    /// [`pb::MessageMetadata::replicated_from`]. Used by the connection's
+    /// receive dispatch to pick between [`crate::event::ConnectionEvent::Message`]
+    /// and [`crate::event::ConnectionEvent::MessageReceivedFromShadow`].
+    ///
+    /// Returns `None` (regular delivery) when:
+    ///   * `shadow_metadata` is `None` (consumer is not subscribed to a shadow topic), or
+    ///   * the inbound metadata has no `replicated_from` field (the entry was authored on this
+    ///     topic, not replicated from elsewhere).
+    #[must_use]
+    pub fn classify_for_shadow(&self, message: &IncomingMessage) -> Option<(String, MessageId)> {
+        let shadow = self.shadow_metadata.as_ref()?;
+        message.metadata.replicated_from.as_ref()?;
+        // The broker presents the source-topic ledger/entry pointers verbatim;
+        // by the PIP-180 structural-equality contract ([`MessageId`]) the
+        // shadow-side id IS the source-side id.
+        Some((shadow.source_topic.clone(), message.message_id))
     }
 
     /// Take a rolling-window snapshot at `now`. On the first call, just records
@@ -1576,5 +1646,110 @@ mod tests {
         );
         let msg = c.pop_message().expect("reassembled message");
         assert_eq!(msg.payload.as_ref(), b"aabb");
+    }
+
+    // ---------- PIP-180 / ADR-0033: shadow-topic receive-side tests ----------
+
+    fn shadow_im(ledger: u64, entry: u64, replicated_from: Option<&str>) -> IncomingMessage {
+        let mut meta = pb::MessageMetadata {
+            producer_name: "src-producer".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000,
+            ..Default::default()
+        };
+        meta.replicated_from = replicated_from.map(str::to_owned);
+        IncomingMessage {
+            message_id: MessageId {
+                ledger_id: ledger,
+                entry_id: entry,
+                partition: -1,
+                batch_index: -1,
+                batch_size: 0,
+            },
+            metadata: meta,
+            single_metadata: None,
+            payload: Bytes::from_static(b"payload"),
+            redelivery_count: 0,
+            broker_entry_metadata: None,
+            arrived_at: std::time::Instant::now(),
+        }
+    }
+
+    /// PIP-180: a shadow-attached consumer classifies a message carrying
+    /// `MessageMetadata.replicated_from` as a shadow delivery, returning the
+    /// source-topic name + source `MessageId`.
+    #[test]
+    fn consumer_classifies_shadow_via_metadata() {
+        let mut c = ConsumerState::new(
+            ConsumerHandle(1),
+            "persistent://public/default/shadow-t".to_owned(),
+            "s".to_owned(),
+            100,
+        );
+        c.set_shadow_metadata(ShadowTopicMetadata {
+            source_topic: "persistent://public/default/source-t".to_owned(),
+        });
+        let im = shadow_im(7, 42, Some("source-cluster"));
+        let class = c
+            .classify_for_shadow(&im)
+            .expect("shadow consumer + replicated_from = shadow classification");
+        assert_eq!(class.0, "persistent://public/default/source-t");
+        // The source id is structurally equal to the shadow-side id (PIP-180
+        // contract on `MessageId`).
+        assert_eq!(class.1, im.message_id);
+    }
+
+    /// PIP-180: the connection's receive dispatch emits
+    /// `MessageReceivedFromShadow` (not `Message`) when the consumer is
+    /// shadow-attached AND the inbound entry carries `replicated_from`.
+    /// Exercised here at the consumer level via `classify_for_shadow`; the
+    /// conn.rs-level dispatch is the user of this classifier and is covered
+    /// by the runtime integration tests.
+    #[test]
+    fn consumer_emits_message_received_from_shadow() {
+        let mut c = ConsumerState::new(
+            ConsumerHandle(1),
+            "persistent://public/default/shadow-t".to_owned(),
+            "s".to_owned(),
+            100,
+        );
+        c.set_shadow_metadata(ShadowTopicMetadata {
+            source_topic: "persistent://public/default/source-t".to_owned(),
+        });
+        // A message with `replicated_from` set — broker-presented shadow copy.
+        let im = shadow_im(99, 1, Some("dc-east"));
+        assert!(c.classify_for_shadow(&im).is_some());
+        // Same consumer, message *without* `replicated_from` — falls back to
+        // the regular `Message` event (e.g. a direct write to the shadow
+        // topic, which PIP-180 disallows but defensive: classify still says
+        // "regular").
+        let im_no_repl = shadow_im(99, 2, None);
+        assert!(
+            c.classify_for_shadow(&im_no_repl).is_none(),
+            "no `replicated_from` => regular Message event"
+        );
+    }
+
+    /// PIP-180: a non-shadow consumer always classifies as regular —
+    /// `MessageMetadata.replicated_from` on a non-shadow consumer (e.g. a
+    /// geo-replicated topic that happens to carry the field) does NOT
+    /// upgrade the delivery to a shadow event. The shadow path is opt-in
+    /// via [`ConsumerState::set_shadow_metadata`].
+    #[test]
+    fn consumer_emits_message_received_for_non_shadow() {
+        let c = ConsumerState::new(
+            ConsumerHandle(1),
+            "persistent://public/default/regular-t".to_owned(),
+            "s".to_owned(),
+            100,
+        );
+        // Consumer not configured with shadow metadata — even if the entry
+        // carries `replicated_from` (e.g. geo-replicated topic), classify
+        // returns None and the dispatch falls through to `Message`.
+        let im = shadow_im(7, 42, Some("source-cluster"));
+        assert!(c.classify_for_shadow(&im).is_none());
+        // And the same regardless of `replicated_from`.
+        let im_none = shadow_im(7, 43, None);
+        assert!(c.classify_for_shadow(&im_none).is_none());
     }
 }

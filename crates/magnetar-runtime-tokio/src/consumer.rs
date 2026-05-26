@@ -46,6 +46,54 @@ impl Consumer {
         self.shared.inner.lock().consumer_is_closed(self.handle)
     }
 
+    /// PIP-180 / ADR-0033: pre-populate shadow-topic metadata so the receive
+    /// dispatch surfaces source-topic context on each incoming message.
+    ///
+    /// Once set, every inbound entry carrying
+    /// [`pb::MessageMetadata::replicated_from`] is emitted by the sans-io
+    /// state machine as
+    /// [`magnetar_proto::ConnectionEvent::MessageReceivedFromShadow`]
+    /// rather than the regular
+    /// [`magnetar_proto::ConnectionEvent::Message`].
+    ///
+    /// Typically called by `Client::subscribe_shadow_aware` (or
+    /// `magnetar::Client::subscribe` under the `admin` feature) after a
+    /// `magnetar-admin` `get_shadow_source(topic)` lookup resolves a
+    /// shadow-attached topic. Direct callers may set it themselves when
+    /// they already know the source topic (e.g. tests, integration
+    /// scenarios where the admin REST is mocked).
+    pub fn set_shadow_source(&self, source_topic: impl Into<String>) {
+        let source = source_topic.into();
+        let mut conn = self.shared.inner.lock();
+        if let Some(c) = conn.consumer_mut(self.handle) {
+            c.set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
+                source_topic: source,
+            });
+        }
+    }
+
+    /// PIP-180 / ADR-0033: returns the cached source-topic name if this
+    /// consumer is shadow-attached, or `None` for a regular consumer.
+    ///
+    /// `Some(topic)` ⇒ shadow-attached (broker-side topic is a shadow of
+    /// `topic`); `None` ⇒ regular consumer (no shadow translation on the
+    /// receive path).
+    #[must_use]
+    pub fn shadow_source_topic(&self) -> Option<String> {
+        self.shared
+            .inner
+            .lock()
+            .consumer(self.handle)
+            .and_then(|c| c.shadow_metadata.as_ref().map(|m| m.source_topic.clone()))
+    }
+
+    /// PIP-180 / ADR-0033: convenience predicate equivalent to
+    /// `shadow_source_topic().is_some()`.
+    #[must_use]
+    pub fn is_shadow(&self) -> bool {
+        self.shadow_source_topic().is_some()
+    }
+
     /// Number of messages currently buffered in this consumer's receiver queue, waiting
     /// for a `receive()` call to pull them out. Mirrors Java
     /// `Consumer#getNumMessagesInQueue`.
@@ -734,6 +782,7 @@ impl Consumer {
                 uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
                 num_messages: 1,
                 txn_id: None,
+                source_message_id: None,
             };
             dlq_producer.send(outgoing).await?;
             self.ack(msg.message_id).await?;
@@ -835,6 +884,7 @@ impl Consumer {
             uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
             num_messages: 1,
             txn_id: None,
+            source_message_id: None,
         };
         retry_producer.send(outgoing).await?;
         self.ack(msg.message_id).await?;
