@@ -991,10 +991,14 @@ the retry topic with delay + properties, then ack the original.
 
 ## Multi-topics fan-in
 
-`MultiTopicsConsumer` and `PatternConsumer` are façade types layered on
-top of N child `Consumer`s — one per subscribed topic. The receive race
-is *not* a channel — it is a `futures_util::future::select_all` over the
-child consumers' `receive()` futures.
+`MultiTopicsConsumer<C>` and `PatternConsumer<C>` are engine-generic
+façade types layered on top of N child consumers — one per subscribed
+topic. `C: ConsumerApi` defaults to the tokio runtime's `Consumer`,
+and pass-2 (ADR-0037) lifted the impl bodies to dispatch through the
+trait so both engines drive the same coordinator unchanged. The
+receive race is *not* a channel — it is a
+`futures_util::future::select_all` over the child consumers'
+`receive()` futures.
 
 ```text
             ┌──── child Consumer 1 ────┐
@@ -1074,6 +1078,31 @@ live in concrete `impl PulsarClient<TokioEngine>` /
 `impl PulsarClient<MoonpoolEngine<P>>` blocks rather than on the trait
 ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md);
 source: [`crates/magnetar/src/engine.rs`](crates/magnetar/src/engine.rs)).
+
+### Per-surface extension traits (ADR-0026 §D1)
+
+Dependent façade surfaces lift through per-family extension traits,
+each implemented on the runtime's concrete `Client` / `Producer` /
+`Consumer` type. `impl<E: Engine> PulsarClient<E> where E::ClientState:
+<Trait>` dispatches the user-visible method through the trait. Today's
+trait set:
+
+| Trait | Implemented on | Surfaces driven by it |
+| --- | --- | --- |
+| `TransactionApi` | runtime `Client` | `PulsarClient::new_transaction` + commit/abort. |
+| `SubscribeApi` (with `type Consumer: ConsumerApi`) | runtime `Client` | `ConsumerBuilder<'a, E>::subscribe` + every consumer-spawning builder (`MultiTopicsConsumerBuilder<'a, E>`, `PartitionedConsumerBuilder<'a, E>`, `PatternConsumerBuilder<'a, E>`, `ReaderBuilder<'a, E>`, `TypedConsumerBuilder<'a, S, E>`). |
+| `CreateProducerApi` (with `type Producer: ProducerApi`) | runtime `Client` | `ProducerBuilder<'a, E>::create` + `TypedProducerBuilder<'a, S, E>`. |
+| `ConsumerApi` (with `type Producer: ProducerApi<Error = Self::Error>`) | runtime `Consumer` | All inherent methods of `MultiTopicsConsumer<C>` / `PatternConsumer<C>` / `Reader<C>` / `TableView<C>` (and the DLQ + retry helpers route through the associated `Producer`). |
+| `ProducerApi` | runtime `Producer` | `PartitionedProducer<P>` inherent methods. |
+| `BrokerMetadataApi` | runtime `Client` | `PulsarClient::partitions_for_topic` / `topic_list_snapshot`; `PartitionedConsumerBuilder` (partition discovery) + `PatternConsumer::update` (PIP-145 delta polling). |
+
+Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the
+17 trait methods needed to lift `MultiTopicsConsumer<C>` /
+`PatternConsumer<C>` impl bodies (13 multi-topic helpers + `pause` /
+`resume` / `seek_to_message` / `seek_to_timestamp` + the
+`unsubscribe(force: bool)` overload), and introduced
+`BrokerMetadataApi` to lift the partition-count + topic-list-watcher
+lookups so the three builders are engine-generic end-to-end.
 
 ### `magnetar-runtime-tokio` — production (default)
 
