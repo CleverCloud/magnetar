@@ -218,40 +218,6 @@ fixed, not `#[ignore]`-d.
 /goal close the pre-existing moonpool coverage gap. Generate cargo llvm-cov --html, identify the largest uncovered hunks in crates/magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,transport}.rs, add targeted tests to crates/magnetar-runtime-moonpool/tests/ until check-sim-coverage reports no uncovered lines against origin/main. Keep test parity 1:1; mirror each new moonpool test on the tokio side so the gate stays green.
 ```
 
-### `try_reserve_memory_or_register_wins_recheck_under_contention` flakes under load
-
-**Status.** The coverage-only race test introduced in commit
-`0c7b318` at
-[`crates/magnetar-runtime-moonpool/src/lib.rs:810`](../crates/magnetar-runtime-moonpool/src/lib.rs)
-runs 10000 iterations of a `try_reserve_memory_or_register` ↔
-`release_memory` race with a 5-second wall-clock budget. Under
-heavy parallel test load (e.g. running the full workspace `cargo
-test --all-features` on a multi-core box with other agent
-workloads competing for CPU) the 10000 iterations exceed the
-budget and the test panics with
-`"recheck race did not fire within 5s budget"`. The test header
-documents itself: *"the test is best-effort for line 327/328
-coverage, but ALWAYS passes correctness-wise (the helper's
-contract is upheld either way)."*
-
-**Unblock.** Two pragmatic options:
-
-1. **Loosen the budget.** Raise `Duration::from_secs(5)` to e.g.
-   `Duration::from_secs(30)`; the test still terminates in a few
-   seconds under light load and gains headroom under contention.
-2. **Make iteration count adaptive.** Replace the hard 10000-loop
-   with a `while Instant::now() < deadline` loop that bumps a
-   counter; assert `count > 100` at the end. Same coverage hit
-   on lines 327/328, no false-positive panic.
-
-Either fix is a ~3-line patch with no behavioural consequence.
-Tracked here so it doesn't get forgotten the next time the
-workspace test runs under heavy load.
-
-```text
-/goal fix the load-flaky `try_reserve_memory_or_register_wins_recheck_under_contention` test in crates/magnetar-runtime-moonpool/src/lib.rs:810. Replace the fixed 10000-iteration loop with an adaptive `while Instant::now() < deadline` loop that requires at least ~100 iterations to confirm contention coverage. Validation: full workspace `cargo test --workspace --all-features --locked` under high parallelism (e.g. on a multi-core box with `cargo test -j8`) must pass green.
-```
-
 ---
 
 ## Auth
