@@ -13,11 +13,34 @@
 //! Both wrappers stamp the schema's wire bytes on the underlying open frames via the
 //! `magnetar_proto` schema field on `CreateProducerRequest` / `SubscribeRequest`, so the broker
 //! records the schema and surfaces it to the dashboard.
+//!
+//! # Engine-generic surfaces (ADR-0026 §D1)
+//!
+//! `TypedProducer<S, P>` and `TypedConsumer<S, C>` are generic over
+//! their inner runtime type (`P: ProducerApi`, `C: ConsumerApi`). The
+//! defaults (`P = magnetar_runtime_tokio::Producer`,
+//! `C = magnetar_runtime_tokio::Consumer`) keep existing callers
+//! pointing at the tokio specialisation without naming the producer /
+//! consumer type. Moonpool callers name
+//! `TypedProducer<S, magnetar_runtime_moonpool::Producer<P>>` and
+//! `TypedConsumer<S, magnetar_runtime_moonpool::Consumer<P>>`.
+//!
+//! Methods that depend on the runtime's `magnetar_proto::IncomingMessage`
+//! shape (the `receive` family, `receive_batch`, `reconsume_later`,
+//! `republish_dead_letters`) stay on the tokio specialisation
+//! because the engine-generic [`crate::ConsumerApi`] trait returns
+//! [`crate::IncomingMessage`] which loses the protocol-level
+//! `single_metadata` and `arrived_at` fields. Same split pattern as
+//! `PartitionedProducer<P>` (commit `aaa0661`).
+//!
+//! [`TypedProducerBuilder<'a, S, E>`] and [`TypedConsumerBuilder<'a,
+//! S, E>`] are generic over the engine and route their `.create()` /
+//! `.subscribe()` through [`crate::CreateProducerApi`] /
+//! [`crate::SubscribeApi`] on the inner runtime client.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use magnetar_proto::producer::OutgoingMessage as ProtoOutgoingMessage;
 use magnetar_proto::schema::{Schema, SchemaError};
 use magnetar_proto::{IncomingMessage, MessageId, pb};
 use magnetar_runtime_tokio::{Consumer, Producer};
@@ -34,10 +57,8 @@ use crate::client::PulsarError;
 /// pointing at the tokio specialisation. Moonpool callers name
 /// `TypedProducer<S, magnetar_runtime_moonpool::Producer<P>>`.
 ///
-/// Methods that need helpers not on `ProducerApi` today
-/// (`compression`, `last_sequence_id_published`, `pending_count`,
-/// `batch_len`, `batch_bytes`) live in a separate
-/// `impl TypedProducer<S, magnetar_runtime_tokio::Producer>` block.
+/// Every inherent method dispatches through the [`crate::ProducerApi`]
+/// trait, so the surface compiles against both engines.
 pub struct TypedProducer<S: Schema, P: crate::ProducerApi = Producer> {
     inner: P,
     schema: Arc<S>,
@@ -52,10 +73,10 @@ impl<S: Schema, P: crate::ProducerApi + std::fmt::Debug> std::fmt::Debug for Typ
     }
 }
 
-impl<S: Schema> TypedProducer<S> {
+impl<S: Schema, P: crate::ProducerApi> TypedProducer<S, P> {
     /// The inner runtime producer. Useful for accessing connection-state observers and stats.
     #[must_use]
-    pub fn inner(&self) -> &Producer {
+    pub fn inner(&self) -> &P {
         &self.inner
     }
 
@@ -75,20 +96,18 @@ impl<S: Schema> TypedProducer<S> {
     ) -> Result<MessageId, PulsarError> {
         self.warm_broker_schema().await?;
         let bytes = self.schema.encode(value).map_err(schema_to_pulsar)?;
-        let mut metadata = pb::MessageMetadata::default();
+        // Build a façade [`crate::OutgoingMessage`] so the engine-generic
+        // [`crate::ProducerApi::send`] (which consumes that shape) can
+        // dispatch through the runtime's per-engine
+        // `From<crate::OutgoingMessage> for magnetar_proto::OutgoingMessage`
+        // bridge.
+        let mut msg = crate::OutgoingMessage::with_payload(bytes);
         if let Some(k) = key {
-            metadata.partition_key = Some(k);
-            metadata.partition_key_b64_encoded = Some(false);
+            msg = msg.key(k);
         }
-        let payload_len = bytes.len();
-        let msg = ProtoOutgoingMessage {
-            payload: bytes,
-            metadata,
-            uncompressed_size: u32::try_from(payload_len).unwrap_or(u32::MAX),
-            num_messages: 1,
-            txn_id: None,
-        };
-        let id = self.inner.send(msg).await?;
+        let id = crate::ProducerApi::send(&self.inner, msg)
+            .await
+            .map_err(|err| PulsarError::Other(format!("send: {err}")))?;
         Ok(id)
     }
 
@@ -98,109 +117,119 @@ impl<S: Schema> TypedProducer<S> {
     /// the broker-resolved schema after the first successful round-trip.
     async fn warm_broker_schema(&self) -> Result<(), PulsarError> {
         if self.schema.needs_broker_schema() {
-            let resolved = self
-                .inner
-                .get_schema(None)
+            let resolved = crate::ProducerApi::get_schema(&self.inner, None)
                 .await
-                .map_err(PulsarError::Client)?;
+                .map_err(|err| PulsarError::Other(format!("get_schema: {err}")))?;
             self.schema.store_resolved_schema(resolved);
         }
         Ok(())
     }
 
-    /// Start a Java-symmetric `TypedMessageBuilder`. Mirrors `producer.newMessage()` —
-    /// chain `.key`, `.event_time_ms`, `.property`, etc., end with `.send(&value).await`.
-    pub fn new_message(&self) -> TypedMessageBuilder<'_, S> {
-        TypedMessageBuilder {
-            producer: self,
-            msg: crate::OutgoingMessage::default(),
-        }
-    }
-
     /// Close the underlying producer.
     pub async fn close(self) -> Result<(), PulsarError> {
-        self.inner.close().await.map_err(PulsarError::Client)
+        crate::ProducerApi::close_owned(self.inner)
+            .await
+            .map_err(|err| PulsarError::Other(format!("close: {err}")))
     }
 
     /// Topic this producer is bound to. Mirrors Java `Producer#getTopic`.
     #[must_use]
     pub fn topic(&self) -> String {
-        self.inner.topic()
+        crate::ProducerApi::topic(&self.inner)
     }
 
     /// Producer name (broker-assigned if not user-supplied). Mirrors Java
     /// `Producer#getProducerName`.
     #[must_use]
     pub fn name(&self) -> String {
-        self.inner.name()
+        crate::ProducerApi::name(&self.inner)
     }
 
     /// Compression codec this producer was configured with. See `Producer::compression`.
     #[must_use]
     pub fn compression(&self) -> magnetar_proto::types::CompressionKind {
-        self.inner.compression()
+        crate::ProducerApi::compression(&self.inner)
     }
 
     /// `true` while the broker connection is up. Mirrors Java `Producer#isConnected`.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.inner.is_connected()
+        crate::ProducerApi::is_connected(&self.inner)
     }
 
     /// `true` once [`Self::close`] has been called.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
+        crate::ProducerApi::is_closed(&self.inner)
     }
 
     /// Cumulative producer counters snapshot. Mirrors Java `Producer#getStats`.
     #[must_use]
     pub fn stats(&self) -> magnetar_proto::ProducerStats {
-        self.inner.stats()
+        crate::ProducerApi::stats(&self.inner)
     }
 
     /// Wall-clock instant of the most-recent connection drop. Mirrors Java
     /// `Producer#getLastDisconnectedTimestamp`.
     #[must_use]
     pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
-        self.inner.last_disconnected_timestamp()
+        crate::ProducerApi::last_disconnected_timestamp(&self.inner)
     }
 
     /// Last sequence id pushed onto the wire. Mirrors Java `Producer#getLastSequenceId`.
     #[must_use]
     pub fn last_sequence_id(&self) -> i64 {
-        self.inner.last_sequence_id()
+        crate::ProducerApi::last_sequence_id(&self.inner)
     }
 
     /// Last sequence id the broker has acknowledged. Mirrors Java
     /// `Producer#getLastSequenceIdPublished`.
     #[must_use]
     pub fn last_sequence_id_published(&self) -> i64 {
-        self.inner.last_sequence_id_published()
+        crate::ProducerApi::last_sequence_id_published(&self.inner)
     }
 
     /// Number of in-flight sends. See `Producer::pending_count`.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.inner.pending_count()
+        crate::ProducerApi::pending_count(&self.inner)
     }
 
     /// Number of messages buffered in the batch container. See `Producer::batch_len`.
     #[must_use]
     pub fn batch_len(&self) -> usize {
-        self.inner.batch_len()
+        crate::ProducerApi::batch_len(&self.inner)
     }
 
     /// Payload bytes buffered in the batch container. See `Producer::batch_bytes`.
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
-        self.inner.batch_bytes()
+        crate::ProducerApi::batch_bytes(&self.inner)
     }
 
     /// Flush pending batches and await every in-flight send. Mirrors Java
     /// `Producer#flushAsync`.
     pub async fn flush(&self) -> Result<(), PulsarError> {
-        self.inner.flush().await.map_err(PulsarError::Client)
+        crate::ProducerApi::flush(&self.inner)
+            .await
+            .map_err(|err| PulsarError::Other(format!("flush: {err}")))
+    }
+}
+
+impl<S: Schema> TypedProducer<S, Producer> {
+    /// Start a Java-symmetric `TypedMessageBuilder`. Mirrors `producer.newMessage()` —
+    /// chain `.key`, `.event_time_ms`, `.property`, etc., end with `.send(&value).await`.
+    ///
+    /// Tokio-only — [`TypedMessageBuilder`] composes the per-message
+    /// [`crate::OutgoingMessage`] which today flows through the
+    /// tokio-specialised `Producer::send` for the dispatch surface
+    /// `.into()` already covers. Moonpool callers can build their own
+    /// `OutgoingMessage` and call [`Self::send`] directly.
+    pub fn new_message(&self) -> TypedMessageBuilder<'_, S> {
+        TypedMessageBuilder {
+            producer: self,
+            msg: crate::OutgoingMessage::default(),
+        }
     }
 }
 
@@ -211,7 +240,7 @@ impl<S: Schema> TypedProducer<S> {
 /// defensive about).
 #[derive(Debug)]
 pub struct TypedMessageBuilder<'a, S: Schema> {
-    producer: &'a TypedProducer<S>,
+    producer: &'a TypedProducer<S, Producer>,
     msg: crate::OutgoingMessage,
 }
 
@@ -303,8 +332,15 @@ impl<S: Schema> TypedMessageBuilder<'_, S> {
 
 /// Builder for a [`TypedProducer`]. The schema is required; the topic comes from the parent
 /// [`PulsarClient::typed_producer`] entry point.
-pub struct TypedProducerBuilder<'a, S: Schema> {
-    client: &'a PulsarClient,
+///
+/// Generic over `E: Engine` (ADR-0026 §D1). The default
+/// (`E = crate::TokioEngine`) keeps existing callers source-compatible.
+/// Moonpool callers parametrise with
+/// `TypedProducerBuilder<'_, S, MoonpoolEngine<P>>` and get a
+/// `TypedProducer<S, magnetar_runtime_moonpool::Producer<P>>` from
+/// [`Self::create`].
+pub struct TypedProducerBuilder<'a, S: Schema, E: crate::Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     topic: String,
     schema: Arc<S>,
     name: Option<String>,
@@ -316,10 +352,14 @@ pub struct TypedProducerBuilder<'a, S: Schema> {
     access_mode: pb::ProducerAccessMode,
     send_timeout: Option<std::time::Duration>,
     batching_max_publish_delay: Option<std::time::Duration>,
+    /// Tokio-engine encryption hook (PIP-4). Only consulted on the
+    /// tokio specialisation of [`Self::create`] — the engine-generic
+    /// path routes through [`crate::CreateProducerApi`] which does not
+    /// surface the encryptor.
     encryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
 }
 
-impl<S: Schema> std::fmt::Debug for TypedProducerBuilder<'_, S> {
+impl<S: Schema, E: crate::Engine> std::fmt::Debug for TypedProducerBuilder<'_, S, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypedProducerBuilder")
             .field("topic", &self.topic)
@@ -329,8 +369,8 @@ impl<S: Schema> std::fmt::Debug for TypedProducerBuilder<'_, S> {
     }
 }
 
-impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
-    pub(crate) fn new(client: &'a PulsarClient, topic: String, schema: Arc<S>) -> Self {
+impl<'a, S: Schema, E: crate::Engine> TypedProducerBuilder<'a, S, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>, topic: String, schema: Arc<S>) -> Self {
         Self {
             client,
             topic,
@@ -410,8 +450,74 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
         self.batching_max_publish_delay = Some(delay);
         self
     }
+}
 
-    /// Mirrors `ProducerBuilder::encryption`.
+impl<S: Schema, E: crate::Engine> TypedProducerBuilder<'_, S, E>
+where
+    E::ClientState: crate::CreateProducerApi,
+{
+    /// Build and open the producer via the engine-generic
+    /// [`crate::CreateProducerApi`] trait. The configured schema is
+    /// advertised on `CommandProducer.schema`.
+    ///
+    /// The encryptor (PIP-4) is **not** consulted on this path —
+    /// tokio-engine callers that need encryption use
+    /// [`Self::create_with_encryption`] on the
+    /// tokio specialisation.
+    pub async fn create(
+        self,
+    ) -> Result<TypedProducer<S, <E::ClientState as crate::CreateProducerApi>::Producer>, PulsarError>
+    {
+        let schema_pb = pb::Schema {
+            name: self.topic.clone(),
+            schema_data: self.schema.schema_data().to_vec(),
+            r#type: self.schema.schema_type() as i32,
+            properties: self
+                .schema
+                .properties()
+                .into_iter()
+                .map(|(key, value)| pb::KeyValue { key, value })
+                .collect(),
+        };
+        let mut builder = self
+            .client
+            .producer(self.topic)
+            .schema(schema_pb)
+            .compression(self.compression)
+            .chunking(self.chunking)
+            .access_mode(self.access_mode);
+        if let Some(n) = self.name {
+            builder = builder.name(n);
+        }
+        if let Some((max_msgs, max_bytes)) = self.batching {
+            builder = builder.batching(max_msgs, max_bytes);
+        }
+        for (k, v) in self.properties {
+            builder = builder.property(k, v);
+        }
+        if let Some(id) = self.initial_sequence_id {
+            builder = builder.initial_sequence_id(id);
+        }
+        if let Some(t) = self.send_timeout {
+            builder = builder.send_timeout(t);
+        }
+        if let Some(d) = self.batching_max_publish_delay {
+            builder = builder.batching_max_publish_delay(d);
+        }
+        let inner = builder.create().await?;
+        Ok(TypedProducer {
+            inner,
+            schema: self.schema,
+        })
+    }
+}
+
+/// Tokio-engine-specific `TypedProducerBuilder` methods that depend on
+/// the tokio `MessageEncryptor` extension (PIP-4 not yet wired on
+/// moonpool).
+impl<S: Schema> TypedProducerBuilder<'_, S, crate::TokioEngine> {
+    /// Mirrors `ProducerBuilder::encryption`. Only consulted by
+    /// [`Self::create_with_encryption`].
     #[must_use]
     pub fn encryption(
         mut self,
@@ -421,9 +527,10 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
         self
     }
 
-    /// Build and open the producer. The configured schema is advertised on
+    /// Build and open the producer honoring the configured
+    /// `MessageEncryptor` (PIP-4). The configured schema is advertised on
     /// `CommandProducer.schema`.
-    pub async fn create(self) -> Result<TypedProducer<S>, PulsarError> {
+    pub async fn create_with_encryption(self) -> Result<TypedProducer<S>, PulsarError> {
         let schema_pb = pb::Schema {
             name: self.topic.clone(),
             schema_data: self.schema.schema_data().to_vec(),
@@ -463,11 +570,6 @@ impl<'a, S: Schema> TypedProducerBuilder<'a, S> {
         if let Some(e) = self.encryptor {
             builder = builder.encryption(e);
         }
-        // Use the tokio-specialised `create_with_encryption` path to
-        // honor the encryptor configured above. Engine-generic
-        // callers (post-Builder-lift) use `.create()` which dispatches
-        // through `CreateProducerApi` and ignores the encryptor field
-        // (PIP-4 not yet wired on moonpool).
         let inner = builder.create_with_encryption().await?;
         Ok(TypedProducer {
             inner,
@@ -512,15 +614,20 @@ where
 /// pointing at the tokio specialisation. Moonpool callers name
 /// `TypedConsumer<S, magnetar_runtime_moonpool::Consumer<P>>`.
 ///
-/// Methods that need helpers not on `ConsumerApi` today
-/// (`ack_grouped` family, `available_in_queue`, `available_permits`,
-/// `drain_dead_letter`, `flow`, `has_reached_end_of_topic`,
-/// `has_received_any_message`, `is_inactive`, `is_paused`,
-/// `last_disconnected_timestamp`, `receive_batch`,
-/// `receive_with_timeout`, `redeliver_unacked`, `pause`, `resume`,
-/// the `ack_with_txn` family) stay on the tokio specialisation
-/// `impl TypedConsumer<S, magnetar_runtime_tokio::Consumer>` until
-/// the trait grows them.
+/// Engine-generic methods dispatch through [`crate::ConsumerApi`].
+/// Methods that require the runtime's
+/// `magnetar_proto::IncomingMessage` shape (the `receive` family,
+/// `receive_batch`, `reconsume_later`, `republish_dead_letters`) or
+/// helpers not on `ConsumerApi` today (`pause`, `resume`, `flow`,
+/// `is_paused`, `has_reached_end_of_topic`, `available_in_queue`,
+/// `available_permits`, `has_received_any_message`, `is_inactive`,
+/// `ack_batch`, `ack_with_properties`,
+/// `ack_cumulative_with_properties`, `ack_batch_with_txn`,
+/// `seek_to_message`, `seek_to_timestamp`,
+/// `receive_batch_with_bytes_cap`, `drain_dead_letter`, unsubscribe
+/// with `force=true`) stay on the tokio specialisation
+/// `impl TypedConsumer<S, magnetar_runtime_tokio::Consumer>` until the
+/// trait grows them.
 pub struct TypedConsumer<S: Schema, C: crate::ConsumerApi = Consumer> {
     inner: C,
     schema: Arc<S>,
@@ -535,13 +642,168 @@ impl<S: Schema, C: crate::ConsumerApi + std::fmt::Debug> std::fmt::Debug for Typ
     }
 }
 
-impl<S: Schema> TypedConsumer<S> {
+impl<S: Schema, C: crate::ConsumerApi> TypedConsumer<S, C> {
     /// The inner runtime consumer.
     #[must_use]
-    pub fn inner(&self) -> &Consumer {
+    pub fn inner(&self) -> &C {
         &self.inner
     }
 
+    /// Acknowledge a single message.
+    pub async fn ack(&self, message_id: MessageId) -> Result<(), PulsarError> {
+        crate::ConsumerApi::ack(&self.inner, message_id)
+            .await
+            .map_err(|err| PulsarError::Other(format!("ack: {err}")))
+    }
+
+    /// Close the underlying consumer.
+    pub async fn close(self) -> Result<(), PulsarError> {
+        crate::ConsumerApi::close_owned(self.inner)
+            .await
+            .map_err(|err| PulsarError::Other(format!("close: {err}")))
+    }
+
+    /// Topic this consumer is bound to. Mirrors Java `Consumer#getTopic`.
+    #[must_use]
+    pub fn topic(&self) -> String {
+        crate::ConsumerApi::topic(&self.inner)
+    }
+
+    /// Subscription name. Mirrors Java `Consumer#getSubscription`.
+    #[must_use]
+    pub fn subscription(&self) -> String {
+        crate::ConsumerApi::subscription(&self.inner)
+    }
+
+    /// Consumer name. Mirrors Java `Consumer#getConsumerName`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        crate::ConsumerApi::name(&self.inner)
+    }
+
+    /// `true` while the broker connection is up. Mirrors Java `Consumer#isConnected`.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        crate::ConsumerApi::is_connected(&self.inner)
+    }
+
+    /// `true` once [`Self::close`] / `unsubscribe` has completed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        crate::ConsumerApi::is_closed(&self.inner)
+    }
+
+    /// Cumulative consumer counters snapshot. Mirrors Java `Consumer#getStats`.
+    #[must_use]
+    pub fn stats(&self) -> magnetar_proto::ConsumerStats {
+        crate::ConsumerApi::stats(&self.inner)
+    }
+
+    /// Wall-clock instant of the most-recent connection drop. Mirrors Java
+    /// `Consumer#getLastDisconnectedTimestamp`.
+    #[must_use]
+    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
+        crate::ConsumerApi::last_disconnected_timestamp(&self.inner)
+    }
+
+    /// Negative-ack a message. Mirrors Java `Consumer#negativeAcknowledge`.
+    pub fn negative_ack(&self, message_id: MessageId) {
+        crate::ConsumerApi::negative_ack(&self.inner, message_id);
+    }
+
+    /// Tell the broker to redeliver every unacked message. Mirrors Java
+    /// `Consumer#redeliverUnacknowledgedMessages`.
+    pub fn redeliver_unacked(&self) {
+        crate::ConsumerApi::redeliver_unacked(&self.inner);
+    }
+
+    /// Cumulative ack. Mirrors Java `Consumer#acknowledgeCumulativeAsync(MessageId)`.
+    pub async fn ack_cumulative(&self, message_id: MessageId) -> Result<(), PulsarError> {
+        crate::ConsumerApi::ack_cumulative(&self.inner, message_id)
+            .await
+            .map_err(|err| PulsarError::Other(format!("ack_cumulative: {err}")))
+    }
+
+    /// Fire-and-forget ack into the consumer's ack-grouping tracker (opt-in via
+    /// `TypedConsumerBuilder::ack_group_time`).
+    pub fn ack_grouped(&self, message_id: MessageId) {
+        crate::ConsumerApi::ack_grouped(&self.inner, message_id);
+    }
+
+    /// Fire-and-forget cumulative ack into the consumer's ack-grouping tracker.
+    pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        crate::ConsumerApi::ack_grouped_cumulative(&self.inner, message_id);
+    }
+
+    /// Ack a single message inside a transaction. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Transaction)`.
+    pub async fn ack_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), PulsarError> {
+        crate::ConsumerApi::ack_with_txn(&self.inner, message_id, txn_id)
+            .await
+            .map_err(|err| PulsarError::Other(format!("ack_with_txn: {err}")))
+    }
+
+    /// Cumulative ack inside a transaction. Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Transaction)`.
+    pub async fn ack_cumulative_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), PulsarError> {
+        crate::ConsumerApi::ack_cumulative_with_txn(&self.inner, message_id, txn_id)
+            .await
+            .map_err(|err| PulsarError::Other(format!("ack_cumulative_with_txn: {err}")))
+    }
+
+    /// Seek to the earliest message. Mirrors Java `Consumer#seek(MessageId.earliest)`.
+    pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
+        crate::ConsumerApi::seek_to_earliest(&self.inner)
+            .await
+            .map_err(|err| PulsarError::Other(format!("seek_to_earliest: {err}")))
+    }
+
+    /// Seek to the latest (head) position. Mirrors Java `Consumer#seek(MessageId.latest)`.
+    pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
+        crate::ConsumerApi::seek_to_latest(&self.inner)
+            .await
+            .map_err(|err| PulsarError::Other(format!("seek_to_latest: {err}")))
+    }
+
+    /// Ask the broker for the topic's last-published message id. Mirrors Java
+    /// `Consumer#getLastMessageId`.
+    pub async fn last_message_id(&self) -> Result<MessageId, PulsarError> {
+        crate::ConsumerApi::last_message_id(&self.inner)
+            .await
+            .map_err(|err| PulsarError::Other(format!("last_message_id: {err}")))
+    }
+
+    /// `true` if the broker has at least one message strictly past `cursor`. Mirrors Java
+    /// `Consumer#hasMessageAvailable` (the variant taking a cursor).
+    pub async fn has_message_after(&self, cursor: MessageId) -> Result<bool, PulsarError> {
+        crate::ConsumerApi::has_message_after(&self.inner, cursor)
+            .await
+            .map_err(|err| PulsarError::Other(format!("has_message_after: {err}")))
+    }
+}
+
+/// Tokio-engine-specific `TypedConsumer` methods.
+///
+/// These methods depend on either (a) the runtime's
+/// `magnetar_proto::IncomingMessage` shape (the `receive` family
+/// returns the proto-level message so the consumer keeps access to
+/// `single_metadata` + `arrived_at` — fields the engine-generic
+/// [`crate::ConsumerApi::receive`] trait method drops by widening to
+/// [`crate::IncomingMessage`]), or (b) `Consumer` helpers not yet on
+/// [`crate::ConsumerApi`] (the long tail of `pause` / `flow` / the
+/// extended ack family / DLQ / retry / batched receive). Each of these
+/// methods can be lifted into the engine-generic impl block as the
+/// matching helper lands on the trait — same incremental split as
+/// `PartitionedProducer<P>`.
+impl<S: Schema> TypedConsumer<S, Consumer> {
     /// Receive the next message. The payload is schema-decoded; if decoding fails the error
     /// is surfaced as [`PulsarError::Schema`] and the message remains unacked so the broker
     /// re-delivers it (subject to the consumer's redelivery policy).
@@ -569,73 +831,6 @@ impl<S: Schema> TypedConsumer<S> {
             payload: raw.payload.clone(),
             raw,
         })
-    }
-
-    /// Acknowledge a single message.
-    pub async fn ack(&self, message_id: MessageId) -> Result<(), PulsarError> {
-        self.inner
-            .ack(message_id)
-            .await
-            .map_err(PulsarError::Client)
-    }
-
-    /// Close the underlying consumer.
-    pub async fn close(self) -> Result<(), PulsarError> {
-        self.inner.close().await.map_err(PulsarError::Client)
-    }
-
-    /// Topic this consumer is bound to. Mirrors Java `Consumer#getTopic`.
-    #[must_use]
-    pub fn topic(&self) -> String {
-        self.inner.topic()
-    }
-
-    /// Subscription name. Mirrors Java `Consumer#getSubscription`.
-    #[must_use]
-    pub fn subscription(&self) -> String {
-        self.inner.subscription()
-    }
-
-    /// Consumer name. Mirrors Java `Consumer#getConsumerName`.
-    #[must_use]
-    pub fn name(&self) -> String {
-        self.inner.name()
-    }
-
-    /// `true` while the broker connection is up. Mirrors Java `Consumer#isConnected`.
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        self.inner.is_connected()
-    }
-
-    /// `true` once [`Self::close`] / `unsubscribe` has completed.
-    #[must_use]
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
-    }
-
-    /// Cumulative consumer counters snapshot. Mirrors Java `Consumer#getStats`.
-    #[must_use]
-    pub fn stats(&self) -> magnetar_proto::ConsumerStats {
-        self.inner.stats()
-    }
-
-    /// Wall-clock instant of the most-recent connection drop. Mirrors Java
-    /// `Consumer#getLastDisconnectedTimestamp`.
-    #[must_use]
-    pub fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
-        self.inner.last_disconnected_timestamp()
-    }
-
-    /// Negative-ack a message. Mirrors Java `Consumer#negativeAcknowledge`.
-    pub fn negative_ack(&self, message_id: MessageId) {
-        self.inner.negative_ack(message_id);
-    }
-
-    /// Tell the broker to redeliver every unacked message. Mirrors Java
-    /// `Consumer#redeliverUnacknowledgedMessages`.
-    pub fn redeliver_unacked(&self) {
-        self.inner.redeliver_unacked();
     }
 
     /// Pause delivery. Mirrors Java `Consumer#pause`.
@@ -688,32 +883,12 @@ impl<S: Schema> TypedConsumer<S> {
         self.inner.is_inactive()
     }
 
-    /// Cumulative ack. Mirrors Java `Consumer#acknowledgeCumulativeAsync(MessageId)`.
-    pub async fn ack_cumulative(&self, message_id: MessageId) -> Result<(), PulsarError> {
-        self.inner
-            .ack_cumulative(message_id)
-            .await
-            .map_err(PulsarError::Client)
-    }
-
     /// Batched individual ack. Mirrors Java `Consumer#acknowledgeAsync(List<MessageId>)`.
     pub async fn ack_batch(&self, message_ids: Vec<MessageId>) -> Result<(), PulsarError> {
         self.inner
             .ack_batch(message_ids)
             .await
             .map_err(PulsarError::Client)
-    }
-
-    /// Fire-and-forget ack into the consumer's ack-grouping tracker (opt-in via
-    /// `TypedConsumerBuilder::ack_group_time`). See
-    /// [`magnetar_runtime_tokio::Consumer::ack_grouped`].
-    pub fn ack_grouped(&self, message_id: MessageId) {
-        self.inner.ack_grouped(message_id);
-    }
-
-    /// Fire-and-forget cumulative ack into the consumer's ack-grouping tracker.
-    pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
-        self.inner.ack_grouped_cumulative(message_id);
     }
 
     /// Unsubscribe this consumer's subscription from the broker. Mirrors Java
@@ -734,45 +909,11 @@ impl<S: Schema> TypedConsumer<S> {
             .map_err(PulsarError::Client)
     }
 
-    /// Seek to the earliest message. Mirrors Java `Consumer#seek(MessageId.earliest)`.
-    pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
-        self.inner
-            .seek_to_earliest()
-            .await
-            .map_err(PulsarError::Client)
-    }
-
-    /// Seek to the latest (head) position. Mirrors Java `Consumer#seek(MessageId.latest)`.
-    pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
-        self.inner
-            .seek_to_latest()
-            .await
-            .map_err(PulsarError::Client)
-    }
-
     /// Seek to a publish-time deadline (millis since epoch). Mirrors Java
     /// `Consumer#seek(long)`.
     pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
         self.inner
             .seek_to_timestamp(publish_time_ms)
-            .await
-            .map_err(PulsarError::Client)
-    }
-
-    /// Ask the broker for the topic's last-published message id. Mirrors Java
-    /// `Consumer#getLastMessageId`.
-    pub async fn last_message_id(&self) -> Result<MessageId, PulsarError> {
-        self.inner
-            .last_message_id()
-            .await
-            .map_err(PulsarError::Client)
-    }
-
-    /// `true` if the broker has at least one message strictly past `cursor`. Mirrors Java
-    /// `Consumer#hasMessageAvailable` (the variant taking a cursor).
-    pub async fn has_message_after(&self, cursor: MessageId) -> Result<bool, PulsarError> {
-        self.inner
-            .has_message_after(cursor)
             .await
             .map_err(PulsarError::Client)
     }
@@ -862,19 +1003,6 @@ impl<S: Schema> TypedConsumer<S> {
             .map_err(PulsarError::Client)
     }
 
-    /// Ack a single message inside a transaction. Mirrors Java
-    /// `Consumer#acknowledgeAsync(MessageId, Transaction)`.
-    pub async fn ack_with_txn(
-        &self,
-        message_id: MessageId,
-        txn_id: magnetar_proto::TxnId,
-    ) -> Result<(), PulsarError> {
-        self.inner
-            .ack_with_txn(message_id, txn_id)
-            .await
-            .map_err(PulsarError::Client)
-    }
-
     /// Batched ack inside a transaction. Mirrors Java
     /// `Consumer#acknowledgeAsync(List<MessageId>, Transaction)`.
     pub async fn ack_batch_with_txn(
@@ -897,19 +1025,6 @@ impl<S: Schema> TypedConsumer<S> {
     ) -> Result<(), PulsarError> {
         self.inner
             .ack_cumulative_with_properties(message_id, properties)
-            .await
-            .map_err(PulsarError::Client)
-    }
-
-    /// Cumulative ack inside a transaction. Mirrors Java
-    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Transaction)`.
-    pub async fn ack_cumulative_with_txn(
-        &self,
-        message_id: MessageId,
-        txn_id: magnetar_proto::TxnId,
-    ) -> Result<(), PulsarError> {
-        self.inner
-            .ack_cumulative_with_txn(message_id, txn_id)
             .await
             .map_err(PulsarError::Client)
     }
@@ -966,8 +1081,15 @@ impl<S: Schema> TypedConsumer<S> {
 }
 
 /// Builder for a [`TypedConsumer`].
-pub struct TypedConsumerBuilder<'a, S: Schema> {
-    client: &'a PulsarClient,
+///
+/// Generic over `E: Engine` (ADR-0026 §D1). The default
+/// (`E = crate::TokioEngine`) keeps existing callers source-compatible.
+/// Moonpool callers parametrise with
+/// `TypedConsumerBuilder<'_, S, MoonpoolEngine<P>>` and get a
+/// `TypedConsumer<S, magnetar_runtime_moonpool::Consumer<P>>` from
+/// [`Self::subscribe`].
+pub struct TypedConsumerBuilder<'a, S: Schema, E: crate::Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     topic: String,
     schema: Arc<S>,
     subscription: Option<String>,
@@ -991,7 +1113,7 @@ pub struct TypedConsumerBuilder<'a, S: Schema> {
     start_message_rollback_duration_sec: Option<u64>,
 }
 
-impl<S: Schema> std::fmt::Debug for TypedConsumerBuilder<'_, S> {
+impl<S: Schema, E: crate::Engine> std::fmt::Debug for TypedConsumerBuilder<'_, S, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypedConsumerBuilder")
             .field("topic", &self.topic)
@@ -1003,8 +1125,8 @@ impl<S: Schema> std::fmt::Debug for TypedConsumerBuilder<'_, S> {
     }
 }
 
-impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
-    pub(crate) fn new(client: &'a PulsarClient, topic: String, schema: Arc<S>) -> Self {
+impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>, topic: String, schema: Arc<S>) -> Self {
         Self {
             client,
             topic,
@@ -1176,9 +1298,19 @@ impl<'a, S: Schema> TypedConsumerBuilder<'a, S> {
         self.receiver_queue_size = size;
         self
     }
+}
 
-    /// Build and subscribe. The configured schema is advertised on `CommandSubscribe.schema`.
-    pub async fn subscribe(self) -> Result<TypedConsumer<S>, PulsarError> {
+impl<S: Schema, E: crate::Engine> TypedConsumerBuilder<'_, S, E>
+where
+    E::ClientState: crate::SubscribeApi,
+{
+    /// Build and subscribe via the engine-generic [`crate::SubscribeApi`]
+    /// trait. The configured schema is advertised on
+    /// `CommandSubscribe.schema`.
+    pub async fn subscribe(
+        self,
+    ) -> Result<TypedConsumer<S, <E::ClientState as crate::SubscribeApi>::Consumer>, PulsarError>
+    {
         let subscription = self
             .subscription
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;

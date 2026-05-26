@@ -34,7 +34,7 @@ follow-up train; the gap is tracked below.
 | Reader | ✅ | ✅ |
 | TableView | ✅ | ✅ |
 | Transactions (PIP-31) | ✅ | ✅ |
-| Typed schemas | ✅ | 🟡 (phantom-lift; impl tokio-bound) |
+| Typed schemas | ✅ | ✅ |
 | Deterministic chaos pack | n/a | ✅ |
 | tokio ↔ moonpool differential equivalence harness | n/a | ✅ |
 

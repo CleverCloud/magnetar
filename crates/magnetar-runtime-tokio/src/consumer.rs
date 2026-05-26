@@ -1636,4 +1636,136 @@ mod tests {
             "the cancelled receive's slab slot must be evicted",
         );
     }
+
+    /// `ack_grouped` is fire-and-forget; with no `ack_group_time` tracker
+    /// configured the proto layer falls back to a synchronous immediate
+    /// `CommandAck`. Calling it on a fresh consumer must NOT panic and
+    /// MUST leave the consumer registered. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_grouped_falls_back_to_immediate_ack() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-grp".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        consumer.ack_grouped(magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 0,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        });
+        assert!(!consumer.is_closed());
+    }
+
+    /// `ack_grouped_cumulative` mirrors `ack_grouped` for cumulative
+    /// acks. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_grouped_cumulative_falls_back_to_immediate_ack() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-grp-cum".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        consumer.ack_grouped_cumulative(magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 5,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        });
+        assert!(!consumer.is_closed());
+    }
+
+    /// `ack_with_txn` queues an ack stamped with the given `TxnId`. The
+    /// returned future stays pending until the broker confirms (no driver
+    /// running here), so we just confirm the call enqueues without panic
+    /// and the consumer remains registered. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_with_txn_enqueues_request() {
+        use std::time::Duration;
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-txn".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        let txn = magnetar_proto::TxnId {
+            most_sig_bits: 1,
+            least_sig_bits: 2,
+        };
+        let mid = magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 0,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let fut = consumer.ack_with_txn(mid, txn);
+        let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
+        assert!(res.is_err(), "expected pending future (no driver)");
+        assert!(!consumer.is_closed());
+    }
+
+    /// `ack_cumulative_with_txn` mirrors `ack_with_txn` for cumulative
+    /// acks under a transaction. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_cumulative_with_txn_enqueues_request() {
+        use std::time::Duration;
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-cum-txn".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        let txn = magnetar_proto::TxnId {
+            most_sig_bits: 1,
+            least_sig_bits: 2,
+        };
+        let mid = magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 5,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let fut = consumer.ack_cumulative_with_txn(mid, txn);
+        let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
+        assert!(res.is_err(), "expected pending future (no driver)");
+        assert!(!consumer.is_closed());
+    }
 }

@@ -882,28 +882,6 @@ impl PulsarClient<crate::TokioEngine> {
             .map_err(PulsarError::Client)
     }
 
-    /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
-    /// `PulsarClient#newProducer(Schema<T>)`.
-    #[must_use]
-    pub fn typed_producer<S: magnetar_proto::schema::Schema>(
-        &self,
-        topic: impl Into<String>,
-        schema: std::sync::Arc<S>,
-    ) -> crate::TypedProducerBuilder<'_, S> {
-        crate::TypedProducerBuilder::new(self, topic.into(), schema)
-    }
-
-    /// Open a schema-aware [`crate::TypedConsumerBuilder`] for the given topic. Mirrors Java's
-    /// `PulsarClient#newConsumer(Schema<T>)`.
-    #[must_use]
-    pub fn typed_consumer<S: magnetar_proto::schema::Schema>(
-        &self,
-        topic: impl Into<String>,
-        schema: std::sync::Arc<S>,
-    ) -> crate::TypedConsumerBuilder<'_, S> {
-        crate::TypedConsumerBuilder::new(self, topic.into(), schema)
-    }
-
     /// Close the underlying connection.
     pub async fn close(self) {
         self.inner.close().await;
@@ -964,6 +942,28 @@ impl<E: crate::Engine> PulsarClient<E> {
     #[must_use]
     pub fn reader(&self, topic: impl Into<String>) -> ReaderBuilder<'_, E> {
         ReaderBuilder::new(self, topic.into())
+    }
+
+    /// Open a schema-aware [`crate::TypedProducerBuilder`] for the given topic. Mirrors Java's
+    /// `PulsarClient#newProducer(Schema<T>)`. Engine-generic per ADR-0026 §D1.
+    #[must_use]
+    pub fn typed_producer<S: magnetar_proto::schema::Schema>(
+        &self,
+        topic: impl Into<String>,
+        schema: std::sync::Arc<S>,
+    ) -> crate::TypedProducerBuilder<'_, S, E> {
+        crate::TypedProducerBuilder::new(self, topic.into(), schema)
+    }
+
+    /// Open a schema-aware [`crate::TypedConsumerBuilder`] for the given topic. Mirrors Java's
+    /// `PulsarClient#newConsumer(Schema<T>)`. Engine-generic per ADR-0026 §D1.
+    #[must_use]
+    pub fn typed_consumer<S: magnetar_proto::schema::Schema>(
+        &self,
+        topic: impl Into<String>,
+        schema: std::sync::Arc<S>,
+    ) -> crate::TypedConsumerBuilder<'_, S, E> {
+        crate::TypedConsumerBuilder::new(self, topic.into(), schema)
     }
 }
 

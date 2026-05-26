@@ -173,6 +173,34 @@ impl<P: Providers> Producer<P> {
             .producer_last_sequence_id_pushed(self.handle)
     }
 
+    /// Last sequence id the broker has acknowledged via
+    /// `CommandSendReceipt`. Returns `-1` if no sends have been acked
+    /// yet. Mirrors `org.apache.pulsar.client.api.Producer#getLastSequenceIdPublished`.
+    /// Useful for resume-from-checkpoint flows.
+    #[must_use]
+    pub fn last_sequence_id_published(&self) -> i64 {
+        self.shared
+            .inner
+            .lock()
+            .producer_last_sequence_id_published(self.handle)
+    }
+
+    /// Number of messages currently buffered in the batch container,
+    /// waiting for the next flush cycle. Returns `0` when batching is
+    /// disabled or the batch is empty. Mirrors the tokio runtime's
+    /// `Producer::batch_len`.
+    #[must_use]
+    pub fn batch_len(&self) -> usize {
+        self.shared.inner.lock().producer_batch_len(self.handle)
+    }
+
+    /// Sum of payload bytes currently buffered in the batch container.
+    /// Mirrors the tokio runtime's `Producer::batch_bytes`.
+    #[must_use]
+    pub fn batch_bytes(&self) -> usize {
+        self.shared.inner.lock().producer_batch_bytes(self.handle)
+    }
+
     /// Snapshot of this producer's cumulative counters. Mirrors Java
     /// `org.apache.pulsar.client.api.Producer#getStats`. Returns a zeroed
     /// snapshot if the producer handle is no longer registered (closed).
@@ -1566,5 +1594,81 @@ mod tests {
         // (Rust 1.85+). The workspace MSRV is 1.85 per ADR-0007 so we
         // can use it directly.
         std::task::Waker::noop().clone()
+    }
+
+    /// `last_sequence_id_published` reports `-1` until the broker has
+    /// acked at least one send. Mirrors the tokio runtime's
+    /// `Producer::last_sequence_id_published`. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn last_sequence_id_published_defaults_to_minus_one() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/last-seq-pub".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        assert_eq!(
+            producer.last_sequence_id_published(),
+            -1,
+            "no broker ack yet → -1 (parity with tokio engine + Java)"
+        );
+    }
+
+    /// `batch_len` reports `0` on a producer opened without batching.
+    /// Mirrors the tokio runtime's `Producer::batch_len`. ADR-0024 1:1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_len_reports_zero_when_batching_disabled() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/batch-len".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        assert_eq!(
+            producer.batch_len(),
+            0,
+            "batching disabled → batch_len == 0"
+        );
+    }
+
+    /// `batch_bytes` reports `0` on a producer opened without batching.
+    /// Mirrors the tokio runtime's `Producer::batch_bytes`. ADR-0024 1:1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_bytes_reports_zero_when_batching_disabled() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/batch-bytes".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            _providers: std::marker::PhantomData,
+        };
+        assert_eq!(
+            producer.batch_bytes(),
+            0,
+            "batching disabled → batch_bytes == 0"
+        );
     }
 }

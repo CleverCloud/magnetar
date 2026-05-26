@@ -209,8 +209,13 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Other`] when an unexpected outcome arrives on this request id
     ///   (state-machine bug, not a transient failure).
     pub async fn ack(&self, message_id: MessageId) -> Result<(), ClientError> {
-        self.ack_inner(vec![message_id], pb::command_ack::AckType::Individual)
-            .await
+        self.ack_inner(
+            vec![message_id],
+            pb::command_ack::AckType::Individual,
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     /// Acknowledge a cumulative position. Resolves once the broker confirms.
@@ -219,14 +224,92 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Broker`] when the broker reports an ack failure.
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn ack_cumulative(&self, message_id: MessageId) -> Result<(), ClientError> {
-        self.ack_inner(vec![message_id], pb::command_ack::AckType::Cumulative)
-            .await
+        self.ack_inner(
+            vec![message_id],
+            pb::command_ack::AckType::Cumulative,
+            Vec::new(),
+            None,
+        )
+        .await
+    }
+
+    /// Acknowledge a single message as part of a Pulsar transaction
+    /// (PIP-31). The ack only takes effect once the transaction
+    /// commits. Mirrors Java `Consumer#acknowledgeAsync(MessageId,
+    /// Transaction)`.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker reports an ack failure.
+    /// - [`ClientError::Other`] when an unexpected outcome arrives.
+    pub async fn ack_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), ClientError> {
+        self.ack_inner(
+            vec![message_id],
+            pb::command_ack::AckType::Individual,
+            Vec::new(),
+            Some(txn_id),
+        )
+        .await
+    }
+
+    /// Cumulative ack as part of a Pulsar transaction (PIP-31). Mirrors
+    /// Java `Consumer#acknowledgeCumulativeAsync(MessageId,
+    /// Transaction)`.
+    ///
+    /// # Errors
+    /// - [`ClientError::Broker`] when the broker reports an ack failure.
+    /// - [`ClientError::Other`] when an unexpected outcome arrives.
+    pub async fn ack_cumulative_with_txn(
+        &self,
+        message_id: MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Result<(), ClientError> {
+        self.ack_inner(
+            vec![message_id],
+            pb::command_ack::AckType::Cumulative,
+            Vec::new(),
+            Some(txn_id),
+        )
+        .await
+    }
+
+    /// Stage an individual ack into this consumer's ack-grouping
+    /// tracker (opt-in via `ConsumerBuilder::ack_group_time`).
+    /// Fire-and-forget: the call returns immediately without a future,
+    /// and the coalesced `CommandAck` is emitted by the state machine
+    /// once `ack_group_time` has elapsed. With no tracker configured,
+    /// the proto layer falls back to a synchronous immediate
+    /// `CommandAck` so the message is never silently dropped. Mirrors
+    /// Java's `acknowledgmentGroupTime` path.
+    pub fn ack_grouped(&self, message_id: MessageId) {
+        let now = std::time::Instant::now();
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.ack_grouped_individual(self.handle, message_id, now);
+        }
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// Stage a cumulative ack into this consumer's ack-grouping tracker.
+    /// See [`Self::ack_grouped`] for the semantics.
+    pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        let now = std::time::Instant::now();
+        {
+            let mut conn = self.shared.inner.lock();
+            conn.ack_grouped_cumulative(self.handle, message_id, now);
+        }
+        self.shared.driver_waker.notify_one();
     }
 
     async fn ack_inner(
         &self,
         message_ids: Vec<MessageId>,
         ack_type: pb::command_ack::AckType,
+        properties: Vec<(String, i64)>,
+        txn_id: Option<magnetar_proto::TxnId>,
     ) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
@@ -235,8 +318,8 @@ impl<P: Providers> Consumer<P> {
                 AckRequest {
                     message_ids,
                     ack_type,
-                    properties: Vec::new(),
-                    txn_id: None,
+                    properties,
+                    txn_id,
                 },
             )
         };
@@ -1120,5 +1203,127 @@ mod tests {
             }
             other => panic!("expected ClientError::Broker, got {other:?}"),
         }
+    }
+
+    /// `ack_grouped` is fire-and-forget; with no `ack_group_time` tracker
+    /// configured the proto layer falls back to a synchronous immediate
+    /// `CommandAck`. Calling it on a fresh consumer must NOT panic and
+    /// MUST notify the driver waker so the queued frame is flushed.
+    /// ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_grouped_falls_back_to_immediate_ack() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-grp".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        // Fire-and-forget: must not panic, must notify the driver.
+        consumer.ack_grouped(magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 0,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        });
+        // Sanity: the consumer is still registered after the call.
+        assert!(!consumer.is_closed());
+    }
+
+    /// `ack_grouped_cumulative` mirrors `ack_grouped` for cumulative
+    /// acks. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_grouped_cumulative_falls_back_to_immediate_ack() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-grp-cum".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        consumer.ack_grouped_cumulative(magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 5,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        });
+        assert!(!consumer.is_closed());
+    }
+
+    /// `ack_with_txn` queues an ack stamped with the given `TxnId`. The
+    /// returned future stays pending until the broker confirms (no driver
+    /// running here), so we just confirm the call enqueues without panic
+    /// and the consumer remains registered. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_with_txn_enqueues_request() {
+        use std::time::Duration;
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-txn".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let txn = magnetar_proto::TxnId {
+            most_sig_bits: 1,
+            least_sig_bits: 2,
+        };
+        let mid = magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 0,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let fut = consumer.ack_with_txn(mid, txn);
+        let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
+        // No driver is running → broker never confirms → the future
+        // remains pending and the timeout fires. The point of the test
+        // is that the request was enqueued without panic.
+        assert!(res.is_err(), "expected pending future (no driver)");
+        assert!(!consumer.is_closed());
+    }
+
+    /// `ack_cumulative_with_txn` mirrors `ack_with_txn` for cumulative
+    /// acks under a transaction. ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ack_cumulative_with_txn_enqueues_request() {
+        use std::time::Duration;
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/t-ack-cum-txn".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let txn = magnetar_proto::TxnId {
+            most_sig_bits: 1,
+            least_sig_bits: 2,
+        };
+        let mid = magnetar_proto::MessageId {
+            ledger_id: 1,
+            entry_id: 5,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+        };
+        let fut = consumer.ack_cumulative_with_txn(mid, txn);
+        let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
+        assert!(res.is_err(), "expected pending future (no driver)");
+        assert!(!consumer.is_closed());
     }
 }

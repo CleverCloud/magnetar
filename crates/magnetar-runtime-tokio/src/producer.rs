@@ -1199,4 +1199,80 @@ mod tests {
             "re-park must cancel the prior waker before inserting a new one",
         );
     }
+
+    /// `last_sequence_id_published` reports `-1` until the broker has
+    /// acked at least one send. ADR-0024 1:1 mirror of the moonpool
+    /// runtime test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn last_sequence_id_published_defaults_to_minus_one() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/last-seq-pub".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+        assert_eq!(
+            producer.last_sequence_id_published(),
+            -1,
+            "no broker ack yet → -1 (parity with moonpool engine + Java)"
+        );
+    }
+
+    /// `batch_len` reports `0` on a producer opened without batching.
+    /// ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_len_reports_zero_when_batching_disabled() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/batch-len".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+        assert_eq!(
+            producer.batch_len(),
+            0,
+            "batching disabled → batch_len == 0"
+        );
+    }
+
+    /// `batch_bytes` reports `0` on a producer opened without batching.
+    /// ADR-0024 1:1 mirror.
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_bytes_reports_zero_when_batching_disabled() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/batch-bytes".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared,
+            handle,
+            compression: CompressionKind::None,
+            encryptor: None,
+        };
+        assert_eq!(
+            producer.batch_bytes(),
+            0,
+            "batching disabled → batch_bytes == 0"
+        );
+    }
 }

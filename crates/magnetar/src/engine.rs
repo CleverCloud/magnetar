@@ -320,6 +320,34 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// happened yet. Mirrors Java
     /// `Producer#getLastDisconnectedTimestamp`.
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime>;
+
+    /// Compression codec this producer was opened with. Mirrors Java
+    /// `ProducerImpl#conf.getCompressionType()`. Returns
+    /// `CompressionKind::None` when the producer was opened without
+    /// explicit compression.
+    fn compression(&self) -> magnetar_proto::types::CompressionKind;
+
+    /// Last sequence id the broker has acknowledged via
+    /// `CommandSendReceipt`. Returns `-1` if no sends have been acked
+    /// yet. Mirrors Java
+    /// `Producer#getLastSequenceIdPublished`. Useful for
+    /// resume-from-checkpoint flows.
+    fn last_sequence_id_published(&self) -> i64;
+
+    /// Number of in-flight sends (queued and not yet acked by the
+    /// broker). Mirrors the un-batched view of Java
+    /// `ProducerStats#getPendingQueueSize`. Equivalent to
+    /// `self.stats().pending_queue_size as usize` but spares the full
+    /// stats snapshot.
+    fn pending_count(&self) -> usize;
+
+    /// Number of messages currently buffered in the batch container,
+    /// waiting for the next flush cycle. Returns `0` when batching is
+    /// disabled or the batch is empty.
+    fn batch_len(&self) -> usize;
+
+    /// Sum of payload bytes currently buffered in the batch container.
+    fn batch_bytes(&self) -> usize;
 }
 
 /// Pulsar consumer wire surface — implemented by each runtime on its
@@ -454,6 +482,39 @@ pub trait ConsumerApi: 'static + Send + Sync {
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
     where
         Self: Sized;
+
+    /// Fire-and-forget individual ack into the consumer's
+    /// ack-grouping tracker (opt-in via
+    /// `ConsumerBuilder::ack_group_time`). The state machine flushes
+    /// the tracker after `ack_group_time` elapses, emitting one
+    /// coalesced `CommandAck`. With no tracker configured, the proto
+    /// layer falls back to a synchronous immediate `CommandAck` so the
+    /// message is never silently dropped. Mirrors Java's
+    /// `acknowledgmentGroupTime` path.
+    fn ack_grouped(&self, message_id: magnetar_proto::MessageId);
+
+    /// Fire-and-forget cumulative ack into the consumer's ack-grouping
+    /// tracker. See [`Self::ack_grouped`] for the semantics.
+    fn ack_grouped_cumulative(&self, message_id: magnetar_proto::MessageId);
+
+    /// Acknowledge `message_id` as part of a Pulsar transaction
+    /// (PIP-31). The ack only takes effect once the transaction
+    /// commits. Mirrors Java
+    /// `Consumer#acknowledgeAsync(MessageId, Transaction)`.
+    fn ack_with_txn(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Cumulative ack as part of a Pulsar transaction (PIP-31).
+    /// Mirrors Java
+    /// `Consumer#acknowledgeCumulativeAsync(MessageId, Transaction)`.
+    fn ack_cumulative_with_txn(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
 }
 
 /// Engine-side subscribe surface used by `ConsumerBuilder<E>` and the
@@ -637,6 +698,26 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         magnetar_runtime_tokio::Producer::last_disconnected_timestamp(self)
     }
+
+    fn compression(&self) -> magnetar_proto::types::CompressionKind {
+        magnetar_runtime_tokio::Producer::compression(self)
+    }
+
+    fn last_sequence_id_published(&self) -> i64 {
+        magnetar_runtime_tokio::Producer::last_sequence_id_published(self)
+    }
+
+    fn pending_count(&self) -> usize {
+        magnetar_runtime_tokio::Producer::pending_count(self)
+    }
+
+    fn batch_len(&self) -> usize {
+        magnetar_runtime_tokio::Producer::batch_len(self)
+    }
+
+    fn batch_bytes(&self) -> usize {
+        magnetar_runtime_tokio::Producer::batch_bytes(self)
+    }
 }
 
 #[cfg(feature = "tokio")]
@@ -755,6 +836,34 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(magnetar_runtime_tokio::Consumer::close(self))
     }
+
+    fn ack_grouped(&self, message_id: magnetar_proto::MessageId) {
+        magnetar_runtime_tokio::Consumer::ack_grouped(self, message_id);
+    }
+
+    fn ack_grouped_cumulative(&self, message_id: magnetar_proto::MessageId) {
+        magnetar_runtime_tokio::Consumer::ack_grouped_cumulative(self, message_id);
+    }
+
+    fn ack_with_txn(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::ack_with_txn(
+            self, message_id, txn_id,
+        ))
+    }
+
+    fn ack_cumulative_with_txn(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::ack_cumulative_with_txn(
+            self, message_id, txn_id,
+        ))
+    }
 }
 
 #[cfg(all(feature = "tokio", feature = "moonpool"))]
@@ -821,6 +930,26 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
 
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         magnetar_runtime_moonpool::Producer::last_disconnected_timestamp(self)
+    }
+
+    fn compression(&self) -> magnetar_proto::types::CompressionKind {
+        magnetar_runtime_moonpool::Producer::compression(self)
+    }
+
+    fn last_sequence_id_published(&self) -> i64 {
+        magnetar_runtime_moonpool::Producer::last_sequence_id_published(self)
+    }
+
+    fn pending_count(&self) -> usize {
+        magnetar_runtime_moonpool::Producer::pending_count(self)
+    }
+
+    fn batch_len(&self) -> usize {
+        magnetar_runtime_moonpool::Producer::batch_len(self)
+    }
+
+    fn batch_bytes(&self) -> usize {
+        magnetar_runtime_moonpool::Producer::batch_bytes(self)
     }
 }
 
@@ -943,6 +1072,34 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(magnetar_runtime_moonpool::Consumer::close(self))
+    }
+
+    fn ack_grouped(&self, message_id: magnetar_proto::MessageId) {
+        magnetar_runtime_moonpool::Consumer::ack_grouped(self, message_id);
+    }
+
+    fn ack_grouped_cumulative(&self, message_id: magnetar_proto::MessageId) {
+        magnetar_runtime_moonpool::Consumer::ack_grouped_cumulative(self, message_id);
+    }
+
+    fn ack_with_txn(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::ack_with_txn(
+            self, message_id, txn_id,
+        ))
+    }
+
+    fn ack_cumulative_with_txn(
+        &self,
+        message_id: magnetar_proto::MessageId,
+        txn_id: magnetar_proto::TxnId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(
+            magnetar_runtime_moonpool::Consumer::ack_cumulative_with_txn(self, message_id, txn_id),
+        )
     }
 }
 
