@@ -44,6 +44,12 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0026](adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) | D1–D4 design decisions (FDB / Pulsar Java / Codex synthesis): concrete generic surfaces (not GATs); pure-sim chaos; defer SASL/Athenz; implement vendor-proto | Accepted |
 | [0027](adr/0027-moonpool-engine-clientstate-is-runtime-client.md) | `MoonpoolEngine::ClientState` is `magnetar_runtime_moonpool::Client<P>` directly; drops `MoonpoolClientState` wrapper, partially supersedes ADR-0019 §gate (e) | Accepted |
 | [0028](adr/0028-supervised-reconnect-anti-thrash-policy.md) | Opt-in anti-thrash policy for supervised reconnect: per-handle ack-then-drop window + connection-level cooldown (mitigates broker-driven post-restart cascade, follow-up #74) | Proposed |
+| [0029](adr/0029-sasl-kerberos-gssapi-scope.md) | v0.2.0 scope for SASL Kerberos / GSSAPI: libgssapi binding behind `kerberos` feature, AUTH_CHALLENGE continuation, Dockerised KDC fixture | Proposed |
+| [0030](adr/0030-athenz-zts-round-trip-scope.md) | v0.2.0 scope for Athenz ZTS round-trip: reqwest-backed ZTS client with expiry-aware caching, Dockerised ZTS fixture | Proposed |
+| [0031](adr/0031-pip-460-scalable-subscription-scope.md) | v0.2.0 scope for PIP-460 scalable subscription model — wire-protocol delta, sans-io additions, test plan | Proposed |
+| [0032](adr/0032-pip-466-v5-client-surface-scope.md) | v0.2.0 scope for PIP-466 V5 client surface — API-shape decision (no wire change); rename evaluation | Proposed |
+| [0033](adr/0033-pip-180-shadow-topic-scope.md) | v0.2.0 scope for PIP-180 shadow topic — read-only follower subscription mode, no-ack/no-seek consumer semantics | Proposed |
+| [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Proposed |
 
 ## How to add an ADR
 
