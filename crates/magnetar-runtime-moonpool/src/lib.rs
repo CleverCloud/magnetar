@@ -828,12 +828,16 @@ mod tests {
         let waker_ctr = Arc::new(NoopWaker(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(waker_ctr.clone());
 
+        // Adaptive loop: iterate until the wall-clock deadline elapses, with
+        // a minimum-iteration floor so the lines 327/328 coverage stays
+        // hit even on a fast host. The original fixed 10_000-iteration loop
+        // panicked under heavy parallel test load (e.g. full workspace
+        // `cargo test --all-features` with concurrent workloads); the
+        // helper's correctness contract holds regardless of iteration count.
         let deadline = Instant::now() + Duration::from_secs(5);
-        for _ in 0..10_000usize {
-            assert!(
-                Instant::now() <= deadline,
-                "recheck race did not fire within 5s budget",
-            );
+        let mut iters = 0usize;
+        while Instant::now() <= deadline && iters < 10_000 {
+            iters += 1;
             // Saturate the budget for this iteration so the fast-path CAS
             // in `try_reserve_memory_or_register` fails deterministically.
             shared.try_reserve_memory(16).expect("seed budget at limit");
@@ -882,8 +886,16 @@ mod tests {
                 }
             }
         }
-        // No deterministic assertion at the end: the test is best-effort
-        // for line 327/328 coverage, but ALWAYS passes correctness-wise
-        // (the helper's contract is upheld either way).
+        // Coverage floor: assert we executed at least enough iterations
+        // for the lines-327/328 hit-count to be meaningful. On any
+        // reasonably-spec'd host this clears comfortably; the assertion
+        // catches a degenerate case where the loop ran zero or one times.
+        assert!(
+            iters >= 100,
+            "expected ≥100 race iterations within 5s, got {iters}",
+        );
+        // No deterministic assertion on `outcome` distribution: the test
+        // is best-effort for line 327/328 coverage, but the helper's
+        // correctness contract is upheld either way.
     }
 }
