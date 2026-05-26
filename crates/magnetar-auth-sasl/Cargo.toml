@@ -1,6 +1,6 @@
 [package]
 name        = "magnetar-auth-sasl"
-description = "SASL auth provider for magnetar."
+description = "SASL auth providers (PLAIN + Kerberos/GSSAPI) for magnetar."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -17,12 +17,16 @@ workspace = true
 
 [dependencies]
 bytes          = { workspace = true }
+libgssapi      = { workspace = true, optional = true }
 magnetar-proto = { workspace = true }
+parking_lot    = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
 
 [features]
-# Kerberos/GSSAPI support is feature-gated. Disabled by default so the crate stays
-# easy to build on systems without `libkrb5`. When enabled, the implementation will
-# wire `SaslKerberos` to a GSSAPI library (not in M6).
-kerberos = []
+# Real GSSAPI/Kerberos support. Pulls in the `libgssapi` crate, which links
+# against the system MIT KRB5 / Heimdal runtime. Off by default so the crate
+# builds on hosts without `libkrb5`. The SASL state machine and the
+# scripted-token test fake are always available; the GSSAPI binding itself
+# (`LibGssapiClient`) lives behind this flag — see ADR-0029.
+kerberos = ["dep:libgssapi"]

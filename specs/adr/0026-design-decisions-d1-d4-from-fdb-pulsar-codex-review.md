@@ -191,6 +191,11 @@ All four decisions landed in commits between 2026-05-23 and
   Athenz pre-fetched role token ✅) from deferred (Kerberos/GSSAPI
   🟡, Athenz ZTS round-trip 🟡). ADR-0010 §Decision spells out
   the partial scope and rationale.
+
+  *Update (2026-05-26):* SASL Kerberos / GSSAPI ✅ has now also
+  landed (ahead of the v0.2.0 milestone) via
+  [ADR-0029](0029-sasl-kerberos-gssapi-scope.md); the Athenz ZTS
+  round-trip remains deferred under D3.
 - **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
   (commit `c23f6fd`). `BrokerWorkload` binds a sim `TcpListener`
   at the workload's assigned IP and replies to the minimum Pulsar

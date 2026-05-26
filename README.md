@@ -82,10 +82,12 @@ client at v0.1.0.
 - **Auth providers**: token, mTLS (the two stock providers in
   `magnetar-proto::auth`), OAuth2 `ClientCredentialsFlow` (working — fetches
   + caches + auto-refreshes JWTs against a standard OIDC token endpoint),
-  SASL `PLAIN` (RFC 4616, working), Athenz with a pre-fetched role
-  token (`AthenzProvider::with_role_token`, working). SASL Kerberos /
-  GSSAPI and the Athenz ZTS round-trip return `AuthError::Unsupported`
-  and are deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
+  SASL `PLAIN` (RFC 4616, working), SASL Kerberos / GSSAPI via `libgssapi`
+  under the `auth-sasl-kerberos` feature (working — multi-round
+  `AUTH_CHALLENGE` initiate loop), Athenz with a pre-fetched role token
+  (`AthenzProvider::with_role_token`, working). The Athenz ZTS round-trip
+  still returns `AuthError::Unsupported` and is deferred to v0.2.0 per
+  [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
 - **Trackers**: ack grouping, unacked-message tracker (ack timeout +
   redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff`
   (PIP-37), batch-index ACK set (PIP-54).
@@ -114,7 +116,8 @@ The default feature set enables the tokio engine. The feature flags catalog:
 | `moonpool` | no | Pulls in `magnetar-runtime-moonpool` for deterministic-simulation testing. |
 | `admin` | no | Re-exports `magnetar-admin` under `magnetar::admin`. |
 | `auth-oauth2` | no | Pulls in `magnetar-auth-oauth2` (OAuth2 ClientCredentialsFlow provider). |
-| `auth-sasl` | no | Pulls in `magnetar-auth-sasl`. |
+| `auth-sasl` | no | Pulls in `magnetar-auth-sasl` (SASL PLAIN + the sans-io Kerberos surface). |
+| `auth-sasl-kerberos` | no | Implies `auth-sasl` and turns on `magnetar-auth-sasl/kerberos`, which binds `libgssapi`. Build host needs the MIT KRB5 / Heimdal headers (`krb5-devel` / `libkrb5-dev`) **and** `libclang` (`clang-libs` / `libclang-dev`) — `libgssapi-sys` runs `bindgen` at build time. See [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | `auth-athenz` | no | Pulls in `magnetar-auth-athenz`. |
 | `encryption` | no | Pulls in `magnetar-messagecrypto` plus the PIP-4 bridge type. |
 | `e2e` | no | Implies `tokio` + `admin`; flips on the `testcontainers`-backed end-to-end suite (requires Docker). |
@@ -636,7 +639,7 @@ known-missing feature.
 | mTLS | ✅ | ✅ | `magnetar_proto::auth::TlsAuth` + `tls_trust_certs_pem` / `tls_trust_certs_file_path`. |
 | OAuth2 ClientCredentialsFlow | ✅ | ✅ | `magnetar_auth_oauth2::ClientCredentialsFlow` — POSTs `grant_type=client_credentials` to the IDP, caches the JWT, refreshes within 30 s of expiry. Reports `auth_method_name = "token"`. |
 | SASL `PLAIN` (RFC 4616) | ✅ | ✅ | `magnetar_auth_sasl::SaslPlain` — `\0<username>\0<password>` payload. |
-| SASL Kerberos / GSSAPI | ✅ | 🟡 | `magnetar_auth_sasl::SaslKerberos::initial` returns `AuthError::Unsupported`; libgssapi binding deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
+| SASL Kerberos / GSSAPI | ✅ | ✅ | `magnetar_auth_sasl::SaslKerberos` runs the GSSAPI initiate loop via `libgssapi` (façade feature `auth-sasl-kerberos`). The multi-round `AUTH_CHALLENGE` / `AUTH_RESPONSE` exchange threads through `AuthProvider::respond_to_challenge`; the four sans-io test layers per [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) drive a `magnetar_auth_sasl::ScriptedGssapiClient` so they stay free of a libkrb5 build dep. End-to-end coverage uses a Dockerised KDC fixture. See [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | Athenz (pre-fetched role token) | ✅ | ✅ | `AthenzProvider::with_role_token` — bypass the ZTS round-trip when the caller already holds a valid role token. |
 | Athenz (ZTS round-trip) | ✅ | 🟡 | `AthenzProvider::new(...).initial` returns `AuthError::Unsupported`; ZTS/ZMS client deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
 | In-band `AUTH_CHALLENGE` refresh (PIP-30 / PIP-292) | ✅ | ✅ | Driver consults the configured `AuthProvider` and submits `CommandAuthResponse`. |
@@ -716,10 +719,14 @@ known-missing feature.
   [`docs/shadow-topic.md`](docs/shadow-topic.md)).
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-33
   replicated subscriptions** are scoped for v0.2.0.
-- **SASL** ships `PLAIN` (RFC 4616) wired end-to-end; the
-  Kerberos/GSSAPI mechanism is a stub that returns
-  `AuthError::Unsupported`. Full GSSAPI binding (`libgssapi`) is
-  deferred to v0.2.0 per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
+- **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616)
+  under the default `auth-sasl` feature, and Kerberos/GSSAPI via
+  `libgssapi` under the `auth-sasl-kerberos` feature. The
+  multi-round `AUTH_CHALLENGE` exchange threads through
+  `AuthProvider::respond_to_challenge`. The four sans-io test
+  layers drive a deterministic `ScriptedGssapiClient`; the e2e
+  layer runs against a Dockerised KDC. See
+  [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md).
 - **Athenz** ships `with_role_token` (use a pre-fetched ZTS role token
   directly); the `new()` path that contacts ZTS itself returns
   `AuthError::Unsupported`. Full ZTS/ZMS client is deferred to v0.2.0

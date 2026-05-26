@@ -46,6 +46,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # `magnetar-auth-sasl/kerberos` (and the façade's
+      # `auth-sasl-kerberos`) pull in `libgssapi`, which links against
+      # MIT KRB5 / GSSAPI. The Ubuntu runner has the runtime libraries
+      # but not the development headers; install them so `--all-features`
+      # can resolve `krb5-gssapi.pc`. See ADR-0029.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   build:
@@ -62,6 +69,10 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
+      # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
+      # headers. Runtime libs ship by default; the -dev package only.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo build --workspace --all-features --locked
 
   test:
@@ -72,6 +83,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
+      # headers. Runtime libs ship by default; the -dev package only.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo test --workspace --all-features --locked
 
   doc:
@@ -82,6 +97,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
+      # headers for the rustdoc build under `--all-features`.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo doc --workspace --all-features --no-deps --locked
 
   deny:
@@ -140,6 +159,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
+      # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
+      # headers under `--all-features`.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - run: cargo build --workspace --all-features --locked
 
   codegen-check:
@@ -179,10 +202,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ADR-0029: e2e_sasl_kerberos.rs links `libgssapi`; install MIT
+      # KRB5 headers.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
       - name: Pre-pull Pulsar image (caches the layer for faster container startup)
         run: docker pull apachepulsar/pulsar:4.0.4
+      - name: Pre-pull KDC image (caches the layer for the SASL Kerberos e2e)
+        run: docker pull gcavalcante8808/krb5-server:latest || true
       - name: Run e2e suite
-        run: cargo test --workspace --features e2e --locked -- --nocapture
+        run: cargo test --workspace --features e2e,auth-sasl-kerberos --locked -- --nocapture
         timeout-minutes: 75
 
   mutants-smoke:

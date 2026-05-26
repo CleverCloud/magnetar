@@ -27,6 +27,11 @@ moonpool = ["tokio", "dep:magnetar-runtime-moonpool", "dep:moonpool-core"]
 admin    = ["dep:magnetar-admin"]
 auth-oauth2 = ["dep:magnetar-auth-oauth2"]
 auth-sasl   = ["dep:magnetar-auth-sasl"]
+# `auth-sasl-kerberos` implies `auth-sasl` and turns on the GSSAPI binding
+# in `magnetar-auth-sasl` (see that crate's `kerberos` feature + ADR-0029).
+# Pulls `libgssapi` into the dependency graph; requires the system MIT KRB5
+# or Heimdal runtime to be installed on the build host.
+auth-sasl-kerberos = ["auth-sasl", "magnetar-auth-sasl/kerberos"]
 auth-athenz = ["dep:magnetar-auth-athenz"]
 encryption  = ["dep:magnetar-messagecrypto"]
 # End-to-end tests against a real Pulsar 4.x standalone broker via

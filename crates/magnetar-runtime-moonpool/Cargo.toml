@@ -49,3 +49,7 @@ tokio          = { workspace = true, features = ["sync", "macros", "rt", "rt-mul
 # minimum Pulsar wire subset. See ADR-0026 §D2.
 moonpool-sim   = { workspace = true }
 async-trait    = { workspace = true }
+# SASL Kerberos integration test driver. `magnetar-auth-sasl` ships
+# `ScriptedGssapiClient` without enabling the `kerberos` feature so this
+# dev-dep does NOT pull libgssapi into the build (ADR-0029 + ADR-0024 §3).
+magnetar-auth-sasl = { workspace = true }

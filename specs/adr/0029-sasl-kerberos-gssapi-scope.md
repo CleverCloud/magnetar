@@ -1,9 +1,10 @@
-# ADR-0029 — SASL Kerberos / GSSAPI scope for v0.2.0
+# ADR-0029 — SASL Kerberos / GSSAPI binding
 
-- **Status**: Proposed
+- **Status**: Accepted — landed ahead of the v0.2.0 milestone
+  (2026-05-26)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
-- **Tags**: auth, sasl, kerberos, gssapi, v0.2.0, scope
+- **Tags**: auth, sasl, kerberos, gssapi, landed
 
 ## Context
 
@@ -166,9 +167,51 @@ plan has a concrete sizing and acceptance contract.
   parsing if a downstream user requires drop-in compatibility with
   a Java application's JAAS config. Not in scope here.
 
+## As-implemented amendments (2026-05-26)
+
+The design under "Decision" was tightened during implementation in
+two places — both simplifications, neither changes the wire
+behaviour described in this ADR:
+
+1. **No new `SaslMechanism` trait in `magnetar-proto`.** The
+   provided design proposed introducing a `SaslMechanism` trait
+   inside `magnetar-proto::auth` so the `Conn` state machine could
+   drive multi-step authentication. As-shipped the existing
+   `AuthProvider::respond_to_challenge` hook (already used by
+   PIP-30 / PIP-292 token refresh) is reused verbatim: each
+   `CommandAuthChallenge` is funneled through the same
+   `AuthChallengeState::handle_challenge` path, and `SaslKerberos`
+   threads continuation tokens by forwarding into the wrapped
+   `GssapiClient`. No protocol-layer changes were necessary;
+   `magnetar-proto` already supports arbitrary multi-round SASL
+   handshakes via `AuthChallengeState` (verified by the new
+   `multi_round_handshake_threads_continuation_tokens` test on
+   `magnetar-proto::auth`).
+
+2. **No `SaslKerberosConfig` JAAS-subset struct (yet).** The
+   provided design proposed surfacing `SaslKerberosConfig` with
+   `jaas_section` / `server_type` / `server_principal` / `keytab` /
+   `ticket_cache` fields. As-shipped the constructor is the simpler
+   `SaslKerberos::with_principal(spn: &str)`, which delegates to
+   `libgssapi::credential::Cred::acquire` with default initiator
+   credentials — i.e. the host's default credential cache or
+   keytab as resolved by the system Kerberos config. Explicit
+   keytab and ticket-cache injection becomes a follow-up if a
+   downstream user needs it; the trade-off is documented here so
+   the broader scope is preserved.
+
+The `SaslKerberosFake` from the original design ships as
+[`magnetar_auth_sasl::ScriptedGssapiClient`] — a reusable
+`GssapiClient` implementation that replays a fixed transcript of
+`(challenge, reply, continue_needed)` triples. All four sans-io
+test layers per ADR-0024 (proto, tokio, moonpool, differential)
+drive `ScriptedGssapiClient`; the e2e layer
+(`crates/magnetar/tests/e2e_sasl_kerberos.rs`) drives
+`LibGssapiClient` against a Dockerised KDC.
+
 ## Status
 
-Proposed (awaiting Florentin sign-off, 2026-05-26)
+Accepted — landed via `feat/sasl-kerberos` on 2026-05-26.
 
 ## References
 

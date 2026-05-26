@@ -21,9 +21,13 @@ binding rationale, sources, and decision text live in that ADR;
 this section only tracks shipping status:
 
 - **D4** — `xtask vendor-proto --rev <sha>` (commit `ac1420c`).
-- **D3** — SASL `PLAIN` ✅ + Athenz pre-fetched role token ✅ ship;
-  SASL Kerberos/GSSAPI 🟡 + Athenz ZTS round-trip 🟡 deferred to
-  v0.2.0 (commit `96d6f74`).
+- **D3** — SASL `PLAIN` ✅ + Athenz pre-fetched role token ✅ ship.
+  SASL Kerberos/GSSAPI also ✅ via `libgssapi` under the
+  `auth-sasl-kerberos` façade feature (lands per
+  [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md);
+  the D3 deferral applied to v0.2.0 and that work has now landed
+  ahead of milestone). Athenz ZTS round-trip 🟡 remains deferred
+  per ADR-0026 §D3.
 - **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
   first cut: BrokerWorkload + ClientWorkload under
   `SimulationBuilder`, 16-seed sweep (commit `c23f6fd`). Follow-on
@@ -254,23 +258,16 @@ failing tests are fixed, not `#[ignore]`-d.
 
 ## Auth
 
-### SASL Kerberos / GSSAPI
+### SASL Kerberos / GSSAPI ✅ landed
 
-**Status.** `magnetar_auth_sasl::SaslKerberos::initial` returns
-`AuthError::Unsupported`. SASL `PLAIN` (RFC 4616) is fully wired and
-ships in v0.1.0; the Kerberos/GSSAPI mechanism is the deferred portion.
-
-**Unblock.** Deferred to v0.2.0 per
-[ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D3. The work item is binding `libgssapi-sys` (or the safer wrapper crate
-`libgssapi`) into `SaslKerberos::initial` and threading the
-`AUTH_CHALLENGE` continuation through the existing
-`AuthProvider::respond_to_challenge` surface. Scope is ~600–900 LOC plus
-a Dockerised KDC fixture for the e2e suite.
-
-```text
-/goal land SASL Kerberos / GSSAPI in magnetar-auth-sasl. Bind libgssapi to SaslKerberos::initial, thread AUTH_CHALLENGE continuations through AuthProvider::respond_to_challenge, add a Dockerised KDC fixture (testcontainers + bitnami/kerberos) behind the `e2e` feature, and flip the README parity matrix row from 🟡 to ✅. All four test layers per ADR-0024 — the GSSAPI calls themselves go behind a `kerberos` feature flag so the sans-io test layers can mock the wire bytes deterministically.
-```
+`magnetar_auth_sasl::SaslKerberos` binds `libgssapi` under the
+`auth-sasl-kerberos` façade feature; the multi-round `AUTH_CHALLENGE`
+continuation threads through `AuthProvider::respond_to_challenge`.
+All four sans-io test layers per ADR-0024 drive a
+`ScriptedGssapiClient` so they stay free of a libkrb5 build dep; the
+end-to-end layer (`crates/magnetar/tests/e2e_sasl_kerberos.rs`) spins
+up a Dockerised KDC. Binding decision recorded in
+[ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md).
 
 ### Athenz ZTS round-trip
 

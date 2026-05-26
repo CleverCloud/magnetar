@@ -248,4 +248,112 @@ mod tests {
         assert_eq!(inner.auth_data.as_deref(), Some(b"static-token".as_slice()));
         assert_eq!(state.completed(), 1);
     }
+
+    /// Provider that scripts a multi-step SASL Kerberos / GSSAPI exchange.
+    /// Models what `magnetar_auth_sasl::SaslKerberos` does at the trait
+    /// surface: the server-issued challenge is fed into a step counter, and
+    /// each response carries a distinct continuation token. Pinning this in
+    /// `magnetar-proto` (instead of in the auth crate) ensures the sans-io
+    /// state machine itself handles arbitrary multi-round SASL handshakes —
+    /// not just the single-round token-refresh case (PIP-30 / PIP-292).
+    #[derive(Debug)]
+    struct ScriptedSaslProvider {
+        replies: std::sync::Mutex<std::vec::IntoIter<Bytes>>,
+        /// Last challenge bytes observed — assertions in the test read this.
+        last_challenge: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    impl ScriptedSaslProvider {
+        fn new(replies: Vec<Bytes>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into_iter()),
+                last_challenge: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl AuthProvider for ScriptedSaslProvider {
+        fn method(&self) -> &str {
+            "sasl"
+        }
+        fn initial(&self) -> Result<Bytes, AuthError> {
+            // The very first call carries an empty challenge — record it for
+            // the assertions in the multi-round test below.
+            *self.last_challenge.lock().expect("mutex poisoned") = Some(Vec::new());
+            self.replies
+                .lock()
+                .expect("mutex poisoned")
+                .next()
+                .ok_or_else(|| AuthError::Invalid("scripted SASL transcript exhausted".to_owned()))
+        }
+        fn respond_to_challenge(&self, challenge: &[u8]) -> Result<Bytes, AuthError> {
+            *self.last_challenge.lock().expect("mutex poisoned") = Some(challenge.to_vec());
+            self.replies
+                .lock()
+                .expect("mutex poisoned")
+                .next()
+                .ok_or_else(|| AuthError::Invalid("scripted SASL transcript exhausted".to_owned()))
+        }
+    }
+
+    /// Multi-round SASL Kerberos handshake: the broker issues three
+    /// `CommandAuthChallenge` events in sequence, and the connection state
+    /// must thread each one back into the same `AuthProvider` instance via
+    /// `respond_to_challenge`. Validates that:
+    /// 1. `AuthChallengeState` is reusable across consecutive challenges.
+    /// 2. `completed()` reports the cumulative round-trip count.
+    /// 3. The protocol-version echo on every `CommandAuthResponse` matches the broker's
+    ///    `CommandAuthChallenge.protocol_version`.
+    /// 4. The `auth_method_name` is constant across the whole exchange (the SASL mechanism doesn't
+    ///    change mid-handshake).
+    ///
+    /// Mirrors the GSSAPI initiate-loop the Java `AuthenticationSasl`
+    /// client drives over `ClientCnx.handleAuthChallenge` until SASL state
+    /// flips to COMPLETE.
+    #[test]
+    fn multi_round_handshake_threads_continuation_tokens() {
+        let provider = ScriptedSaslProvider::new(vec![
+            Bytes::from_static(b"gss-step-2"),
+            Bytes::from_static(b"gss-step-3"),
+            Bytes::from_static(b"gss-final"),
+        ]);
+        let mut state = AuthChallengeState::new();
+        let challenges = [
+            (b"server-nonce-1".to_vec(), 21u32),
+            (b"server-nonce-2".to_vec(), 21u32),
+            (b"server-nonce-3".to_vec(), 21u32),
+        ];
+        let expected_replies: [&[u8]; 3] = [b"gss-step-2", b"gss-step-3", b"gss-final"];
+        for (idx, (challenge, version)) in challenges.iter().enumerate() {
+            let cmd = pb::CommandAuthChallenge {
+                server_version: Some("test/0".to_owned()),
+                challenge: Some(pb::AuthData {
+                    auth_method_name: Some("sasl".to_owned()),
+                    auth_data: Some(challenge.clone()),
+                }),
+                protocol_version: Some(*version as i32),
+            };
+            let response = state
+                .handle_challenge(&cmd, &provider)
+                .expect("challenge response");
+            // After each round, in_progress flips back to idle. completed
+            // counts every challenge — pin the cumulative count.
+            assert!(!state.is_in_progress());
+            assert_eq!(state.completed() as usize, idx + 1);
+            let inner = response.response.expect("response payload");
+            assert_eq!(inner.auth_method_name.as_deref(), Some("sasl"));
+            assert_eq!(inner.auth_data.as_deref(), Some(expected_replies[idx]));
+            assert_eq!(response.protocol_version, Some(*version as i32));
+            // Provider must have observed the most recent broker challenge.
+            assert_eq!(
+                provider
+                    .last_challenge
+                    .lock()
+                    .expect("mutex poisoned")
+                    .as_deref(),
+                Some(challenge.as_slice()),
+            );
+        }
+        assert_eq!(state.completed(), 3);
+    }
 }

@@ -49,3 +49,7 @@ url                 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "test-util", "time", "sync"] }
+# Used by the SASL Kerberos integration test; the auth-sasl crate ships
+# `ScriptedGssapiClient` without enabling the `kerberos` feature, so this
+# dev-dep does NOT pull libgssapi into the build.
+magnetar-auth-sasl = { workspace = true }

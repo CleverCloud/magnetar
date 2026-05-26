@@ -111,7 +111,7 @@ Everything else with a `🟡` or `❌` in the README parity matrix is one of:
 | Item | Status | Why deferred |
 | --- | --- | --- |
 | **SASL `PLAIN` (RFC 4616)** | ✅ landed | `magnetar_auth_sasl::SaslPlain` emits the `\0<user>\0<pass>` payload. Useful for username/password broker auth in tests and for brokers configured without a token provider. |
-| **SASL Kerberos / GSSAPI** | 🟡 deferred to v0.2.0 | `magnetar_auth_sasl::SaslKerberos::initial` returns `AuthError::Unsupported`; the GSSAPI binding (`libgssapi`) is a multi-stakeholder dependency, deferred per [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
+| **SASL Kerberos / GSSAPI** | ✅ landed | `magnetar_auth_sasl::SaslKerberos` binds `libgssapi` under the `auth-sasl-kerberos` façade feature. The multi-round `AUTH_CHALLENGE` continuation threads through `AuthProvider::respond_to_challenge`. The four sans-io test layers per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md) drive a `ScriptedGssapiClient`; e2e uses a Dockerised KDC. See [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | **Athenz (pre-fetched role token)** | ✅ landed | `AthenzProvider::with_role_token` uses the supplied token as the `auth_data` payload — useful when an out-of-band agent (`zts-agent`, sidecar) already mints the token. |
 | **Athenz (ZTS round-trip)** | 🟡 deferred to v0.2.0 | `AthenzProvider::new(...).initial` returns `AuthError::Unsupported`; the ZTS/ZMS client is deferred per [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3. |
 | **PIP-460** — Scalable topics | ❌ | Experimental in Apache Pulsar; surface still iterating upstream. v0.2.0. |
