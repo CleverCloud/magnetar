@@ -373,3 +373,135 @@ fn lookup_ordering(kinds: &[i32]) -> (bool, bool) {
         matches!((lookup, subscribe), (Some(l), Some(s)) if l < s),
     )
 }
+
+/// Golden 7 — seek-per-partition: subscribe to four partitions of a
+/// partitioned topic, publish 5 messages on each (20 total), drain
+/// everything, then seek **partition 2 only** and assert that
+/// 1. partition 2's consumer replays its five payloads, AND
+/// 2. partitions 0, 1, 3 stay at the post-drain cursor (their next `Recv` times out — no spillover
+///    from the seek).
+///
+/// Cross-engine assertion is via [`assert_equivalent`] — tokio and
+/// moonpool must emit identical `EventStream`s. The broker-side
+/// invariant ("Seek only touches partition 2") is additionally
+/// asserted via the broker's [`ScriptedBroker::seeked_partitions_snapshot`]
+/// log: it must record exactly `[2]` for each engine leg.
+#[tokio::test(flavor = "current_thread")]
+async fn seek_per_partition_replays_only_one_partition() {
+    const PARTITIONS: i32 = 4;
+    const PER_PART: u8 = 5;
+    const BASE_TOPIC: &str = "persistent://public/default/seek-per-part-test";
+
+    // Build the 3-step ops list.
+    let mut ops: Vec<Op> = Vec::new();
+
+    // Step 1+2: per-partition publishes. Subscribes happen lazily inside
+    // the runner on the first `RecvPartition` op for that partition.
+    for p in 0..PARTITIONS {
+        for i in 0..PER_PART {
+            ops.push(Op::SendPartition {
+                partition: p,
+                payload: vec![b'p', b'0' + u8::try_from(p).unwrap_or(0), b'-', b'0' + i],
+            });
+        }
+    }
+    // Drain Step-2 messages so each partition's consumer cursor lands
+    // past the 5 stored messages.
+    for p in 0..PARTITIONS {
+        for _ in 0..PER_PART {
+            ops.push(Op::RecvPartition {
+                partition: p,
+                timeout: Duration::from_secs(2),
+            });
+        }
+    }
+    // Step 3: seek partition 2 only. Then issue one Recv per partition.
+    // Partition 2 must replay; others must time out (their cursor is at
+    // EOF and the broker has no more messages queued).
+    ops.push(Op::SeekPartition {
+        partition: 2,
+        message_id: mid(1, 0),
+    });
+    for p in 0..PARTITIONS {
+        ops.push(Op::RecvPartition {
+            partition: p,
+            // Partition 2 will get a quick replay; the others need a
+            // short timeout so the trace stays sub-second when nothing
+            // arrives. Keep timings identical across the two engines so
+            // the `EventStream`s compare equal.
+            timeout: Duration::from_millis(250),
+        });
+    }
+    ops.push(Op::Close);
+
+    let trace = Trace::new(BASE_TOPIC, "sub-seek-part", ops);
+
+    // Run both legs against fresh broker instances and collect the
+    // broker-side seeked-partition log so we can assert engine-local
+    // invariants beyond the EventStream comparison.
+    let broker_t = ScriptedBroker::bind().await.expect("broker bind");
+    let tokio_stream = runner_tokio::run(&broker_t.pulsar_url(), &trace)
+        .await
+        .expect("tokio runner");
+    let tokio_seeks = broker_t.seeked_partitions_snapshot();
+    broker_t.shutdown().await;
+
+    let broker_m = ScriptedBroker::bind().await.expect("broker bind");
+    let moonpool_stream = runner_moonpool::run(&broker_m.host_port(), &trace)
+        .await
+        .expect("moonpool runner");
+    let moonpool_seeks = broker_m.seeked_partitions_snapshot();
+    broker_m.shutdown().await;
+
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged for seek-per-partition trace",
+    );
+
+    // The post-seek `Recv` events live at the tail; isolate them and
+    // verify partition 2 replayed while the others timed out.
+    let total_ops = trace.ops.len();
+    let post_seek_recvs =
+        &tokio_stream.events[total_ops - 1 - usize::try_from(PARTITIONS).unwrap()..total_ops - 1];
+    assert_eq!(post_seek_recvs.len(), PARTITIONS as usize);
+    for (p, event) in post_seek_recvs.iter().enumerate() {
+        let p = i32::try_from(p).unwrap();
+        if p == 2 {
+            // Partition 2 must have replayed its first message.
+            match event {
+                Event::ReceivedPartition {
+                    partition: pp,
+                    message_id,
+                    ..
+                } => {
+                    assert_eq!(*pp, 2);
+                    assert_eq!(
+                        message_id.entry_id, 0,
+                        "partition 2 should replay from entry 0"
+                    );
+                }
+                other => panic!("expected ReceivedPartition for p=2, got {other:?}"),
+            }
+        } else {
+            // Other partitions must NOT have moved — their cursor is past
+            // the only 5 stored messages, so Recv times out.
+            assert!(
+                matches!(event, Event::RecvTimeoutPartition { partition } if *partition == p),
+                "expected RecvTimeoutPartition for p={p}, got {event:?}",
+            );
+        }
+    }
+
+    // Broker-side invariant: exactly one Seek was issued, and it
+    // targeted partition 2. Both engines must observe the same.
+    assert_eq!(
+        tokio_seeks,
+        vec![2_i32],
+        "tokio: scripted broker should have seen exactly one Seek on partition 2",
+    );
+    assert_eq!(
+        moonpool_seeks,
+        vec![2_i32],
+        "moonpool: scripted broker should have seen exactly one Seek on partition 2",
+    );
+}

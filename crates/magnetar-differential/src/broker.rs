@@ -63,6 +63,19 @@ struct ProducerState {
 /// Shared mutable state for the scripted broker. Each connection has
 /// its own [`SessionState`] (this struct); cross-session state would
 /// belong on a parent broker handle if the harness ever needs it.
+///
+/// **Partition awareness.** Pulsar encodes partition identity in the
+/// topic name itself via the `-partition-N` suffix (Java's
+/// `TopicName.getPartitionIndex` convention); the broker therefore
+/// reuses the existing per-topic `ledger`/`consumers` maps for
+/// per-partition isolation (each `-partition-N` topic gets its own
+/// ledger and cursor). The `per_partition` map adds an observability
+/// view keyed by partition index (with `-1` for non-partitioned
+/// topics): every broker-assigned message id is appended to its
+/// partition's bucket as the broker stores it, and every seek that
+/// targets a partitioned topic records the partition idx in
+/// `seeked_partitions`. Both views let golden traces assert
+/// per-partition dispatch without crawling the raw frame log.
 #[derive(Debug, Default)]
 struct SessionState {
     /// Per-topic message ledger (append-only).
@@ -71,6 +84,14 @@ struct SessionState {
     producers: HashMap<u64, (String, ProducerState)>,
     /// Per consumer id (assigned by the client).
     consumers: HashMap<u64, (String, ConsumerState)>,
+    /// Observability view of every stored message id grouped by
+    /// partition index (parsed from the topic's `-partition-N`
+    /// suffix; `-1` when the topic is non-partitioned).
+    per_partition: HashMap<i32, Vec<(u64, u64)>>,
+    /// Append-only log of partition indices touched by `CommandSeek`
+    /// against partitioned topics. Lets traces assert that a seek on
+    /// partition `K` did not move any other partition's cursor.
+    seeked_partitions: Vec<i32>,
 }
 
 /// Cross-session log of received `BaseCommand` kinds, in arrival order.
@@ -78,6 +99,15 @@ struct SessionState {
 /// harness reads it after each engine run to assert ordering invariants
 /// (e.g. lookup-before-producer-open).
 pub type FrameLog = Arc<Mutex<Vec<i32>>>;
+
+/// Cross-session, append-only log of partition indices touched by
+/// `CommandSeek` against partitioned topics. The partition index is
+/// parsed from the consumer's bound topic via the `-partition-N`
+/// suffix (Java's `TopicName.getPartitionIndex` convention); `-1`
+/// when the consumer is bound to a non-partitioned topic. Lets the
+/// `seek-per-partition` golden trace assert that exactly one
+/// partition's cursor was moved by a `SeekPartition` op.
+pub type SeekedPartitionLog = Arc<Mutex<Vec<i32>>>;
 
 /// Handle to a running scripted broker. Drop to shut down.
 pub struct ScriptedBroker {
@@ -88,6 +118,9 @@ pub struct ScriptedBroker {
     /// Shared, append-only log of every `BaseCommand` kind (as the
     /// `pb::base_command::Type` integer tag) seen across every session.
     frame_log: FrameLog,
+    /// Shared, append-only log of partition indices that received a
+    /// `CommandSeek`.
+    seeked_partitions: SeekedPartitionLog,
 }
 
 impl std::fmt::Debug for ScriptedBroker {
@@ -111,6 +144,8 @@ impl ScriptedBroker {
         let shutdown_clone = shutdown.clone();
         let frame_log: FrameLog = Arc::new(Mutex::new(Vec::new()));
         let frame_log_clone = frame_log.clone();
+        let seeked_partitions: SeekedPartitionLog = Arc::new(Mutex::new(Vec::new()));
+        let seeked_partitions_clone = seeked_partitions.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let accept = listener.accept();
@@ -119,7 +154,8 @@ impl ScriptedBroker {
                         match res {
                             Ok((stream, _)) => {
                                 let log = frame_log_clone.clone();
-                                tokio::spawn(handle_session(stream, log));
+                                let seeks = seeked_partitions_clone.clone();
+                                tokio::spawn(handle_session(stream, log, seeks));
                             }
                             Err(_) => break,
                         }
@@ -133,6 +169,7 @@ impl ScriptedBroker {
             shutdown,
             accept_task: Some(accept_task),
             frame_log,
+            seeked_partitions,
         })
     }
 
@@ -147,6 +184,22 @@ impl ScriptedBroker {
     /// engine's snapshot doesn't include the first engine's frames.
     pub fn clear_frame_log(&self) {
         self.frame_log.lock().clear();
+    }
+
+    /// Snapshot the partition indices touched by every `CommandSeek`
+    /// received so far, in arrival order. Used by the seek-per-partition
+    /// golden trace to assert that a seek on partition `K` did not bleed
+    /// into any other partition's cursor.
+    #[must_use]
+    pub fn seeked_partitions_snapshot(&self) -> Vec<i32> {
+        self.seeked_partitions.lock().clone()
+    }
+
+    /// Clear the seeked-partitions log. Mirrors [`Self::clear_frame_log`]
+    /// for isolating per-engine snapshots when running both legs against
+    /// the same broker instance.
+    pub fn clear_seeked_partitions(&self) {
+        self.seeked_partitions.lock().clear();
     }
 
     /// `pulsar://127.0.0.1:<port>` URL the engines should connect to.
@@ -182,7 +235,28 @@ impl Drop for ScriptedBroker {
     }
 }
 
-async fn handle_session(mut stream: TcpStream, frame_log: FrameLog) {
+/// Parse the partition index from a Pulsar topic name. Mirrors Java's
+/// `TopicName.getPartitionIndex`: returns the trailing integer from a
+/// `-partition-N` suffix, or `-1` when the topic is non-partitioned.
+///
+/// Used by the scripted broker so traces can address partitions by
+/// integer index (the wire protocol carries partition identity in the
+/// topic-name suffix, not in a dedicated field on `CommandSubscribe`).
+fn partition_index_of(topic: &str) -> i32 {
+    if let Some(idx) = topic.rfind("-partition-") {
+        topic[idx + "-partition-".len()..]
+            .parse::<i32>()
+            .unwrap_or(-1)
+    } else {
+        -1
+    }
+}
+
+async fn handle_session(
+    mut stream: TcpStream,
+    frame_log: FrameLog,
+    seeked_partitions: SeekedPartitionLog,
+) {
     let state = Arc::new(Mutex::new(SessionState::default()));
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let mut out_buf = BytesMut::with_capacity(64 * 1024);
@@ -211,7 +285,7 @@ async fn handle_session(mut stream: TcpStream, frame_log: FrameLog) {
             let _ = read_buf.split_to(consumed);
             eprintln!("[broker] decoded frame type={}", frame.command.r#type);
             frame_log.lock().push(frame.command.r#type);
-            handle_frame(&state, &frame, &mut out_buf);
+            handle_frame(&state, &frame, &mut out_buf, &seeked_partitions);
         }
 
         // Push any queued messages to consumers with outstanding permits.
@@ -246,6 +320,7 @@ fn handle_frame(
     state: &Arc<Mutex<SessionState>>,
     frame: &magnetar_proto::Frame,
     out: &mut BytesMut,
+    seeked_partitions: &SeekedPartitionLog,
 ) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
@@ -289,7 +364,15 @@ fn handle_frame(
                         entry_id,
                         payload: payload.body.clone(),
                     };
-                    state.lock().ledger.entry(topic).or_default().push(stored);
+                    let partition = partition_index_of(&topic);
+                    {
+                        let mut g = state.lock();
+                        g.ledger.entry(topic).or_default().push(stored);
+                        g.per_partition
+                            .entry(partition)
+                            .or_default()
+                            .push((ledger_id, entry_id));
+                    }
                     emit_send_receipt(out, s.producer_id, s.sequence_id, ledger_id, entry_id);
                 }
             }
@@ -327,10 +410,14 @@ fn handle_frame(
                 if let Some((topic, c)) = g.consumers.get_mut(&s.consumer_id) {
                     // Seek to the first message at-or-after the given
                     // message id; if no message id was provided, reset
-                    // to the beginning.
+                    // to the beginning. Each `-partition-N` topic has
+                    // its OWN ledger + cursor, so this naturally only
+                    // moves the cursor on the partition addressed by
+                    // this consumer — other partitions' consumers are
+                    // untouched.
+                    let topic_owned = topic.clone();
                     if let Some(mid) = &s.message_id {
-                        let topic = topic.clone();
-                        let ledger = g.ledger.get(&topic).cloned().unwrap_or_default();
+                        let ledger = g.ledger.get(&topic_owned).cloned().unwrap_or_default();
                         let new_cursor = ledger
                             .iter()
                             .position(|m| {
@@ -346,6 +433,9 @@ fn handle_frame(
                         c.cursor = 0;
                         c.nacked.clear();
                     }
+                    let partition = partition_index_of(&topic_owned);
+                    g.seeked_partitions.push(partition);
+                    seeked_partitions.lock().push(partition);
                     emit_success(out, s.request_id);
                 }
             }

@@ -9,9 +9,11 @@
 //! produced by the tokio and moonpool runners.
 //!
 //! Op surface is intentionally tight: `Send`, `Recv`, `Ack`, `Nack`,
-//! `Seek`, `Close`. Extend it as new differential coverage lands; keep
-//! every variant **observable** so the equivalence check stays
-//! meaningful.
+//! `Seek`, `Close`, plus partition-aware siblings `SendPartition`,
+//! `RecvPartition`, `AckPartition`, `SeekPartition` for the
+//! partitioned-topic traces. Extend it as new differential coverage
+//! lands; keep every variant **observable** so the equivalence check
+//! stays meaningful.
 
 use std::time::Duration;
 
@@ -57,6 +59,43 @@ pub enum Op {
     /// is a no-op on the consumer side) and the consumer if open.
     /// Resolves the producer/consumer close round-trip.
     Close,
+    /// Send to a specific partition of [`Trace::topic`]. Internally the
+    /// runner opens (or reuses) a producer bound to
+    /// `<trace.topic>-partition-N`, mirroring Java's
+    /// `PartitionedProducerImpl` topic-naming convention.
+    SendPartition {
+        /// Zero-based partition index. The runner resolves it to the
+        /// per-partition topic name suffix `-partition-{partition}`.
+        partition: i32,
+        /// Raw payload bytes (uncompressed, unencrypted).
+        payload: Vec<u8>,
+    },
+    /// Receive one message from a specific partition. Mirrors
+    /// [`Op::Recv`] but targets the per-partition consumer.
+    RecvPartition {
+        /// Zero-based partition index.
+        partition: i32,
+        /// How long to wait before surfacing
+        /// [`Event::RecvTimeoutPartition`].
+        timeout: Duration,
+    },
+    /// Individually acknowledge a single message id on the given
+    /// partition's consumer.
+    AckPartition {
+        /// Zero-based partition index.
+        partition: i32,
+        /// Target message id.
+        message_id: MessageId,
+    },
+    /// Seek the per-partition consumer to a specific message id. The
+    /// scripted broker resets the cursor on **only** that partition's
+    /// ledger; other partitions keep their current cursor.
+    SeekPartition {
+        /// Zero-based partition index.
+        partition: i32,
+        /// Target message id (cursor reset point).
+        message_id: MessageId,
+    },
 }
 
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`
@@ -105,6 +144,39 @@ pub enum Event {
     },
     /// `Close` completed for the producer and (if open) consumer.
     Closed,
+    /// `SendPartition` succeeded; broker assigned [`MessageId`] on the
+    /// given partition.
+    SentPartition {
+        /// Zero-based partition index the send was routed to.
+        partition: i32,
+        /// Sequence id the engine surfaced on success.
+        message_id: MessageId,
+    },
+    /// `RecvPartition` returned a message.
+    ReceivedPartition {
+        /// Zero-based partition index the recv pulled from.
+        partition: i32,
+        /// Payload bytes the broker pushed.
+        payload: Vec<u8>,
+        /// Broker-assigned message id.
+        message_id: MessageId,
+    },
+    /// `RecvPartition` timed out without a message arriving.
+    RecvTimeoutPartition {
+        /// Zero-based partition index the recv was bound to.
+        partition: i32,
+    },
+    /// `AckPartition` succeeded.
+    AckedPartition {
+        /// Zero-based partition index the ack targeted.
+        partition: i32,
+    },
+    /// `SeekPartition` succeeded — only the given partition's cursor
+    /// was reset.
+    SeekedPartition {
+        /// Zero-based partition index whose cursor was reset.
+        partition: i32,
+    },
 }
 
 /// A scripted sequence of [`Op`]s the harness replays against an

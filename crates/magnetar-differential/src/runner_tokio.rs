@@ -6,6 +6,7 @@
 //! [`magnetar_runtime_tokio::Client`] and returns the resulting
 //! [`EventStream`].
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,6 +15,12 @@ use magnetar_proto::{CreateProducerRequest, MessageId, SubscribeRequest};
 use magnetar_runtime_tokio::{Client, ClientError, Consumer, Producer};
 
 use crate::trace::{Event, EventStream, Op, Trace};
+
+/// Build the per-partition topic name for a given base topic.
+/// Mirrors Java `PartitionedProducerImpl`'s topic-naming convention.
+fn partition_topic(base: &str, partition: i32) -> String {
+    format!("{base}-partition-{partition}")
+}
 
 /// Run `trace` against the tokio engine talking to `pulsar_url`.
 ///
@@ -46,6 +53,14 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
 
     // Open the consumer lazily on first need (Recv / Ack / Nack / Seek).
     let mut consumer: Option<Consumer> = None;
+
+    // Per-partition producers + consumers, opened lazily on first
+    // SendPartition / RecvPartition / AckPartition / SeekPartition op
+    // targeting that partition. Each partition is its own logical topic
+    // (`<base>-partition-N`) so we hold one producer + one consumer per
+    // partition.
+    let mut part_producers: HashMap<i32, Producer> = HashMap::new();
+    let mut part_consumers: HashMap<i32, Consumer> = HashMap::new();
 
     for op in &trace.ops {
         match op {
@@ -93,6 +108,73 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                     }),
                 }
             }
+            Op::SendPartition { partition, payload } => {
+                let topic = partition_topic(&trace.topic, *partition);
+                match ensure_part_producer(&client, &mut part_producers, *partition, &topic).await {
+                    Ok(p) => {
+                        let bytes = Bytes::from(payload.clone());
+                        stream.push(run_send_partition(p, *partition, bytes).await);
+                    }
+                    Err(e) => stream.push(Event::SendError { kind: classify(&e) }),
+                }
+            }
+            Op::RecvPartition { partition, timeout } => {
+                let topic = partition_topic(&trace.topic, *partition);
+                match ensure_part_consumer(
+                    &client,
+                    &mut part_consumers,
+                    *partition,
+                    &topic,
+                    &trace.subscription,
+                )
+                .await
+                {
+                    Ok(c) => stream.push(run_recv_partition(c, *partition, *timeout).await),
+                    Err(_) => stream.push(Event::RecvTimeoutPartition {
+                        partition: *partition,
+                    }),
+                }
+            }
+            Op::AckPartition {
+                partition,
+                message_id,
+            } => {
+                let topic = partition_topic(&trace.topic, *partition);
+                match ensure_part_consumer(
+                    &client,
+                    &mut part_consumers,
+                    *partition,
+                    &topic,
+                    &trace.subscription,
+                )
+                .await
+                {
+                    Ok(c) => stream.push(run_ack_partition(c, *partition, *message_id).await),
+                    Err(_) => stream.push(Event::AckError {
+                        kind: "consumer-open-failed".to_owned(),
+                    }),
+                }
+            }
+            Op::SeekPartition {
+                partition,
+                message_id,
+            } => {
+                let topic = partition_topic(&trace.topic, *partition);
+                match ensure_part_consumer(
+                    &client,
+                    &mut part_consumers,
+                    *partition,
+                    &topic,
+                    &trace.subscription,
+                )
+                .await
+                {
+                    Ok(c) => stream.push(run_seek_partition(c, *partition, *message_id).await),
+                    Err(_) => stream.push(Event::SeekError {
+                        kind: "consumer-open-failed".to_owned(),
+                    }),
+                }
+            }
             Op::Close => {
                 // Drain by closing producer and (if open) consumer.
                 // Producer/Consumer expose `close(self)`; clone the
@@ -102,6 +184,12 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                     let _ = c.close().await;
                 }
                 let _ = producer.clone().close().await;
+                for (_, c) in part_consumers.drain() {
+                    let _ = c.close().await;
+                }
+                for (_, p) in part_producers.drain() {
+                    let _ = p.close().await;
+                }
                 stream.push(Event::Closed);
                 // Detach the driver instead of waiting for `client.close()`
                 // to join it — the scripted broker drops its session
@@ -121,11 +209,110 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
     if let Some(c) = consumer.take() {
         let _ = c.close().await;
     }
+    for (_, c) in part_consumers.drain() {
+        let _ = c.close().await;
+    }
+    for (_, p) in part_producers.drain() {
+        let _ = p.close().await;
+    }
     if let Some(d) = client.take_driver() {
         d.abort();
     }
     drop(client);
     Ok(stream)
+}
+
+// `clippy::map_entry` would have us use the Entry API, but the
+// producer/consumer factory call is `async` and `Entry` doesn't
+// straddle an `.await`, so `contains_key` + `insert` is the right shape.
+#[allow(clippy::map_entry)]
+async fn ensure_part_producer<'a>(
+    client: &Client,
+    map: &'a mut HashMap<i32, Producer>,
+    partition: i32,
+    topic: &str,
+) -> Result<&'a Producer, ClientError> {
+    if !map.contains_key(&partition) {
+        let p = client
+            .open_producer_with(
+                CreateProducerRequest {
+                    topic: topic.to_owned(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?;
+        map.insert(partition, p);
+    }
+    Ok(map.get(&partition).expect("inserted above"))
+}
+
+#[allow(clippy::map_entry)]
+async fn ensure_part_consumer<'a>(
+    client: &Client,
+    map: &'a mut HashMap<i32, Consumer>,
+    partition: i32,
+    topic: &str,
+    sub: &str,
+) -> Result<&'a Consumer, ClientError> {
+    if !map.contains_key(&partition) {
+        let c = client
+            .subscribe_with(
+                SubscribeRequest {
+                    topic: topic.to_owned(),
+                    subscription: sub.to_owned(),
+                    receiver_queue_size: 16,
+                    durable: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?;
+        map.insert(partition, c);
+    }
+    Ok(map.get(&partition).expect("inserted above"))
+}
+
+async fn run_send_partition(producer: &Producer, partition: i32, payload: Bytes) -> Event {
+    let msg = OutgoingMessage {
+        payload: payload.clone(),
+        metadata: magnetar_proto::pb::MessageMetadata::default(),
+        uncompressed_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        num_messages: 1,
+        txn_id: None,
+    };
+    match producer.send(msg).await {
+        Ok(message_id) => Event::SentPartition {
+            partition,
+            message_id,
+        },
+        Err(e) => Event::SendError { kind: classify(&e) },
+    }
+}
+
+async fn run_recv_partition(consumer: &Consumer, partition: i32, timeout: Duration) -> Event {
+    match tokio::time::timeout(timeout, consumer.receive()).await {
+        Ok(Ok(msg)) => Event::ReceivedPartition {
+            partition,
+            payload: msg.payload.to_vec(),
+            message_id: msg.message_id,
+        },
+        Ok(Err(_)) | Err(_) => Event::RecvTimeoutPartition { partition },
+    }
+}
+
+async fn run_ack_partition(consumer: &Consumer, partition: i32, message_id: MessageId) -> Event {
+    match consumer.ack(message_id).await {
+        Ok(()) => Event::AckedPartition { partition },
+        Err(e) => Event::AckError { kind: classify(&e) },
+    }
+}
+
+async fn run_seek_partition(consumer: &Consumer, partition: i32, message_id: MessageId) -> Event {
+    match consumer.seek_to_message(message_id).await {
+        Ok(()) => Event::SeekedPartition { partition },
+        Err(e) => Event::SeekError { kind: classify(&e) },
+    }
 }
 
 async fn ensure_consumer<'a>(

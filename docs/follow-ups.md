@@ -172,22 +172,17 @@ for the differential harness specifically.
 
 ### Expand the golden-trace catalog
 
-**Status.** The harness ships six golden traces (round-trip, batch,
-nack-redelivery, seek-to-start, many-publishes, lookup-before-open).
-Missing: seek-per-partition, transactional ack paths, the
+**Status.** The harness ships seven golden traces (round-trip, batch,
+nack-redelivery, seek-to-start, many-publishes, lookup-before-open,
+seek-per-partition). Missing: transactional ack paths and the
 `cryptoFailureAction` matrix.
 
 **Unblock.** Each new trace extends the scripted broker as needed (the
 broker speaks a deliberately minimal subset of the wire protocol; new
-opcodes get added per trace). Seek-per-partition is the smallest
-(~120 LOC; broker tracks partition id, dispatches `Seek` by partition).
-Transactional ack needs `CommandEndTxn` + per-txn ack ledger in the
-broker (~180 LOC). `cryptoFailureAction` is the largest (~240 LOC)
-and needs the crypto bridge ported to moonpool first.
-
-```text
-/goal land golden-trace seek-per-partition in magnetar-differential. Single commit. Extends ScriptedBroker.SessionState with per-partition message_id routing, adds Op::SeekPartition variant + Event::SeekedPartition, and a 3-step trace asserting tokio and moonpool agree on per-partition seek replay. All four test layers per ADR-0024.
-```
+opcodes get added per trace). Transactional ack needs `CommandEndTxn`
++ per-txn ack ledger in the broker (~180 LOC). `cryptoFailureAction`
+is the largest (~240 LOC) and needs the crypto bridge ported to
+moonpool first.
 
 ---
 
