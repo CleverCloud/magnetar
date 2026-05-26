@@ -1059,10 +1059,12 @@ mod tests {
     }
 
     /// Regression for the CLI "consume hangs against fresh broker" bug: when the broker
-    /// rejects a subscribe with `CommandError` (`ServiceNotReady` / "redo the lookup"),
-    /// the moonpool engine's `SubscribeAckedFut` must surface a `ClientError::Broker`
-    /// rather than parking on the driver waker forever. Mirrors the proto-level
-    /// `command_error_on_subscribe_emits_subscribe_failed` test.
+    /// rejects a subscribe with a PERMANENT `CommandError` (e.g.
+    /// `AuthorizationError`), the moonpool engine's `SubscribeAckedFut` must surface
+    /// a `ClientError::Broker` rather than parking on the driver waker forever.
+    /// Mirrors the proto-level permanent-failure test. Transient codes
+    /// (`ServiceNotReady` / `MetadataError` / `TopicNotFound`) hit the retry path
+    /// instead (see #71 in `docs/follow-ups.md`).
     #[tokio::test(flavor = "current_thread")]
     async fn subscribe_acked_fut_surfaces_broker_error() {
         use std::time::Duration;
@@ -1079,7 +1081,7 @@ mod tests {
             let mut conn = shared.inner.lock();
             let request_id = conn.peek_next_request_id_for_test();
             let handle = conn.subscribe(SubscribeRequest {
-                topic: "persistent://public/default/no-bundle".to_owned(),
+                topic: "persistent://public/default/forbidden".to_owned(),
                 subscription: "regression".to_owned(),
                 sub_type: pb::command_subscribe::SubType::Exclusive,
                 ..Default::default()
@@ -1091,8 +1093,8 @@ mod tests {
             r#type: pb::base_command::Type::Error as i32,
             error: Some(pb::CommandError {
                 request_id,
-                error: pb::ServerError::ServiceNotReady as i32,
-                message: "redo the lookup".to_owned(),
+                error: pb::ServerError::AuthorizationError as i32,
+                message: "not authorized".to_owned(),
             }),
             ..Default::default()
         };
@@ -1113,8 +1115,8 @@ mod tests {
             .expect("subscribe-acked future must resolve (regression: previously hung)");
         match res {
             Err(crate::ClientError::Broker { code, message }) => {
-                assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
-                assert_eq!(message, "redo the lookup");
+                assert_eq!(code, pb::ServerError::AuthorizationError as i32);
+                assert_eq!(message, "not authorized");
             }
             other => panic!("expected ClientError::Broker, got {other:?}"),
         }

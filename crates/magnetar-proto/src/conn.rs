@@ -627,6 +627,28 @@ impl core::fmt::Debug for Connection {
     }
 }
 
+/// Classify a `ServerError` code as a transient producer-open / consumer-subscribe error
+/// — one where the broker is asking the client to retry rather than treating the
+/// attachment as permanently failed. Mirrors the retry-classification Java's
+/// `ProducerImpl.handleProducerCreationError` and `ConsumerImpl.connectionFailed` apply.
+///
+/// Codes covered:
+/// - `MetadataError` (1): metadata store is still loading; usually transient post-restart.
+/// - `ServiceNotReady` (6): broker isn't done initialising the topic / bundle.
+/// - `TopicNotFound` (11): topic load timed out or autocreate hasn't happened yet.
+///
+/// Everything else (auth failures, fenced producer, "topic already deleted", quota
+/// exceeded, …) stays on the permanent-failure path so the user-facing future surfaces
+/// the error instead of silently looping.
+fn is_transient_open_error(code: i32) -> bool {
+    matches!(
+        pb::ServerError::try_from(code),
+        Ok(pb::ServerError::MetadataError
+            | pb::ServerError::ServiceNotReady
+            | pb::ServerError::TopicNotFound)
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PendingRequestKind {
     Lookup,
@@ -1415,22 +1437,53 @@ impl Connection {
                 // re-emitted on reconnect.
                 match kind {
                     Some(PendingRequestKind::ProducerOpen { handle }) => {
-                        self.producers.remove(&handle);
-                        self.producer_create_requests.remove(&handle);
-                        self.events.push_back(ConnectionEvent::ProducerOpenFailed {
-                            handle,
-                            code: err.error,
-                            message: err.message.clone(),
-                        });
+                        // Pulsar wire convention: `ServiceNotReady` (6),
+                        // `MetadataError` (1), `TopicNotFound` (11) are the broker's
+                        // transient post-restart codes — the namespace bundle hasn't
+                        // been re-acquired by this broker yet, the metadata store is
+                        // still loading, or the topic load timed out. Java's
+                        // `ProducerImpl.handleProducerCreationError` re-runs lookup
+                        // with backoff in those cases and only fails permanently on
+                        // authentication / fenced / "topic already deleted" errors.
+                        // Without this classification, magnetar removed the producer
+                        // state on every transient post-`docker restart` rebuild and
+                        // left every subsequent `producer.send()` hanging on a
+                        // "unknown producer handle" — see #71 in
+                        // `docs/follow-ups.md`.
+                        if is_transient_open_error(err.error) {
+                            self.events
+                                .push_back(ConnectionEvent::ProducerOpenFailedTransient {
+                                    handle,
+                                    code: err.error,
+                                    message: err.message.clone(),
+                                });
+                        } else {
+                            self.producers.remove(&handle);
+                            self.producer_create_requests.remove(&handle);
+                            self.events.push_back(ConnectionEvent::ProducerOpenFailed {
+                                handle,
+                                code: err.error,
+                                message: err.message.clone(),
+                            });
+                        }
                     }
                     Some(PendingRequestKind::ConsumerSubscribe { handle }) => {
-                        self.consumers.remove(&handle);
-                        self.consumer_subscribe_requests.remove(&handle);
-                        self.events.push_back(ConnectionEvent::SubscribeFailed {
-                            handle,
-                            code: err.error,
-                            message: err.message,
-                        });
+                        if is_transient_open_error(err.error) {
+                            self.events
+                                .push_back(ConnectionEvent::SubscribeFailedTransient {
+                                    handle,
+                                    code: err.error,
+                                    message: err.message.clone(),
+                                });
+                        } else {
+                            self.consumers.remove(&handle);
+                            self.consumer_subscribe_requests.remove(&handle);
+                            self.events.push_back(ConnectionEvent::SubscribeFailed {
+                                handle,
+                                code: err.error,
+                                message: err.message,
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -3345,6 +3398,53 @@ impl Connection {
         RequestId(id)
     }
 
+    /// Re-emit `CommandProducer` for a SINGLE producer handle. Used by the supervised
+    /// driver loop to retry a producer-open that the broker rejected with a transient
+    /// error (`ServiceNotReady`, `MetadataError`, `TopicNotFound` — see #71). The full
+    /// [`Self::rebuild_producers`] sweep would re-emit `CommandProducer` for every still-
+    /// open producer; this targeted variant is cheaper and avoids stepping on producers
+    /// that are already successfully reattached on this session. Bumps `epoch` so the
+    /// broker associates the new attachment with a strictly newer generation. Returns
+    /// the request id that the user can correlate with the next response, or `None` when
+    /// the producer was closed / removed between the broker error and this retry.
+    pub fn retry_producer_open(&mut self, handle: ProducerHandle) -> Option<RequestId> {
+        let req = self.producer_create_requests.get(&handle)?.clone();
+        let p = self.producers.get_mut(&handle)?;
+        if p.closed {
+            return None;
+        }
+        p.epoch = p.epoch.saturating_add(1);
+        let request_id = self.emit_command_producer(handle, &req);
+        self.drain_producer_outbound();
+        Some(request_id)
+    }
+
+    /// Companion to [`Self::retry_producer_open`] for consumers. Re-emits the
+    /// `CommandSubscribe` + initial `CommandFlow` for a single consumer handle, used
+    /// when the broker rejected a previous `CommandSubscribe` with a transient code
+    /// (`NamespaceBundleNotServed`, `ServiceNotReady`, …). The full
+    /// [`Self::rebuild_consumers`] sweep is too coarse: it would re-emit every
+    /// still-open consumer's `CommandSubscribe`, which would double-attach the ones
+    /// that already succeeded on this session.
+    pub fn retry_consumer_subscribe(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
+        let req = self.consumer_subscribe_requests.get(&handle)?.clone();
+        let c = self.consumers.get(&handle)?;
+        if c.closed {
+            return None;
+        }
+        // Resume from the last acked id when we have one (same logic
+        // `rebuild_consumers` uses). The broker treats an unset
+        // `start_message_id` as "from the configured initial position".
+        let resume_from = self
+            .consumers
+            .get(&handle)
+            .and_then(|c| c.last_acked_message_id);
+        let request_id = self.emit_command_subscribe(handle, &req, resume_from);
+        let _ = self.initial_flow(handle);
+        self.drain_producer_outbound();
+        Some(request_id)
+    }
+
     fn encode_command(&mut self, cmd: &pb::BaseCommand) -> Result<(), ProtocolError> {
         encode_command(&mut self.outbound, cmd)?;
         Ok(())
@@ -4203,10 +4303,14 @@ mod conn_state_tests {
     /// `ProducerOpenFailed` event (and clear the producer state) so engines waiting on the
     /// event stream observe the rejection instead of hanging. Regression for the CLI
     /// "produce hangs against fresh broker" bug: the broker rejects with
-    /// `ServiceNotReady`/"Please redo the lookup", and the engine must surface it as a
-    /// hard error rather than waiting indefinitely on a `ProducerReady` that will never come.
+    /// `ServiceNotReady`/"Please redo the lookup". `ServiceNotReady` is the broker's
+    /// transient post-restart code, so the connection MUST keep the producer state and
+    /// emit `ProducerOpenFailedTransient` (the runtime then retries via
+    /// [`Connection::retry_producer_open`]) — see #71 in `docs/follow-ups.md`. The
+    /// permanent-failure path is covered by
+    /// [`command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`].
     #[test]
-    fn command_error_on_producer_open_emits_producer_open_failed() {
+    fn command_error_on_producer_open_emits_producer_open_failed_transient() {
         let mut conn = Connection::new(ConnectionConfig::default());
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
@@ -4237,7 +4341,7 @@ mod conn_state_tests {
             .expect("handle CommandError");
 
         match conn.poll_event() {
-            Some(ConnectionEvent::ProducerOpenFailed {
+            Some(ConnectionEvent::ProducerOpenFailedTransient {
                 handle: ev_handle,
                 code,
                 message,
@@ -4246,12 +4350,11 @@ mod conn_state_tests {
                 assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
                 assert_eq!(message, "namespace bundle not served");
             }
-            other => panic!("expected ProducerOpenFailed event, got {other:?}"),
+            other => panic!("expected ProducerOpenFailedTransient event, got {other:?}"),
         }
         assert!(
-            conn.producer(handle).is_none(),
-            "producer state must be cleared after broker rejection so reconnect replay does \
-             not re-issue the dead open"
+            conn.producer(handle).is_some(),
+            "producer state must be RETAINED so the runtime can retry attach"
         );
         assert!(
             !conn.has_pending_request_for_test(request_id),
@@ -4259,11 +4362,62 @@ mod conn_state_tests {
         );
     }
 
-    /// Same shape as the producer-open case but on the subscribe path. The matching outcome
-    /// for `ConsumerSubscribe { handle }` must surface a `SubscribeFailed` event with the
-    /// broker's code + message and drop the consumer state.
+    /// Sibling of the transient test above: a hard error code
+    /// (`AuthorizationError`, `ProducerFenced`, …) MUST drop the producer state and
+    /// emit `ProducerOpenFailed` so the user's open future fails fast. The transient
+    /// retry path only applies to the codes Java's `ProducerImpl` treats as retriable
+    /// (`MetadataError`, `ServiceNotReady`, `TopicNotFound`).
     #[test]
-    fn command_error_on_subscribe_emits_subscribe_failed() {
+    fn command_error_on_producer_open_with_permanent_code_emits_producer_open_failed() {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        let _ = drain_outbound_commands(&mut conn);
+
+        let request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/forbidden".to_owned(),
+            ..Default::default()
+        });
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: request_id.0,
+                error: pb::ServerError::AuthorizationError as i32,
+                message: "not authorized".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        match conn.poll_event() {
+            Some(ConnectionEvent::ProducerOpenFailed {
+                handle: ev_handle,
+                code,
+                ..
+            }) => {
+                assert_eq!(ev_handle, handle);
+                assert_eq!(code, pb::ServerError::AuthorizationError as i32);
+            }
+            other => panic!("expected ProducerOpenFailed event, got {other:?}"),
+        }
+        assert!(
+            conn.producer(handle).is_none(),
+            "permanent producer-open failure must drop the producer state"
+        );
+    }
+
+    /// Same shape as the producer-open transient case but on the subscribe path. The
+    /// transient code keeps the consumer state alive so the runtime can retry via
+    /// [`Connection::retry_consumer_subscribe`].
+    #[test]
+    fn command_error_on_subscribe_emits_subscribe_failed_transient() {
         let mut conn = Connection::new(ConnectionConfig::default());
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
@@ -4295,7 +4449,7 @@ mod conn_state_tests {
             .expect("handle CommandError");
 
         match conn.poll_event() {
-            Some(ConnectionEvent::SubscribeFailed {
+            Some(ConnectionEvent::SubscribeFailedTransient {
                 handle: ev_handle,
                 code,
                 message,
@@ -4304,7 +4458,7 @@ mod conn_state_tests {
                 assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
                 assert_eq!(message, "namespace bundle not served");
             }
-            other => panic!("expected SubscribeFailed event, got {other:?}"),
+            other => panic!("expected SubscribeFailedTransient event, got {other:?}"),
         }
         assert!(
             !conn.has_pending_request_for_test(request_id),

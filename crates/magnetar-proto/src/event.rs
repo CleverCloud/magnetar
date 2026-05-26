@@ -92,6 +92,23 @@ pub enum ConnectionEvent {
         message: String,
     },
 
+    /// The broker rejected a `CommandProducer` with a TRANSIENT error code (e.g.
+    /// `ServiceNotReady`, `MetadataError`, `TopicNotFound`) — typically a
+    /// post-restart broker whose namespace bundle hasn't been re-acquired yet.
+    /// Unlike [`Self::ProducerOpenFailed`], the producer state is NOT dropped: the
+    /// runtime is expected to back off and call
+    /// [`crate::Connection::retry_producer_open`] to retry the attach. Mirrors
+    /// Java `ProducerImpl.handleProducerCreationError` retrying on the same
+    /// codes (see #71 in `docs/follow-ups.md`).
+    ProducerOpenFailedTransient {
+        /// The producer that failed to open.
+        handle: ProducerHandle,
+        /// Pulsar wire-protocol `ServerError` code (`pb::ServerError`).
+        code: i32,
+        /// Human-readable error from the broker.
+        message: String,
+    },
+
     /// A subscribe request was acknowledged by the broker.
     SubscribeAcked {
         /// The consumer handle this event refers to.
@@ -105,6 +122,19 @@ pub enum ConnectionEvent {
     /// connection. Pair with [`ConnectionEvent::SubscribeAcked`] as the success/failure split
     /// for a `subscribe` round-trip.
     SubscribeFailed {
+        /// The consumer that failed to subscribe.
+        handle: ConsumerHandle,
+        /// Pulsar wire-protocol `ServerError` code (`pb::ServerError`).
+        code: i32,
+        /// Human-readable error from the broker.
+        message: String,
+    },
+
+    /// Consumer-side companion to [`Self::ProducerOpenFailedTransient`]. The
+    /// broker rejected `CommandSubscribe` with a transient code; the consumer
+    /// state is retained and the runtime should retry via
+    /// [`crate::Connection::retry_consumer_subscribe`] after a backoff.
+    SubscribeFailedTransient {
         /// The consumer that failed to subscribe.
         handle: ConsumerHandle,
         /// Pulsar wire-protocol `ServerError` code (`pb::ServerError`).

@@ -1095,12 +1095,15 @@ mod tests {
     }
 
     /// Regression for the CLI "produce hangs against fresh broker" bug: when the broker
-    /// rejects a producer-open with `CommandError` (e.g. `ServiceNotReady` because the
-    /// namespace bundle has not yet been activated), the moonpool engine's
-    /// `wait_producer_ready` must surface a `ClientError::Broker { code, message }` rather
-    /// than parking on the driver waker forever. Mirrors the proto-level
-    /// `command_error_on_producer_open_emits_producer_open_failed` test, but covers the
-    /// engine-side bridge from event to future-result.
+    /// rejects a producer-open with a PERMANENT `CommandError` (e.g.
+    /// `AuthorizationError`), the moonpool engine's `wait_producer_ready` must surface
+    /// a `ClientError::Broker { code, message }` rather than parking on the driver
+    /// waker forever. Mirrors the proto-level
+    /// `command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`
+    /// test, but covers the engine-side bridge from event to future-result.
+    /// `ServiceNotReady` / `MetadataError` / `TopicNotFound` are deliberately NOT used
+    /// here — those are transient (the runtime retries via
+    /// `retry_producer_open`); see #71 in `docs/follow-ups.md`.
     #[tokio::test(flavor = "current_thread")]
     async fn wait_producer_ready_surfaces_broker_error() {
         let shared = handshake_complete_shared();
@@ -1108,7 +1111,7 @@ mod tests {
             let mut conn = shared.inner.lock();
             let request_id = conn.peek_next_request_id_for_test();
             let handle = conn.create_producer(CreateProducerRequest {
-                topic: "persistent://public/default/no-bundle".to_owned(),
+                topic: "persistent://public/default/forbidden".to_owned(),
                 ..Default::default()
             });
             (handle, request_id)
@@ -1118,8 +1121,8 @@ mod tests {
             r#type: pb::base_command::Type::Error as i32,
             error: Some(pb::CommandError {
                 request_id,
-                error: pb::ServerError::ServiceNotReady as i32,
-                message: "redo the lookup".to_owned(),
+                error: pb::ServerError::AuthorizationError as i32,
+                message: "not authorized".to_owned(),
             }),
             ..Default::default()
         };
@@ -1142,8 +1145,8 @@ mod tests {
         .expect("producer-ready future must resolve (regression: previously hung)");
         match res {
             Err(super::ClientError::Broker { code, message }) => {
-                assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
-                assert_eq!(message, "redo the lookup");
+                assert_eq!(code, pb::ServerError::AuthorizationError as i32);
+                assert_eq!(message, "not authorized");
             }
             other => panic!("expected ClientError::Broker, got {other:?}"),
         }

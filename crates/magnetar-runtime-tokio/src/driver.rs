@@ -77,6 +77,8 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 ConnectionEvent::AuthChallenge { .. }
                     | ConnectionEvent::TopicListChanged { .. }
                     | ConnectionEvent::TopicMigrated { .. }
+                    | ConnectionEvent::ProducerOpenFailedTransient { .. }
+                    | ConnectionEvent::SubscribeFailedTransient { .. }
             )
         });
         let Some(event) = event else {
@@ -144,6 +146,60 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 return Err(ClientError::Other(
                     "PIP-188: broker requested topic migration; resetting connection".to_owned(),
                 ));
+            }
+            ConnectionEvent::ProducerOpenFailedTransient {
+                handle,
+                code,
+                message,
+            } => {
+                // Broker bounced the `CommandProducer` with a transient code
+                // (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) — typical
+                // post-`docker restart` window where the namespace bundle hasn't
+                // been re-acquired yet. magnetar keeps the producer state intact
+                // (`conn.rs` `CommandError` handler), so we just need to retry the
+                // attachment after a short delay. Spawn a tokio task instead of
+                // sleeping inline: blocking the driver loop here would freeze
+                // every other connection event for the backoff duration.
+                tracing::info!(
+                    ?handle,
+                    code,
+                    %message,
+                    "producer-open transient error; scheduling retry"
+                );
+                let shared_for_retry = shared.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let request_id = {
+                        let mut conn = shared_for_retry.inner.lock();
+                        conn.retry_producer_open(handle)
+                    };
+                    if request_id.is_some() {
+                        shared_for_retry.driver_waker.notify_one();
+                    }
+                });
+            }
+            ConnectionEvent::SubscribeFailedTransient {
+                handle,
+                code,
+                message,
+            } => {
+                tracing::info!(
+                    ?handle,
+                    code,
+                    %message,
+                    "consumer-subscribe transient error; scheduling retry"
+                );
+                let shared_for_retry = shared.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let request_id = {
+                        let mut conn = shared_for_retry.inner.lock();
+                        conn.retry_consumer_subscribe(handle)
+                    };
+                    if request_id.is_some() {
+                        shared_for_retry.driver_waker.notify_one();
+                    }
+                });
             }
             _ => {}
         }

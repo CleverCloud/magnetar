@@ -553,48 +553,73 @@ deeper bug tracked as **#71**.
 
 ### #71 — Producer / consumer rebuild fails on namespace-bundle-not-served
 
-**Symptom.** Right after `docker restart`, the supervised driver
-runs `rebuild_producers` / `rebuild_consumers`. The broker rejects
-both with:
+**Done in `fix/producer-rebuild-transient-retry`.** Three pieces
+landed:
 
-```text
-Namespace bundle for topic (...magnetar-e2e-reconnect-...) not
-served by this instance:localhost:8080. Please redo the lookup.
-Request is denied: namespace=public/default
-```
+1. `Connection`'s `CommandError` handler now classifies error codes.
+   `MetadataError` (1) / `ServiceNotReady` (6) / `TopicNotFound` (11)
+   are transient (Java's `ProducerImpl.handleProducerCreationError`
+   treats them the same way). On a transient code the producer /
+   consumer state is RETAINED — previously magnetar removed it,
+   leaving every subsequent `send()` / `receive()` against a
+   "unknown producer handle" `InvariantViolation`. New
+   `ProducerOpenFailedTransient` / `SubscribeFailedTransient` events
+   surface the broker code.
+2. New `Connection::retry_producer_open(handle)` and
+   `Connection::retry_consumer_subscribe(handle)` re-emit
+   `CommandProducer` / `CommandSubscribe` for a SINGLE handle. The
+   producer-side variant bumps `epoch`; the consumer-side variant
+   resumes from `last_acked_message_id` when one exists.
+3. The tokio driver's `handle_pending_events` observes the new
+   transient events, spawns a backoff task (`sleep 2 s`), and calls
+   the matching `retry_*` method on the shared connection.
 
-The bundle ownership hasn't been re-acquired by the broker yet
-(typical post-restart transient — bookies + namespace ownership
-reload takes ~10-15 s). magnetar's `CommandError` handler
-(`conn.rs:1417`) treats this as a fatal `ProducerOpen` failure,
-**removes** the producer from `self.producers`, and emits
-`ProducerOpenFailed`. Subsequent `producer.send()` calls hit the
-"unknown producer handle" `InvariantViolation` in
-`Connection::send`. The `SendFut`s never resolve and
-`e2e_supervised_reconnect_across_broker_restart` times out.
+Unit tests:
+- `command_error_on_producer_open_emits_producer_open_failed_transient`
+  pins the retain-state behaviour for `ServiceNotReady`.
+- `command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`
+  pins the drop-state behaviour for `AuthorizationError`.
+- The consumer equivalent
+  `command_error_on_subscribe_emits_subscribe_failed_transient`.
+- The moonpool runtime tests
+  `wait_producer_ready_surfaces_broker_error` /
+  `subscribe_acked_fut_surfaces_broker_error` updated to use the
+  permanent code — transient code now flips them into the retry
+  loop where the user-facing future stays `Pending`.
 
-Java client behaviour: `ProducerImpl` re-runs lookup with backoff
-on `NamespaceBundleNotServed` / `ServiceNotReady` /
-`TopicNotFound` (all classified as "retriable") and only fails
-permanently on hard errors (auth, fenced, etc.). magnetar needs
-the same retry classification at the producer/consumer rebuild
-layer.
+**Remaining (tracked as #72).** Pulsar's broker emits
+`NamespaceBundleNotServed` as `code == ServiceNotReady` with the
+text `"Please redo the lookup"`. magnetar's retry currently just
+re-issues `CommandProducer` to the same broker, which keeps
+returning the same error because the bundle ownership is only
+re-acquired when a `CommandLookupTopic` triggers it. Thread a
+fresh `lookup_topic` into the retry path (or change
+`rebuild_producers` / `rebuild_consumers` to always lookup first,
+matching Java's `ProducerImpl.connectionOpened` → `lookupRequest`).
 
-**Fix path.** Either:
-1. In `conn.rs` `CommandError` handler: keep the producer/consumer
-   state for transient error codes (`ServiceNotReady`,
-   `NamespaceBundleNotServed`, `TopicNotFound`, `MetadataError`)
-   and emit a `ProducerOpenTransient` event that the supervisor
-   consumes by re-running `rebuild_producers` after a backoff. OR
-2. Introduce a small `producer_rebuild_retry` task per producer
-   handle that runs on its own backoff after the supervisor's
-   initial `rebuild_producers` lands a transient error.
+### #72 — Producer / consumer retry must redo lookup first
 
-Option (1) is closer to Pulsar's wire semantics; option (2) keeps
-the supervisor loop simpler. Either way the user-facing `SendFut`
-must stay `Pending` across the retry sequence (same contract as
-the existing in-flight-publish-replay path: no `Err` surfaces to
-the caller for transient broker errors).
+After #71's retry path landed, the supervised reconnect loop now
+correctly retains the producer / consumer state on transient
+errors and re-emits `CommandProducer` / `CommandSubscribe` with
+backoff. But Pulsar's broker reports namespace bundle ownership
+issues as `ServiceNotReady` with the text `"Please redo the
+lookup"`; the retry keeps hitting the same error because magnetar
+re-issues the attach command WITHOUT a fresh
+`CommandLookupTopic`. The broker only re-acquires bundle
+ownership when a lookup arrives.
+
+**Fix path.** In the tokio driver's `handle_pending_events`
+transient handlers (currently calling `retry_producer_open` /
+`retry_consumer_subscribe`), prepend a fresh `lookup_topic` for
+the affected handle's topic. After lookup completes, then call
+`retry_producer_open` / `retry_consumer_subscribe`. The topic
+name lives in `producer_create_requests` / `consumer_subscribe_requests`,
+so the driver can read it through the shared connection.
+
+Alternative: make `rebuild_producers` / `rebuild_consumers` do
+the lookup themselves before re-emitting. Closer to Java's
+`ProducerImpl.connectionOpened` → `lookupRequest` flow.
 
 ### #67 — Fresh consumer_id refactor for post-seek resubscribe
 
