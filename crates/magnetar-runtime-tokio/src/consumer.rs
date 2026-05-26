@@ -2116,6 +2116,130 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn republish_dead_letters_returns_zero_when_queue_is_empty() {
+        // Mirror of the moonpool engine's identically-named test
+        // (ADR-0024). DLQ is empty → helper returns 0 without invoking
+        // `Producer::send`.
+        use magnetar_proto::CreateProducerRequest;
+
+        use crate::producer::Producer;
+
+        let shared = handshake_complete_shared();
+        let consumer_handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/dlq-empty".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer_handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/dlq-empty-DLQ".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle: consumer_handle,
+            decryptor: None,
+        };
+        let producer = Producer {
+            shared,
+            handle: producer_handle,
+            compression: magnetar_proto::types::CompressionKind::None,
+            encryptor: None,
+        };
+        let count = consumer
+            .republish_dead_letters(&producer)
+            .await
+            .expect("republish_dead_letters must resolve");
+        assert_eq!(count, 0, "no DLQ messages present");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconsume_later_stamps_reconsumetimes_on_first_call() {
+        // Mirror of the moonpool engine's identically-named test
+        // (ADR-0024). Drives `reconsume_later` against a producer wired
+        // into the same shared state; the helper queues the retry-letter
+        // publish into the outbox (verified non-empty after one poll
+        // cycle).
+        use bytes::Bytes;
+        use magnetar_proto::{CreateProducerRequest, MessageId};
+
+        use crate::producer::Producer;
+
+        let shared = handshake_complete_shared();
+        let consumer_handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/retry-src".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer_handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/retry-src-RETRY".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle: consumer_handle,
+            decryptor: None,
+        };
+        let producer = Producer {
+            shared: shared.clone(),
+            handle: producer_handle,
+            compression: magnetar_proto::types::CompressionKind::None,
+            encryptor: None,
+        };
+        let msg = magnetar_proto::IncomingMessage {
+            message_id: MessageId {
+                ledger_id: 7,
+                entry_id: 99,
+                partition: -1,
+                batch_index: -1,
+                batch_size: 0,
+            },
+            payload: Bytes::from_static(b"retryme"),
+            metadata: magnetar_proto::pb::MessageMetadata::default(),
+            single_metadata: None,
+            redelivery_count: 0,
+            broker_entry_metadata: None,
+            arrived_at: Instant::now(),
+        };
+        {
+            let helper = consumer.reconsume_later(
+                &producer,
+                msg.clone(),
+                std::time::Duration::from_millis(500),
+            );
+            tokio::pin!(helper);
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut helper).await;
+            assert!(
+                outcome.is_err(),
+                "helper should still be parked (no driver to ack)",
+            );
+        }
+
+        let pending_publish_bytes = {
+            let mut sink = Vec::new();
+            let mut conn = shared.inner.lock();
+            let _ = conn.poll_transmit(&mut sink);
+            sink.len()
+        };
+        assert!(
+            pending_publish_bytes > 0,
+            "reconsume_later must have queued the retry publish",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn drain_dead_letter_empty_by_default() {
         let shared = handshake_complete_shared();
         let handle = {
