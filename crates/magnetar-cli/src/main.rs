@@ -14,6 +14,8 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+mod version;
+
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -26,7 +28,13 @@ use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
 #[derive(Debug, Parser)]
-#[command(name = "magnetar", version, about, long_about = None)]
+#[command(
+    name = "magnetar",
+    version = version::short(),
+    long_version = version::long(),
+    about,
+    long_about = None,
+)]
 pub(crate) struct Cli {
     /// Increase logging verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count)]
