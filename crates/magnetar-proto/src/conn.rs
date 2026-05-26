@@ -1119,17 +1119,19 @@ impl Connection {
             |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
         );
         // `None` here = use the broker's persisted cursor (just reset by the seek).
+        //
+        // NOTE: we ONLY emit `CommandSubscribe` here. The runtime layer is
+        // responsible for awaiting `SubscribeAcked` and THEN issuing
+        // `CommandFlow` + `CommandRedeliverUnacknowledgedMessages`. Pulsar's
+        // broker drops `CommandFlow` for a consumer that doesn't exist yet —
+        // `ServerCnx.handleFlow` logs "Couldn't find consumer to handle flow"
+        // and returns silently. Sending Flow inline (before the broker's
+        // SubscribeSuccess) loses the permits: the broker creates the
+        // consumer with `available_permits = 0` and never dispatches the
+        // post-seek backlog. This was #67's root cause — the broker
+        // confirmed `backlog 10` after the cursor reset, but no message ever
+        // arrived because the permits were dropped on the floor.
         let request_id = self.emit_command_subscribe(handle, &req, None);
-        self.initial_flow(handle);
-        // After cursor reset, the broker still tracks the consumer's
-        // pre-seek dispatched-but-not-acked messages as "in-flight" — it
-        // won't push **anything** new until those slots free up. Issue
-        // `CommandRedeliverUnacknowledgedMessages` (empty message_ids =
-        // redeliver all) to release the broker's tracking, then the post-
-        // seek cursor position can dispatch fresh entries. Mirrors what
-        // Java's `ConsumerImpl#redeliverUnacknowledgedMessages` does
-        // implicitly on the connection-reset path.
-        self.emit_redeliver_unacked(handle, Vec::new());
         Some(request_id)
     }
 
@@ -2763,6 +2765,21 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Issue `CommandRedeliverUnacknowledgedMessages` with an empty
+    /// `message_ids` list, which the broker treats as "redeliver everything
+    /// currently tracked as in-flight for this consumer". Used by the
+    /// post-seek resubscribe path: after the cursor reset the broker still
+    /// holds the pre-seek `consumerId → unacked` map open, and the dispatcher
+    /// will not push fresh entries until those slots free up. Mirrors what
+    /// Java's `ConsumerImpl#redeliverUnacknowledgedMessages` does
+    /// implicitly on the connection-reset path. Caller is responsible for
+    /// only firing this AFTER the matching `SubscribeAcked` so the broker
+    /// has the consumer registered (the broker drops the command for an
+    /// unknown consumer id without error).
+    pub fn redeliver_unacked_all(&mut self, handle: ConsumerHandle) {
+        self.emit_redeliver_unacked(handle, Vec::new());
     }
 
     /// Issue an explicit FLOW for a consumer.

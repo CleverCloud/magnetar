@@ -652,41 +652,46 @@ needs Pulsar broker investigation to confirm and decide whether
 magnetar should add anti-thrash backoff or stop redialing for a
 configurable window after a transient error. Tracked as **#74**.
 
-### #67 — Fresh consumer_id refactor for post-seek resubscribe
+### #67 — Fresh consumer_id refactor for post-seek resubscribe (FIXED — wrong diagnosis, real fix is ack-then-flow)
 
-**Symptom.** After landing the three-part fix for #65 (duringSeek
-drop + transient close + redeliver), the broker confirms `backlog 5`
-on `partition-0` after the seek (cursor reset to mid_ms point), but
-no message dispatches to the re-subscribed consumer with the same
-`consumer_id`.
+**Real root cause** (discovered while investigating, not the
+consumer_id hypothesis the original ticket carried):
+`resubscribe_consumer_after_seek` emitted `CommandSubscribe +
+CommandFlow + CommandRedeliverUnacknowledgedMessages` in one shot on
+the wire. Pulsar's `ServerCnx.handleFlow` silently drops
+`CommandFlow` for a consumer id that doesn't exist yet — and on the
+post-seek resubscribe path the broker's consumer-id slot is still
+empty until it finishes processing the Subscribe. Result: permits
+were lost, the broker created the consumer with
+`available_permits = 0`, and the dispatcher never pushed the
+post-seek backlog (the "broker confirms backlog 10 but no message
+dispatches" symptom).
 
-**Investigation done.** `magnetar_proto::conn::Consumer::deliver` is
-never called after the resubscribe — broker isn't dispatching even
-though `Created subscription` lands in the broker log post-resub.
+**Fix.** Split the proto-layer `resubscribe_consumer_after_seek`
+so it ONLY emits `CommandSubscribe` and returns the request id.
+Runtime layer (`Consumer::seek` in `magnetar-runtime-tokio`) now
+waits for `SubscribeAcked` via `wait_subscribe_acked`, THEN issues
+`initial_flow` + `redeliver_unacked_all` (new public method on
+`Connection` mirroring the previous private `emit_redeliver_unacked`
+empty-list variant). Mirrors Java's
+`ConsumerImpl#reconnectLater` → `connectionOpened` flow: subscribe
+ack first, flow second.
 
-**Open hypothesis.** The Pulsar broker tracks "pending acks" per
-`consumer_id` even after the disconnect; on resubscribe with the
-same `consumer_id`, the broker thinks the previously-dispatched
-messages are still owed and refuses to push new ones from the
-just-reset cursor.
+Verification:
+- `cargo test -p magnetar --features e2e --test
+  e2e_seek_per_partition`: 1/1 PASS (was 0/1 FAIL).
+- `cargo test --lib -p magnetar-proto -p magnetar-runtime-tokio
+  -p magnetar -p magnetar-runtime-moonpool`: 422 passed.
+- `cargo clippy --workspace --all-features --all-targets
+  -- -D warnings`: clean.
+- `cargo run -p xtask -- check-runtime-test-parity`: tokio=95
+  moonpool=95.
 
-**Fix steps.**
-1. Refactor `resubscribe_consumer_after_seek` to allocate a fresh
-   `consumer_id` (via `next_consumer_id`).
-2. Re-key `Connection::consumers`, `consumer_subscribe_requests`,
-   and any pending receive-wakers to the new handle.
-3. Add a per-handle `current_remote_id` indirection so the
-   user-facing `Consumer` keeps holding its original
-   `ConsumerHandle` while incoming messages are routed to the new
-   id.
-4. Validate `e2e_seek_per_partition_callback` against
-   `apachepulsar/pulsar:4.0.4`.
-
-**Repro.**
-
-```sh
-cargo test -p magnetar --features e2e --test e2e_seek_per_partition -- --include-ignored --test-threads=1
-```
+The original "fresh consumer_id" hypothesis turned out to be a red
+herring — the broker DOES disconnect the old consumer cleanly
+during seek processing and accepts a fresh subscribe with the same
+consumer id. The "pending acks per consumer_id" theory was never
+the bottleneck. No indirection refactor needed.
 
 ---
 

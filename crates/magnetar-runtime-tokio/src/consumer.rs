@@ -490,9 +490,23 @@ impl Consumer {
                 };
                 self.shared.driver_waker.notify_one();
                 if resub_request_id.is_some() {
-                    // Wait for the new `SubscribeAcked` event before returning so
-                    // callers can safely call `receive()` right after `seek*().await`.
+                    // Must wait for the broker to ACK the re-subscribe before
+                    // sending Flow + Redeliver. Pulsar's `ServerCnx.handleFlow`
+                    // silently drops `CommandFlow` for a consumer that doesn't
+                    // exist yet — sending it inline (before SubscribeSuccess
+                    // arrives) loses the permits and the broker creates the
+                    // consumer with `available_permits = 0` so no dispatch
+                    // ever happens. The previous in-proto-layer order
+                    // (subscribe + flow + redeliver in one shot) tripped this
+                    // race and was the real root cause of #67's "broker
+                    // confirms backlog but no message dispatches".
                     wait_subscribe_acked(&self.shared, self.handle).await?;
+                    {
+                        let mut conn = self.shared.inner.lock();
+                        let _ = conn.initial_flow(self.handle);
+                        conn.redeliver_unacked_all(self.handle);
+                    }
+                    self.shared.driver_waker.notify_one();
                 }
                 Ok(())
             }
