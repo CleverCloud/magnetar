@@ -62,6 +62,17 @@
     dead_code
 )]
 
+/// Pulsar wire-protocol version this driver advertises in
+/// `CommandConnect.protocol_version`. Currently `21` — the level
+/// negotiated by Pulsar 4.x brokers; covers PIP-188 `TOPIC_MIGRATED`,
+/// PIP-145 `CommandWatchTopicList`, the PIP-31 transactional family,
+/// and the rest of the v0.1.0 parity surface.
+///
+/// Exposed so the CLI banner (`magnetar --version`) and any external
+/// tooling read the same number the wire driver sends, removing the
+/// drift risk of two parallel literals.
+pub const SUPPORTED_PROTOCOL_VERSION: i32 = 21;
+
 pub mod anti_thrash;
 pub mod auth;
 pub mod backoff;

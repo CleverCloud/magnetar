@@ -151,7 +151,7 @@ impl Default for ConnectionConfig {
             client_version: format!("magnetar/{}", env!("CARGO_PKG_VERSION")),
             auth_method_name: "none".to_owned(),
             auth_data: None,
-            protocol_version: 21,
+            protocol_version: crate::SUPPORTED_PROTOCOL_VERSION,
             feature_flags: pb::FeatureFlags::default(),
             keepalive_interval: Duration::from_secs(30),
             operation_timeout: Duration::from_secs(30),
@@ -3626,7 +3626,7 @@ mod conn_state_tests {
             r#type: pb::base_command::Type::Connected as i32,
             connected: Some(pb::CommandConnected {
                 server_version: "magnetar-test".to_owned(),
-                protocol_version: Some(21),
+                protocol_version: Some(crate::SUPPORTED_PROTOCOL_VERSION),
                 max_message_size: Some(5 * 1024 * 1024),
                 feature_flags: Some(pb::FeatureFlags::default()),
             }),

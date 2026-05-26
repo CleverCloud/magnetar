@@ -32,13 +32,11 @@ use std::sync::OnceLock;
 
 use anstyle::{AnsiColor, Style};
 
-/// Pulsar wire-protocol version this driver speaks.
-///
-/// Mirrors the hard-coded `protocol_version` in
-/// `magnetar-proto/src/conn.rs`. Tracked as a follow-up in
-/// `docs/follow-ups.md` (expose as a typed constant from
-/// `magnetar-proto`).
-const PULSAR_PROTOCOL_VERSION: u32 = 21;
+/// Pulsar wire-protocol version this driver speaks. Sourced from the
+/// canonical [`magnetar::proto::SUPPORTED_PROTOCOL_VERSION`] so the CLI
+/// banner stays in lock-step with the value the wire driver actually
+/// sends in `CommandConnect.protocol_version`.
+const PULSAR_PROTOCOL_VERSION: i32 = magnetar::proto::SUPPORTED_PROTOCOL_VERSION;
 
 /// Short `-V` payload. One line, never colorized.
 ///
