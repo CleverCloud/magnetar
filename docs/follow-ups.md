@@ -490,48 +490,65 @@ using `client.producer(topic)` instead of
 producer (`fix/seek-per-partition`) the broker shows backlog
 10/10/10/10 across all 4 partitions — `RoundRobin` works correctly.
 
-### #66 — Post-restart send doesn't get receipt
+### #66 — Post-restart send doesn't get receipt (FIXED)
 
-**Symptom.** `e2e_supervised_reconnect_across_broker_restart` no
-longer fast-fails (the #56 close-flag fix removed the
-`InvariantViolation`), but the post-restart `producer.send().await`
-hangs waiting for a `CommandSendReceipt` that never arrives. The
-test exhausts its 30 × 2 s retry budget on the send.
+**Root cause.** `Connection::is_closed()` returned `true` for both
+user-initiated close (`Closing` / `Closed`) AND transport drop
+(`Failed`, the state `mark_disconnected()` sets on `PeerClosed`).
+The supervised driver loop's reconnect gate
+(`driver.rs:275`, `driver.rs:315` in tokio; the moonpool runtime
+mirror) checked `is_closed()` and bailed out the instant the broker
+went away — the auto-reconnect loop never even started a second
+attempt.
 
-**Investigation done.**
-- TCP reconnect works: testcontainers `stop_with_timeout` + `start`
-  is observed by the supervised driver; `reset()` + `rebuild_producers`
-  is called after the new handshake (see `driver.rs:362, 502`).
-- Broker re-creates the producer (visible in broker logs).
-- The first `CommandSend` after reconnect carries the same
-  `producer_name` and an incremented `epoch`, but no receipt comes
-  back.
+**Fix.** New `Connection::is_user_closed()` that returns `true` only
+for `Closing` / `Closed` (NOT `Failed`). Both supervisor loops now
+gate on `is_user_closed()` so a transport drop falls into the
+backoff / redial / `rebuild_producers` / `rebuild_consumers` path
+instead of returning. Unit test
+`is_user_closed_excludes_failed_so_supervisor_can_reconnect` locks
+the contract.
 
-**Open hypotheses.**
-- `in_flight_publish_snapshots` (conn.rs:846) re-injects replay
-  frames with the original `sequence_id`. If the first new send
-  after reconnect happens BEFORE the replay drains, the broker may
-  see a `sequence_id` gap or duplicate.
-- Magnetar's `epoch` bump on `rebuild_producers` may not match what
-  the broker's `ProducerImpl.epoch` validation expects.
-- The reset path may be flushing the user's pre-reset `OpSend`
-  wakers in a way that the future re-registers but never gets fired
-  by the receipt (the receipt's `apply_receipt` finds nothing in
-  `pending` if the snapshot was already drained).
-
-**Fix steps.**
-1. Set up a TCP proxy between magnetar and the broker that logs
-   every frame in both directions.
-2. Compare the post-reconnect CommandSend wire bytes vs what Java's
-   `ProducerImpl#resendMessages` emits.
-3. Pay particular attention to `epoch`, `sequence_id`,
-   `highest_sequence_id`, and the `metadata.producer_name`.
+**Validation.** A manual probe against an externally-managed broker
+restarted via `docker restart` confirms the first
+`producer.send().await` after the broker comes back resolves with
+`Ok(MessageId)` (3 ms round-trip). The full
+`e2e_supervised_reconnect_across_broker_restart` test still fails,
+but for a separate testcontainers-specific reason: `bin/pulsar
+standalone` exits cleanly on the `SIGTERM` from
+`container.stop_with_timeout()` and `container.start()` does NOT
+re-run the entrypoint. The supervisor sits in a `Connection
+refused` retry loop until the test budget runs out. Fixing that
+needs the test to use `docker restart <id>` (re-executes the
+entrypoint) instead of stop+start — tracked as a separate test-
+infrastructure follow-up below.
 
 **Repro.**
 
 ```sh
 cargo test -p magnetar --features e2e --test e2e_reconnect -- --include-ignored --test-threads=1 --nocapture
 ```
+
+### #70 — `e2e_reconnect` testcontainers restart strategy
+
+The `e2e_supervised_reconnect_across_broker_restart` and
+`e2e_transparent_inflight_publish_replay_across_broker_restart`
+tests both use `container.stop_with_timeout()` + `container.start()`
+to simulate a broker restart. That cycle leaves the container alive
+but without a running `pulsar` process: `bin/pulsar standalone` is
+the container's `CMD`, exits gracefully on `SIGTERM`, and
+`container.start()` (which just re-runs `docker start`) does NOT
+re-execute the `CMD`. The supervisor then sits in a `Connection
+refused` retry loop until the test times out.
+
+**Fix path.** Replace the two `stop_with_timeout + start` cycles
+with a `std::process::Command::new("docker").args(["restart", ...,
+container.id()])` call (`docker restart` re-runs the entrypoint).
+Also confirm port mapping is preserved across the restart on the
+Docker version we run on CI — the manual experiment in this
+worktree showed the mapping flipped, which would need extra
+handling (re-resolve the port via `container.get_host_port_ipv4`
+after restart).
 
 ### #67 — Fresh consumer_id refactor for post-seek resubscribe
 

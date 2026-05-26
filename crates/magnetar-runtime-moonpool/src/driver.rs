@@ -342,8 +342,11 @@ where
         driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
 
     loop {
-        // User-requested close beats reconnect.
-        if shared.inner.lock().is_closed() {
+        // User-requested close beats reconnect. `Failed` (transport drop, from
+        // `mark_disconnected`) deliberately does NOT count here — the supervisor exists
+        // precisely to retry after that, so the gate is `is_user_closed()` (Closing /
+        // Closed only), mirroring the tokio runtime.
+        if shared.inner.lock().is_user_closed() {
             return last_inner_result;
         }
 
@@ -376,8 +379,9 @@ where
                 }
             }
 
-            // Did the user request close while we were sleeping?
-            if shared.inner.lock().is_closed() {
+            // Did the user request close while we were sleeping? Same `is_user_closed`
+            // gate as the outer loop.
+            if shared.inner.lock().is_user_closed() {
                 return last_inner_result;
             }
 

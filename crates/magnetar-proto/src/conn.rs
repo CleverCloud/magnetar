@@ -729,6 +729,19 @@ impl Connection {
         )
     }
 
+    /// `true` only when the **user** has asked for a graceful close — `Closing` (close in
+    /// progress) or `Closed` (close complete). `Failed` (transport drop) returns `false`
+    /// so the auto-reconnect supervisor can distinguish "user wants out" from "broker went
+    /// away". Without this split, `mark_disconnected()` (called on `PeerClosed`) flipped
+    /// the state to `Failed` and the supervisor's `is_closed()` check bailed out instead
+    /// of running its reconnect loop. Mirrors Java `PulsarClient#getState()` returning
+    /// `Closing` / `Closed` but NOT `Failed` when callers want to gate user-initiated
+    /// shutdown.
+    #[must_use]
+    pub fn is_user_closed(&self) -> bool {
+        matches!(self.state, HandshakeState::Closing | HandshakeState::Closed)
+    }
+
     /// Wall-clock time the connection last reached [`HandshakeState::Connected`], if ever.
     /// Returns `None` before the first successful handshake.
     pub fn last_connected_timestamp(&self) -> Option<SystemTime> {
@@ -3437,6 +3450,51 @@ mod conn_state_tests {
         conn2.handle_bytes(Instant::now(), &frame2).expect("handle");
         conn2.mark_disconnected();
         assert!(conn2.is_closed(), "Failed state counts as closed");
+    }
+
+    /// `is_user_closed` MUST distinguish user-initiated close (Closing /
+    /// Closed) from transport drop (Failed). The supervisor's reconnect loop
+    /// uses this to decide "exit cleanly" vs "redial" — collapsing them (as
+    /// `is_closed` does) made the supervisor bail out the instant
+    /// `mark_disconnected` flipped state to `Failed`, defeating the whole
+    /// auto-reconnect feature. Locks the contract.
+    #[test]
+    fn is_user_closed_excludes_failed_so_supervisor_can_reconnect() {
+        // (a) Connected: neither closed nor user-closed.
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        assert!(!conn.is_closed());
+        assert!(!conn.is_user_closed());
+
+        // (b) After `close()` (user-initiated): both flip true.
+        let mut user_closed = Connection::new(ConnectionConfig::default());
+        user_closed.begin_handshake().expect("handshake");
+        user_closed
+            .handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        user_closed.close();
+        assert!(user_closed.is_closed());
+        assert!(
+            user_closed.is_user_closed(),
+            "user close MUST be observable via is_user_closed",
+        );
+
+        // (c) After `mark_disconnected()` (transport drop): `is_closed` is
+        // true but `is_user_closed` is FALSE — this is the gate the
+        // supervisor relies on to decide "redial, don't exit".
+        let mut dropped = Connection::new(ConnectionConfig::default());
+        dropped.begin_handshake().expect("handshake");
+        dropped
+            .handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+        dropped.mark_disconnected();
+        assert!(dropped.is_closed());
+        assert!(
+            !dropped.is_user_closed(),
+            "transport drop must NOT short-circuit the supervisor reconnect loop",
+        );
     }
 
     #[test]

@@ -269,9 +269,12 @@ async fn supervised_driver_loop(
     let mut last_inner_result = driver_loop_inner(&shared, &mut socket).await;
 
     loop {
-        // User-requested close beats reconnect — the state machine is already in `Closing`
-        // or `Closed`, so we propagate the inner result (Ok or Err) as-is.
-        if shared.inner.lock().is_closed() {
+        // User-requested close beats reconnect — the state machine is in `Closing` /
+        // `Closed`, so we propagate the inner result (Ok or Err) as-is. `Failed`
+        // (transport drop, `mark_disconnected`) deliberately does NOT count: the
+        // supervisor's whole purpose is to reconnect after that, so `is_user_closed()`
+        // (which excludes `Failed`) is the right gate here.
+        if shared.inner.lock().is_user_closed() {
             return last_inner_result;
         }
 
@@ -305,8 +308,10 @@ async fn supervised_driver_loop(
                 }
             }
 
-            // Did the user request close while we were sleeping?
-            if shared.inner.lock().is_closed() {
+            // Did the user request close while we were sleeping? Same `is_user_closed`
+            // gate as the outer loop — `Failed` from `mark_disconnected` must NOT abort
+            // the reconnect.
+            if shared.inner.lock().is_user_closed() {
                 return last_inner_result;
             }
 
