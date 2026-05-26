@@ -165,6 +165,8 @@ PIP-121 + PIP-188 paths under deterministic seeds. Tests are normal
 | Reconnect with in-flight publishes | [`reconnect_with_inflight.rs`](../crates/magnetar-runtime-moonpool/tests/reconnect_with_inflight.rs) |
 | Virtual-clock ack-timeout fires | [`virtual_clock_ack_timeout.rs`](../crates/magnetar-runtime-moonpool/tests/virtual_clock_ack_timeout.rs) |
 | Virtual-clock send-timeout fires | [`virtual_clock_send_timeout.rs`](../crates/magnetar-runtime-moonpool/tests/virtual_clock_send_timeout.rs) |
+| ADR-0028 anti-thrash policy (broker ack-then-drop cascade) | [`anti_thrash.rs`](../crates/magnetar-runtime-moonpool/tests/anti_thrash.rs) |
+| Stateful broker + invariant assertions (D2 chaos pack) | [`sim_chaos.rs`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs) |
 
 Reproduce a flaky run under a specific seed:
 
