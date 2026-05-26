@@ -541,14 +541,60 @@ the container's `CMD`, exits gracefully on `SIGTERM`, and
 re-execute the `CMD`. The supervisor then sits in a `Connection
 refused` retry loop until the test times out.
 
-**Fix path.** Replace the two `stop_with_timeout + start` cycles
-with a `std::process::Command::new("docker").args(["restart", ...,
-container.id()])` call (`docker restart` re-runs the entrypoint).
-Also confirm port mapping is preserved across the restart on the
-Docker version we run on CI — the manual experiment in this
-worktree showed the mapping flipped, which would need extra
-handling (re-resolve the port via `container.get_host_port_ipv4`
-after restart).
+**Fix landed.** Both reconnect tests now invoke `docker restart
+--time 5 <id>` via `std::process::Command` instead of
+`stop_with_timeout` + `start`. The test wraps the URL in
+[`ControlledClusterFailover`] and calls `set_url(new_host:new_port)`
+after the restart because `docker restart` against testcontainers'
+random port binding picks a fresh host port (verified locally).
+The supervisor reaches the rebuild step and replays producer +
+consumer state — the post-restart `send` then surfaces a separate
+deeper bug tracked as **#71**.
+
+### #71 — Producer / consumer rebuild fails on namespace-bundle-not-served
+
+**Symptom.** Right after `docker restart`, the supervised driver
+runs `rebuild_producers` / `rebuild_consumers`. The broker rejects
+both with:
+
+```text
+Namespace bundle for topic (...magnetar-e2e-reconnect-...) not
+served by this instance:localhost:8080. Please redo the lookup.
+Request is denied: namespace=public/default
+```
+
+The bundle ownership hasn't been re-acquired by the broker yet
+(typical post-restart transient — bookies + namespace ownership
+reload takes ~10-15 s). magnetar's `CommandError` handler
+(`conn.rs:1417`) treats this as a fatal `ProducerOpen` failure,
+**removes** the producer from `self.producers`, and emits
+`ProducerOpenFailed`. Subsequent `producer.send()` calls hit the
+"unknown producer handle" `InvariantViolation` in
+`Connection::send`. The `SendFut`s never resolve and
+`e2e_supervised_reconnect_across_broker_restart` times out.
+
+Java client behaviour: `ProducerImpl` re-runs lookup with backoff
+on `NamespaceBundleNotServed` / `ServiceNotReady` /
+`TopicNotFound` (all classified as "retriable") and only fails
+permanently on hard errors (auth, fenced, etc.). magnetar needs
+the same retry classification at the producer/consumer rebuild
+layer.
+
+**Fix path.** Either:
+1. In `conn.rs` `CommandError` handler: keep the producer/consumer
+   state for transient error codes (`ServiceNotReady`,
+   `NamespaceBundleNotServed`, `TopicNotFound`, `MetadataError`)
+   and emit a `ProducerOpenTransient` event that the supervisor
+   consumes by re-running `rebuild_producers` after a backoff. OR
+2. Introduce a small `producer_rebuild_retry` task per producer
+   handle that runs on its own backoff after the supervisor's
+   initial `rebuild_producers` lands a transient error.
+
+Option (1) is closer to Pulsar's wire semantics; option (2) keeps
+the supervisor loop simpler. Either way the user-facing `SendFut`
+must stay `Pending` across the retry sequence (same contract as
+the existing in-flight-publish-replay path: no `Err` surfaces to
+the caller for transient broker errors).
 
 ### #67 — Fresh consumer_id refactor for post-seek resubscribe
 

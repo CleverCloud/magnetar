@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
+use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -108,19 +109,31 @@ fn supervisor_for_e2e() -> SupervisorConfig {
 /// round-trip a message after the broker returns. Pins the
 /// supervised-reconnect + transparent-rebuild contract end-to-end.
 ///
-/// `testcontainers` 0.27 has no `restart_async`; instead we call
-/// `stop_with_timeout(Some(5))` then `start()` on the same container
-/// handle. The container id (and therefore the host-port binding from
-/// Docker's NAT table) is preserved across the cycle, so the
-/// `service_url` we built at first start stays valid for the reconnect.
+/// `testcontainers` 0.27 has no `restart_async`. `stop_with_timeout` +
+/// `start` doesn't work either: `bin/pulsar standalone` exits cleanly on
+/// `SIGTERM` and `container.start()` only re-runs `docker start`, which does
+/// NOT re-execute the entrypoint. The container would come back alive but
+/// with no broker inside, and the supervisor would spin on `Connection
+/// refused` until the test budget ran out (the symptom we observed before
+/// this fix). We shell out to `docker restart` instead — that re-runs the
+/// entrypoint and brings the broker back.
 #[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn std::error::Error>>
 {
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
+    // testcontainers maps the broker's 6650 to a random host port and reuses
+    // that port across `docker restart` only when the port is explicitly
+    // pinned. Default `-P` random binding gets a fresh host port on every
+    // restart — so wrap the URL in a `ControlledClusterFailover` and bump it
+    // after the restart. The supervisor calls `get_service_url()` on every
+    // redial, so a single `set_url` is enough to redirect the loop to the
+    // new port.
+    let failover = ControlledClusterFailover::new(service_url);
+    let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
     let client = PulsarClient::builder()
-        .service_url(service_url)
+        .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
         .operation_timeout(Duration::from_secs(60))
         .build()
@@ -149,17 +162,25 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     assert_eq!(pre.payload.as_ref(), b"before-restart");
     consumer.ack(pre.message_id).await?;
 
-    // Stop the broker. SIGTERM with a short grace period mimics a real
-    // transient outage rather than an instant SIGKILL.
-    tracing::info!("stopping pulsar container to force reconnect");
-    container.stop_with_timeout(Some(5)).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Restart. `start()` reuses the same container id; the host-port
-    // mapping in Docker's NAT table persists, so `service_url` from the
-    // first start remains valid.
-    tracing::info!("starting pulsar container to verify reconnect");
-    container.start().await?;
+    // `docker restart` re-runs the entrypoint, so `bin/pulsar standalone`
+    // comes back. SIGTERM with a 5 s grace mimics a real transient outage.
+    tracing::info!("restarting pulsar container to force reconnect");
+    let container_id = container.id().to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(["restart", "--time", "5", &container_id])
+            .status()
+    })
+    .await??;
+    assert!(status.success(), "docker restart failed: {status:?}");
+    // Re-query the (possibly new) host port and feed it to the supervisor's
+    // failover provider — `docker restart` against an `-P` binding picks a
+    // fresh random port.
+    let new_host = container.get_host().await?;
+    let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+    let new_url = format!("pulsar://{new_host}:{new_port}");
+    tracing::info!(%new_url, "redirecting supervisor to post-restart port");
+    failover.set_url(new_url);
 
     // The broker takes a few seconds to come back. The supervisor
     // handles retries; we poll send() until it succeeds or the budget
@@ -219,8 +240,14 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
+    // See the producer-restart test for why we wrap in
+    // `ControlledClusterFailover` — `docker restart` against testcontainers'
+    // random port binding picks a fresh host port, and the supervisor must
+    // be redirected.
+    let failover = ControlledClusterFailover::new(service_url);
+    let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
     let client = PulsarClient::builder()
-        .service_url(service_url)
+        .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
         .operation_timeout(Duration::from_secs(120))
         .build()
@@ -253,7 +280,12 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     // Now stop the broker and fire several publishes while it's down. The driver
     // accepts them into `ProducerState::pending`; the reconnect path snapshots
     // them and rebuild_producers replays them on the new session.
+    //
+    // `docker restart` (not `stop_with_timeout` + `start`) is required — see
+    // the long comment on the producer-restart test above for why
+    // `container.start()` doesn't actually re-run `bin/pulsar standalone`.
     tracing::info!("stopping pulsar container to force in-flight replay");
+    let container_id = container.id().to_string();
     container.stop_with_timeout(Some(5)).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -269,9 +301,23 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
         }));
     }
 
-    // Restart the broker — supervised reconnect path kicks in.
-    tracing::info!("starting pulsar container to validate transparent replay");
-    container.start().await?;
+    // `docker restart` re-runs `bin/pulsar standalone`. The
+    // `container.stop_with_timeout` already stopped the container; `docker
+    // restart` against a stopped container is equivalent to `docker start`
+    // and runs the CMD again, which is what we need.
+    tracing::info!("restarting pulsar container to validate transparent replay");
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(["restart", "--time", "5", &container_id])
+            .status()
+    })
+    .await??;
+    assert!(status.success(), "docker restart failed: {status:?}");
+    // Redirect supervisor to the post-restart port (random-mapped, see the
+    // producer-restart test for the rationale).
+    let new_host = container.get_host().await?;
+    let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+    failover.set_url(format!("pulsar://{new_host}:{new_port}"));
 
     // Each `SendFut` MUST resolve `Ok(_)` — no `Err` surfaces to the caller.
     // Stage 3 transparent replay = the user's future never observed the reset.
