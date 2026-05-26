@@ -29,7 +29,35 @@ Stack additively with `~/.claude/CLAUDE.md`; when this file and the global file 
 
 ## TLS
 
-`rustls` is the only TLS implementation. No `native-tls`, `openssl`, `openssl-sys`. The moonpool engine drives `rustls::ClientConnection` by hand (read_tls / process_new_packets / write_tls) over the moonpool byte pipe.
+`rustls` is the only TLS implementation. No `native-tls`. `openssl` /
+`openssl-sys` are admitted **only** as transitive deps of
+`rustls-openssl` under the `crypto-openssl` feature
+([ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)) — `deny.toml`
+enforces this via `wrappers = ["rustls-openssl"]`. The moonpool engine
+drives `rustls::ClientConnection` by hand (`read_tls` /
+`process_new_packets` / `write_tls`) over the moonpool byte pipe.
+
+### Crypto provider selection
+
+The active rustls crypto backend is picked at compile time on the
+`magnetar` façade via four mutually-pluggable features:
+
+| Feature              | Backend           | Post-quantum KEX     | FIPS validated | Default |
+|----------------------|-------------------|----------------------|----------------|---------|
+| `crypto-aws-lc-rs`   | aws-lc-rs         | yes (X25519MLKEM768) | no             | ✓       |
+| `crypto-ring`        | ring              | no                   | no             |         |
+| `crypto-openssl`     | rustls-openssl    | yes                  | depends on OpenSSL build | |
+| `crypto-fips`        | aws-lc-fips-sys   | (FIPS-approved only) | yes            |         |
+
+Production callsites must use
+`magnetar_runtime_tokio::tls_crypto::active_provider()` (or the
+moonpool sibling) rather than `CryptoProvider::get_default()` or
+`ring::default_provider()`. The shim is idempotent and installs the
+provider on first call. Under `--all-features` the cfg cascade
+resolves to aws-lc-rs.
+
+A single `compile_error!` fires if no `crypto-*` feature is selected.
+The per-cell matrix is enforced by `cargo xtask check-crypto-matrix`.
 
 ## Worktree workflow
 

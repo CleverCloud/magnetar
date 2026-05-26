@@ -1,9 +1,19 @@
 # ADR-0005 — TLS via `rustls` only, no `native-tls` / `openssl`
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0035](0035-pluggable-crypto-provider.md), openssl ban portion)
 - **Date**: 2026-05-20
 - **Decider**: Florentin Dubois
 - **Tags**: tls, dependencies, supply-chain
+
+> **Amendment (2026-05-26, [ADR-0035](0035-pluggable-crypto-provider.md)).**
+> The `openssl` / `openssl-sys` ban is narrowed: those crates re-enter
+> the dep graph **only** as transitive deps of `rustls-openssl` (the
+> rustls crypto-provider wrapper around system OpenSSL), gated by the
+> `crypto-openssl` Cargo feature and scoped in `deny.toml` via
+> `wrappers = ["rustls-openssl"]`. Everything else in this ADR stays in
+> force: `rustls` is still the only TLS implementation, `native-tls`
+> stays banned, TLS-1.3 stays the wire default, and the moonpool
+> byte-pipe adapter is unchanged.
 
 ## Context
 

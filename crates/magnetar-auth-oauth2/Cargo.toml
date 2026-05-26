@@ -15,6 +15,16 @@ categories    = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Pluggable rustls crypto provider (issue #9, ADR-0035). Same shape as
+# `magnetar-admin`: reqwest's `rustls-tls` resolves to aws-lc-rs;
+# `rustls-tls-no-provider` defers to whichever provider the engine boot
+# installed.
+crypto-aws-lc-rs = ["reqwest/rustls-tls"]
+crypto-ring      = ["reqwest/rustls-tls-no-provider"]
+crypto-openssl   = ["reqwest/rustls-tls-no-provider"]
+crypto-fips      = ["reqwest/rustls-tls-no-provider"]
+
 [dependencies]
 bytes          = { workspace = true }
 magnetar-proto = { workspace = true }

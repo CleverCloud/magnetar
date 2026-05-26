@@ -15,6 +15,17 @@ categories    = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Pluggable rustls crypto provider (issue #9, ADR-0035). reqwest 0.12's
+# `rustls-tls` resolves to aws-lc-rs internally; `rustls-tls-no-provider`
+# trusts the caller to `install_default()` whichever provider is in use
+# (the tokio engine boot does that idempotently via the
+# `magnetar_runtime_tokio::tls_crypto::install_default_provider()` shim).
+crypto-aws-lc-rs = ["reqwest/rustls-tls"]
+crypto-ring      = ["reqwest/rustls-tls-no-provider"]
+crypto-openssl   = ["reqwest/rustls-tls-no-provider"]
+crypto-fips      = ["reqwest/rustls-tls-no-provider"]
+
 [dependencies]
 magnetar-proto = { workspace = true }
 reqwest        = { workspace = true }

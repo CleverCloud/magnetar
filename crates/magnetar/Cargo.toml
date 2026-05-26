@@ -16,7 +16,7 @@ categories    = { workspace = true }
 workspace = true
 
 [features]
-default  = ["tokio"]
+default  = ["tokio", "crypto-aws-lc-rs"]
 tokio    = ["dep:magnetar-runtime-tokio", "dep:tokio", "dep:futures-util"]
 # `moonpool` is additive on top of `tokio` — per ADR-0019 gate (e) the
 # façade ships both engines simultaneously available in the same binary,
@@ -33,6 +33,40 @@ encryption  = ["dep:magnetar-messagecrypto"]
 # `testcontainers-rs`. Requires Docker on the host. CI runs these in
 # the `e2e` job (workflow_dispatch + release branches only).
 e2e         = ["tokio", "admin"]
+
+# --- Crypto provider features (issue #9, ADR-0035). Compile-time pluggable
+# rustls crypto backend. Under `--all-features` the cfg-priority cascade
+# resolves to aws-lc-rs (see `magnetar-runtime-{tokio,moonpool}/src/
+# tls_crypto.rs`). Single-provider builds must enable exactly one of
+# these via `--no-default-features --features tokio,crypto-<x>`. ---
+crypto-aws-lc-rs = [
+    "magnetar-runtime-tokio?/crypto-aws-lc-rs",
+    "magnetar-runtime-moonpool?/crypto-aws-lc-rs",
+    "magnetar-auth-athenz?/crypto-aws-lc-rs",
+    "magnetar-admin?/crypto-aws-lc-rs",
+    "magnetar-auth-oauth2?/crypto-aws-lc-rs",
+]
+crypto-ring = [
+    "magnetar-runtime-tokio?/crypto-ring",
+    "magnetar-runtime-moonpool?/crypto-ring",
+    "magnetar-auth-athenz?/crypto-ring",
+    "magnetar-admin?/crypto-ring",
+    "magnetar-auth-oauth2?/crypto-ring",
+]
+crypto-openssl = [
+    "magnetar-runtime-tokio?/crypto-openssl",
+    "magnetar-runtime-moonpool?/crypto-openssl",
+    "magnetar-auth-athenz?/crypto-openssl",
+    "magnetar-admin?/crypto-openssl",
+    "magnetar-auth-oauth2?/crypto-openssl",
+]
+crypto-fips = [
+    "magnetar-runtime-tokio?/crypto-fips",
+    "magnetar-runtime-moonpool?/crypto-fips",
+    "magnetar-auth-athenz?/crypto-fips",
+    "magnetar-admin?/crypto-fips",
+    "magnetar-auth-oauth2?/crypto-fips",
+]
 
 [dependencies]
 magnetar-proto             = { workspace = true }

@@ -173,11 +173,15 @@ mod tests {
 
     /// Build an `Arc<ClientConfig>` from an empty (intentionally invalid) trust
     /// store. The `ClientConnection` will still construct; we only smoke-test
-    /// that the adapter's buffer accounting works.
+    /// that the adapter's buffer accounting works. The rustls crypto provider
+    /// is picked by the workspace's `crypto-*` feature (issue #9, ADR-0035)
+    /// via the explicit [`crate::tls_crypto::active_provider`] shim.
     fn make_session() -> rustls::ClientConnection {
         let root_store = rustls::RootCertStore::empty();
         let config = std::sync::Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions are valid")
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         );

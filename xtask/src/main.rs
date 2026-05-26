@@ -15,6 +15,9 @@
 //! - `check-runtime-test-parity`: assert `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`
 //!   carry the same number of `#[test]` / `#[tokio::test]` / `#[moonpool::test]` items. Mirrors
 //!   ADR-0024.
+//! - `check-crypto-matrix`: build the four `crypto-*` provider features in isolation (issue #9,
+//!   ADR-0035). Complements `cargo build --workspace --all-features` (which exercises the cfg
+//!   cascade) by proving each single-provider cell compiles cleanly.
 //! - `vendor-proto --rev <sha>`: refresh vendored `PulsarApi.proto`.
 //!
 //! Codegen drives `prost-build` against `crates/magnetar-proto/proto/`, writes
@@ -103,6 +106,14 @@ enum Cmd {
     /// `crates/magnetar-runtime-moonpool/{src,tests}`. Strict equality
     /// required. See ADR-0024.
     CheckRuntimeTestParity,
+    /// Build the per-provider crypto matrix (issue #9, ADR-0035).
+    ///
+    /// Iterates the four mutually-pluggable `crypto-*` features in
+    /// isolation (under `tokio` and `tokio,moonpool`) so each cell is
+    /// independently buildable. Complements the `--all-features`
+    /// baseline (which goes through the cfg cascade in
+    /// `magnetar-runtime-{tokio,moonpool}/src/tls_crypto.rs`).
+    CheckCryptoMatrix,
     /// Refresh the vendored Pulsar proto from a given upstream commit.
     VendorProto {
         /// Apache Pulsar commit SHA to vendor from.
@@ -133,6 +144,7 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
         Cmd::CheckSimCoverage { base } => check_sim_coverage(&base),
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
+        Cmd::CheckCryptoMatrix => check_crypto_matrix(),
         Cmd::VendorProto { rev, source } => vendor_proto(&rev, source.as_deref()),
     }
 }
@@ -1281,4 +1293,64 @@ fn run_git_in_capture(repo: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Build the four `crypto-*` provider features in isolation.
+///
+/// Each cell is exercised with the `tokio` feature on (production
+/// surface) and with both `tokio` + `moonpool` on (so the moonpool
+/// engine's `tls_crypto` sibling compiles under each provider too).
+/// `cargo build --workspace --all-features` already validates the cfg
+/// cascade in `magnetar-runtime-{tokio,moonpool}/src/tls_crypto.rs`;
+/// this check is the per-cell complement (issue #9, ADR-0035).
+fn check_crypto_matrix() -> Result<()> {
+    const PROVIDERS: &[&str] = &[
+        "crypto-aws-lc-rs",
+        "crypto-ring",
+        "crypto-openssl",
+        "crypto-fips",
+    ];
+
+    let workspace_root = workspace_root()?;
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut failures: Vec<String> = Vec::new();
+
+    for crypto in PROVIDERS {
+        for base in ["tokio", "tokio,moonpool"] {
+            let features = format!("{base},{crypto}");
+            eprintln!(
+                "xtask check-crypto-matrix: cargo build -p magnetar --no-default-features --features {features}"
+            );
+            let status = StdCommand::new(&cargo)
+                .current_dir(&workspace_root)
+                .args([
+                    "build",
+                    "-p",
+                    "magnetar",
+                    "--no-default-features",
+                    "--features",
+                    &features,
+                ])
+                .status()
+                .with_context(|| {
+                    format!("failed to invoke `cargo build` for features `{features}`")
+                })?;
+            if !status.success() {
+                failures.push(features);
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        eprintln!("xtask check-crypto-matrix: all 8 cells built successfully.");
+        Ok(())
+    } else {
+        for cell in &failures {
+            eprintln!("xtask check-crypto-matrix: FAILED cell: {cell}");
+        }
+        bail!(
+            "xtask check-crypto-matrix: {} of 8 cell(s) failed.",
+            failures.len()
+        );
+    }
 }

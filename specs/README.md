@@ -20,7 +20,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0002](adr/0002-license-apache-2-0.md) | License: Apache-2.0 only | Accepted |
 | [0003](adr/0003-no-channels-rule.md) | No channel crates in the workspace | Accepted |
 | [0004](adr/0004-sans-io-protocol-core.md) | Sans-io `magnetar-proto` + swappable I/O engines | Accepted |
-| [0005](adr/0005-rustls-only-tls.md) | TLS: `rustls` only, no `native-tls` / `openssl` | Accepted |
+| [0005](adr/0005-rustls-only-tls.md) | TLS: `rustls` only, no `native-tls` / `openssl` | Amended by [ADR-0035](adr/0035-pluggable-crypto-provider.md) (openssl ban portion) |
 | [0006](adr/0006-moonpool-tls-byte-pipe.md) | moonpool engine drives `rustls::ClientConnection` directly | Accepted |
 | [0007](adr/0007-edition-2024-msrv-1-85.md) | Rust edition 2024, MSRV 1.85 | Accepted |
 | [0008](adr/0008-crate-topology.md) | 11-crate workspace topology | Accepted |
@@ -34,7 +34,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0016](adr/0016-pip-121-cluster-failover.md) | PIP-121 `ServiceUrlProvider` + `ControlledClusterFailover` + `AutoClusterFailover` w/ `HealthProbe` | Accepted |
 | [0017](adr/0017-memory-limit-atomic-reservation.md) | `memory_limit` runtime accounting via atomic CAS + `SendFut::Drop` release | Accepted |
 | [0018](adr/0018-pip-188-reconnect-on-migrate.md) | PIP-188 `TOPIC_MIGRATED` → supervised reset + reconnect (re-uses Stage 2/3 supervisor) | Accepted |
-| [0019](adr/0019-engine-scope-and-moonpool-parity.md) | Engine scope for v0.1.0 parity; moonpool parity as follow-up train | Accepted |
+| [0019](adr/0019-engine-scope-and-moonpool-parity.md) | Engine scope for v0.1.0 parity; moonpool parity as follow-up train | Superseded by [ADR-0027](adr/0027-moonpool-engine-clientstate-is-runtime-client.md) (partial, §gate (e)) |
 | [0020](adr/0020-memory-limit-producer-block.md) | `MemoryLimitPolicy::ProducerBlock` back-pressure via Waker slab | Accepted |
 | [0021](adr/0021-no-silent-test-ignore-or-remove.md) | Tests are fixed, not silently ignored or removed | Accepted |
 | [0022](adr/0022-memory-limit-producer-block-moonpool.md) | `MemoryLimitPolicy::ProducerBlock` ported to the moonpool engine; fairness contract under `Providers` | Accepted |
@@ -50,6 +50,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0032](adr/0032-pip-466-v5-client-surface-scope.md) | v0.2.0 scope for PIP-466 V5 client surface — API-shape decision (no wire change); rename evaluation | Proposed |
 | [0033](adr/0033-pip-180-shadow-topic-scope.md) | v0.2.0 scope for PIP-180 shadow topic — read-only follower subscription mode, no-ack/no-seek consumer semantics | Proposed |
 | [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Proposed |
+| [0035](adr/0035-pluggable-crypto-provider.md) | Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) — amends ADR-0005 openssl ban via `deny.toml` `wrappers = ["rustls-openssl"]` carve-out | Accepted |
 
 ## How to add an ADR
 

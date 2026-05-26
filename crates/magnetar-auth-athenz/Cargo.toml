@@ -15,6 +15,18 @@ categories    = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Pluggable rustls crypto provider (issue #9, ADR-0035). This crate
+# only uses rustls types (cert / material), not the crypto provider
+# itself; the features exist so the façade's propagation chain compiles
+# uniformly across all rustls consumers. `crypto-openssl` is a no-op
+# here because rustls-openssl is a runtime provider crate, not a type
+# surface.
+crypto-aws-lc-rs = ["rustls/aws_lc_rs"]
+crypto-ring      = ["rustls/ring"]
+crypto-fips      = ["rustls/fips"]
+crypto-openssl   = []
+
 [dependencies]
 bytes          = { workspace = true }
 magnetar-proto = { workspace = true }

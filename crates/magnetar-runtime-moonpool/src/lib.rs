@@ -68,6 +68,7 @@ pub mod dns;
 mod driver;
 mod producer;
 pub mod tls;
+pub mod tls_crypto;
 mod transport;
 
 use std::sync::Arc;
@@ -728,14 +729,18 @@ mod tests {
 
     /// `connect_tls` compiles against `TokioProviders` with a stock empty
     /// rustls config. Smoke-tests that the TLS variant of the `Transport`
-    /// enum + `RustlsByteAdapter` plumbing typechecks end-to-end.
+    /// enum + `RustlsByteAdapter` plumbing typechecks end-to-end. The
+    /// rustls crypto provider is picked by the workspace's `crypto-*`
+    /// feature (issue #9, ADR-0035).
     #[test]
     #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
     fn connect_tls_compiles() {
         let providers = TokioProviders::new();
         let engine = MoonpoolEngine::new(providers);
         let tls_config = std::sync::Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+                .with_safe_default_protocol_versions()
+                .expect("rustls default protocol versions are valid")
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth(),
         );

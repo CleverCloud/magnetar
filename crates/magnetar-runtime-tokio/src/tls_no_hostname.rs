@@ -57,10 +57,9 @@ pub fn tls_config_no_hostname(
 
     // Wrap the standard WebPKI verifier so the chain check still runs —
     // we only override `verify_server_cert` to drop the hostname-match
-    // step.
-    let provider = rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+    // step. The provider is picked by the workspace's `crypto-*`
+    // feature (issue #9, ADR-0035) and installed idempotently.
+    let provider = crate::tls_crypto::active_provider();
     let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .map_err(|e| {
@@ -144,7 +143,7 @@ mod tests {
     /// Sanity-check the builder rejects an empty PEM blob.
     #[test]
     fn empty_pem_is_rejected() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::tls_crypto::install_default_provider();
         let err = tls_config_no_hostname(b"").expect_err("empty PEM must be rejected");
         match err {
             crate::ClientError::Other(msg) => {
