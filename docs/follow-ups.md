@@ -621,18 +621,36 @@ a fresh `CommandProducer` lands, broker emits "Created new
 producer", and the subscription is re-attached on the same
 connection.
 
-**Remaining (tracked as #73).** Even after the broker successfully
-re-attaches the producer + consumer, the user-side
-`producer.send().await` does not observe a `CommandSendReceipt`
-(broker logs show no inbound `CommandSend` after the re-attach).
-There's a subtle state-machine bug between the
-`ProducerOpenFailedTransient → retry_producer_open → CommandProducerSuccess`
-path and the user-facing `SendFut`: the future is parked but the
-re-attach doesn't kick the driver to flush a fresh CommandSend
-from the queued `OpSend`s. Needs investigation in the
-producer state machine — likely the producer's `Open` /
-`ReadyForSending` state never transitions back from the transient
-window.
+**Partial fix for #73 in `fix/retry-replay-pending-sends`.** Two
+related defects identified and fixed:
+
+1. `Connection::reset()` wiped `in_flight_publish_snapshots` at
+   the top of every cycle. When the supervisor cycled through
+   `reset()` repeatedly (each post-disconnect rebuild rejected
+   with `NamespaceBundleNotServed`, broker drops connection,
+   redial, reset again) the first reset's snapshot of the user's
+   queued send was overwritten by the second reset's empty
+   pending → snapshot lost forever, send hangs. Fixed: reset now
+   APPENDS new snapshots via `entry.or_default().extend(...)`
+   instead of clearing — `rebuild_producers.remove()` is the
+   single consumer so accumulation is safe.
+2. `retry_producer_open` now also calls `replay_pending_outbound`
+   (new `ProducerState` method) so any `OpSend`s the user enqueued
+   during the transient window get their cached wire frames re-emitted
+   onto outbound after the targeted re-attach. Mirrors the snapshot
+   replay path in `rebuild_producers` but for the single-handle
+   transient case.
+
+After these two fixes the supervisor still gets caught in a
+broker-driven disconnect cascade: rebuild succeeds, broker creates
+the producer, then drops the TCP connection ~10 ms later (broker
+logs "Cleared producer created after connection was closed"
+followed by a fresh `Subscribing on topic` + immediate close,
+several iterations per second). The cascade looks broker-side
+(bundle ownership / load-balancing churn after the restart) but
+needs Pulsar broker investigation to confirm and decide whether
+magnetar should add anti-thrash backoff or stop redialing for a
+configurable window after a transient error. Tracked as **#74**.
 
 ### #67 — Fresh consumer_id refactor for post-seek resubscribe
 

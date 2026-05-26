@@ -1221,6 +1221,28 @@ impl ProducerState {
         }
     }
 
+    /// Re-push the wire frames for every currently-pending `OpSend` back onto the outbound
+    /// queue WITHOUT re-adding the ops to `pending` (they're already there). Used by the
+    /// transient-retry path: after `retry_producer_open` re-attaches the producer, any
+    /// `OpSend`s that the user enqueued during the transient window had their original
+    /// frames silently dropped by the broker (Pulsar drops `CommandSend` for unknown
+    /// `producer_id` without sending an error). Re-emitting the cached `replay_frames`
+    /// re-runs the publish on the freshly-attached producer; the user-facing `SendFut`
+    /// then resolves on the eventual `CommandSendReceipt`. Distinct from
+    /// [`Self::replay_snapshots`], which is the reset-path counterpart that pushes the
+    /// `OpSend`s into `pending` from scratch.
+    ///
+    /// `OpSend`s with empty `replay_frames` (in-progress batched sends from
+    /// `add_to_batch`) are skipped: their wire bytes only materialise at `flush_batch`
+    /// time.
+    pub fn replay_pending_outbound(&mut self) {
+        for op in &self.pending {
+            for frame in &op.replay_frames {
+                self.outbound.push_back(frame.clone());
+            }
+        }
+    }
+
     /// Mark the producer closed. New sends return [`ProducerError::Closed`].
     pub fn close(&mut self) {
         self.closed = true;

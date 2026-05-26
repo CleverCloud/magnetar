@@ -856,7 +856,16 @@ impl Connection {
         // do *not* install a `SessionLost` outcome on the Send key — the user future polls
         // after the wake-up, finds the slot empty, re-registers, and will eventually see
         // the receipt from the replayed publish.
-        self.in_flight_publish_snapshots.clear();
+        //
+        // We APPEND new snapshots onto the existing `in_flight_publish_snapshots` rather
+        // than clearing first — the supervisor may cycle through `reset()` multiple times
+        // (broker rejects the rebuild, drops the connection, supervisor redials, calls
+        // `reset()` again) before `rebuild_producers` actually drains the snapshots onto
+        // a successful session. Pre-fix the second `reset()` wiped the first reset's
+        // snapshots so the user's pre-restart send was silently lost. The
+        // `rebuild_producers` path is the single consumer of this map (it `.remove()`s
+        // each handle's vector) so accumulation is safe — there's no double-replay
+        // because anything successfully replayed is gone from the map.
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
             if let Some(producer) = self.producers.get_mut(&handle) {
@@ -879,7 +888,10 @@ impl Connection {
                     }
                 }
                 if !snapshots.is_empty() {
-                    self.in_flight_publish_snapshots.insert(handle, snapshots);
+                    self.in_flight_publish_snapshots
+                        .entry(handle)
+                        .or_default()
+                        .extend(snapshots);
                 }
             }
         }
@@ -3415,6 +3427,19 @@ impl Connection {
         }
         p.epoch = p.epoch.saturating_add(1);
         let request_id = self.emit_command_producer(handle, &req);
+        // Pending `OpSend`s from the transient window have already had their wire frames
+        // written to the socket — but the broker dropped them because the producer wasn't
+        // attached (Pulsar silently discards `CommandSend` for an unknown `producer_id`).
+        // After `CommandProducer` lands the new attachment, replay each pending op's
+        // wire frame so the broker re-publishes and the user's `SendFut` finally observes
+        // a `CommandSendReceipt`. The frames go onto outbound AFTER `CommandProducer`, so
+        // the broker processes the attach first and the sends second — same ordering Java's
+        // `ProducerImpl#resendMessages` enforces after a reattach. Mirrors the snapshot
+        // replay in `rebuild_producers` (Stage 3 at-least-once parity), but targeted at a
+        // single producer's already-in-`pending` ops rather than the reset-time snapshot.
+        if let Some(p) = self.producers.get_mut(&handle) {
+            p.replay_pending_outbound();
+        }
         self.drain_producer_outbound();
         Some(request_id)
     }
