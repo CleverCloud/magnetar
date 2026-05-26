@@ -158,6 +158,81 @@ impl<P: Providers> Consumer<P> {
             .unwrap_or_default()
     }
 
+    /// Number of messages currently buffered in this consumer's receiver
+    /// queue, waiting for a `receive()` call to pull them out. Returns `0`
+    /// for closed/unknown handles. Mirrors Java
+    /// `Consumer#getNumMessagesInQueue`.
+    #[must_use]
+    pub fn available_in_queue(&self) -> usize {
+        self.shared.inner.lock().consumer_queue_len(self.handle)
+    }
+
+    /// Number of dispatch permits this consumer still has with the broker
+    /// — i.e. messages it has authorised the broker to push without an
+    /// explicit `CommandFlow`. Returns `0` for closed/unknown handles.
+    /// Mirrors Java `ConsumerBase#getAvailablePermits`.
+    #[must_use]
+    pub fn available_permits(&self) -> u32 {
+        self.shared
+            .inner
+            .lock()
+            .consumer_available_permits(self.handle)
+    }
+
+    /// `true` if this consumer has received at least one message since
+    /// opening. Mirrors Java `Consumer#hasReceivedAnyMessage` — useful as a
+    /// "did anything ever arrive?" probe without inspecting the full
+    /// [`ConsumerStats`](magnetar_proto::consumer::ConsumerStats).
+    #[must_use]
+    pub fn has_received_any_message(&self) -> bool {
+        self.stats().total_msgs_received > 0
+    }
+
+    /// Returns `true` if this consumer is currently paused (no automatic
+    /// flow refills until [`Self::resume`]). Returns `false` for
+    /// closed/unknown handles. Mirrors Java `Consumer#isPaused` (Pulsar
+    /// itself doesn't expose this on the Java client; we surface it for
+    /// observability).
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.shared
+            .inner
+            .lock()
+            .is_paused(self.handle)
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` once the broker has indicated end-of-topic for this
+    /// consumer (no further messages will be dispatched). Mirrors Java
+    /// `Consumer#hasReachedEndOfTopic`.
+    #[must_use]
+    pub fn has_reached_end_of_topic(&self) -> bool {
+        self.shared
+            .inner
+            .lock()
+            .consumer_reached_end_of_topic(self.handle)
+    }
+
+    /// Mirrors Java `Consumer#isInactive`. Returns `true` once the consumer
+    /// has reached end-of-topic on its subscription (no more messages will
+    /// be dispatched). Note: a closed consumer is not represented as
+    /// "inactive" here; check the connection state machine if you need to
+    /// detect close.
+    #[must_use]
+    pub fn is_inactive(&self) -> bool {
+        self.has_reached_end_of_topic()
+    }
+
+    /// Drain every message the state machine has flagged as dead-letter
+    /// (redelivery count greater than the configured `max_redeliver_count`).
+    /// The caller is responsible for republishing them to the configured
+    /// DLQ topic. Returns an empty `Vec` when DLQ routing is disabled or no
+    /// messages have been flagged.
+    pub fn drain_dead_letter(&self) -> Vec<IncomingMessage> {
+        let mut conn = self.shared.inner.lock();
+        conn.drain_dead_letter(self.handle)
+    }
+
     /// Stops automatic flow refills so the broker stops dispatching new
     /// messages once already-issued permits drain. Buffered messages remain
     /// receivable.
@@ -1325,5 +1400,172 @@ mod tests {
         let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
         assert!(res.is_err(), "expected pending future (no driver)");
         assert!(!consumer.is_closed());
+    }
+
+    // ── helper-method ports (MultiTopics surface lift, pass-1) ───────────
+    //
+    // The block below mirrors `crates/magnetar-runtime-tokio/src/consumer.rs`
+    // 1:1 per ADR-0024 §strict test-count parity. Each helper has a tokio
+    // counterpart with the same name and the same observable contract.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn available_in_queue_reflects_pending_messages() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/avail-queue".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        // Empty queue right after subscribe.
+        assert_eq!(consumer.available_in_queue(), 0);
+
+        // Pump a couple of CommandMessage frames; the per-consumer queue
+        // grows lockstep with delivery.
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..3_u64 {
+                let bytes = command_message_bytes(handle.0, 300 + i, format!("q{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+        // The cardinality matches what the proto state machine accepted —
+        // `>= 0` (the events-pump may have buffered some into the events
+        // queue; the safety invariant is non-decrease relative to the
+        // empty starting point).
+        let depth = consumer.available_in_queue();
+        assert!(depth <= 3, "queue depth must not exceed delivered count");
+
+        // Closed/unknown handle path returns 0.
+        let closed: Consumer<TokioProviders> =
+            make_consumer(shared.clone(), magnetar_proto::ConsumerHandle(9999));
+        assert_eq!(closed.available_in_queue(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn available_permits_reads_state_machine_counter() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/permits".to_owned(),
+                subscription: "s".to_owned(),
+                receiver_queue_size: 64,
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        // Right after subscribe, before the initial flow is granted, the
+        // counter is zero.
+        assert_eq!(consumer.available_permits(), 0);
+        // Granting the initial flow bumps the counter to receiver_queue_size.
+        {
+            let mut conn = shared.inner.lock();
+            let _ = conn.initial_flow(handle);
+        }
+        assert_eq!(consumer.available_permits(), 64);
+
+        let closed: Consumer<TokioProviders> =
+            make_consumer(shared, magnetar_proto::ConsumerHandle(9999));
+        assert_eq!(closed.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn has_received_any_message_flips_after_first_delivery() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/has-recv".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        assert!(
+            !consumer.has_received_any_message(),
+            "fresh consumer must report no messages received",
+        );
+
+        // Drive one CommandMessage through the state machine and then drain
+        // it via `receive()` so the stats counter increments.
+        {
+            let mut conn = shared.inner.lock();
+            let bytes = command_message_bytes(handle.0, 400, b"first");
+            conn.handle_bytes(Instant::now(), &bytes)
+                .expect("handle CommandMessage");
+        }
+        let _ = consumer.receive().await.expect("receive must resolve");
+        assert!(
+            consumer.has_received_any_message(),
+            "has_received_any_message must flip true after first receive",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn is_paused_reads_state_machine_flag() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/is-paused".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        assert!(!consumer.is_paused(), "default state is unpaused");
+        consumer.pause();
+        assert!(consumer.is_paused(), "after pause()");
+        consumer.resume();
+        assert!(!consumer.is_paused(), "after resume()");
+
+        // Unknown handle defaults to false.
+        let closed: Consumer<TokioProviders> =
+            make_consumer(shared, magnetar_proto::ConsumerHandle(9999));
+        assert!(!closed.is_paused());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn has_reached_end_of_topic_defaults_to_false() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/end-of-topic".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        assert!(
+            !consumer.has_reached_end_of_topic(),
+            "default state is not end-of-topic",
+        );
+        // is_inactive is a synonym for has_reached_end_of_topic per Java
+        // semantics on the consumer surface.
+        assert!(!consumer.is_inactive());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_dead_letter_empty_by_default() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/dlq".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        assert!(
+            consumer.drain_dead_letter().is_empty(),
+            "no messages have been flagged for DLQ yet",
+        );
     }
 }

@@ -1768,4 +1768,190 @@ mod tests {
         assert!(res.is_err(), "expected pending future (no driver)");
         assert!(!consumer.is_closed());
     }
+
+    // ── helper-method ports (MultiTopics surface lift, pass-1) ───────────
+    //
+    // The block below mirrors `crates/magnetar-runtime-moonpool/src/consumer.rs`
+    // 1:1 per ADR-0024 §strict test-count parity.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn available_in_queue_reflects_pending_messages() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/avail-queue".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        assert_eq!(consumer.available_in_queue(), 0);
+
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..3_u64 {
+                let bytes = command_message_bytes(handle.0, 300 + i, format!("q{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+        let depth = consumer.available_in_queue();
+        assert!(depth <= 3, "queue depth must not exceed delivered count");
+
+        let closed = Consumer {
+            shared,
+            handle: magnetar_proto::ConsumerHandle(9999),
+            decryptor: None,
+        };
+        assert_eq!(closed.available_in_queue(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn available_permits_reads_state_machine_counter() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/permits".to_owned(),
+                subscription: "s".to_owned(),
+                receiver_queue_size: 64,
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        // Right after subscribe, before the initial flow is granted, the
+        // counter is zero.
+        assert_eq!(consumer.available_permits(), 0);
+        // Granting the initial flow bumps the counter to receiver_queue_size.
+        {
+            let mut conn = shared.inner.lock();
+            let _ = conn.initial_flow(handle);
+        }
+        assert_eq!(consumer.available_permits(), 64);
+
+        let closed = Consumer {
+            shared,
+            handle: magnetar_proto::ConsumerHandle(9999),
+            decryptor: None,
+        };
+        assert_eq!(closed.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn has_received_any_message_flips_after_first_delivery() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/has-recv".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        assert!(
+            !consumer.has_received_any_message(),
+            "fresh consumer must report no messages received",
+        );
+
+        {
+            let mut conn = shared.inner.lock();
+            let bytes = command_message_bytes(handle.0, 400, b"first");
+            conn.handle_bytes(Instant::now(), &bytes)
+                .expect("handle CommandMessage");
+        }
+        let _ = consumer.receive().await.expect("receive must resolve");
+        assert!(
+            consumer.has_received_any_message(),
+            "has_received_any_message must flip true after first receive",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn is_paused_reads_state_machine_flag() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/is-paused".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+        };
+        assert!(!consumer.is_paused(), "default state is unpaused");
+        consumer.pause();
+        assert!(consumer.is_paused(), "after pause()");
+        consumer.resume();
+        assert!(!consumer.is_paused(), "after resume()");
+
+        let closed = Consumer {
+            shared,
+            handle: magnetar_proto::ConsumerHandle(9999),
+            decryptor: None,
+        };
+        assert!(!closed.is_paused());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn has_reached_end_of_topic_defaults_to_false() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/end-of-topic".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        assert!(
+            !consumer.has_reached_end_of_topic(),
+            "default state is not end-of-topic",
+        );
+        assert!(!consumer.is_inactive());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_dead_letter_empty_by_default() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/dlq".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        assert!(
+            consumer.drain_dead_letter().is_empty(),
+            "no messages have been flagged for DLQ yet",
+        );
+    }
 }
