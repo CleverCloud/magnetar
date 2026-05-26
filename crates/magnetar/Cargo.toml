@@ -38,6 +38,11 @@ encryption  = ["dep:magnetar-messagecrypto"]
 # `testcontainers-rs`. Requires Docker on the host. CI runs these in
 # the `e2e` job (workflow_dispatch + release branches only).
 e2e         = ["tokio", "admin"]
+# PIP-33 multi-cluster e2e (ADR-0034) — opt-in even within `e2e` because
+# the two-cluster docker-compose fixture is ~60s slower to spin up. Per
+# ADR-0036 cost-shifting precedent, runs weekly only via
+# `.github/workflows/e2e-replicated-subs.yml`, never on per-PR CI.
+e2e-multi-cluster = ["e2e"]
 
 # --- Crypto provider features (issue #9, ADR-0035). Compile-time pluggable
 # rustls crypto backend. Under `--all-features` the cfg-priority cascade

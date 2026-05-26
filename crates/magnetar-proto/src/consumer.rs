@@ -504,6 +504,19 @@ impl ConsumerState {
         })
     }
 
+    /// Account for one broker-side ledger entry that the conn-level filter has decided to
+    /// drop before reaching the user (PIP-33 replicated-subscription markers; any future
+    /// drop-on-receive sentinel). The broker consumed one permit when it dispatched the
+    /// entry, so we bump the internal `consumed_since_flow` counter symmetrically —
+    /// otherwise the permit counter would drift after every marker and the broker would
+    /// eventually stop dispatching.
+    ///
+    /// Intentionally **does not** increment the user-visible `total_msgs_received` /
+    /// `total_bytes_received` counters: markers are not user messages.
+    pub fn record_marker_consumed(&mut self) {
+        self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+    }
+
     /// Force an initial flow for the configured receiver queue.
     pub fn initial_flow(&mut self) -> pb::CommandFlow {
         let permits = self.receiver_queue_size as u32;

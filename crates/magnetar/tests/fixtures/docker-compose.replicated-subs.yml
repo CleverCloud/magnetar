@@ -1,0 +1,147 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Two-cluster Apache Pulsar 4.0 fixture used by
+# crates/magnetar/tests/e2e_replicated_subscriptions.rs to exercise PIP-33
+# (replicated subscriptions). Each cluster runs as a single standalone-style
+# broker against a shared ZooKeeper / Configuration Store; PIP-33 requires the
+# clusters to know about each other via `pulsar-admin clusters create` and the
+# target namespace to have `replicated_subscription_status=true`. See
+# fixtures/configure_replicated_subs.sh for the post-up setup.
+#
+# Usage (manual / weekly CI):
+#   docker compose -f docker-compose.replicated-subs.yml up -d
+#   ./configure_replicated_subs.sh
+#   cargo test --features 'e2e,e2e-multi-cluster' \
+#     -p magnetar --test e2e_replicated_subscriptions -- --include-ignored
+#   docker compose -f docker-compose.replicated-subs.yml down -v
+#
+# Per ADR-0036 cost-shifting precedent, this fixture is *not* part of per-PR
+# CI — it lives in .github/workflows/e2e-replicated-subs.yml (weekly cadence).
+
+services:
+  zookeeper:
+    image: apachepulsar/pulsar:4.0.4
+    container_name: magnetar-pip33-zookeeper
+    restart: unless-stopped
+    environment:
+      - PULSAR_MEM=-Xms256m -Xmx512m
+    command: >
+      bash -c "bin/apply-config-from-env.py conf/zookeeper.conf &&
+               bin/generate-zookeeper-config.sh conf/zookeeper.conf &&
+               exec bin/pulsar zookeeper"
+    healthcheck:
+      test: ["CMD", "bin/pulsar-zookeeper-ruok.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  pulsar-init:
+    image: apachepulsar/pulsar:4.0.4
+    container_name: magnetar-pip33-init
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    command: >
+      bash -c "bin/pulsar initialize-cluster-metadata
+                 --cluster cluster-a
+                 --zookeeper zookeeper:2181
+                 --configuration-store zookeeper:2181
+                 --web-service-url http://broker-a:8080
+                 --broker-service-url pulsar://broker-a:6650 &&
+               bin/pulsar initialize-cluster-metadata
+                 --cluster cluster-b
+                 --zookeeper zookeeper:2181
+                 --configuration-store zookeeper:2181
+                 --web-service-url http://broker-b:8080
+                 --broker-service-url pulsar://broker-b:6650 || true"
+
+  bookkeeper-a:
+    image: apachepulsar/pulsar:4.0.4
+    container_name: magnetar-pip33-bk-a
+    restart: unless-stopped
+    depends_on:
+      pulsar-init:
+        condition: service_completed_successfully
+    environment:
+      - clusterName=cluster-a
+      - zkServers=zookeeper:2181
+      - metadataServiceUri=metadata-store:zk:zookeeper:2181
+      - PULSAR_MEM=-Xms256m -Xmx512m
+    command: >
+      bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf &&
+               bin/bookkeeper shell metaformat -nonInteractive -force || true &&
+               exec bin/pulsar bookie"
+
+  bookkeeper-b:
+    image: apachepulsar/pulsar:4.0.4
+    container_name: magnetar-pip33-bk-b
+    restart: unless-stopped
+    depends_on:
+      pulsar-init:
+        condition: service_completed_successfully
+    environment:
+      - clusterName=cluster-b
+      - zkServers=zookeeper:2181
+      - metadataServiceUri=metadata-store:zk:zookeeper:2181
+      - PULSAR_MEM=-Xms256m -Xmx512m
+    command: >
+      bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf &&
+               exec bin/pulsar bookie"
+
+  broker-a:
+    image: apachepulsar/pulsar:4.0.4
+    container_name: magnetar-pip33-broker-a
+    restart: unless-stopped
+    depends_on:
+      bookkeeper-a:
+        condition: service_started
+    environment:
+      - clusterName=cluster-a
+      - zookeeperServers=zookeeper:2181
+      - configurationStoreServers=zookeeper:2181
+      - advertisedAddress=broker-a
+      - brokerServicePort=6650
+      - webServicePort=8080
+      # PIP-33 snapshot interval — pin to 1s so the e2e cursor-resume
+      # tolerance assertion is deterministic.
+      - replicatedSubscriptionsSnapshotFrequencyMillis=1000
+      - PULSAR_MEM=-Xms512m -Xmx1g
+    command: >
+      bash -c "bin/apply-config-from-env.py conf/broker.conf &&
+               exec bin/pulsar broker"
+    ports:
+      - "6650:6650"
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  broker-b:
+    image: apachepulsar/pulsar:4.0.4
+    container_name: magnetar-pip33-broker-b
+    restart: unless-stopped
+    depends_on:
+      bookkeeper-b:
+        condition: service_started
+    environment:
+      - clusterName=cluster-b
+      - zookeeperServers=zookeeper:2181
+      - configurationStoreServers=zookeeper:2181
+      - advertisedAddress=broker-b
+      - brokerServicePort=6650
+      - webServicePort=8080
+      - replicatedSubscriptionsSnapshotFrequencyMillis=1000
+      - PULSAR_MEM=-Xms512m -Xmx1g
+    command: >
+      bash -c "bin/apply-config-from-env.py conf/broker.conf &&
+               exec bin/pulsar broker"
+    ports:
+      - "6651:6650"
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30

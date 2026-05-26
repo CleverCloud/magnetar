@@ -760,7 +760,7 @@ known-missing feature.
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim — magnetar ships its own idiomatic surface |
 | PIP-180 | Shadow topic | ✅ | v0.2.0 — admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
 | PIP-415 | `getMessageIdByIndex` | ✅ | `magnetar-admin::AdminClient::topic_get_message_id_by_index` — REST-only per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) (binary-protocol section intentionally empty; canonical implementation [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin / broker / CLI only) |
-| PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
+| PIP-33 | Replicated subscriptions | ✅ | `ConsumerBuilder::replicate_subscription_state(bool)` + receive-path filter that drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
 | PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime with `HealthProbe`). Active URL re-resolved on every supervised-reconnect attempt. |
 
 ---

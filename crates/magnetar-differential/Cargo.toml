@@ -33,3 +33,5 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-u
 # (per ADR-0024 layer 4). Provider lives in `magnetar-auth-sasl`; we
 # pull it WITHOUT the `kerberos` feature so no libgssapi linkage leaks.
 magnetar-auth-sasl = { workspace = true }
+# PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
+prost = { workspace = true }

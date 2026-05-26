@@ -106,6 +106,15 @@ pub(crate) enum Cmd {
         /// Acknowledge each received message before printing the next.
         #[arg(long, default_value_t = true)]
         ack: bool,
+        /// PIP-33: mark this subscription as replicated. The broker
+        /// synchronises the cursor position across geo-replicated peer
+        /// clusters at ~1s granularity, so a failover consumer resumes
+        /// near its previous position. **Requires broker-side geo-
+        /// replication + `namespace replicated_subscription_status=true`**;
+        /// against a single-cluster broker the flag is silently ignored.
+        /// See `docs/replicated-subscriptions.md`.
+        #[arg(long, default_value_t = false)]
+        replicate_subscription_state: bool,
     },
     /// Admin commands (`/admin/v2/...`).
     Admin {
@@ -294,6 +303,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             sub_type,
             count,
             ack,
+            replicate_subscription_state,
         } => {
             run_consume(
                 &service_url,
@@ -303,6 +313,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 sub_type,
                 count,
                 ack,
+                replicate_subscription_state,
             )
             .await
         }
@@ -526,12 +537,14 @@ async fn run_consume(
     sub_type: SubType,
     count: usize,
     ack: bool,
+    replicate_subscription_state: bool,
 ) -> Result<(), CliError> {
     let client = build_data_client(service_url, token.as_deref()).await?;
     let consumer = client
         .consumer(topic)
         .subscription(subscription)
         .subscription_type(sub_type)
+        .replicate_subscription_state(replicate_subscription_state)
         .subscribe()
         .await?;
 

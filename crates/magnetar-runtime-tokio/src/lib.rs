@@ -124,6 +124,15 @@ pub struct ConnectionShared {
     /// Wakeup for `next_topic_list_change` futures. Notified after every push to
     /// `topic_list_changes`.
     pub topic_list_notify: Notify,
+    /// PIP-33 replicated-subscription marker observations. The driver drains
+    /// [`magnetar_proto::ConnectionEvent::ReplicatedSubscriptionMarkerObserved`]
+    /// events here so they do not accumulate in the proto event queue.
+    /// Surface via [`Client::next_replicated_subscription_marker`] /
+    /// [`Client::poll_replicated_subscription_marker`]. See ADR-0034.
+    pub replicated_subscription_markers:
+        Mutex<std::collections::VecDeque<ObservedReplicatedSubscriptionMarker>>,
+    /// Wakeup for `next_replicated_subscription_marker` futures.
+    pub replicated_subscription_marker_notify: Notify,
     /// Set by the auto-reconnect supervisor between [`magnetar_proto::Connection::reset`] and
     /// the new socket's handshake. When `true`, the driver loop runs
     /// [`magnetar_proto::Connection::rebuild_producers`] +
@@ -191,6 +200,17 @@ pub struct TopicListChange {
     pub added: Vec<String>,
     /// Topics that no longer match the pattern.
     pub removed: Vec<String>,
+}
+
+/// PIP-33: a replicated-subscription marker observation surfaced by the driver.
+/// Owned snapshot of `ConnectionEvent::ReplicatedSubscriptionMarkerObserved` so callers
+/// can hold it across `.await` boundaries.
+#[derive(Debug, Clone)]
+pub struct ObservedReplicatedSubscriptionMarker {
+    /// Consumer the marker arrived on.
+    pub handle: magnetar_proto::ConsumerHandle,
+    /// Decoded marker payload.
+    pub marker: magnetar_proto::ReplicatedSubscriptionMarker,
 }
 
 impl std::fmt::Debug for ConnectionShared {
@@ -370,6 +390,8 @@ impl ConnectionShared {
             auth_provider,
             topic_list_changes: Mutex::new(std::collections::VecDeque::new()),
             topic_list_notify: Notify::new(),
+            replicated_subscription_markers: Mutex::new(std::collections::VecDeque::new()),
+            replicated_subscription_marker_notify: Notify::new(),
             pending_rebuild: AtomicBool::new(false),
             memory_limit_bytes,
             memory_used: AtomicU64::new(0),

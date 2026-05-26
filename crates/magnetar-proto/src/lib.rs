@@ -84,6 +84,7 @@ pub mod event;
 pub mod frame;
 pub mod health_probe;
 pub mod lookup;
+pub mod markers;
 pub mod producer;
 pub mod schema;
 pub mod service_url;
@@ -127,6 +128,11 @@ pub use crate::frame::{
     decode_one, encode_command, encode_payload,
 };
 pub use crate::health_probe::HealthProbe;
+pub use crate::markers::{
+    ClusterMessageId, MarkerDecodeError, MarkersMessageIdData, ReplicatedSubscriptionMarker,
+    ReplicatedSubscriptionMarkerDetails, ReplicatedSubscriptionMarkerKind,
+    decode_replicated_subscription_marker,
+};
 pub use crate::producer::ProducerStats;
 pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,

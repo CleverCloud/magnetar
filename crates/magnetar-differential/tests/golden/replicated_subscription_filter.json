@@ -1,0 +1,30 @@
+{
+  "_comment": "PIP-33 (ADR-0034) — golden snapshot of the canonical broker transcript used by replicated_subscriptions_equivalence::marker_filter_event_stream_parity. Documentation-only: the byte-level invariant is the Rust assertion in the test, this file is the human-reviewable description of the expected behaviour.",
+  "broker_script": [
+    {"action": "regular_message", "ledger_id": 1, "entry_id": 1},
+    {"action": "regular_message", "ledger_id": 1, "entry_id": 2},
+    {"action": "regular_message", "ledger_id": 1, "entry_id": 3},
+    {"action": "marker", "kind": "REPLICATED_SUBSCRIPTION_SNAPSHOT_REQUEST", "marker_type": 10, "snapshot_id": "req-10", "source_cluster": "cluster-a"},
+    {"action": "regular_message", "ledger_id": 1, "entry_id": 5},
+    {"action": "marker", "kind": "REPLICATED_SUBSCRIPTION_SNAPSHOT_RESPONSE", "marker_type": 11, "snapshot_id": "resp-11"},
+    {"action": "regular_message", "ledger_id": 1, "entry_id": 7},
+    {"action": "marker", "kind": "REPLICATED_SUBSCRIPTION_SNAPSHOT", "marker_type": 12, "snapshot_id": "snap-12"},
+    {"action": "regular_message", "ledger_id": 1, "entry_id": 9},
+    {"action": "marker", "kind": "REPLICATED_SUBSCRIPTION_UPDATE", "marker_type": 13, "subscription_name": "sub-pip-33"}
+  ],
+  "expected_user_message_count": 7,
+  "expected_marker_observations": [
+    "SnapshotRequest",
+    "SnapshotResponse",
+    "Snapshot",
+    "Update"
+  ],
+  "subscribe_request": {
+    "topic": "persistent://public/default/diff",
+    "subscription": "sub-pip-33",
+    "receiver_queue_size": 16,
+    "durable": true,
+    "replicate_subscription_state": true
+  },
+  "engine_equivalence": "tokio and moonpool must produce byte-identical CommandSubscribe wire bytes and the same ordered sequence of marker observations + the same count of user messages received."
+}

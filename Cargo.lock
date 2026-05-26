@@ -1689,6 +1689,7 @@ dependencies = [
  "magnetar-runtime-tokio",
  "moonpool-core",
  "parking_lot",
+ "prost 0.13.5",
  "tokio",
  "tracing",
 ]
@@ -1747,6 +1748,7 @@ dependencies = [
  "moonpool-core",
  "moonpool-sim",
  "parking_lot",
+ "prost 0.13.5",
  "rustls",
  "rustls-openssl",
  "slab",
@@ -1766,6 +1768,7 @@ dependencies = [
  "magnetar-proto",
  "parking_lot",
  "pin-project-lite",
+ "prost 0.13.5",
  "rustls",
  "rustls-native-certs",
  "rustls-openssl",

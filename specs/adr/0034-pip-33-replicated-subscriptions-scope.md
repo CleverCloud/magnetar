@@ -1,6 +1,6 @@
 # ADR-0034 — PIP-33 replicated subscriptions scope for v0.2.0
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: pip-33, replicated-subscriptions, geo-replication, v0.2.0, scope
@@ -150,7 +150,8 @@ separate `docs(adr): amend ADR-0010` commit.
 
 ## Status
 
-Proposed (awaiting Florentin sign-off, 2026-05-26)
+Accepted — landed in feat/pip-33-replicated-subscriptions
+(see [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md)).
 
 ## References
 

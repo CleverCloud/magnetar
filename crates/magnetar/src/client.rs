@@ -883,6 +883,26 @@ impl PulsarClient<crate::TokioEngine> {
             .map_err(PulsarError::Client)
     }
 
+    /// PIP-33 (ADR-0034): non-blocking peek for the next replicated-subscription
+    /// marker observation buffered by the driver. `None` when the buffer is empty.
+    /// Mirrors [`magnetar_runtime_tokio::Client::poll_replicated_subscription_marker`].
+    #[must_use]
+    pub fn poll_replicated_subscription_marker(
+        &self,
+    ) -> Option<magnetar_runtime_tokio::ObservedReplicatedSubscriptionMarker> {
+        self.inner.poll_replicated_subscription_marker()
+    }
+
+    /// PIP-33 (ADR-0034): await the next replicated-subscription marker
+    /// observation. Resolves to `None` when the connection has closed and no
+    /// further markers will arrive. Mirrors
+    /// [`magnetar_runtime_tokio::Client::next_replicated_subscription_marker`].
+    pub async fn next_replicated_subscription_marker(
+        &self,
+    ) -> Option<magnetar_runtime_tokio::ObservedReplicatedSubscriptionMarker> {
+        self.inner.next_replicated_subscription_marker().await
+    }
+
     /// Close the underlying connection.
     pub async fn close(self) {
         self.inner.close().await;

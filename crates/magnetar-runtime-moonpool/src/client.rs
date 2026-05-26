@@ -360,6 +360,44 @@ impl<P: Providers> Client<P> {
         self.shared.topic_list_changes.lock().pop_front()
     }
 
+    /// PIP-33: await the next replicated-subscription marker observed on any
+    /// consumer of this connection. Mirrors the tokio engine's identically-
+    /// named method. Resolves with the buffered observation, or `None` if the
+    /// connection has closed and no further markers will arrive.
+    pub async fn next_replicated_subscription_marker(
+        &self,
+    ) -> Option<crate::ObservedReplicatedSubscriptionMarker> {
+        loop {
+            if let Some(marker) = self
+                .shared
+                .replicated_subscription_markers
+                .lock()
+                .pop_front()
+            {
+                return Some(marker);
+            }
+            if self.shared.inner.lock().is_closed() {
+                return None;
+            }
+            self.shared
+                .replicated_subscription_marker_notify
+                .notified()
+                .await;
+        }
+    }
+
+    /// Non-blocking peek for the next replicated-subscription marker
+    /// observation. Returns `None` when the buffer is empty.
+    #[must_use]
+    pub fn poll_replicated_subscription_marker(
+        &self,
+    ) -> Option<crate::ObservedReplicatedSubscriptionMarker> {
+        self.shared
+            .replicated_subscription_markers
+            .lock()
+            .pop_front()
+    }
+
     // -----------------------------------------------------------------
     // Transactions (PIP-31) — mirror `magnetar_runtime_tokio::Client`.
     //

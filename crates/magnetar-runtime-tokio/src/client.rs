@@ -588,6 +588,46 @@ impl Client {
         self.shared.topic_list_changes.lock().pop_front()
     }
 
+    /// PIP-33: await the next replicated-subscription marker observed by any consumer on
+    /// this connection. Resolves once the broker emits a `REPLICATED_SUBSCRIPTION_*`
+    /// marker on a subscribed topic (typically once per snapshot interval, default 1s
+    /// when the namespace has `replicated_subscription_status=true`), or `None` if the
+    /// connection has closed. Markers are filtered off the regular [`Consumer::receive`]
+    /// stream — applications that just want to consume messages don't need this.
+    pub async fn next_replicated_subscription_marker(
+        &self,
+    ) -> Option<crate::ObservedReplicatedSubscriptionMarker> {
+        loop {
+            if let Some(marker) = self
+                .shared
+                .replicated_subscription_markers
+                .lock()
+                .pop_front()
+            {
+                return Some(marker);
+            }
+            if self.shared.inner.lock().is_closed() {
+                return None;
+            }
+            self.shared
+                .replicated_subscription_marker_notify
+                .notified()
+                .await;
+        }
+    }
+
+    /// Non-blocking peek for the next replicated-subscription marker observation.
+    /// Returns `None` when the buffer is empty.
+    #[must_use]
+    pub fn poll_replicated_subscription_marker(
+        &self,
+    ) -> Option<crate::ObservedReplicatedSubscriptionMarker> {
+        self.shared
+            .replicated_subscription_markers
+            .lock()
+            .pop_front()
+    }
+
     /// Query the broker for the number of partitions a topic has. Returns `0` for
     /// non-partitioned topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
     pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {

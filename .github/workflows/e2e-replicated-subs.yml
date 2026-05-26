@@ -1,0 +1,92 @@
+name: E2E PIP-33 replicated subscriptions
+
+# Weekly two-cluster e2e for PIP-33 (replicated subscriptions, ADR-0034).
+# Excluded from per-PR CI: the docker-compose fixture is ~60s slower to spin
+# up than a single-broker testcontainers run AND requires careful broker
+# orchestration that is flake-prone against the GitHub Actions network.
+#
+# Following the ADR-0036 cost-shifting precedent — same shape as
+# moonpool-seed-sweep.yml. A failure here gates the v0.2.0 release-cut
+# (the release manager waits for a green run before tagging).
+#
+# Manual trigger via workflow_dispatch for ad-hoc runs (e.g. validating a
+# broker.conf change locally before merge).
+#
+# Security note: this workflow does NOT interpolate any github.event.*
+# values into run: blocks; only static cron + manual triggers reach the
+# matrix, so command-injection attack surface is empty by construction.
+
+on:
+  schedule:
+    # Mondays 03:47 UTC. Off-the-hour to avoid the GH scheduler burst at :00.
+    - cron: '47 3 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-replicated-subs
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings --cfg tokio_unstable"
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 5
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  e2e-replicated-subs:
+    name: PIP-33 two-cluster e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bring up two-cluster Pulsar fixture
+        working-directory: crates/magnetar/tests/fixtures
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.replicated-subs.yml up -d
+          # Wait for both brokers' admin endpoints to report healthy.
+          for url in http://localhost:8080/admin/v2/brokers/health \
+                     http://localhost:8081/admin/v2/brokers/health; do
+            attempts=60
+            until curl -sf "$url" >/dev/null; do
+              attempts=$((attempts - 1))
+              if [ "$attempts" -le 0 ]; then
+                echo "broker @ $url did not become healthy in time"
+                docker compose -f docker-compose.replicated-subs.yml ps
+                docker compose -f docker-compose.replicated-subs.yml logs --tail=200
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+
+      - name: Configure peer clusters + replicated subscription status
+        working-directory: crates/magnetar/tests/fixtures
+        run: ./configure_replicated_subs.sh
+
+      - name: Build e2e test binary
+        run: |
+          cargo build --tests \
+            --features 'e2e,e2e-multi-cluster' \
+            -p magnetar --test e2e_replicated_subscriptions --locked
+
+      - name: Run e2e tests
+        run: |
+          cargo test \
+            --features 'e2e,e2e-multi-cluster' \
+            -p magnetar --test e2e_replicated_subscriptions \
+            --locked -- --include-ignored --nocapture
+
+      - name: Tear down fixture
+        if: always()
+        working-directory: crates/magnetar/tests/fixtures
+        run: docker compose -f docker-compose.replicated-subs.yml down -v || true
+
+      - name: Dump broker logs on failure
+        if: failure()
+        working-directory: crates/magnetar/tests/fixtures
+        run: docker compose -f docker-compose.replicated-subs.yml logs --tail=500 || true

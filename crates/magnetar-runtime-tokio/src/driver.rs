@@ -79,6 +79,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     | ConnectionEvent::TopicMigrated { .. }
                     | ConnectionEvent::ProducerOpenFailedTransient { .. }
                     | ConnectionEvent::SubscribeFailedTransient { .. }
+                    | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
             )
         });
         let Some(event) = event else {
@@ -118,6 +119,17 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     .lock()
                     .push_back(crate::TopicListChange { added, removed });
                 shared.topic_list_notify.notify_waiters();
+            }
+            ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker } => {
+                // PIP-33 (ADR-0034): drain off the proto-level event queue into the
+                // per-client buffer so it can't accumulate on idle subscribers.
+                shared
+                    .replicated_subscription_markers
+                    .lock()
+                    .push_back(crate::ObservedReplicatedSubscriptionMarker { handle, marker });
+                shared
+                    .replicated_subscription_marker_notify
+                    .notify_waiters();
             }
             ConnectionEvent::TopicMigrated {
                 producer,

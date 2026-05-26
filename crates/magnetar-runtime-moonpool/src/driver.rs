@@ -62,7 +62,7 @@ use tokio::task::JoinHandle;
 
 use crate::dns::DnsResolver;
 use crate::transport::Transport;
-use crate::{ConnectionShared, EngineError, TopicListChange};
+use crate::{ConnectionShared, EngineError, ObservedReplicatedSubscriptionMarker, TopicListChange};
 
 /// Default size of the per-connection read buffer. Reads are non-blocking
 /// and append-style, so this is just the high-water mark before allocation
@@ -88,6 +88,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                 ConnectionEvent::AuthChallenge { .. }
                     | ConnectionEvent::TopicListChanged { .. }
                     | ConnectionEvent::TopicMigrated { .. }
+                    | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
             )
         });
         let Some(event) = event else {
@@ -125,6 +126,16 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     .lock()
                     .push_back(TopicListChange { added, removed });
                 shared.topic_list_notify.notify_waiters();
+            }
+            ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker } => {
+                // PIP-33 (ADR-0034): drain off the proto-level event queue.
+                shared
+                    .replicated_subscription_markers
+                    .lock()
+                    .push_back(ObservedReplicatedSubscriptionMarker { handle, marker });
+                shared
+                    .replicated_subscription_marker_notify
+                    .notify_waiters();
             }
             ConnectionEvent::TopicMigrated {
                 producer,

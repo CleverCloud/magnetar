@@ -13,6 +13,7 @@
 
 use bytes::Bytes;
 
+use crate::markers::ReplicatedSubscriptionMarker;
 use crate::pb;
 use crate::txn::{TxnError, TxnId, TxnState};
 use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
@@ -186,6 +187,23 @@ pub enum ConnectionEvent {
         /// The decoded message — same payload + metadata the consumer would
         /// have surfaced via [`Self::Message`] on a non-shadow topic.
         message: IncomingMessage,
+    },
+
+    /// PIP-33: the broker emitted a `REPLICATED_SUBSCRIPTION_*` marker on this
+    /// consumer's topic. Surfaced for observability only — the marker is filtered
+    /// off the user-visible message stream (never appears as [`Self::Message`])
+    /// because it carries broker-side snapshot/update payload, not application
+    /// data. Magnetar never originates these markers; the broker generates them
+    /// when the namespace has `replicated_subscription_status=true` and a peer
+    /// cluster's snapshot/update cycle fires. See
+    /// [`crate::markers`] for the payload typing and
+    /// [ADR-0034](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0034-pip-33-replicated-subscriptions-scope.md)
+    /// for scope.
+    ReplicatedSubscriptionMarkerObserved {
+        /// The consumer that received the marker.
+        handle: ConsumerHandle,
+        /// Decoded marker payload (kind + details).
+        marker: ReplicatedSubscriptionMarker,
     },
 
     /// A `CommandSendReceipt` correlated with one of our pending publishes.

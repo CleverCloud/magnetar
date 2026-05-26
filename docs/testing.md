@@ -139,6 +139,7 @@ Suites cover:
 | [`e2e_rolling_stats.rs`](../crates/magnetar/tests/e2e_rolling_stats.rs) | Rolling-window stats (msgs/sec, bytes/sec, latency p50/p99/max). |
 | [`e2e_seek_per_partition.rs`](../crates/magnetar/tests/e2e_seek_per_partition.rs) | Per-partition seek callbacks. |
 | [`e2e_cluster_failover.rs`](../crates/magnetar/tests/e2e_cluster_failover.rs) | PIP-121 manual cluster swap with two broker containers. |
+| [`e2e_replicated_subscriptions.rs`](../crates/magnetar/tests/e2e_replicated_subscriptions.rs) | PIP-33 cursor-resume across two clusters. Opt-in via `--features e2e,e2e-multi-cluster`; not run on per-PR CI (the docker-compose fixture is ~60s + flake-prone). Weekly run via [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) per the [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) cost-shifting precedent. |
 
 ## The `#[ignore]` policy
 

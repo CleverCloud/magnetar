@@ -1442,6 +1442,47 @@ impl Connection {
                     "Message frame missing payload",
                 ))?;
                 let handle = ConsumerHandle(msg.consumer_id);
+                // PIP-33 ([ADR-0034]): if the payload carries a REPLICATED_SUBSCRIPTION_*
+                // marker (`MarkerType` 10..=13), filter it off the user-visible event
+                // stream and emit an observation event instead. The broker manages the
+                // marker's cursor position independently — we bump the consumer's
+                // permit counter via `record_marker_consumed` so flow control stays
+                // symmetric. Txn markers (20..=22) and any future / unknown kind fall
+                // through to the existing `deliver` path (decoder returns `Ok(None)`).
+                //
+                // [ADR-0034]: ../../specs/adr/0034-pip-33-replicated-subscriptions-scope.md
+                if let Some(marker_type) = payload.metadata.marker_type {
+                    match crate::markers::decode_replicated_subscription_marker(
+                        marker_type,
+                        &payload.body,
+                    ) {
+                        Ok(Some(marker)) => {
+                            if let Some(consumer) = self.consumers.get_mut(&handle) {
+                                consumer.record_marker_consumed();
+                            }
+                            self.events.push_back(
+                                ConnectionEvent::ReplicatedSubscriptionMarkerObserved {
+                                    handle,
+                                    marker,
+                                },
+                            );
+                            return Ok(());
+                        }
+                        Ok(None) => {
+                            // Not a replicated-subscription marker — fall through to the
+                            // existing deliver path (preserves txn-marker behaviour).
+                        }
+                        Err(_) => {
+                            // Malformed RS marker payload: drop quietly. The broker should
+                            // not be emitting truncated markers; logging it would couple
+                            // magnetar-proto to a logging facade.
+                            if let Some(consumer) = self.consumers.get_mut(&handle) {
+                                consumer.record_marker_consumed();
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
                 if let Some(consumer) = self.consumers.get_mut(&handle) {
                     let outcome = consumer.deliver(
                         &msg,
@@ -5117,5 +5158,265 @@ mod conn_state_tests {
             "unflushed batched sends are NOT replayed — caller's responsibility"
         );
         assert_eq!(conn.producer_batch_len(producer), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // PIP-33 — Replicated-subscription tests (ADR-0034).
+    //
+    // - command_subscribe_with_replicate_state_{true,false}: assert encoder sets / omits
+    //   CommandSubscribe field 14 (`replicate_subscription_state`).
+    // - consumer_filters_replicated_marker_*: assert receive-path filter drops kinds 10..=13 from
+    //   the user-visible event stream and emits `ReplicatedSubscriptionMarkerObserved` instead.
+    // - consumer_passes_through_*: regression guards for non-marker messages and txn markers
+    //   (unchanged behaviour).
+    // -------------------------------------------------------------------
+
+    fn marker_metadata(kind: i32) -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "broker-marker".to_owned(),
+            sequence_id: 0,
+            publish_time: 1_700_000_000_000,
+            marker_type: Some(kind),
+            ..Default::default()
+        }
+    }
+
+    fn regular_metadata() -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "producer".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn message_frame(consumer_id: u64, meta: &pb::MessageMetadata, payload: &[u8]) -> Vec<u8> {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: 1,
+                    partition: None,
+                    batch_index: None,
+                    ack_set: Vec::new(),
+                    batch_size: None,
+                    first_chunk_message_id: None,
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut buf, &cmd, meta, payload).expect("encode_payload");
+        buf.to_vec()
+    }
+
+    fn handshake_subscribe(replicate: Option<bool>) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(ConnectionConfig::default());
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        // Drain the Connected event so later poll_event calls return our test events.
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/replicated".to_owned(),
+            subscription: "sub-pip-33".to_owned(),
+            replicate_subscription_state: replicate,
+            ..Default::default()
+        });
+        (conn, handle)
+    }
+
+    fn drain_command_subscribe(conn: &mut Connection) -> pb::CommandSubscribe {
+        let mut out = Vec::new();
+        conn.poll_transmit(&mut out);
+        let mut bytes = bytes::Bytes::from(out);
+        loop {
+            let frame = crate::frame::decode_one(&mut bytes).expect("decode subscribe");
+            if frame.command.r#type == pb::base_command::Type::Subscribe as i32 {
+                return frame.command.subscribe.expect("CommandSubscribe");
+            }
+            assert!(!bytes.is_empty(), "no CommandSubscribe in outbound");
+        }
+    }
+
+    #[test]
+    fn command_subscribe_with_replicate_state_true_emits_field() {
+        let (mut conn, _h) = handshake_subscribe(Some(true));
+        let sub = drain_command_subscribe(&mut conn);
+        // Wire field 14 must be present and set.
+        assert_eq!(sub.replicate_subscription_state, Some(true));
+    }
+
+    #[test]
+    fn command_subscribe_with_replicate_state_false_byte_identical_to_v01() {
+        // Default subscribe (None) MUST omit field 14 entirely so the wire bytes match v0.1.0
+        // (preserves backward compat for callers that never touched the flag).
+        let (mut conn_none, _) = handshake_subscribe(None);
+        let mut out_none = Vec::new();
+        conn_none.poll_transmit(&mut out_none);
+
+        let sub = drain_command_subscribe(&mut {
+            let (c, _) = handshake_subscribe(None);
+            c
+        });
+        assert_eq!(sub.replicate_subscription_state, None);
+
+        // Explicit Some(false) is semantically equivalent and must round-trip.
+        let (mut conn_false, _) = handshake_subscribe(Some(false));
+        let sub_false = drain_command_subscribe(&mut conn_false);
+        assert_eq!(sub_false.replicate_subscription_state, Some(false));
+    }
+
+    #[test]
+    fn consumer_filters_replicated_marker_from_event_stream() {
+        let (mut conn, handle) = handshake_subscribe(Some(true));
+        // Drain the outbound subscribe so it doesn't interfere with subsequent inspection.
+        let _ = drain_command_subscribe(&mut conn);
+
+        // Feed a Snapshot marker (kind 12) on this consumer.
+        let snap = pb::ReplicatedSubscriptionsSnapshot {
+            snapshot_id: "snap-99".to_owned(),
+            local_message_id: Some(pb::MarkersMessageIdData {
+                ledger_id: 1,
+                entry_id: 1,
+            }),
+            clusters: Vec::new(),
+        };
+        let mut payload = Vec::new();
+        prost::Message::encode(&snap, &mut payload).expect("encode snapshot");
+        let frame = message_frame(handle.0, &marker_metadata(12), &payload);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle marker frame");
+
+        // No Message event must surface for this consumer.
+        let mut seen_message = false;
+        while let Some(ev) = conn.poll_event() {
+            if matches!(ev, ConnectionEvent::Message { handle: h, .. } if h == handle) {
+                seen_message = true;
+            }
+        }
+        assert!(!seen_message, "marker leaked as Message event");
+    }
+
+    #[test]
+    fn consumer_emits_marker_observation_event() {
+        let (mut conn, handle) = handshake_subscribe(Some(true));
+        let _ = drain_command_subscribe(&mut conn);
+
+        let update = pb::ReplicatedSubscriptionsUpdate {
+            subscription_name: "sub-pip-33".to_owned(),
+            clusters: vec![pb::ClusterMessageId {
+                cluster: "cluster-b".to_owned(),
+                message_id: pb::MarkersMessageIdData {
+                    ledger_id: 7,
+                    entry_id: 13,
+                },
+            }],
+        };
+        let mut payload = Vec::new();
+        prost::Message::encode(&update, &mut payload).expect("encode update");
+        let frame = message_frame(handle.0, &marker_metadata(13), &payload);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle update marker");
+
+        let mut observed = None;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle: h, marker } = ev
+            {
+                if h == handle {
+                    observed = Some(marker);
+                    break;
+                }
+            }
+        }
+        let marker = observed.expect("ReplicatedSubscriptionMarkerObserved event");
+        assert_eq!(
+            marker.kind,
+            crate::markers::ReplicatedSubscriptionMarkerKind::Update
+        );
+        match marker.details {
+            crate::markers::ReplicatedSubscriptionMarkerDetails::Update {
+                subscription_name,
+                clusters,
+            } => {
+                assert_eq!(subscription_name, "sub-pip-33");
+                assert_eq!(clusters.len(), 1);
+                assert_eq!(clusters[0].cluster, "cluster-b");
+                assert_eq!(clusters[0].message_id.entry_id, 13);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consumer_passes_through_non_marker_messages() {
+        // Regression guard: regular messages (no marker_type) must still surface as
+        // ConnectionEvent::Message.
+        let (mut conn, handle) = handshake_subscribe(None);
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.initial_flow(handle);
+        // Drain any flow command on the wire.
+        let mut sink = Vec::new();
+        conn.poll_transmit(&mut sink);
+
+        let frame = message_frame(handle.0, &regular_metadata(), b"hello-pip-33");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle regular message");
+
+        let mut seen_message = false;
+        let mut seen_marker = false;
+        while let Some(ev) = conn.poll_event() {
+            match ev {
+                ConnectionEvent::Message { handle: h, .. } if h == handle => seen_message = true,
+                ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle: h, .. }
+                    if h == handle =>
+                {
+                    seen_marker = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_message, "regular message must surface as Message");
+        assert!(!seen_marker, "regular message must NOT surface as marker");
+    }
+
+    #[test]
+    fn consumer_passes_through_txn_markers() {
+        // Txn markers (kinds 20..=22) fall through to the existing deliver path —
+        // the receive-path filter is intentionally scoped to PIP-33 marker kinds
+        // only (decoder returns Ok(None) for txn kinds).
+        let (mut conn, handle) = handshake_subscribe(None);
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.initial_flow(handle);
+        let mut sink = Vec::new();
+        conn.poll_transmit(&mut sink);
+
+        let mut meta = marker_metadata(21); // TXN_COMMIT
+        meta.num_messages_in_batch = Some(1);
+        let frame = message_frame(handle.0, &meta, b"txn-payload");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle txn marker frame");
+
+        let mut saw_rs_marker = false;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle: h, .. } = ev {
+                if h == handle {
+                    saw_rs_marker = true;
+                }
+            }
+        }
+        assert!(
+            !saw_rs_marker,
+            "txn markers must not fire the PIP-33 observation event",
+        );
     }
 }

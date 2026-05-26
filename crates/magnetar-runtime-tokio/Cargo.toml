@@ -53,3 +53,5 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", 
 # `ScriptedGssapiClient` without enabling the `kerberos` feature, so this
 # dev-dep does NOT pull libgssapi into the build.
 magnetar-auth-sasl = { workspace = true }
+# PIP-33 marker encoding in tests/replicated_subscriptions.rs.
+prost = { workspace = true }
