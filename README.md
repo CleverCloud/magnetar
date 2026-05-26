@@ -693,15 +693,25 @@ known-missing feature.
 
 - **Moonpool engine parity.** v0.1.0 Java parity is satisfied by
   the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
-  Transactions (PIP-31) lifted to
-  `impl<E: Engine + TransactionApi> PulsarClient<E>` per ADR-0026
-  §D1 and work on both engines. The remaining façade surfaces bound
-  to `PulsarClient<TokioEngine>` (partitioned, multi-topics, pattern,
-  reader, table-view, typed schemas) hold concrete
-  `magnetar_runtime_tokio::{Producer, Consumer}` instances and are
-  blocked on a Producer/Consumer surface lift. See
+  Transactions (PIP-31), Reader, and typed schemas (via
+  `TypedProducer<S, P>` / `TypedConsumer<S, C>`) now ride on
+  `impl<E: Engine + ...> PulsarClient<E>` per ADR-0026 §D1 + the
+  ConsumerApi/ProducerApi + SubscribeApi/CreateProducerApi
+  extension traits, and work on both engines.
+  The remaining façade entry-points still bound to
+  `PulsarClient<TokioEngine>` — **partitioned_producer**,
+  **MultiTopicsConsumer**, **PartitionedConsumer** (a type alias
+  for MultiTopicsConsumer), **PatternConsumer**, and
+  **TableView** (`table_view` / `typed_table_view`; the inner
+  `PartitionedProducer<P>` / `TableView<C>` / `TypedTableView<S,
+  C>` *types* do carry an engine-generic parameter, but the
+  builders + entry methods live in `impl
+  PulsarClient<TokioEngine>`) — have their moonpool helper
+  methods ported (commits `5f1368f`, `53669f9`, `0f95a3c`,
+  `008abbf`) but the impl-body / builder lift (pass-2) is still
+  pending. See
   [`docs/parity-status.md`](docs/parity-status.md) and
-  [`docs/follow-ups.md`](docs/follow-ups.md).
+  [`docs/follow-ups.md#per-surface-builder--impl-body-lifts`](docs/follow-ups.md#per-surface-builder--impl-body-lifts).
 - **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-180
   shadow topic** + **PIP-33 replicated subscriptions** are scoped for
   v0.2.0.
@@ -737,6 +747,7 @@ known-missing feature.
 | PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
 | PIP-188 | `TOPIC_MIGRATED` | ✅ | Wire opcode decoded; tokio driver's event loop catches `ConnectionEvent::TopicMigrated`, logs the new-broker hint, and returns an error from `driver_loop_inner` so the supervisor triggers `Connection::reset` + reconnect. `rebuild_producers` / `rebuild_consumers` re-attach every still-open handle on the new socket. |
+| _local_ | Anti-thrash policy ([ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)) | ✅ (opt-in) | Per-handle ack-then-drop detector + connection-level cooldown. Mitigates broker-driven post-restart cascades (Pulsar PR #14467 / #13428 / #12846 — `ServerCnx#handleProducer` ↔ `AbstractTopic#addProducer` race). `SupervisorConfig::anti_thrash_threshold` default `None`. |
 | PIP-460 | Scalable topics | ❌ | Scoped for v0.2.0 (experimental) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim — magnetar ships its own idiomatic surface |
 | PIP-180 | Shadow topic | ❌ | v0.2.0 |

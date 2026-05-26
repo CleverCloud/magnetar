@@ -56,7 +56,43 @@ this section only tracks shipping status:
   metadata (`19a8df5`), Java-compatible KeyValue inline schema
   (`623a5b3`), chunk-payload metadata reserve (`14cc7f8`),
   CloseProducer treated as transient (`aa9b3fc`). E2E sweep:
-  **19 files PASS / 51 tests** with one residual (#74 below).
+  **19 files PASS / 51 tests** at the time these fixes landed.
+- **ADR-0028 anti-thrash policy — Accepted + implemented** (commit
+  `a083ed2`, closes follow-up #74). Opt-in `SupervisorConfig`
+  knobs (`anti_thrash_threshold`, `drop_grace`,
+  `max_backoff_after_thrash`), default OFF. `magnetar-proto::
+  AntiThrashState` ring + per-Connection observer + `Connection
+  Event::AntiThrashCooldown { until }`. Four-layer tests per
+  ADR-0024 plus a `DropsTcpAfterCreate { delay_ms }` chaos
+  workload. Architecture documentation in `ARCHITECTURE.md`
+  §"Supervised reconnect" / "Anti-thrash policy".
+- **MultiTopics pass-1: moonpool consumer helpers** — 13 net-new
+  methods on `magnetar_runtime_moonpool::Consumer` (commits
+  `5f1368f`, `53669f9`, `0f95a3c`, `008abbf`). Pass-2 (the
+  surface lift itself) remains open per [next section](#per-surface-builder--impl-body-lifts).
+- **Differential harness — seek-per-partition golden trace**
+  (commit `3d6c7e6`). Scripted broker partition routing + new
+  `Op::SendPartition` / `RecvPartition` / `AckPartition` /
+  `SeekPartition` variants. Catalog now ships seven golden traces.
+- **Crypto provider pluggability — ADR-0035 Accepted** (commits
+  `19f8b9f`, `3f392af`, `9a6ffde`). `rustls` crypto provider
+  switched to a feature-gated set (`crypto-aws-lc-rs` default /
+  `-ring` / `-openssl` / `-fips`); workspace-scope
+  `--all-features` continues to work via the `tls_crypto.rs` cfg
+  cascade (priority order resolves multi-provider activation),
+  and `cargo xtask check-crypto-matrix` covers the per-provider
+  build matrix exhaustively. Per-package invocations
+  (`cargo test -p <crate>`) need an explicit crypto feature
+  because dependency features don't transitively activate under
+  `-p`.
+- **Moonpool seed sweep policy — ADR-0036 Accepted** (commit
+  `305f31d`). Daily 16-random-seed CI job replaces the per-PR
+  fixed 32-seed matrix; each `(commit, seed)` pair is
+  bit-for-bit reproducible so the per-PR cost was wasted.
+- **`magnetar_proto::SUPPORTED_PROTOCOL_VERSION` constant**
+  (commit `51101c5`). Deduplicates the literal `21` from three
+  call sites (proto `ConnectionConfig::default`, proto test
+  fixture, CLI banner).
 
 ---
 
@@ -194,9 +230,11 @@ landed 2026-05-22 with both `cargo xtask check-sim-coverage` and
 2026-05-22 baseline was `tokio=65 moonpool=61` (gap of 4); subsequent
 landings (memory-limit slab, AutoClusterFailover moonpool port, TLS
 chaos fixtures, race-stress coverage, lookup-before-open, the D1
-surface train, the post-seek ack-then-flow fix in `f4872d7`) brought
-it to `tokio=95 moonpool=95`. Pre-existing moonpool patch-coverage of
-older surface lines is unmeasured today.
+surface train, the post-seek ack-then-flow fix in `f4872d7`, the
+MultiTopics pass-1 moonpool helpers, and the ADR-0028 anti-thrash
+implementation) brought it to **`tokio=121 moonpool=121`**.
+Pre-existing moonpool patch-coverage of older surface lines is
+unmeasured today.
 
 **Unblock.** Dedicated session driven by the local prompt at
 `tasks/coverage-closure-prompt.md` (gitignored). Phases:
@@ -308,72 +346,6 @@ all four can land independently as v0.2.0 follow-ups.
 
 ```text
 /goal scope PIP-460 / PIP-466 / PIP-180 / PIP-33 for v0.2.0. Per PIP, produce: (1) the wire-protocol delta against the current vendored PulsarApi.proto, (2) the magnetar-proto state-machine additions, (3) the runtime-tokio + runtime-moonpool surface ports, (4) the four-layer test plan per ADR-0024, (5) the e2e plan against apachepulsar/pulsar:4.x. Produce one planning doc per PIP under specs/proposals/. No code yet — these are planning passes.
-```
-
-### `magnetar_proto::SUPPORTED_PROTOCOL_VERSION` constant
-
-**Status.** The Pulsar wire-protocol version is hard-coded as the literal
-`21` in two places: `crates/magnetar-proto/src/conn.rs` (the value sent
-in `CommandConnect.protocol_version`) and `crates/magnetar-cli/src/version.rs`
-(the value rendered in the `magnetar --version` banner). The CLI banner
-also surfaces it via `pulsar wire protocol: v21`.
-
-**Unblock.** Expose the value as a `pub const SUPPORTED_PROTOCOL_VERSION:
-i32 = 21;` in `magnetar-proto` and consume it from both call sites. This
-removes the duplication and ensures the CLI banner stays in sync with the
-wire identifier when the driver eventually bumps the advertised protocol.
-Small, drop-in change; no behavior change today.
-
----
-
-## Open runtime bugs
-
-### #74 — Post-restart disconnect cascade (broker-driven)
-
-**Status.** Surfaced while closing #73 (in-flight publish snapshot
-accumulation) and #72 (lookup-then-retry on transient open errors).
-The supervised reconnect path is now correct on the magnetar side:
-transient `CommandError` retains state, a fresh `CommandLookupTopic`
-runs before `retry_producer_open` / `retry_consumer_subscribe`,
-in-flight `OpSend` snapshots survive multiple reset cycles, and a
-re-attached producer replays its cached wire frames. End-to-end,
-this lets `e2e_supervised_reconnect_across_broker_restart` reach the
-rebuild step.
-
-What still fails is **broker-side** behaviour after the restart:
-broker creates the producer, then drops the TCP connection ~10 ms
-later. Broker logs show `"Cleared producer created after connection
-was closed"` followed by a fresh `"Subscribing on topic"` + immediate
-close, several iterations per second. This is consistent with a
-bundle-ownership / load-balancing churn window where the broker
-accepts the create command but the bundle is reassigned (or the
-broker is mid-`unloadBundle`) before the producer can actually send.
-
-E2E impact: `e2e_supervised_reconnect_across_broker_restart` times
-out and `e2e_cluster_failover` fails. All 19 other e2e files (51
-tests) pass.
-
-**Unblock.** Two-pronged:
-
-1. **Broker investigation.** Trace exactly which broker code path
-   drops the connection. Candidate hypotheses to confirm or rule
-   out: (a) `LoadManagerShared.shouldAntiAffinityNamespaceUnload`
-   triggering an unload mid-create; (b) the broker rejecting the
-   reconnect because the previous session epoch is still considered
-   live; (c) testcontainers' `docker restart` racing the
-   ZooKeeper session timeout (broker fences itself).
-2. **Magnetar-side anti-thrash.** If the cascade is fundamentally
-   broker-side, add a tracked-by-handle "transient open success rate"
-   window: if N successful re-attaches in M seconds all get dropped
-   within K ms, escalate from per-handle retry to a connection-level
-   backoff (re-redial after `max_backoff_after_thrash`). This
-   protects the broker without changing the success path.
-
-Either path needs Pulsar-broker-source familiarity to confirm the
-root cause before committing the magnetar-side mitigation.
-
-```text
-/goal investigate #74 (post-restart disconnect cascade). Phase 1: capture broker logs at TRACE level during `docker restart` of `apachepulsar/pulsar:4.0.4`; identify the code path that drops the TCP connection after a successful `CommandProducer` ack. Phase 2: if broker-side bundle churn is confirmed, draft an ADR for magnetar's anti-thrash policy (per-handle success-rate window + connection-level cooldown) and implement it behind a `SupervisorConfig::anti_thrash_threshold` knob; default off. Phase 3: e2e validation against `e2e_supervised_reconnect_across_broker_restart` + `e2e_cluster_failover`; both must reach `Ok(())` within the existing test budget. Update parity-status.md if any user-visible behavior changes.
 ```
 
 ---

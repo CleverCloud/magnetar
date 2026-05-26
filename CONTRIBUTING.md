@@ -11,28 +11,36 @@
 
 Before opening a PR:
 
+Pick a routine feature subset that pulls in every magnetar facet
+EXCEPT `crypto-fips` (the FIPS provider needs a native build
+toolchain that not every contributor has installed):
+
 ```
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
+
 cargo +nightly fmt --check
-cargo clippy --workspace --features crypto-aws-lc-rs --all-targets -- -D warnings
-cargo build --workspace --features crypto-aws-lc-rs
-cargo test --workspace --features crypto-aws-lc-rs --locked
+cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
+cargo build --workspace --no-default-features --features "$FEATURES"
+cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
 RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
-  cargo doc --workspace --features crypto-aws-lc-rs --no-deps --locked
+  cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked
 cargo xtask check-no-channels         # banned-channel grep (ADR-0003)
 cargo xtask check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
 cargo xtask check-no-internal-clock   # no host-clock reads in proto (ADR-0011)
 cargo xtask codegen --check           # proto codegen drift
 cargo xtask check-sim-coverage        # 100% moonpool patch coverage (ADR-0024)
 cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
-cargo xtask check-crypto-matrix       # per-provider build matrix (ADR-0035)
+cargo xtask check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
 ```
 
-The crypto features (`crypto-aws-lc-rs` / `crypto-ring` / `crypto-openssl` /
-`crypto-fips`) are mutually exclusive per
-[ADR-0035](specs/adr/0035-pluggable-crypto-provider.md) — use the
-single-feature flag above instead of `--all-features` (which fails to
-compile because it activates all crypto providers at once).
+`check-crypto-matrix` exhaustively covers ALL providers — including
+`crypto-fips` — in a controlled CI environment where the native
+build toolchain is available. Contributors with a FIPS toolchain
+locally can substitute `--all-features` for `--no-default-features
+--features "$FEATURES"` above. Per-package invocations
+(`cargo test -p <crate>`) need an explicit crypto feature because
+dependency features don't transitively activate under `-p`.
 
 Moonpool seed sweep: CI runs a daily 16-random-seed job per
 [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md);
@@ -42,6 +50,10 @@ locally you can reproduce a flaky run with:
 MOONPOOL_SEED=0xdeadbeef cargo test -p magnetar-runtime-moonpool \
   --features crypto-aws-lc-rs --locked -- --nocapture
 ```
+
+(Using a single-provider feature flag here avoids pulling
+`crypto-fips` for the per-package run, which would otherwise need
+a native FIPS build toolchain locally.)
 
 E2e tests (require Docker; auto-pulls `apachepulsar/pulsar:4.0.4`):
 

@@ -153,6 +153,18 @@ PIP-188 `TOPIC_MIGRATED` reuses the same path: the driver surfaces a
 `driver_loop_inner`, and the supervisor performs the reset +
 reconnect against the new URL.
 
+[ADR-0028](../specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)
+layers an **opt-in anti-thrash policy** on top of the supervisor:
+a per-`Connection` ring records each `ReAttachOk` outcome and any
+TCP drop that follows within `drop_grace`; once `N` re-attaches in
+a sliding window of `M` all get dropped within `K` ms, the
+supervisor honours an `AntiThrashCooldown { until }` event and
+sleeps until the cooldown clears before the next
+`Transport::connect`. Default off
+(`SupervisorConfig::anti_thrash_threshold: None`). Full
+explanation in
+[`../ARCHITECTURE.md#anti-thrash-policy-opt-in-adr-0028`](../ARCHITECTURE.md#anti-thrash-policy-opt-in-adr-0028).
+
 ## TLS
 
 Three TLS sites in the workspace; all use `rustls`:

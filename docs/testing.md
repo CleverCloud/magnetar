@@ -10,32 +10,49 @@ and whether the target is gated behind a feature flag or `#[ignore]`.
 | --- | --- | --- | --- | --- |
 | **Unit** | `crates/<crate>/src/**` in `#[cfg(test)] mod tests` blocks | none | nothing | yes |
 | **Integration** | `crates/<crate>/tests/*.rs` | none | nothing | yes |
-| **Deterministic chaos** | [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/) | `--all-features` | nothing (virtual everything) | yes |
-| **Differential equivalence** | [`crates/magnetar-differential/tests/`](../crates/magnetar-differential/tests/) | `--all-features` | nothing | yes |
+| **Deterministic chaos** | [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/) | `--features crypto-aws-lc-rs` (or any single `crypto-*` provider — per-package `--all-features` would pull `crypto-fips` and its native toolchain) | nothing (virtual everything) | yes |
+| **Differential equivalence** | [`crates/magnetar-differential/tests/`](../crates/magnetar-differential/tests/) | When run with `--workspace`, use the routine feature subset (see [Running each category](#running-each-category)); when run standalone (`-p magnetar-differential`), forward a crypto provider feature to the runtime deps | nothing | yes |
 | **End-to-end (e2e)** | [`crates/magnetar/tests/e2e_*.rs`](../crates/magnetar/tests/) | `--features e2e` + `#[ignore = "e2e: requires Docker"]` | Docker + `apachepulsar/pulsar:4.0.4` | no |
 
 ## Running each category
 
 ```bash
+# Routine feature subset that activates every magnetar facet
+# EXCEPT crypto-fips (its native FIPS build toolchain isn't
+# universally available; check-crypto-matrix covers FIPS in CI).
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
+
 # Unit + integration (no broker, no Docker).
-cargo test --workspace --all-features --locked
+cargo test --workspace --no-default-features --features "$FEATURES" --locked
 
 # Moonpool deterministic-simulation suite (single seed; default).
-cargo test -p magnetar-runtime-moonpool --all-features --locked
+# Per-package `--all-features` would activate `crypto-fips` and need
+# a native FIPS toolchain — use a single provider feature instead.
+cargo test -p magnetar-runtime-moonpool --features crypto-aws-lc-rs --locked
 
 # Same, swept across seeds 1..32 (local pre-flight; CI runs a 16-random-seed
 # sweep daily — see .github/workflows/moonpool-seed-sweep.yml / ADR-0036).
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
-    --all-features --locked -- --quiet || echo "seed $seed FAILED"
+    --features crypto-aws-lc-rs --locked -- --quiet || echo "seed $seed FAILED"
 done
 
-# Differential equivalence harness.
-cargo test -p magnetar-differential --all-features --locked
+# Differential equivalence harness. The crate has no crypto features
+# of its own, so `-p magnetar-differential --all-features` activates
+# nothing on the runtime deps and the cfg cascade fires. Either run
+# it as part of `--workspace --features "$FEATURES"` above, or
+# forward a crypto provider feature explicitly to the runtime deps:
+cargo test -p magnetar-differential --locked --features \
+  'magnetar-runtime-tokio/crypto-aws-lc-rs,magnetar-runtime-moonpool/crypto-aws-lc-rs'
 
 # End-to-end suite (Docker required, runs apachepulsar/pulsar:4.0.4).
 cargo test --workspace --features e2e -- --include-ignored
 ```
+
+Contributors with a FIPS toolchain installed locally can substitute
+`--all-features` for `--no-default-features --features "$FEATURES"`
+above. `cargo xtask check-crypto-matrix` is the authoritative
+per-provider sweep regardless.
 
 The validation chain documented in
 [`parity-status.md#validation-chain-per-commit`](parity-status.md#validation-chain-per-commit)

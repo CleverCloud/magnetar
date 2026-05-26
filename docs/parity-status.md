@@ -139,19 +139,38 @@ satisfies on the tokio engine.
 
 ## Validation chain (per commit)
 
+Pick a routine feature subset that pulls in every magnetar facet
+EXCEPT `crypto-fips` (whose FIPS native build toolchain isn't
+universally available); `cargo xtask check-crypto-matrix` covers
+FIPS exhaustively in CI.
+
 ```
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
+
 cargo +nightly fmt --all
-cargo build --workspace --all-features
-cargo clippy --workspace --all-features --all-targets -- -D warnings
-cargo test --workspace --all-features
+cargo build --workspace --no-default-features --features "$FEATURES"
+cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
+cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
 RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
-  cargo doc --workspace --all-features --no-deps --locked
-cargo xtask check-no-channels
-cargo xtask check-no-io-deps
-cargo xtask check-no-internal-clock
+  cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked
+cargo xtask check-no-channels         # ADR-0003
+cargo xtask check-no-io-deps          # ADR-0004
+cargo xtask check-no-internal-clock   # ADR-0011
 cargo xtask codegen --check
+cargo xtask check-sim-coverage        # ADR-0024 patch coverage
+cargo xtask check-runtime-test-parity # ADR-0024 1:1 runtime parity
+cargo xtask check-crypto-matrix       # ADR-0035 per-provider build matrix incl. FIPS
 ```
+
+Contributors with a FIPS toolchain locally can substitute
+`--all-features` for `--no-default-features --features "$FEATURES"`.
+Per-package invocations (`-p magnetar-runtime-tokio --features X`)
+need an explicit crypto feature because dependency features don't
+transitively activate under `-p`. See
+[ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) for the
+provider matrix and `cargo xtask check-crypto-matrix` for the
+authoritative per-provider build sweep.
 
 Behind `--features e2e`, the suite spins `apachepulsar/pulsar:4.0.4`
 in Docker and exercises the public surface against a real broker — see
