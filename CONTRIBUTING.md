@@ -13,19 +13,40 @@ Before opening a PR:
 
 ```
 cargo +nightly fmt --check
-cargo clippy --workspace --all-features -- -D warnings
-cargo build --workspace --all-features
-cargo test --workspace
+cargo clippy --workspace --features crypto-aws-lc-rs --all-targets -- -D warnings
+cargo build --workspace --features crypto-aws-lc-rs
+cargo test --workspace --features crypto-aws-lc-rs --locked
 cargo deny check
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo xtask check-no-channels       # custom enforcement of the no-channels rule
-cargo xtask check-no-io-deps        # asserts magnetar-proto has zero I/O deps
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
+  cargo doc --workspace --features crypto-aws-lc-rs --no-deps --locked
+cargo xtask check-no-channels         # banned-channel grep (ADR-0003)
+cargo xtask check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
+cargo xtask check-no-internal-clock   # no host-clock reads in proto (ADR-0011)
+cargo xtask codegen --check           # proto codegen drift
+cargo xtask check-sim-coverage        # 100% moonpool patch coverage (ADR-0024)
+cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
+cargo xtask check-crypto-matrix       # per-provider build matrix (ADR-0035)
 ```
 
-E2e tests (require Docker):
+The crypto features (`crypto-aws-lc-rs` / `crypto-ring` / `crypto-openssl` /
+`crypto-fips`) are mutually exclusive per
+[ADR-0035](specs/adr/0035-pluggable-crypto-provider.md) — use the
+single-feature flag above instead of `--all-features` (which fails to
+compile because it activates all crypto providers at once).
+
+Moonpool seed sweep: CI runs a daily 16-random-seed job per
+[ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md);
+locally you can reproduce a flaky run with:
 
 ```
-cargo test --workspace --features e2e
+MOONPOOL_SEED=0xdeadbeef cargo test -p magnetar-runtime-moonpool \
+  --features crypto-aws-lc-rs --locked -- --nocapture
+```
+
+E2e tests (require Docker; auto-pulls `apachepulsar/pulsar:4.0.4`):
+
+```
+cargo test --workspace --features e2e -- --include-ignored
 ```
 
 ## Commit hygiene
