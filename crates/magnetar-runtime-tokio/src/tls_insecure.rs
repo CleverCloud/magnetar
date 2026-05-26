@@ -18,8 +18,11 @@
 //! footgun-mitigation discussion.
 //!
 //! The verifier honors whichever subset of TLS 1.2 / 1.3 the configured
-//! `rustls::crypto::CryptoProvider` supports; under the workspace's `ring`
-//! feature set that means TLS 1.3 is the wire default.
+//! `rustls::crypto::CryptoProvider` supports. The provider itself is
+//! picked by the workspace's `crypto-*` feature (issue #9, ADR-0035) —
+//! aws-lc-rs by default (with rustls's built-in post-quantum hybrid key
+//! exchange), or ring / rustls-openssl / FIPS aws-lc-rs by explicit
+//! opt-in. TLS 1.3 stays the wire default under every provider.
 
 use std::sync::Arc;
 
@@ -36,16 +39,13 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 /// presented. Pair with a separate auth provider (token / oauth2) for client
 /// identity.
 ///
-/// # Panics
-///
-/// Panics if no [`rustls::crypto::CryptoProvider`] is installed for the current
-/// process. The workspace's `ring` feature installs one automatically; this
-/// function exists for callers wiring their own provider.
+/// The active rustls crypto provider is picked by the workspace's
+/// `crypto-*` feature (issue #9, ADR-0035) and installed idempotently
+/// via [`crate::tls_crypto::active_provider`]. No silent `ring`
+/// fallback.
 #[must_use]
 pub fn insecure_tls_config() -> Arc<rustls::ClientConfig> {
-    let provider = rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+    let provider = crate::tls_crypto::active_provider();
     let verifier = Arc::new(NoCertificateVerification {
         supported_algs: provider.signature_verification_algorithms,
     });
@@ -104,9 +104,9 @@ mod tests {
 
     #[test]
     fn insecure_config_builds() {
-        // Install a default provider if none is set (matches what `tokio_rustls`
-        // does in its docs example for tests).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Install the workspace-selected provider (per the `crypto-*`
+        // feature; aws-lc-rs by default).
+        crate::tls_crypto::install_default_provider();
         let cfg = insecure_tls_config();
         assert!(Arc::strong_count(&cfg) >= 1);
         // ALPN-protocols default is empty; we just sanity-check that the
@@ -116,10 +116,8 @@ mod tests {
 
     #[test]
     fn verifier_accepts_any_cert() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let provider = rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+        crate::tls_crypto::install_default_provider();
+        let provider = crate::tls_crypto::active_provider();
         let verifier = NoCertificateVerification {
             supported_algs: provider.signature_verification_algorithms,
         };

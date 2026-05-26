@@ -15,12 +15,23 @@ categories    = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Pluggable rustls crypto provider (issue #9, ADR-0035). Mirrors
+# `magnetar-runtime-tokio` minus `tokio-rustls` — the moonpool engine
+# drives `rustls::ClientConnection` over a byte pipe directly (ADR-0006)
+# and never pulls `tokio-rustls`.
+crypto-aws-lc-rs = ["rustls/aws_lc_rs"]
+crypto-ring      = ["rustls/ring"]
+crypto-fips      = ["rustls/fips"]
+crypto-openssl   = ["dep:rustls-openssl"]
+
 [dependencies]
 magnetar-proto = { workspace = true }
 bytes          = { workspace = true }
 moonpool-core  = { workspace = true }
 parking_lot    = { workspace = true }
 rustls         = { workspace = true }
+rustls-openssl = { workspace = true, optional = true }
 slab           = { workspace = true }
 tokio          = { workspace = true, features = ["sync", "macros", "rt", "time", "io-util"] }
 tracing        = { workspace = true }

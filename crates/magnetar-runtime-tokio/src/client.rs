@@ -73,6 +73,10 @@ impl Client {
     /// chain in `pem_bytes` (the system trust store is NOT loaded). Mirrors Java
     /// `ClientBuilder#tlsTrustCertsFilePath` — useful when the broker uses a self-signed cert.
     ///
+    /// The rustls crypto provider is picked by the workspace's `crypto-*`
+    /// feature (issue #9, ADR-0035) via the explicit
+    /// [`crate::tls_crypto::active_provider`] shim.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::Other`] if no valid certificate is parsed from the PEM.
@@ -94,9 +98,16 @@ impl Client {
                 "no trust certificates were parsed from the provided PEM".to_owned(),
             ));
         }
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let config =
+            rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    ClientError::Other(format!(
+                        "rustls rejected the workspace's default protocol versions: {e}"
+                    ))
+                })?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         Ok(Arc::new(config))
     }
 

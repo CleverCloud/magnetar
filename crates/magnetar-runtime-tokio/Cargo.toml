@@ -15,6 +15,16 @@ categories    = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# Pluggable rustls crypto provider (issue #9, ADR-0035). The façade
+# propagates exactly one of these via `dep?/feature` — under
+# `--all-features` the cfg cascade in `src/tls_crypto.rs` picks
+# aws-lc-rs (highest priority). `rustls/fips` implies `aws_lc_rs`.
+crypto-aws-lc-rs = ["rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
+crypto-ring      = ["rustls/ring",      "tokio-rustls/ring"]
+crypto-fips      = ["rustls/fips"]
+crypto-openssl   = ["dep:rustls-openssl"]
+
 [dependencies]
 magnetar-proto      = { workspace = true }
 bytes               = { workspace = true }
@@ -27,6 +37,7 @@ tokio-rustls        = { workspace = true }
 rustls              = { workspace = true }
 rustls-pki-types    = { workspace = true }
 rustls-native-certs = { workspace = true }
+rustls-openssl      = { workspace = true, optional = true }
 # Compression codecs — Pulsar's `CompressionType` enum maps 1:1 to these crates.
 lz4_flex            = { workspace = true }
 flate2              = { workspace = true }

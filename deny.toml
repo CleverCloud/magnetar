@@ -1,5 +1,17 @@
 # cargo-deny configuration for magnetar.
 # See https://embarkstudios.github.io/cargo-deny/
+#
+# `[bans].deny[].wrappers` is the cargo-deny syntax for "ban this crate
+# UNLESS it is pulled by one of these specific parents". Used here to
+# admit `openssl` / `openssl-sys` only when they show up beneath the
+# `rustls-openssl` rustls crypto provider crate (issue #9, ADR-0035).
+# Requires cargo-deny >= 0.14.
+#
+# `[graph] all-features = true` is intentional: it unions every
+# `crypto-*` feature so the openssl carve-out is exercised in the same
+# pass as the aws-lc-rs / ring / fips paths. The cfg cascade in
+# `magnetar-runtime-{tokio,moonpool}::tls_crypto` resolves multiple
+# providers deterministically at compile time.
 
 [graph]
 all-features = true
@@ -45,10 +57,17 @@ deny = [
     { name = "postage",           reason = "magnetar bans channels" },
     { name = "tachyonix",         reason = "magnetar bans channels" },
     { name = "thingbuf",          reason = "magnetar bans channels" },
-    # No native-tls / openssl-sys — rustls is the only TLS implementation we ship.
+    # No native-tls — rustls is the only TLS implementation we ship.
+    # `openssl` / `openssl-sys` are conditionally allowed (issue #9,
+    # ADR-0035) ONLY when they show up beneath `rustls-openssl`, which
+    # is the rustls crypto-provider wrapper around system OpenSSL.
+    # `openssl-sys` is also wrapped by `openssl` (the high-level Rust
+    # binding), which is itself only allowed beneath `rustls-openssl`.
+    # Any other parent (e.g. a hypothetical `reqwest` switch to
+    # `native-tls`) still trips the deny.
     { name = "native-tls",        reason = "magnetar uses rustls only" },
-    { name = "openssl",           reason = "magnetar uses rustls only" },
-    { name = "openssl-sys",       reason = "magnetar uses rustls only" },
+    { name = "openssl",           reason = "magnetar uses rustls only; allowed transitively via rustls-openssl", wrappers = ["rustls-openssl"] },
+    { name = "openssl-sys",       reason = "magnetar uses rustls only; allowed transitively via rustls-openssl (openssl is the high-level wrapper)", wrappers = ["rustls-openssl", "openssl"] },
 ]
 skip       = []
 skip-tree  = []

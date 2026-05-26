@@ -73,6 +73,7 @@ pub mod dns;
 mod driver;
 mod error;
 mod producer;
+pub mod tls_crypto;
 pub mod tls_insecure;
 pub mod tls_no_hostname;
 mod transport;

@@ -166,6 +166,11 @@ impl AsyncWrite for Transport {
 ///
 /// Used when the caller of [`crate::Client::connect`] does not supply a custom config.
 ///
+/// The rustls crypto provider is picked by the workspace's `crypto-*`
+/// feature (issue #9, ADR-0035) and installed via the explicit
+/// [`crate::tls_crypto::active_provider`] shim — no implicit
+/// `get_default()` fallback to `ring`.
+///
 /// # Errors
 ///
 /// Returns [`ClientError::Other`] if the system root certificates cannot be loaded.
@@ -184,7 +189,13 @@ pub fn default_tls_config() -> Result<Arc<rustls::ClientConfig>, ClientError> {
     for cert in native.certs {
         let _ = roots.add(cert);
     }
-    let config = rustls::ClientConfig::builder()
+    let config = rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            ClientError::Other(format!(
+                "rustls rejected the workspace's default protocol versions: {e}"
+            ))
+        })?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(config))
