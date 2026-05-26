@@ -18,6 +18,15 @@
 //! - Callers drive reconciliation explicitly (no spawned task) — call `update()` from a timer or
 //!   before/after blocking work.
 //!
+//! Engine genericity (pass-2)
+//! --------------------------
+//! [`PatternConsumer<C>`] is generic over `C: crate::ConsumerApi`; child consumers are
+//! subscribed through the engine-generic [`crate::ConsumerBuilder`] (which dispatches via
+//! [`crate::SubscribeApi`]). The companion [`PatternConsumerBuilder<'a, E>`] is generic
+//! over `E: crate::Engine` (default [`crate::TokioEngine`]) and looks up the initial topic
+//! snapshot via [`crate::BrokerMetadataApi`]. The PIP-145 child-subscribe in
+//! [`PatternConsumer::update`] also routes through `<E::ClientState as SubscribeApi>::subscribe`.
+//!
 //! Cancel safety
 //! -------------
 //! [`PatternConsumer::receive`] is cancel-safe in the same sense as
@@ -26,32 +35,26 @@
 
 use std::sync::Arc;
 
-use futures_util::FutureExt;
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
-use magnetar_runtime_tokio::Consumer;
 use parking_lot::Mutex;
 
-use crate::PulsarClient;
 use crate::client::PulsarError;
+use crate::{BrokerMetadataApi, ConsumerApi, Engine, PulsarClient, SubscribeApi};
 
 /// Regex-pattern consumer. Holds one consumer per matching topic and reconciles the set
 /// against PIP-145 deltas on `update()`.
 ///
-/// Phantom-generic over `C: ConsumerApi` per ADR-0026 §D1 — type
-/// parameter present (defaulting to
-/// `magnetar_runtime_tokio::Consumer`) with the inherent impl
-/// bound to the default. Full impl-body lift is blocked on
-/// `ConsumerBuilder` becoming engine-aware (the reconciliation
-/// loop calls `client.consumer(topic).subscribe()` to subscribe
-/// newly-discovered topics).
+/// Generic over `C: crate::ConsumerApi` — defaults to the tokio runtime's `Consumer`.
+/// The companion [`PatternConsumerBuilder<'a, E>`] selects the engine and produces a
+/// `PatternConsumer<<E::ClientState as SubscribeApi>::Consumer>` on `.subscribe()`.
 #[derive(Debug)]
-pub struct PatternConsumer<C: crate::ConsumerApi = Consumer> {
+pub struct PatternConsumer<C: ConsumerApi = magnetar_runtime_tokio::Consumer> {
     inner: Arc<Inner<C>>,
 }
 
 #[derive(Debug)]
-struct Inner<C: crate::ConsumerApi = Consumer> {
+struct Inner<C: ConsumerApi> {
     /// Active consumer set, keyed by topic name.
     consumers: Mutex<Vec<NamedConsumer<C>>>,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
@@ -89,7 +92,10 @@ struct ConsumerTemplate {
 
 impl ConsumerTemplate {
     /// Apply the template to a [`crate::ConsumerBuilder`] for the given topic.
-    fn apply<'a>(&self, mut builder: crate::ConsumerBuilder<'a>) -> crate::ConsumerBuilder<'a> {
+    fn apply<'a, E: Engine>(
+        &self,
+        mut builder: crate::ConsumerBuilder<'a, E>,
+    ) -> crate::ConsumerBuilder<'a, E> {
         builder = builder
             .subscription(self.subscription.clone())
             .subscription_type(self.sub_type)
@@ -135,7 +141,7 @@ impl ConsumerTemplate {
 }
 
 #[derive(Debug, Clone)]
-struct NamedConsumer<C: crate::ConsumerApi = Consumer> {
+struct NamedConsumer<C: ConsumerApi> {
     topic: String,
     consumer: C,
 }
@@ -158,7 +164,7 @@ pub struct ReconcileReport {
     pub removed: usize,
 }
 
-impl PatternConsumer {
+impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     /// Namespace this consumer is watching, as supplied to the builder.
     #[must_use]
     pub fn namespace(&self) -> &str {
@@ -207,17 +213,24 @@ impl PatternConsumer {
     /// Idempotent; returns the count of additions and removals applied during this call.
     /// Mirrors Java's internal `PatternMultiTopicsConsumerImpl#recheckTopics` cycle.
     ///
+    /// PIP-145 child-subscribe routes through the engine-generic
+    /// [`crate::ConsumerBuilder`] which dispatches via
+    /// [`crate::SubscribeApi`].
+    ///
     /// # Errors
     ///
     /// Returns the first [`PulsarError`] encountered while subscribing a new topic; topics
     /// successfully reconciled before the error remain subscribed.
-    pub async fn update(&self, client: &PulsarClient) -> Result<ReconcileReport, PulsarError> {
-        let runtime = client.runtime_client();
+    pub async fn update<E>(&self, client: &PulsarClient<E>) -> Result<ReconcileReport, PulsarError>
+    where
+        E: Engine,
+        E::ClientState: SubscribeApi<Consumer = C> + BrokerMetadataApi,
+    {
         let mut report = ReconcileReport::default();
         // Drain every pending delta synchronously, then apply the reconciliation.
         let mut added: Vec<String> = Vec::new();
         let mut removed: Vec<String> = Vec::new();
-        while let Some(change) = runtime.poll_topic_list_change() {
+        while let Some(change) = crate::BrokerMetadataApi::poll_topic_list_change(&client.inner) {
             added.extend(change.added);
             removed.extend(change.removed);
         }
@@ -226,7 +239,7 @@ impl PatternConsumer {
         }
         // Removals first — close the consumer, drop from the set.
         if !removed.is_empty() {
-            let drained: Vec<NamedConsumer> = {
+            let drained: Vec<NamedConsumer<C>> = {
                 let mut guard = self.inner.consumers.lock();
                 let mut drained = Vec::new();
                 guard.retain(|nc| {
@@ -240,7 +253,7 @@ impl PatternConsumer {
                 drained
             };
             for nc in drained {
-                let _ = nc.consumer.close().await;
+                let _ = ConsumerApi::close_owned(nc.consumer).await;
                 report.removed += 1;
             }
         }
@@ -280,7 +293,7 @@ impl PatternConsumer {
     pub async fn receive(&self) -> Result<PatternMessage, PulsarError> {
         // Snapshot the consumer set under the lock, then release before awaiting — holding the
         // mutex across an await would serialise receive against update.
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         if snapshot.is_empty() {
             return Err(PulsarError::Config(
                 "no topics matched the pattern — nothing to receive".to_owned(),
@@ -288,19 +301,20 @@ impl PatternConsumer {
         }
         if snapshot.len() == 1 {
             let nc = &snapshot[0];
-            let msg = nc.consumer.receive().await?;
+            let msg = nc
+                .consumer
+                .receive()
+                .await
+                .map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
             return Ok(PatternMessage {
                 topic: nc.topic.clone(),
                 message: msg,
             });
         }
-        let futures: Vec<_> = snapshot
-            .iter()
-            .map(|nc| nc.consumer.receive().boxed())
-            .collect();
+        let futures: Vec<_> = snapshot.iter().map(|nc| nc.consumer.receive()).collect();
         let (result, idx, _rest) = select_all(futures).await;
         let topic = snapshot[idx].topic.clone();
-        let message = result?;
+        let message = result.map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
         Ok(PatternMessage { topic, message })
     }
 
@@ -315,7 +329,10 @@ impl PatternConsumer {
         let consumer = self
             .lookup(topic)
             .map_err(|err| PulsarError::Config(format!("ack: {err}")))?;
-        consumer.ack(message_id).await.map_err(PulsarError::Client)
+        consumer
+            .ack(message_id)
+            .await
+            .map_err(|e| PulsarError::Other(format!("ack: {e}")))
     }
 
     /// Cumulative ack on the per-topic child that produced `message_id`.
@@ -334,7 +351,7 @@ impl PatternConsumer {
         consumer
             .ack_cumulative(message_id)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(|e| PulsarError::Other(format!("ack_cumulative: {e}")))
     }
 
     /// Negatively acknowledge a message on the per-topic child that produced it.
@@ -389,12 +406,20 @@ impl PatternConsumer {
     ///
     /// `client` is taken as [`Arc`] because the task captures it for the lifetime of the
     /// ticker loop; callers typically already hold the client behind an [`Arc`].
+    ///
+    /// Engine-generic: works under any `E` whose `ClientState` implements both
+    /// [`crate::SubscribeApi`] (for child-subscribes) and
+    /// [`crate::BrokerMetadataApi`] (for delta polling) — both runtimes do.
     #[must_use = "the JoinHandle must be retained to abort the auto-reconcile task; dropping it detaches the task"]
-    pub fn start_auto_reconcile(
+    pub fn start_auto_reconcile<E>(
         &self,
-        client: std::sync::Arc<PulsarClient>,
+        client: std::sync::Arc<PulsarClient<E>>,
         interval: std::time::Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<()>
+    where
+        E: Engine,
+        E::ClientState: SubscribeApi<Consumer = C> + BrokerMetadataApi,
+    {
         let consumer = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -444,16 +469,16 @@ impl PatternConsumer {
         let consumers = inner.consumers.into_inner();
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in consumers {
-            if let Err(e) = nc.consumer.close().await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = ConsumerApi::close_owned(nc.consumer).await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("close: {e}")));
             }
         }
         first_err
     }
 
-    fn lookup(&self, topic: &str) -> Result<Consumer, String> {
+    fn lookup(&self, topic: &str) -> Result<C, String> {
         self.inner
             .consumers
             .lock()
@@ -464,7 +489,7 @@ impl PatternConsumer {
     }
 }
 
-impl Clone for PatternConsumer {
+impl<C: ConsumerApi> Clone for PatternConsumer<C> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -474,9 +499,13 @@ impl Clone for PatternConsumer {
 
 /// Builder for [`PatternConsumer`]. Mirrors Java's
 /// `PulsarClient#newConsumer().topicsPattern(...)`.
-#[derive(Debug)]
-pub struct PatternConsumerBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Generic over `E: crate::Engine` (default [`crate::TokioEngine`]). The
+/// `.subscribe()` method snapshots the matching topics via
+/// [`crate::BrokerMetadataApi::watch_topic_list`] and opens each per-topic child
+/// through the engine-generic [`crate::ConsumerBuilder`].
+pub struct PatternConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     namespace: Option<String>,
     pattern: Option<String>,
     subscription: Option<String>,
@@ -498,8 +527,18 @@ pub struct PatternConsumerBuilder<'a> {
     start_message_rollback_duration_sec: Option<u64>,
 }
 
-impl<'a> PatternConsumerBuilder<'a> {
-    pub(crate) fn new(client: &'a PulsarClient) -> Self {
+impl<E: Engine> std::fmt::Debug for PatternConsumerBuilder<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatternConsumerBuilder")
+            .field("namespace", &self.namespace)
+            .field("pattern", &self.pattern)
+            .field("subscription", &self.subscription)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>) -> Self {
         Self {
             client,
             namespace: None,
@@ -673,7 +712,14 @@ impl<'a> PatternConsumerBuilder<'a> {
         self.start_message_rollback_duration_sec = Some(seconds);
         self
     }
+}
 
+impl<E> PatternConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi + BrokerMetadataApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone,
+{
     /// Take an initial snapshot of matching topics, subscribe to each, and return the
     /// [`PatternConsumer`]. Call [`PatternConsumer::update`] periodically to reconcile
     /// against newly-emitted PIP-145 deltas — newly-discovered topics inherit every knob
@@ -681,10 +727,12 @@ impl<'a> PatternConsumerBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`PulsarError::Config`] if a required field is missing, [`PulsarError::Client`]
+    /// Returns [`PulsarError::Config`] if a required field is missing, [`PulsarError::Other`]
     /// if the broker refuses the watch, or the first per-topic subscribe error if a topic in
     /// the snapshot cannot be opened (already-opened topics are torn down before the error).
-    pub async fn subscribe(self) -> Result<PatternConsumer, PulsarError> {
+    pub async fn subscribe(
+        self,
+    ) -> Result<PatternConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
         let namespace = self
             .namespace
             .ok_or_else(|| PulsarError::Config("namespace is required".to_owned()))?;
@@ -720,7 +768,8 @@ impl<'a> PatternConsumerBuilder<'a> {
             .topic_list_snapshot(&namespace, &pattern)
             .await?;
 
-        let mut opened: Vec<NamedConsumer> = Vec::with_capacity(topics.len());
+        let mut opened: Vec<NamedConsumer<<E::ClientState as SubscribeApi>::Consumer>> =
+            Vec::with_capacity(topics.len());
         for topic in &topics {
             let builder = template.apply(self.client.consumer(topic.clone()));
             match builder.subscribe().await {
@@ -730,7 +779,7 @@ impl<'a> PatternConsumerBuilder<'a> {
                 }),
                 Err(e) => {
                     for nc in opened {
-                        let _ = nc.consumer.close().await;
+                        let _ = ConsumerApi::close_owned(nc.consumer).await;
                     }
                     return Err(e);
                 }
@@ -779,7 +828,7 @@ mod tests {
     /// Helper: build an empty [`PatternConsumer`] for tests. The set is empty and the
     /// embedded template is a defaults-only stub — sufficient for tests that never reach
     /// `update()` or any per-topic dispatch.
-    fn empty_pattern_consumer() -> PatternConsumer {
+    fn empty_pattern_consumer() -> PatternConsumer<magnetar_runtime_tokio::Consumer> {
         let template = ConsumerTemplate {
             subscription: "test-sub".to_owned(),
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
@@ -882,9 +931,10 @@ mod tests {
     #[test]
     fn start_auto_reconcile_signature() {
         let _: fn(
-            &PatternConsumer,
+            &PatternConsumer<magnetar_runtime_tokio::Consumer>,
             std::sync::Arc<crate::PulsarClient>,
             std::time::Duration,
-        ) -> tokio::task::JoinHandle<()> = PatternConsumer::start_auto_reconcile;
+        ) -> tokio::task::JoinHandle<()> =
+            PatternConsumer::start_auto_reconcile::<crate::TokioEngine>;
     }
 }

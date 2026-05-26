@@ -3,9 +3,21 @@
 //! Multi-topics consumer — subscribes to N topics and merges their delivery streams.
 //!
 //! Mirrors Java's `MultiTopicsConsumerImpl`. The consumer is a thin coordinator over a
-//! `Vec<Consumer>` with `receive()` returning the first message ready across all underlying
-//! consumers. Cancelling the future leaves un-popped messages in their respective consumer
-//! queues — see the `cancel-safe` discussion in [`magnetar_runtime_tokio::Consumer::receive`].
+//! `Vec<C>` (where `C: crate::ConsumerApi`) with `receive()` returning the first message
+//! ready across all underlying consumers. Cancelling the future leaves un-popped messages
+//! in their respective consumer queues — see the `cancel-safe` discussion in
+//! [`magnetar_runtime_tokio::Consumer::receive`].
+//!
+//! Engine genericity (pass-2)
+//! --------------------------
+//! [`MultiTopicsConsumer<C>`] is generic over `C: crate::ConsumerApi` so the same
+//! coordinator drives the tokio and moonpool runtimes. The companion
+//! [`MultiTopicsConsumerBuilder<'a, E>`] is generic over `E: crate::Engine` (default
+//! [`crate::TokioEngine`]) and routes `.subscribe()` through the engine-generic
+//! [`crate::ConsumerBuilder`] (which dispatches through
+//! [`crate::SubscribeApi`]) so each per-topic child uses the engine's concrete
+//! consumer type. Tokio-only methods (currently none) would live in
+//! `impl MultiTopicsConsumer<magnetar_runtime_tokio::Consumer>` carve-outs.
 //!
 //! Dynamic membership
 //! ------------------
@@ -24,34 +36,29 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::FutureExt;
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
-use magnetar_runtime_tokio::Consumer;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::PulsarClient;
 use crate::client::{PulsarError, SeekTarget};
+use crate::{ConsumerApi, Engine, PulsarClient, SubscribeApi};
 
 /// Multi-topics consumer. Each contained consumer subscribes to one topic; `receive()`
 /// returns the next message across the whole set.
 ///
-/// Phantom-generic over `C: ConsumerApi` per ADR-0026 §D1 — the
-/// type parameter is present (defaulting to
-/// `magnetar_runtime_tokio::Consumer`) but the inherent impl is
-/// currently bound to the default. Full lift requires lifting
-/// `ConsumerBuilder` itself (which `add_topic` uses to subscribe
-/// new children), which is a separate sub-PR. See
-/// `docs/follow-ups.md`.
+/// Generic over `C: crate::ConsumerApi` — the default is the tokio runtime's
+/// `Consumer`. The companion [`MultiTopicsConsumerBuilder<'a, E>`] selects the
+/// engine and produces a `MultiTopicsConsumer<<E::ClientState as
+/// SubscribeApi>::Consumer>` on `.subscribe()`.
 #[derive(Debug)]
-pub struct MultiTopicsConsumer<C: crate::ConsumerApi = Consumer> {
+pub struct MultiTopicsConsumer<C: ConsumerApi = magnetar_runtime_tokio::Consumer> {
     inner: Arc<Inner<C>>,
 }
 
 #[derive(Debug)]
-struct Inner<C: crate::ConsumerApi = Consumer> {
+struct Inner<C: ConsumerApi> {
     /// Active consumer set. Held under a mutex so [`MultiTopicsConsumer::add_topic`] /
     /// [`MultiTopicsConsumer::remove_topic`] can mutate the set without rebuilding the
     /// consumer. Every other method snapshots the Vec under the lock and releases before
@@ -70,6 +77,11 @@ struct Inner<C: crate::ConsumerApi = Consumer> {
     /// [`MultiTopicsConsumerBuilder::auto_update_partitions_interval`], `None`
     /// otherwise (default). Tracks one watched topic — the "base" topic used by a
     /// [`crate::PartitionedConsumer`] (the underlying surface). Aborts on drop.
+    ///
+    /// The task uses [`tokio::task::JoinHandle`] + [`tokio::sync::Notify`]
+    /// directly — both engines (`TokioEngine`, `MoonpoolEngine<P>`) schedule
+    /// onto tokio under the hood (see `Engine::TaskHandle = tokio::task::JoinHandle`
+    /// in `engine.rs`), so this scaffolding is engine-invariant.
     auto_update: Option<Arc<AutoUpdateTask>>,
 }
 
@@ -191,7 +203,10 @@ struct ConsumerTemplate {
 
 impl ConsumerTemplate {
     /// Apply the template to a [`crate::ConsumerBuilder`] for the given topic.
-    fn apply<'a>(&self, mut builder: crate::ConsumerBuilder<'a>) -> crate::ConsumerBuilder<'a> {
+    fn apply<'a, E: Engine>(
+        &self,
+        mut builder: crate::ConsumerBuilder<'a, E>,
+    ) -> crate::ConsumerBuilder<'a, E> {
         builder = builder
             .subscription(self.subscription.clone())
             .subscription_type(self.sub_type)
@@ -237,7 +252,7 @@ impl ConsumerTemplate {
 }
 
 #[derive(Debug, Clone)]
-struct NamedConsumer<C: crate::ConsumerApi = Consumer> {
+struct NamedConsumer<C: ConsumerApi> {
     topic: String,
     consumer: C,
 }
@@ -252,7 +267,7 @@ pub struct MultiTopicsMessage {
     pub message: IncomingMessage,
 }
 
-impl MultiTopicsConsumer {
+impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// Topics this consumer is currently subscribed to, in the order they were added (initial
     /// builder order followed by [`Self::add_topic`] insertions, minus any topic removed via
     /// [`Self::remove_topic`]).
@@ -296,11 +311,15 @@ impl MultiTopicsConsumer {
     ///
     /// Returns the underlying subscribe error if the broker refuses the new subscription.
     /// The consumer set is left untouched on error.
-    pub async fn add_topic(
+    pub async fn add_topic<E>(
         &self,
-        client: &PulsarClient,
+        client: &PulsarClient<E>,
         topic: impl Into<String>,
-    ) -> Result<(), PulsarError> {
+    ) -> Result<(), PulsarError>
+    where
+        E: Engine,
+        E::ClientState: SubscribeApi<Consumer = C>,
+    {
         let topic = topic.into();
         // Check membership under the lock and release before awaiting — never hold the
         // mutex across an `.await`.
@@ -319,7 +338,7 @@ impl MultiTopicsConsumer {
         // if a peer raced us, drop our newly-subscribed consumer and close it; otherwise
         // push it. The guard is released before any `.await`
         // (clippy::await_holding_lock).
-        let to_close: Option<Consumer> = {
+        let to_close: Option<C> = {
             let mut guard = self.inner.consumers.lock();
             if guard.iter().any(|nc| nc.topic == topic) {
                 Some(consumer)
@@ -329,7 +348,7 @@ impl MultiTopicsConsumer {
             }
         };
         if let Some(c) = to_close {
-            let _ = c.close().await;
+            let _ = ConsumerApi::close_owned(c).await;
         }
         Ok(())
     }
@@ -344,7 +363,7 @@ impl MultiTopicsConsumer {
     /// Returns the underlying close error from the per-topic consumer.
     pub async fn remove_topic(&self, topic: &str) -> Result<(), PulsarError> {
         // Remove under the lock, release, then close — never hold the mutex across await.
-        let removed: Option<NamedConsumer> = {
+        let removed: Option<NamedConsumer<C>> = {
             let mut guard = self.inner.consumers.lock();
             guard
                 .iter()
@@ -352,7 +371,9 @@ impl MultiTopicsConsumer {
                 .map(|pos| guard.remove(pos))
         };
         if let Some(nc) = removed {
-            nc.consumer.close().await.map_err(PulsarError::Client)?;
+            ConsumerApi::close_owned(nc.consumer)
+                .await
+                .map_err(|e| PulsarError::Other(format!("remove_topic close: {e}")))?;
         }
         Ok(())
     }
@@ -398,7 +419,7 @@ impl MultiTopicsConsumer {
         consumer
             .ack_cumulative(message_id)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(|e| PulsarError::Other(format!("ack_cumulative: {e}")))
     }
 
     /// Fire-and-forget ack into the per-topic child's ack-grouping tracker (opt-in via
@@ -434,7 +455,7 @@ impl MultiTopicsConsumer {
     pub async fn reconsume_later(
         &self,
         topic: &str,
-        retry_producer: &magnetar_runtime_tokio::Producer,
+        retry_producer: &C::Producer,
         msg: IncomingMessage,
         delay: std::time::Duration,
     ) -> Result<(), PulsarError> {
@@ -444,7 +465,7 @@ impl MultiTopicsConsumer {
         consumer
             .reconsume_later(retry_producer, msg, delay)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(|e| PulsarError::Other(format!("reconsume_later: {e}")))
     }
 
     /// Same as [`Self::reconsume_later`] but stamps custom properties on the republished
@@ -452,7 +473,7 @@ impl MultiTopicsConsumer {
     pub async fn reconsume_later_with_properties(
         &self,
         topic: &str,
-        retry_producer: &magnetar_runtime_tokio::Producer,
+        retry_producer: &C::Producer,
         msg: IncomingMessage,
         custom_properties: Vec<(String, String)>,
         delay: std::time::Duration,
@@ -463,7 +484,7 @@ impl MultiTopicsConsumer {
         consumer
             .reconsume_later_with_properties(retry_producer, msg, custom_properties, delay)
             .await
-            .map_err(PulsarError::Client)
+            .map_err(|e| PulsarError::Other(format!("reconsume_later_with_properties: {e}")))
     }
 
     /// Tell the broker to redeliver every unacked message across every child consumer.
@@ -481,7 +502,7 @@ impl MultiTopicsConsumer {
         // Snapshot the consumer set under the lock and release before awaiting — holding
         // the mutex across an await would serialise receive against add_topic /
         // remove_topic.
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         if snapshot.is_empty() {
             return Err(PulsarError::Config(
                 "no topics subscribed to receive from".to_owned(),
@@ -489,7 +510,11 @@ impl MultiTopicsConsumer {
         }
         if snapshot.len() == 1 {
             let nc = &snapshot[0];
-            let msg = nc.consumer.receive().await?;
+            let msg = nc
+                .consumer
+                .receive()
+                .await
+                .map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
             *self.inner.cursor.lock() = 0;
             return Ok(MultiTopicsMessage {
                 topic: nc.topic.clone(),
@@ -497,13 +522,10 @@ impl MultiTopicsConsumer {
             });
         }
 
-        let futures: Vec<_> = snapshot
-            .iter()
-            .map(|nc| nc.consumer.receive().boxed())
-            .collect();
+        let futures: Vec<_> = snapshot.iter().map(|nc| nc.consumer.receive()).collect();
         let (result, idx, _rest) = select_all(futures).await;
         let topic = snapshot[idx].topic.clone();
-        let message = result?;
+        let message = result.map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
         *self.inner.cursor.lock() = (idx + 1) % snapshot.len();
         Ok(MultiTopicsMessage { topic, message })
     }
@@ -515,7 +537,10 @@ impl MultiTopicsConsumer {
         let consumer = self
             .lookup(topic)
             .map_err(|err| PulsarError::Config(format!("ack on multi-consumer: {err}")))?;
-        consumer.ack(message_id).await.map_err(PulsarError::Client)
+        consumer
+            .ack(message_id)
+            .await
+            .map_err(|e| PulsarError::Other(format!("ack: {e}")))
     }
 
     /// `true` while every child consumer reports the underlying connection is up.
@@ -642,10 +667,10 @@ impl MultiTopicsConsumer {
         let consumers = inner.consumers.into_inner();
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in consumers {
-            if let Err(e) = nc.consumer.close().await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = ConsumerApi::close_owned(nc.consumer).await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("close: {e}")));
             }
         }
         first_err
@@ -657,13 +682,13 @@ impl MultiTopicsConsumer {
     pub async fn unsubscribe(&self, force: bool) -> Result<(), PulsarError> {
         // Snapshot under the lock and release before awaiting — never hold the mutex
         // across an `.await`.
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in &snapshot {
-            if let Err(e) = nc.consumer.unsubscribe(force).await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = nc.consumer.unsubscribe(force).await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("unsubscribe: {e}")));
             }
         }
         first_err
@@ -672,13 +697,13 @@ impl MultiTopicsConsumer {
     /// Seek every child consumer to the given publish-time deadline. Mirrors Java
     /// `Consumer#seek(long)` at the multi-topic scope.
     pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in &snapshot {
-            if let Err(e) = nc.consumer.seek_to_timestamp(publish_time_ms).await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = nc.consumer.seek_to_timestamp(publish_time_ms).await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("seek_to_timestamp: {e}")));
             }
         }
         first_err
@@ -687,13 +712,13 @@ impl MultiTopicsConsumer {
     /// Seek every child consumer to the earliest message. Mirrors Java
     /// `Consumer#seek(MessageId.earliest)` at the multi-topic scope.
     pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in &snapshot {
-            if let Err(e) = nc.consumer.seek_to_earliest().await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = nc.consumer.seek_to_earliest().await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("seek_to_earliest: {e}")));
             }
         }
         first_err
@@ -702,13 +727,13 @@ impl MultiTopicsConsumer {
     /// Seek every child consumer to the latest (head) position. Mirrors Java
     /// `Consumer#seek(MessageId.latest)` at the multi-topic scope.
     pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in &snapshot {
-            if let Err(e) = nc.consumer.seek_to_latest().await {
-                if first_err.is_ok() {
-                    first_err = Err(PulsarError::Client(e));
-                }
+            if let Err(e) = nc.consumer.seek_to_latest().await
+                && first_err.is_ok()
+            {
+                first_err = Err(PulsarError::Other(format!("seek_to_latest: {e}")));
             }
         }
         first_err
@@ -730,7 +755,7 @@ impl MultiTopicsConsumer {
     where
         F: FnMut(&str) -> SeekTarget,
     {
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in &snapshot {
             let target = f(nc.topic.as_str());
@@ -741,7 +766,7 @@ impl MultiTopicsConsumer {
             if let Err(e) = res
                 && first_err.is_ok()
             {
-                first_err = Err(PulsarError::Client(e));
+                first_err = Err(PulsarError::Other(format!("seek_per_partition: {e}")));
             }
         }
         first_err
@@ -751,20 +776,20 @@ impl MultiTopicsConsumer {
     /// per child consumer, in the order they appear in the current consumer set. Mirrors
     /// Java `Consumer#getLastMessageIds` for partitioned/multi-topic consumers.
     pub async fn last_message_ids(&self) -> Result<Vec<(String, MessageId)>, PulsarError> {
-        let snapshot: Vec<NamedConsumer> = { self.inner.consumers.lock().clone() };
+        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
         let mut out = Vec::with_capacity(snapshot.len());
         for nc in &snapshot {
             let id = nc
                 .consumer
                 .last_message_id()
                 .await
-                .map_err(PulsarError::Client)?;
+                .map_err(|e| PulsarError::Other(format!("last_message_id: {e}")))?;
             out.push((nc.topic.clone(), id));
         }
         Ok(out)
     }
 
-    fn lookup(&self, topic: &str) -> Result<Consumer, String> {
+    fn lookup(&self, topic: &str) -> Result<C, String> {
         self.inner
             .consumers
             .lock()
@@ -835,10 +860,14 @@ impl MultiTopicsConsumer {
     /// # Errors
     ///
     /// Surfaces [`PulsarError::Client`] when the broker metadata lookup fails.
-    pub async fn refresh_partitions(
+    pub async fn refresh_partitions<E>(
         &self,
-        client: &PulsarClient,
-    ) -> Result<Option<u32>, PulsarError> {
+        client: &PulsarClient<E>,
+    ) -> Result<Option<u32>, PulsarError>
+    where
+        E: Engine,
+        E::ClientState: crate::BrokerMetadataApi,
+    {
         let Some(task) = self.inner.auto_update.as_ref() else {
             return Ok(None);
         };
@@ -856,7 +885,7 @@ impl MultiTopicsConsumer {
     }
 }
 
-impl Clone for MultiTopicsConsumer {
+impl<C: ConsumerApi> Clone for MultiTopicsConsumer<C> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -866,9 +895,15 @@ impl Clone for MultiTopicsConsumer {
 
 /// Builder for [`MultiTopicsConsumer`]. Mirrors `org.apache.pulsar.client.api.ConsumerBuilder`
 /// at the multi-topic layer.
-#[derive(Debug)]
-pub struct MultiTopicsConsumerBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Generic over `E: crate::Engine` (default [`crate::TokioEngine`]). The
+/// `.subscribe()` method dispatches through the engine-generic
+/// [`crate::ConsumerBuilder`] (which routes through [`crate::SubscribeApi`]) so
+/// each per-topic child uses the engine's concrete consumer type. The returned
+/// [`MultiTopicsConsumer<C>`] has `C = <E::ClientState as
+/// SubscribeApi>::Consumer`.
+pub struct MultiTopicsConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     topics: Vec<String>,
     subscription: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
@@ -895,8 +930,18 @@ pub struct MultiTopicsConsumerBuilder<'a> {
     auto_update_base_topic: Option<String>,
 }
 
-impl<'a> MultiTopicsConsumerBuilder<'a> {
-    pub(crate) fn new(client: &'a PulsarClient) -> Self {
+impl<E: Engine> std::fmt::Debug for MultiTopicsConsumerBuilder<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiTopicsConsumerBuilder")
+            .field("topics", &self.topics)
+            .field("subscription", &self.subscription)
+            .field("sub_type", &self.sub_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>) -> Self {
         Self {
             client,
             topics: Vec::new(),
@@ -1111,10 +1156,19 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
         self.auto_update_base_topic = Some(topic);
         self
     }
+}
 
+impl<E> MultiTopicsConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone,
+{
     /// Open every per-topic subscription concurrently. If any subscribe fails the others
     /// that already succeeded are torn down before the error is returned.
-    pub async fn subscribe(self) -> Result<MultiTopicsConsumer, PulsarError> {
+    pub async fn subscribe(
+        self,
+    ) -> Result<MultiTopicsConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
         let subscription = self
             .subscription
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;
@@ -1146,7 +1200,8 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
 
         // Subscribe sequentially — the first failure short-circuits, and on failure we close
         // the consumers we already opened.
-        let mut consumers: Vec<NamedConsumer> = Vec::with_capacity(self.topics.len());
+        let mut consumers: Vec<NamedConsumer<<E::ClientState as SubscribeApi>::Consumer>> =
+            Vec::with_capacity(self.topics.len());
         for topic in &self.topics {
             let builder = template.apply(self.client.consumer(topic.clone()));
             let result = builder.subscribe().await;
@@ -1158,7 +1213,7 @@ impl<'a> MultiTopicsConsumerBuilder<'a> {
                 Err(e) => {
                     // Best-effort teardown of previously-opened consumers.
                     for nc in consumers {
-                        let _ = nc.consumer.close().await;
+                        let _ = ConsumerApi::close_owned(nc.consumer).await;
                     }
                     return Err(e);
                 }
@@ -1227,13 +1282,13 @@ mod tests {
     /// reachable via [`MultiTopicsConsumer::subscription`] even with an empty set.
     #[test]
     fn empty_inner_is_consistent() {
-        let inner = Arc::new(Inner {
+        let inner: Arc<Inner<magnetar_runtime_tokio::Consumer>> = Arc::new(Inner {
             consumers: Mutex::new(Vec::new()),
             cursor: Mutex::new(0),
             template: empty_template(),
             auto_update: None,
         });
-        let consumer = MultiTopicsConsumer {
+        let consumer: MultiTopicsConsumer<magnetar_runtime_tokio::Consumer> = MultiTopicsConsumer {
             inner: inner.clone(),
         };
         assert_eq!(consumer.len(), 0);

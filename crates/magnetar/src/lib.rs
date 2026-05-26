@@ -64,7 +64,8 @@ pub use engine::MoonpoolEngine;
 pub use engine::TokioEngine;
 #[cfg(feature = "tokio")]
 pub use engine::{
-    ConsumerApi, CreateProducerApi, OpenProducerFut, ProducerApi, SubscribeApi, SubscribeFut,
+    BrokerMetadataApi, ConsumerApi, CreateProducerApi, OpenProducerFut, ProducerApi,
+    ReceiveBatchFut, ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange, WatchTopicListFut,
 };
 pub use engine::{Engine, TransactionApi};
 

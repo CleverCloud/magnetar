@@ -11,17 +11,28 @@
 //! Under the hood this is a [`crate::MultiTopicsConsumer`] with broker-discovered topics, so
 //! the receive-side semantics (cancel-safe `select_all`, per-topic ack routing) are shared
 //! with the manually-listed multi-topics case.
+//!
+//! Engine genericity
+//! -----------------
+//! [`PartitionedConsumerBuilder<'a, E>`] is engine-generic and lifts to a
+//! [`PartitionedConsumer<C>`] whose `C` is the engine's concrete consumer type
+//! (`<E::ClientState as SubscribeApi>::Consumer`). The metadata lookup uses the
+//! engine-generic [`crate::PulsarClient::partitions_for_topic`].
 
 use crate::client::PulsarError;
-use crate::{MultiTopicsConsumer, PulsarClient};
+use crate::{Engine, MultiTopicsConsumer, PulsarClient, SubscribeApi};
 
 /// Partition-aware consumer. Effectively a [`crate::MultiTopicsConsumer`] whose topic list
 /// was auto-discovered from a partitioned topic.
-pub type PartitionedConsumer = MultiTopicsConsumer;
+pub type PartitionedConsumer<C = magnetar_runtime_tokio::Consumer> = MultiTopicsConsumer<C>;
 
 /// Builder for a partition-aware consumer.
-pub struct PartitionedConsumerBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Generic over `E: crate::Engine` (default [`crate::TokioEngine`]). The
+/// `.subscribe()` method routes through [`crate::MultiTopicsConsumerBuilder`]
+/// so each per-partition child uses the engine's concrete consumer type.
+pub struct PartitionedConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
+    client: &'a PulsarClient<E>,
     topic: String,
     subscription: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
@@ -43,7 +54,7 @@ pub struct PartitionedConsumerBuilder<'a> {
     auto_update_partitions_interval: Option<std::time::Duration>,
 }
 
-impl std::fmt::Debug for PartitionedConsumerBuilder<'_> {
+impl<E: Engine> std::fmt::Debug for PartitionedConsumerBuilder<'_, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartitionedConsumerBuilder")
             .field("topic", &self.topic)
@@ -53,8 +64,8 @@ impl std::fmt::Debug for PartitionedConsumerBuilder<'_> {
     }
 }
 
-impl<'a> PartitionedConsumerBuilder<'a> {
-    pub(crate) fn new(client: &'a PulsarClient, topic: String) -> Self {
+impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
         Self {
             client,
             topic,
@@ -237,18 +248,23 @@ impl<'a> PartitionedConsumerBuilder<'a> {
         };
         self
     }
+}
 
+impl<E> PartitionedConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi + crate::BrokerMetadataApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone,
+{
     /// Query partition count, then open one per-partition consumer. If the broker reports
     /// `0` partitions the builder falls back to a single consumer on the original topic.
-    pub async fn subscribe(self) -> Result<PartitionedConsumer, PulsarError> {
+    pub async fn subscribe(
+        self,
+    ) -> Result<PartitionedConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
         let subscription = self
             .subscription
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;
-        let partitions = self
-            .client
-            .runtime_client()
-            .partitioned_topic_metadata(&self.topic)
-            .await?;
+        let partitions = self.client.partitions_for_topic(&self.topic).await?;
         let topics: Vec<String> = if partitions == 0 {
             vec![self.topic.clone()]
         } else {

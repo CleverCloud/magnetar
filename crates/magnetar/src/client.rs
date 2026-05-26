@@ -816,22 +816,6 @@ impl PulsarClient<crate::TokioEngine> {
         crate::TypedTableViewBuilder::new(self, topic.into(), schema)
     }
 
-    /// Open a [`crate::MultiTopicsConsumerBuilder`] that subscribes to many topics at once.
-    /// Mirrors Java's `PulsarClient#newConsumer().topics(...)`.
-    #[must_use]
-    pub fn multi_topics_consumer(&self) -> crate::MultiTopicsConsumerBuilder<'_> {
-        crate::MultiTopicsConsumerBuilder::new(self)
-    }
-
-    /// Open a [`crate::PatternConsumerBuilder`] that subscribes to every topic in a namespace
-    /// matching a broker-side regex pattern (PIP-145). Reconciles against `TopicListChanged`
-    /// deltas on demand via [`crate::PatternConsumer::update`]. Mirrors Java's
-    /// `PulsarClient#newConsumer().topicsPattern(...)`.
-    #[must_use]
-    pub fn pattern_consumer(&self) -> crate::PatternConsumerBuilder<'_> {
-        crate::PatternConsumerBuilder::new(self)
-    }
-
     /// Open a [`crate::PartitionedProducerBuilder`] for the given topic. The builder queries
     /// the broker for the partition count and opens one child producer per partition.
     /// Mirrors Java's `PulsarClient#newProducer()` against a partitioned topic.
@@ -841,46 +825,6 @@ impl PulsarClient<crate::TokioEngine> {
         topic: impl Into<String>,
     ) -> crate::PartitionedProducerBuilder<'_> {
         crate::PartitionedProducerBuilder::new(self, topic.into())
-    }
-
-    /// Open a [`crate::PartitionedConsumerBuilder`] for the given topic. The builder
-    /// auto-discovers the partition count and subscribes to every partition under a single
-    /// subscription name. Mirrors Java's `PulsarClient#newConsumer()` against a partitioned
-    /// topic.
-    #[must_use]
-    pub fn partitioned_consumer(
-        &self,
-        topic: impl Into<String>,
-    ) -> crate::PartitionedConsumerBuilder<'_> {
-        crate::PartitionedConsumerBuilder::new(self, topic.into())
-    }
-
-    /// Query the broker for the partition count of `topic`. Returns `0` for non-partitioned
-    /// topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PulsarError::Client`] if the broker refuses the metadata lookup.
-    pub async fn partitions_for_topic(&self, topic: &str) -> Result<u32> {
-        self.inner
-            .partitioned_topic_metadata(topic)
-            .await
-            .map_err(PulsarError::Client)
-    }
-
-    /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
-    /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
-    /// this pattern right now" workflows. Live updates are emitted by the connection as
-    /// `TopicListChanged` events but are not yet streamed by this helper.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PulsarError::Client`] if the broker refuses the watch.
-    pub async fn topic_list_snapshot(&self, namespace: &str, pattern: &str) -> Result<Vec<String>> {
-        self.inner
-            .watch_topic_list(namespace, pattern)
-            .await
-            .map_err(PulsarError::Client)
     }
 
     /// PIP-33 (ADR-0034): non-blocking peek for the next replicated-subscription
@@ -985,6 +929,72 @@ impl<E: crate::Engine> PulsarClient<E> {
         schema: std::sync::Arc<S>,
     ) -> crate::TypedConsumerBuilder<'_, S, E> {
         crate::TypedConsumerBuilder::new(self, topic.into(), schema)
+    }
+
+    /// Open a [`crate::MultiTopicsConsumerBuilder`] that subscribes to many topics at once.
+    /// Mirrors Java's `PulsarClient#newConsumer().topics(...)`. Engine-generic per
+    /// ADR-0026 §D1 — `.subscribe()` routes through the engine-generic
+    /// [`crate::ConsumerBuilder`].
+    #[must_use]
+    pub fn multi_topics_consumer(&self) -> crate::MultiTopicsConsumerBuilder<'_, E> {
+        crate::MultiTopicsConsumerBuilder::new(self)
+    }
+
+    /// Open a [`crate::PatternConsumerBuilder`] that subscribes to every topic in a namespace
+    /// matching a broker-side regex pattern (PIP-145). Reconciles against `TopicListChanged`
+    /// deltas on demand via [`crate::PatternConsumer::update`]. Mirrors Java's
+    /// `PulsarClient#newConsumer().topicsPattern(...)`. Engine-generic per ADR-0026 §D1.
+    #[must_use]
+    pub fn pattern_consumer(&self) -> crate::PatternConsumerBuilder<'_, E> {
+        crate::PatternConsumerBuilder::new(self)
+    }
+
+    /// Open a [`crate::PartitionedConsumerBuilder`] for the given topic. The builder
+    /// auto-discovers the partition count and subscribes to every partition under a single
+    /// subscription name. Mirrors Java's `PulsarClient#newConsumer()` against a partitioned
+    /// topic. Engine-generic per ADR-0026 §D1.
+    #[must_use]
+    pub fn partitioned_consumer(
+        &self,
+        topic: impl Into<String>,
+    ) -> crate::PartitionedConsumerBuilder<'_, E> {
+        crate::PartitionedConsumerBuilder::new(self, topic.into())
+    }
+}
+
+/// Broker-metadata methods that dispatch through the
+/// [`crate::BrokerMetadataApi`] extension trait. Engine-generic per
+/// ADR-0026 §D1 — both runtimes implement `BrokerMetadataApi` on their
+/// `Client` type.
+impl<E: crate::Engine> PulsarClient<E>
+where
+    E::ClientState: crate::BrokerMetadataApi,
+{
+    /// Query the broker for the partition count of `topic`. Returns `0` for non-partitioned
+    /// topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulsarError::Other`] if the broker refuses the metadata lookup.
+    pub async fn partitions_for_topic(&self, topic: &str) -> Result<u32> {
+        crate::BrokerMetadataApi::partitioned_topic_metadata(&self.inner, topic)
+            .await
+            .map_err(|err| PulsarError::Other(format!("partitions_for_topic: {err}")))
+    }
+
+    /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
+    /// given namespace + regex pattern (PIP-145). Useful for "discover all topics matching
+    /// this pattern right now" workflows. Live updates are emitted by the connection as
+    /// `TopicListChanged` events and surfaced through
+    /// [`crate::BrokerMetadataApi::poll_topic_list_change`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PulsarError::Other`] if the broker refuses the watch.
+    pub async fn topic_list_snapshot(&self, namespace: &str, pattern: &str) -> Result<Vec<String>> {
+        crate::BrokerMetadataApi::watch_topic_list(&self.inner, namespace, pattern)
+            .await
+            .map_err(|err| PulsarError::Other(format!("topic_list_snapshot: {err}")))
     }
 }
 
@@ -2023,8 +2033,8 @@ impl<C: crate::ConsumerApi> Reader<C> {
         let msg = crate::ConsumerApi::receive(&self.consumer)
             .await
             .map_err(|err| PulsarError::Other(format!("read_next: {err}")))?;
-        *self.last_received.lock() = Some(msg.id);
-        Ok(msg)
+        *self.last_received.lock() = Some(msg.message_id);
+        Ok(IncomingMessage::from(msg))
     }
 
     /// Manually record a received message id into the per-reader cursor. Useful when

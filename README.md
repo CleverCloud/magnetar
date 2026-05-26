@@ -701,18 +701,27 @@ known-missing feature.
   `impl<E: Engine + ...> PulsarClient<E>` per ADR-0026 §D1 + the
   ConsumerApi/ProducerApi + SubscribeApi/CreateProducerApi
   extension traits, and work on both engines.
-  The remaining façade entry-points still bound to
-  `PulsarClient<TokioEngine>` — **partitioned_producer**,
   **MultiTopicsConsumer**, **PartitionedConsumer** (a type alias
-  for MultiTopicsConsumer), **PatternConsumer**, and
-  **TableView** (`table_view` / `typed_table_view`; the inner
-  `PartitionedProducer<P>` / `TableView<C>` / `TypedTableView<S,
-  C>` *types* do carry an engine-generic parameter, but the
-  builders + entry methods live in `impl
-  PulsarClient<TokioEngine>`) — have their moonpool helper
-  methods ported (commits `5f1368f`, `53669f9`, `0f95a3c`,
-  `008abbf`) but the impl-body / builder lift (pass-2) is still
-  pending. See
+  for MultiTopicsConsumer), and **PatternConsumer** (PIP-145)
+  have now landed pass-2: `MultiTopicsConsumer<C>` /
+  `PatternConsumer<C>` are engine-generic via the
+  `ConsumerApi` trait (extended with the pass-1 helper methods,
+  `pause`/`resume`, `seek_to_message`/`seek_to_timestamp`, and
+  the DLQ/retry helpers backed by a matched
+  `type Producer: ProducerApi`); the matching
+  `MultiTopicsConsumerBuilder<'a, E>` /
+  `PartitionedConsumerBuilder<'a, E>` /
+  `PatternConsumerBuilder<'a, E>` route `.subscribe()` through
+  the engine-generic `ConsumerBuilder` (which dispatches via
+  `SubscribeApi`). Topic-list lookups +
+  `partitioned_topic_metadata` use the new `BrokerMetadataApi`
+  extension trait. The remaining façade entry-points still
+  bound to `PulsarClient<TokioEngine>` are
+  **partitioned_producer** and **TableView** (`table_view` /
+  `typed_table_view`; the inner `PartitionedProducer<P>` /
+  `TableView<C>` / `TypedTableView<S, C>` *types* do carry an
+  engine-generic parameter, but the builders + entry methods
+  still live in `impl PulsarClient<TokioEngine>`). See
   [`docs/parity-status.md`](docs/parity-status.md) and
   [`docs/follow-ups.md#per-surface-builder--impl-body-lifts`](docs/follow-ups.md#per-surface-builder--impl-body-lifts).
 - **PIP-180 shadow topic** landed in v0.2.0 ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md),

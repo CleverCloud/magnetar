@@ -358,23 +358,49 @@ pub trait ProducerApi: 'static + Send + Sync {
 /// the wire-level subscription lifecycle: `receive`, the ack family
 /// (`ack`, `ack_cumulative`, `ack_with_txn`, `ack_cumulative_with_txn`),
 /// `negative_ack`, plus topic / subscription / `is_closed` accessors.
-/// Helpers that touch tokio-specific futures (`ReceiveFut`,
-/// `receive_with_timeout`), the broader ack family
-/// (`ack_with_txn`, `ack_batch`, `ack_cumulative_with_txn`,
-/// `ack_with_properties`), `flow`, `redeliver_unacked`,
-/// `last_message_id`, `has_message_after`, `seek_*`, and `close` stay
-/// runtime-specific in Phase 1; the trait is additive so subsequent
-/// façade lifts grow it as they need the surface.
+///
+/// Pass-2 of the `MultiTopicsConsumer` / `PatternConsumer` lift extends
+/// this trait with the queue/permits getters (`available_in_queue`,
+/// `available_permits`, `has_received_any_message`, `has_reached_end_of_topic`,
+/// `is_paused`, `is_inactive`), the DLQ helpers (`drain_dead_letter`,
+/// `republish_dead_letters`, `reconsume_later`,
+/// `reconsume_later_with_properties`), the receive-batch family
+/// (`receive_with_timeout`, `receive_batch`, `receive_batch_with_bytes_cap`),
+/// flow control (`pause`, `resume`), and the remaining seek primitives
+/// (`seek_to_message`, `seek_to_timestamp`). The `unsubscribe` method now
+/// carries the PIP-313 `force: bool` flag so the trait matches the runtime
+/// signatures verbatim.
+///
+/// The associated [`Self::Producer`] type ties each engine's `Consumer` to
+/// its matching `Producer`, letting [`Self::republish_dead_letters`] and the
+/// [`Self::reconsume_later`] family accept a runtime-typed producer reference
+/// at the trait level without re-introducing a tokio-only carve-out.
 #[cfg(feature = "tokio")]
 pub trait ConsumerApi: 'static + Send + Sync {
     /// Per-runtime client error type used by the wire calls.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Matched runtime producer used by the DLQ + retry helpers.
+    /// Each runtime ties this to its own `Producer` (tokio →
+    /// [`magnetar_runtime_tokio::Producer`]; moonpool →
+    /// `magnetar_runtime_moonpool::Producer<P>`) so
+    /// [`Self::republish_dead_letters`] /
+    /// [`Self::reconsume_later`] /
+    /// [`Self::reconsume_later_with_properties`] dispatch through the
+    /// trait without a tokio-only carve-out.
+    type Producer: ProducerApi<Error = Self::Error>;
+
     /// Receive the next message. Resolves once the broker has
-    /// delivered an entry.
+    /// delivered an entry. Returns the
+    /// [`magnetar_proto::IncomingMessage`] surfaced by the state
+    /// machine; callers that prefer the façade-side
+    /// [`crate::IncomingMessage`] (with computed accessors) can call
+    /// `.into()` on the result.
     fn receive(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<crate::IncomingMessage, Self::Error>> + Send + '_>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<magnetar_proto::IncomingMessage, Self::Error>> + Send + '_>,
+    >;
 
     /// Acknowledge `message_id` individually. Mirrors Java
     /// `Consumer#acknowledge(MessageId)`.
@@ -461,12 +487,14 @@ pub trait ConsumerApi: 'static + Send + Sync {
     );
 
     /// Tear down this consumer's subscription on the broker. Mirrors
-    /// Java `Consumer#unsubscribe`. PIP-313's `force=true` variant lives
-    /// directly on the concrete runtime types as
-    /// `Consumer::unsubscribe(force)`; pass-2 of the
-    /// `MultiTopicsConsumer` surface lift will add the boolean to the
-    /// trait method itself.
-    fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+    /// Java `Consumer#unsubscribe`. `force=true` selects the PIP-313
+    /// destructive variant that detaches every other attached consumer
+    /// on the same subscription; `force=false` (Java default) keeps the
+    /// cursor in place when other consumers are still attached.
+    fn unsubscribe(
+        &self,
+        force: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
 
     /// Seek to the earliest available message. Mirrors Java
     /// `Consumer#seek(MessageId.earliest)`.
@@ -477,6 +505,116 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// Seek to the latest available message. Mirrors Java
     /// `Consumer#seek(MessageId.latest)`.
     fn seek_to_latest(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Seek to an explicit message id. Mirrors Java
+    /// `Consumer#seek(MessageId)`.
+    fn seek_to_message(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Seek to a publish-time deadline (broker-side wall clock, ms
+    /// since epoch). Mirrors Java `Consumer#seek(long)`.
+    fn seek_to_timestamp(
+        &self,
+        publish_time_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
+
+    /// Stop automatic flow refills. Mirrors Java `Consumer#pause` —
+    /// already-issued permits keep draining, no new FLOW frames are
+    /// emitted until [`Self::resume`].
+    fn pause(&self);
+
+    /// Re-enable automatic flow refills. Mirrors Java `Consumer#resume`.
+    fn resume(&self);
+
+    /// Number of messages currently buffered in the per-consumer
+    /// receiver queue, waiting for a `receive()` call. Mirrors Java
+    /// `Consumer#getNumMessagesInQueue`.
+    fn available_in_queue(&self) -> usize;
+
+    /// Outstanding dispatch permits the consumer has granted the broker
+    /// (messages it has authorised the broker to push without an
+    /// explicit `CommandFlow`). Mirrors Java
+    /// `ConsumerBase#getAvailablePermits`.
+    fn available_permits(&self) -> u32;
+
+    /// `true` once the consumer has received at least one message since
+    /// opening. Mirrors Java `Consumer#hasReceivedAnyMessage`.
+    fn has_received_any_message(&self) -> bool;
+
+    /// `true` once the broker has indicated end-of-topic for this
+    /// consumer (no more messages will be dispatched). Mirrors Java
+    /// `Consumer#hasReachedEndOfTopic`.
+    fn has_reached_end_of_topic(&self) -> bool;
+
+    /// `true` while [`Self::pause`] has flipped the consumer's flow
+    /// refills off. Mirrors Java `Consumer#isPaused`.
+    fn is_paused(&self) -> bool;
+
+    /// Mirrors Java `Consumer#isInactive`. Returns `true` once the
+    /// consumer has reached end-of-topic (no more messages will be
+    /// dispatched). Note: a closed consumer is not represented as
+    /// "inactive" here.
+    fn is_inactive(&self) -> bool;
+
+    /// Drain every message the state machine has flagged as dead-letter
+    /// (redelivery count greater than the configured
+    /// `max_redeliver_count`). The caller is responsible for
+    /// republishing them to the DLQ topic (or using
+    /// [`Self::republish_dead_letters`] for the transparent path).
+    fn drain_dead_letter(&self) -> Vec<magnetar_proto::IncomingMessage>;
+
+    /// Receive the next message bounded by `timeout`. Resolves with
+    /// `Ok(None)` when the deadline elapses with no message. Mirrors
+    /// Java `Consumer#receive(int, TimeUnit)`.
+    fn receive_with_timeout(&self, timeout: Duration) -> ReceiveOptFut<'_, Self>;
+
+    /// Receive up to `max_messages` messages in one call. Waits up to
+    /// `max_wait` for the first message, then drains additional
+    /// already-buffered messages without further waiting. Mirrors Java
+    /// `Consumer#batchReceive`.
+    fn receive_batch(&self, max_messages: usize, max_wait: Duration) -> ReceiveBatchFut<'_, Self>;
+
+    /// Same as [`Self::receive_batch`] but stops once the accumulated
+    /// payload size would exceed `max_bytes`. Mirrors Java
+    /// `BatchReceivePolicy` with all three caps (count, bytes, wait).
+    fn receive_batch_with_bytes_cap(
+        &self,
+        max_messages: usize,
+        max_bytes: usize,
+        max_wait: Duration,
+    ) -> ReceiveBatchFut<'_, Self>;
+
+    /// Drain the per-consumer dead-letter queue and republish every
+    /// entry via `dlq_producer`, preserving the message's metadata.
+    /// Acks each original after a successful republish. Returns the
+    /// number of messages republished.
+    fn republish_dead_letters<'a>(
+        &'a self,
+        dlq_producer: &'a Self::Producer,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>>;
+
+    /// Republish a single message via `retry_producer` with a
+    /// `delay`-bounded deadline, then ack the original. Mirrors Java
+    /// `Consumer#reconsumeLater(Message, long, TimeUnit)`.
+    fn reconsume_later<'a>(
+        &'a self,
+        retry_producer: &'a Self::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        delay: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+
+    /// Same as [`Self::reconsume_later`] but lets the caller stamp
+    /// additional custom properties on the republished message. Mirrors
+    /// Java's properties-aware reconsumeLater overload.
+    fn reconsume_later_with_properties<'a>(
+        &'a self,
+        retry_producer: &'a Self::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        custom_properties: Vec<(String, String)>,
+        delay: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
 
     /// Consume the consumer and tear down the broker-side resource
     /// (`CommandCloseConsumer`). Mirrors Java `Consumer#close`. Both
@@ -519,6 +657,120 @@ pub trait ConsumerApi: 'static + Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
 }
 
+/// PIP-145 `TopicListChanged` delta surfaced through
+/// [`BrokerMetadataApi::poll_topic_list_change`]. Façade-side analogue
+/// of the per-runtime `TopicListChange` structs — each runtime impl
+/// converts its own delta into this engine-agnostic shape so generic
+/// surfaces (`PatternConsumer<C>::update`) can reconcile without
+/// touching runtime-specific types.
+#[cfg(feature = "tokio")]
+#[derive(Debug, Clone)]
+pub struct TopicListChange {
+    /// Topics that newly match the pattern.
+    pub added: Vec<String>,
+    /// Topics that no longer match the pattern.
+    pub removed: Vec<String>,
+}
+
+/// Engine-side broker metadata lookups used by
+/// [`crate::PartitionedConsumerBuilder`] and
+/// [`crate::PatternConsumerBuilder`] (alongside other partition-aware
+/// surfaces). Each runtime implements this on its concrete `Client`
+/// type.
+///
+/// Same sans-io contract as [`SubscribeApi`] — async methods return
+/// `Pin<Box<dyn Future + Send + '_>>`; the impl drives the
+/// `magnetar_proto::Connection` state machine.
+#[cfg(feature = "tokio")]
+pub trait BrokerMetadataApi: 'static + Send + Sync {
+    /// Per-runtime client error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Query the broker for the partition count of `topic`. Returns
+    /// `0` for non-partitioned topics. Mirrors Java
+    /// `PulsarClient#getPartitionsForTopic`.
+    fn partitioned_topic_metadata<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>>;
+
+    /// Subscribe to a topic-list watcher and return the initial topic
+    /// snapshot for the given namespace + regex pattern (PIP-145).
+    fn watch_topic_list<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+    ) -> WatchTopicListFut<'a, Self>;
+
+    /// Drain the next pending `TopicListChanged` delta from the
+    /// connection's PIP-145 buffer, if any. Returns `None` when no
+    /// deltas are pending. Used by `PatternConsumer::update` to
+    /// reconcile its child set.
+    fn poll_topic_list_change(&self) -> Option<TopicListChange>;
+}
+
+#[cfg(feature = "tokio")]
+impl BrokerMetadataApi for magnetar_runtime_tokio::Client {
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn partitioned_topic_metadata<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>> {
+        Box::pin(magnetar_runtime_tokio::Client::partitioned_topic_metadata(
+            self, topic,
+        ))
+    }
+
+    fn watch_topic_list<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+    ) -> WatchTopicListFut<'a, Self> {
+        Box::pin(magnetar_runtime_tokio::Client::watch_topic_list(
+            self, namespace, pattern,
+        ))
+    }
+
+    fn poll_topic_list_change(&self) -> Option<TopicListChange> {
+        magnetar_runtime_tokio::Client::poll_topic_list_change(self).map(|c| TopicListChange {
+            added: c.added,
+            removed: c.removed,
+        })
+    }
+}
+
+#[cfg(all(feature = "tokio", feature = "moonpool"))]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
+    for magnetar_runtime_moonpool::Client<P>
+{
+    type Error = magnetar_runtime_moonpool::ClientError;
+
+    fn partitioned_topic_metadata<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>> {
+        Box::pin(magnetar_runtime_moonpool::Client::partitioned_topic_metadata(self, topic))
+    }
+
+    fn watch_topic_list<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+    ) -> WatchTopicListFut<'a, Self> {
+        Box::pin(magnetar_runtime_moonpool::Client::watch_topic_list(
+            self, namespace, pattern,
+        ))
+    }
+
+    fn poll_topic_list_change(&self) -> Option<TopicListChange> {
+        magnetar_runtime_moonpool::Client::poll_topic_list_change(self).map(|c| TopicListChange {
+            added: c.added,
+            removed: c.removed,
+        })
+    }
+}
+
 /// Engine-side subscribe surface used by `ConsumerBuilder<E>` and the
 /// other consumer-spawning façade surfaces (`MultiTopicsConsumer`,
 /// `PatternConsumer`, `Reader`). Each runtime implements this on its
@@ -556,6 +808,33 @@ pub type SubscribeFut<'a, S> = Pin<
             + 'a,
     >,
 >;
+
+/// Helper alias: `ConsumerApi::receive_with_timeout` future return type.
+#[cfg(feature = "tokio")]
+pub type ReceiveOptFut<'a, C> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Option<magnetar_proto::IncomingMessage>, <C as ConsumerApi>::Error>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Helper alias: `ConsumerApi::receive_batch` / `receive_batch_with_bytes_cap`
+/// future return type.
+#[cfg(feature = "tokio")]
+pub type ReceiveBatchFut<'a, C> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<magnetar_proto::IncomingMessage>, <C as ConsumerApi>::Error>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Helper alias: `BrokerMetadataApi::watch_topic_list` future return type.
+#[cfg(feature = "tokio")]
+pub type WatchTopicListFut<'a, B> =
+    Pin<Box<dyn Future<Output = Result<Vec<String>, <B as BrokerMetadataApi>::Error>> + Send + 'a>>;
 
 /// Engine-side producer-creation surface used by `ProducerBuilder<E>`
 /// and `PartitionedProducer<E>`. Same shape as [`SubscribeApi`] for
@@ -725,16 +1004,14 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
 #[cfg(feature = "tokio")]
 impl ConsumerApi for magnetar_runtime_tokio::Consumer {
     type Error = magnetar_runtime_tokio::ClientError;
+    type Producer = magnetar_runtime_tokio::Producer;
 
     fn receive(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<crate::IncomingMessage, Self::Error>> + Send + '_>>
-    {
-        Box::pin(async move {
-            magnetar_runtime_tokio::Consumer::receive(self)
-                .await
-                .map(crate::IncomingMessage::from)
-        })
+    ) -> Pin<
+        Box<dyn Future<Output = Result<magnetar_proto::IncomingMessage, Self::Error>> + Send + '_>,
+    > {
+        Box::pin(magnetar_runtime_tokio::Consumer::receive(self))
     }
 
     fn ack(
@@ -821,8 +1098,11 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
         magnetar_runtime_tokio::Consumer::negative_ack_with_delay(self, message_id, delay);
     }
 
-    fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        Box::pin(magnetar_runtime_tokio::Consumer::unsubscribe(self, false))
+    fn unsubscribe(
+        &self,
+        force: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::unsubscribe(self, force))
     }
 
     fn seek_to_earliest(
@@ -833,6 +1113,133 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn seek_to_latest(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_tokio::Consumer::seek_to_latest(self))
+    }
+
+    fn seek_to_message(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::seek_to_message(
+            self, message_id,
+        ))
+    }
+
+    fn seek_to_timestamp(
+        &self,
+        publish_time_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::seek_to_timestamp(
+            self,
+            publish_time_ms,
+        ))
+    }
+
+    fn pause(&self) {
+        magnetar_runtime_tokio::Consumer::pause(self);
+    }
+
+    fn resume(&self) {
+        magnetar_runtime_tokio::Consumer::resume(self);
+    }
+
+    fn available_in_queue(&self) -> usize {
+        magnetar_runtime_tokio::Consumer::available_in_queue(self)
+    }
+
+    fn available_permits(&self) -> u32 {
+        magnetar_runtime_tokio::Consumer::available_permits(self)
+    }
+
+    fn has_received_any_message(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::has_received_any_message(self)
+    }
+
+    fn has_reached_end_of_topic(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::has_reached_end_of_topic(self)
+    }
+
+    fn is_paused(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::is_paused(self)
+    }
+
+    fn is_inactive(&self) -> bool {
+        magnetar_runtime_tokio::Consumer::is_inactive(self)
+    }
+
+    fn drain_dead_letter(&self) -> Vec<magnetar_proto::IncomingMessage> {
+        magnetar_runtime_tokio::Consumer::drain_dead_letter(self)
+    }
+
+    fn receive_with_timeout(&self, timeout: Duration) -> ReceiveOptFut<'_, Self> {
+        Box::pin(magnetar_runtime_tokio::Consumer::receive_with_timeout(
+            self, timeout,
+        ))
+    }
+
+    fn receive_batch(&self, max_messages: usize, max_wait: Duration) -> ReceiveBatchFut<'_, Self> {
+        Box::pin(magnetar_runtime_tokio::Consumer::receive_batch(
+            self,
+            max_messages,
+            max_wait,
+        ))
+    }
+
+    fn receive_batch_with_bytes_cap(
+        &self,
+        max_messages: usize,
+        max_bytes: usize,
+        max_wait: Duration,
+    ) -> ReceiveBatchFut<'_, Self> {
+        Box::pin(
+            magnetar_runtime_tokio::Consumer::receive_batch_with_bytes_cap(
+                self,
+                max_messages,
+                max_bytes,
+                max_wait,
+            ),
+        )
+    }
+
+    fn republish_dead_letters<'a>(
+        &'a self,
+        dlq_producer: &'a Self::Producer,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::republish_dead_letters(
+            self,
+            dlq_producer,
+        ))
+    }
+
+    fn reconsume_later<'a>(
+        &'a self,
+        retry_producer: &'a Self::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        delay: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::reconsume_later(
+            self,
+            retry_producer,
+            msg,
+            delay,
+        ))
+    }
+
+    fn reconsume_later_with_properties<'a>(
+        &'a self,
+        retry_producer: &'a Self::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        custom_properties: Vec<(String, String)>,
+        delay: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(
+            magnetar_runtime_tokio::Consumer::reconsume_later_with_properties(
+                self,
+                retry_producer,
+                msg,
+                custom_properties,
+                delay,
+            ),
+        )
     }
 
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
@@ -960,16 +1367,14 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
     for magnetar_runtime_moonpool::Consumer<P>
 {
     type Error = magnetar_runtime_moonpool::ClientError;
+    type Producer = magnetar_runtime_moonpool::Producer<P>;
 
     fn receive(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<crate::IncomingMessage, Self::Error>> + Send + '_>>
-    {
-        Box::pin(async move {
-            magnetar_runtime_moonpool::Consumer::receive(self)
-                .await
-                .map(crate::IncomingMessage::from)
-        })
+    ) -> Pin<
+        Box<dyn Future<Output = Result<magnetar_proto::IncomingMessage, Self::Error>> + Send + '_>,
+    > {
+        Box::pin(magnetar_runtime_moonpool::Consumer::receive(self))
     }
 
     fn ack(
@@ -1058,14 +1463,12 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
         magnetar_runtime_moonpool::Consumer::negative_ack_with_delay(self, message_id, delay);
     }
 
-    fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        // The `ConsumerApi` trait keeps a zero-arg `unsubscribe()` for now;
-        // pass-2 of the MultiTopicsConsumer surface lift adds the `force`
-        // variant onto the trait directly. Default to `force=false`
-        // (PIP-313: respect other attached consumers) — same as the tokio
-        // engine's matching trait impl.
+    fn unsubscribe(
+        &self,
+        force: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_moonpool::Consumer::unsubscribe(
-            self, false,
+            self, force,
         ))
     }
 
@@ -1077,6 +1480,133 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn seek_to_latest(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_moonpool::Consumer::seek_to_latest(self))
+    }
+
+    fn seek_to_message(
+        &self,
+        message_id: magnetar_proto::MessageId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::seek_to_message(
+            self, message_id,
+        ))
+    }
+
+    fn seek_to_timestamp(
+        &self,
+        publish_time_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::seek_to_timestamp(
+            self,
+            publish_time_ms,
+        ))
+    }
+
+    fn pause(&self) {
+        magnetar_runtime_moonpool::Consumer::pause(self);
+    }
+
+    fn resume(&self) {
+        magnetar_runtime_moonpool::Consumer::resume(self);
+    }
+
+    fn available_in_queue(&self) -> usize {
+        magnetar_runtime_moonpool::Consumer::available_in_queue(self)
+    }
+
+    fn available_permits(&self) -> u32 {
+        magnetar_runtime_moonpool::Consumer::available_permits(self)
+    }
+
+    fn has_received_any_message(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::has_received_any_message(self)
+    }
+
+    fn has_reached_end_of_topic(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::has_reached_end_of_topic(self)
+    }
+
+    fn is_paused(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::is_paused(self)
+    }
+
+    fn is_inactive(&self) -> bool {
+        magnetar_runtime_moonpool::Consumer::is_inactive(self)
+    }
+
+    fn drain_dead_letter(&self) -> Vec<magnetar_proto::IncomingMessage> {
+        magnetar_runtime_moonpool::Consumer::drain_dead_letter(self)
+    }
+
+    fn receive_with_timeout(&self, timeout: Duration) -> ReceiveOptFut<'_, Self> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::receive_with_timeout(
+            self, timeout,
+        ))
+    }
+
+    fn receive_batch(&self, max_messages: usize, max_wait: Duration) -> ReceiveBatchFut<'_, Self> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::receive_batch(
+            self,
+            max_messages,
+            max_wait,
+        ))
+    }
+
+    fn receive_batch_with_bytes_cap(
+        &self,
+        max_messages: usize,
+        max_bytes: usize,
+        max_wait: Duration,
+    ) -> ReceiveBatchFut<'_, Self> {
+        Box::pin(
+            magnetar_runtime_moonpool::Consumer::receive_batch_with_bytes_cap(
+                self,
+                max_messages,
+                max_bytes,
+                max_wait,
+            ),
+        )
+    }
+
+    fn republish_dead_letters<'a>(
+        &'a self,
+        dlq_producer: &'a Self::Producer,
+    ) -> Pin<Box<dyn Future<Output = Result<usize, Self::Error>> + Send + 'a>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::republish_dead_letters(
+            self,
+            dlq_producer,
+        ))
+    }
+
+    fn reconsume_later<'a>(
+        &'a self,
+        retry_producer: &'a Self::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        delay: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::reconsume_later(
+            self,
+            retry_producer,
+            msg,
+            delay,
+        ))
+    }
+
+    fn reconsume_later_with_properties<'a>(
+        &'a self,
+        retry_producer: &'a Self::Producer,
+        msg: magnetar_proto::IncomingMessage,
+        custom_properties: Vec<(String, String)>,
+        delay: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
+        Box::pin(
+            magnetar_runtime_moonpool::Consumer::reconsume_later_with_properties(
+                self,
+                retry_producer,
+                msg,
+                custom_properties,
+                delay,
+            ),
+        )
     }
 
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {

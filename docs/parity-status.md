@@ -28,9 +28,9 @@ follow-up train; the gap is tracked below.
 | PIP-188 `TOPIC_MIGRATED` → reconnect ([ADR-0018](../specs/adr/0018-pip-188-reconnect-on-migrate.md)) | ✅ | ✅ |
 | Generic `PulsarClient<E: Engine>` ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)) | ✅ | ✅ |
 | Partitioned producer | ✅ | ✅ (engine-generic; tokio-only `refresh_partitions` + batch counters on specialisation) |
-| Partitioned consumer | ✅ | 🟡 (phantom-lift via `MultiTopicsConsumer` alias; impl tokio-bound) |
-| MultiTopicsConsumer | ✅ | 🟡 (phantom-lift; impl tokio-bound) |
-| PatternConsumer (PIP-145) | ✅ | 🟡 (phantom-lift; impl tokio-bound) |
+| Partitioned consumer | ✅ | ✅ (engine-generic via `MultiTopicsConsumer<C>` alias + `PartitionedConsumerBuilder<'a, E>`) |
+| MultiTopicsConsumer | ✅ | ✅ (engine-generic `MultiTopicsConsumer<C>` + `MultiTopicsConsumerBuilder<'a, E>`) |
+| PatternConsumer (PIP-145) | ✅ | ✅ (engine-generic `PatternConsumer<C>` + `PatternConsumerBuilder<'a, E>`; PIP-145 child-subscribe via `<E::ClientState as SubscribeApi>::subscribe`) |
 | Reader | ✅ | ✅ |
 | TableView | ✅ | ✅ |
 | Transactions (PIP-31) | ✅ | ✅ |
@@ -44,7 +44,7 @@ bundle. `TokioProviders` runs it against a real broker;
 `moonpool-sim`'s `SimProviders` runs it under deterministic seeds
 ([`moonpool-engine.md`](moonpool-engine.md)).
 
-**Four of seven dependent surfaces fully lifted** per ADR-0026 §D1
+**Six of seven dependent surfaces fully lifted** per ADR-0026 §D1
 and now work on both engines:
 
 - **Transaction (PIP-31)** via the `TransactionApi` extension
@@ -56,49 +56,59 @@ and now work on both engines:
   PartitionedProducer<P>` (with tokio-only specialisation for
   `refresh_partitions`, batch counters,
   `last_sequence_id_published`).
+- **MultiTopicsConsumer / PartitionedConsumer** via
+  `MultiTopicsConsumer<C: ConsumerApi>` (default `C =
+  magnetar_runtime_tokio::Consumer`) +
+  `MultiTopicsConsumerBuilder<'a, E: Engine = TokioEngine>` /
+  `PartitionedConsumerBuilder<'a, E>`; `.subscribe()` routes
+  through the engine-generic `ConsumerBuilder` (which dispatches
+  via `SubscribeApi`) and `partitions_for_topic` dispatches
+  through the new `BrokerMetadataApi` extension trait.
+- **PatternConsumer (PIP-145)** via `PatternConsumer<C: ConsumerApi>`
+  + `PatternConsumerBuilder<'a, E: Engine = TokioEngine>`;
+  PIP-145 auto-reconcile (`update()` + `start_auto_reconcile()`)
+  subscribes child consumers through
+  `<E::ClientState as SubscribeApi>::subscribe` and polls
+  `TopicListChanged` deltas through
+  `<E::ClientState as BrokerMetadataApi>::poll_topic_list_change`.
 
-**TypedProducer / TypedConsumer** are phantom-lifted: type
+**TypedProducer / TypedConsumer** remain phantom-lifted: type
 parameters present on the structs (defaulting to the tokio
 runtime), but the impl-body lift is queued behind the remaining
-helper-method ports.
-
-The remaining three façade surfaces — **`MultiTopicsConsumer`**,
-**`PartitionedConsumer`** (type alias for `MultiTopicsConsumer`),
-**`PatternConsumer`** — now carry the cascading type parameter
-(`Inner<C>`, `NamedConsumer<C>`, `MultiTopicsConsumer<C>` /
-`PatternConsumer<C>` all parameterized) so callers can name
-`MultiTopicsConsumer<MoonpoolConsumer<P>>` /
-`PatternConsumer<MoonpoolConsumer<P>>` at the type level. The
-inherent impl methods stay tokio-bound because the `add_topic` /
-PIP-145 reconciliation paths subscribe new children via
-`client.consumer(topic).subscribe()`.
+helper-method ports for the typed surfaces.
 
 The **base** `ConsumerBuilder<'a, E: Engine = TokioEngine>` /
 `ProducerBuilder<'a, E: Engine = TokioEngine>` /
-`ReaderBuilder<E: Engine = TokioEngine>` are now engine-generic
+`ReaderBuilder<E: Engine = TokioEngine>` are engine-generic
 (landed via `SubscribeApi` / `CreateProducerApi` extension traits,
-commits `cc61d4d`, `0b6f363`, `08c89ca`). The remaining work for
-each of the four phantom-lifted surfaces is:
+commits `cc61d4d`, `0b6f363`, `08c89ca`).
 
-1. lifting the *inner* builder
-   (`TypedProducerBuilder`, `TypedConsumerBuilder`,
-   `MultiTopicsConsumerBuilder`, `PatternConsumerBuilder`) to
-   carry the same `E: Engine = TokioEngine` parameter; and
-2. porting a handful of helper methods to the `ProducerApi` /
-   `ConsumerApi` trait surface (the typed and multi-topics
-   surfaces call methods like `compression`,
-   `last_sequence_id_published`, `pending_count`, the
-   `ack_with_txn` family, `available_in_queue`, etc. that aren't
-   yet on the trait).
+The `ConsumerApi` trait surface is now comprehensive (pass-2
+extension): receive, ack, ack_cumulative, negative_ack,
+negative_ack_with_delay, ack_grouped, ack_grouped_cumulative,
+ack_with_txn, ack_cumulative_with_txn, redeliver_unacked,
+`unsubscribe(force: bool)`, seek_to_earliest, seek_to_latest,
+`seek_to_message`, `seek_to_timestamp`, `pause`, `resume`,
+`available_in_queue`, `available_permits`,
+`has_received_any_message`, `has_reached_end_of_topic`,
+`is_paused`, `is_inactive`, `drain_dead_letter`,
+`receive_with_timeout`, `receive_batch`,
+`receive_batch_with_bytes_cap`, `republish_dead_letters`,
+`reconsume_later`, `reconsume_later_with_properties`, get_schema,
+last_message_id, has_message_after, last_disconnected_timestamp,
+topic, subscription, name, is_closed, is_connected, stats,
+close_owned. The DLQ + retry helpers thread a matched
+`type Producer: ProducerApi<Error = Self::Error>` associated
+type so the trait stays runtime-typed without re-introducing a
+tokio-only carve-out.
 
-See [`follow-ups.md`](follow-ups.md#per-surface-builder--impl-body-lifts).
-
-The `ConsumerApi` trait surface is otherwise comprehensive today
-(receive, ack, ack_cumulative, negative_ack,
-negative_ack_with_delay, redeliver_unacked, unsubscribe,
-seek_to_earliest, seek_to_latest, get_schema, last_message_id,
-has_message_after, last_disconnected_timestamp, topic,
-subscription, name, is_closed, is_connected, stats, close_owned).
+The companion `BrokerMetadataApi` extension trait (added alongside
+pass-2) lifts the partition-count + topic-list watcher lookups —
+`partitioned_topic_metadata`, `watch_topic_list`,
+`poll_topic_list_change` — onto each engine's `Client` so
+[`PartitionedConsumerBuilder`] / [`PatternConsumerBuilder`] /
+`PulsarClient::partitions_for_topic` /
+`PulsarClient::topic_list_snapshot` are all engine-generic.
 
 Callers that reach for a tokio-only method on the moonpool engine
 still get a trait-bound compile error, not a silent fallback —
