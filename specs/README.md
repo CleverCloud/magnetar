@@ -43,6 +43,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0025](adr/0025-engine-trait-task-and-timer-primitives.md) | Engine trait extension phase 1: `TaskHandle` + `Interval` + spawn / abort / interval primitives | Accepted |
 | [0026](adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) | D1–D4 design decisions (FDB / Pulsar Java / Codex synthesis): concrete generic surfaces (not GATs); pure-sim chaos; defer SASL/Athenz; implement vendor-proto | Accepted |
 | [0027](adr/0027-moonpool-engine-clientstate-is-runtime-client.md) | `MoonpoolEngine::ClientState` is `magnetar_runtime_moonpool::Client<P>` directly; drops `MoonpoolClientState` wrapper, partially supersedes ADR-0019 §gate (e) | Accepted |
+| [0028](adr/0028-supervised-reconnect-anti-thrash-policy.md) | Opt-in anti-thrash policy for supervised reconnect: per-handle ack-then-drop window + connection-level cooldown (mitigates broker-driven post-restart cascade, follow-up #74) | Proposed |
 
 ## How to add an ADR
 
