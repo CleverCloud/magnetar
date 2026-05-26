@@ -39,9 +39,9 @@ this section only tracks shipping status:
 - **D1 surface train** — concrete generic types
   `magnetar::<Surface><T, E: Engine>` (no GATs) on all seven
   dependent surfaces. Transaction (`ab9041b`), Reader, TableView,
-  PartitionedProducer have full impl-body lifts; TypedSchemas,
-  MultiTopicsConsumer, PartitionedConsumer, and PatternConsumer
-  carry their cascading type parameter (`Inner<C>`, `NamedConsumer<C>`,
+  PartitionedProducer, **MultiTopicsConsumer / PartitionedConsumer /
+  PatternConsumer (pass-2 lift)** have full impl-body lifts.
+  TypedSchemas carry their cascading type parameter (`Inner<C>`,
   `<C>` / `<P>`) but their inherent impl methods stay tokio-bound
   pending the per-surface builder lifts (see
   [next section](#per-surface-builder--impl-body-lifts)).
@@ -74,8 +74,31 @@ this section only tracks shipping status:
   §"Supervised reconnect" / "Anti-thrash policy".
 - **MultiTopics pass-1: moonpool consumer helpers** — 13 net-new
   methods on `magnetar_runtime_moonpool::Consumer` (commits
-  `5f1368f`, `53669f9`, `0f95a3c`, `008abbf`). Pass-2 (the
-  surface lift itself) remains open per [next section](#per-surface-builder--impl-body-lifts).
+  `5f1368f`, `53669f9`, `0f95a3c`, `008abbf`).
+- **MultiTopics / PartitionedConsumer / PatternConsumer pass-2 lift
+  — LANDED**. `MultiTopicsConsumer<C>` /
+  `PatternConsumer<C>` impl bodies dispatch through the extended
+  `ConsumerApi` trait (17 trait additions: 13 pass-1 helpers +
+  `pause`/`resume`/`seek_to_message`/`seek_to_timestamp` +
+  `unsubscribe(force: bool)` overload + `type Producer: ProducerApi`
+  associated type for the DLQ/retry helpers).
+  `MultiTopicsConsumerBuilder<'a, E>` /
+  `PartitionedConsumerBuilder<'a, E>` /
+  `PatternConsumerBuilder<'a, E>` route `.subscribe()` through the
+  engine-generic `ConsumerBuilder` (`SubscribeApi` dispatch). New
+  `BrokerMetadataApi` extension trait lifts
+  `partitioned_topic_metadata` / `watch_topic_list` /
+  `poll_topic_list_change` onto both runtimes' `Client` so
+  `PulsarClient::partitions_for_topic` /
+  `PulsarClient::topic_list_snapshot` and the partitioned /
+  pattern builders are all engine-generic. PIP-145 auto-reconcile
+  (`PatternConsumer::update` + `start_auto_reconcile`) routes
+  child-subscribes through `<E::ClientState as SubscribeApi>::
+  subscribe` and delta polling through `<E::ClientState as
+  BrokerMetadataApi>::poll_topic_list_change`. Test parity
+  tokio=121 moonpool=121; full validation chain
+  (`cargo test`, `clippy -D warnings`, `cargo doc -D warnings`,
+  per-engine xtask checks, `check-crypto-matrix` 8/8 cells) green.
 - **Differential harness — seek-per-partition golden trace**
   (commit `3d6c7e6`). Scripted broker partition routing + new
   `Op::SendPartition` / `RecvPartition` / `AckPartition` /
@@ -114,9 +137,9 @@ this section only tracks shipping status:
 
 ## Per-surface builder + impl-body lifts
 
-**Status.** Pass-1 (moonpool runtime ports) landed via four commits
-`5f1368f`, `53669f9`, `0f95a3c`, `008abbf`. Pass-2 (the actual
-surface lift) still pending.
+**Status.** Six of seven dependent ADR-0026 §D1 surfaces are now fully
+lifted on both engines. Only `TypedProducer` / `TypedConsumer` remain
+phantom-lifted.
 
 - ✅ **`TypedProducer<S, P>` / `TypedConsumer<S, C>` — LANDED**
   (commit `95b8790`). Builders carry `E: Engine = TokioEngine`;
@@ -124,6 +147,10 @@ surface lift) still pending.
   (`compression`, `last_sequence_id_published`, `pending_count`,
   `batch_len`, `batch_bytes`) and `ConsumerApi` (`ack_grouped`,
   `ack_grouped_cumulative`, `ack_with_txn`, `ack_cumulative_with_txn`).
+  The inner-builder lift (`TypedProducerBuilder<'a, S, E>` /
+  `TypedConsumerBuilder<'a, S, E>`) is still phantom on `E` — pass-2
+  for the typed surfaces remains queued behind a few helper-method
+  ports for the typed-specific knobs.
 - ✅ **MultiTopics pass-1: moonpool helpers — LANDED**. Thirteen
   net-new methods on `magnetar_runtime_moonpool::Consumer`
   (`available_in_queue`, `available_permits`,
@@ -132,57 +159,47 @@ surface lift) still pending.
   `receive_with_timeout`, `receive_batch`,
   `receive_batch_with_bytes_cap`, `unsubscribe(force: bool)`,
   `reconsume_later`, `reconsume_later_with_properties`,
-  `republish_dead_letters`). Test parity tokio=118 moonpool=118.
-- 🟡 `MultiTopicsConsumer<C>` — phantom-lift in commit `b51680a`;
-  `MultiTopicsConsumerBuilder` is still `<'a>`. Awaiting pass-2.
-- 🟡 `PartitionedConsumer` — type alias for `MultiTopicsConsumer<C>`;
-  lifts transitively when MultiTopicsConsumer lifts.
-- 🟡 `PatternConsumer<C>` — phantom-lift in commit `31f9cbe`; same
-  blocker as MultiTopicsConsumer plus topic-watcher subscription
-  needs `SubscribeApi`-mediated child consumer creation.
+  `republish_dead_letters`).
+- ✅ **MultiTopics / PartitionedConsumer / PatternConsumer pass-2
+  lift — LANDED**. `MultiTopicsConsumer<C>` /
+  `PatternConsumer<C>` impl bodies dispatch through the extended
+  `ConsumerApi` trait (17 trait additions: 13 pass-1 helpers + the
+  four flow-control / seek primitives + `unsubscribe(force: bool)`
+  overload + `type Producer: ProducerApi<Error = Self::Error>`
+  associated type for `republish_dead_letters` / `reconsume_later`).
+  `MultiTopicsConsumerBuilder<'a, E>` /
+  `PartitionedConsumerBuilder<'a, E>` /
+  `PatternConsumerBuilder<'a, E>` route `.subscribe()` through the
+  engine-generic `ConsumerBuilder` (which dispatches via
+  `SubscribeApi`). New `BrokerMetadataApi` extension trait
+  (`partitioned_topic_metadata`, `watch_topic_list`,
+  `poll_topic_list_change`) implemented on both runtime `Client`s
+  lifts `PulsarClient::partitions_for_topic` /
+  `PulsarClient::topic_list_snapshot` onto the engine-generic
+  `impl<E: Engine + ...> PulsarClient<E>` block. PIP-145
+  child-subscribe routes through
+  `<E::ClientState as SubscribeApi>::subscribe`; delta polling
+  routes through
+  `<E::ClientState as BrokerMetadataApi>::poll_topic_list_change`.
+  Test parity tokio=121 moonpool=121.
 
-**Pass-2 — the surface lift itself.** All 13 helpers exist on both
-runtimes today (tokio's matching surface was already there). What
-remains:
-
-1. **Add the 13 helpers to the `ConsumerApi` trait** in
-   `crates/magnetar/src/engine.rs`. Each addition is a thin delegate
-   on both `impl ConsumerApi for magnetar_runtime_tokio::Consumer`
-   and `impl<P: Providers> ConsumerApi for
-   magnetar_runtime_moonpool::Consumer<P>`. No new tests for the
-   trait pass-through (the existing pass-1 unit tests on each
-   runtime already cover the behavior).
-2. **Lift `MultiTopicsConsumerBuilder<'a>`** to
-   `MultiTopicsConsumerBuilder<'a, E: Engine = TokioEngine>`. Route
-   `.subscribe()` / `.subscribe_all()` through the engine-generic
-   base `ConsumerBuilder`.
-3. **Lift `PatternConsumerBuilder<'a>`** to
-   `PatternConsumerBuilder<'a, E: Engine = TokioEngine>`. The
-   PIP-145 auto-reconcile child-subscribe routes through
-   `<E::ClientState as SubscribeApi>::subscribe`.
-4. **Lift `MultiTopicsConsumer<C>` + `PatternConsumer<C>` impl
-   bodies** so every method dispatches through the trait. Split
-   tokio-only methods into a separate `impl<...>
-   MultiTopicsConsumer<C, TokioEngine>` block if needed (mirror
-   the PartitionedProducer split pattern).
-5. **Flip parity-status.md rows** for "Partitioned consumer",
-   "MultiTopicsConsumer", "PatternConsumer (PIP-145)" from
-   "🟡 (phantom-lift; impl tokio-bound)" to "✅". Update the
-   README parity matrix accordingly.
+**Remaining inner-builder lift — `TypedProducerBuilder<'a, S>` /
+`TypedConsumerBuilder<'a, S>`.** Both still carry only the schema
+type parameter; lifting them to
+`TypedProducerBuilder<'a, S, E: Engine = TokioEngine>` /
+`TypedConsumerBuilder<'a, S, E: Engine = TokioEngine>` is the last
+remaining D1 sub-PR. The base
+`ConsumerBuilder` / `ProducerBuilder` already lift through
+`SubscribeApi` / `CreateProducerApi`, so the typed builders' new
+`subscribe()` / `create()` would dispatch through the same path
+once the engine parameter is plumbed in.
 
 Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
-the 13 trait additions are pure delegates so they don't need new
-mirror tests if the underlying impl is already covered on both
-sides; the test count should stay at the current 136/136 (baseline
-at MultiTopics pass-1 landing time was 118/118; ADR-0028 took it to
-121/121; the coverage-closure pass 1 in commit `82185cb` brought it
-to 136/136) unless the lift introduces new behavior (e.g.
-cross-engine partition routing).
-
-```text
-/goal lift MultiTopicsConsumer<C> + PartitionedConsumer + PatternConsumer<C> impl-bodies on both engines (pass-2; pass-1 helpers already on both runtimes per commits 5f1368f, 53669f9, 0f95a3c, 008abbf). Steps: (1) add the 13 pass-1 helpers to ConsumerApi as thin delegates (`available_in_queue`, `available_permits`, `has_received_any_message`, `has_reached_end_of_topic`, `is_paused`, `is_inactive`, `drain_dead_letter`, `receive_with_timeout`, `receive_batch`, `receive_batch_with_bytes_cap`, `unsubscribe`, `reconsume_later`, `reconsume_later_with_properties`, `republish_dead_letters`); (2) lift `MultiTopicsConsumerBuilder<'a>` → `MultiTopicsConsumerBuilder<'a, E: Engine = TokioEngine>` and `PatternConsumerBuilder<'a>` similarly; route .subscribe()/.subscribe_all() through the engine-generic base ConsumerBuilder; (3) lift `MultiTopicsConsumer<C>` + `PatternConsumer<C>` impl-bodies dispatching through the trait; split tokio-only methods if any; (4) PatternConsumer's PIP-145 auto-reconcile child-subscribe routes through `<E::ClientState as SubscribeApi>::subscribe`; (5) flip parity-status.md rows for "Partitioned consumer", "MultiTopicsConsumer", "PatternConsumer (PIP-145)" to ✅; flip the README parity matrix; (6) full validation chain incl. `cargo +nightly fmt`, `cargo build --workspace --all-features`, `cargo clippy --workspace --all-features --all-targets -- -D warnings`, `cargo test --workspace --features crypto-aws-lc-rs --locked`, `check-runtime-test-parity`, `check-no-channels`, `check-no-io-deps`, `check-no-internal-clock`, `RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps --locked`.
-```
+the trait additions are pure delegates so they don't introduce new
+behavior to mirror; the post-lift runtime test count stays at 136/136
+(unchanged from the coverage-closure pass 1 baseline in commit
+`82185cb`).
 
 ---
 

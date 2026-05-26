@@ -52,6 +52,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Accepted |
 | [0035](adr/0035-pluggable-crypto-provider.md) | Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) — amends ADR-0005 openssl ban via `deny.toml` `wrappers = ["rustls-openssl"]` carve-out | Accepted |
 | [0036](adr/0036-moonpool-seed-sweep-daily-random.md) | Moonpool seed sweep: daily 16-random-seed sweep in a dedicated workflow, drop per-PR fixed 32-seed matrix — amends ADR-0024 §3 (CI cadence) | Accepted |
+| [0037](adr/0037-multi-topics-pattern-consumer-pass-2-lift.md) | MultiTopicsConsumer / PartitionedConsumer / PatternConsumer pass-2 lift: extend `ConsumerApi` (17 new methods + `type Producer`), introduce `BrokerMetadataApi`, lift the matching builders to `<'a, E: Engine>` — six-of-seven ADR-0026 §D1 surfaces now lifted | Accepted |
 
 ## How to add an ADR
 
