@@ -24,15 +24,20 @@
 use std::sync::Arc;
 
 use magnetar_runtime_moonpool::tls::RustlsByteAdapter;
+use magnetar_runtime_moonpool::tls_crypto::active_provider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 /// Stand-up a client session against an empty trust store. The
 /// `ClientConnection` still constructs and emits a `ClientHello`; we only
-/// drive the inbound side with corrupted bytes after that point.
+/// drive the inbound side with corrupted bytes after that point. The
+/// rustls crypto provider is picked by the workspace's `crypto-*`
+/// feature (issue #9, ADR-0035).
 fn make_session() -> ClientConnection {
     let config = Arc::new(
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(active_provider())
+            .with_safe_default_protocol_versions()
+            .expect("rustls default protocol versions are valid")
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth(),
     );

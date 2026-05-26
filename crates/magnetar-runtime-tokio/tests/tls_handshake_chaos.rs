@@ -15,12 +15,15 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use magnetar_runtime_tokio::tls_crypto::active_provider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 fn make_session() -> ClientConnection {
     let config = Arc::new(
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(active_provider())
+            .with_safe_default_protocol_versions()
+            .expect("rustls default protocol versions are valid")
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth(),
     );
