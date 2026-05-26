@@ -62,13 +62,17 @@ this section only tracks shipping status:
 
 ## Per-surface builder + impl-body lifts
 
-**Status.** Four façade surfaces still phantom-lift: their structs
+**Status.** Three façade surfaces still phantom-lift: their structs
 carry the engine-generic type parameter but their inherent impl
 blocks live on `impl PulsarClient<TokioEngine>` only.
 
-- `TypedProducer<S, P>` / `TypedConsumer<S, C>` — phantom-lift in
-  commit `6a83ea2`; `TypedProducerBuilder` / `TypedConsumerBuilder`
-  themselves are still `<'a, S>` (no `E`).
+- ✅ **`TypedProducer<S, P>` / `TypedConsumer<S, C>` — LANDED**
+  (commit `95b8790`). Builders carry `E: Engine = TokioEngine`;
+  helper-method ports added to `ProducerApi`
+  (`compression`, `last_sequence_id_published`, `pending_count`,
+  `batch_len`, `batch_bytes`) and `ConsumerApi` (`ack_grouped`,
+  `ack_grouped_cumulative`, `ack_with_txn`, `ack_cumulative_with_txn`).
+  Test parity tokio=102 moonpool=102.
 - `MultiTopicsConsumer<C>` — phantom-lift in commit `b51680a`;
   `MultiTopicsConsumerBuilder` is still `<'a>`. The
   `add_topic` / PIP-145 `auto_update` reconciliation paths
@@ -83,33 +87,49 @@ The base `ConsumerBuilder` / `ProducerBuilder` / `ReaderBuilder`
 are already lifted and route through the
 [`SubscribeApi`](../crates/magnetar/src/engine.rs) /
 [`CreateProducerApi`](../crates/magnetar/src/engine.rs) extension
-traits, so the remaining work breaks into two patterns:
+traits, so the remaining work for the three pending surfaces
+breaks into two patterns:
 
-1. **Helper-method ports** to the `ConsumerApi` / `ProducerApi`
-   trait surface for the methods the typed surfaces invoke (e.g.
-   `compression`, `last_sequence_id_published`, `pending_count`,
-   `batch_len`, `batch_bytes`, `ack_grouped`,
-   `ack_grouped_cumulative`, `available_in_queue`,
-   `available_permits`, `drain_dead_letter`,
+1. **Helper-method ports** to the `ConsumerApi` trait for the
+   methods MultiTopics + Pattern impl-bodies invoke that are NOT
+   yet on the trait. Audited set (from Agent C's investigation):
+   `available_in_queue`, `available_permits`, `drain_dead_letter`,
    `has_reached_end_of_topic`, `has_received_any_message`,
-   `is_inactive`, `is_paused`, `receive_batch`,
-   `receive_with_timeout`, the `ack_with_txn` family). Each port
-   needs the moonpool runtime equivalent before the trait method
-   is added.
-2. **Inner-builder genericity** — `TypedProducerBuilder<'a, S>`,
-   `TypedConsumerBuilder<'a, S>`, `MultiTopicsConsumerBuilder<'a>`,
-   `PatternConsumerBuilder<'a>` all gain an `E: Engine = TokioEngine`
-   type parameter, then route their `.create()` / `.subscribe()` /
-   `.subscribe_all()` calls through the base `ConsumerBuilder` /
-   `ProducerBuilder` (already engine-generic).
+   `is_inactive`, `is_paused`, `pause`, `resume`, `receive_batch`,
+   `receive_with_timeout`, `reconsume_later`,
+   `reconsume_later_with_properties`, `seek_to_message`,
+   `seek_to_timestamp`, `unsubscribe(force: bool)`.
+   Several of these (`drain_dead_letter`, `receive_batch`,
+   `receive_with_timeout`, `has_received_any_message`,
+   `has_reached_end_of_topic`, `is_paused`, `is_inactive`)
+   **don't exist on `magnetar-runtime-moonpool` today** — they
+   need a sans-io port in `magnetar-proto` + moonpool runtime
+   impl before the trait method can be added (each port is
+   ~50-200 LOC).
+2. **Inner-builder genericity** — `MultiTopicsConsumerBuilder<'a>`,
+   `PatternConsumerBuilder<'a>` gain `E: Engine = TokioEngine`,
+   then route `.subscribe()` / `.subscribe_all()` through the
+   engine-generic base `ConsumerBuilder`.
+
+The scope is larger than a single agent session can absorb (~7
+multi-layer feature ports + ~14 trait additions + ~28 mirror tests
+per ADR-0024). Recommendation: split into two passes — first the
+sans-io + moonpool runtime ports for the missing helpers
+(separate commits per helper, validated under
+`check-runtime-test-parity`), then the surface lift itself.
 
 Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
-each new trait method needs a 1:1 mirror test on both runtime sides;
-`cargo run -p xtask -- check-runtime-test-parity` is hard-failing.
+each new trait method needs a 1:1 mirror test on both runtime
+sides; `cargo run -p xtask -- check-runtime-test-parity` is
+hard-failing.
 
 ```text
-/goal lift the four phantom-lifted surfaces (TypedProducer/TypedConsumer, MultiTopicsConsumer, PartitionedConsumer, PatternConsumer) so they compile on both engines. Per surface: (1) audit the inherent impl block for helper methods not on ConsumerApi/ProducerApi; (2) port each missing helper to magnetar-runtime-moonpool first so the trait is implementable on both sides; (3) add the helper to ConsumerApi/ProducerApi with a mirror test on both runtimes (ADR-0024 1:1 parity); (4) lift the inner Builder (TypedProducerBuilder, TypedConsumerBuilder, MultiTopicsConsumerBuilder, PatternConsumerBuilder) to carry `E: Engine = TokioEngine`, defaulting to keep existing callers compiling; (5) route .create()/.subscribe()/.subscribe_all() through the engine-generic base builders; (6) flip the corresponding parity-status.md rows from 🟡 to ✅ and the README parity matrix accordingly. Validation: `cargo +nightly fmt && cargo build --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo test --workspace --all-features && cargo run -p xtask -- check-runtime-test-parity && cargo run -p xtask -- check-no-channels && cargo run -p xtask -- check-no-io-deps && RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps`.
+/goal port the missing moonpool consumer helpers (drain_dead_letter, receive_batch, receive_with_timeout, has_received_any_message, has_reached_end_of_topic, is_paused, is_inactive, available_in_queue, available_permits, pause, resume, reconsume_later, reconsume_later_with_properties, seek_to_message, seek_to_timestamp, unsubscribe_with_force) to magnetar-runtime-moonpool. Per helper: (1) sans-io plumbing in magnetar-proto if needed; (2) moonpool runtime impl mirroring the tokio runtime signature exactly; (3) unit test on moonpool side + 1:1 mirror test on tokio side per ADR-0024. Keep `check-runtime-test-parity` green throughout. NO trait additions yet — leave the `ConsumerApi` extensions + surface lift to a follow-on commit. Validation: full chain incl. `check-runtime-test-parity`, `check-no-channels`, `check-no-io-deps`, `cargo doc -D warnings`.
+```
+
+```text
+/goal lift MultiTopicsConsumer<C> + PartitionedConsumer + PatternConsumer<C> impl-bodies on both engines (depends on the previous /goal: moonpool consumer helpers ported). Steps: (1) add 16 helpers to ConsumerApi with mirror tests on both runtimes (ADR-0024 1:1); (2) lift MultiTopicsConsumerBuilder<'a> + PatternConsumerBuilder<'a> to carry `E: Engine = TokioEngine`; (3) route .subscribe() / .subscribe_all() through the engine-generic base ConsumerBuilder; (4) PatternConsumer's PIP-145 auto-reconcile child-subscribe routes through `<E::ClientState as SubscribeApi>::subscribe`; (5) flip parity-status.md rows for "Partitioned consumer", "MultiTopicsConsumer", "PatternConsumer (PIP-145)" to ✅; flip the README parity matrix; (6) full validation chain.
 ```
 
 ---
@@ -196,6 +216,40 @@ fixed, not `#[ignore]`-d.
 
 ```text
 /goal close the pre-existing moonpool coverage gap. Generate cargo llvm-cov --html, identify the largest uncovered hunks in crates/magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,transport}.rs, add targeted tests to crates/magnetar-runtime-moonpool/tests/ until check-sim-coverage reports no uncovered lines against origin/main. Keep test parity 1:1; mirror each new moonpool test on the tokio side so the gate stays green.
+```
+
+### `try_reserve_memory_or_register_wins_recheck_under_contention` flakes under load
+
+**Status.** The coverage-only race test introduced in commit
+`0c7b318` at
+[`crates/magnetar-runtime-moonpool/src/lib.rs:810`](../crates/magnetar-runtime-moonpool/src/lib.rs)
+runs 10000 iterations of a `try_reserve_memory_or_register` ↔
+`release_memory` race with a 5-second wall-clock budget. Under
+heavy parallel test load (e.g. running the full workspace `cargo
+test --all-features` on a multi-core box with other agent
+workloads competing for CPU) the 10000 iterations exceed the
+budget and the test panics with
+`"recheck race did not fire within 5s budget"`. The test header
+documents itself: *"the test is best-effort for line 327/328
+coverage, but ALWAYS passes correctness-wise (the helper's
+contract is upheld either way)."*
+
+**Unblock.** Two pragmatic options:
+
+1. **Loosen the budget.** Raise `Duration::from_secs(5)` to e.g.
+   `Duration::from_secs(30)`; the test still terminates in a few
+   seconds under light load and gains headroom under contention.
+2. **Make iteration count adaptive.** Replace the hard 10000-loop
+   with a `while Instant::now() < deadline` loop that bumps a
+   counter; assert `count > 100` at the end. Same coverage hit
+   on lines 327/328, no false-positive panic.
+
+Either fix is a ~3-line patch with no behavioural consequence.
+Tracked here so it doesn't get forgotten the next time the
+workspace test runs under heavy load.
+
+```text
+/goal fix the load-flaky `try_reserve_memory_or_register_wins_recheck_under_contention` test in crates/magnetar-runtime-moonpool/src/lib.rs:810. Replace the fixed 10000-iteration loop with an adaptive `while Instant::now() < deadline` loop that requires at least ~100 iterations to confirm contention coverage. Validation: full workspace `cargo test --workspace --all-features --locked` under high parallelism (e.g. on a multi-core box with `cargo test -j8`) must pass green.
 ```
 
 ---
