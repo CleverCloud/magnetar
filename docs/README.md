@@ -16,6 +16,7 @@ contributors; this folder goes deeper.
 | [`memory-limit.md`](memory-limit.md) | `MemoryLimitPolicy::{FailImmediately, ProducerBlock}` accounting (atomic CAS + Waker slab). |
 | [`testing.md`](testing.md) | Test categories (unit, integration, deterministic chaos, differential, e2e/Docker) and how to run them. |
 | [`parity-status.md`](parity-status.md) | Java parity snapshot — engine surface table and moonpool parity train. |
+| [`cli.md`](cli.md) | `magnetar` binary reference — `--version` banner, color policy, build-time metadata. |
 | [`follow-ups.md`](follow-ups.md) | Consolidated open work tracker. |
 
 ## Companion documents (top-level)

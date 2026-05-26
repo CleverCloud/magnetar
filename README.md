@@ -140,6 +140,31 @@ helpers (`protoc` codegen, e2e driver, dependency audits).
 
 ---
 
+## Build metadata (`magnetar --version`)
+
+The `magnetar` binary exposes a sozu / systemd-style identification
+banner:
+
+```
+$ magnetar --version
+magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
+built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.85.0 (…) · target=x86_64-unknown-linux-gnu
+features: +default
+pulsar wire protocol: v21
+os: linux · report bugs at https://github.com/FlorentinDUBOIS/magnetar
+```
+
+- `-V` prints a single-line, never-colorized form:
+  `magnetar 0.1.0-dev.0 (sha-dirty)`.
+- `--version` prints the multi-line form above, colorized on a TTY.
+  `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
+- `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for
+  reproducible builds.
+
+Full reference: [`docs/cli.md`](docs/cli.md).
+
+---
+
 ## Quickstart
 
 The high-level `PulsarClient` builder is the public entry point. It wires the

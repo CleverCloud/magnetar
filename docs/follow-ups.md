@@ -316,6 +316,20 @@ all four can land independently as v0.2.0 follow-ups.
 /goal scope PIP-460 / PIP-466 / PIP-180 / PIP-33 for v0.2.0. Per PIP, produce: (1) the wire-protocol delta against the current vendored PulsarApi.proto, (2) the magnetar-proto state-machine additions, (3) the runtime-tokio + runtime-moonpool surface ports, (4) the four-layer test plan per ADR-0024, (5) the e2e plan against apachepulsar/pulsar:4.x. Produce one planning doc per PIP under specs/proposals/. No code yet — these are planning passes.
 ```
 
+### `magnetar_proto::SUPPORTED_PROTOCOL_VERSION` constant
+
+**Status.** The Pulsar wire-protocol version is hard-coded as the literal
+`21` in two places: `crates/magnetar-proto/src/conn.rs` (the value sent
+in `CommandConnect.protocol_version`) and `crates/magnetar-cli/src/version.rs`
+(the value rendered in the `magnetar --version` banner). The CLI banner
+also surfaces it via `pulsar wire protocol: v21`.
+
+**Unblock.** Expose the value as a `pub const SUPPORTED_PROTOCOL_VERSION:
+i32 = 21;` in `magnetar-proto` and consume it from both call sites. This
+removes the duplication and ensures the CLI banner stays in sync with the
+wire identifier when the driver eventually bumps the advertised protocol.
+Small, drop-in change; no behavior change today.
+
 ---
 
 ## Open runtime bugs
