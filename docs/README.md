@@ -17,6 +17,7 @@ contributors; this folder goes deeper.
 | [`testing.md`](testing.md) | Test categories (unit, integration, deterministic chaos, differential, e2e/Docker) and how to run them. |
 | [`parity-status.md`](parity-status.md) | Java parity snapshot — engine surface table and moonpool parity train. |
 | [`cli.md`](cli.md) | `magnetar` binary reference — `--version` banner, color policy, build-time metadata. |
+| [`simulation-patterns.md`](simulation-patterns.md) | Research note — FoundationDB simulator, moonpool, TigerBeetle VOPR + TigerStyle, and what magnetar should adopt next. |
 | [`follow-ups.md`](follow-ups.md) | Consolidated open work tracker. |
 
 ## Companion documents (top-level)
