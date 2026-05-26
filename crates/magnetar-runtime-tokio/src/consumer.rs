@@ -1934,6 +1934,129 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn receive_with_timeout_returns_none_on_idle_consumer() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/recv-timeout".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        let result = consumer
+            .receive_with_timeout(std::time::Duration::from_millis(50))
+            .await
+            .expect("receive_with_timeout must surface Ok(None) not an error");
+        assert!(
+            result.is_none(),
+            "idle consumer must return Ok(None) after the deadline",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_with_timeout_returns_message_when_available() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/recv-timeout-ok".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            let bytes = command_message_bytes(handle.0, 500, b"now");
+            conn.handle_bytes(Instant::now(), &bytes)
+                .expect("handle CommandMessage");
+        }
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        let result = consumer
+            .receive_with_timeout(std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_with_timeout must resolve")
+            .expect("a message must be returned within the deadline");
+        assert_eq!(result.payload.as_ref(), b"now");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_drains_already_buffered_messages() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/batch".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..5_u64 {
+                let bytes = command_message_bytes(handle.0, 600 + i, format!("b{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        let drained = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_batch must resolve");
+        assert!(
+            drained.len() <= 5,
+            "drained {} messages but only 5 were delivered",
+            drained.len()
+        );
+        assert!(
+            !drained.is_empty(),
+            "at least one message should have been drained",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_with_bytes_cap_short_circuits_zero_caps() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/batch-zero".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer = Consumer {
+            shared,
+            handle,
+            decryptor: None,
+        };
+        let zero_msgs = consumer
+            .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_secs(60))
+            .await
+            .expect("ok");
+        assert!(zero_msgs.is_empty());
+        let zero_bytes = consumer
+            .receive_batch_with_bytes_cap(10, 0, std::time::Duration::from_secs(60))
+            .await
+            .expect("ok");
+        assert!(zero_bytes.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn drain_dead_letter_empty_by_default() {
         let shared = handshake_complete_shared();
         let handle = {

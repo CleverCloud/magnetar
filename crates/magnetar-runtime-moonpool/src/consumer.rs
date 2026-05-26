@@ -276,6 +276,106 @@ impl<P: Providers> Consumer<P> {
         .await
     }
 
+    /// Receive the next message, bounded by `timeout`. Returns `Ok(None)` if
+    /// the deadline elapses with no message. Mirrors Java
+    /// `Consumer#receive(int timeout, TimeUnit unit)`.
+    ///
+    /// The timeout source is `tokio::time::timeout`, which under
+    /// `TokioProviders` measures wall time. Under
+    /// [`moonpool_core::SimProviders`] the timeout is still wall-time —
+    /// pass-2 of the engine-generic surface lift will route this through
+    /// `Providers::time` for full sim-determinism. Today's behavior matches
+    /// the tokio engine's `Consumer::receive_with_timeout`.
+    ///
+    /// # Errors
+    /// Propagates [`Self::receive`] errors. The timeout case returns
+    /// `Ok(None)` rather than an error to match Java's "no message"
+    /// semantic.
+    pub async fn receive_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<IncomingMessage>, ClientError> {
+        match tokio::time::timeout(timeout, self.receive()).await {
+            Ok(Ok(msg)) => Ok(Some(msg)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Receive up to `max_messages` messages in one call. Mirrors Java
+    /// `Consumer#batchReceive`. Waits up to `max_wait` for the first
+    /// message, then drains any additional already-buffered messages
+    /// without further waiting.
+    ///
+    /// Returns an empty `Vec` if the timeout elapses with no messages.
+    ///
+    /// # Errors
+    /// Propagates [`Self::receive`] errors.
+    pub async fn receive_batch(
+        &self,
+        max_messages: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<IncomingMessage>, ClientError> {
+        self.receive_batch_with_bytes_cap(max_messages, usize::MAX, max_wait)
+            .await
+    }
+
+    /// Same as [`Self::receive_batch`] but stops once the accumulated
+    /// payload size would exceed `max_bytes`. Mirrors Java's
+    /// `BatchReceivePolicy` — the broker-side policy supports three caps
+    /// (max messages, max bytes, max wait) and stops on whichever fires
+    /// first. Pass `usize::MAX` to disable a cap. The first message is
+    /// always included even if it alone exceeds `max_bytes` (matches
+    /// Java's "deliver at least one" semantic), but subsequent ones obey
+    /// the cap strictly.
+    ///
+    /// # Errors
+    /// Propagates [`Self::receive`] errors.
+    pub async fn receive_batch_with_bytes_cap(
+        &self,
+        max_messages: usize,
+        max_bytes: usize,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<IncomingMessage>, ClientError> {
+        if max_messages == 0 || max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let first = tokio::time::timeout(max_wait, self.receive()).await;
+        let first = match first {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut acc_bytes = first.payload.len();
+        let mut out = Vec::with_capacity(max_messages.min(64));
+        out.push(first);
+        while out.len() < max_messages {
+            // Peek at the next message's payload size; if popping would
+            // exceed the byte cap, leave it for the next batch.
+            let next_size = self
+                .shared
+                .inner
+                .lock()
+                .peek_message_payload_size(self.handle);
+            let Some(next_size) = next_size else { break };
+            if acc_bytes.saturating_add(next_size) > max_bytes {
+                break;
+            }
+            let msg = {
+                let mut conn = self.shared.inner.lock();
+                conn.pop_message(self.handle)
+            };
+            let Some(msg) = msg else { break };
+            acc_bytes = acc_bytes.saturating_add(msg.payload.len());
+            out.push(msg);
+        }
+        // pop_message may have queued FLOW frames; wake the driver.
+        if out.len() > 1 {
+            self.shared.driver_waker.notify_one();
+        }
+        Ok(out)
+    }
+
     /// Acknowledge a single message (individual ack). Resolves once the
     /// broker confirms via `CommandAckResponse`.
     ///
@@ -1549,6 +1649,118 @@ mod tests {
         // is_inactive is a synonym for has_reached_end_of_topic per Java
         // semantics on the consumer surface.
         assert!(!consumer.is_inactive());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_with_timeout_returns_none_on_idle_consumer() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/recv-timeout".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        // No messages have been pushed → the timeout fires and we get None.
+        let result = consumer
+            .receive_with_timeout(std::time::Duration::from_millis(50))
+            .await
+            .expect("receive_with_timeout must surface Ok(None) not an error");
+        assert!(
+            result.is_none(),
+            "idle consumer must return Ok(None) after the deadline",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_with_timeout_returns_message_when_available() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/recv-timeout-ok".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        // Pre-deliver one message.
+        {
+            let mut conn = shared.inner.lock();
+            let bytes = command_message_bytes(handle.0, 500, b"now");
+            conn.handle_bytes(Instant::now(), &bytes)
+                .expect("handle CommandMessage");
+        }
+        let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        let result = consumer
+            .receive_with_timeout(std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_with_timeout must resolve")
+            .expect("a message must be returned within the deadline");
+        assert_eq!(result.payload.as_ref(), b"now");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_drains_already_buffered_messages() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/batch".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        // Pre-deliver 5 messages.
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..5_u64 {
+                let bytes = command_message_bytes(handle.0, 600 + i, format!("b{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &bytes)
+                    .expect("handle CommandMessage");
+            }
+        }
+        let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        let drained = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_batch must resolve");
+        assert!(
+            drained.len() <= 5,
+            "drained {} messages but only 5 were delivered",
+            drained.len()
+        );
+        assert!(
+            !drained.is_empty(),
+            "at least one message should have been drained",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_with_bytes_cap_short_circuits_zero_caps() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/batch-zero".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        // max_messages=0 → empty without waiting.
+        let zero_msgs = consumer
+            .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_secs(60))
+            .await
+            .expect("ok");
+        assert!(zero_msgs.is_empty());
+        // max_bytes=0 → empty without waiting.
+        let zero_bytes = consumer
+            .receive_batch_with_bytes_cap(10, 0, std::time::Duration::from_secs(60))
+            .await
+            .expect("ok");
+        assert!(zero_bytes.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
