@@ -461,9 +461,11 @@ pub trait ConsumerApi: 'static + Send + Sync {
     );
 
     /// Tear down this consumer's subscription on the broker. Mirrors
-    /// Java `Consumer#unsubscribe`. PIP-313's `force=true` variant
-    /// lives on the concrete runtime types as `unsubscribe_with_force`
-    /// (extension point, not on the trait yet).
+    /// Java `Consumer#unsubscribe`. PIP-313's `force=true` variant lives
+    /// directly on the concrete runtime types as
+    /// `Consumer::unsubscribe(force)`; pass-2 of the
+    /// `MultiTopicsConsumer` surface lift will add the boolean to the
+    /// trait method itself.
     fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>>;
 
     /// Seek to the earliest available message. Mirrors Java
@@ -1057,7 +1059,14 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
     }
 
     fn unsubscribe(&self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + '_>> {
-        Box::pin(magnetar_runtime_moonpool::Consumer::unsubscribe(self))
+        // The `ConsumerApi` trait keeps a zero-arg `unsubscribe()` for now;
+        // pass-2 of the MultiTopicsConsumer surface lift adds the `force`
+        // variant onto the trait directly. Default to `force=false`
+        // (PIP-313: respect other attached consumers) — same as the tokio
+        // engine's matching trait impl.
+        Box::pin(magnetar_runtime_moonpool::Consumer::unsubscribe(
+            self, false,
+        ))
     }
 
     fn seek_to_earliest(

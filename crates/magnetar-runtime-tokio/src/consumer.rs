@@ -2057,6 +2057,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_force_true_round_trips_command_success() {
+        // `unsubscribe(true)` issues `CommandUnsubscribe { force: true }`
+        // and resolves on `CommandSuccess`. Mirrors
+        // `magnetar-runtime-moonpool` 1:1 (ADR-0024).
+        for force in [false, true] {
+            let shared = handshake_complete_shared();
+            let handle = {
+                let mut conn = shared.inner.lock();
+                conn.subscribe(SubscribeRequest {
+                    topic: format!("persistent://public/default/unsub-{force}"),
+                    subscription: "s".to_owned(),
+                    ..Default::default()
+                })
+            };
+            let consumer = Consumer {
+                shared: shared.clone(),
+                handle,
+                decryptor: None,
+            };
+
+            let request_id = shared.inner.lock().peek_next_request_id_for_test();
+            let inj_shared = shared.clone();
+            let inj = tokio::spawn(async move {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                    let has = inj_shared
+                        .inner
+                        .lock()
+                        .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                    if has {
+                        let cmd = pb::BaseCommand {
+                            r#type: pb::base_command::Type::Success as i32,
+                            success: Some(pb::CommandSuccess {
+                                request_id,
+                                schema: None,
+                            }),
+                            ..Default::default()
+                        };
+                        let mut buf = BytesMut::new();
+                        encode_command(&mut buf, &cmd).expect("encode CommandSuccess");
+                        inj_shared
+                            .inner
+                            .lock()
+                            .handle_bytes(Instant::now(), &buf)
+                            .expect("handle CommandSuccess");
+                        return;
+                    }
+                }
+                panic!("pending unsubscribe request never registered");
+            });
+            consumer
+                .unsubscribe(force)
+                .await
+                .expect("unsubscribe must resolve on CommandSuccess");
+            inj.await.expect("injector completes");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn drain_dead_letter_empty_by_default() {
         let shared = handshake_complete_shared();
         let handle = {

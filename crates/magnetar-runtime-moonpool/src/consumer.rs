@@ -555,25 +555,21 @@ impl<P: Providers> Consumer<P> {
         self.negative_ack_many(Vec::new());
     }
 
-    /// Unsubscribe — tear down this consumer's subscription on the
-    /// broker (deletes the cursor, not just the consumer handle).
-    /// Mirrors Java `Consumer#unsubscribe`. Callers typically follow
-    /// with [`Self::close`].
+    /// Unsubscribe — tear down this consumer's subscription on the broker
+    /// (deletes the cursor, not just the consumer handle). Mirrors Java
+    /// `Consumer#unsubscribe`. Callers typically follow with
+    /// [`Self::close`].
+    ///
+    /// `force=true` (PIP-313) drops the subscription even when other
+    /// consumers are still attached to the same subscription name. Signature
+    /// matches `magnetar_runtime_tokio::Consumer::unsubscribe` exactly so
+    /// the `ConsumerApi` trait can route through either runtime in pass-2
+    /// of the surface lift.
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the broker rejects the unsubscribe.
     /// - [`ClientError::Other`] on an unexpected outcome.
-    pub async fn unsubscribe(&self) -> Result<(), ClientError> {
-        self.unsubscribe_with_force(false).await
-    }
-
-    /// `force=true` variant per PIP-313 — unsubscribe even when other
-    /// consumers are still attached to the subscription.
-    ///
-    /// # Errors
-    /// - [`ClientError::Broker`] when the broker rejects the unsubscribe.
-    /// - [`ClientError::Other`] on an unexpected outcome.
-    pub async fn unsubscribe_with_force(&self, force: bool) -> Result<(), ClientError> {
+    pub async fn unsubscribe(&self, force: bool) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.unsubscribe(self.handle, force)
@@ -1761,6 +1757,64 @@ mod tests {
             .await
             .expect("ok");
         assert!(zero_bytes.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_force_true_round_trips_command_success() {
+        // `unsubscribe(true)` issues `CommandUnsubscribe { force: true }`
+        // and resolves on `CommandSuccess`. Mirrors the tokio engine's
+        // counterpart 1:1 (ADR-0024). Two separate consumers per branch
+        // because a successful unsubscribe consumes the broker-side
+        // subscription state.
+        for force in [false, true] {
+            let shared = handshake_complete_shared();
+            let handle = {
+                let mut conn = shared.inner.lock();
+                conn.subscribe(SubscribeRequest {
+                    topic: format!("persistent://public/default/unsub-{force}"),
+                    subscription: "s".to_owned(),
+                    ..Default::default()
+                })
+            };
+            let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+
+            let request_id = shared.inner.lock().peek_next_request_id_for_test();
+            let inj_shared = shared.clone();
+            let inj = tokio::spawn(async move {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                    let has = inj_shared
+                        .inner
+                        .lock()
+                        .has_pending_request_for_test(magnetar_proto::RequestId(request_id));
+                    if has {
+                        let cmd = pb::BaseCommand {
+                            r#type: pb::base_command::Type::Success as i32,
+                            success: Some(pb::CommandSuccess {
+                                request_id,
+                                schema: None,
+                            }),
+                            ..Default::default()
+                        };
+                        let mut buf = BytesMut::new();
+                        magnetar_proto::encode_command(&mut buf, &cmd)
+                            .expect("encode CommandSuccess");
+                        inj_shared
+                            .inner
+                            .lock()
+                            .handle_bytes(Instant::now(), &buf)
+                            .expect("handle CommandSuccess");
+                        return;
+                    }
+                }
+                panic!("pending unsubscribe request never registered");
+            });
+            consumer
+                .unsubscribe(force)
+                .await
+                .expect("unsubscribe must resolve on CommandSuccess");
+            inj.await.expect("injector completes");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
