@@ -99,6 +99,16 @@ this section only tracks shipping status:
   (commit `51101c5`). Deduplicates the literal `21` from three
   call sites (proto `ConnectionConfig::default`, proto test
   fixture, CLI banner).
+- **Pre-existing moonpool coverage gap — closure pass 1** (commit
+  `82185cb`). 15 mirrored tests on each runtime
+  (`tests/coverage_close.rs`) drill the largest uncovered hunks in
+  `magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,
+  transport}.rs`. Per-file coverage on the five target files now
+  reads consumer 75.4%, driver 54.7%, lib 92.4%, producer 85.4%,
+  transport 30.3% (172 net-new lines covered, 662 → 490 uncovered);
+  test parity tokio=136 moonpool=136. Coverage closure follow-up
+  stays open for the next pass on the remaining hunks (transport
+  TLS + driver supervised loop) — see the relevant section below.
 
 ---
 
@@ -164,8 +174,11 @@ Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
 the 13 trait additions are pure delegates so they don't need new
 mirror tests if the underlying impl is already covered on both
-sides; the test count should stay at 118/118 unless the lift
-introduces new behavior (e.g. cross-engine partition routing).
+sides; the test count should stay at the current 136/136 (baseline
+at MultiTopics pass-1 landing time was 118/118; ADR-0028 took it to
+121/121; the coverage-closure pass 1 in commit `82185cb` brought it
+to 136/136) unless the lift introduces new behavior (e.g.
+cross-engine partition routing).
 
 ```text
 /goal lift MultiTopicsConsumer<C> + PartitionedConsumer + PatternConsumer<C> impl-bodies on both engines (pass-2; pass-1 helpers already on both runtimes per commits 5f1368f, 53669f9, 0f95a3c, 008abbf). Steps: (1) add the 13 pass-1 helpers to ConsumerApi as thin delegates (`available_in_queue`, `available_permits`, `has_received_any_message`, `has_reached_end_of_topic`, `is_paused`, `is_inactive`, `drain_dead_letter`, `receive_with_timeout`, `receive_batch`, `receive_batch_with_bytes_cap`, `unsubscribe`, `reconsume_later`, `reconsume_later_with_properties`, `republish_dead_letters`); (2) lift `MultiTopicsConsumerBuilder<'a>` → `MultiTopicsConsumerBuilder<'a, E: Engine = TokioEngine>` and `PatternConsumerBuilder<'a>` similarly; route .subscribe()/.subscribe_all() through the engine-generic base ConsumerBuilder; (3) lift `MultiTopicsConsumer<C>` + `PatternConsumer<C>` impl-bodies dispatching through the trait; split tokio-only methods if any; (4) PatternConsumer's PIP-145 auto-reconcile child-subscribe routes through `<E::ClientState as SubscribeApi>::subscribe`; (5) flip parity-status.md rows for "Partitioned consumer", "MultiTopicsConsumer", "PatternConsumer (PIP-145)" to ✅; flip the README parity matrix; (6) full validation chain incl. `cargo +nightly fmt`, `cargo build --workspace --all-features`, `cargo clippy --workspace --all-features --all-targets -- -D warnings`, `cargo test --workspace --features crypto-aws-lc-rs --locked`, `check-runtime-test-parity`, `check-no-channels`, `check-no-io-deps`, `check-no-internal-clock`, `RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps --locked`.
@@ -238,22 +251,42 @@ landings (memory-limit slab, AutoClusterFailover moonpool port, TLS
 chaos fixtures, race-stress coverage, lookup-before-open, the D1
 surface train, the post-seek ack-then-flow fix in `f4872d7`, the
 MultiTopics pass-1 moonpool helpers, and the ADR-0028 anti-thrash
-implementation) brought it to **`tokio=121 moonpool=121`**.
-Pre-existing moonpool patch-coverage of older surface lines is
-unmeasured today.
+implementation) brought it to `tokio=121 moonpool=121`. Pass 1 of
+the pre-existing-gap closure landed in commit `82185cb` with 15
+mirrored tests on each runtime (`tests/coverage_close.rs`), taking
+the parity count to **`tokio=136 moonpool=136`**. Per-file coverage
+on the five target files is now:
+
+| File | Coverage | Gap remaining |
+| --- | --- | --- |
+| `src/consumer.rs`  | 75.4% | 154 lines |
+| `src/driver.rs`    | 54.7% | 141 lines |
+| `src/lib.rs`       | 92.4% |  16 lines |
+| `src/producer.rs`  | 85.4% |  55 lines |
+| `src/transport.rs` | 30.3% | 124 lines |
+
+The largest remaining hunks live in `src/transport.rs` (TLS pump
+incl. `connect_tls` / `tls_handshake` / TLS-side `read_buf` /
+`write_all` / `flush`) and `src/driver.rs` (supervised reconnect
+loop + anti-thrash cooldown). They need either a TLS-enabled
+in-process broker fixture (rustls server cert + `RustlsByteAdapter`
+peer driver) or a `moonpool_core::SimProviders` substrate, both of
+which are substantial scaffolding work.
 
 **Unblock.** Dedicated session driven by the local prompt at
 `tasks/coverage-closure-prompt.md` (gitignored). Phases:
 (1) bring tokio↔moonpool counts to 1:1 — **done**;
-(2) close pre-existing moonpool coverage gaps file by file using the
-`cargo llvm-cov --html` report; (3) full validation chain green
-including the local `1..32` seed sweep (ADR-0024 §3 / ADR-0036 — CI
-runs the equivalent as a daily 16-random-seed sweep in
-`.github/workflows/moonpool-seed-sweep.yml`). ADR-0021 still applies —
-failing tests are fixed, not `#[ignore]`-d.
+(2a) close the largest pre-existing moonpool coverage gaps — **done
+in commit `82185cb` (pass 1)**; (2b) close the residual transport
+TLS + driver supervised-loop hunks — open;
+(3) full validation chain green including the local `1..32` seed
+sweep (ADR-0024 §3 / ADR-0036 — CI runs the equivalent as a daily
+16-random-seed sweep in
+`.github/workflows/moonpool-seed-sweep.yml`). ADR-0021 still applies
+— failing tests are fixed, not `#[ignore]`-d.
 
 ```text
-/goal close the pre-existing moonpool coverage gap. Generate cargo llvm-cov --html, identify the largest uncovered hunks in crates/magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,transport}.rs, add targeted tests to crates/magnetar-runtime-moonpool/tests/ until check-sim-coverage reports no uncovered lines against origin/main. Keep test parity 1:1; mirror each new moonpool test on the tokio side so the gate stays green.
+/goal close the residual moonpool transport TLS + driver supervised-loop coverage hunks. Stand up an in-process rustls-enabled broker fixture (self-signed cert + `RustlsByteAdapter` peer driver) under `crates/magnetar-runtime-moonpool/tests/`, then add targeted tests that exercise `Transport::connect_tls`, `tls_handshake`, the TLS variants of `read_buf` / `write_all` / `flush`, and `Transport::shutdown`. Pair each new moonpool test with a same-named tokio counterpart (the tokio path is already covered via `tls_handshake_chaos.rs`; the mirror may be a Debug / fmt smoke if the surface is engine-private). Optionally close the remaining `driver.rs` `supervised_driver_loop` lines via a synthetic peer that drops the socket between handshakes. Validation chain per CLAUDE.md.
 ```
 
 ---

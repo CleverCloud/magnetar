@@ -167,6 +167,7 @@ PIP-121 + PIP-188 paths under deterministic seeds. Tests are normal
 | Virtual-clock send-timeout fires | [`virtual_clock_send_timeout.rs`](../crates/magnetar-runtime-moonpool/tests/virtual_clock_send_timeout.rs) |
 | ADR-0028 anti-thrash policy (broker ack-then-drop cascade) | [`anti_thrash.rs`](../crates/magnetar-runtime-moonpool/tests/anti_thrash.rs) |
 | Stateful broker + invariant assertions (D2 chaos pack) | [`sim_chaos.rs`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs) |
+| Targeted ADR-0024 coverage closure for `src/{driver,producer,consumer,lib,transport}.rs` | [`coverage_close.rs`](../crates/magnetar-runtime-moonpool/tests/coverage_close.rs) (mirror: [tokio side](../crates/magnetar-runtime-tokio/tests/coverage_close.rs)) |
 
 Reproduce a flaky run under a specific seed:
 
