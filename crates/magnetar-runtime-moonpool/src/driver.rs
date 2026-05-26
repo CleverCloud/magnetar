@@ -47,7 +47,7 @@
 //! send futures stay pending across the reset until the replayed
 //! `CommandSendReceipt` lands (at-least-once publish parity with the Java client).
 //!
-//! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 //! [`Transport`]: crate::transport::Transport
 
 use std::sync::Arc;

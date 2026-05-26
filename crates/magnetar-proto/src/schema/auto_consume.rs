@@ -19,7 +19,7 @@
 //! driver task fills the cache when the `CommandGetSchemaResponse` arrives and wakes any
 //! consumer-side futures via the [`OpOutcome::GetSchemaResponse`](crate::OpOutcome) outcome.
 //!
-//! [`GUIDELINES.md`]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [`GUIDELINES.md`]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 use std::sync::{Arc, Mutex};
 

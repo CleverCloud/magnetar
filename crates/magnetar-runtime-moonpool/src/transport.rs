@@ -17,7 +17,7 @@
 //! encrypt, and ships the ciphertext on the wire. This keeps the TLS
 //! handshake deterministic under `moonpool-sim` chaos testing — option (d)
 //! from `docs/decisions-log.md`, atomised as
-//! [ADR-0006](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0006-moonpool-tls-byte-pipe.md).
+//! [ADR-0006](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0006-moonpool-tls-byte-pipe.md).
 
 use std::io;
 use std::sync::Arc;
@@ -132,7 +132,7 @@ impl<P: Providers> Transport<P> {
     /// `host` is the SNI / hostname-verification name (NOT the resolved
     /// IP). `tls_config` is the workspace-wide
     /// [`rustls::ClientConfig`] — there is no `native-tls` or `openssl`
-    /// shim ([ADR-0005](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0005-rustls-only-tls.md)).
+    /// shim ([ADR-0005](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0005-rustls-only-tls.md)).
     ///
     /// # Errors
     /// - [`EngineError::Config`] when `host` is not a valid `ServerName`.

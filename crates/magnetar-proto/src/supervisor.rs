@@ -59,7 +59,7 @@ pub struct SupervisorConfig {
     /// [`Self::max_backoff_after_thrash`].
     ///
     /// Recommended starting values when opting in (see [ADR-0028 §"Defaults
-    /// and migration"](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)):
+    /// and migration"](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)):
     /// `AntiThrashThreshold { successful_attaches: 5, window:
     /// Duration::from_secs(2), drop_within: Duration::from_millis(50) }` with
     /// `max_backoff_after_thrash = Duration::from_secs(30)`.

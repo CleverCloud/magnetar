@@ -42,7 +42,7 @@
 //! reset. This delivers at-least-once publish parity with the Java client (mirrors
 //! `ProducerImpl#resendMessages`).
 //!
-//! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 use std::sync::Arc;
 use std::time::Instant;

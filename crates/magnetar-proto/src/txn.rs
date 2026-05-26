@@ -39,7 +39,7 @@
 //!                                                       └────────────┘
 //! ```
 //!
-//! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 use core::time::Duration;
 use std::collections::{HashMap, HashSet};

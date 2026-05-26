@@ -82,7 +82,7 @@ use magnetar_proto::{Connection, ConnectionConfig};
 /// in `magnetar-proto` so the runtime engines can plug them into the
 /// supervised reconnect path without re-implementing the trait. Java
 /// parity: `org.apache.pulsar.client.api.ServiceUrlProvider`. See
-/// [ADR-0016](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0016-pip-121-cluster-failover.md).
+/// [ADR-0016](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0016-pip-121-cluster-failover.md).
 ///
 /// The health-probe-driven [`AutoClusterFailover`] policy now also has a
 /// moonpool-native implementation in
@@ -90,7 +90,7 @@ use magnetar_proto::{Connection, ConnectionConfig};
 /// [`moonpool_core::Providers`] so the probe loop and the TCP probe
 /// socket dance run through the moonpool task / network providers and
 /// stay deterministic under `moonpool-sim`. See
-/// [ADR-0023](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md)
+/// [ADR-0023](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md)
 /// for the trait extraction that made this possible.
 ///
 /// [`AutoClusterFailover`]: crate::auto_cluster_failover::AutoClusterFailover
@@ -140,7 +140,7 @@ pub struct ConnectionShared {
     /// limit (matches `ConnectionConfig::memory_limit_bytes` default).
     /// Mirrors the tokio engine's identically-named field and Java's
     /// `ClientBuilder#memoryLimit`. See
-    /// [ADR-0017](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
+    /// [ADR-0017](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
     pub memory_limit_bytes: u64,
     /// Current in-flight publish bytes reserved by [`Producer::send`]
     /// calls that have not yet seen their
@@ -158,9 +158,9 @@ pub struct ConnectionShared {
     /// Snapshotted from
     /// [`magnetar_proto::ConnectionConfig::memory_limit_policy`] at
     /// construction time. See
-    /// [ADR-0020](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
+    /// [ADR-0020](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
     /// for the tokio counterpart and
-    /// [ADR-0022](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0022-memory-limit-producer-block-moonpool.md)
+    /// [ADR-0022](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0022-memory-limit-producer-block-moonpool.md)
     /// for the moonpool-specific fairness contract under
     /// [`moonpool_core::Providers`].
     pub memory_limit_policy: magnetar_proto::MemoryLimitPolicy,
@@ -174,7 +174,7 @@ pub struct ConnectionShared {
     ///
     /// Not a channel — this is a `Slab<Waker>` behind a
     /// `parking_lot::Mutex`, the canonical no-channel wake pattern (see
-    /// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+    /// [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     ///
     /// Under `moonpool_core::SimProviders` the drain visits slab slots in
     /// insertion order (slab free-list FIFO), but `core::task::Waker::wake`
@@ -248,7 +248,7 @@ impl ConnectionShared {
     /// and the tokio engine's identically-shaped helper.
     ///
     /// `AtomicU64` is not a channel; see
-    /// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
+    /// [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
     ///
     /// # Errors
     /// Surfaces [`EngineError::MemoryLimitExceeded`] when the reservation
@@ -421,7 +421,7 @@ pub enum EngineError {
     /// would push the engine past the configured
     /// [`ConnectionShared::memory_limit_bytes`] budget. Mirrors Java's
     /// `MemoryLimitController` in `FailImmediately` policy. See
-    /// [ADR-0017](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
+    /// [ADR-0017](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0017-memory-limit-atomic-reservation.md).
     #[error("memory limit exceeded: current={current}B + requested={requested}B > limit={limit}B")]
     MemoryLimitExceeded {
         /// Bytes currently reserved on the budget when the request was rejected.
@@ -494,7 +494,7 @@ impl<P: Providers> MoonpoolEngine<P> {
     /// (routes the raw `host:port` through the moonpool
     /// [`moonpool_core::NetworkProvider`]). Java parity:
     /// `ClientBuilder#dnsResolver`. See
-    /// [ADR-0015](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0015-dns-resolver-injection.md).
+    /// [ADR-0015](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0015-dns-resolver-injection.md).
     ///
     /// # Errors
     /// Same envelope as [`Self::connect_plain`], plus the resolver may
@@ -531,7 +531,7 @@ impl<P: Providers> MoonpoolEngine<P> {
     /// hostname-verification name handed to rustls; pass the broker hostname
     /// even if `addr` is a resolved IP. `tls_config` is the workspace-wide
     /// [`rustls::ClientConfig`] (no `native-tls` / `openssl` shim,
-    /// [ADR-0005](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0005-rustls-only-tls.md)).
+    /// [ADR-0005](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0005-rustls-only-tls.md)).
     ///
     /// The TLS handshake runs inline before `connect_tls` returns. After
     /// that, the driver loop pumps decrypted plaintext through the same

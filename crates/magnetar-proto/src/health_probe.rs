@@ -45,9 +45,9 @@
 //! - [ADR-0016] — PIP-121 cluster-failover decisions.
 //! - [ADR-0023] — extraction of this trait into `magnetar-proto`.
 //!
-//! [ADR-0004]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md
-//! [ADR-0016]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0016-pip-121-cluster-failover.md
-//! [ADR-0023]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md
+//! [ADR-0004]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md
+//! [ADR-0016]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0016-pip-121-cluster-failover.md
+//! [ADR-0023]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md
 
 use core::fmt::Debug;
 use std::task::{Context, Poll};

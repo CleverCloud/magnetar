@@ -15,7 +15,7 @@
 //!
 //! - **Probe contract** — the policy delegates the actual health check to a sans-io
 //!   [`magnetar_proto::HealthProbe`] (lifted out of the tokio crate per
-//!   [ADR-0023](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md)).
+//!   [ADR-0023](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md)).
 //!   The trait surface is identical to the tokio engine's; only the implementation differs.
 //! - **Failover policy** — first-healthy-wins in priority order. The primary URL is index 0;
 //!   failover candidates follow.
@@ -37,13 +37,13 @@
 //! the [`moonpool_core::NetworkProvider`] so the same code path is driven
 //! by [`moonpool_core::TokioProviders`] in production and by `SimProviders`
 //! in deterministic-simulation tests. See
-//! [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
+//! [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
 //! and
-//! [ADR-0023](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md).
+//! [ADR-0023](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md).
 //!
 //! # No channels
 //!
-//! Per [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md):
+//! Per [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md):
 //! the probe slot uses an [`Arc<parking_lot::Mutex<ProbeSlot>>`] + a
 //! [`tokio::sync::Notify`] single-cell wakeup; the active-URL slot uses an
 //! [`Arc<parking_lot::Mutex<usize>>`]. No `mpsc`/`broadcast`/`watch`/`oneshot`.
@@ -296,7 +296,7 @@ impl<P: Providers> ServiceUrlProvider for AutoClusterFailover<P> {
 /// verdict and wakes the parked waker through a
 /// [`tokio::sync::Notify`]-free path (we wake the [`Waker`] directly to
 /// preserve the no-channels invariant — see
-/// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+/// [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
 pub struct MoonpoolHealthProbe<P: Providers> {
     /// In-flight probe state keyed by endpoint string. A missing key means
     /// no probe is running; once the spawned task resolves we drain the

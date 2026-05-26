@@ -71,7 +71,7 @@ pub struct ConsumerState {
     /// cleanly without one waker clobbering another.
     ///
     /// Not a channel — a `Slab<Waker>` is the canonical no-channel wake pattern
-    /// (see [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+    /// (see [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub receive_wakers: Slab<Waker>,
     /// Closed flag.
     pub closed: bool,
@@ -330,7 +330,7 @@ impl ConsumerState {
     /// [`Self::current_msgs_per_sec`] / [`Self::current_bytes_per_sec`].
     ///
     /// Sans-io discipline: `now` is injected (see
-    /// [ADR-0011](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md)).
+    /// [ADR-0011](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md)).
     /// Runtime engines typically wire this to a `tokio::time::interval` ticker.
     pub fn record_rate_window(&mut self, now: std::time::Instant) {
         if let Some((prev_msgs, prev_bytes, prev_at)) = self.last_rate_snapshot {

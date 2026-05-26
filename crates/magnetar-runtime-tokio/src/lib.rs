@@ -39,7 +39,7 @@
 //!
 //! This crate does not use any flavour of channel (mpsc / broadcast / watch / oneshot). The
 //! pattern is documented in [GUIDELINES.md] §"No-channels rule" and atomised in
-//! [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md):
+//! [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md):
 //!
 //! - User-facing futures lock `Arc<parking_lot::Mutex<magnetar_proto::Connection>>` directly.
 //! - Driver wake-ups travel through a single-cell [`tokio::sync::Notify`].
@@ -47,11 +47,11 @@
 //!   registered via [`magnetar_proto::Connection::register_waker`] and dispatched when the matching
 //!   [`magnetar_proto::OpOutcome`] lands.
 //!
-//! See also [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
-//! (sans-io split) and [ADR-0011](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md)
+//! See also [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
+//! (sans-io split) and [ADR-0011](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md)
 //! (clock injection on state-machine entries).
 //!
-//! [GUIDELINES.md]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
@@ -152,7 +152,7 @@ pub struct ConnectionShared {
     ///
     /// Snapshotted from
     /// [`magnetar_proto::ConnectionConfig::memory_limit_policy`] at
-    /// construction time. See [ADR-0020](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md).
+    /// construction time. See [ADR-0020](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md).
     pub memory_limit_policy: magnetar_proto::MemoryLimitPolicy,
     /// Waker slab consulted by [`Self::release_memory`] when a reservation
     /// frees up. Populated by [`Self::try_reserve_memory_or_register`] from
@@ -164,7 +164,7 @@ pub struct ConnectionShared {
     ///
     /// Not a channel — this is a `Slab<Waker>` behind a `parking_lot::Mutex`,
     /// the canonical no-channel wake pattern (see
-    /// [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+    /// [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     pub memory_wakers: Mutex<Slab<Waker>>,
     /// Set to `true` after the first successful TC-partition lookup. Pulsar brokers do not
     /// load the `__transaction_coordinator_assign-partition-N` topic until something forces
@@ -217,7 +217,7 @@ impl ConnectionShared {
     /// `MemoryLimitController` (in `MemoryLimitPolicy.FailImmediately`
     /// mode).
     ///
-    /// See [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)
+    /// See [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)
     /// — `AtomicU64` is not a channel; it's the right primitive for this counter.
     pub fn try_reserve_memory(&self, bytes: u64) -> Result<(), ClientError> {
         if self.memory_limit_bytes == 0 {

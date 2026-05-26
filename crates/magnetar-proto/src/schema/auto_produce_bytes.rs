@@ -21,7 +21,7 @@
 //! Per [`GUIDELINES.md`] the sans-io core uses `Arc<Mutex<…>>` for shared mutable state and
 //! `Notify`/Waker slabs for cross-task signalling. The cache follows the same pattern.
 //!
-//! [`GUIDELINES.md`]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [`GUIDELINES.md`]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 use std::sync::{Arc, Mutex};
 

@@ -2,7 +2,7 @@ Magnetar
 Copyright 2026 Florentin Dubois
 
 This product includes software developed by Florentin Dubois
-(https://github.com/FlorentinDUBOIS/magnetar).
+(https://github.com/CleverCloud/magnetar).
 
 This product vendors and depends on a redacted copy of the
 Apache Pulsar wire protocol definition (PulsarApi.proto,

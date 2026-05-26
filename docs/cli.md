@@ -27,7 +27,7 @@ The CLI exposes two forms, modeled on `sozu` and `systemd`:
   built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.85.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21
-  os: linux · report bugs at https://github.com/FlorentinDUBOIS/magnetar
+  os: linux · report bugs at https://github.com/CleverCloud/magnetar
   ```
 
   The lines are intentionally machine-greppable (`rustc=`, `profile=`,

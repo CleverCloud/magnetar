@@ -7,7 +7,7 @@
 //! the deterministic-simulation substrate can plug in a virtual resolver.
 //! Java parity: `ClientBuilder#dnsResolver`. Lives in the runtime crate (not
 //! `magnetar-proto`) because DNS is, by definition, I/O — see
-//! [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md).
+//! [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md).
 //!
 //! # Default
 //!
@@ -22,7 +22,7 @@
 //!
 //! Same reasoning as the tokio crate: keep the dep graph tight. The trait
 //! returns a boxed future explicitly so it stays object-safe without macro
-//! magic. See [ADR-0015](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0015-dns-resolver-injection.md).
+//! magic. See [ADR-0015](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0015-dns-resolver-injection.md).
 //!
 //! # Determinism
 //!

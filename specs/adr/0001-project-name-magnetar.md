@@ -24,8 +24,8 @@ prefixed sub-crates stay readable.
 ## Decision
 
 - The workspace is named **`magnetar`**.
-- The local source path is `/home/florentin/Sources/github.com/FlorentinDUBOIS/magnetar/`.
-- The GitHub repo is `github.com/FlorentinDUBOIS/magnetar`.
+- The local source path is `/home/florentin/Sources/github.com/CleverCloud/magnetar/`.
+- The GitHub repo is `github.com/CleverCloud/magnetar`.
 - Published crates: `magnetar`, `magnetar-proto`, `magnetar-runtime-tokio`,
   `magnetar-runtime-moonpool`, `magnetar-admin`, `magnetar-fakes`,
   `magnetar-cli`, `magnetar-auth-oauth2`, `magnetar-auth-sasl`,

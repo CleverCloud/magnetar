@@ -9,7 +9,7 @@
 //! resolver, etc.
 //!
 //! Lives in `magnetar-runtime-tokio` (not `magnetar-proto`) because DNS is
-//! by definition I/O — see [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md).
+//! by definition I/O — see [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md).
 //!
 //! # Default
 //!

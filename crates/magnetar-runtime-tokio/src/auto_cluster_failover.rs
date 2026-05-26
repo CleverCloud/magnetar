@@ -28,8 +28,8 @@
 //! The trait it delegates to (`magnetar_proto::HealthProbe`) is sans-io and
 //! lives in the proto crate, which keeps moonpool free to ship its own
 //! probe impl without dragging tokio into `magnetar-proto`.
-//! See [ADR-0004](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
-//! and [ADR-0023](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md).
+//! See [ADR-0004](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0004-sans-io-protocol-core.md)
+//! and [ADR-0023](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0023-health-probe-trait-extraction.md).
 
 use std::collections::HashMap;
 use std::future::{Future as _, poll_fn};

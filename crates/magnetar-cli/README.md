@@ -56,7 +56,7 @@ magnetar produce persistent://public/default/x --message hi
 magnetar consume persistent://public/default/x --subscription s --count 5
 ```
 
-These print `not yet wired (M9)` and exit 0 today. They get implemented once the [`Connection`](https://github.com/FlorentinDUBOIS/magnetar) state machine and the tokio engine are integrated into the `magnetar` façade.
+These print `not yet wired (M9)` and exit 0 today. They get implemented once the [`Connection`](https://github.com/CleverCloud/magnetar) state machine and the tokio engine are integrated into the `magnetar` façade.
 
 ## Quickstart against a local broker
 

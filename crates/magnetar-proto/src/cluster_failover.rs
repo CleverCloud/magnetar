@@ -15,7 +15,7 @@
 //!
 //! Mirrors Java `org.apache.pulsar.client.api.ControlledClusterFailover`.
 //!
-//! See [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)
+//! See [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)
 //! — the URL slot uses `parking_lot::Mutex<String>`, not a channel.
 
 use std::sync::{Arc, Mutex};

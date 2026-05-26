@@ -103,7 +103,7 @@ Magnetar is not yet on crates.io. Use the Git path until the first release:
 
 ```toml
 [dependencies]
-magnetar = { git = "https://github.com/FlorentinDUBOIS/magnetar", branch = "main" }
+magnetar = { git = "https://github.com/CleverCloud/magnetar", branch = "main" }
 ```
 
 The default feature set enables the tokio engine. The feature flags catalog:
@@ -195,7 +195,7 @@ magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.85.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
-os: linux · report bugs at https://github.com/FlorentinDUBOIS/magnetar
+os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
 - `-V` prints a single-line, never-colorized form:

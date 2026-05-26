@@ -27,7 +27,7 @@
 //! This module ships only the trait + the static impl. `AutoClusterFailover` (latency-based)
 //! and `ControlledClusterFailover` (external signal) policies are scoped for follow-up.
 //!
-//! [`GUIDELINES.md`]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/GUIDELINES.md
+//! [`GUIDELINES.md`]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
 use core::fmt::Debug;
 use std::sync::Arc;

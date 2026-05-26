@@ -524,9 +524,9 @@ impl<P: Providers> Client<P> {
 /// [`EngineError::MemoryLimitExceeded`] on overflow, while
 /// `ProducerBlock` parks the future on
 /// [`ConnectionShared::memory_wakers`] until budget frees up. See
-/// [ADR-0020](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
+/// [ADR-0020](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
 /// for the tokio mechanism and
-/// [ADR-0022](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0022-memory-limit-producer-block-moonpool.md)
+/// [ADR-0022](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0022-memory-limit-producer-block-moonpool.md)
 /// for the moonpool-specific fairness contract under
 /// [`moonpool_core::Providers`].
 ///

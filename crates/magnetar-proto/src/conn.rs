@@ -139,9 +139,9 @@ pub enum MemoryLimitPolicy {
     /// `ConnectionShared`. Mirrors Java `MemoryLimitPolicy.PRODUCER_BLOCK`.
     ///
     /// Implemented per
-    /// [ADR-0020](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
+    /// [ADR-0020](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0020-memory-limit-producer-block.md)
     /// — the wait uses a `parking_lot::Mutex<Slab<Waker>>` (not a channel)
-    /// honouring [ADR-0003](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
+    /// honouring [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md).
     ProducerBlock,
 }
 

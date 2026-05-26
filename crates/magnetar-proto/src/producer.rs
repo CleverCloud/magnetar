@@ -457,7 +457,7 @@ impl ProducerState {
     /// Sans-io discipline: `now` is injected (see [ADR-0011]). Runtime engines wire this
     /// to a `tokio::time::interval` ticker.
     ///
-    /// [ADR-0011]: https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
+    /// [ADR-0011]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
     pub fn record_rate_window(&mut self, now: std::time::Instant) {
         if let Some((prev_msgs, prev_bytes, prev_at)) = self.last_rate_snapshot {
             let elapsed = now.saturating_duration_since(prev_at).as_secs_f64();

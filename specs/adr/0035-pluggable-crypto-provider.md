@@ -33,7 +33,7 @@ rustls's own crypto-provider design — `rustls::crypto::CryptoProvider`
 plus `install_default()` — already supports the four backends without
 forking. The only thing missing was workspace plumbing.
 
-[#9]: https://github.com/FlorentinDUBOIS/magnetar/issues/9
+[#9]: https://github.com/CleverCloud/magnetar/issues/9
 
 ## Decision
 
@@ -182,4 +182,4 @@ because only the openssl ban portion is touched.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   exemption invoked under "Dependency bumps with no functional
   impact".
-- [Issue #9](https://github.com/FlorentinDUBOIS/magnetar/issues/9).
+- [Issue #9](https://github.com/CleverCloud/magnetar/issues/9).
