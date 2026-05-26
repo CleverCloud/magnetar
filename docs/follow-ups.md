@@ -21,13 +21,15 @@ binding rationale, sources, and decision text live in that ADR;
 this section only tracks shipping status:
 
 - **D4** — `xtask vendor-proto --rev <sha>` (commit `ac1420c`).
-- **D3** — SASL `PLAIN` ✅ + Athenz pre-fetched role token ✅ ship.
-  SASL Kerberos/GSSAPI also ✅ via `libgssapi` under the
-  `auth-sasl-kerberos` façade feature (lands per
-  [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md);
-  the D3 deferral applied to v0.2.0 and that work has now landed
-  ahead of milestone). Athenz ZTS round-trip 🟡 remains deferred
-  per ADR-0026 §D3.
+- **D3** — SASL `PLAIN` ✅ + Athenz pre-fetched role token ✅ ship
+  (commit `96d6f74`). SASL Kerberos/GSSAPI also ✅ via `libgssapi`
+  under the `auth-sasl-kerberos` façade feature (commit `db260ea`,
+  ahead of the v0.2.0 milestone per
+  [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md));
+  the multi-round `AUTH_CHALLENGE` continuation reuses the existing
+  `AuthProvider::respond_to_challenge` surface (no new
+  `SaslMechanism` trait). Athenz ZTS round-trip 🟡 remains deferred
+  per ADR-0026 §D3 / [ADR-0030](../specs/adr/0030-athenz-zts-round-trip-scope.md).
 - **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
   first cut: BrokerWorkload + ClientWorkload under
   `SimulationBuilder`, 16-seed sweep (commit `c23f6fd`). Follow-on

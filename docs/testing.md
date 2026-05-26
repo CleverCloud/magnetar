@@ -17,9 +17,13 @@ and whether the target is gated behind a feature flag or `#[ignore]`.
 ## Running each category
 
 ```bash
-# Routine feature subset that activates every magnetar facet
-# EXCEPT crypto-fips (its native FIPS build toolchain isn't
-# universally available; check-crypto-matrix covers FIPS in CI).
+# Routine feature subset that activates every magnetar facet EXCEPT:
+# - `crypto-fips` (native FIPS toolchain isn't universally available);
+# - `auth-sasl-kerberos` (needs `libkrb5-dev` + `libclang-dev` for
+#   `libgssapi-sys`).
+# `cargo xtask check-crypto-matrix` covers FIPS exhaustively in CI;
+# the GSSAPI provider is exercised by the `e2e_sasl_kerberos.rs`
+# Docker e2e test (see [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
 FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
 
 # Unit + integration (no broker, no Docker).
@@ -131,6 +135,7 @@ Suites cover:
 | [`e2e_persistence.rs`](../crates/magnetar/tests/e2e_persistence.rs) | Persistent + non-persistent semantics. |
 | [`e2e_crypto.rs`](../crates/magnetar/tests/e2e_crypto.rs) | PIP-4 + `cryptoFailureAction` (Fail / Discard / Consume). |
 | [`e2e_oauth2.rs`](../crates/magnetar/tests/e2e_oauth2.rs) | OAuth2 `ClientCredentialsFlow` + token cache + refresh-on-expiry. |
+| [`e2e_sasl_kerberos.rs`](../crates/magnetar/tests/e2e_sasl_kerberos.rs) | SASL Kerberos / GSSAPI via `libgssapi` against a Dockerised MIT KDC (`gcavalcante8808/krb5-server`). Gated on `--features e2e,auth-sasl-kerberos`; needs `libkrb5-dev` + `libclang-dev` on the build host. See [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | [`e2e_dns_resolver.rs`](../crates/magnetar/tests/e2e_dns_resolver.rs) | Custom `DnsResolver` plumbed end-to-end. |
 | [`e2e_force_unsubscribe.rs`](../crates/magnetar/tests/e2e_force_unsubscribe.rs) | PIP-313 force unsubscribe. |
 | [`e2e_memory_limit.rs`](../crates/magnetar/tests/e2e_memory_limit.rs) | `MemoryLimitPolicy::{FailImmediately, ProducerBlock}`. |

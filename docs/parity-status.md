@@ -140,9 +140,13 @@ satisfies on the tokio engine.
 ## Validation chain (per commit)
 
 Pick a routine feature subset that pulls in every magnetar facet
-EXCEPT `crypto-fips` (whose FIPS native build toolchain isn't
-universally available); `cargo xtask check-crypto-matrix` covers
-FIPS exhaustively in CI.
+EXCEPT two opt-in cells:
+
+- `crypto-fips` — needs a FIPS native build toolchain;
+  `cargo xtask check-crypto-matrix` covers it exhaustively in CI.
+- `auth-sasl-kerberos` — needs `libkrb5-dev` + `libclang-dev` for
+  `libgssapi-sys`; covered by the `e2e_sasl_kerberos.rs` Docker e2e
+  per [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md).
 
 ```
 FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"

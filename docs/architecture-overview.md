@@ -18,8 +18,8 @@ crates/
   magnetar-fakes/                 In-process broker stub for tests
   magnetar-messagecrypto/         PIP-4 AES-GCM (aws-lc-rs)
   magnetar-auth-oauth2/           ClientCredentialsFlow + token caching
-  magnetar-auth-sasl/             SASL/Kerberos scaffold (pre-alpha)
-  magnetar-auth-athenz/           Athenz scaffold (pre-alpha)
+  magnetar-auth-sasl/             SASL PLAIN + Kerberos/GSSAPI (libgssapi behind `kerberos` feature)
+  magnetar-auth-athenz/           Athenz pre-fetched role token (ZTS round-trip deferred)
   magnetar-differential/          tokio ↔ moonpool differential equivalence harness (test-only)
 xtask/                            Workspace automation (check-no-channels, check-no-io-deps, check-no-internal-clock, codegen)
 ```

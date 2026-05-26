@@ -390,7 +390,12 @@ must handle:
 - `ConnectionEvent::AuthChallenge { method, challenge }` — driver
   consults the configured `AuthProvider`, asks it for a fresh blob via
   `respond_to_challenge`, and submits it via `submit_auth_response`
-  (PIP-30 / PIP-292).
+  (PIP-30 / PIP-292). The same hook carries SASL Kerberos / GSSAPI
+  continuation tokens: `magnetar_auth_sasl::SaslKerberos` forwards
+  each challenge into its wrapped `GssapiClient` so the GSSAPI
+  initiate loop runs naturally over the existing trait surface (no
+  new `SaslMechanism` trait was needed; see
+  [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
 - `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes
   the delta into `ConnectionShared.topic_list_changes` and wakes
   `topic_list_notify` (PIP-145).
