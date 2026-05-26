@@ -1,6 +1,6 @@
 # ADR-0028 — Supervised-reconnect anti-thrash policy
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: supervisor, reconnect, ha, e2e, broker-quirks, follow-up-74

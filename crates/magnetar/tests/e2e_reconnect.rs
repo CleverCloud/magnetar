@@ -101,6 +101,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
         max_backoff: Duration::from_secs(5),
         mandatory_stop: Duration::from_secs(180),
         max_attempts: None,
+        ..SupervisorConfig::default()
     }
 }
 

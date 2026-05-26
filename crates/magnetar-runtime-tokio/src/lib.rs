@@ -350,8 +350,21 @@ impl ConnectionShared {
     ) -> Arc<Self> {
         let memory_limit_bytes = config.memory_limit_bytes;
         let memory_limit_policy = config.memory_limit_policy;
+        // ADR-0028: opt-in anti-thrash detector. When the supervisor config
+        // declares a threshold, mirror it onto the sans-io detector so the
+        // engine driver can feed re-attach outcomes into it.
+        let anti_thrash_threshold = config
+            .supervisor
+            .as_ref()
+            .and_then(|s| s.anti_thrash_threshold);
+        let anti_thrash_cooldown = config.supervisor.as_ref().map_or_else(
+            || std::time::Duration::from_secs(30),
+            |s| s.max_backoff_after_thrash,
+        );
+        let mut conn = magnetar_proto::Connection::new(config);
+        conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
         Arc::new(Self {
-            inner: Mutex::new(magnetar_proto::Connection::new(config)),
+            inner: Mutex::new(conn),
             driver_waker: Notify::new(),
             auth_provider,
             topic_list_changes: Mutex::new(std::collections::VecDeque::new()),

@@ -297,6 +297,26 @@ pub enum ConnectionEvent {
         /// The schema-registry round-trip outcome.
         result: GetSchemaResult,
     },
+
+    /// The connection-level anti-thrash detector (ADR-0028) has engaged. The
+    /// supervisor must sleep until `until` before its next
+    /// `Transport::connect`, even if its per-handle backoff would have
+    /// retried sooner. Emitted exactly once on each `Normal → Cooldown`
+    /// transition by
+    /// [`Connection::record_reattach_outcome`](crate::Connection::record_reattach_outcome).
+    AntiThrashCooldown {
+        /// Absolute `Instant` the cooldown expires. Compare to the engine's
+        /// `Instant::now()` to compute the remaining sleep.
+        until: std::time::Instant,
+    },
+
+    /// The connection-level anti-thrash cooldown (ADR-0028) has lifted —
+    /// either because the supervisor slept past `until` and explicitly
+    /// cleared it via
+    /// [`Connection::anti_thrash_state_mut`](crate::Connection::anti_thrash_state_mut),
+    /// or because the broker stabilised and the driver called
+    /// [`Connection::record_first_op_success`](crate::Connection::record_first_op_success).
+    AntiThrashCleared,
 }
 
 /// Outcome of a `CommandLookupTopic` round-trip.

@@ -355,6 +355,54 @@ where
             return last_inner_result;
         };
 
+        // ADR-0028: feed a TCP-drop signal into the anti-thrash detector if
+        // the socket closed within the supervisor's `drop_grace` of the
+        // most-recent successful re-attach. Mirror of the tokio runtime
+        // (`crates/magnetar-runtime-tokio/src/driver.rs`). `Instant::now()` is
+        // used here for the per-host clock that pairs with the `Instant` the
+        // sans-io state machine already stamps on `ProducerReady` /
+        // `SubscribeAcked` (driver inner loop, ~`Instant::now()` on
+        // `handle_bytes`). The moonpool engine keeps deterministic sleep
+        // scheduling via `time.sleep(duration)` below.
+        if cfg.anti_thrash_threshold.is_some() {
+            let now = Instant::now();
+            let should_record = {
+                let conn = shared.inner.lock();
+                conn.anti_thrash_state()
+                    .last_reattach_at()
+                    .is_some_and(|t| now.saturating_duration_since(t) <= cfg.drop_grace)
+            };
+            if should_record {
+                shared.inner.lock().record_reattach_outcome(
+                    now,
+                    magnetar_proto::ReAttachHandle::Producer(magnetar_proto::ProducerHandle(0)),
+                    magnetar_proto::ReAttachOutcomeKind::TcpDropAfterReAttach,
+                );
+            }
+        }
+
+        // ADR-0028: if the anti-thrash detector has armed a cooldown, sleep
+        // until it expires (using the moonpool TimeProvider so sim runs stay
+        // deterministic for the sleep itself) before the next redial.
+        let cooldown_until = {
+            let conn = shared.inner.lock();
+            match conn.anti_thrash_tick(Instant::now()) {
+                magnetar_proto::AntiThrashDisposition::Cooldown { until } => Some(until),
+                magnetar_proto::AntiThrashDisposition::Normal => None,
+            }
+        };
+        if let Some(until) = cooldown_until {
+            let now = Instant::now();
+            if until > now {
+                let dur = until.saturating_duration_since(now);
+                tracing::warn!(
+                    "supervisor: anti-thrash cooldown engaged; sleeping {dur:?} before next redial"
+                );
+                let _ = time.sleep(dur).await;
+            }
+            shared.inner.lock().anti_thrash_state_mut().clear_cooldown();
+        }
+
         // Fresh Backoff per disconnect: Java resets the schedule on a successful
         // reconnect, so we reset on a *successful* handshake too. The attempt counter
         // is the only piece of state that survives across reconnect attempts here.

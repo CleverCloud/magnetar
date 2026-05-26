@@ -612,6 +612,13 @@ pub struct Connection {
     /// `|| SystemTime::now()` so existing callers keep working. moonpool /
     /// deterministic-simulation engines plug in a virtual clock here.
     wall_clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    /// Anti-thrash detector (ADR-0028). Disabled by default; opted in by the
+    /// engine driver via [`Self::set_anti_thrash`] when the user configures
+    /// [`crate::supervisor::SupervisorConfig::anti_thrash_threshold`]. The
+    /// detector is purely an observable: the driver records re-attach
+    /// outcomes into it and polls [`Self::anti_thrash_tick`] to decide
+    /// whether to delay the next redial.
+    anti_thrash: crate::anti_thrash::AntiThrashState,
 }
 
 impl core::fmt::Debug for Connection {
@@ -702,6 +709,7 @@ impl Connection {
             last_disconnected_at: None,
             session_epoch: 0,
             wall_clock: std::sync::Arc::new(SystemTime::now),
+            anti_thrash: crate::anti_thrash::AntiThrashState::disabled(),
         }
     }
 
@@ -806,6 +814,89 @@ impl Connection {
     #[must_use]
     pub fn supervisor_config(&self) -> Option<&crate::supervisor::SupervisorConfig> {
         self.config.supervisor.as_ref()
+    }
+
+    /// Configure the anti-thrash detector (ADR-0028). Pass `threshold = None`
+    /// to disable. Engines call this once at supervisor start time after
+    /// reading [`crate::supervisor::SupervisorConfig::anti_thrash_threshold`]
+    /// + [`crate::supervisor::SupervisorConfig::max_backoff_after_thrash`].
+    ///
+    /// The detector is a pure observable — it tracks re-attach outcomes and
+    /// emits cooldown decisions via [`Self::anti_thrash_tick`]; it never
+    /// queues frames or events.
+    pub fn set_anti_thrash(
+        &mut self,
+        threshold: Option<crate::anti_thrash::AntiThrashThreshold>,
+        cooldown: Duration,
+    ) {
+        self.anti_thrash.set_threshold(threshold, cooldown);
+    }
+
+    /// Borrow the anti-thrash state. Engines use this for diagnostics + the
+    /// `tick`-based supervisor gate.
+    #[must_use]
+    pub fn anti_thrash_state(&self) -> &crate::anti_thrash::AntiThrashState {
+        &self.anti_thrash
+    }
+
+    /// Mutable borrow of the anti-thrash state. Used by tests and the engine
+    /// drivers that need to call [`crate::anti_thrash::AntiThrashState::clear_cooldown`]
+    /// after a cooldown sleep has elapsed.
+    pub fn anti_thrash_state_mut(&mut self) -> &mut crate::anti_thrash::AntiThrashState {
+        &mut self.anti_thrash
+    }
+
+    /// Record a re-attach outcome into the anti-thrash detector. No-op when
+    /// the detector is disabled (the default).
+    pub fn record_reattach_outcome(
+        &mut self,
+        now: Instant,
+        handle: crate::anti_thrash::ReAttachHandle,
+        kind: crate::anti_thrash::ReAttachOutcomeKind,
+    ) {
+        let was_cooldown = self.anti_thrash.tick(now);
+        self.anti_thrash.record(now, kind, handle);
+        let is_cooldown = self.anti_thrash.tick(now);
+        match (was_cooldown, is_cooldown) {
+            (
+                crate::anti_thrash::AntiThrashDisposition::Normal,
+                crate::anti_thrash::AntiThrashDisposition::Cooldown { until },
+            ) => {
+                self.events
+                    .push_back(ConnectionEvent::AntiThrashCooldown { until });
+            }
+            (
+                crate::anti_thrash::AntiThrashDisposition::Cooldown { .. },
+                crate::anti_thrash::AntiThrashDisposition::Normal,
+            ) => {
+                self.events.push_back(ConnectionEvent::AntiThrashCleared);
+            }
+            _ => {}
+        }
+    }
+
+    /// Tell the anti-thrash detector that a healthy first-op-after-attach
+    /// completed (e.g. a `SendReceipt` or delivered `Message`). Per ADR-0028,
+    /// this is the explicit reset signal that proves the broker has
+    /// stabilised. Clears any active cooldown and emits
+    /// [`ConnectionEvent::AntiThrashCleared`] if the cooldown was active.
+    pub fn record_first_op_success(&mut self, now: Instant) {
+        let was_cooldown = matches!(
+            self.anti_thrash.tick(now),
+            crate::anti_thrash::AntiThrashDisposition::Cooldown { .. }
+        );
+        self.anti_thrash.record_first_op_success();
+        if was_cooldown {
+            self.events.push_back(ConnectionEvent::AntiThrashCleared);
+        }
+    }
+
+    /// Inspect the current anti-thrash disposition. `now` is the engine's
+    /// `Instant::now()` snapshot. Sans-io: the state machine never reads the
+    /// clock itself.
+    #[must_use]
+    pub fn anti_thrash_tick(&self, now: Instant) -> crate::anti_thrash::AntiThrashDisposition {
+        self.anti_thrash.tick(now)
     }
 
     /// Reset the state machine for a fresh handshake on a new transport. Used by the
@@ -1403,6 +1494,13 @@ impl Connection {
                         last_sequence_id: ok.last_sequence_id.unwrap_or(-1),
                         schema_version: ok.schema_version.unwrap_or_default(),
                     });
+                    // ADR-0028 anti-thrash: feed the successful re-attach into the
+                    // detector. No-op when the detector is disabled (default).
+                    self.record_reattach_outcome(
+                        now,
+                        crate::anti_thrash::ReAttachHandle::Producer(handle),
+                        crate::anti_thrash::ReAttachOutcomeKind::ReAttachOk,
+                    );
                 }
             }
             pb::base_command::Type::Success => {
@@ -1419,6 +1517,13 @@ impl Connection {
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
                     self.events
                         .push_back(ConnectionEvent::SubscribeAcked { handle });
+                    // ADR-0028 anti-thrash: feed the successful subscribe ack into
+                    // the detector. No-op when the detector is disabled (default).
+                    self.record_reattach_outcome(
+                        now,
+                        crate::anti_thrash::ReAttachHandle::Consumer(handle),
+                        crate::anti_thrash::ReAttachOutcomeKind::ReAttachOk,
+                    );
                 }
                 if let Some(PendingRequestKind::ConsumerSeek { handle }) = kind {
                     if let Some(c) = self.consumers.get_mut(&handle) {

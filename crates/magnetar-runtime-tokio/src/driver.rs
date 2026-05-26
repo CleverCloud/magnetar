@@ -398,6 +398,56 @@ async fn supervised_driver_loop(
             return last_inner_result;
         };
 
+        // ADR-0028: the inner loop just exited because the socket closed (or
+        // errored). If the transport closed inside the supervisor's
+        // `drop_grace` of the most-recent successful re-attach, feed the drop
+        // into the anti-thrash detector. This is the engine-side attribution
+        // step — the per-pair `drop_within` knob on the threshold is the
+        // strict policy gate that actually decides whether the paired entry
+        // counts towards tripping cooldown.
+        if cfg.anti_thrash_threshold.is_some() {
+            let now = std::time::Instant::now();
+            let should_record = {
+                let conn = shared.inner.lock();
+                conn.anti_thrash_state()
+                    .last_reattach_at()
+                    .is_some_and(|t| now.saturating_duration_since(t) <= cfg.drop_grace)
+            };
+            if should_record {
+                shared.inner.lock().record_reattach_outcome(
+                    now,
+                    // Diagnostic handle — the detector cares only about the
+                    // timestamp, so use any producer-handle marker. The real
+                    // pairing happens inside `AntiThrashState::record`.
+                    magnetar_proto::ReAttachHandle::Producer(magnetar_proto::ProducerHandle(0)),
+                    magnetar_proto::ReAttachOutcomeKind::TcpDropAfterReAttach,
+                );
+            }
+        }
+
+        // ADR-0028: if the anti-thrash detector has armed a cooldown, sleep
+        // until it expires before the next redial. This stacks above the
+        // per-handle backoff (the inner backoff loop below still runs after).
+        let cooldown_until = {
+            let conn = shared.inner.lock();
+            match conn.anti_thrash_tick(std::time::Instant::now()) {
+                magnetar_proto::AntiThrashDisposition::Cooldown { until } => Some(until),
+                magnetar_proto::AntiThrashDisposition::Normal => None,
+            }
+        };
+        if let Some(until) = cooldown_until {
+            let now = std::time::Instant::now();
+            if until > now {
+                let dur = until.saturating_duration_since(now);
+                tracing::warn!(
+                    "supervisor: anti-thrash cooldown engaged; sleeping {dur:?} before next redial"
+                );
+                tokio::time::sleep(dur).await;
+            }
+            // Clear the cooldown so the next disconnect can re-arm it.
+            shared.inner.lock().anti_thrash_state_mut().clear_cooldown();
+        }
+
         // Fresh Backoff per disconnect: Java resets the schedule on a successful reconnect, so
         // we reset on a *successful* handshake too. The attempt counter is the only piece of
         // state that survives across reconnect attempts here.

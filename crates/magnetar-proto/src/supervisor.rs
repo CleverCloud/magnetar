@@ -25,6 +25,7 @@
 
 use core::time::Duration;
 
+use crate::anti_thrash::AntiThrashThreshold;
 use crate::backoff::Backoff;
 
 /// Configuration for the auto-reconnect supervisor.
@@ -45,6 +46,44 @@ pub struct SupervisorConfig {
     /// forever (matching Java's default). `Some(N)` gives up after `N` consecutive
     /// failures and surfaces the last error to the caller.
     pub max_attempts: Option<u32>,
+    /// Anti-thrash detector threshold (ADR-0028). `None` (the default)
+    /// disables the detector and preserves current behaviour — the
+    /// supervisor uses only per-handle backoff and the in-band transient
+    /// retry path.
+    ///
+    /// When `Some(threshold)`, the supervisor escalates to a
+    /// connection-level cooldown once
+    /// `threshold.successful_attaches` consecutive re-attaches succeed and
+    /// each is followed by a TCP-level drop within `threshold.drop_within`
+    /// (all inside `threshold.window`). The cooldown floor is
+    /// [`Self::max_backoff_after_thrash`].
+    ///
+    /// Recommended starting values when opting in (see [ADR-0028 §"Defaults
+    /// and migration"](https://github.com/FlorentinDUBOIS/magnetar/blob/main/specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)):
+    /// `AntiThrashThreshold { successful_attaches: 5, window:
+    /// Duration::from_secs(2), drop_within: Duration::from_millis(50) }` with
+    /// `max_backoff_after_thrash = Duration::from_secs(30)`.
+    pub anti_thrash_threshold: Option<AntiThrashThreshold>,
+    /// Driver-side grace window for attributing a transport close to a
+    /// recent successful re-attach. When a `TransportClosed` arrives within
+    /// `drop_grace` of the most recent
+    /// [`ConnectionEvent::ProducerReady`](crate::ConnectionEvent::ProducerReady)
+    /// or [`ConnectionEvent::SubscribeAcked`](crate::ConnectionEvent::SubscribeAcked),
+    /// the engine driver feeds it into the anti-thrash detector as a
+    /// [`ReAttachOutcomeKind::TcpDropAfterReAttach`](crate::ReAttachOutcomeKind::TcpDropAfterReAttach).
+    /// Defaults to `Duration::from_millis(500)`.
+    ///
+    /// The stricter per-pair `drop_within` knob on
+    /// [`AntiThrashThreshold`] decides whether the paired entry actually
+    /// counts toward the threshold — `drop_grace` is the engine-side
+    /// attribution window only.
+    pub drop_grace: Duration,
+    /// Cooldown floor applied once
+    /// [`Self::anti_thrash_threshold`] trips. Stacks above the per-handle
+    /// backoff; the supervisor sleeps until at least
+    /// `now + max_backoff_after_thrash` before its next `Transport::connect`
+    /// once the cooldown engages. Default `Duration::from_secs(30)`.
+    pub max_backoff_after_thrash: Duration,
 }
 
 impl Default for SupervisorConfig {
@@ -54,6 +93,9 @@ impl Default for SupervisorConfig {
             max_backoff: Duration::from_secs(60),
             mandatory_stop: Duration::from_secs(60 * 60),
             max_attempts: None,
+            anti_thrash_threshold: None,
+            drop_grace: Duration::from_millis(500),
+            max_backoff_after_thrash: Duration::from_secs(30),
         }
     }
 }
@@ -94,9 +136,28 @@ mod tests {
             max_backoff: Duration::from_secs(30),
             mandatory_stop: Duration::from_secs(120),
             max_attempts: Some(5),
+            ..SupervisorConfig::default()
         };
         assert_eq!(cfg.initial_backoff, Duration::from_millis(50));
         assert_eq!(cfg.max_attempts, Some(5));
+        assert!(cfg.anti_thrash_threshold.is_none());
+        assert_eq!(cfg.drop_grace, Duration::from_millis(500));
+        assert_eq!(cfg.max_backoff_after_thrash, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn anti_thrash_defaults_are_off_with_documented_recommendations() {
+        let cfg = SupervisorConfig::default();
+        assert!(
+            cfg.anti_thrash_threshold.is_none(),
+            "anti-thrash default must be OFF (ADR-0028 §Defaults)"
+        );
+        assert_eq!(cfg.drop_grace, Duration::from_millis(500));
+        assert_eq!(cfg.max_backoff_after_thrash, Duration::from_secs(30));
+        let recommended = AntiThrashThreshold::recommended();
+        assert_eq!(recommended.successful_attaches, 5);
+        assert_eq!(recommended.window, Duration::from_secs(2));
+        assert_eq!(recommended.drop_within, Duration::from_millis(50));
     }
 
     #[test]
@@ -106,6 +167,7 @@ mod tests {
             max_backoff: Duration::from_secs(10),
             mandatory_stop: Duration::from_secs(60),
             max_attempts: None,
+            ..SupervisorConfig::default()
         };
         let mut backoff = cfg.build_backoff(0);
         // First next() returns the initial delay with up to 20% jitter subtracted.
