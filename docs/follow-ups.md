@@ -26,177 +26,90 @@ this section only tracks shipping status:
   v0.2.0 (commit `96d6f74`).
 - **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
   first cut: BrokerWorkload + ClientWorkload under
-  `SimulationBuilder`, 16-seed sweep (commit `c23f6fd`). Follow-on:
-  extend broker workload with SEND / SUBSCRIBE / SEEK / ACK; add
-  invariants (at-least-once, monotonic message-id, no-dup-on-acked,
-  supervisor-recovers-within-N-ticks).
-- **D1 Transaction surface** — `impl<E: Engine + TransactionApi>
-  PulsarClient<E>` works on both engines (commits `1258b89` +
-  D1 phase 2-4 commit + `ab9041b` parity flip).
+  `SimulationBuilder`, 16-seed sweep (commit `c23f6fd`). Follow-on
+  with stateful broker + invariant assertions (at-least-once,
+  monotonic message-id, no-dup-on-acked, supervisor-recovers-within-N)
+  landed in `aaa0661`.
+- **D1 surface train** — concrete generic types
+  `magnetar::<Surface><T, E: Engine>` (no GATs) on all seven
+  dependent surfaces. Transaction (`ab9041b`), Reader, TableView,
+  PartitionedProducer have full impl-body lifts; TypedSchemas,
+  MultiTopicsConsumer, PartitionedConsumer, and PatternConsumer
+  carry their cascading type parameter (`Inner<C>`, `NamedConsumer<C>`,
+  `<C>` / `<P>`) but their inherent impl methods stay tokio-bound
+  pending the per-surface builder lifts (see
+  [next section](#per-surface-builder--impl-body-lifts)).
+- **D1 base builders** — `ConsumerBuilder<'a, E: Engine = TokioEngine>`,
+  `ProducerBuilder<'a, E: Engine = TokioEngine>`, and
+  `ReaderBuilder<E: Engine = TokioEngine>` lifted via
+  `SubscribeApi` / `CreateProducerApi` extension traits implemented
+  on both runtime `Client` types (commits `cc61d4d`, `0b6f363`,
+  `08c89ca`).
+- **E2E sweep stabilisation** — thirteen broker-driven runtime bugs
+  surfaced by the e2e suite (#55 through #73) all landed. Highlights:
+  ack-then-flow ordering on post-seek resubscribe (`f4872d7`),
+  accumulated in-flight publish snapshots across reset cycles
+  (`0e47e14`), lookup-then-retry on transient open errors
+  (`c1bc2c6` + `6da2e80`), `is_user_closed` gate so transport drops
+  trigger reconnect (`86398a8`), batch flush + per-message seq + receipt
+  sentinel (`1508a64`), txn TTL milliseconds + TC bootstrap + txn-id on
+  metadata (`19a8df5`), Java-compatible KeyValue inline schema
+  (`623a5b3`), chunk-payload metadata reserve (`14cc7f8`),
+  CloseProducer treated as transient (`aa9b3fc`). E2E sweep:
+  **19 files PASS / 51 tests** with one residual (#74 below).
 
+---
 
-## Moonpool engine — implementation backlog
+## Per-surface builder + impl-body lifts
 
-### Façade surface bound to `PulsarClient<MoonpoolEngine<P>>`
+**Status.** Four façade surfaces still phantom-lift: their structs
+carry the engine-generic type parameter but their inherent impl
+blocks live on `impl PulsarClient<TokioEngine>` only.
 
-**Status.** Partitioned producer / partitioned consumer /
-MultiTopicsConsumer / PatternConsumer / Reader / TableView /
-transactions / typed schemas do not compile against the moonpool
-engine. Each surface needs:
+- `TypedProducer<S, P>` / `TypedConsumer<S, C>` — phantom-lift in
+  commit `6a83ea2`; `TypedProducerBuilder` / `TypedConsumerBuilder`
+  themselves are still `<'a, S>` (no `E`).
+- `MultiTopicsConsumer<C>` — phantom-lift in commit `b51680a`;
+  `MultiTopicsConsumerBuilder` is still `<'a>`. The
+  `add_topic` / PIP-145 `auto_update` reconciliation paths
+  subscribe new children through tokio-specific helpers.
+- `PartitionedConsumer` — type alias for `MultiTopicsConsumer<C>`;
+  lifts transitively when MultiTopicsConsumer lifts.
+- `PatternConsumer<C>` — phantom-lift in commit `31f9cbe`; same
+  blocker as MultiTopicsConsumer plus topic-watcher subscription
+  needs `SubscribeApi`-mediated child consumer creation.
 
-1. The corresponding moonpool `Client` method ported from
-   `magnetar-runtime-tokio` (`new_txn`, `add_partition_to_txn`,
-   `end_txn`, partitioned-metadata lookup, etc.). ~150–300 LOC per
-   surface.
-2. The façade method made generic over `Engine`, dropping its
-   `impl PulsarClient<TokioEngine>` block.
-3. All four test layers per ADR-0024 + e2e where applicable.
+The base `ConsumerBuilder` / `ProducerBuilder` / `ReaderBuilder`
+are already lifted and route through the
+[`SubscribeApi`](../crates/magnetar/src/engine.rs) /
+[`CreateProducerApi`](../crates/magnetar/src/engine.rs) extension
+traits, so the remaining work breaks into two patterns:
 
-ADR-0026 §D1 locked the trait shape: **concrete generic types
-`magnetar::<Surface><T, E: Engine>`**, not `Engine::Producer<T>` /
-`Engine::Consumer<T>` GATs. The Engine trait stays at ADR-0025
-phase 1 surface (task + timer primitives); per-surface lifts add
-their own engine-agnostic indirection (e.g. an
-`EngineTransactionApi` extension trait implemented per engine on
-its own `Client` type).
+1. **Helper-method ports** to the `ConsumerApi` / `ProducerApi`
+   trait surface for the methods the typed surfaces invoke (e.g.
+   `compression`, `last_sequence_id_published`, `pending_count`,
+   `batch_len`, `batch_bytes`, `ack_grouped`,
+   `ack_grouped_cumulative`, `available_in_queue`,
+   `available_permits`, `drain_dead_letter`,
+   `has_reached_end_of_topic`, `has_received_any_message`,
+   `is_inactive`, `is_paused`, `receive_batch`,
+   `receive_with_timeout`, the `ack_with_txn` family). Each port
+   needs the moonpool runtime equivalent before the trait method
+   is added.
+2. **Inner-builder genericity** — `TypedProducerBuilder<'a, S>`,
+   `TypedConsumerBuilder<'a, S>`, `MultiTopicsConsumerBuilder<'a>`,
+   `PatternConsumerBuilder<'a>` all gain an `E: Engine = TokioEngine`
+   type parameter, then route their `.create()` / `.subscribe()` /
+   `.subscribe_all()` calls through the base `ConsumerBuilder` /
+   `ProducerBuilder` (already engine-generic).
 
-See [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D1 + [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
-§Consequences.
-
-#### Landed — Transaction + Reader + TableView surfaces
-
-**Transaction (PIP-31).** `new_transaction` /
-`register_partition_to_transaction` /
-`register_subscription_to_transaction` / `commit_transaction` /
-`abort_transaction` lifted to `impl<E: Engine + TransactionApi>
-PulsarClient<E>`. Both `PulsarClient<TokioEngine>` and
-`PulsarClient<MoonpoolEngine<P>>` carry the surface.
-
-**Reader.** `Reader<C: ConsumerApi>` with default
-`C = magnetar_runtime_tokio::Consumer` (existing callers
-unchanged). Generic methods route through the trait;
-tokio-engine-specific methods (`read_next_with_timeout`,
-`read_next_fut`, `close`, `seek_to_earliest`) stay on the tokio
-specialisation.
-
-**TableView.** `TableView<C: ConsumerApi + Clone>` with the same
-default-type-arg pattern. The drain task uses `tokio::spawn`
-regardless of engine (per ADR-0025: both engines schedule on
-tokio; determinism comes from substituting providers, not from
-replacing the executor). `TableView::stats()`,
-`TableView::is_connected()`, `TableView::last_message_id()`
-dispatch through `ConsumerApi`.
-
-**Producer/Consumer extension traits.** `ProducerApi` + `ConsumerApi`
-defined in `magnetar::engine`, implemented by both runtimes on
-their `Producer<P>` / `Consumer<P>` types. Trait surface grew
-through the lift train; current methods:
-
-- `ProducerApi`: `send`, `flush`, `is_closed`, `is_connected`,
-  `topic`, `name`, `last_sequence_id`, `get_schema`.
-- `ConsumerApi`: `receive`, `ack`, `ack_cumulative`, `negative_ack`,
-  `last_message_id`, `has_message_after`, `get_schema`, `topic`,
-  `subscription`, `name`, `is_closed`, `is_connected`, `stats`.
-
-`magnetar_runtime_moonpool::Consumer` derives `Clone` (required by
-TableView). Compile-time bound checks live in
-`magnetar/src/lib.rs` tests. ADR-0024 test parity: tokio=95
-moonpool=95 preserved.
-
-#### Why an extension trait, not a method on `Engine`
-
-Pulled forward from ADR-0026's rationale: the methods that operate on
-the client state are not "engine primitives" (those are spawn / timer /
-clock — ADR-0025 phase 1). They are **client surfaces**. Putting them
-on the engine trait would mean every engine grew a method per Pulsar
-PIP forever. An extension trait per surface family scales: each PIP
-adds at most one trait, each engine implements only the surfaces it
-supports, and the façade still gets `impl<E: Engine>` because the
-trait bound is `E::ClientState: TransactionApi + ProducerApi + ...`.
-
-#### Next sub-PR — ConsumerBuilder / ProducerBuilder genericity (unblocks 4 phantom-lifted surfaces)
-
-All seven dependent façade surfaces now carry their engine-generic
-type parameter (Transaction, Reader, TableView, PartitionedProducer
-have full impl-body lifts; TypedProducer/TypedConsumer,
-MultiTopicsConsumer/PartitionedConsumer, PatternConsumer are
-phantom-lifted with impl-body still tokio-bound). The four
-phantom-lifted surfaces share one blocker:
-**`ConsumerBuilder` / `ProducerBuilder` are tokio-bound today**.
-
-The blocker shape — `MultiTopicsConsumer::add_topic` (and the
-PIP-145 reconciliation loop in `PatternConsumer::update`)
-subscribes new children via:
-
-```rust,ignore
-let builder = self.inner.template.apply(client.consumer(topic.clone()));
-let consumer = builder.subscribe().await?;
-```
-
-`client.consumer(topic)` is `PulsarClient<TokioEngine>::consumer()`
-which returns `ConsumerBuilder<'_>` — internally bound to the tokio
-`SubscribeRequest`, `MessageDecryptor`, and ultimately
-`magnetar_runtime_tokio::Client::subscribe()`. The Builder lift
-makes the entire chain engine-generic.
-
-**The lift template (mirrors the surface lifts already landed):**
-
-1. **Lift `ConsumerBuilder` to `ConsumerBuilder<'a, E: Engine>`**
-   parameterised over the engine, with default `E = TokioEngine`.
-   Existing callers (`client.consumer(topic)`) continue compiling
-   via the default-type-argument fallback.
-2. **Add a `SubscribeApi` extension trait on `E::ClientState`** with
-   one method:
-   `fn subscribe(&self, req: SubscribeRequest, decryptor: Option<...>)
-   -> impl Future<Output = Result<C, ClientError>>`. Implement on
-   both runtime `Client` types — both already have the equivalent
-   method.
-3. **`ConsumerBuilder::subscribe()`** dispatches through the trait.
-   Returns `impl Future<Output = Result<<E::ClientState as
-   SubscribeApi>::Consumer, ...>>`.
-4. **Same template for `ProducerBuilder`** with `CreateProducerApi`
-   trait + `Client::open_producer` delegate.
-5. **`Reader::create()`** (already lifted) becomes generic over the
-   Builder's `E`.
-6. **The four phantom-lifted surfaces' impl-body lifts**
-   (TypedSchemas, MultiTopicsConsumer, PartitionedConsumer,
-   PatternConsumer) become mechanical: each method that used to
-   call `client.consumer(topic).subscribe()` now dispatches
-   through `<E::ClientState as SubscribeApi>::subscribe`.
-7. **Test parity per ADR-0024** — each new trait method needs a
-   1:1 mirror test on both runtime sides.
-8. **Parity-status rows flip** to ✅/✅ once each surface's
-   impl-body is fully lifted.
-
-**Sans-io invariant**: same as the surface lifts — trait surface
-uses `Pin<Box<dyn Future + Send + '_>>` with no I/O types;
-`magnetar-proto` carries no new deps.
-
-Surface-specific notes (post-Builder genericity):
-
-- **TypedSchemas** (`TypedProducer<S, P>` / `TypedConsumer<S, C>`).
-  Phantom-lifted in commit `6a83ea2`. Helper methods needed on
-  trait surface: `compression`, `last_sequence_id_published`,
-  `pending_count`, `batch_len`, `batch_bytes` (Producer side);
-  `ack_grouped`, `ack_grouped_cumulative`, `available_in_queue`,
-  `available_permits`, `drain_dead_letter`,
-  `has_reached_end_of_topic`, `has_received_any_message`,
-  `is_inactive`, `is_paused`, `receive_batch`,
-  `receive_with_timeout`, the `ack_with_txn` family (Consumer
-  side). All need moonpool ports before adding to trait.
-- **MultiTopicsConsumer** (`MultiTopicsConsumer<C>`). Cascading
-  phantom-lift in commit `b51680a`. Needs Builder genericity for
-  `add_topic` and the `auto_update` reconciliation. The
-  `pause` / `resume` family is already on moonpool.
-- **PartitionedConsumer**. Type alias for `MultiTopicsConsumer`;
-  lifts transitively once `MultiTopicsConsumer` lifts.
-- **PatternConsumer** (`PatternConsumer<C>`). Cascading
-  phantom-lift in commit `31f9cbe`. Same blocker as
-  MultiTopicsConsumer.
+Test parity per
+[ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
+each new trait method needs a 1:1 mirror test on both runtime sides;
+`cargo run -p xtask -- check-runtime-test-parity` is hard-failing.
 
 ```text
-/goal lift `ConsumerBuilder` + `ProducerBuilder` to be engine-generic. Step 1: add `SubscribeApi` extension trait (one method: `subscribe(req, decryptor) -> Result<Consumer, Error>`) and `CreateProducerApi` extension trait (one method: `open_producer(req) -> Result<Producer, Error>`) in `magnetar::engine`. Delegate impls on `magnetar_runtime_tokio::Client` (existing inherent methods) and `magnetar_runtime_moonpool::Client` (existing inherent methods). Step 2: lift `ConsumerBuilder<'a>` to `ConsumerBuilder<'a, E: Engine = TokioEngine>` and `ProducerBuilder<'a>` similarly; route `.subscribe()` / `.create()` through the new trait. Step 3: lift `Reader<C>::create` to be generic over `E`. Step 4: lift the impl-bodies of `TypedProducer<S, P>`, `TypedConsumer<S, C>`, `MultiTopicsConsumer<C>`, `PatternConsumer<C>` to dispatch via the new traits; for methods that need helpers not on `ConsumerApi`, split into tokio-specialisation impl blocks (same pattern PartitionedProducer used). Step 5: test parity per ADR-0024 — mirror tests on both runtime sides. Step 6: parity-status + README row flips for the four phantom-lifted surfaces. Validation: `cargo +nightly fmt && cargo build --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo run -p xtask -- check-runtime-test-parity && cargo run -p xtask -- check-no-channels && cargo run -p xtask -- check-no-io-deps && RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps`.
+/goal lift the four phantom-lifted surfaces (TypedProducer/TypedConsumer, MultiTopicsConsumer, PartitionedConsumer, PatternConsumer) so they compile on both engines. Per surface: (1) audit the inherent impl block for helper methods not on ConsumerApi/ProducerApi; (2) port each missing helper to magnetar-runtime-moonpool first so the trait is implementable on both sides; (3) add the helper to ConsumerApi/ProducerApi with a mirror test on both runtimes (ADR-0024 1:1 parity); (4) lift the inner Builder (TypedProducerBuilder, TypedConsumerBuilder, MultiTopicsConsumerBuilder, PatternConsumerBuilder) to carry `E: Engine = TokioEngine`, defaulting to keep existing callers compiling; (5) route .create()/.subscribe()/.subscribe_all() through the engine-generic base builders; (6) flip the corresponding parity-status.md rows from 🟡 to ✅ and the README parity matrix accordingly. Validation: `cargo +nightly fmt && cargo build --workspace --all-features && cargo clippy --workspace --all-features --all-targets -- -D warnings && cargo test --workspace --all-features && cargo run -p xtask -- check-runtime-test-parity && cargo run -p xtask -- check-no-channels && cargo run -p xtask -- check-no-io-deps && RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" cargo doc --workspace --all-features --no-deps`.
 ```
 
 ---
@@ -230,7 +143,8 @@ task, which itself isn't being polled. The result is a ~30 s stall per
 keeps a 25 ms `Kicker` to pulse `driver_waker.notify_one()` and bridge
 the LocalSet pump gap.
 
-**Unblock.** Closed by [D2 — vendor moonpool-sim](#d2--vendor-moonpool-sim-into-the-workspace);
+**Unblock.** Closed by the future moonpool-sim integration (see
+the D2 line under [What landed](#what-landed-since-the-multi-source-design-synthesis));
 the simulator's deterministic scheduler drives both sides without
 `spawn_local`. An alternative is restructuring the runner to spawn the
 driver via plain `tokio::spawn`, giving up moonpool-sim compatibility
@@ -248,10 +162,8 @@ broker speaks a deliberately minimal subset of the wire protocol; new
 opcodes get added per trace). Seek-per-partition is the smallest
 (~120 LOC; broker tracks partition id, dispatches `Seek` by partition).
 Transactional ack needs `CommandEndTxn` + per-txn ack ledger in the
-broker (~180 LOC); blocked on [D1](#d1--engine-trait-extension-adr-0025)
-because the txn façade only compiles on tokio today.
-`cryptoFailureAction` is the largest (~240 LOC) and needs the crypto
-bridge ported to moonpool first.
+broker (~180 LOC). `cryptoFailureAction` is the largest (~240 LOC)
+and needs the crypto bridge ported to moonpool first.
 
 ```text
 /goal land golden-trace seek-per-partition in magnetar-differential. Single commit. Extends ScriptedBroker.SessionState with per-partition message_id routing, adds Op::SeekPartition variant + Event::SeekedPartition, and a 3-step trace asserting tokio and moonpool agree on per-partition seek replay. All four test layers per ADR-0024.
@@ -263,13 +175,15 @@ bridge ported to moonpool first.
 
 ### Cross-runtime test + coverage closure (ADR-0024)
 
-**Status.** [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
+**Status.**
+[ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
 landed 2026-05-22 with both `cargo xtask check-sim-coverage` and
 `cargo xtask check-runtime-test-parity` enabled and hard-failing. The
 2026-05-22 baseline was `tokio=65 moonpool=61` (gap of 4); subsequent
 landings (memory-limit slab, AutoClusterFailover moonpool port, TLS
-chaos fixtures, race-stress coverage, lookup-before-open) brought it
-to `tokio=91 moonpool=91`. Pre-existing moonpool patch-coverage of
+chaos fixtures, race-stress coverage, lookup-before-open, the D1
+surface train, the post-seek ack-then-flow fix in `f4872d7`) brought
+it to `tokio=95 moonpool=95`. Pre-existing moonpool patch-coverage of
 older surface lines is unmeasured today.
 
 **Unblock.** Dedicated session driven by the local prompt at
@@ -367,11 +281,12 @@ PIP-466's clean-room style (immutable builders, no
 - **PIP-33 — Replicated subscriptions.** Subscription state is
   replicated across geo-replicated topics so a consumer can resume on
   a different cluster after failover. Wire-protocol additions:
-  per-snapshot markers in the data stream + `CommandReplicatedSubscription
-  Snapshot{Request,Response}`. Substantial broker-side coupling.
-  **Defer to v0.2.0**; magnetar's geo-replication story (via
-  `ServiceUrlProvider` + `AutoClusterFailover`) covers most of the
-  use case at the cluster level without subscription-state replication.
+  per-snapshot markers in the data stream +
+  `CommandReplicatedSubscriptionSnapshot{Request,Response}`.
+  Substantial broker-side coupling. **Defer to v0.2.0**; magnetar's
+  geo-replication story (via `ServiceUrlProvider` +
+  `AutoClusterFailover`) covers most of the use case at the cluster
+  level without subscription-state replication.
 
 **Unblock.** Scoped for v0.2.0. None of these PIPs blocks v0.1.0
 parity per [ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md);
@@ -383,315 +298,55 @@ all four can land independently as v0.2.0 follow-ups.
 
 ---
 
-## E2E-discovered runtime bugs
+## Open runtime bugs
 
-After the test-fixture bootstrap fixes (#55) and the wire-protocol
-bugs surfaced by the e2e sweep, the state is:
+### #74 — Post-restart disconnect cascade (broker-driven)
 
-- **#56** producer rejected after broker reconnect — **PARTIAL** (commit
-  on main): broker-initiated `CommandCloseProducer` no longer flips
-  `closed=true`, so `rebuild_producers` can re-attach. Remaining
-  issue: post-restart send doesn't get a receipt — tracked as **#66**.
-- **#57** chunked send hangs — **FIXED**. Per-chunk payload size now
-  reserves 1 KiB for the wire-frame overhead (matches Java's
-  `chunkMaxMessageSize`).
-- **#58** KeyValue inline schema hangs — **FIXED**. Schema_data is now
-  emitted in the Java-compatible binary layout
-  (`[u32 len][bytes][u32 len][bytes]`) and the seven KeyValue
-  properties are populated on `CommandProducer.schema.properties`.
-- **#63** PIP-4 encryption (roundtrip / failure actions / chunking)
-  — **FIXED**. Combination of #57 (chunked frame size) + the
-  `InitialPosition::Earliest` test-fixture fix on the crypto e2e
-  tests.
-- **#65** seek_per_partition resubscribe — **PARTIAL** (commit on main).
-  Three coupled fixes landed: duringSeek drop in `Consumer::deliver`,
-  transient `CommandCloseConsumer` (matches #56), explicit
-  `CommandRedeliverUnacknowledgedMessages` after resubscribe. Broker
-  still doesn't dispatch post-seek backlog when the same `consumer_id`
-  re-subscribes — likely needs fresh `consumer_id` allocation, tracked
-  as **#67**.
-- **#68** e2e_transactions (PIP-31, all three tests) — **FIXED**. Four
-  Java-parity gaps closed in `fix/txn-ttl-millis`:
-  1. `txn_ttl_seconds` is actually milliseconds on the wire (Pulsar
-     `TransactionMetadataStoreService.newTransaction(tcId, timeoutInMills,
-     ...)` passes `command.getTxnTtlSeconds()` directly into
-     `timeoutInMills`). magnetar used to divide by 1000, so 30 s arrived
-     at the broker as 30 ms and the TC auto-aborted before the next
-     RPC. Fix: stop the conversion; the docstring on
-     `magnetar_proto::txn::TxnClient::new_txn` now warns about the
-     mis-named field.
-  2. The TC partition store is loaded on demand. The first
-     `CommandNewTxn` against a fresh broker hit
-     `TransactionMetadataStoreService.stores.get(tcId) == null` and
-     returned `TransactionCoordinatorNotFound`. Fix: new
-     `Connection::tc_client_connect(tc_id)` mirrors Java's
-     `TransactionMetaStoreHandler.connectionOpened` →
-     `Commands.newTcClientConnectRequest`. `Client::new_txn` runs a
-     one-shot bootstrap (`lookup_topic` then `tc_client_connect`)
-     guarded by `ConnectionShared::txn_bootstrapped`; subsequent calls
-     skip it. Lookup alone is not enough — bundle ownership transfer is
-     async; the `TC_CLIENT_CONNECT_REQUEST` round-trip is what waits for
-     `handleMetadataStoreLoad(tcId)`.
-  3. Batched sends dropped the txn id. The flush path hard-coded
-     `CommandSend.txnid_*: None`, so any `send().await` of a txn
-     message that hit `add_to_batch` bypassed `TransactionBuffer`.
-     `BatchContainer` now carries `txn_id`; `queue_send` flushes when
-     a non-matching `txn_id` arrives (mirrors Java
-     `ProducerImpl.canAddToBatch`).
-  4. Java's `TypedMessageBuilderImpl#beforeSend` also stamps the txn
-     bits on `MessageMetadata` — the broker's `TopicTransactionBuffer`
-     routes off the metadata, not `CommandSend`. Without those bits,
-     entries went straight to the dispatcher and aborts couldn't
-     suppress delivery (the failing
-     `e2e_txn_abort_drops_messages`). Fix: set
-     `metadata.txnid_least_bits` / `txnid_most_bits` in all three send
-     paths (`emit_single`, `flush_batch`, `emit_chunked`).
+**Status.** Surfaced while closing #73 (in-flight publish snapshot
+accumulation) and #72 (lookup-then-retry on transient open errors).
+The supervised reconnect path is now correct on the magnetar side:
+transient `CommandError` retains state, a fresh `CommandLookupTopic`
+runs before `retry_producer_open` / `retry_consumer_subscribe`,
+in-flight `OpSend` snapshots survive multiple reset cycles, and a
+re-attached producer replays its cached wire frames. End-to-end,
+this lets `e2e_supervised_reconnect_across_broker_restart` reach the
+rebuild step.
 
-  Result: `e2e_transactions` is 3/3 PASS. Implemented entirely on the
-  tokio runtime; moonpool simulator does not exercise PIP-31 today.
-- **#69** e2e_batch_chunk (all three tests) — **FIXED**. Three batch-
-  related defects in `fix/batch-fullness-flush`:
-  1. `BatchContainer` never emitted on fullness. `add_to_batch`
-     buffered messages but the producer only flushed when
-     `batching_max_publish_delay` (60 s in the e2e test) elapsed.
-     Java's `ProducerImpl#doBatchSendAndAdd` triggers a flush the
-     moment the container fills — added `flush_batch_if_full` invoked
-     from `queue_send`.
-  2. Every batched send was returned the same `seq_id` (the prior
-     `last_sequence_id_pushed`), so the single `OpSend` pushed at flush
-     time could only wake one of the N user-side `SendFut`s.
-     `add_to_batch` now mints a per-message sequence id and pushes a
-     per-message `OpSend(num_messages=1, replay_frames=[])`;
-     `flush_batch` reuses `batch.lowest_sequence_id` /
-     `highest_sequence_id` for the wire frame instead of bumping the
-     counter again.
-  3. Pulsar's broker echoes `highest_sequence_id = -1L` (encoded as
-     `u64::MAX` over `optional uint64`) on receipts for non-batched
-     sends. A naive `for seq in lowest..=receipt.highest_sequence_id`
-     fan-out iterated up to `u64::MAX` and panicked with
-     `capacity overflow` on the second single send. The receipt handler
-     now treats `highest == u64::MAX || highest < lowest` as the
-     "no batch" sentinel and resolves a single entry; only
-     `highest >= lowest && highest != u64::MAX` triggers the real
-     fan-out.
+What still fails is **broker-side** behaviour after the restart:
+broker creates the producer, then drops the TCP connection ~10 ms
+later. Broker logs show `"Cleared producer created after connection
+was closed"` followed by a fresh `"Subscribing on topic"` + immediate
+close, several iterations per second. This is consistent with a
+bundle-ownership / load-balancing churn window where the broker
+accepts the create command but the bundle is reassigned (or the
+broker is mid-`unloadBundle`) before the producer can actually send.
 
-  The `e2e_producer_batching_flushes_on_max_msgs` test was also
-  re-shaped to enqueue all 5 sends before awaiting any — mirrors Java
-  `BatchMessageTest`'s "fire all `sendAsync`, then join" pattern; the
-  sequential `await` would never fill the batch.
+E2E impact: `e2e_supervised_reconnect_across_broker_restart` times
+out and `e2e_cluster_failover` fails. All 19 other e2e files (51
+tests) pass.
 
-### Remaining follow-ups
+**Unblock.** Two-pronged:
 
-### #64 — PartitionedProducer RoundRobin (CLOSED — misdiagnosis)
+1. **Broker investigation.** Trace exactly which broker code path
+   drops the connection. Candidate hypotheses to confirm or rule
+   out: (a) `LoadManagerShared.shouldAntiAffinityNamespaceUnload`
+   triggering an unload mid-create; (b) the broker rejecting the
+   reconnect because the previous session epoch is still considered
+   live; (c) testcontainers' `docker restart` racing the
+   ZooKeeper session timeout (broker fences itself).
+2. **Magnetar-side anti-thrash.** If the cascade is fundamentally
+   broker-side, add a tracked-by-handle "transient open success rate"
+   window: if N successful re-attaches in M seconds all get dropped
+   within K ms, escalate from per-handle retry to a connection-level
+   backoff (re-redial after `max_backoff_after_thrash`). This
+   protects the broker without changing the success path.
 
-The earlier 0/20/20/0 distribution was caused by the e2e test
-using `client.producer(topic)` instead of
-`client.partitioned_producer(topic)`. With the corrected test
-producer (`fix/seek-per-partition`) the broker shows backlog
-10/10/10/10 across all 4 partitions — `RoundRobin` works correctly.
+Either path needs Pulsar-broker-source familiarity to confirm the
+root cause before committing the magnetar-side mitigation.
 
-### #66 — Post-restart send doesn't get receipt (FIXED)
-
-**Root cause.** `Connection::is_closed()` returned `true` for both
-user-initiated close (`Closing` / `Closed`) AND transport drop
-(`Failed`, the state `mark_disconnected()` sets on `PeerClosed`).
-The supervised driver loop's reconnect gate
-(`driver.rs:275`, `driver.rs:315` in tokio; the moonpool runtime
-mirror) checked `is_closed()` and bailed out the instant the broker
-went away — the auto-reconnect loop never even started a second
-attempt.
-
-**Fix.** New `Connection::is_user_closed()` that returns `true` only
-for `Closing` / `Closed` (NOT `Failed`). Both supervisor loops now
-gate on `is_user_closed()` so a transport drop falls into the
-backoff / redial / `rebuild_producers` / `rebuild_consumers` path
-instead of returning. Unit test
-`is_user_closed_excludes_failed_so_supervisor_can_reconnect` locks
-the contract.
-
-**Validation.** A manual probe against an externally-managed broker
-restarted via `docker restart` confirms the first
-`producer.send().await` after the broker comes back resolves with
-`Ok(MessageId)` (3 ms round-trip). The full
-`e2e_supervised_reconnect_across_broker_restart` test still fails,
-but for a separate testcontainers-specific reason: `bin/pulsar
-standalone` exits cleanly on the `SIGTERM` from
-`container.stop_with_timeout()` and `container.start()` does NOT
-re-run the entrypoint. The supervisor sits in a `Connection
-refused` retry loop until the test budget runs out. Fixing that
-needs the test to use `docker restart <id>` (re-executes the
-entrypoint) instead of stop+start — tracked as a separate test-
-infrastructure follow-up below.
-
-**Repro.**
-
-```sh
-cargo test -p magnetar --features e2e --test e2e_reconnect -- --include-ignored --test-threads=1 --nocapture
+```text
+/goal investigate #74 (post-restart disconnect cascade). Phase 1: capture broker logs at TRACE level during `docker restart` of `apachepulsar/pulsar:4.0.4`; identify the code path that drops the TCP connection after a successful `CommandProducer` ack. Phase 2: if broker-side bundle churn is confirmed, draft an ADR for magnetar's anti-thrash policy (per-handle success-rate window + connection-level cooldown) and implement it behind a `SupervisorConfig::anti_thrash_threshold` knob; default off. Phase 3: e2e validation against `e2e_supervised_reconnect_across_broker_restart` + `e2e_cluster_failover`; both must reach `Ok(())` within the existing test budget. Update parity-status.md if any user-visible behavior changes.
 ```
-
-### #70 — `e2e_reconnect` testcontainers restart strategy
-
-The `e2e_supervised_reconnect_across_broker_restart` and
-`e2e_transparent_inflight_publish_replay_across_broker_restart`
-tests both use `container.stop_with_timeout()` + `container.start()`
-to simulate a broker restart. That cycle leaves the container alive
-but without a running `pulsar` process: `bin/pulsar standalone` is
-the container's `CMD`, exits gracefully on `SIGTERM`, and
-`container.start()` (which just re-runs `docker start`) does NOT
-re-execute the `CMD`. The supervisor then sits in a `Connection
-refused` retry loop until the test times out.
-
-**Fix landed.** Both reconnect tests now invoke `docker restart
---time 5 <id>` via `std::process::Command` instead of
-`stop_with_timeout` + `start`. The test wraps the URL in
-[`ControlledClusterFailover`] and calls `set_url(new_host:new_port)`
-after the restart because `docker restart` against testcontainers'
-random port binding picks a fresh host port (verified locally).
-The supervisor reaches the rebuild step and replays producer +
-consumer state — the post-restart `send` then surfaces a separate
-deeper bug tracked as **#71**.
-
-### #71 — Producer / consumer rebuild fails on namespace-bundle-not-served
-
-**Done in `fix/producer-rebuild-transient-retry`.** Three pieces
-landed:
-
-1. `Connection`'s `CommandError` handler now classifies error codes.
-   `MetadataError` (1) / `ServiceNotReady` (6) / `TopicNotFound` (11)
-   are transient (Java's `ProducerImpl.handleProducerCreationError`
-   treats them the same way). On a transient code the producer /
-   consumer state is RETAINED — previously magnetar removed it,
-   leaving every subsequent `send()` / `receive()` against a
-   "unknown producer handle" `InvariantViolation`. New
-   `ProducerOpenFailedTransient` / `SubscribeFailedTransient` events
-   surface the broker code.
-2. New `Connection::retry_producer_open(handle)` and
-   `Connection::retry_consumer_subscribe(handle)` re-emit
-   `CommandProducer` / `CommandSubscribe` for a SINGLE handle. The
-   producer-side variant bumps `epoch`; the consumer-side variant
-   resumes from `last_acked_message_id` when one exists.
-3. The tokio driver's `handle_pending_events` observes the new
-   transient events, spawns a backoff task (`sleep 2 s`), and calls
-   the matching `retry_*` method on the shared connection.
-
-Unit tests:
-- `command_error_on_producer_open_emits_producer_open_failed_transient`
-  pins the retain-state behaviour for `ServiceNotReady`.
-- `command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`
-  pins the drop-state behaviour for `AuthorizationError`.
-- The consumer equivalent
-  `command_error_on_subscribe_emits_subscribe_failed_transient`.
-- The moonpool runtime tests
-  `wait_producer_ready_surfaces_broker_error` /
-  `subscribe_acked_fut_surfaces_broker_error` updated to use the
-  permanent code — transient code now flips them into the retry
-  loop where the user-facing future stays `Pending`.
-
-**Remaining (tracked as #72).** Pulsar's broker emits
-`NamespaceBundleNotServed` as `code == ServiceNotReady` with the
-text `"Please redo the lookup"`. magnetar's retry currently just
-re-issues `CommandProducer` to the same broker, which keeps
-returning the same error because the bundle ownership is only
-re-acquired when a `CommandLookupTopic` triggers it. Thread a
-fresh `lookup_topic` into the retry path (or change
-`rebuild_producers` / `rebuild_consumers` to always lookup first,
-matching Java's `ProducerImpl.connectionOpened` → `lookupRequest`).
-
-### #72 — Producer / consumer retry must redo lookup first
-
-After #71's retry path landed, the supervised reconnect loop now
-correctly retains the producer / consumer state on transient
-errors and re-emits `CommandProducer` / `CommandSubscribe` with
-backoff. But Pulsar's broker reports namespace bundle ownership
-issues as `ServiceNotReady` with the text `"Please redo the
-lookup"`; the retry keeps hitting the same error because magnetar
-re-issues the attach command WITHOUT a fresh
-`CommandLookupTopic`. The broker only re-acquires bundle
-ownership when a lookup arrives.
-
-**Done in `fix/retry-with-lookup`.** The tokio driver's
-transient-error handlers now run a `lookup_then(shared, topic)`
-helper before calling `retry_producer_open` /
-`retry_consumer_subscribe`. `lookup_then` issues a
-`CommandLookupTopic`, awaits the broker's
-`CommandLookupTopicResponse` via a `poll_fn` future bound to the
-existing `PendingOpKey::Request` slot, and only then signals the
-retry. Broker logs confirm the recovery — the topic is recreated,
-a fresh `CommandProducer` lands, broker emits "Created new
-producer", and the subscription is re-attached on the same
-connection.
-
-**Partial fix for #73 in `fix/retry-replay-pending-sends`.** Two
-related defects identified and fixed:
-
-1. `Connection::reset()` wiped `in_flight_publish_snapshots` at
-   the top of every cycle. When the supervisor cycled through
-   `reset()` repeatedly (each post-disconnect rebuild rejected
-   with `NamespaceBundleNotServed`, broker drops connection,
-   redial, reset again) the first reset's snapshot of the user's
-   queued send was overwritten by the second reset's empty
-   pending → snapshot lost forever, send hangs. Fixed: reset now
-   APPENDS new snapshots via `entry.or_default().extend(...)`
-   instead of clearing — `rebuild_producers.remove()` is the
-   single consumer so accumulation is safe.
-2. `retry_producer_open` now also calls `replay_pending_outbound`
-   (new `ProducerState` method) so any `OpSend`s the user enqueued
-   during the transient window get their cached wire frames re-emitted
-   onto outbound after the targeted re-attach. Mirrors the snapshot
-   replay path in `rebuild_producers` but for the single-handle
-   transient case.
-
-After these two fixes the supervisor still gets caught in a
-broker-driven disconnect cascade: rebuild succeeds, broker creates
-the producer, then drops the TCP connection ~10 ms later (broker
-logs "Cleared producer created after connection was closed"
-followed by a fresh `Subscribing on topic` + immediate close,
-several iterations per second). The cascade looks broker-side
-(bundle ownership / load-balancing churn after the restart) but
-needs Pulsar broker investigation to confirm and decide whether
-magnetar should add anti-thrash backoff or stop redialing for a
-configurable window after a transient error. Tracked as **#74**.
-
-### #67 — Fresh consumer_id refactor for post-seek resubscribe (FIXED — wrong diagnosis, real fix is ack-then-flow)
-
-**Real root cause** (discovered while investigating, not the
-consumer_id hypothesis the original ticket carried):
-`resubscribe_consumer_after_seek` emitted `CommandSubscribe +
-CommandFlow + CommandRedeliverUnacknowledgedMessages` in one shot on
-the wire. Pulsar's `ServerCnx.handleFlow` silently drops
-`CommandFlow` for a consumer id that doesn't exist yet — and on the
-post-seek resubscribe path the broker's consumer-id slot is still
-empty until it finishes processing the Subscribe. Result: permits
-were lost, the broker created the consumer with
-`available_permits = 0`, and the dispatcher never pushed the
-post-seek backlog (the "broker confirms backlog 10 but no message
-dispatches" symptom).
-
-**Fix.** Split the proto-layer `resubscribe_consumer_after_seek`
-so it ONLY emits `CommandSubscribe` and returns the request id.
-Runtime layer (`Consumer::seek` in `magnetar-runtime-tokio`) now
-waits for `SubscribeAcked` via `wait_subscribe_acked`, THEN issues
-`initial_flow` + `redeliver_unacked_all` (new public method on
-`Connection` mirroring the previous private `emit_redeliver_unacked`
-empty-list variant). Mirrors Java's
-`ConsumerImpl#reconnectLater` → `connectionOpened` flow: subscribe
-ack first, flow second.
-
-Verification:
-- `cargo test -p magnetar --features e2e --test
-  e2e_seek_per_partition`: 1/1 PASS (was 0/1 FAIL).
-- `cargo test --lib -p magnetar-proto -p magnetar-runtime-tokio
-  -p magnetar -p magnetar-runtime-moonpool`: 422 passed.
-- `cargo clippy --workspace --all-features --all-targets
-  -- -D warnings`: clean.
-- `cargo run -p xtask -- check-runtime-test-parity`: tokio=95
-  moonpool=95.
-
-The original "fresh consumer_id" hypothesis turned out to be a red
-herring — the broker DOES disconnect the old consumer cleanly
-during seek processing and accepts a fresh subscribe with the same
-consumer id. The "pending acks per consumer_id" theory was never
-the bottleneck. No indirection refactor needed.
 
 ---
 

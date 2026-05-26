@@ -409,29 +409,75 @@ the outer `supervised_driver_loop` decides whether to retry. The supervisor:
    correct.
 2. **Resets the state machine** with `Connection::reset()` — this snaps the
    handshake back to `Uninitialized`, bumps the `session_epoch`, drains the
-   pending-op slabs, and surfaces `OpOutcome::SessionLost` to every
-   in-flight user future. Producers / consumers see `is_connected() = false`
-   but stay live.
-3. **Backs off** with a small exponential schedule capped by
+   pending-op slabs, and **accumulates** in-flight publish snapshots into
+   `Connection::in_flight_publish_snapshots` (append, never clear). The
+   snapshot is `rebuild_producers`'s single consumer, so multiple reset
+   cycles within a single rebuild are safe. User-facing send futures stay
+   `Pending`; the snapshot carries enough state to replay them. Producers /
+   consumers see `is_connected() = false` but stay live.
+3. **Gates on `is_user_closed()`** — only the explicit `Closing` / `Closed`
+   states stop the supervisor. The transport-drop state (`Failed`, set by
+   `mark_disconnected`) does NOT count as user-closed, so a TCP drop falls
+   into the backoff / redial path instead of returning. This is the
+   difference between "broker went away" and "user called `.close()`".
+4. **Backs off** with a small exponential schedule capped by
    `ReconnectConfig::max_backoff` (jittered by the engine clock — under
    moonpool-sim this is deterministic per seed).
-4. **Reconnects** through the same `Transport::connect` path used at
-   client init.
-5. **Rebuilds producers and consumers** via
+5. **Reconnects** through the same `Transport::connect` path used at
+   client init (re-resolving the broker URL via the configured
+   `ServiceUrlProvider` on every attempt — this is where PIP-121 plugs in).
+6. **Rebuilds producers and consumers** via
    `Connection::rebuild_producers(now)` and
    `Connection::rebuild_consumers(now)`. Each helper re-emits
-   `CommandProducer` / `CommandSubscribe` for every still-open handle and
-   stamps the new `session_epoch`. User-facing futures stay registered;
-   they get woken when the new producer/consumer IDs are issued by the
-   broker and become live again.
-6. **Drains in-flight publish replays** — Stage 3 follow-up; today the
-   send paths see `SessionLost` and surface an error per send rather than
-   transparently re-queueing. The waker slabs are already cleared by
-   `reset()`.
+   `CommandProducer` / `CommandSubscribe` for every still-open handle,
+   stamps the new `session_epoch`, and replays the in-flight `OpSend`
+   cached wire frames once the broker acks the producer. Consumers
+   replay `initial_flow` followed by an explicit
+   `CommandRedeliverUnacknowledgedMessages` after `SubscribeAcked`
+   (the broker silently drops `CommandFlow` for an unknown
+   `consumer_id`, so the Java `ConsumerImpl#reconnectLater` ordering
+   is mandatory). User-facing futures stay registered; they get woken
+   when the broker re-issues the producer/consumer IDs.
 
 The supervisor never retries past `ReconnectConfig::max_attempts`; on
 exhaustion it propagates the last `EngineError::Io` upward and the
 `Client` is closed.
+
+#### Transient-error retry (per-handle)
+
+Not every failed re-attach needs a full reset cycle. Pulsar's broker
+classifies a subset of `CommandError` codes as transient retry signals:
+`MetadataError` (1), `ServiceNotReady` (6), `TopicNotFound` (11) — the
+same set Java's `ProducerImpl.handleProducerCreationError` retries on.
+A common case is `NamespaceBundleNotServed`, emitted as
+`ServiceNotReady` with the text `"Please redo the lookup"`.
+
+For these codes the supervisor:
+
+1. **Retains state.** `Connection::handle_command_error` emits
+   `ProducerOpenFailedTransient` / `SubscribeFailedTransient` events;
+   the producer / consumer state is NOT removed. Permanent codes
+   (e.g. `AuthorizationError`) still drop state and surface
+   `ProducerOpenFailed` / `SubscribeFailed` to the user.
+2. **Looks up first, then retries.** The driver's
+   `handle_pending_events` runs `lookup_then(topic)` before
+   `Connection::retry_producer_open(handle)` /
+   `retry_consumer_subscribe(handle)`. `lookup_then` issues a
+   `CommandLookupTopic`, waits for the `CommandLookupTopicResponse` via
+   a `poll_fn` future bound to the existing `PendingOpKey::Request`
+   slot, and only then signals the per-handle retry. This is what
+   re-acquires bundle ownership on the broker side.
+3. **Re-emits a single command.** `retry_producer_open` bumps the
+   handle's `epoch`, emits a fresh `CommandProducer`, and calls
+   `ProducerState::replay_pending_outbound` so any `OpSend`s
+   enqueued during the transient window get their cached wire frames
+   re-pushed onto outbound after the targeted re-attach.
+   `retry_consumer_subscribe` resumes from `last_acked_message_id`
+   when one exists.
+
+The transient path is independent of the full Stage 2 reset cycle:
+it keeps the existing connection alive and only rebuilds the
+specific handle that errored.
 
 ### Source
 

@@ -71,23 +71,34 @@ The remaining three façade surfaces — **`MultiTopicsConsumer`**,
 `PatternConsumer<MoonpoolConsumer<P>>` at the type level. The
 inherent impl methods stay tokio-bound because the `add_topic` /
 PIP-145 reconciliation paths subscribe new children via
-`client.consumer(topic).subscribe()` — that calls into
-`PulsarClient::consumer(topic)` which today returns a
-tokio-engine `ConsumerBuilder` only.
+`client.consumer(topic).subscribe()`.
 
-Full impl-body lift requires lifting `ConsumerBuilder` itself
-to be engine-aware (and the matching `ProducerBuilder` for the
-producer side). That sub-PR is queued in `docs/follow-ups.md` as
-the next surface-train task after this round of structural lifts.
+The **base** `ConsumerBuilder<'a, E: Engine = TokioEngine>` /
+`ProducerBuilder<'a, E: Engine = TokioEngine>` /
+`ReaderBuilder<E: Engine = TokioEngine>` are now engine-generic
+(landed via `SubscribeApi` / `CreateProducerApi` extension traits,
+commits `cc61d4d`, `0b6f363`, `08c89ca`). The remaining work for
+each of the four phantom-lifted surfaces is:
 
-The `ConsumerApi` trait surface is comprehensive enough today
+1. lifting the *inner* builder
+   (`TypedProducerBuilder`, `TypedConsumerBuilder`,
+   `MultiTopicsConsumerBuilder`, `PatternConsumerBuilder`) to
+   carry the same `E: Engine = TokioEngine` parameter; and
+2. porting a handful of helper methods to the `ProducerApi` /
+   `ConsumerApi` trait surface (the typed and multi-topics
+   surfaces call methods like `compression`,
+   `last_sequence_id_published`, `pending_count`, the
+   `ack_with_txn` family, `available_in_queue`, etc. that aren't
+   yet on the trait).
+
+See [`follow-ups.md`](follow-ups.md#per-surface-builder--impl-body-lifts).
+
+The `ConsumerApi` trait surface is otherwise comprehensive today
 (receive, ack, ack_cumulative, negative_ack,
 negative_ack_with_delay, redeliver_unacked, unsubscribe,
 seek_to_earliest, seek_to_latest, get_schema, last_message_id,
 has_message_after, last_disconnected_timestamp, topic,
-subscription, name, is_closed, is_connected, stats, close_owned)
-that no further trait-method ports are needed for the impl-body
-lift once the Builder genericity lands.
+subscription, name, is_closed, is_connected, stats, close_owned).
 
 Callers that reach for a tokio-only method on the moonpool engine
 still get a trait-bound compile error, not a silent fallback —
