@@ -12,194 +12,47 @@ deferred or blocked. Items with a `/goal …` block at the bottom of
 their entry are ready to be picked up by an agent team — copy the
 prompt verbatim into a fresh session.
 
----
-
-## What landed (since the multi-source design synthesis)
-
-ADR-0026 locked four design decisions (D1–D4) on 2026-05-23. The
-binding rationale, sources, and decision text live in that ADR;
-this section only tracks shipping status:
-
-- **D4** — `xtask vendor-proto --rev <sha>` (commit `ac1420c`).
-- **D3** — SASL `PLAIN` ✅ + Athenz pre-fetched role token ✅ ship
-  (commit `96d6f74`). SASL Kerberos/GSSAPI also ✅ via `libgssapi`
-  under the `auth-sasl-kerberos` façade feature (commit `db260ea`,
-  ahead of the v0.2.0 milestone per
-  [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md));
-  the multi-round `AUTH_CHALLENGE` continuation reuses the existing
-  `AuthProvider::respond_to_challenge` surface (no new
-  `SaslMechanism` trait). Athenz ZTS round-trip 🟡 remains deferred
-  per ADR-0026 §D3 / [ADR-0030](../specs/adr/0030-athenz-zts-round-trip-scope.md).
-- **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
-  first cut: BrokerWorkload + ClientWorkload under
-  `SimulationBuilder`, 16-seed sweep (commit `c23f6fd`). Follow-on
-  with stateful broker + invariant assertions (at-least-once,
-  monotonic message-id, no-dup-on-acked, supervisor-recovers-within-N)
-  landed in `aaa0661`.
-- **D1 surface train** — concrete generic types
-  `magnetar::<Surface><T, E: Engine>` (no GATs) on all seven
-  dependent surfaces. Transaction (`ab9041b`), Reader, TableView,
-  PartitionedProducer, **MultiTopicsConsumer / PartitionedConsumer /
-  PatternConsumer (pass-2 lift)** have full impl-body lifts.
-  TypedSchemas carry their cascading type parameter (`Inner<C>`,
-  `<C>` / `<P>`) but their inherent impl methods stay tokio-bound
-  pending the per-surface builder lifts (see
-  [next section](#per-surface-builder--impl-body-lifts)).
-- **D1 base builders** — `ConsumerBuilder<'a, E: Engine = TokioEngine>`,
-  `ProducerBuilder<'a, E: Engine = TokioEngine>`, and
-  `ReaderBuilder<E: Engine = TokioEngine>` lifted via
-  `SubscribeApi` / `CreateProducerApi` extension traits implemented
-  on both runtime `Client` types (commits `cc61d4d`, `0b6f363`,
-  `08c89ca`).
-- **E2E sweep stabilisation** — thirteen broker-driven runtime bugs
-  surfaced by the e2e suite (#55 through #73) all landed. Highlights:
-  ack-then-flow ordering on post-seek resubscribe (`f4872d7`),
-  accumulated in-flight publish snapshots across reset cycles
-  (`0e47e14`), lookup-then-retry on transient open errors
-  (`c1bc2c6` + `6da2e80`), `is_user_closed` gate so transport drops
-  trigger reconnect (`86398a8`), batch flush + per-message seq + receipt
-  sentinel (`1508a64`), txn TTL milliseconds + TC bootstrap + txn-id on
-  metadata (`19a8df5`), Java-compatible KeyValue inline schema
-  (`623a5b3`), chunk-payload metadata reserve (`14cc7f8`),
-  CloseProducer treated as transient (`aa9b3fc`). E2E sweep:
-  **19 files PASS / 51 tests** at the time these fixes landed.
-- **ADR-0028 anti-thrash policy — Accepted + implemented** (commit
-  `a083ed2`, closes follow-up #74). Opt-in `SupervisorConfig`
-  knobs (`anti_thrash_threshold`, `drop_grace`,
-  `max_backoff_after_thrash`), default OFF. `magnetar-proto::
-  AntiThrashState` ring + per-Connection observer + `Connection
-  Event::AntiThrashCooldown { until }`. Four-layer tests per
-  ADR-0024 plus a `DropsTcpAfterCreate { delay_ms }` chaos
-  workload. Architecture documentation in `ARCHITECTURE.md`
-  §"Supervised reconnect" / "Anti-thrash policy".
-- **MultiTopics pass-1: moonpool consumer helpers** — 13 net-new
-  methods on `magnetar_runtime_moonpool::Consumer` (commits
-  `5f1368f`, `53669f9`, `0f95a3c`, `008abbf`).
-- **MultiTopics / PartitionedConsumer / PatternConsumer pass-2 lift
-  — LANDED**. `MultiTopicsConsumer<C>` /
-  `PatternConsumer<C>` impl bodies dispatch through the extended
-  `ConsumerApi` trait (17 trait additions: 13 pass-1 helpers +
-  `pause`/`resume`/`seek_to_message`/`seek_to_timestamp` +
-  `unsubscribe(force: bool)` overload + `type Producer: ProducerApi`
-  associated type for the DLQ/retry helpers).
-  `MultiTopicsConsumerBuilder<'a, E>` /
-  `PartitionedConsumerBuilder<'a, E>` /
-  `PatternConsumerBuilder<'a, E>` route `.subscribe()` through the
-  engine-generic `ConsumerBuilder` (`SubscribeApi` dispatch). New
-  `BrokerMetadataApi` extension trait lifts
-  `partitioned_topic_metadata` / `watch_topic_list` /
-  `poll_topic_list_change` onto both runtimes' `Client` so
-  `PulsarClient::partitions_for_topic` /
-  `PulsarClient::topic_list_snapshot` and the partitioned /
-  pattern builders are all engine-generic. PIP-145 auto-reconcile
-  (`PatternConsumer::update` + `start_auto_reconcile`) routes
-  child-subscribes through `<E::ClientState as SubscribeApi>::
-  subscribe` and delta polling through `<E::ClientState as
-  BrokerMetadataApi>::poll_topic_list_change`. Test parity
-  tokio=121 moonpool=121; full validation chain
-  (`cargo test`, `clippy -D warnings`, `cargo doc -D warnings`,
-  per-engine xtask checks, `check-crypto-matrix` 8/8 cells) green.
-- **Differential harness — seek-per-partition golden trace**
-  (commit `3d6c7e6`). Scripted broker partition routing + new
-  `Op::SendPartition` / `RecvPartition` / `AckPartition` /
-  `SeekPartition` variants. Catalog now ships seven golden traces.
-- **Crypto provider pluggability — ADR-0035 Accepted** (commits
-  `19f8b9f`, `3f392af`, `9a6ffde`). `rustls` crypto provider
-  switched to a feature-gated set (`crypto-aws-lc-rs` default /
-  `-ring` / `-openssl` / `-fips`); workspace-scope
-  `--all-features` continues to work via the `tls_crypto.rs` cfg
-  cascade (priority order resolves multi-provider activation),
-  and `cargo xtask check-crypto-matrix` covers the per-provider
-  build matrix exhaustively. Per-package invocations
-  (`cargo test -p <crate>`) need an explicit crypto feature
-  because dependency features don't transitively activate under
-  `-p`.
-- **Moonpool seed sweep policy — ADR-0036 Accepted** (commit
-  `305f31d`). Daily 16-random-seed CI job replaces the per-PR
-  fixed 32-seed matrix; each `(commit, seed)` pair is
-  bit-for-bit reproducible so the per-PR cost was wasted.
-- **`magnetar_proto::SUPPORTED_PROTOCOL_VERSION` constant**
-  (commit `51101c5`). Deduplicates the literal `21` from three
-  call sites (proto `ConnectionConfig::default`, proto test
-  fixture, CLI banner).
-- **Pre-existing moonpool coverage gap — closure pass 1** (commit
-  `82185cb`). 15 mirrored tests on each runtime
-  (`tests/coverage_close.rs`) drill the largest uncovered hunks in
-  `magnetar-runtime-moonpool/src/{driver,producer,consumer,lib,
-  transport}.rs`. Per-file coverage on the five target files now
-  reads consumer 75.4%, driver 54.7%, lib 92.4%, producer 85.4%,
-  transport 30.3% (172 net-new lines covered, 662 → 490 uncovered);
-  test parity tokio=136 moonpool=136. Coverage closure follow-up
-  stays open for the next pass on the remaining hunks (transport
-  TLS + driver supervised loop) — see the relevant section below.
+History — what already landed — lives in `git log` and in the per-ADR
+implementation notes. Anything not listed below is either done, or
+explicitly out of scope for v0.2.0 ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+§D-series, [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md),
+[ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
 
 ---
 
 ## Per-surface builder + impl-body lifts
 
-**Status.** Six of seven dependent ADR-0026 §D1 surfaces are now fully
-lifted on both engines. Only `TypedProducer` / `TypedConsumer` remain
-phantom-lifted.
+**Status.** Every ADR-0026 §D1 dependent surface (Transaction, Reader,
+TableView, PartitionedProducer, MultiTopicsConsumer,
+PartitionedConsumer, PatternConsumer, `TypedProducer`,
+`TypedConsumer`) carries an engine-generic struct type parameter on
+both its concrete type AND its builder. Builders dispatch their
+core entry method (`create()` / `subscribe()`) through the
+appropriate `*Api` extension trait so the type-level lift is
+complete.
 
-- ✅ **`TypedProducer<S, P>` / `TypedConsumer<S, C>` — LANDED**
-  (commit `95b8790`). Builders carry `E: Engine = TokioEngine`;
-  helper-method ports added to `ProducerApi`
-  (`compression`, `last_sequence_id_published`, `pending_count`,
-  `batch_len`, `batch_bytes`) and `ConsumerApi` (`ack_grouped`,
-  `ack_grouped_cumulative`, `ack_with_txn`, `ack_cumulative_with_txn`).
-  The inner-builder lift (`TypedProducerBuilder<'a, S, E>` /
-  `TypedConsumerBuilder<'a, S, E>`) is still phantom on `E` — pass-2
-  for the typed surfaces remains queued behind a few helper-method
-  ports for the typed-specific knobs.
-- ✅ **MultiTopics pass-1: moonpool helpers — LANDED**. Thirteen
-  net-new methods on `magnetar_runtime_moonpool::Consumer`
-  (`available_in_queue`, `available_permits`,
-  `has_received_any_message`, `has_reached_end_of_topic`,
-  `is_paused`, `is_inactive`, `drain_dead_letter`,
-  `receive_with_timeout`, `receive_batch`,
-  `receive_batch_with_bytes_cap`, `unsubscribe(force: bool)`,
-  `reconsume_later`, `reconsume_later_with_properties`,
-  `republish_dead_letters`).
-- ✅ **MultiTopics / PartitionedConsumer / PatternConsumer pass-2
-  lift — LANDED**. `MultiTopicsConsumer<C>` /
-  `PatternConsumer<C>` impl bodies dispatch through the extended
-  `ConsumerApi` trait (17 trait additions: 13 pass-1 helpers + the
-  four flow-control / seek primitives + `unsubscribe(force: bool)`
-  overload + `type Producer: ProducerApi<Error = Self::Error>`
-  associated type for `republish_dead_letters` / `reconsume_later`).
-  `MultiTopicsConsumerBuilder<'a, E>` /
-  `PartitionedConsumerBuilder<'a, E>` /
-  `PatternConsumerBuilder<'a, E>` route `.subscribe()` through the
-  engine-generic `ConsumerBuilder` (which dispatches via
-  `SubscribeApi`). New `BrokerMetadataApi` extension trait
-  (`partitioned_topic_metadata`, `watch_topic_list`,
-  `poll_topic_list_change`) implemented on both runtime `Client`s
-  lifts `PulsarClient::partitions_for_topic` /
-  `PulsarClient::topic_list_snapshot` onto the engine-generic
-  `impl<E: Engine + ...> PulsarClient<E>` block. PIP-145
-  child-subscribe routes through
-  `<E::ClientState as SubscribeApi>::subscribe`; delta polling
-  routes through
-  `<E::ClientState as BrokerMetadataApi>::poll_topic_list_change`.
-  Test parity tokio=121 moonpool=121.
+**Remaining gap — entry-point methods on `PulsarClient<E>`.** The
+following entry-point methods still live in
+`impl PulsarClient<TokioEngine>` rather than the engine-generic
+block:
 
-**Remaining inner-builder lift — `TypedProducerBuilder<'a, S>` /
-`TypedConsumerBuilder<'a, S>`.** Both still carry only the schema
-type parameter; lifting them to
-`TypedProducerBuilder<'a, S, E: Engine = TokioEngine>` /
-`TypedConsumerBuilder<'a, S, E: Engine = TokioEngine>` is the last
-remaining D1 sub-PR. The base
-`ConsumerBuilder` / `ProducerBuilder` already lift through
-`SubscribeApi` / `CreateProducerApi`, so the typed builders' new
-`subscribe()` / `create()` would dispatch through the same path
-once the engine parameter is plumbed in.
+- `PulsarClient::partitioned_producer(...)`
+- `PulsarClient::table_view(...)`
+- `PulsarClient::typed_table_view(...)`
+
+Lifting these to the engine-generic `impl<E: Engine> PulsarClient<E>`
+block needs the matching `BrokerMetadataApi` / partition-count
+lookups already present on both engines and a small amount of
+plumbing to surface tokio-only specialised methods
+(`refresh_partitions`, `last_sequence_id_published`) via a
+specialisation block. The inner builders are already engine-generic
+so the lift is mostly mechanical.
 
 Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
 the trait additions are pure delegates so they don't introduce new
-behavior to mirror; the post-lift runtime test count stays at 136/136
-(unchanged from the coverage-closure pass 1 baseline in commit
-`82185cb`).
+behavior to mirror; the post-lift runtime test count stays at parity
+(tokio=moonpool, currently 151/151).
 
 ---
 
@@ -232,9 +85,8 @@ task, which itself isn't being polled. The result is a ~30 s stall per
 keeps a 25 ms `Kicker` to pulse `driver_waker.notify_one()` and bridge
 the LocalSet pump gap.
 
-**Unblock.** Closed by the future moonpool-sim integration (see
-the D2 line under [What landed](#what-landed-since-the-multi-source-design-synthesis));
-the simulator's deterministic scheduler drives both sides without
+**Unblock.** Closed by the future moonpool-sim integration; the
+simulator's deterministic scheduler drives both sides without
 `spawn_local`. An alternative is restructuring the runner to spawn the
 driver via plain `tokio::spawn`, giving up moonpool-sim compatibility
 for the differential harness specifically.
@@ -257,22 +109,16 @@ moonpool first.
 
 ## Testing + coverage
 
-### Cross-runtime test + coverage closure (ADR-0024)
+### Residual moonpool transport TLS + driver supervised-loop coverage
 
 **Status.**
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
-landed 2026-05-22 with both `cargo xtask check-sim-coverage` and
-`cargo xtask check-runtime-test-parity` enabled and hard-failing. The
-2026-05-22 baseline was `tokio=65 moonpool=61` (gap of 4); subsequent
-landings (memory-limit slab, AutoClusterFailover moonpool port, TLS
-chaos fixtures, race-stress coverage, lookup-before-open, the D1
-surface train, the post-seek ack-then-flow fix in `f4872d7`, the
-MultiTopics pass-1 moonpool helpers, and the ADR-0028 anti-thrash
-implementation) brought it to `tokio=121 moonpool=121`. Pass 1 of
-the pre-existing-gap closure landed in commit `82185cb` with 15
-mirrored tests on each runtime (`tests/coverage_close.rs`), taking
-the parity count to **`tokio=136 moonpool=136`**. Per-file coverage
-on the five target files is now:
+landed with both `cargo xtask check-sim-coverage` and
+`cargo xtask check-runtime-test-parity` enabled and hard-failing.
+Runtime test parity sits at **`tokio=151 moonpool=151`** as of this
+refresh (pass-1 coverage closure plus subsequent landings).
+Per-file coverage on the five target files at the last measurement
+reads:
 
 | File | Coverage | Gap remaining |
 | --- | --- | --- |
@@ -290,18 +136,6 @@ in-process broker fixture (rustls server cert + `RustlsByteAdapter`
 peer driver) or a `moonpool_core::SimProviders` substrate, both of
 which are substantial scaffolding work.
 
-**Unblock.** Dedicated session driven by the local prompt at
-`tasks/coverage-closure-prompt.md` (gitignored). Phases:
-(1) bring tokio↔moonpool counts to 1:1 — **done**;
-(2a) close the largest pre-existing moonpool coverage gaps — **done
-in commit `82185cb` (pass 1)**; (2b) close the residual transport
-TLS + driver supervised-loop hunks — open;
-(3) full validation chain green including the local `1..32` seed
-sweep (ADR-0024 §3 / ADR-0036 — CI runs the equivalent as a daily
-16-random-seed sweep in
-`.github/workflows/moonpool-seed-sweep.yml`). ADR-0021 still applies
-— failing tests are fixed, not `#[ignore]`-d.
-
 ```text
 /goal close the residual moonpool transport TLS + driver supervised-loop coverage hunks. Stand up an in-process rustls-enabled broker fixture (self-signed cert + `RustlsByteAdapter` peer driver) under `crates/magnetar-runtime-moonpool/tests/`, then add targeted tests that exercise `Transport::connect_tls`, `tls_handshake`, the TLS variants of `read_buf` / `write_all` / `flush`, and `Transport::shutdown`. Pair each new moonpool test with a same-named tokio counterpart (the tokio path is already covered via `tls_handshake_chaos.rs`; the mirror may be a Debug / fmt smoke if the surface is engine-private). Optionally close the remaining `driver.rs` `supervised_driver_loop` lines via a synthetic peer that drops the socket between handshakes. Validation chain per CLAUDE.md.
 ```
@@ -310,29 +144,19 @@ sweep (ADR-0024 §3 / ADR-0036 — CI runs the equivalent as a daily
 
 ## Auth
 
-### SASL Kerberos / GSSAPI ✅ landed
-
-`magnetar_auth_sasl::SaslKerberos` binds `libgssapi` under the
-`auth-sasl-kerberos` façade feature; the multi-round `AUTH_CHALLENGE`
-continuation threads through `AuthProvider::respond_to_challenge`.
-All four sans-io test layers per ADR-0024 drive a
-`ScriptedGssapiClient` so they stay free of a libkrb5 build dep; the
-end-to-end layer (`crates/magnetar/tests/e2e_sasl_kerberos.rs`) spins
-up a Dockerised KDC. Binding decision recorded in
-[ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md).
-
 ### Athenz ZTS round-trip
 
-**Status.** `AthenzProvider::with_role_token` ships in v0.1.0 (callers
-that already hold a valid ZTS role token can hand it directly to the
+**Status.** `AthenzProvider::with_role_token` ships (callers that
+already hold a valid ZTS role token can hand it directly to the
 provider). `AthenzProvider::new(...).initial` returns
 `AuthError::Unsupported`.
 
 **Unblock.** Deferred to v0.2.0 per
 [ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D3. The work item is implementing a minimal `reqwest`-backed ZTS
-client that exchanges the tenant private key for a role token,
-caches it with an expiry-aware refresh, and surfaces failures through
+§D3 and [ADR-0030](../specs/adr/0030-athenz-zts-round-trip-scope.md).
+The work item is implementing a minimal `reqwest`-backed ZTS client
+that exchanges the tenant private key for a role token, caches it
+with an expiry-aware refresh, and surfaces failures through
 `AuthError`. Scope is ~400–600 LOC plus a Dockerised ZTS fixture
 (`athenz/athenz-zts-server`) for the e2e suite.
 
@@ -342,49 +166,20 @@ caches it with an expiry-aware refresh, and surfaces failures through
 
 ---
 
-## Protocol — v0.2.0 PIP wave
+## Protocol — open v0.2.0 PIP wave
 
-The planning pass for PIP-460 / PIP-466 / PIP-180 / PIP-33 landed as
-four per-PIP proposals under [`specs/proposals/`](../specs/proposals/),
-each citing its authorising ADR (0031–0034) and breaking down
-wire-protocol delta, sans-io additions, runtime ports, the four-layer
-test plan per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md),
-and the e2e plan. The earlier "scope these four" goal is **closed**.
-
-What follows is one entry per PIP — upstream-readiness flag, what
-v0.2.0 ships, and a fresh `/goal …` block ready to implement.
-
-### Upstream-readiness summary
+The v0.2.0 planning pass produced four per-PIP proposals under
+[`specs/proposals/`](../specs/proposals/) authorised by ADRs 0031–0034.
+Status snapshot:
 
 | PIP | Upstream | v0.2.0 status |
 | --- | --- | --- |
-| PIP-33 — Replicated subscriptions | 🟢 LIVE (Pulsar 2.4, 2019) | ✅ landed — see [`docs/replicated-subscriptions.md`](replicated-subscriptions.md) |
-| PIP-180 — Shadow topic | 🟢 LIVE (Pulsar 2.11, 2023) | ✅ landed — see [`docs/shadow-topic.md`](shadow-topic.md) |
+| PIP-33 — Replicated subscriptions | 🟢 LIVE (Pulsar 2.4, 2019) | ✅ landed — see [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md) + [`docs/replicated-subscriptions.md`](replicated-subscriptions.md) |
+| PIP-180 — Shadow topic | 🟢 LIVE (Pulsar 2.11, 2023) | ✅ landed — see [ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md) + [`docs/shadow-topic.md`](shadow-topic.md) |
 | PIP-466 — V5 client surface | 🟠 DESIGN-PHASE (Java V5 still iterating; magnetar v0.2.0 surface is a v4-wire skin) | ⌛ unblocked — mirrors existing v4 e2e; `/goal` below |
 | PIP-460 — Scalable topics | 🔴 NOT LIVE (PIP `Draft`; targets Pulsar 5.0 LTS, Oct 2026; phased 4.3.0 / 4.4.0) | ⏸ blocked — needs `apachepulsar/pulsar:5.0.0-rc-*` |
 
-### PIP-33 — Replicated subscriptions ✅ landed
-
-Landed in v0.2.0 ([ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md),
-[`docs/replicated-subscriptions.md`](replicated-subscriptions.md)).
-`ConsumerBuilder::replicate_subscription_state(bool)` on the façade
-flips `CommandSubscribe` field 14; the receive-path filter in
-`magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and
-surfaces them via `PulsarClient::next_replicated_subscription_marker` /
-`poll_replicated_subscription_marker`. Two-cluster e2e runs weekly via
-[`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml).
-
-### PIP-180 — Shadow topic ✅ landed
-
-Landed in v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md),
-[`docs/shadow-topic.md`](shadow-topic.md)). Three new
-`magnetar-admin` methods (`create_shadow_topic` / `delete_shadow_topic` /
-`get_shadow_topics` + `get_shadow_source`), producer-side
-`send_with_source_message_id`, consumer-side
-`ConnectionEvent::MessageReceivedFromShadow`, and the structural
-`MessageId` equality contract.
-
-#### Post-landing follow-ups
+### PIP-180 post-landing follow-ups
 
 - **Subscribe-time admin REST hint integration (façade-level)** —
   the runtime engines expose `Consumer::set_shadow_source(...)` but
@@ -394,7 +189,7 @@ Landed in v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md),
   which has `magnetar-admin` available behind the `admin` feature).
   A clean addition would be a `Client::subscribe_shadow_aware(...)`
   on the magnetar façade that performs the lookup when the `admin`
-  feature is active. Track here as a quality-of-life follow-up.
+  feature is active.
 - **Post-subscribe shadow-metadata cache race** — the per-`Consumer`
   shadow metadata is resolved once at subscribe time and cached
   for the consumer's lifetime. If a shadow is created on a topic
@@ -405,22 +200,21 @@ Landed in v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md),
 - **Moonpool `BrokerWorkload::ShadowReceive`** — the differential
   `ScriptedBroker` already echoes the client-asserted source id on
   `CommandSendReceipt`, so the moonpool sim_chaos suite doesn't
-  need a separate `ShadowTopic` workload variant to exercise the
-  wire path. If a richer scenario lands later (e.g. shadow-aware
-  receive injection with `replicated_from` set on the inbound
-  `CommandMessage`), add a `BrokerWorkload::ShadowReceive {
-  source_topic }` variant.
+  need a separate `ShadowTopic` workload variant. If a richer
+  scenario lands later (e.g. shadow-aware receive injection with
+  `replicated_from` set on the inbound `CommandMessage`), add a
+  `BrokerWorkload::ShadowReceive { source_topic }` variant.
 - **E2E replicator-side wire path** —
   `crates/magnetar/tests/e2e_shadow_topic.rs` exercises the admin
   REST cycle + a regular produce-on-source / consume-on-shadow
   round-trip. The replicator-style `send_with_source_message_id`
   path against a real broker is covered by the differential
   equivalence test against the scripted broker that echoes the
-  source id back; against Pulsar 4.x, the broker's real authorisation
-  flow may reject a client-asserted source id that doesn't match a
-  registered replicator producer. Adding the e2e assertion would
-  need a Pulsar 4.x cluster with a registered replicator role —
-  defer until that fixture is available.
+  source id back; against Pulsar 4.x, the broker's real
+  authorisation flow may reject a client-asserted source id that
+  doesn't match a registered replicator producer. Adding the e2e
+  assertion would need a Pulsar 4.x cluster with a registered
+  replicator role — defer until that fixture is available.
 
 ### PIP-466 — V5 client surface (🟠 DESIGN-PHASE, surface usable today)
 
@@ -473,8 +267,8 @@ expected churn pattern:
 1. New gap surfaces → entry added with **Status** + **Unblock** + a
    `/goal …` block.
 2. Agent team picks up the `/goal …` block in a fresh session.
-3. PR merges → the entry is removed (or its **Status** is updated to
-   "landed by `<commit-sha>`" if a follow-on tracker is needed).
+3. PR merges → the entry is removed (the ADR / docs file carries the
+   post-implementation reference).
 
 Pending **decisions** (`D1` … `Dn`) live in this file until Florentin
 calls them. Once decided, the decision becomes an ADR (or a

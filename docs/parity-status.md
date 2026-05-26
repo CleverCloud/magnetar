@@ -72,10 +72,16 @@ and now work on both engines:
   `TopicListChanged` deltas through
   `<E::ClientState as BrokerMetadataApi>::poll_topic_list_change`.
 
-**TypedProducer / TypedConsumer** remain phantom-lifted: type
-parameters present on the structs (defaulting to the tokio
-runtime), but the impl-body lift is queued behind the remaining
-helper-method ports for the typed surfaces.
+**TypedProducer / TypedConsumer** are also engine-generic at the
+struct *and* builder level:
+`TypedProducerBuilder<'a, S, E: Engine = TokioEngine>` /
+`TypedConsumerBuilder<'a, S, E: Engine = TokioEngine>` build via
+`E::ClientState: CreateProducerApi` / `SubscribeApi`. The
+remaining gap is at the **entry-point** level on `PulsarClient<E>`
+itself — `partitioned_producer`, `table_view`, and
+`typed_table_view` still live in `impl PulsarClient<TokioEngine>`
+rather than the engine-generic block (see
+[`follow-ups.md` §Per-surface builder + impl-body lifts](follow-ups.md#per-surface-builder--impl-body-lifts)).
 
 The **base** `ConsumerBuilder<'a, E: Engine = TokioEngine>` /
 `ProducerBuilder<'a, E: Engine = TokioEngine>` /

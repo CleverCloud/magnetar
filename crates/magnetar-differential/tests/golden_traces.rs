@@ -221,8 +221,8 @@ async fn seek_to_start_then_replay() {
 /// storage path on each publish (Stage 3 transparent in-flight publish replay landed
 /// `OpSend::replay_frames` so reset → `rebuild_producers` can re-issue every unconfirmed
 /// publish on the new session). This golden does NOT trigger a reset — the differential
-/// harness has no public hook to do so today (see follow-ups), so the new replay branch
-/// is exercised by the unit + integration tests in the proto, tokio, and moonpool crates.
+/// harness has no public hook to do so today, so the new replay branch is exercised
+/// by the unit + integration tests in the proto, tokio, and moonpool crates.
 /// What this golden DOES guarantee: the post-replay-frame-storage code path produces
 /// byte-identical `EventStream`s across the tokio and moonpool engines. Catches the easy
 /// regression where the new path diverges between engines without altering
@@ -276,8 +276,7 @@ async fn many_publishes_round_trip() {
 /// engines MUST issue `CommandLookupTopic` before `CommandProducer` /
 /// `CommandSubscribe`. Pulsar's broker uses the lookup round-trip to
 /// activate the topic's namespace bundle; skipping it surfaces
-/// `ServerError::ServiceNotReady` against a fresh broker
-/// (see `docs/follow-ups.md`).
+/// `ServerError::ServiceNotReady` against a fresh broker.
 ///
 /// Drives the trace `Send → Recv → Close` against the scripted broker for
 /// each engine, snapshots the per-engine frame log on the broker side,

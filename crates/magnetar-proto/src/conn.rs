@@ -1630,8 +1630,7 @@ impl Connection {
                         // Without this classification, magnetar removed the producer
                         // state on every transient post-`docker restart` rebuild and
                         // left every subsequent `producer.send()` hanging on a
-                        // "unknown producer handle" — see #71 in
-                        // `docs/follow-ups.md`.
+                        // "unknown producer handle".
                         if is_transient_open_error(err.error) {
                             self.events
                                 .push_back(ConnectionEvent::ProducerOpenFailedTransient {
@@ -4517,8 +4516,7 @@ mod conn_state_tests {
     /// `ServiceNotReady`/"Please redo the lookup". `ServiceNotReady` is the broker's
     /// transient post-restart code, so the connection MUST keep the producer state and
     /// emit `ProducerOpenFailedTransient` (the runtime then retries via
-    /// [`Connection::retry_producer_open`]) — see #71 in `docs/follow-ups.md`. The
-    /// permanent-failure path is covered by
+    /// [`Connection::retry_producer_open`]). The permanent-failure path is covered by
     /// [`command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`].
     #[test]
     fn command_error_on_producer_open_emits_producer_open_failed_transient() {

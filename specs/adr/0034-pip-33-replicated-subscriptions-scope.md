@@ -153,6 +153,29 @@ separate `docs(adr): amend ADR-0010` commit.
 Accepted — landed in feat/pip-33-replicated-subscriptions
 (see [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md)).
 
+## Implementation footprint
+
+The detailed implementation map originally lived under
+`specs/proposals/pip-33-replicated-subscriptions.md`; it was folded
+back into this ADR once the work landed. Authoritative landing
+artefacts:
+
+| Concern | File |
+| --- | --- |
+| Marker decoder + types (`ReplicatedSubscriptionMarker{Kind,Details}`, `ClusterMessageId`) | [`crates/magnetar-proto/src/markers.rs`](../../crates/magnetar-proto/src/markers.rs) |
+| `SubscribeOptions.replicate_subscription_state` + `CommandSubscribe` encoder | [`crates/magnetar-proto/src/consumer.rs`](../../crates/magnetar-proto/src/consumer.rs) |
+| Receive-path marker filter + `Event::ReplicatedSubscriptionMarkerObserved` | [`crates/magnetar-proto/src/consumer.rs`](../../crates/magnetar-proto/src/consumer.rs), [`event.rs`](../../crates/magnetar-proto/src/event.rs) |
+| `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker` | [`crates/magnetar/src/client.rs`](../../crates/magnetar/src/client.rs) |
+| `ConsumerBuilder::replicate_subscription_state(bool)` | [`crates/magnetar/src/client.rs`](../../crates/magnetar/src/client.rs) (`ConsumerBuilder::replicate_subscription_state`) |
+| Moonpool scripted broker `InjectsReplicatedMarkers` workload | [`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`](../../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs) |
+| Differential golden trace | `crates/magnetar-differential/tests/golden/replicated_subscription_filter.json` |
+| User docs | [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md) |
+| Two-cluster e2e | `crates/magnetar/tests/e2e_replicated_subscriptions.rs` + `.github/workflows/e2e-replicated-subs.yml` (weekly) |
+
+Total landed footprint ≈ 1K LOC including tests. The two-cluster e2e
+fixture is opt-in via a separate `e2e-multi-cluster` sub-feature; the
+weekly workflow files an automatic GitHub issue on failure.
+
 ## References
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum;

@@ -1568,16 +1568,11 @@ impl ProducerBuilder<'_, crate::TokioEngine> {
 
 /// Builder for a consumer.
 ///
-/// Phantom-generic over `E: Engine` per ADR-0026 §D1 — the type
-/// parameter is present (defaulting to [`crate::TokioEngine`]) so callers
-/// can name `ConsumerBuilder<'a, MoonpoolEngine<P>>` at the type
-/// level. The inherent impl methods (notably `subscribe()`) are
-/// currently bound to the tokio default; the full lift dispatches
-/// `subscribe()` through [`crate::SubscribeApi`] in a follow-on
-/// sub-PR (see `docs/follow-ups.md` "Next sub-PR — `ConsumerBuilder`
-/// / `ProducerBuilder` genericity"). The `SubscribeApi` extension
-/// trait + delegate impls on both runtimes already landed in
-/// commit `cc61d4d`.
+/// Engine-generic over `E: Engine` per ADR-0026 §D1 (default
+/// [`crate::TokioEngine`]). The base `subscribe()` dispatches through
+/// the [`crate::SubscribeApi`] extension trait implemented by both
+/// runtimes' `Client`; tokio-only knobs (PIP-4 decryption) live on
+/// the `impl ConsumerBuilder<TokioEngine>` specialised block.
 pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     client: &'a PulsarClient<E>,
     req: SubscribeRequest,

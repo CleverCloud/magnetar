@@ -48,8 +48,8 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0030](adr/0030-athenz-zts-round-trip-scope.md) | v0.2.0 scope for Athenz ZTS round-trip: reqwest-backed ZTS client with expiry-aware caching, Dockerised ZTS fixture | Proposed |
 | [0031](adr/0031-pip-460-scalable-subscription-scope.md) | v0.2.0 scope for PIP-460 scalable subscription model — wire-protocol delta, sans-io additions, test plan | Proposed |
 | [0032](adr/0032-pip-466-v5-client-surface-scope.md) | v0.2.0 scope for PIP-466 V5 client surface — API-shape decision (no wire change); rename evaluation | Proposed |
-| [0033](adr/0033-pip-180-shadow-topic-scope.md) | v0.2.0 scope for PIP-180 shadow topic — producer-side `CommandSend.message_id` propagation, consumer-side `MessageReceivedFromShadow` event, admin REST (`createShadowTopic` / `deleteShadowTopic` / `getShadowTopics`) | Accepted |
-| [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Accepted |
+| [0033](adr/0033-pip-180-shadow-topic-scope.md) | v0.2.0 scope for PIP-180 shadow topic — producer-side `CommandSend.message_id` propagation, consumer-side `MessageReceivedFromShadow` event, admin REST (`createShadowTopic` / `deleteShadowTopic` / `getShadowTopics`) | Accepted (landed in v0.2.0) |
+| [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Accepted (landed in v0.2.0) |
 | [0035](adr/0035-pluggable-crypto-provider.md) | Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) — amends ADR-0005 openssl ban via `deny.toml` `wrappers = ["rustls-openssl"]` carve-out | Accepted |
 | [0036](adr/0036-moonpool-seed-sweep-daily-random.md) | Moonpool seed sweep: daily 16-random-seed sweep in a dedicated workflow, drop per-PR fixed 32-seed matrix — amends ADR-0024 §3 (CI cadence) | Accepted |
 | [0037](adr/0037-multi-topics-pattern-consumer-pass-2-lift.md) | MultiTopicsConsumer / PartitionedConsumer / PatternConsumer pass-2 lift: extend `ConsumerApi` (17 new methods + `type Producer`), introduce `BrokerMetadataApi`, lift the matching builders to `<'a, E: Engine>` — six-of-seven ADR-0026 §D1 surfaces now lifted | Accepted |
@@ -78,4 +78,6 @@ the **implementation map** that turns the decision into a landed PR: wire
 delta, sans-io additions, runtime ports, four-layer test plan, e2e plan.
 
 See [`proposals/README.md`](proposals/README.md) for the index. The v0.2.0
-wave currently covers PIP-460, PIP-466, PIP-180 and PIP-33.
+wave currently has two open proposals (PIP-460, PIP-466); the PIP-180 and
+PIP-33 proposals were folded back into their ADRs (0033, 0034) once the
+work landed — see each ADR's "Implementation footprint" section.

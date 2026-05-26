@@ -172,9 +172,9 @@ mod tests {
     }
 
     /// Phase 1 of the Producer/Consumer foundational lift — see
-    /// ADR-0026 §D1 and `docs/follow-ups.md`. Each bound check fires
-    /// at typeck; if either runtime's `Producer` / `Consumer` regresses
-    /// the bound, the seven dependent façade lifts won't compile.
+    /// ADR-0026 §D1. Each bound check fires at typeck; if either
+    /// runtime's `Producer` / `Consumer` regresses the bound, the
+    /// seven dependent façade lifts won't compile.
     #[cfg(feature = "tokio")]
     fn assert_producer_api_bound<T: crate::ProducerApi>() {}
 

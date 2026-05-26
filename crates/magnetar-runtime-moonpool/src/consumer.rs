@@ -1530,7 +1530,7 @@ mod tests {
     /// a `ClientError::Broker` rather than parking on the driver waker forever.
     /// Mirrors the proto-level permanent-failure test. Transient codes
     /// (`ServiceNotReady` / `MetadataError` / `TopicNotFound`) hit the retry path
-    /// instead (see #71 in `docs/follow-ups.md`).
+    /// instead.
     #[tokio::test(flavor = "current_thread")]
     async fn subscribe_acked_fut_surfaces_broker_error() {
         use std::time::Duration;

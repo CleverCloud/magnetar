@@ -312,10 +312,10 @@ impl Client {
     /// so the call's only side effect is forcing the broker to activate the topic's
     /// namespace bundle. A multi-broker redirect (where the returned `broker_service_url`
     /// names a different broker) is logged as a warning and treated as success — the actual
-    /// "reconnect to that broker" follow-up is tracked in `docs/follow-ups.md`. Until that
-    /// lands, the user still hits the bundle-not-served path if the resolved broker differs
-    /// from the current one, but the failure surfaces as a `ClientError::Broker` thanks to
-    /// the `ProducerOpenFailed` / `SubscribeFailed` events instead of hanging.
+    /// "reconnect to that broker" reroute is not wired today. The user still hits the
+    /// bundle-not-served path if the resolved broker differs from the current one, but
+    /// the failure surfaces as a `ClientError::Broker` via the `ProducerOpenFailed` /
+    /// `SubscribeFailed` events instead of hanging.
     async fn lookup_topic(&self, topic: &str) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();

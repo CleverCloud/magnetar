@@ -1,7 +1,6 @@
 # Replicated subscriptions (PIP-33)
 
 **Scope**: [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md)
-· **Proposal**: [`specs/proposals/pip-33-replicated-subscriptions.md`](../specs/proposals/pip-33-replicated-subscriptions.md)
 · **Upstream**: [PIP-33 (Apache Pulsar wiki)](https://github.com/apache/pulsar/wiki/PIP-33%3A-Replicated-subscriptions)
 
 PIP-33 keeps a subscription's cursor position in sync across geo-replicated

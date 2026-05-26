@@ -167,6 +167,31 @@ against `apachepulsar/pulsar:4.0.4`. No proto bump, no feature flag —
 regular sends remain byte-identical to v0.1.0. User-facing docs at
 [`docs/shadow-topic.md`](../../docs/shadow-topic.md).
 
+## Implementation footprint
+
+The detailed implementation map originally lived under
+`specs/proposals/pip-180-shadow-topic.md`; it was folded back into
+this ADR once the work landed. Authoritative landing artefacts:
+
+| Concern | File |
+| --- | --- |
+| Producer send entry (`send_with_source_message_id`) | [`crates/magnetar-proto/src/producer.rs`](../../crates/magnetar-proto/src/producer.rs) |
+| Receive-path source-topic classification + `ShadowTopicMetadata` cache | [`crates/magnetar-proto/src/consumer.rs`](../../crates/magnetar-proto/src/consumer.rs) |
+| `Event::MessageReceivedFromShadow` variant | [`crates/magnetar-proto/src/event.rs`](../../crates/magnetar-proto/src/event.rs) |
+| Admin REST surface (create / delete / get / get-source) | [`crates/magnetar-admin/src/`](../../crates/magnetar-admin) |
+| Tokio runtime wiring (producer + consumer + subscribe hint) | [`crates/magnetar-runtime-tokio/src/`](../../crates/magnetar-runtime-tokio/src) |
+| Moonpool runtime mirror + scripted broker `ShadowTopic` workload | [`crates/magnetar-runtime-moonpool/src/`](../../crates/magnetar-runtime-moonpool/src), `tests/sim_chaos.rs` |
+| Differential golden trace | `crates/magnetar-differential/tests/golden/shadow_send_with_source.json` |
+| CLI `magnetar shadow {create,delete,list,source}` | [`crates/magnetar-cli/src/main.rs`](../../crates/magnetar-cli/src/main.rs) (`ShadowCmd` + `run_shadow`) |
+| User docs | [`docs/shadow-topic.md`](../../docs/shadow-topic.md) |
+| E2E | `crates/magnetar/tests/e2e_shadow_topic.rs` |
+
+Total landed footprint ≈ 1.5K LOC including tests. `MessageId`
+equality keeps the structural contract `(ledger_id, entry_id,
+batch_index, partition_index)`; the consumer-side classifier resolves
+shadow-ness from the admin REST `getShadowTopics(source)` hint cached
+on the `Consumer` at subscribe time.
+
 ## References
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum;

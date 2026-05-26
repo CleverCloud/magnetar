@@ -131,11 +131,11 @@ The supervised reconnect path consults the configured
   runtime via `set_url(...)`. Tests or sidecars drive failover by
   swapping the URL between reconnects.
 
-`AutoClusterFailover` (PIP-121 health-probe-driven) is tokio-only
-because it spawns its own probe loop on `tokio::spawn`. The moonpool
-analogue would need a probe abstraction that the runtime can stub
-deterministically (no real DNS, no real TCP). Tracked in
-[`follow-ups.md`](follow-ups.md).
+`AutoClusterFailover<P>` (PIP-121 health-probe-driven) ships on the
+moonpool engine as well — the probe loop runs on `P::TaskProvider`,
+so the simulator drives the schedule deterministically with no real
+DNS or TCP. Source:
+[`crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs`](../crates/magnetar-runtime-moonpool/src/auto_cluster_failover.rs).
 
 ## PIP-188 TOPIC_MIGRATED
 
@@ -227,11 +227,11 @@ shapes, generic bounds) which is the load-bearing part for
 equivalence.
 
 The harness ships per [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
-M8. A known follow-up — the scripted broker stalls the producer-open
-round-trip under one fixture — is tracked in
-[`follow-ups.md`](follow-ups.md); the corresponding smoke test is
-explicitly `#[ignore]`-marked with a TODO per
-[ADR-0021](../specs/adr/0021-no-silent-test-ignore-or-remove.md).
+M8. The remaining structural caveat — the moonpool runner's
+`spawn_local` driver requires a 25 ms `Kicker` to bridge the
+`LocalSet` pump gap — is tracked in
+[`follow-ups.md`](follow-ups.md) §"Differential equivalence harness"
+and closes once the moonpool-sim provider lands.
 
 ## What is *not* yet exercised under simulation
 

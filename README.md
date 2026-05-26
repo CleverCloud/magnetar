@@ -828,7 +828,7 @@ v0.1.0 targets full Java client parity on the tokio engine
 moonpool engine reaches feature parity with tokio on a follow-up train.
 
 The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
-The v0.2.0 wave has landed:
+The v0.2.0 wave items already landed on `main`:
 
 - **PIP-180** shadow topic ([`docs/shadow-topic.md`](docs/shadow-topic.md),
   [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
@@ -836,12 +836,18 @@ The v0.2.0 wave has landed:
   ([`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md),
   [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md)).
 - **SASL Kerberos / GSSAPI** ([ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
+- **Pluggable rustls crypto provider** (aws-lc-rs / ring / openssl / fips —
+  [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)).
+- **Daily 16-random-seed moonpool sweep** ([ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md)).
+- **Anti-thrash supervised reconnect policy** (opt-in,
+  [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
-The remaining deferred items — **PIP-460** scalable topics, **PIP-466**
-V5 surface, and the **Athenz ZTS** round-trip — are still scoped for
-v0.2.0 per
+Open v0.2.0 wave items — **PIP-460** scalable topics, **PIP-466**
+V5 surface, and the **Athenz ZTS** round-trip — are still scoped per
 [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D3.
+§D3 and the per-PIP scope ADRs ([ADR-0030](specs/adr/0030-athenz-zts-round-trip-scope.md),
+[ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md),
+[ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md)).
 
 ---
 

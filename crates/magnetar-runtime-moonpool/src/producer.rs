@@ -1165,7 +1165,7 @@ mod tests {
     /// test, but covers the engine-side bridge from event to future-result.
     /// `ServiceNotReady` / `MetadataError` / `TopicNotFound` are deliberately NOT used
     /// here — those are transient (the runtime retries via
-    /// `retry_producer_open`); see #71 in `docs/follow-ups.md`.
+    /// `retry_producer_open`).
     #[tokio::test(flavor = "current_thread")]
     async fn wait_producer_ready_surfaces_broker_error() {
         let shared = handshake_complete_shared();

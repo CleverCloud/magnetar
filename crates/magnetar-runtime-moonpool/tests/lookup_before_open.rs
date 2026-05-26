@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration test for ADR-0019 / `docs/follow-ups.md` Java parity item
+//! Integration test for ADR-0019 Java parity item
 //! "Moonpool engine: lookup before producer/consumer open".
 //!
 //! The moonpool engine's [`Client::open_producer`] and [`Client::subscribe`]

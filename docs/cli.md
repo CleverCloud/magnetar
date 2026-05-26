@@ -80,10 +80,9 @@ same revision produce identical banners.
 ### Pulsar wire-protocol version
 
 The `pulsar wire protocol: v21` line reflects the value the driver
-advertises in `CommandConnect.protocol_version`
-(`crates/magnetar-proto/src/conn.rs`). It is currently hard-coded in
-both places. Tracking issue: `docs/follow-ups.md` (expose as a typed
-constant from `magnetar-proto`).
+advertises in `CommandConnect.protocol_version`. Both the driver and
+the CLI banner read from
+`magnetar_proto::SUPPORTED_PROTOCOL_VERSION`, so they cannot drift.
 
 ## Subcommands
 

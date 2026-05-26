@@ -100,7 +100,7 @@ pub enum ConnectionEvent {
     /// runtime is expected to back off and call
     /// [`crate::Connection::retry_producer_open`] to retry the attach. Mirrors
     /// Java `ProducerImpl.handleProducerCreationError` retrying on the same
-    /// codes (see #71 in `docs/follow-ups.md`).
+    /// codes.
     ProducerOpenFailedTransient {
         /// The producer that failed to open.
         handle: ProducerHandle,

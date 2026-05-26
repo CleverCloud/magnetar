@@ -265,15 +265,12 @@ where
 
 /// Partition-aware producer.
 ///
-/// Phantom-generic over `P: ProducerApi` per ADR-0026 §D1 — the
-/// type parameter is present (defaulting to
-/// `magnetar_runtime_tokio::Producer`) but the inherent impl is
-/// currently bound to the default. Full lift of the inherent impl to
-/// `impl<P: ProducerApi> PartitionedProducer<P>` is queued in
-/// `docs/follow-ups.md`; this commit only widens the trait surface
-/// (`ProducerApi::stats` + `ProducerApi::close_owned`) so the
-/// follow-up can dispatch the `send` / `flush` / `close` / `stats`
-/// method bodies through the trait without further trait churn.
+/// Generic over `P: ProducerApi` per ADR-0026 §D1 (default
+/// `magnetar_runtime_tokio::Producer`). The general inherent impl
+/// dispatches `send` / `flush` / `close` / `stats` through `ProducerApi`;
+/// tokio-only specialised methods (`refresh_partitions`,
+/// `last_sequence_id_published`, batch counters) live in the
+/// `impl PartitionedProducer<Producer>` specialised block below.
 #[derive(Debug)]
 pub struct PartitionedProducer<P: crate::ProducerApi = Producer> {
     partitions: Vec<P>,

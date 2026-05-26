@@ -28,8 +28,15 @@ references.
 | --- | --- | --- | --- | --- |
 | [PIP-460](pip-460-scalable-topics.md) | Scalable topics / DAG-watch consumer (experimental) | [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md) | Draft | 🔴 **NOT LIVE** — PIP is `Draft` upstream; targets Pulsar 5.0 LTS (Oct 2026) with phased rollout via 4.3.0 / 4.4.0. No release ships it yet. |
 | [PIP-466](pip-466-v5-client-surface.md) | V5 client surface (experimental) | [ADR-0032](../adr/0032-pip-466-v5-client-surface-scope.md) | Draft | 🟠 **DESIGN-PHASE** — V5 Java client API still iterating upstream; no stable Pulsar release exposes the V5 modules as default. magnetar's V5 surface is a thin skin over v4 wire (which **is** live), so it works against Pulsar 4.x today. |
-| [PIP-180](pip-180-shadow-topic.md) | Shadow topic — producer-side source-id + admin REST | [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md) | Implemented | 🟢 **LIVE** — merged upstream in Pulsar 2.11; available on the v0.1.0 baseline broker (`apachepulsar/pulsar:4.0.4`). |
-| [PIP-33](pip-33-replicated-subscriptions.md) | Replicated subscriptions — subscribe flag + marker filter | [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md) | Implemented | 🟢 **LIVE** — merged upstream in Pulsar 2.4 (2019); available on the v0.1.0 baseline broker. |
+
+> **PIP-180 (shadow topic)** and **PIP-33 (replicated subscriptions)**
+> landed in v0.2.0. Their proposals have been folded back into their
+> authorising ADRs as an "Implementation footprint" section —
+> [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md),
+> [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md).
+> User-facing docs live at
+> [`docs/shadow-topic.md`](../../docs/shadow-topic.md) and
+> [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md).
 
 ### Upstream-readiness legend
 
@@ -47,8 +54,6 @@ references.
 
 | PIP | e2e against `apachepulsar/pulsar:4.0.4` | Notes |
 | --- | --- | --- |
-| PIP-33 | ✅ Possible today | Requires the two-cluster fixture (peer brokers + geo-replication); same upstream image. |
-| PIP-180 | ✅ Possible today | Single-broker, no extra fixture. |
 | PIP-466 | ✅ Possible today | Mirror tests against existing v4 e2e suite. |
 | PIP-460 | ⏸ Blocked | Needs `apachepulsar/pulsar:5.0.0-rc-*` with `scalableTopicsEnabled=true`. 4-layer tests against in-process fakes can land; e2e cannot. |
 
