@@ -10,7 +10,7 @@ new ADR that supersedes the old one and update the old one's status header.
 - `Accepted` — In force.
 - `Superseded by ADR-NNNN` — Replaced by a later decision.
 - `Deprecated` — Withdrawn, no replacement.
-- `Proposed` — Drafted, awaiting sign-off (none today).
+- `Proposed` — Drafted, awaiting sign-off.
 
 ## Index
 

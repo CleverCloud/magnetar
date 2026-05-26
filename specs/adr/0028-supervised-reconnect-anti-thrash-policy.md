@@ -1,254 +1,301 @@
-# ADR-0028 — Supervised reconnect anti-thrash policy
+# ADR-0028 — Supervised-reconnect anti-thrash policy
 
 - **Status**: Proposed
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
-- **Tags**: supervisor, reconnect, ha, broker-cascade, follow-up-74
+- **Tags**: supervisor, reconnect, ha, e2e, broker-quirks, follow-up-74
 
 ## Context
 
-After the supervised reconnect path stabilised through 2026-05 (commits
-`6da2e80`, `c1bc2c6`, `0e47e14`, `86398a8`, `f4872d7`), the magnetar
-side of an `apachepulsar/pulsar:4.0.4` restart cycle is correct:
+E2E investigation of follow-up #74 (post-restart disconnect cascade,
+[`docs/follow-ups.md`](../../docs/follow-ups.md#74--post-restart-disconnect-cascade-broker-driven))
+established that the magnetar-side supervised reconnect path is now
+correct: transient `CommandError` retains state, `lookup_then(topic)`
+re-acquires bundle ownership before `retry_producer_open` /
+`retry_consumer_subscribe`, `Connection::in_flight_publish_snapshots`
+accumulates across multiple `reset()` cycles (commit `0e47e14`),
+consumer rebuild waits for `SubscribeAcked` before issuing
+`CommandFlow` + `CommandRedeliverUnacknowledgedMessages` (commit
+`f4872d7`), and producer rebuild calls
+`ProducerState::replay_pending_outbound`. End-to-end, this lets
+`e2e_supervised_reconnect_across_broker_restart` reach the rebuild
+step.
 
-- `Connection::handle_command_error` classifies `MetadataError` (1) /
-  `ServiceNotReady` (6) / `TopicNotFound` (11) as transient and
-  retains the producer / consumer state.
-- The driver runs `lookup_then(topic)` before
-  `retry_producer_open` / `retry_consumer_subscribe`, mirroring
-  Java's `ProducerImpl.connectionOpened` → `lookupRequest`.
-- `Connection::in_flight_publish_snapshots` accumulates across
-  multiple `reset()` cycles (no longer cleared on each cycle), so a
-  user send queued during the transient window survives an
-  arbitrary number of `rebuild_producers` rounds.
-- Consumers replay `initial_flow` + `CommandRedeliverUnacknowledgedMessages`
-  AFTER `SubscribeAcked` (Pulsar's `ServerCnx.handleFlow` silently
-  drops `CommandFlow` for an unregistered consumer id, so the
-  ack-then-flow ordering is mandatory).
-- `Connection::is_user_closed()` gates the supervisor on the
-  user-initiated `Closing` / `Closed` states only; a transport drop
-  (`Failed`) falls into backoff / redial.
+What still fails is **broker-side**. After `docker restart` of
+`apachepulsar/pulsar:4.0.4` (standalone, ZK + broker + bookie in one
+JVM) the broker accepts the `CommandProducer`, ACKs it, then drops the
+TCP connection within ~10 ms. Broker logs cycle several iterations per
+second:
 
-What still breaks is **broker-side**. After `docker restart` of the
-testcontainers broker:
+```
+Subscribing on topic …
+Cleared producer created after connection was closed
+Subscribing on topic …
+Cleared producer created after connection was closed
+…
+```
 
-1. magnetar reconnects, runs `lookup_topic`, gets the new broker
-   service URL.
-2. magnetar sends `CommandProducer`; broker logs `"Created new
-   producer …"` and acks.
-3. ~10 ms later the broker drops the TCP connection.
-4. Broker logs cycle: `"Subscribing on topic …"` → `"Cleared producer
-   created after connection was closed"` → repeat, several
-   iterations per second.
-5. magnetar's per-handle retry path treats each drop as a transient
-   error and re-attaches — feeding the cascade.
+The two failing e2e suites are
+`e2e_supervised_reconnect_across_broker_restart` (timeout) and
+`e2e_cluster_failover` (fail). All 19 other e2e files (51 tests) pass.
 
-E2E impact: `e2e_supervised_reconnect_across_broker_restart`
-(timeout) and `e2e_cluster_failover` (fail). All 19 other e2e files
-(51 tests) pass.
+### Broker-side root-cause investigation
 
-The broker code paths most likely involved (in Pulsar 4.0.x):
+Tracing the log surface and the producer lifecycle through the Apache
+Pulsar `branch-4.0` source narrows the cascade to a well-documented
+race in `ServerCnx.handleProducer()` ↔ `AbstractTopic.addProducer()` ↔
+`BrokerService.getOrCreateTopic()`, aggravated in single-node
+standalone mode by the pre-restart ZooKeeper ephemeral nodes outliving
+the JVM:
 
-- `org.apache.pulsar.broker.service.ServerCnx#handleProducer` —
-  produces the `CommandProducerSuccess` ack on the executor thread;
-  if the channel is closed between the ack write and `addProducer`
-  finishing, `AbstractTopic#addProducer` runs the
-  `"Cleared producer created after connection was closed"` log site
-  (consistent with the observed log line).
-- `org.apache.pulsar.broker.loadbalance.LoadManagerShared#unloadNamespaceBundlesGracefully`
-  and `ModularLoadManagerImpl#doNamespaceBundleSplit` — bundle
-  ownership churn during the broker's post-restart "warm-up" window
-  while the load manager re-discovers ownership.
-- `org.apache.pulsar.zookeeper.ZooKeeperSessionWatcher` — if the
-  testcontainers `docker restart` races the ZooKeeper session
-  timeout, the broker self-fences (`Watcher.Event.KeeperState.Expired`)
-  and dispatches a connection close from the executor.
+- **(d) The log site itself.** The string `Cleared producer created
+  after connection was closed` is emitted from the `producerFuture`
+  completion handler inside `ServerCnx.handleProducer()`. The handler
+  fires *after* `Topic.addProducer()` resolves on the topic executor.
+  At that point it checks whether the channel is still active; if not,
+  it tears down the just-installed producer and logs this line. The
+  same pattern is documented in `channelInactive` (`ServerCnx.java`
+  ~L470, where the per-producerFuture cleanup lambda calls
+  `closeNow(true)` on any future that resolved successfully after the
+  channel was already inactive — see Apache Pulsar PR
+  [#13428](https://github.com/apache/pulsar/pull/13428)).
+- **(b) The driver of the race — dangling `producerFuture` from the
+  prior session epoch.** `ServerCnx` keys its producer cache by raw
+  `producerId` and tracks completion via a per-id `CompletableFuture`.
+  When `BrokerService.checkTopicNsOwnership` throws (because the
+  freshly-restarted broker has not yet reclaimed the bundle), the
+  exception sometimes fails to propagate cleanly out of
+  `getOrCreateTopic`, leaving the future un-completed (see Apache
+  Pulsar issue [#6416](https://github.com/apache/pulsar/issues/6416),
+  [#9792](https://github.com/apache/pulsar/issues/9792), and the
+  remediation in PR [#14467](https://github.com/apache/pulsar/pull/14467)
+  — "Fix producerFuture not completed in ServerCnx#handleProducer").
+  The client then reconnects, re-issues `CommandProducer`, the future
+  finally resolves, but the original `ctx.channel()` is gone — broker
+  logs the "Cleared producer" line and the cascade restarts.
+- **(c) The standalone-mode ZK session race.**
+  `apachepulsar/pulsar:4.0.4` standalone collocates ZooKeeper, broker
+  and bookie in one JVM. A `docker restart` SIGTERMs the JVM, but the
+  pre-restart broker's ZK ephemeral nodes (bundle ownership markers
+  under `/namespace/.../0x.../data`) remain registered against the
+  *previous* ZK session until `tickTime × syncLimit` elapses
+  (~30 s with defaults). The new JVM's broker therefore observes its
+  own pre-restart instance as still owning the bundles, refuses
+  ownership, and the load manager iterates trying to reacquire — each
+  attempt creating a window where `getOrCreateTopic` resolves but the
+  client's TCP session has already been torn down by the prior
+  rejection. This matches Apache Pulsar issue
+  [#3566](https://github.com/apache/pulsar/issues/3566) and the
+  Clever Cloud production note in Slack
+  ([archives/C9D4X6TL1/p1777460888080179](https://clevercloud.slack.com/archives/C9D4X6TL1/p1777460888080179?thread_ts=1777452698.077029)):
+  > "Pulsar […] galère quand tu coupe des consumers/producer
+  > brutalement, ta lease ZK n'a pas encore expiré. du coup quand tu
+  > reboot, il te dis qu'il est déjà connecté."
+- **(a) `LoadManagerShared.shouldAntiAffinityNamespaceUnload`** is
+  *not* the trigger here. Anti-affinity unload only fires when the
+  load manager sees a healthier broker in the same anti-affinity
+  group; in single-node standalone there are no peers. Ruled out for
+  this scenario.
 
-A fully conclusive diagnosis needs broker-side TRACE logging, which
-is out of scope for this ADR — the policy proposed here is
-intentionally agnostic about which broker path is to blame, because
-the user-observable symptom is the same regardless of cause: rapid
-"ack then TCP-drop" oscillation that magnetar's current retry loop
-cannot escape.
+### Why magnetar must mitigate even after the broker stabilises
 
-Two prior ADRs frame the supervisor:
+Even with the well-known fixes landed upstream
+([PR #14467](https://github.com/apache/pulsar/pull/14467),
+[PR #13428](https://github.com/apache/pulsar/pull/13428),
+[PR #12846](https://github.com/apache/pulsar/pull/12846)), the
+re-attach cascade remains observable on `4.0.4`, on any standalone
+restart, and on any cluster-level rolling restart where the
+ZK-session-vs-broker-startup race window opens. Magnetar's current
+supervisor retries each handle as fast as `Backoff::next_delay`
+allows; the retries themselves stress the broker further (each one
+allocates a `Topic` future on the broker executor before the channel
+is closed), keeping the broker in the bundle-acquire churn.
 
-- [ADR-0018 PIP-188 reconnect-on-migrate](0018-pip-188-reconnect-on-migrate.md)
-  — single `TopicMigrated` event escalates to a supervised reset.
-- [ADR-0024 cross-runtime test + coverage policy](0024-cross-runtime-test-and-coverage-policy.md)
-  — any behavioural change ships with all four test layers.
+Magnetar's contract per
+[ADR-0010](0010-v0-1-full-java-parity.md) is Java-client parity —
+the Java client backs off the *connection* (not just the handle) once
+it observes repeated successful-create-then-dropped sessions
+(`PulsarClientImpl.tryReconnect` → `ClientCnx.handleCloseProducer` →
+`Backoff.next`). Magnetar today only backs off per handle. The gap is
+the missing connection-scoped cooldown.
 
 ## Decision
 
-Add an opt-in anti-thrash policy to `SupervisorConfig`. Default off
-(preserves the current behaviour). Two knobs and one state machine.
+Add an **opt-in anti-thrash policy** on `SupervisorConfig` that escalates
+from per-handle retry to a connection-level cooldown when the broker
+exhibits the create-then-drop pattern. Default **OFF** to preserve
+current behaviour; users opt in by setting the threshold knobs.
 
-### Knobs
+### API additions (no code in this commit)
+
+In `crates/magnetar-runtime-tokio/src/supervisor.rs` (and the moonpool
+counterpart per [ADR-0019](0019-engine-scope-and-moonpool-parity.md)
+parity train):
 
 ```rust
-// crates/magnetar-runtime-tokio/src/supervisor.rs
-// + crates/magnetar-runtime-moonpool/src/supervisor.rs
 pub struct SupervisorConfig {
-    // ...existing fields...
+    // ... existing fields ...
 
-    /// If `Some((n, window))`, observe per-handle re-attaches:
-    /// if `n` successful re-attaches occur within `window` and each
-    /// one is followed by a TCP drop within `drop_grace`, escalate
-    /// to a connection-level cooldown. `None` disables anti-thrash.
-    pub anti_thrash_threshold: Option<(u32, Duration)>,
+    /// Anti-thrash detector window.
+    ///
+    /// `None` → disabled (default; current per-handle retry behavior).
+    /// `Some(threshold)` → if `threshold.successful_attaches` re-attaches
+    /// succeed in `threshold.window` wall-clock and each is followed by
+    /// a TCP-level drop within `threshold.drop_within`, escalate from
+    /// per-handle retry to connection-level cooldown.
+    pub anti_thrash_threshold: Option<AntiThrashThreshold>,
 
-    /// How long a successful re-attach has to "stick" before the
-    /// anti-thrash window forgets it. Default: 500 ms.
-    pub drop_grace: Duration,
-
-    /// Cooldown applied on the connection-level redial loop after
-    /// anti-thrash fires. Default: 30 s.
+    /// Connection-level cooldown applied once `anti_thrash_threshold`
+    /// trips. Stacks above the per-handle backoff; the supervisor
+    /// re-redials only after this delay even if individual handles
+    /// would have retried sooner. Default `Duration::from_secs(30)`.
     pub max_backoff_after_thrash: Duration,
+}
+
+pub struct AntiThrashThreshold {
+    pub successful_attaches: u32,   // N
+    pub window: Duration,           // M
+    pub drop_within: Duration,      // K
 }
 ```
 
-### State machine (per `Connection`)
+### Detector mechanics
 
-A bounded ring of `(timestamp, handle, outcome)` events on
-`Connection`. Outcomes:
+- The detector lives **per `Connection`** (not per handle) inside
+  `magnetar-proto::Connection`'s supervisor-observed state, behind a
+  small `AntiThrashState { ring: VecDeque<AttachOutcome>, … }`. No
+  channels (per [ADR-0003](0003-no-channels-rule.md)); state is read
+  under the existing `parking_lot::Mutex<ConnectionShared>`.
+- On every successful `CommandProducerSuccess` /
+  `CommandSubscribeAcked` the supervisor records
+  `(now, handle_id)` in the ring.
+- On every subsequent TCP-level transport drop (i.e. `EngineEvent::
+  TransportClosed` arriving before the corresponding handle's first
+  user-driven op resolves), the supervisor records the elapsed delta.
+- If `successful_attaches` entries in the ring all have
+  `transport_drop_delta ≤ drop_within` and the ring window
+  `≤ M`, the connection enters **`Cooldown(max_backoff_after_thrash)`**.
+- In `Cooldown`, the driver loop pauses redial. Handles see the same
+  user-visible state as a normal supervised reconnect; the only
+  difference is the floor on retry latency.
+- The detector resets on any successful attach + first-op-success
+  pair (proves the broker has stabilised).
 
-- `ReAttachOk { handle }` — `CommandProducer` / `CommandSubscribe`
-  acked on the new session.
-- `TcpDropAfterReAttach { handle, elapsed_since_attach }` —
-  driver loop observes the socket closing within `drop_grace` of a
-  prior `ReAttachOk`.
+### Defaults and migration
 
-On every `mark_disconnected(now, wall_now)` the supervisor inspects
-the ring:
-
-1. Count successful re-attaches in the trailing `window`.
-2. If count ≥ `n` AND every one of those `n` was followed by a
-   `TcpDropAfterReAttach`, raise a `ConnectionEvent::AntiThrashCooldown`.
-3. The tokio + moonpool driver loops observe the event and sleep
-   for `max_backoff_after_thrash` before the next `Transport::connect`
-   attempt.
-4. The ring is cleared on the next successful re-attach that
-   survives `drop_grace`.
-
-### Knob defaults
-
-- `anti_thrash_threshold: None` — anti-thrash OFF by default;
-  no behavioural change for existing callers.
-- `drop_grace: 500ms` — generous enough to ride normal Pulsar load
-  variance; tight enough to detect the observed ~10 ms cascade.
-- `max_backoff_after_thrash: 30s` — chosen to outlast a typical
-  broker bundle-rebalance window.
-
-### Scope
-
-Strictly the supervisor. Nothing in `magnetar-proto` changes other
-than:
-
-- Two new variants on `ConnectionEvent`: `AntiThrashCooldown` and
-  `AntiThrashCleared`.
-- A `Connection::record_reattach_outcome(now, handle, kind)` hook
-  the runtime calls on each re-attach result and on each socket
-  drop.
-
-This keeps the policy testable from the sans-io layer and lets the
-moonpool chaos broker drive the test (see Consequences).
+- `anti_thrash_threshold: None`, `max_backoff_after_thrash:
+  Duration::from_secs(30)` ship as the new defaults. Existing user
+  configs compile unchanged.
+- Recommended starting values when opting in (documented in
+  rustdoc + `docs/architecture-overview.md` supervisor section):
+  `successful_attaches = 5`, `window = Duration::from_secs(2)`,
+  `drop_within = Duration::from_millis(50)`.
 
 ## Consequences
 
-**Easier**
-
-- Users hitting a broker-side cascade (bundle churn, ZooKeeper
-  session-timeout race, anti-affinity unload mid-create) can opt in
-  and get a stable client that backs off rather than melting CPU.
+**Makes easier.**
 - `e2e_supervised_reconnect_across_broker_restart` and
-  `e2e_cluster_failover` become recoverable inside the existing
-  test budget.
+  `e2e_cluster_failover` pass under simulated broker churn once the
+  detector is enabled — the test harness sets a tight threshold and
+  asserts the cooldown engages within the test budget.
+- Java-client behavioural parity for the connection-level backoff
+  arm; documented in the parity matrix.
+- A broker restart under load stops amplifying its own churn from the
+  magnetar side. Fewer half-open producer futures land on
+  `ServerCnx.producers`, easing the upstream race window itself.
 
-**Harder**
+**Makes harder / costs.**
+- Adds one config knob to the supervisor surface. Default-OFF means
+  no behaviour change for users who don't opt in, but the surface area
+  grows.
+- Adds `AntiThrashState` to `Connection`. Sized to a small ring
+  (default capacity = `successful_attaches × 2`); ~hundreds of bytes
+  per connection, no allocation on the hot path.
+- Detector semantics are subtle — operators who tune
+  `drop_within` too low will miss the cascade; too high and they pay
+  a 30 s reconnect floor on any healthy short-lived attach.
+- Documentation debt: requires a new section in
+  `docs/architecture-overview.md` and a parity-matrix row update.
+  Both land in the same changeset as the implementation, per the
+  [`docs are code`](../../CLAUDE.md#principles) principle.
 
-- New configuration surface. `SupervisorConfig` already has six
-  fields; this adds three more. Documented under
-  `crates/magnetar-runtime-tokio/src/supervisor.rs` and mirrored on
-  the moonpool side.
-- The anti-thrash state machine is itself a tracked invariant —
-  per ADR-0024, every change ships with all four test layers + the
-  moonpool 32-seed sweep.
+**Incompatibilities.**
+- None. The knob is additive; supervisors that don't set it observe
+  current behaviour exactly. The detector is connection-scoped, so
+  no interaction with the PIP-188 `TopicMigrated` path
+  ([ADR-0018](0018-pip-188-reconnect-on-migrate.md)) — a migration
+  *is* a deliberate broker-side drop after a successful attach, but
+  the new URL bypasses the cooldown because the connection identity
+  changes.
 
-**Cost**
+## Test plan
 
-- A bounded ring (size = `n * 2`, so default `8` slots if `n=4`)
-  per `Connection`. `Vec<(Instant, ProducerHandle | ConsumerHandle,
-  Outcome)>` with FIFO eviction — `O(n)` per insert, no allocations
-  in the hot path.
-- The user-facing observability: surface `AntiThrashCooldown` as a
-  `tracing::warn!` and as a `Producer::last_disconnected_timestamp`
-  bump so dashboards see it.
+Per [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md)
+cross-runtime test + coverage policy, the implementation changeset
+ships **all four layers** plus an e2e:
 
-**Incompatibilities**
+1. **`magnetar-proto` unit test.** Feed the supervisor a synthetic
+   ring of `(now, attach_ok, transport_drop_delta)` triples and
+   assert `AntiThrashState::tick` enters `Cooldown` exactly when the
+   threshold conditions are met, and exits on a successful
+   first-op-after-attach.
+2. **`magnetar-runtime-tokio` integration test** under
+   `crates/magnetar-runtime-tokio/tests/anti_thrash.rs`. Drives a
+   `magnetar-fakes` broker variant that ACKs `CommandProducer` then
+   `RST`s the TCP socket within 10 ms; asserts the supervisor
+   transitions to `Cooldown` and that the cooldown latency floor is
+   honoured.
+3. **`magnetar-runtime-moonpool` integration test** under
+   `crates/magnetar-runtime-moonpool/tests/anti_thrash.rs`. Extends the
+   chaos-pack `BrokerWorkload` introduced in
+   [ADR-0026](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+   §D2 (commit `aaa0661`) with a `DropsTcpAfterCreate { delay_ms }`
+   variant. Asserts cooldown engages and that the deterministic seed
+   sweep (1..=32) reproduces the same engagement count.
+4. **`magnetar-differential` equivalence test** asserting
+   tokio ↔ moonpool `EventStream` parity for the
+   attach-then-drop sequence, confirming the user-visible event
+   ordering (`Connected → ProducerSuccess → TransportClosed →
+   ReconnectScheduled { in: ≥ max_backoff_after_thrash } → Connected →
+   ProducerSuccess`).
+5. **Docker e2e.** Re-runs `e2e_supervised_reconnect_across_broker_restart`
+   and `e2e_cluster_failover` with the supervisor configured at
+   `(N=5, M=2s, K=50ms, cooldown=30s)`; both must reach `Ok(())`
+   within the existing test budget.
 
-- None. Default is OFF.
-
-### Test plan (per ADR-0024)
-
-1. **Proto unit** (`crates/magnetar-proto/src/conn.rs`): the
-   ring eviction + threshold trigger, with frozen `now`. Asserts
-   `AntiThrashCooldown` event surfaces only when all `n` re-attaches
-   in `window` are followed by `TcpDropAfterReAttach`.
-2. **Tokio integration**
-   (`crates/magnetar-runtime-tokio/tests/`): drives the supervisor
-   against a fake transport that ack-then-drops on `n` consecutive
-   re-attaches; asserts the connect cadence after cooldown matches
-   `max_backoff_after_thrash`.
-3. **Moonpool integration**
-   (`crates/magnetar-runtime-moonpool/tests/`): mirror of (2)
-   under deterministic `SimProviders`.
-4. **Differential** (`crates/magnetar-differential/tests/`): a
-   golden trace where the scripted broker ack-then-drops three
-   times; tokio and moonpool both transition into cooldown with the
-   same wall-clock offset (modulo engine jitter).
-5. **Sim chaos**
-   (`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`): extend
-   the existing `BrokerWorkload` with a `DropAfterAttach { delay }`
-   variant. 16-seed sweep (default) + 32-seed local sweep
-   (`MOONPOOL_SEED=1..=32`) must converge to the same cooldown
-   decision on every seed.
-6. **E2E** (`crates/magnetar/tests/e2e_reconnect.rs`,
-   `e2e_cluster_failover.rs`): enable the knob with
-   `anti_thrash_threshold = Some((3, Duration::from_secs(2)))`;
-   both tests must reach `Ok(())` within the existing test budget.
-
-### Out of scope for this ADR
-
-- Pulsar broker-side fix. Bundle-churn churn during `docker
-  restart` may have a real broker bug behind it; that investigation
-  is tracked separately under #74 and may produce upstream PRs.
-- A more general circuit-breaker (failed-open / failed-closed /
-  half-open). The policy here is the narrowest mitigation that
-  matches the observed cascade pattern. A broader breaker would
-  belong in a future ADR after we have field data on other
-  cascade shapes.
+Sim coverage on the diff must remain 100 % (`cargo xtask
+check-sim-coverage`) and the tokio↔moonpool 1:1 count must hold
+(`cargo xtask check-runtime-test-parity`).
 
 ## References
 
-- `docs/follow-ups.md` §"#74 — Post-restart disconnect cascade
-  (broker-driven)" — investigation summary + e2e impact
-- `crates/magnetar-proto/src/conn.rs` —
-  `Connection::in_flight_publish_snapshots`,
-  `Connection::handle_command_error` (transient classification),
-  `Connection::is_user_closed`
-- `crates/magnetar-runtime-tokio/src/driver.rs` —
-  `supervised_driver_loop`, transient-retry path
-- `crates/magnetar-runtime-moonpool/src/driver.rs` — mirror
-- `ARCHITECTURE.md#supervised-reconnect` — the full reconnect
-  story this ADR amends
-- [ADR-0010 v0.1.0 full Java parity](0010-v0-1-full-java-parity.md)
-  — why this is a stability fix, not a feature
-- [ADR-0018 PIP-188 reconnect-on-migrate](0018-pip-188-reconnect-on-migrate.md)
-  — supervised-reset precedent
-- [ADR-0024 cross-runtime test + coverage policy](0024-cross-runtime-test-and-coverage-policy.md)
-  — binding test plan above
-- [ADR-0026 D1–D4 design synthesis](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-  — pure-sim chaos suite hosting the new `DropAfterAttach`
-  workload
-- Apache Pulsar 4.0.x — `ServerCnx`, `AbstractTopic`,
-  `LoadManagerShared`, `ZooKeeperSessionWatcher`
+- [`docs/follow-ups.md` §#74](../../docs/follow-ups.md#74--post-restart-disconnect-cascade-broker-driven)
+  — failure description + unblock plan.
+- [`ADR-0010 v0.1.0 full Java parity`](0010-v0-1-full-java-parity.md)
+  — connection-level backoff is part of the parity contract.
+- [`ADR-0018 PIP-188 reconnect on migrate`](0018-pip-188-reconnect-on-migrate.md)
+  — the supervised-reset primitive this builds on; explicit
+  non-interaction with `TopicMigrated`.
+- [`ADR-0024 cross-runtime test + coverage policy`](0024-cross-runtime-test-and-coverage-policy.md)
+  — four-layer test set + diff coverage gate.
+- [`ADR-0026 D1–D4 design decisions`](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+  — chaos-pack `BrokerWorkload` foundation (D2).
+- Apache Pulsar issue [#6416](https://github.com/apache/pulsar/issues/6416)
+  — dangling `producerFuture` after bundle unload.
+- Apache Pulsar issue [#9792](https://github.com/apache/pulsar/issues/9792)
+  — "Producer cannot connect after broker load shedding".
+- Apache Pulsar issue [#3566](https://github.com/apache/pulsar/issues/3566)
+  — ZK session race triggers broker shutdown / fence.
+- Apache Pulsar PR [#14467](https://github.com/apache/pulsar/pull/14467)
+  — fix for `producerFuture` not completed in
+  `ServerCnx#handleProducer`.
+- Apache Pulsar PR [#13428](https://github.com/apache/pulsar/pull/13428)
+  — race conditions in closing producers and consumers
+  (`channelInactive` cleanup, completion lambda).
+- Apache Pulsar PR [#12846](https://github.com/apache/pulsar/pull/12846)
+  — producer incorrectly removed from topic's producer map after
+  unload race.
+- `crates/magnetar-runtime-tokio/src/supervisor.rs` — supervisor
+  surface this extends.
+- `crates/magnetar-proto/src/conn.rs` — `Connection` state hosting
+  `AntiThrashState`.
