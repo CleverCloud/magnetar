@@ -293,59 +293,103 @@ caches it with an expiry-aware refresh, and surfaces failures through
 
 ---
 
-## Protocol
+## Protocol — v0.2.0 PIP wave
 
-### PIP-460 scalable topics, PIP-466 V5 surface, PIP-180 shadow topic, PIP-33 replicated subscriptions
+The planning pass for PIP-460 / PIP-466 / PIP-180 / PIP-33 landed as
+four per-PIP proposals under [`specs/proposals/`](../specs/proposals/),
+each citing its authorising ADR (0031–0034) and breaking down
+wire-protocol delta, sans-io additions, runtime ports, the four-layer
+test plan per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md),
+and the e2e plan. The earlier "scope these four" goal is **closed**.
 
-**Status.** Out of scope for v0.1.0 per
-[ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md). PIP-466 is
-"inspired by, not adopted verbatim" — magnetar's public API takes
-PIP-466's clean-room style (immutable builders, no
-`with*` setter chains) without binding to its exact wire surface.
+What follows is one entry per PIP — upstream-readiness flag, what
+v0.2.0 ships, and a fresh `/goal …` block ready to implement.
 
-**Rationale per PIP.**
+### Upstream-readiness summary
 
-- **PIP-460 — Scalable subscription model.** Upstream itself carries
-  the **experimental** tag (Apache Pulsar 4.0.x). The wire surface
-  (`CommandTopicMigrated` variants, subscription-state metadata,
-  bundle-split coordination) is still iterating. Binding magnetar to
-  the current draft would tie the client to a moving target. **Defer
-  to v0.2.0** once upstream stabilises the surface.
+| PIP | Upstream | v0.2.0 e2e |
+| --- | --- | --- |
+| PIP-33 — Replicated subscriptions | 🟢 LIVE (Pulsar 2.4, 2019) | ✅ unblocked — two-cluster fixture |
+| PIP-180 — Shadow topic | 🟢 LIVE (Pulsar 2.11, 2023) | ✅ unblocked — single-broker |
+| PIP-466 — V5 client surface | 🟠 DESIGN-PHASE (Java V5 still iterating; magnetar v0.2.0 surface is a v4-wire skin) | ✅ unblocked — mirrors existing v4 e2e |
+| PIP-460 — Scalable topics | 🔴 NOT LIVE (PIP `Draft`; targets Pulsar 5.0 LTS, Oct 2026; phased 4.3.0 / 4.4.0) | ⏸ blocked — needs `apachepulsar/pulsar:5.0.0-rc-*` |
 
-- **PIP-466 — V5 client surface.** This is an **API-shape decision**,
-  not a wire-protocol change. Magnetar's user-facing API
-  (`PulsarClient::builder()`, `ProducerBuilder`,
-  `ConsumerBuilder`, immutable configs, `Option<…>` over
-  default-bearing setters) already follows PIP-466's spirit. Verbatim
-  adoption would mean re-naming method receivers to match Java's V5
-  conventions (e.g. `Producer.newMessageAsync()` → `producer.send_async()`
-  vs current `producer.send()`). **No wire change required**; decision
-  is whether to chase the rename for surface parity.
+### PIP-33 — Replicated subscriptions (🟢 LIVE)
 
-- **PIP-180 — Shadow topic.** Adds a read-only follower topic that
-  mirrors a primary. The wire surface is small (one new
-  subscription mode + a metadata flag on `CommandSubscribe`), but
-  the consumer-side semantics (no-acks, no-seek, redelivery rules)
-  are subtle. **Defer to v0.2.0** as a low-priority feature — primary
-  use case is cross-region read fan-out, which Clever Cloud's roadmap
-  has not asked for.
+**Status.** Proposal accepted in [`specs/proposals/pip-33-replicated-subscriptions.md`](../specs/proposals/pip-33-replicated-subscriptions.md);
+scope locked by [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md).
+Wire bits already vendored (`CommandSubscribe.replicate_subscription_state` +
+`MarkerType::REPLICATED_SUBSCRIPTION_*`). Estimate ~1065 LOC.
 
-- **PIP-33 — Replicated subscriptions.** Subscription state is
-  replicated across geo-replicated topics so a consumer can resume on
-  a different cluster after failover. Wire-protocol additions:
-  per-snapshot markers in the data stream +
-  `CommandReplicatedSubscriptionSnapshot{Request,Response}`.
-  Substantial broker-side coupling. **Defer to v0.2.0**; magnetar's
-  geo-replication story (via `ServiceUrlProvider` +
-  `AutoClusterFailover`) covers most of the use case at the cluster
-  level without subscription-state replication.
-
-**Unblock.** Scoped for v0.2.0. None of these PIPs blocks v0.1.0
-parity per [ADR-0010](../specs/adr/0010-v0-1-full-java-parity.md);
-all four can land independently as v0.2.0 follow-ups.
+**Ships in v0.2.0.** `ConsumerBuilder::replicate_subscription_state(bool)`,
+the marker filter on the receive path,
+`Event::ReplicatedSubscriptionMarkerObserved` for observability, and the
+two-cluster e2e fixture run weekly (not per-PR, cost-shifted via
+[ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) precedent).
 
 ```text
-/goal scope PIP-460 / PIP-466 / PIP-180 / PIP-33 for v0.2.0. Per PIP, produce: (1) the wire-protocol delta against the current vendored PulsarApi.proto, (2) the magnetar-proto state-machine additions, (3) the runtime-tokio + runtime-moonpool surface ports, (4) the four-layer test plan per ADR-0024, (5) the e2e plan against apachepulsar/pulsar:4.x. Produce one planning doc per PIP under specs/proposals/. No code yet — these are planning passes.
+/goal implement PIP-33 (replicated subscriptions) per specs/proposals/pip-33-replicated-subscriptions.md and ADR-0034. Wire is already vendored — no proto bump. Waves: (1) `magnetar-proto::markers` module decoding REPLICATED_SUBSCRIPTION_{REQUEST,RESPONSE,SNAPSHOT,UPDATE} (kinds 10–13), `#[non_exhaustive]` enums, decoder returns Ok(None) for unknown/txn markers; (2) `magnetar-proto::consumer` receive-path filter — markers do NOT surface as `Event::MessageReceived`, instead emit `Event::ReplicatedSubscriptionMarkerObserved { consumer_id, marker }`; extend `SubscribeOptions { replicate_subscription_state: bool }` (default false); encoder emits CommandSubscribe field 14 when set; (3) `magnetar-runtime-tokio::ConsumerBuilder::replicate_subscription_state(bool)`; (4) `magnetar-runtime-moonpool` 1:1 builder mirror + `BrokerWorkload::InjectsReplicatedMarkers { every_n_messages, kinds }` in `sim_chaos.rs`; (5) `magnetar-cli consumer subscribe --replicate-subscription-state` flag; (6) e2e `crates/magnetar/tests/e2e_replicated_subscriptions.rs` + `docker-compose.replicated-subs.yml` two-cluster fixture + `configure_replicated_subs.sh` script + new `.github/workflows/e2e-replicated-subs.yml` weekly workflow (per-PR CI skips it; see ADR-0036 precedent). Four test layers per ADR-0024 — all binding, no exemptions: (a) proto unit (11 tests), (b) tokio integration (5 tests), (c) moonpool 1:1 (5 tests), (d) differential equivalence (2 tests) + golden trace at `crates/magnetar-differential/tests/golden/replicated_subscription_filter.json`. Docs: `docs/replicated-subscriptions.md` (NEW, explain broker-side prerequisites), parity-status.md row → ✅, README parity matrix row, flip ADR-0034 to Accepted. Full validation chain incl. seed sweep + `check-runtime-test-parity` + `check-sim-coverage`. Two explicit non-goals: client never originates snapshot markers; magnetar does not implement broker-side replication.
+```
+
+### PIP-180 — Shadow topic (🟢 LIVE)
+
+**Status.** Proposal accepted in [`specs/proposals/pip-180-shadow-topic.md`](../specs/proposals/pip-180-shadow-topic.md);
+scope locked by [ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md).
+Wire already vendored — `CommandSend.message_id` is field 9 (commented
+"used in replicator for shadow topic" at
+[`PulsarApi.proto:547`](../crates/magnetar-proto/proto/PulsarApi.proto)),
+the encoder simply never emits it today. Estimate ~1570 LOC.
+
+**Ships in v0.2.0.** `Producer::send_with_source_message_id` sans-io
+entry; three new `magnetar-admin` methods (`create_shadow_topic` /
+`delete_shadow_topic` / `get_shadow_topics`) mirroring
+`org.apache.pulsar.client.admin.Topics`; consumer-side
+`Event::MessageReceivedFromShadow` variant; documented `MessageId`
+equality contract (`(ledger_id, entry_id, batch_index, partition_index)`).
+
+```text
+/goal implement PIP-180 (shadow topic) per specs/proposals/pip-180-shadow-topic.md and ADR-0033. No proto bump — wire is already vendored at PulsarApi.proto:547 (CommandSend.message_id, field 9). Waves: (1) `magnetar-proto::producer::Producer::send_with_source_message_id(source_msg_id: MessageId, payload: Bytes, metadata: MessageMetadata, now: Instant) -> SendHandle` emitting CommandSend with the optional field set; regular `send` leaves it None (byte-identical to v0.1.0); (2) `magnetar-proto::consumer` classification: detect shadow-presented messages via `MessageMetadata.replicated_from` + cached `ShadowTopicMetadata`, emit `Event::MessageReceivedFromShadow { consumer_id, source_topic, source_message_id, shadow_message_id, payload, metadata }`; non-shadow path unchanged; document `MessageId` structural equality contract on `(ledger_id, entry_id, batch_index, partition_index)`; (3) `magnetar-admin::AdminClient` three methods: `create_shadow_topic(source, shadow, ShadowTopicProperties) -> Result<(), AdminError>` → PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/shadowTopics; `delete_shadow_topic(shadow)` → DELETE; `get_shadow_topics(source) -> Vec<TopicName>` → GET; reuse existing `AdminError` taxonomy (404 → TopicNotFound, 409 → Conflict, etc.); (4) `magnetar-runtime-tokio` producer + consumer surface; subscribe-time admin REST hint pre-populates shadow metadata on the `Consumer`; (5) `magnetar-runtime-moonpool` 1:1 mirror + `BrokerWorkload::ShadowTopic { source, shadow }` mode in sim_chaos.rs replying to CommandSend with CommandSendReceipt.message_id = client-provided source_msg_id (round-trip preservation); extend the existing scripted admin fake with the three new endpoint handlers; (6) `magnetar-cli shadow {create,delete,list}` subcommand (~120 LOC). Four test layers per ADR-0024, all binding: (a) proto unit (7 tests incl. v0.1.0 byte-identical guard), (b) tokio integration (8 tests using wiremock for admin + magnetar-fakes for wire), (c) moonpool 1:1 (8 tests), (d) differential equivalence (2 tests) + golden trace `crates/magnetar-differential/tests/golden/shadow_send_with_source.json`. E2E `crates/magnetar/tests/e2e_shadow_topic.rs` against existing `apachepulsar/pulsar:4.0.4` — no new container, no docker-compose helper needed. Docs: `docs/shadow-topic.md` (NEW, document the client-asserted source-id caveat), parity-status.md row → ✅, README parity matrix row, flip ADR-0033 to Accepted. No feature flag. Full validation chain incl. seed sweep.
+```
+
+### PIP-466 — V5 client surface (🟠 DESIGN-PHASE, surface usable today)
+
+**Status.** Proposal accepted in [`specs/proposals/pip-466-v5-client-surface.md`](../specs/proposals/pip-466-v5-client-surface.md);
+scope locked by [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md).
+No proto change — V5 is a v4-wire skin. Estimate ~1080 LOC. Upstream
+Java V5 is still iterating, hence the experimental tag — but magnetar's
+surface works against current Pulsar 4.x brokers since it ultimately
+sends the v4 commands.
+
+**Ships in v0.2.0.** `magnetar::v5` module behind
+`feature = "experimental-v5-client"` (default off) exposing
+`PulsarClientV5<E>`, `v5::Producer<T, E>`, `v5::StreamConsumer<T, E>`,
+`v5::QueueConsumer<T, E>`. Each is a thin wrapper holding the
+corresponding v4 type. V5 `Reader`, `TableView`, `Transaction`,
+`CheckpointConsumer` are explicit v0.3.0+.
+
+```text
+/goal implement PIP-466 V5 client surface per specs/proposals/pip-466-v5-client-surface.md and ADR-0032. No wire change. No sans-io change. No new `Event` variant. The V5 surface is a thin skin over v4 — internally delegates every call. Waves: (1) `magnetar/Cargo.toml` add `experimental-v5-client = []` feature (default OFF); `magnetar/src/lib.rs` add `#[cfg(feature = "experimental-v5-client")] pub mod v5;`; (2) `magnetar/src/v5/mod.rs` (NEW) + submodules `client.rs`, `producer.rs`, `stream_consumer.rs`, `queue_consumer.rs`; (3) `magnetar/src/v5/mapping.rs` (NEW) — single source-of-truth table of V5→v4 field translations: send_timeout: Duration → ms u64 (default 30s); max_pending_messages: Option<usize> → usize with None=0 (default Some(1000)); ack_timeout: Option<Duration> → ms u64 with None=0 (default None); negative_ack_redelivery_delay: Duration → ms u64 (default 60s); receiver_queue_size: usize direct (default 1000); subscription_initial_position direct; (4) `PulsarClientV5<E: Engine>` wraps `Arc<E::ClientState>`; exposes `v4() -> PulsarClient<E>` escape hatch with the SAME state (no double init); (5) `v5::Producer<T, E>` holds `crate::Producer<T, E>`; signatures use Duration + Option<MessageId> return on send; (6) `v5::StreamConsumer<T, E>` → v4 Consumer with SubscriptionType::Exclusive / Failover; `v5::QueueConsumer<T, E>` → v4 with Shared / KeyShared; (7) every public V5 type carries `#[doc = "**Experimental** — PIP-466 V5 client surface (v0.2.0). Behaviour and signatures may change before V5 is promoted to default."]`. Test layers per ADR-0024 — claim and JUSTIFY two exemptions in the commit body via `test-exemption-proto: PIP-466 V5 surface (no wire/sans-io change)` and `test-exemption-differential: PIP-466 V5 surface (no new sans-io surface)`. Required layers: (b) `crates/magnetar/tests/v5_*.rs` — 5 files (`v5_producer_mapping.rs`, `v5_stream_consumer_mapping.rs`, `v5_queue_consumer_mapping.rs`, `v5_client_v4_escape_hatch.rs`, `v5_builder_defaults.rs` table-driven from mapping.rs), each asserting the wire bytes magnetar-fakes observes match the v4 expectation; (c) `crates/magnetar/tests/v5_*_moonpool.rs` — same five files mirrored 1:1 under SimulationBuilder. NO new moonpool BrokerWorkload variant (the v4 fakes already cover it). NO new differential test (v4 differential already covers the wire). E2E: 3 mirror tests under `crates/magnetar/tests/e2e_pulsar_v5.rs` + `e2e_sub_types_v5.rs` parameterising existing e2e patterns against Pulsar 4.0.4 — gated `feature = "e2e,experimental-v5-client"`. Docs: `docs/v5-client.md` (NEW including the mapping table), parity-status.md row → 🟡 experimental, README parity matrix row, flip ADR-0032 to Accepted. Full validation chain incl. `check-crypto-matrix` (V5 × crypto axis).
+```
+
+### PIP-460 — Scalable topics (🔴 NOT LIVE, scaffold-now / e2e-later)
+
+**Status.** Proposal accepted in [`specs/proposals/pip-460-scalable-topics.md`](../specs/proposals/pip-460-scalable-topics.md);
+scope locked by [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md).
+Upstream PIP is **`Draft`**, targets Pulsar 5.0 LTS (Oct 2026) with
+phased rollout via 4.3.0 / 4.4.0. Estimate ~2080 LOC. Wire-protocol
+delta is significant — 3 new commands + a new optional
+`MessageId.segment_id` — and the proto bump is gated on upstream
+cutting an RC.
+
+**Ships in v0.2.0.** StreamConsumer-only, drops-on-DAG-change (no
+transparent failover), behind `feature = "scalable-topics"` (default
+off). `QueueConsumer`, `CheckpointConsumer`, controller-election, and
+in-place repartition are explicit v0.3.0+. **E2E is best-effort and
+does not block release**; the 4-layer in-process tests are the binding
+acceptance gate.
+
+```text
+/goal implement PIP-460 scalable-topics surface per specs/proposals/pip-460-scalable-topics.md and ADR-0031. Upstream is `Draft` and no broker ships PIP-460 today, so this is scaffold-now / e2e-later. Waves: (0) PREREQ — separate commit per ADR-0026 §D4: `cargo run -p xtask -- vendor-proto --rev <pulsar-5.0-rc-sha>` ONCE upstream cuts a 5.0 RC; until that lands, hand-encode the new commands behind a `cfg(feature = "scalable-topics")` gate in `magnetar-proto/src/pb/scalable_topics.rs` (NEW) using prost-build manual definitions; (1) `magnetar-proto/src/types.rs` extend `MessageId { segment_id: Option<SegmentId> }`, new types `SegmentId(u64)`, `KeyRange { start: u32, end: u32 }`, `SegmentState { Active, Splitting, Merging, Sealed }` (`#[non_exhaustive]`), `SegmentDescriptor`; equality rules: `None`-segment ignored for v4 invariant, `Some(_)` vs `None` returns false (cross-mode); (2) `magnetar-proto/src/dag_watch.rs` (NEW) — `DagWatchSession` with monotonic update_seq tracking, `handle_update(SegmentDagUpdate) -> Result<DagDelta, DagError>`, `DagError::{NonMonotonic, UnknownSegment, ...}`; (3) `magnetar-proto/src/conn.rs` — new entries `send_scalable_topic_lookup`, `open_dag_watch`, `close_dag_watch`; `magnetar-proto/src/event.rs` — new variants `ScalableTopicLookupResolved`, `SegmentDagUpdated`, `DagChangedDuringConsume { reason: DagChangeReason }`; `magnetar-proto/src/lib.rs` — new `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS` constant; (4) `magnetar::scalable` module (NEW) behind `feature = "scalable-topics"` (default off) exposing `ScalableTopicsApi` extension trait + `StreamConsumer<T, E> where E::ClientState: ScalableTopicsApi`; on `DagChangedDuringConsume` close all per-segment v4 consumers and surface `ConsumerEvent::DagChanged`; (5) `magnetar-runtime-tokio` — `topic://` URL parser branch; impl `ScalableTopicsApi for TokioRuntimeState`; driver translates DagWatch events into consumer wake-ups; (6) `magnetar-runtime-moonpool` — impl `ScalableTopicsApi for Client<P>`; `magnetar-runtime-moonpool/tests/scalable_topic_broker.rs` (NEW) — scripted controller-broker (replies to lookup, opens DagWatch, pushes 2 updates: 1 split + 1 merge, then closes); `BrokerWorkload::ScalableTopic` variant in sim_chaos.rs; (7) `magnetar-cli topic-info <topic://...>` subcommand (~80 LOC, prints segment DAG). Test layers per ADR-0024 — all binding: (a) proto unit (9 tests incl. encoder roundtrip + v4-shape byte-identical guard + monotonic update_seq + split/merge), (b) tokio integration in `crates/magnetar-runtime-tokio/tests/scalable_topic.rs` (4 tests incl. `scalable_topics_feature_off_does_not_export` compile_error proof), (c) moonpool 1:1 mirror with 100% diff coverage via `check-sim-coverage`, (d) differential equivalence + golden trace `crates/magnetar-differential/tests/golden/scalable_topic_drop_on_split.json`. E2E gated behind `#[ignore = "e2e: requires Pulsar 5.0 with PIP-460"]` + `feature = "e2e,scalable-topics"` — `crates/magnetar/tests/e2e_scalable_topic.rs` (NEW) does NOT block v0.2.0 release-cut. Docs: `docs/scalable-topics.md` (NEW with experimental banner + drop-on-change semantics), parity-status.md row → 🟡 experimental, README parity matrix row, flip ADR-0031 to Accepted. Land in this exact order to keep `check-runtime-test-parity` green: (a) before (b); moonpool `ScalableTopicBroker` fake before any tokio test; differential after both engines have green tests. Out of scope (v0.3.0+ markers): QueueConsumer, CheckpointConsumer, controller-election awareness, transparent segment failover, in-place repartition, segment-aware sticky-key dispatch.
 ```
 
 ---

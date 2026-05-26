@@ -68,3 +68,13 @@ A chronological decision log is great for "what happened on date X" but bad
 for "what's the current rule on TLS?". ADRs invert that: one file per
 question, one canonical answer per file, and a stable identifier
 (`ADR-0005`) you can cite in code comments and commit messages.
+
+## Proposals — implementation maps below the ADRs
+
+Where an ADR locks the **binding decision** ("we will ship X in v0.2.0,
+behind feature Y"), a **proposal** under [`proposals/`](proposals/) locks
+the **implementation map** that turns the decision into a landed PR: wire
+delta, sans-io additions, runtime ports, four-layer test plan, e2e plan.
+
+See [`proposals/README.md`](proposals/README.md) for the index. The v0.2.0
+wave currently covers PIP-460, PIP-466, PIP-180 and PIP-33.
