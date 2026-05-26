@@ -18,7 +18,7 @@ contributors; this folder goes deeper.
 | [`parity-status.md`](parity-status.md) | Java parity snapshot — engine surface table and moonpool parity train. |
 | [`cli.md`](cli.md) | `magnetar` binary reference — `--version` banner, color policy, build-time metadata. |
 | [`shadow-topic.md`](shadow-topic.md) | PIP-180 shadow topics — admin REST, producer-side `send_with_source_message_id`, consumer-side `MessageReceivedFromShadow`, structural `MessageId` equality, caveats. |
-| [`replicated-subscriptions.md`](replicated-subscriptions.md) | PIP-33 replicated subscriptions — `replicate_subscription_state` wire flag, marker decoder, `ReplicatedSubscriptionMarkerObserved` event surface. |
+| [`replicated-subscriptions.md`](replicated-subscriptions.md) | PIP-33 replicated subscriptions — `ConsumerBuilder::replicate_subscription_state(bool)`, broker-side prerequisites (two-cluster + namespace `replicated_subscription_status=true`), receive-path marker filter, observation channel. |
 | [`simulation-patterns.md`](simulation-patterns.md) | Research note — FoundationDB simulator, moonpool, TigerBeetle VOPR + TigerStyle, and what magnetar should adopt next. |
 | [`follow-ups.md`](follow-ups.md) | Consolidated open work tracker. |
 

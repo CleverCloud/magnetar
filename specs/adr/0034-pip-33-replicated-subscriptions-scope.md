@@ -1,6 +1,6 @@
 # ADR-0034 — PIP-33 replicated subscriptions scope for v0.2.0
 
-- **Status**: Accepted
+- **Status**: Accepted (2026-05-26)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: pip-33, replicated-subscriptions, geo-replication, v0.2.0, scope

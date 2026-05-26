@@ -715,10 +715,13 @@ known-missing feature.
   pending. See
   [`docs/parity-status.md`](docs/parity-status.md) and
   [`docs/follow-ups.md#per-surface-builder--impl-body-lifts`](docs/follow-ups.md#per-surface-builder--impl-body-lifts).
-- **PIP-180 shadow topic** is in v0.2.0 ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md),
+- **PIP-180 shadow topic** landed in v0.2.0 ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md),
   [`docs/shadow-topic.md`](docs/shadow-topic.md)).
-- **PIP-460 scalable topics** + **PIP-466 V5 surface** + **PIP-33
-  replicated subscriptions** are scoped for v0.2.0.
+- **PIP-33 replicated subscriptions** landed in v0.2.0
+  ([ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md),
+  [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md)).
+- **PIP-460 scalable topics** + **PIP-466 V5 surface** are scoped for
+  v0.2.0.
 - **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616)
   under the default `auth-sasl` feature, and Kerberos/GSSAPI via
   `libgssapi` under the `auth-sasl-kerberos` feature. The
@@ -816,12 +819,18 @@ v0.1.0 targets full Java client parity on the tokio engine
 moonpool engine reaches feature parity with tokio on a follow-up train.
 
 The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
-PIP-180 shadow topic landed in v0.2.0 (see
-[`docs/shadow-topic.md`](docs/shadow-topic.md) +
-[ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
-The remaining deferred-scope items (PIP-460 scalable topics, PIP-466 V5
-surface, PIP-33 replicated subscriptions, SASL Kerberos / GSSAPI, Athenz
-ZTS round-trip) ship in v0.2.0 per
+The v0.2.0 wave has landed:
+
+- **PIP-180** shadow topic ([`docs/shadow-topic.md`](docs/shadow-topic.md),
+  [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
+- **PIP-33** replicated subscriptions
+  ([`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md),
+  [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md)).
+- **SASL Kerberos / GSSAPI** ([ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
+
+The remaining deferred items — **PIP-460** scalable topics, **PIP-466**
+V5 surface, and the **Athenz ZTS** round-trip — are still scoped for
+v0.2.0 per
 [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
 §D3.
 

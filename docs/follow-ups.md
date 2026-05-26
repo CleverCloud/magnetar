@@ -339,49 +339,33 @@ v0.2.0 ships, and a fresh `/goal …` block ready to implement.
 
 ### Upstream-readiness summary
 
-| PIP | Upstream | v0.2.0 e2e |
+| PIP | Upstream | v0.2.0 status |
 | --- | --- | --- |
-| PIP-33 — Replicated subscriptions | 🟢 LIVE (Pulsar 2.4, 2019) | ✅ unblocked — two-cluster fixture |
-| PIP-180 — Shadow topic | 🟢 LIVE (Pulsar 2.11, 2023) | ✅ unblocked — single-broker |
-| PIP-466 — V5 client surface | 🟠 DESIGN-PHASE (Java V5 still iterating; magnetar v0.2.0 surface is a v4-wire skin) | ✅ unblocked — mirrors existing v4 e2e |
+| PIP-33 — Replicated subscriptions | 🟢 LIVE (Pulsar 2.4, 2019) | ✅ landed — see [`docs/replicated-subscriptions.md`](replicated-subscriptions.md) |
+| PIP-180 — Shadow topic | 🟢 LIVE (Pulsar 2.11, 2023) | ✅ landed — see [`docs/shadow-topic.md`](shadow-topic.md) |
+| PIP-466 — V5 client surface | 🟠 DESIGN-PHASE (Java V5 still iterating; magnetar v0.2.0 surface is a v4-wire skin) | ⌛ unblocked — mirrors existing v4 e2e; `/goal` below |
 | PIP-460 — Scalable topics | 🔴 NOT LIVE (PIP `Draft`; targets Pulsar 5.0 LTS, Oct 2026; phased 4.3.0 / 4.4.0) | ⏸ blocked — needs `apachepulsar/pulsar:5.0.0-rc-*` |
 
-### PIP-33 — Replicated subscriptions (🟢 LIVE)
+### PIP-33 — Replicated subscriptions ✅ landed
 
-**Status.** Proposal accepted in [`specs/proposals/pip-33-replicated-subscriptions.md`](../specs/proposals/pip-33-replicated-subscriptions.md);
-scope locked by [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md).
-Wire bits already vendored (`CommandSubscribe.replicate_subscription_state` +
-`MarkerType::REPLICATED_SUBSCRIPTION_*`). Estimate ~1065 LOC.
+Landed in v0.2.0 ([ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md),
+[`docs/replicated-subscriptions.md`](replicated-subscriptions.md)).
+`ConsumerBuilder::replicate_subscription_state(bool)` on the façade
+flips `CommandSubscribe` field 14; the receive-path filter in
+`magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and
+surfaces them via `PulsarClient::next_replicated_subscription_marker` /
+`poll_replicated_subscription_marker`. Two-cluster e2e runs weekly via
+[`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml).
 
-**Ships in v0.2.0.** `ConsumerBuilder::replicate_subscription_state(bool)`,
-the marker filter on the receive path,
-`Event::ReplicatedSubscriptionMarkerObserved` for observability, and the
-two-cluster e2e fixture run weekly (not per-PR, cost-shifted via
-[ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) precedent).
+### PIP-180 — Shadow topic ✅ landed
 
-```text
-/goal implement PIP-33 (replicated subscriptions) per specs/proposals/pip-33-replicated-subscriptions.md and ADR-0034. Wire is already vendored — no proto bump. Waves: (1) `magnetar-proto::markers` module decoding REPLICATED_SUBSCRIPTION_{REQUEST,RESPONSE,SNAPSHOT,UPDATE} (kinds 10–13), `#[non_exhaustive]` enums, decoder returns Ok(None) for unknown/txn markers; (2) `magnetar-proto::consumer` receive-path filter — markers do NOT surface as `Event::MessageReceived`, instead emit `Event::ReplicatedSubscriptionMarkerObserved { consumer_id, marker }`; extend `SubscribeOptions { replicate_subscription_state: bool }` (default false); encoder emits CommandSubscribe field 14 when set; (3) `magnetar-runtime-tokio::ConsumerBuilder::replicate_subscription_state(bool)`; (4) `magnetar-runtime-moonpool` 1:1 builder mirror + `BrokerWorkload::InjectsReplicatedMarkers { every_n_messages, kinds }` in `sim_chaos.rs`; (5) `magnetar-cli consumer subscribe --replicate-subscription-state` flag; (6) e2e `crates/magnetar/tests/e2e_replicated_subscriptions.rs` + `docker-compose.replicated-subs.yml` two-cluster fixture + `configure_replicated_subs.sh` script + new `.github/workflows/e2e-replicated-subs.yml` weekly workflow (per-PR CI skips it; see ADR-0036 precedent). Four test layers per ADR-0024 — all binding, no exemptions: (a) proto unit (11 tests), (b) tokio integration (5 tests), (c) moonpool 1:1 (5 tests), (d) differential equivalence (2 tests) + golden trace at `crates/magnetar-differential/tests/golden/replicated_subscription_filter.json`. Docs: `docs/replicated-subscriptions.md` (NEW, explain broker-side prerequisites), parity-status.md row → ✅, README parity matrix row, flip ADR-0034 to Accepted. Full validation chain incl. seed sweep + `check-runtime-test-parity` + `check-sim-coverage`. Two explicit non-goals: client never originates snapshot markers; magnetar does not implement broker-side replication.
-```
-
-### PIP-180 — Shadow topic (🟢 LIVE)
-
-**Status.** Proposal accepted in [`specs/proposals/pip-180-shadow-topic.md`](../specs/proposals/pip-180-shadow-topic.md);
-scope locked by [ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md).
-Wire already vendored — `CommandSend.message_id` is field 9 (commented
-"used in replicator for shadow topic" at
-[`PulsarApi.proto:547`](../crates/magnetar-proto/proto/PulsarApi.proto)),
-the encoder simply never emits it today. Estimate ~1570 LOC.
-
-**Ships in v0.2.0.** `Producer::send_with_source_message_id` sans-io
-entry; three new `magnetar-admin` methods (`create_shadow_topic` /
-`delete_shadow_topic` / `get_shadow_topics`) mirroring
-`org.apache.pulsar.client.admin.Topics`; consumer-side
-`Event::MessageReceivedFromShadow` variant; documented `MessageId`
-equality contract (`(ledger_id, entry_id, batch_index, partition_index)`).
-
-```text
-/goal implement PIP-180 (shadow topic) per specs/proposals/pip-180-shadow-topic.md and ADR-0033. No proto bump — wire is already vendored at PulsarApi.proto:547 (CommandSend.message_id, field 9). Waves: (1) `magnetar-proto::producer::Producer::send_with_source_message_id(source_msg_id: MessageId, payload: Bytes, metadata: MessageMetadata, now: Instant) -> SendHandle` emitting CommandSend with the optional field set; regular `send` leaves it None (byte-identical to v0.1.0); (2) `magnetar-proto::consumer` classification: detect shadow-presented messages via `MessageMetadata.replicated_from` + cached `ShadowTopicMetadata`, emit `Event::MessageReceivedFromShadow { consumer_id, source_topic, source_message_id, shadow_message_id, payload, metadata }`; non-shadow path unchanged; document `MessageId` structural equality contract on `(ledger_id, entry_id, batch_index, partition_index)`; (3) `magnetar-admin::AdminClient` three methods: `create_shadow_topic(source, shadow, ShadowTopicProperties) -> Result<(), AdminError>` → PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/shadowTopics; `delete_shadow_topic(shadow)` → DELETE; `get_shadow_topics(source) -> Vec<TopicName>` → GET; reuse existing `AdminError` taxonomy (404 → TopicNotFound, 409 → Conflict, etc.); (4) `magnetar-runtime-tokio` producer + consumer surface; subscribe-time admin REST hint pre-populates shadow metadata on the `Consumer`; (5) `magnetar-runtime-moonpool` 1:1 mirror + `BrokerWorkload::ShadowTopic { source, shadow }` mode in sim_chaos.rs replying to CommandSend with CommandSendReceipt.message_id = client-provided source_msg_id (round-trip preservation); extend the existing scripted admin fake with the three new endpoint handlers; (6) `magnetar-cli shadow {create,delete,list}` subcommand (~120 LOC). Four test layers per ADR-0024, all binding: (a) proto unit (7 tests incl. v0.1.0 byte-identical guard), (b) tokio integration (8 tests using wiremock for admin + magnetar-fakes for wire), (c) moonpool 1:1 (8 tests), (d) differential equivalence (2 tests) + golden trace `crates/magnetar-differential/tests/golden/shadow_send_with_source.json`. E2E `crates/magnetar/tests/e2e_shadow_topic.rs` against existing `apachepulsar/pulsar:4.0.4` — no new container, no docker-compose helper needed. Docs: `docs/shadow-topic.md` (NEW, document the client-asserted source-id caveat), parity-status.md row → ✅, README parity matrix row, flip ADR-0033 to Accepted. No feature flag. Full validation chain incl. seed sweep.
-```
+Landed in v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md),
+[`docs/shadow-topic.md`](shadow-topic.md)). Three new
+`magnetar-admin` methods (`create_shadow_topic` / `delete_shadow_topic` /
+`get_shadow_topics` + `get_shadow_source`), producer-side
+`send_with_source_message_id`, consumer-side
+`ConnectionEvent::MessageReceivedFromShadow`, and the structural
+`MessageId` equality contract.
 
 ### PIP-466 — V5 client surface (🟠 DESIGN-PHASE, surface usable today)
 

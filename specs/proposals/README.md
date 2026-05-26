@@ -28,8 +28,8 @@ references.
 | --- | --- | --- | --- | --- |
 | [PIP-460](pip-460-scalable-topics.md) | Scalable topics / DAG-watch consumer (experimental) | [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md) | Draft | 🔴 **NOT LIVE** — PIP is `Draft` upstream; targets Pulsar 5.0 LTS (Oct 2026) with phased rollout via 4.3.0 / 4.4.0. No release ships it yet. |
 | [PIP-466](pip-466-v5-client-surface.md) | V5 client surface (experimental) | [ADR-0032](../adr/0032-pip-466-v5-client-surface-scope.md) | Draft | 🟠 **DESIGN-PHASE** — V5 Java client API still iterating upstream; no stable Pulsar release exposes the V5 modules as default. magnetar's V5 surface is a thin skin over v4 wire (which **is** live), so it works against Pulsar 4.x today. |
-| [PIP-180](pip-180-shadow-topic.md) | Shadow topic — producer-side source-id + admin REST | [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md) | Draft | 🟢 **LIVE** — merged upstream in Pulsar 2.11; available on the v0.1.0 baseline broker (`apachepulsar/pulsar:4.0.4`). |
-| [PIP-33](pip-33-replicated-subscriptions.md) | Replicated subscriptions — subscribe flag + marker filter | [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md) | Draft | 🟢 **LIVE** — merged upstream in Pulsar 2.4 (2019); available on the v0.1.0 baseline broker. |
+| [PIP-180](pip-180-shadow-topic.md) | Shadow topic — producer-side source-id + admin REST | [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md) | Implemented | 🟢 **LIVE** — merged upstream in Pulsar 2.11; available on the v0.1.0 baseline broker (`apachepulsar/pulsar:4.0.4`). |
+| [PIP-33](pip-33-replicated-subscriptions.md) | Replicated subscriptions — subscribe flag + marker filter | [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md) | Implemented | 🟢 **LIVE** — merged upstream in Pulsar 2.4 (2019); available on the v0.1.0 baseline broker. |
 
 ### Upstream-readiness legend
 

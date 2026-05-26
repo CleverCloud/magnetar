@@ -33,7 +33,7 @@ crates/
   magnetar-admin/                 — reqwest-backed REST admin client
   magnetar-auth-athenz/           — Athenz auth scaffold
   magnetar-auth-oauth2/           — OAuth2 ClientCredentialsFlow
-  magnetar-auth-sasl/             — SASL/Kerberos scaffold
+  magnetar-auth-sasl/             — SASL PLAIN + Kerberos/GSSAPI (libgssapi behind `kerberos` feature, ADR-0029)
   magnetar-cli/                   — `magnetar` binary
   magnetar-differential/          — tokio ↔ moonpool differential harness (test-only)
   magnetar-fakes/                 — in-process broker stub for tests

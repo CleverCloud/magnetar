@@ -384,8 +384,8 @@ keep enqueuing while the driver holds the network handle.
 `handle_bytes` is the inbound entry. As frames are decoded, the state
 machine populates the outcome slab and calls `Waker::wake()` on whatever
 user future is waiting. After the lock drops, the driver pulls semantic
-events via `poll_event()` and reacts to the two that the runtime layer
-must handle:
+events via `poll_event()` and reacts to the variants that the runtime
+layer must handle:
 
 - `ConnectionEvent::AuthChallenge { method, challenge }` — driver
   consults the configured `AuthProvider`, asks it for a fresh blob via
@@ -399,6 +399,18 @@ must handle:
 - `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes
   the delta into `ConnectionShared.topic_list_changes` and wakes
   `topic_list_notify` (PIP-145).
+- `ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker }`
+  — driver pushes the observation into
+  `ConnectionShared.replicated_subscription_markers` and wakes
+  `replicated_subscription_marker_notify` (PIP-33 / ADR-0034). The
+  marker is filtered off the user-visible message stream upstream in
+  the `magnetar-proto` receive path so it never reaches
+  `Consumer::receive`.
+
+The `MessageReceivedFromShadow` variant (PIP-180 / ADR-0033) is
+emitted in place of `Message` for shadow-topic consumers; user-facing
+futures pick it up directly via the same Waker slab as `Message`, so
+the driver does not need to special-case it.
 
 Every other event has already been turned into a future-completion via
 the Waker slab inside the state machine; the driver does not need to
@@ -628,6 +640,26 @@ the PIP-145 broker-driven topic-discovery state. The connection handles
 emits `ConnectionEvent::TopicListChanged` on the event queue. The driver
 forwards those to `ConnectionShared.topic_list_changes`, where
 `PatternConsumer::update` reconciles them against its child consumers.
+
+### Replicated-subscription markers (`magnetar-proto/src/markers.rs`)
+
+PIP-33 wire payload typing. Defines the `ReplicatedSubscriptionMarkerKind`
+enum (`SnapshotRequest=10`, `SnapshotResponse=11`, `Snapshot=12`,
+`Update=13`) and the matching `ReplicatedSubscriptionMarkerDetails` sum
+type, plus `decode_replicated_subscription_marker(marker_type, payload)`.
+Both enums are `#[non_exhaustive]` so future broker-side kinds stay
+additive. The decoder returns `Ok(None)` for txn markers (kinds 20..=22)
+and any unknown kind — forward-compat for future broker emits.
+
+The connection's receive-path filter at the `pb::base_command::Type::Message`
+arm in `conn.rs` consults this decoder before delivering to the
+consumer: replicated-subscription markers are diverted into
+`ConnectionEvent::ReplicatedSubscriptionMarkerObserved` and never reach
+`ConsumerState::deliver`. The consumer's `record_marker_consumed`
+helper bumps `consumed_since_flow` so permit accounting stays symmetric
+with the broker's view (otherwise the broker's perceived permit budget
+would drift by one per marker). See [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md)
+and [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md).
 
 ### Transactions (`magnetar-proto/src/txn.rs`)
 
@@ -1392,9 +1424,9 @@ The schema is advertised on `CommandProducer.schema` /
 | PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
 | PIP-460 | Scalable topics | ❌ | v0.2.0 (experimental upstream) |
 | PIP-466 | V5 client API surface | ❌ | Inspired by, not adopted verbatim |
-| PIP-180 | Shadow topic | ❌ | v0.2.0 |
+| PIP-180 | Shadow topic | ✅ | v0.2.0 — admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
 | PIP-415 | `getMessageIdByIndex` | ✅ | `crates/magnetar-admin/src/lib.rs::AdminClient::topic_get_message_id_by_index` — REST-only ([PIP-415 spec](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) leaves "Binary protocol" empty; canonical impl [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin/broker/CLI only) |
-| PIP-33 | Replicated subscriptions | ❌ | v0.2.0 |
+| PIP-33 | Replicated subscriptions | ✅ | v0.2.0 — `ConsumerBuilder::replicate_subscription_state(bool)` on the façade flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
 
 ---
 

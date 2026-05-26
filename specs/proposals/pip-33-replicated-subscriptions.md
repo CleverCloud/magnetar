@@ -1,6 +1,6 @@
 # PIP-33 — Replicated subscriptions (v0.2.0)
 
-- **Status**: Draft
+- **Status**: Implemented in v0.2.0 (see [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md))
 - **ADR**: [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md)
 - **Target**: v0.2.0
 - **Date**: 2026-05-26
