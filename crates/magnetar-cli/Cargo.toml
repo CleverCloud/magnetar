@@ -12,6 +12,7 @@ readme        = "../../README.md"
 keywords      = { workspace = true }
 categories    = { workspace = true }
 publish     = true
+build       = "build.rs"
 
 [[bin]]
 name = "magnetar"
@@ -27,6 +28,8 @@ workspace = true
 [dependencies]
 magnetar           = { workspace = true, features = ["tokio"] }
 magnetar-admin     = { workspace = true }
+anstream           = "1"
+anstyle            = "1"
 clap               = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tracing            = { workspace = true }
