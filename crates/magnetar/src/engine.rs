@@ -111,6 +111,24 @@ pub trait Engine: 'static + Send + Sync + Debug {
     fn random_subscription_suffix() -> String
     where
         Self: Sized;
+
+    /// Engine-provided `OAuth2` [`magnetar_auth_oauth2::Clock`]. Used by
+    /// callers that build a `ClientCredentialsFlow` from generic-engine
+    /// code so the `OAuth2` cache deadlines flow through the same clock
+    /// the engine uses everywhere else, instead of always landing on
+    /// `Arc::new(SystemClock)` at the `OAuth2` builder boundary.
+    ///
+    /// Default is `Arc::new(magnetar_auth_oauth2::SystemClock)` —
+    /// matches the `OAuth2` builder's own default. Engines wired into a
+    /// virtual-time substrate (e.g. moonpool with `SimProviders`)
+    /// override this to return a clock that reads the simulated time.
+    #[cfg(feature = "auth-oauth2")]
+    fn oauth2_clock() -> std::sync::Arc<dyn magnetar_auth_oauth2::Clock>
+    where
+        Self: Sized,
+    {
+        std::sync::Arc::new(magnetar_auth_oauth2::SystemClock)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,6 +2007,25 @@ mod tests {
         use moonpool_core::TokioProviders;
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MoonpoolEngine<TokioProviders>>();
+    }
+
+    #[cfg(all(feature = "tokio", feature = "auth-oauth2"))]
+    #[test]
+    fn tokio_engine_oauth2_clock_is_monotonic() {
+        let clock = <TokioEngine as Engine>::oauth2_clock();
+        let a = clock.now();
+        let b = clock.now();
+        assert!(b >= a, "OAuth2 clock must be monotonic");
+    }
+
+    #[cfg(all(feature = "moonpool", feature = "auth-oauth2"))]
+    #[test]
+    fn moonpool_engine_oauth2_clock_is_monotonic() {
+        use moonpool_core::TokioProviders;
+        let clock = <MoonpoolEngine<TokioProviders> as Engine>::oauth2_clock();
+        let a = clock.now();
+        let b = clock.now();
+        assert!(b >= a, "OAuth2 clock must be monotonic");
     }
 
     // -------------------------------------------------------------

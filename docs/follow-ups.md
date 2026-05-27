@@ -33,13 +33,6 @@ What remains open from that audit — bucketed by category — is below.
 Findings are `path:line`-verifiable; tags: **[codex]** = codex-only
 catch, **[Δ]** = auditor disagreement with documented resolution.
 
-### Open — sans-io / determinism
-
-- **`crates/magnetar-auth-oauth2/src/lib.rs::SystemClock`** —
-  `SystemClock::now()` is the production default for OAuth2's
-  `Clock` trait; the same crate provides a `VirtualClock` in tests.
-  Wire a `Clock` provider through the engine so the production path
-  is actually injectable.
 ### Open — zero-copy
 
 - **`crates/magnetar-proto/src/frame.rs::encode_payload`** — single
