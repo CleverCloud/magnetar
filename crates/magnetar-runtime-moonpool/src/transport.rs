@@ -401,4 +401,24 @@ mod tests {
     fn split_host_port_rejects_missing_port() {
         assert!(split_host_port("broker").is_err());
     }
+
+    // `split_host_port` rejection paths beyond "missing port" are
+    // worth pinning too: a non-numeric port-suffix should surface a
+    // typed `EngineError::Config` rather than panic / parse silently.
+    #[test]
+    fn split_host_port_rejects_non_numeric_port() {
+        let err = split_host_port("broker:abc")
+            .expect_err("non-numeric port must surface as a config error");
+        assert!(
+            format!("{err:?}").contains("port"),
+            "error message should mention port: {err:?}",
+        );
+    }
+
+    #[test]
+    fn split_host_port_handles_high_port() {
+        let (host, port) = split_host_port("broker:65535").expect("parse");
+        assert_eq!(host, "broker");
+        assert_eq!(port, 65535);
+    }
 }

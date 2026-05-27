@@ -110,4 +110,29 @@ mod tests {
             Err(ClientError::BadUrl(_))
         ));
     }
+
+    // Mirrors `magnetar_runtime_moonpool::transport::tests::split_host_port_rejects_non_numeric_port`:
+    // a non-numeric port should surface a typed error, not panic.
+    #[test]
+    fn rejects_non_numeric_port() {
+        let err = ParsedUrl::parse("pulsar://broker:abc")
+            .expect_err("non-numeric port must surface as a typed error");
+        // Either BadUrl (url crate rejects it pre-parse) or
+        // UnsupportedScheme — both are typed and non-panicking.
+        assert!(
+            matches!(
+                err,
+                ClientError::BadUrl(_) | ClientError::UnsupportedScheme(_)
+            ),
+            "expected typed parse error, got {err:?}",
+        );
+    }
+
+    // Mirrors `magnetar_runtime_moonpool::transport::tests::split_host_port_handles_high_port`:
+    // the maximum legal TCP port (65535) must parse without overflow.
+    #[test]
+    fn parses_high_port() {
+        let parsed = ParsedUrl::parse("pulsar://broker:65535").expect("parse");
+        assert_eq!(parsed.port, 65535);
+    }
 }
