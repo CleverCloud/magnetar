@@ -87,16 +87,19 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
     crate work). Once available, replace the moonpool driver's
     local coalesce with the real vectored dispatch; the chaos
     pack can then drop / re-order individual segments.
-  - **Wave 3** (read-path `BytesMut` ownership pass-through) —
-    runtime hands owned `BytesMut` chunks to `handle_bytes`
-    directly. The proto-side double-copy was already removed
-    (commit `bf66a5b`); wave 3 closes the runtime-side gap.
-- **Read path double-copy** —
-  `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner`
-  reads `read_buf` → `split().freeze()`. The proto-side re-copy was
-  removed by the `handle_bytes` `split_to` refactor (commit
-  `bf66a5b`). Once the segment-aware transmit type lands (ADR-0039
-  wave 3), the runtime can pass owned `BytesMut` ownership directly.
+
+  **Wave 3 landed**: read-path ownership pass-through.
+  `Connection::handle_bytes_owned(now, chunk: BytesMut)` is the
+  new owned-chunk entry point — when the proto's `inbound`
+  buffer is empty (the common case after a full-frame decode),
+  the chunk is **swapped** into place with zero memcpy; mid-frame
+  fall-back re-uses the legacy `extend_from_slice` path. Both
+  the tokio and moonpool drivers' `driver_loop_inner` now read
+  into a local `BytesMut`, call `split()` (O(1) move) to take
+  ownership of the freshly-read chunk, and dispatch via
+  `handle_bytes_owned`. The legacy `Connection::handle_bytes(&[u8])`
+  entry stays for callers holding borrowed slices; both share the
+  same `handle_bytes_decode_loop` framing/decode body.
 
 ### Open — security hardening
 

@@ -786,9 +786,19 @@ where
                     shared.inner.lock().mark_disconnected();
                     return Err(ClientError::PeerClosed);
                 }
-                let bytes = read_buf.split().freeze();
+                // ADR-0039 wave 3 (read-path ownership pass-through):
+                // hand the freshly-read `BytesMut` chunk to the state
+                // machine via `handle_bytes_owned`. When the proto's
+                // internal `inbound` buffer is empty (the common case
+                // after a full-frame decode), the chunk is *swapped*
+                // into place with zero memcpy. Mid-frame fall-back
+                // re-uses the legacy `extend_from_slice` path. The
+                // local `read_buf` keeps a fresh empty
+                // `BytesMut::with_capacity(READ_BUFFER_CAPACITY)` for
+                // the next iteration (via `split()`'s O(1) move).
+                let chunk = read_buf.split();
                 let now = Instant::now();
-                if let Err(err) = shared.inner.lock().handle_bytes(now, &bytes) {
+                if let Err(err) = shared.inner.lock().handle_bytes_owned(now, chunk) {
                     shared.inner.lock().mark_disconnected();
                     return Err(err.into());
                 }

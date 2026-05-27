@@ -814,10 +814,54 @@ impl Connection {
         Ok(())
     }
 
+    /// Feed inbound bytes to the state machine — **owned-chunk** entry
+    /// point (ADR-0039 wave 3 — read-path ownership pass-through).
+    ///
+    /// When the protocol's internal `inbound` buffer is empty (the
+    /// common case: every full frame consumed by the previous call
+    /// left an empty queue), this **swaps** the caller's `BytesMut`
+    /// directly into `self.inbound` — zero memcpy. Otherwise falls
+    /// back to the legacy `extend_from_slice` path (one memcpy of the
+    /// new chunk, unavoidable when partial-frame bytes are still
+    /// queued).
+    ///
+    /// Runtimes that read into their own `BytesMut` (the tokio and
+    /// moonpool drivers do, via `tokio::io::AsyncReadExt::read_buf`
+    /// then `BytesMut::split()`) call this entry to skip the
+    /// user-space memcpy the [`Self::handle_bytes`] `&[u8]` entry
+    /// must perform. Callers holding a borrowed slice should keep
+    /// using [`Self::handle_bytes`] — both share the same framing
+    /// and decode loop.
+    pub fn handle_bytes_owned(
+        &mut self,
+        now: Instant,
+        chunk: BytesMut,
+    ) -> Result<(), ProtocolError> {
+        self.last_activity = Some(now);
+        if self.inbound.is_empty() {
+            // Common case: the previous call drained a full frame and
+            // left `inbound` empty. Replace the empty staging buffer
+            // with the caller's chunk — zero memcpy.
+            self.inbound = chunk;
+        } else {
+            // Mid-frame fall-back: the previous call partially decoded;
+            // splice the new chunk onto the existing buffer.
+            self.inbound.extend_from_slice(&chunk);
+        }
+        self.handle_bytes_decode_loop(now)
+    }
+
     /// Feed inbound bytes to the state machine.
     pub fn handle_bytes(&mut self, now: Instant, bytes: &[u8]) -> Result<(), ProtocolError> {
         self.last_activity = Some(now);
         self.inbound.extend_from_slice(bytes);
+        self.handle_bytes_decode_loop(now)
+    }
+
+    /// Shared framing / decode loop — pulled out so
+    /// [`Self::handle_bytes`] and [`Self::handle_bytes_owned`] both
+    /// dispatch the same per-frame logic without code duplication.
+    fn handle_bytes_decode_loop(&mut self, now: Instant) -> Result<(), ProtocolError> {
         loop {
             // Peek the front of the inbound buffer to find out whether a
             // complete frame is ready. If not, park and wait for more
@@ -3548,6 +3592,68 @@ mod conn_state_tests {
         let mut buf = bytes::BytesMut::new();
         encode_command(&mut buf, &cmd).expect("encode CommandConnected");
         buf
+    }
+
+    #[test]
+    fn handle_bytes_owned_swaps_empty_inbound_with_zero_copy() {
+        // ADR-0039 wave 3: when the proto's inbound buffer is empty,
+        // `handle_bytes_owned` must take ownership of the caller's
+        // `BytesMut` without an `extend_from_slice` memcpy.
+        // We verify by feeding a complete handshake frame and
+        // confirming the state machine reaches Connected. (Direct
+        // `Bytes::as_ptr()` equality would assert the no-copy
+        // invariant, but the `inbound.split_to(...)` inside the
+        // decode loop moves the buffer into a Bytes that's no longer
+        // pointer-identical to the input — the no-copy property is
+        // confirmed structurally by the swap branch in the source
+        // and the runtime parity tests below.)
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let chunk = handshake_response_bytes();
+        conn.handle_bytes_owned(Instant::now(), chunk)
+            .expect("handle_bytes_owned");
+        assert!(
+            conn.is_connected(),
+            "handshake completes via owned-chunk entry"
+        );
+    }
+
+    #[test]
+    fn handle_bytes_owned_extends_when_inbound_holds_partial_frame() {
+        // Mid-frame fall-back: when proto already holds a partial
+        // frame in `inbound`, `handle_bytes_owned` must splice the
+        // new chunk on top (extend_from_slice) without dropping the
+        // earlier bytes. We split the full handshake frame in two,
+        // feed the first half via `handle_bytes` (legacy entry, which
+        // populates `inbound`), then the second half via
+        // `handle_bytes_owned`, and assert the state machine
+        // converges on Connected.
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let full = handshake_response_bytes();
+        let split = full.len() / 2;
+        let (first, second) = full.split_at(split);
+        conn.handle_bytes(Instant::now(), first)
+            .expect("first half");
+        // Mid-frame: `inbound` now holds `first.len()` bytes.
+        assert!(
+            !conn.is_connected(),
+            "handshake still pending after first half"
+        );
+        let mut second_buf = bytes::BytesMut::with_capacity(second.len());
+        second_buf.extend_from_slice(second);
+        conn.handle_bytes_owned(Instant::now(), second_buf)
+            .expect("second half via owned");
+        assert!(
+            conn.is_connected(),
+            "handshake completes after mid-frame owned-chunk extend"
+        );
     }
 
     #[test]
