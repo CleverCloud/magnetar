@@ -93,7 +93,7 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   `ReaderBuilder<'a, E>` are 95% tokio-bound** — phantom `E`
   parameter on builder methods that ignore it. Move the generic only
   to the final `.create()` / `.subscribe()` dispatch.
-- **Large modules: `client.rs` (now 2187 lines, was 2544),
+- **Large modules: `client.rs` (now 1581 lines, was 2544),
   `engine.rs` (2148 lines), `conn.rs` (now 5241 lines, was 5724)** —
   split candidates. The audit's original suggestion that `conn.rs`
   shed `txn.rs` / `dlq.rs` / `anti_thrash.rs` satellites was
@@ -109,11 +109,12 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
     **Landed**.
   - `client.rs::ClientBuilder` → moved to
     `crates/magnetar/src/client_builder.rs` (387 lines), re-exported
-    from `magnetar::*` so `PulsarClient::builder()` / `magnetar::ClientBuilder::default()`
-    paths stay unchanged. **Landed**.
-  - `client.rs::ProducerBuilder` / `ConsumerBuilder` / `ReaderBuilder`
-    blocks → `magnetar/src/builders.rs` (cross-cuts with the
-    phantom-`E` cleanup item above). **Pending.**
+    from `magnetar::*`. **Landed**.
+  - `client.rs::{ProducerBuilder, ConsumerBuilder, ReaderBuilder}`
+    (generic + tokio-specific impl blocks) → moved to
+    `crates/magnetar/src/builders.rs` (632 lines), re-exported from
+    `magnetar::*`. **Landed**. `client.rs` shrank by 963 lines
+    (38%) across the two extractions.
   - `engine.rs` → `engine/{traits.rs, tokio.rs, moonpool.rs}` once the
     per-engine impls grow further. Today the trait + two impls fit
     comfortably; defer until the next per-engine surface lift makes
