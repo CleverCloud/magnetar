@@ -39,7 +39,10 @@ fn connected_frame() -> BytesMut {
 }
 
 fn handshake_complete(at: Instant) -> Connection {
-    let mut conn = Connection::new(ConnectionConfig::default());
+    let mut conn = Connection::new(
+        ConnectionConfig::default(),
+        std::sync::Arc::new(std::time::SystemTime::now),
+    );
     conn.begin_handshake().expect("handshake");
     let frame = connected_frame();
     conn.handle_bytes(at, &frame).expect("connected");

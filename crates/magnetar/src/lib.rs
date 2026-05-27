@@ -133,7 +133,10 @@ pub use crypto_bridge::MessageCryptoBridge;
 mod tests {
     #[test]
     fn proto_reexport_compiles() {
-        let _conn = crate::proto::Connection::new(crate::proto::ConnectionConfig::default());
+        let _conn = crate::proto::Connection::new(
+            crate::proto::ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
     }
 
     #[cfg(feature = "tokio")]

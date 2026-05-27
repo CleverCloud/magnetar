@@ -23,7 +23,10 @@ use magnetar_proto::{Connection, ConnectionConfig, CreateProducerRequest, Produc
 /// Construct a `Connection` whose state machine has cleared the
 /// handshake so `create_producer` runs cleanly.
 fn handshake_complete(now: Instant) -> Connection {
-    let mut conn = Connection::new(ConnectionConfig::default());
+    let mut conn = Connection::new(
+        ConnectionConfig::default(),
+        std::sync::Arc::new(std::time::SystemTime::now),
+    );
     conn.begin_handshake().expect("begin_handshake");
     let connected = pb::BaseCommand {
         r#type: pb::base_command::Type::Connected as i32,

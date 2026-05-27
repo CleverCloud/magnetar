@@ -401,7 +401,8 @@ impl ConnectionShared {
             || std::time::Duration::from_secs(30),
             |s| s.max_backoff_after_thrash,
         );
-        let mut conn = magnetar_proto::Connection::new(config);
+        let mut conn =
+            magnetar_proto::Connection::new(config, Arc::new(std::time::SystemTime::now));
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
         Arc::new(Self {
             inner: Mutex::new(conn),

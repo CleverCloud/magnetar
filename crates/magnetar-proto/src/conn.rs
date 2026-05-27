@@ -619,10 +619,12 @@ pub struct Connection {
     /// session-bound operations.
     session_epoch: u64,
     /// Wall-clock provider — the sans-io state machine never calls
-    /// [`SystemTime::now`] directly. Engines inject a real wall clock via
-    /// [`Self::with_wall_clock_provider`]; the default is
-    /// `|| SystemTime::now()` so existing callers keep working. moonpool /
-    /// deterministic-simulation engines plug in a virtual clock here.
+    /// [`SystemTime::now`] directly. Mandatory constructor parameter of
+    /// [`Self::new`]: the tokio engine wraps `SystemTime::now`,
+    /// moonpool / deterministic-simulation engines plug in a virtual clock.
+    /// Forcing the choice at construction time keeps the state machine
+    /// genuinely sans-io and lets `xtask check-no-internal-clock` validate
+    /// the engine construction site (ADR-0011).
     wall_clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
     /// Anti-thrash detector (ADR-0028). Disabled by default; opted in by the
     /// engine driver via [`Self::set_anti_thrash`] when the user configures
@@ -691,7 +693,15 @@ enum PendingRequestKind {
 
 impl Connection {
     /// Construct a fresh, unconnected sans-io `Connection`.
-    pub fn new(config: ConnectionConfig) -> Self {
+    ///
+    /// `wall_clock` is mandatory — the sans-io state machine never reaches
+    /// for the host clock on its own (ADR-0011). Engines pass:
+    /// - tokio: `Arc::new(SystemTime::now)`
+    /// - moonpool: a closure reading the virtual clock atomic
+    pub fn new(
+        config: ConnectionConfig,
+        wall_clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
+    ) -> Self {
         Self {
             config,
             state: HandshakeState::Uninitialized,
@@ -720,34 +730,9 @@ impl Connection {
             last_connected_at: None,
             last_disconnected_at: None,
             session_epoch: 0,
-            wall_clock: std::sync::Arc::new(SystemTime::now),
+            wall_clock,
             anti_thrash: crate::anti_thrash::AntiThrashState::disabled(),
         }
-    }
-
-    /// Inject an explicit wall-clock provider. Engines that drive the state
-    /// machine under a virtual clock (e.g. moonpool simulation) call this
-    /// once after [`Self::new`] to make every internal `SystemTime` value
-    /// flow from the injected source instead of the host's wall clock.
-    /// Mirrors the same pattern as `now: Instant` parameters on
-    /// [`Self::handle_bytes`] / [`Self::handle_timeout`]: the state machine
-    /// never reaches for a clock on its own.
-    #[must_use]
-    pub fn with_wall_clock_provider(
-        mut self,
-        provider: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
-    ) -> Self {
-        self.wall_clock = provider;
-        self
-    }
-
-    /// Replace the wall-clock provider on an existing Connection. See
-    /// [`Self::with_wall_clock_provider`] for the rationale.
-    pub fn set_wall_clock_provider(
-        &mut self,
-        provider: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
-    ) {
-        self.wall_clock = provider;
     }
 
     /// Returns the current handshake state.
@@ -3896,7 +3881,10 @@ mod conn_state_tests {
 
     #[test]
     fn timestamps_track_connect_and_disconnect() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         assert!(conn.last_connected_timestamp().is_none());
         assert!(conn.last_disconnected_timestamp().is_none());
         assert!(!conn.is_connected());
@@ -3926,7 +3914,10 @@ mod conn_state_tests {
 
     #[test]
     fn local_close_records_disconnect() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame).expect("handle");
@@ -3938,7 +3929,10 @@ mod conn_state_tests {
 
     #[test]
     fn is_closed_tracks_terminal_states() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         assert!(!conn.is_closed(), "uninitialized is not closed");
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
@@ -3948,7 +3942,10 @@ mod conn_state_tests {
         assert!(conn.is_closed(), "after close, is_closed is true");
 
         // Mark_disconnected (Failed) is also a terminal state.
-        let mut conn2 = Connection::new(ConnectionConfig::default());
+        let mut conn2 = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn2.begin_handshake().expect("handshake");
         let frame2 = handshake_response_bytes();
         conn2.handle_bytes(Instant::now(), &frame2).expect("handle");
@@ -3965,7 +3962,10 @@ mod conn_state_tests {
     #[test]
     fn is_user_closed_excludes_failed_so_supervisor_can_reconnect() {
         // (a) Connected: neither closed nor user-closed.
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -3973,7 +3973,10 @@ mod conn_state_tests {
         assert!(!conn.is_user_closed());
 
         // (b) After `close()` (user-initiated): both flip true.
-        let mut user_closed = Connection::new(ConnectionConfig::default());
+        let mut user_closed = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         user_closed.begin_handshake().expect("handshake");
         user_closed
             .handle_bytes(Instant::now(), &handshake_response_bytes())
@@ -3988,7 +3991,10 @@ mod conn_state_tests {
         // (c) After `mark_disconnected()` (transport drop): `is_closed` is
         // true but `is_user_closed` is FALSE — this is the gate the
         // supervisor relies on to decide "redial, don't exit".
-        let mut dropped = Connection::new(ConnectionConfig::default());
+        let mut dropped = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         dropped.begin_handshake().expect("handshake");
         dropped
             .handle_bytes(Instant::now(), &handshake_response_bytes())
@@ -4003,7 +4009,10 @@ mod conn_state_tests {
 
     #[test]
     fn consumer_crypto_failure_action_defaults_to_fail_for_unknown_handle() {
-        let conn = Connection::new(ConnectionConfig::default());
+        let conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         // No consumer has been created; an arbitrary handle must map to the safe default.
         let action = conn.consumer_crypto_failure_action(ConsumerHandle(42));
         assert_eq!(action, CryptoFailureAction::Fail);
@@ -4013,7 +4022,10 @@ mod conn_state_tests {
     fn consumer_crypto_failure_action_round_trips_from_subscribe_request() {
         // Spin up a handshake-complete connection so `subscribe` runs cleanly. We never
         // observe the broker response — we only need the locally-stored consumer state.
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame).expect("handle");
@@ -4043,7 +4055,10 @@ mod conn_state_tests {
     /// so the engine layer can re-bind the affected producer/consumer to the new broker.
     #[test]
     fn topic_migrated_command_surfaces_event() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame)
@@ -4127,7 +4142,10 @@ mod conn_state_tests {
 
     #[test]
     fn reset_bumps_epoch_and_fails_pending_ops_with_session_lost() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame).expect("handle");
@@ -4210,7 +4228,10 @@ mod conn_state_tests {
     fn op_outcome_session_lost_round_trips_through_outcome_slab() {
         // The slab itself is HashMap<PendingOpKey, OpOutcome>; this test exercises the
         // SessionLost variant end-to-end so the runtime-side dispatcher can pattern-match.
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame).expect("handle");
@@ -4237,7 +4258,10 @@ mod conn_state_tests {
     /// connect path with a state check.
     #[test]
     fn begin_handshake_twice_returns_handshake_error() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("first call succeeds");
         let err = conn
             .begin_handshake()
@@ -4270,7 +4294,10 @@ mod conn_state_tests {
     /// state machine).
     #[test]
     fn partitioned_metadata_response_surfaces_partition_count() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame)
@@ -4336,7 +4363,10 @@ mod conn_state_tests {
     /// `BinaryProtoLookupService#getPartitionedTopicMetadata` failure handling.
     #[test]
     fn partitioned_metadata_response_propagates_broker_error() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame)
@@ -4384,7 +4414,10 @@ mod conn_state_tests {
     /// the runtime layer; here we only pin that one redirect produces one retry frame.
     #[test]
     fn lookup_redirect_response_triggers_authoritative_retry() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         let frame = handshake_response_bytes();
         conn.handle_bytes(Instant::now(), &frame)
@@ -4446,7 +4479,10 @@ mod conn_state_tests {
     /// "session lifetime".
     #[test]
     fn close_before_connected_does_not_set_disconnected_timestamp() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         // Don't even call begin_handshake — we're still Uninitialized.
         conn.close();
         assert!(
@@ -4456,7 +4492,10 @@ mod conn_state_tests {
         assert!(conn.is_closed(), "state is now Closing");
 
         // Also from ConnectSent (mid-handshake) the disconnect must stay absent.
-        let mut conn2 = Connection::new(ConnectionConfig::default());
+        let mut conn2 = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn2.begin_handshake().expect("handshake");
         // No handshake response — still in ConnectSent.
         conn2.close();
@@ -4482,7 +4521,10 @@ mod conn_state_tests {
 
     #[test]
     fn rebuild_producers_re_emits_command_producer_after_reset() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -4563,7 +4605,10 @@ mod conn_state_tests {
 
     #[test]
     fn rebuild_consumers_re_emits_subscribe_and_flow_after_reset() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -4649,7 +4694,10 @@ mod conn_state_tests {
 
     #[test]
     fn producer_epoch_increments_on_rebuild() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -4721,7 +4769,10 @@ mod conn_state_tests {
     /// [`command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`].
     #[test]
     fn command_error_on_producer_open_emits_producer_open_failed_transient() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
@@ -4779,7 +4830,10 @@ mod conn_state_tests {
     /// (`MetadataError`, `ServiceNotReady`, `TopicNotFound`).
     #[test]
     fn command_error_on_producer_open_with_permanent_code_emits_producer_open_failed() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
@@ -4828,7 +4882,10 @@ mod conn_state_tests {
     /// [`Connection::retry_consumer_subscribe`].
     #[test]
     fn command_error_on_subscribe_emits_subscribe_failed_transient() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
@@ -4914,7 +4971,10 @@ mod conn_state_tests {
     /// `SessionLost` outcome installed on the publish key.
     #[test]
     fn reset_snapshots_in_flight_publishes_keyed_by_producer_handle() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
@@ -5013,7 +5073,10 @@ mod conn_state_tests {
             (inner, waker)
         }
 
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
@@ -5085,7 +5148,10 @@ mod conn_state_tests {
     /// order. The replayed `CommandSend` frames hit the outbound buffer.
     #[test]
     fn rebuild_producers_replays_snapshotted_publishes_with_original_sequence_ids() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -5157,7 +5223,10 @@ mod conn_state_tests {
     /// SendFut observes the outcome as if the original session had simply lasted longer.
     #[test]
     fn apply_receipt_resolves_replayed_send_after_rebuild() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -5230,7 +5299,10 @@ mod conn_state_tests {
     /// in original FIFO order, preserving the per-producer wire ordering.
     #[test]
     fn replay_preserves_ordering_across_rebuild() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -5303,7 +5375,10 @@ mod conn_state_tests {
     /// in-progress batch). Only frames that already hit the wire's pending queue replay.
     #[test]
     fn reset_clears_batch_container_does_not_replay_unbatched_stragglers() {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
@@ -5412,7 +5487,10 @@ mod conn_state_tests {
     }
 
     fn handshake_subscribe(replicate: Option<bool>) -> (Connection, ConsumerHandle) {
-        let mut conn = Connection::new(ConnectionConfig::default());
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
         conn.begin_handshake().expect("handshake");
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");

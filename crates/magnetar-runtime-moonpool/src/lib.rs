@@ -252,8 +252,8 @@ pub struct ConnectionShared {
     pub wall_clock_base_ms: u64,
     /// Atomic millis-since-`UNIX_EPOCH`, advanced by the driver loop
     /// (`wall_clock_base_ms + providers.time().now().as_millis()`) and
-    /// read by the proto-layer wall-clock closure installed via
-    /// [`Connection::set_wall_clock_provider`] in [`Self::with_auth`].
+    /// read by the proto-layer wall-clock closure passed into
+    /// [`Connection::new`] in [`Self::with_auth`].
     ///
     /// `AtomicU64` is `Send + Sync` regardless of the surrounding
     /// `P::Time` impl, which is what lets this bridge work under
@@ -329,9 +329,8 @@ impl ConnectionShared {
                 std::time::UNIX_EPOCH
                     + std::time::Duration::from_millis(read_handle.load(Ordering::Relaxed))
             });
-        let mut conn = Connection::new(config);
+        let mut conn = Connection::new(config, wall_clock_provider);
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
-        conn.set_wall_clock_provider(wall_clock_provider);
         Arc::new(Self {
             inner: Mutex::new(conn),
             driver_waker: Notify::new(),

@@ -49,16 +49,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   `Clock` trait; the same crate provides a `VirtualClock` in tests.
   Wire a `Clock` provider through the engine so the production path
   is actually injectable.
-- **`Connection::new(wall_clock)` explicit-injection refactor**
-  (follow-on to the moonpool wall-clock bridge already landed).
-  Currently the `wall_clock_base_ms` flows through
-  `ConnectionShared`, but `Connection::new` itself still defaults
-  `wall_clock` to `SystemTime::now` (`crates/magnetar-proto/src/conn.rs::Connection::new`).
-  ~45 in-tree call sites, mostly proto tests. Forces every caller
-  to make an explicit clock choice and lets
-  `xtask check-no-internal-clock` validate the construction site.
-  Estimate: ~1–2 hours of mechanical call-site updates.
-
 ### Open — zero-copy
 
 - **Batched-consumer per-message metadata clone** —
