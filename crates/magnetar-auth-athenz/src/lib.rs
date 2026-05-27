@@ -22,7 +22,12 @@ use magnetar_proto::{AuthError, AuthProvider};
 use serde::{Deserialize, Serialize};
 
 /// Athenz tenant/service configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The `Debug` impl is manual: the `private_key_pem` field is redacted
+/// behind a `<redacted>` sentinel so accidental `{:?}` logging of the
+/// config can't leak the PEM body. Every other field is surfaced as-is
+/// (they're all metadata: domain names, key ids, URLs).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AthenzConfig {
     /// Tenant domain (e.g. `"mydomain"`).
     pub tenant_domain: String,
@@ -32,7 +37,7 @@ pub struct AthenzConfig {
     pub provider_domain: String,
     /// Athenz key id used by the ZTS server to verify the signature.
     pub key_id: String,
-    /// Tenant private key PEM (RSA).
+    /// Tenant private key PEM (RSA). Redacted from [`std::fmt::Debug`].
     pub private_key_pem: String,
     /// Athenz ZTS endpoint URL.
     pub zts_url: String,
@@ -42,6 +47,21 @@ pub struct AthenzConfig {
     /// Optional role header name override.
     #[serde(default)]
     pub role_header: Option<String>,
+}
+
+impl std::fmt::Debug for AthenzConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AthenzConfig")
+            .field("tenant_domain", &self.tenant_domain)
+            .field("tenant_service", &self.tenant_service)
+            .field("provider_domain", &self.provider_domain)
+            .field("key_id", &self.key_id)
+            .field("private_key_pem", &"<redacted>")
+            .field("zts_url", &self.zts_url)
+            .field("principal_header", &self.principal_header)
+            .field("role_header", &self.role_header)
+            .finish()
+    }
 }
 
 /// Athenz auth provider.
@@ -146,5 +166,23 @@ mod tests {
         );
         let bytes = p.initial().expect("initial");
         assert_eq!(bytes.as_ref(), b"role-token-bytes".as_slice());
+    }
+
+    #[test]
+    fn config_debug_redacts_private_key_pem() {
+        let cfg = sample_config();
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("BEGIN PRIVATE KEY"),
+            "PEM body leaked through Debug: {rendered}",
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "expected redaction sentinel in {rendered}",
+        );
+        assert!(
+            rendered.contains("mydomain"),
+            "non-secret fields should still surface in Debug: {rendered}",
+        );
     }
 }

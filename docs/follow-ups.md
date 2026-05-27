@@ -89,9 +89,11 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 ### Open — security hardening
 
 - **Athenz private key as `String`** —
-  `crates/magnetar-auth-athenz/src/lib.rs` — wrap parsed key in
-  `zeroize::Zeroizing<…>` (ADR-0030 lists this as deferred to
-  v0.2.0).
+  `crates/magnetar-auth-athenz/src/lib.rs` — `AthenzConfig::Debug` now
+  redacts `private_key_pem`. Wrapping the **parsed** RSA key in
+  `zeroize::Zeroizing<…>` is still pending; ADR-0030 defers this to
+  the actual ZTS round-trip landing (the parsed key only exists once
+  that work happens — see the Athenz ZTS round-trip entry below).
 
 ### Open — cleanup and structural clarity
 
