@@ -93,22 +93,25 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   `ReaderBuilder<'a, E>` are 95% tokio-bound** — phantom `E`
   parameter on builder methods that ignore it. Move the generic only
   to the final `.create()` / `.subscribe()` dispatch.
-- **Large modules: `client.rs` (2544 lines), `engine.rs` (2148 lines),
-  `conn.rs` (now 5241 lines, was 5724)** — split candidates. The
-  audit's original suggestion that `conn.rs` shed `txn.rs` /
-  `dlq.rs` / `anti_thrash.rs` satellites was **stale**: `txn.rs` and
-  `anti_thrash.rs` already exist as sibling files in
-  `crates/magnetar-proto/src/`; `dlq.rs` lives inside
+- **Large modules: `client.rs` (now 2187 lines, was 2544),
+  `engine.rs` (2148 lines), `conn.rs` (now 5241 lines, was 5724)** —
+  split candidates. The audit's original suggestion that `conn.rs`
+  shed `txn.rs` / `dlq.rs` / `anti_thrash.rs` satellites was
+  **stale**: `txn.rs` and `anti_thrash.rs` already exist as sibling
+  files in `crates/magnetar-proto/src/`; `dlq.rs` lives inside
   `consumer.rs::DeadLetterPolicy` / `ConsumerState.dead_letter_pending`
   (no separate file today).
   - `conn.rs` type definitions (`*Request` / `*Config` / `*Outcome` /
     `KeySharedConfig` / `AckRequest` / `SeekTarget` /
     `HandshakeState` / `PendingOpKey` / `MemoryLimitPolicy`) → moved
     to `crates/magnetar-proto/src/conn_types.rs` (504 lines),
-    re-exported from `conn::*` via `pub use crate::conn_types::*` so
-    downstream `use magnetar_proto::conn::{ConnectionConfig, OpOutcome};`
+    re-exported from `conn::*` via `pub use crate::conn_types::*`.
+    **Landed**.
+  - `client.rs::ClientBuilder` → moved to
+    `crates/magnetar/src/client_builder.rs` (387 lines), re-exported
+    from `magnetar::*` so `PulsarClient::builder()` / `magnetar::ClientBuilder::default()`
     paths stay unchanged. **Landed**.
-  - `client.rs` `ProducerBuilder` / `ConsumerBuilder` / `ReaderBuilder`
+  - `client.rs::ProducerBuilder` / `ConsumerBuilder` / `ReaderBuilder`
     blocks → `magnetar/src/builders.rs` (cross-cuts with the
     phantom-`E` cleanup item above). **Pending.**
   - `engine.rs` → `engine/{traits.rs, tokio.rs, moonpool.rs}` once the

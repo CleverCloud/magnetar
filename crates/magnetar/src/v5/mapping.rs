@@ -190,7 +190,7 @@ mod tests {
     fn initial_position_is_copy_and_eq() {
         // Type-level guard: the wrapper enum stays Copy + Eq so
         // callers can pattern-match without ownership ceremony.
-        fn _assert_copy_eq<T: Copy + Eq>() {}
-        _assert_copy_eq::<V5SubscriptionInitialPosition>();
+        fn assert_copy_eq<T: Copy + Eq>() {}
+        assert_copy_eq::<V5SubscriptionInitialPosition>();
     }
 }

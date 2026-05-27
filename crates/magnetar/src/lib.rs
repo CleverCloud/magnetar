@@ -71,6 +71,8 @@ pub use engine::{Engine, TransactionApi};
 
 #[cfg(feature = "tokio")]
 mod client;
+#[cfg(feature = "tokio")]
+mod client_builder;
 #[cfg(feature = "moonpool")]
 mod moonpool_client;
 #[cfg(feature = "tokio")]
@@ -89,12 +91,13 @@ mod transaction;
 mod typed;
 #[cfg(feature = "tokio")]
 pub use client::{
-    ClientBuilder, ConsumerBuilder, ConsumerInterceptor, IncomingMessage, MemoryLimit,
-    MemoryLimitPolicy, MessageBuilder, OutgoingMessage, ProducerBuilder, ProducerExt,
-    ProducerInterceptor, PulsarClient, PulsarError, Reader, ReaderBuilder, SeekTarget,
-    ack_cumulative_with_interceptors, ack_with_interceptors, receive_with_interceptors,
-    send_with_interceptors,
+    ConsumerBuilder, ConsumerInterceptor, IncomingMessage, MemoryLimit, MemoryLimitPolicy,
+    MessageBuilder, OutgoingMessage, ProducerBuilder, ProducerExt, ProducerInterceptor,
+    PulsarClient, PulsarError, Reader, ReaderBuilder, SeekTarget, ack_cumulative_with_interceptors,
+    ack_with_interceptors, receive_with_interceptors, send_with_interceptors,
 };
+#[cfg(feature = "tokio")]
+pub use client_builder::ClientBuilder;
 #[cfg(feature = "tokio")]
 pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};
 #[cfg(feature = "tokio")]
