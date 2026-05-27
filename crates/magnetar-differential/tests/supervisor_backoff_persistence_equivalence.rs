@@ -85,8 +85,7 @@ fn tokio_and_moonpool_engines_agree_on_storm_schedule() {
     let post_stable = tokio_schedule[10];
     assert!(
         post_stable <= Duration::from_millis(100),
-        "schedule must collapse to initial after a stable socket, got {:?}",
-        post_stable
+        "schedule must collapse to initial after a stable socket, got {post_stable:?}"
     );
 }
 

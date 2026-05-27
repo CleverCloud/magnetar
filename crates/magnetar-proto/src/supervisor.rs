@@ -232,24 +232,24 @@ mod tests {
             }
             delays.push(backoff.next());
         }
+        let first = delays[0];
         assert!(
-            delays[0] <= Duration::from_millis(100),
-            "first delay starts at initial (with jitter), got {:?}",
-            delays[0]
+            first <= Duration::from_millis(100),
+            "first delay starts at initial (with jitter), got {first:?}"
         );
+        let third = delays[2];
         assert!(
-            delays[2] >= Duration::from_millis(320),
-            "third delay must reflect at least 4x growth (got {:?})",
-            delays[2]
+            third >= Duration::from_millis(320),
+            "third delay must reflect at least 4x growth (got {third:?})"
         );
         // 8th call: base 12.8 s (= initial × 2^7), with up to 20 % jitter
         // → 10.24 – 12.8 s. The lower bound proves the schedule is no
         // longer near `initial`; the higher you go, the more obvious the
         // storm is bounded.
+        let eighth = delays[7];
         assert!(
-            delays[7] >= Duration::from_secs(10) || delays[7] == cfg.max_backoff,
-            "schedule must approach max_backoff under sustained thrash, got {:?}",
-            delays[7]
+            eighth >= Duration::from_secs(10) || eighth == cfg.max_backoff,
+            "schedule must approach max_backoff under sustained thrash, got {eighth:?}"
         );
 
         if cfg.should_reset_backoff(Duration::from_secs(2)) {
@@ -258,8 +258,7 @@ mod tests {
         let after_reset = backoff.next();
         assert!(
             after_reset <= Duration::from_millis(100),
-            "schedule resets to initial after a stable socket, got {:?}",
-            after_reset
+            "schedule resets to initial after a stable socket, got {after_reset:?}"
         );
     }
 

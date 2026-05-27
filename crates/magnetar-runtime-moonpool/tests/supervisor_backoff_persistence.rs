@@ -59,24 +59,24 @@ fn persisted_backoff_grows_under_storm_pattern() {
         delays.push(backoff.next());
     }
 
+    let first = delays[0];
     assert!(
-        delays[0] <= Duration::from_millis(100),
-        "first delay starts at initial (with jitter), got {:?}",
-        delays[0]
+        first <= Duration::from_millis(100),
+        "first delay starts at initial (with jitter), got {first:?}"
     );
+    let third = delays[2];
     assert!(
-        delays[2] >= Duration::from_millis(320),
-        "by the 3rd reconnect the schedule must reflect ≥ 4x growth (got {:?})",
-        delays[2]
+        third >= Duration::from_millis(320),
+        "by the 3rd reconnect the schedule must reflect ≥ 4x growth (got {third:?})"
     );
     // 8th call: base 12.8 s (= initial × 2^7), with up to 20 % jitter
     // → 10.24 – 12.8 s. The lower bound proves the schedule is no longer
     // near `initial`; the higher you go, the more obvious the storm is
     // bounded.
+    let last = *delays.last().expect("delays not empty");
     assert!(
-        delays.last().unwrap() >= &Duration::from_secs(10),
-        "by the 8th reconnect the schedule must approach max_backoff (got {:?})",
-        delays.last()
+        last >= Duration::from_secs(10),
+        "by the 8th reconnect the schedule must approach max_backoff (got {last:?})"
     );
 }
 
@@ -97,7 +97,6 @@ fn stable_socket_resets_persisted_backoff_to_initial() {
     let post_reset = backoff.next();
     assert!(
         post_reset <= Duration::from_millis(100),
-        "schedule must collapse back to initial after a stable socket, got {:?}",
-        post_reset
+        "schedule must collapse back to initial after a stable socket, got {post_reset:?}"
     );
 }
