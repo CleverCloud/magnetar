@@ -12,11 +12,10 @@
 //! # Current surface (v0)
 //!
 //! - [`BrokerFake`] — empty placeholder kept for backwards compatibility.
-//! - [`FrameRecorder`] — drains a [`magnetar_proto::Connection`]'s outbound
-//!   byte stream and decodes each frame into a [`RecordedFrame`] for
-//!   wire-shape assertions. Used by the V5 mapping tests
-//!   (`crates/magnetar/tests/v5_*_mapping.rs`) to confirm that V5 surface
-//!   calls translate to the expected v4 wire commands.
+//! - [`FrameRecorder`] — drains a [`magnetar_proto::Connection`]'s outbound byte stream and decodes
+//!   each frame into a [`RecordedFrame`] for wire-shape assertions. Used by the V5 mapping tests
+//!   (`crates/magnetar/tests/v5_*_mapping.rs`) to confirm that V5 surface calls translate to the
+//!   expected v4 wire commands.
 //!
 //! The recorder is intentionally one-way (drain, decode, assert). A
 //! later cut of the fake adds the reverse direction — synthetic broker
@@ -142,8 +141,9 @@ impl FrameRecorder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use magnetar_proto::{ConnectionConfig, encode_command, pb};
+
+    use super::*;
 
     fn fresh_conn() -> Connection {
         Connection::new(

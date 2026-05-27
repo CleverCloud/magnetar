@@ -423,14 +423,20 @@ commands.
 session that landed the above):**
 
 1. The five `crates/magnetar/tests/v5_*.rs` mapping/wire tests asserting
-   the bytes `magnetar-fakes` observes match the v4 expectation:
-   `v5_producer_mapping.rs` (**landed** — 2 tests via the new
-   `magnetar_fakes::FrameRecorder` API drained against a sans-io
-   `Connection`; default-config and named-producer paths covered),
-   `v5_stream_consumer_mapping.rs`, `v5_queue_consumer_mapping.rs`,
-   `v5_client_v4_escape_hatch.rs`, `v5_builder_defaults.rs`
-   (table-driven from `mapping.rs`) — these four follow the same
-   `FrameRecorder` shape and can ride the scaffolding.
+   the bytes `magnetar-fakes` observes match the v4 expectation —
+   **all five landed** via the new `magnetar_fakes::FrameRecorder` API
+   drained against a sans-io `Connection`:
+   - `v5_producer_mapping.rs` — 2 tests (default config; named producer).
+   - `v5_stream_consumer_mapping.rs` — 4 tests (Exclusive default;
+     `failover()`; `Earliest` initial position; ack-timeout propagation).
+   - `v5_queue_consumer_mapping.rs` — 3 tests (Shared default;
+     `key_shared()` with default `KeySharedMeta`; consumer-name
+     propagation).
+   - `v5_client_v4_escape_hatch.rs` — 4 type-level / zero-sized-wrapper
+     tests pinning the ADR-0032 escape-hatch contract.
+   - `v5_builder_defaults.rs` — 4 table-driven assertions over the
+     `v5::mapping` constants + edge cases (`Some(Duration::ZERO)` vs
+     `None`, `Some(0)` vs `None`, `send_timeout` saturation).
 2. Same five files mirrored 1:1 under `SimulationBuilder` for the
    moonpool engine.
 3. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +

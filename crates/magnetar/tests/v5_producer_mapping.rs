@@ -27,9 +27,7 @@ use magnetar::v5::mapping::{
     send_timeout_to_ms,
 };
 use magnetar_fakes::FrameRecorder;
-use magnetar_proto::{
-    Connection, ConnectionConfig, CreateProducerRequest, encode_command, pb,
-};
+use magnetar_proto::{Connection, ConnectionConfig, CreateProducerRequest, encode_command, pb};
 
 fn fresh_connected() -> Connection {
     let mut conn = Connection::new(ConnectionConfig::default(), Arc::new(SystemTime::now));
@@ -95,7 +93,11 @@ fn v5_producer_default_config_emits_expected_v4_command_producer() {
     let _handle = conn.create_producer(req);
 
     let frames = rec.drain(&mut conn).expect("drain CommandProducer");
-    assert_eq!(frames.len(), 1, "exactly one CommandProducer frame on the wire");
+    assert_eq!(
+        frames.len(),
+        1,
+        "exactly one CommandProducer frame on the wire"
+    );
     let cmd = &frames[0].frame.command;
     assert_eq!(
         cmd.r#type,
