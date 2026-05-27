@@ -103,6 +103,16 @@ These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
    docs-only, comment-only, formatter-only, and dependency bumps with
    no functional impact — justify in the commit message.
    ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md))
+10. **Lock-ordering: global → per-slot, never the reverse.** `Connection`
+    is wrapped in a `parking_lot::Mutex` by the runtime engines; every
+    `ProducerSlot` / `ConsumerSlot` carries its own
+    `parking_lot::Mutex`. A holder of `slot.state.lock()` MUST NOT then
+    take the connection-wide mutex. The hot path
+    (`Producer::send` → `ProducerSlot::queue_send`) takes only the
+    per-slot mutex; the driver merges per-slot staged frames into the
+    connection buffer under the global lock via `poll_transmit`. The
+    reverse acquisition order deadlocks under contention.
+    ([ADR-0038](specs/adr/0038-split-connection-mutex.md))
 
 ## Workflow
 

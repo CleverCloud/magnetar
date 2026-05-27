@@ -292,15 +292,21 @@ impl Client {
         // `ServerError::ServiceNotReady` ("not served by this instance, please redo the
         // lookup"). Java's `PulsarClientImpl#createProducerAsync` does the same lookup.
         self.lookup_topic(&req.topic).await?;
-        let handle = {
+        let (handle, slot) = {
             let mut conn = self.shared.inner.lock();
-            conn.create_producer(req)
+            let handle = conn.create_producer(req);
+            let slot = conn
+                .producer(handle)
+                .cloned()
+                .expect("just-created producer slot must exist");
+            (handle, slot)
         };
         self.shared.driver_waker.notify_one();
         wait_producer_ready(&self.shared, handle).await?;
         Ok(Producer {
             shared: self.shared.clone(),
             handle,
+            slot,
             compression,
             encryptor,
         })
@@ -678,9 +684,14 @@ impl Client {
         let receiver_queue_size = req.receiver_queue_size;
         // See `open_producer_with`: subscribe also needs lookup-driven bundle activation.
         self.lookup_topic(&req.topic).await?;
-        let handle = {
+        let (handle, slot) = {
             let mut conn = self.shared.inner.lock();
-            conn.subscribe(req)
+            let handle = conn.subscribe(req);
+            let slot = conn
+                .consumer(handle)
+                .cloned()
+                .expect("just-created consumer slot must exist");
+            (handle, slot)
         };
         self.shared.driver_waker.notify_one();
         wait_subscribe_acked(&self.shared, handle).await?;
@@ -701,6 +712,7 @@ impl Client {
         Ok(Consumer {
             shared: self.shared.clone(),
             handle,
+            slot,
             decryptor,
         })
     }

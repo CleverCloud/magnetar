@@ -304,19 +304,41 @@ the engine glue.
 
 | Primitive | Where | Why |
 | --- | --- | --- |
-| `parking_lot::Mutex<Connection>` | `ConnectionShared.inner` | The full sans-io state. Critical sections are short and never `.await`. |
+| `parking_lot::Mutex<Connection>` | `ConnectionShared.inner` | Connection-wide state — frame buffers, handshake, `pending_requests`, the events / outcomes / wakers slabs, the handle registry. Critical sections are short and never `.await`. |
+| `parking_lot::Mutex<ProducerState>` / `Mutex<ConsumerState>` | `magnetar_proto::{ProducerSlot,ConsumerSlot}.state` | Per-handle hot state — the `Producer::send` hot path takes ONLY this lock, never the connection-wide one ([ADR-0038](specs/adr/0038-split-connection-mutex.md)). |
 | `parking_lot::Mutex<VecDeque<TopicListChange>>` | `ConnectionShared.topic_list_changes` | PIP-145 topic-list-watcher delta buffer surfaced to user futures. |
 | `parking_lot::RwLock` | tracker internals | Pure read paths under load. |
 | `tokio::sync::Notify` | `ConnectionShared.driver_waker`, `topic_list_notify` | Single-cell async wake-up. Not a channel. |
 | `std::sync::atomic::*` | stats + state flags | Lock-free counters. |
 | `core::task::Waker` slab | `magnetar-proto::Connection.pending_ops` | Future completion. |
 | `tokio::select!` | driver loop | Control-flow multiplexing. Not a channel. |
-| `Arc<T>` | `ConnectionShared`, `MessageEncryptor`, `MessageDecryptor`, `AuthProvider`, `MessageRouter`, interceptors | Cheap clone-and-share. |
+| `Arc<T>` | `ConnectionShared`, `Arc<ProducerSlot>` / `Arc<ConsumerSlot>` on `Producer` / `Consumer`, `MessageEncryptor`, `MessageDecryptor`, `AuthProvider`, `MessageRouter`, interceptors | Cheap clone-and-share. |
 | `arc_swap::ArcSwap` | rare config-rotation slots | Lock-free swap. |
 | `slab::Slab` | per-future Waker keyspace | O(1) insertion + removal. |
 
 Anything not on this list either has a justification in
 [GUIDELINES.md](GUIDELINES.md) or is a candidate for removal.
+
+### Lock-ordering invariant (ADR-0038)
+
+The two layers — global Connection mutex and per-slot mutex — are
+acquired in **strict global → per-slot order**:
+
+1. **Global → per-slot is safe** and is the only path the codebase
+   takes. `Connection`-level methods that need to touch per-handle
+   state look up the slot under `&mut self`, then take
+   `slot.state.lock()` briefly.
+2. **Per-slot → global is FORBIDDEN.** A holder of `slot.state.lock()`
+   that needs Connection-level state MUST release the slot lock
+   first. Wrong-order acquisition deadlocks under contention.
+
+The producer-send hot path (`Producer::send` →
+`ProducerSlot::queue_send`) takes only the per-slot mutex; the driver
+merges per-slot staged frames into the connection-wide outbound
+buffer under the global lock via `poll_transmit`
+(`drain_producer_outbound`). The reconnect rebuild path
+(`Connection::rebuild_producers` / `rebuild_consumers`) takes the
+global lock and each per-slot lock in canonical order.
 
 ---
 

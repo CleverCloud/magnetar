@@ -275,6 +275,42 @@ impl ProducerSlot {
             state: parking_lot::Mutex::new(state),
         })
     }
+
+    /// Enqueue a send into this producer's state machine and stage the
+    /// resulting outbound frame(s) on the per-slot outbound queue. **Takes
+    /// only the per-slot mutex** — does NOT acquire the global Connection
+    /// mutex (ADR-0038 Phase 3 hot-path entry point).
+    ///
+    /// The frames staged by this call are merged into the connection-wide
+    /// outbound buffer the next time the driver invokes
+    /// [`crate::Connection::drain_producer_outbound`].
+    ///
+    /// Returns the [`SequenceId`] assigned to the send so the caller's
+    /// `SendFut` can correlate the eventual `CommandSendReceipt` with the
+    /// publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ProtocolError::InvariantViolation`] when the
+    /// per-producer state machine rejects the send (e.g. producer closed,
+    /// chunking+batching mutual-exclusion violation).
+    pub fn queue_send(
+        &self,
+        msg: OutgoingMessage,
+        publish_time_ms: u64,
+        now: std::time::Instant,
+    ) -> Result<SequenceId, crate::error::ProtocolError> {
+        let mut state = self.state.lock();
+        let _decision = state.queue_send(msg, publish_time_ms, now).map_err(|_| {
+            crate::error::ProtocolError::InvariantViolation("producer rejected send")
+        })?;
+        Ok(SequenceId(state.last_sequence_id_pushed.max(0) as u64))
+    }
+
+    /// Force a batch flush. Takes only the per-slot mutex.
+    pub fn flush_batch(&self, publish_time_ms: u64, now: std::time::Instant) -> usize {
+        self.state.lock().flush_batch(publish_time_ms, now)
+    }
 }
 
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`

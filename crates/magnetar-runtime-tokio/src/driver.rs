@@ -583,6 +583,11 @@ where
 
     loop {
         // Drain outbound bytes + check if the state machine wants us to terminate.
+        // `poll_transmit` already calls `Connection::drain_producer_outbound`
+        // internally to merge per-slot staged frames (queued by
+        // `Producer::send` without taking the global lock — ADR-0038 Phase 3)
+        // into the connection-wide outbound buffer before returning the byte
+        // slice for the driver to flush.
         let (write_buf, deadline, should_close) = {
             let mut conn = shared.inner.lock();
             let out = conn.poll_transmit();

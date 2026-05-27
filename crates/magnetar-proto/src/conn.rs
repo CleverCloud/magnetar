@@ -2831,7 +2831,18 @@ impl Connection {
             })
     }
 
-    fn drain_producer_outbound(&mut self) {
+    /// Walk every registered producer slot, drain its staged outbound
+    /// frames, and encode them into the connection-wide outbound byte
+    /// buffer. The runtime drivers MUST call this immediately before
+    /// [`Self::poll_transmit`] so any sends queued by the per-slot
+    /// hot-path entry point ([`crate::ProducerSlot::queue_send`]) — which
+    /// bypasses the global Connection mutex (ADR-0038 Phase 3) — land on
+    /// the wire.
+    ///
+    /// Lock-ordering: requires `&mut self` on Connection (i.e. the global
+    /// lock is held). Takes each per-slot mutex briefly to drain frames —
+    /// the canonical global → per-slot order.
+    pub fn drain_producer_outbound(&mut self) {
         // Pull every queued frame from every producer and emit it into the connection's
         // outbound byte buffer.
         let handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();

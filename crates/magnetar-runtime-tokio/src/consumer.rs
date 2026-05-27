@@ -21,10 +21,22 @@ use crate::client::wait_subscribe_acked;
 use crate::error::ClientError;
 
 /// User-facing consumer handle.
+///
+/// # Lock-ordering (ADR-0038)
+///
+/// Identity reads (topic, subscription, handle) go through `slot.identity`
+/// with no lock. State-machine reads (`available_in_queue`, `is_closed`,
+/// `stats`, etc.) take only the per-slot mutex via `slot.state.lock()`.
+/// Operations that drive protocol I/O (`receive`, `ack`, `seek`, `close`)
+/// still take `shared.inner.lock()`. Acquisition order: **global → per-slot,
+/// never the reverse**.
 #[derive(Debug, Clone)]
 pub struct Consumer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ConsumerHandle,
+    /// Direct handle to this consumer's per-slot state, cloned from the
+    /// Connection's registry at subscribe time.
+    pub(crate) slot: Arc<magnetar_proto::ConsumerSlot>,
     /// Optional PIP-4 decryption hook. When the broker delivers a message with
     /// `MessageMetadata.encryption_keys` set, the consumer hands the ciphertext through
     /// this hook before yielding it to the user.
@@ -41,9 +53,11 @@ impl Consumer {
     /// [`Self::unsubscribe`] or remotely via a broker `CloseConsumer`). Mirrors Java
     /// `ConsumerImpl#getState() == CLOSED`. Use [`Self::is_connected`] for the live test
     /// — `is_closed` only flips after a terminal close, not on transient disconnects.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.shared.inner.lock().consumer_is_closed(self.handle)
+        self.slot.state.lock().closed
     }
 
     /// PIP-180 / ADR-0033: pre-populate shadow-topic metadata so the receive
@@ -63,15 +77,14 @@ impl Consumer {
     /// they already know the source topic (e.g. tests, integration
     /// scenarios where the admin REST is mocked).
     pub fn set_shadow_source(&self, source_topic: impl Into<String>) {
+        // ADR-0038: per-slot write via the direct Arc<ConsumerSlot>, no global lock.
         let source = source_topic.into();
-        let mut conn = self.shared.inner.lock();
-        if let Some(slot) = conn.consumer_mut(self.handle) {
-            slot.state
-                .lock()
-                .set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
-                    source_topic: source,
-                });
-        }
+        self.slot
+            .state
+            .lock()
+            .set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
+                source_topic: source,
+            });
     }
 
     /// PIP-180 / ADR-0033: returns the cached source-topic name if this
@@ -82,17 +95,13 @@ impl Consumer {
     /// receive path).
     #[must_use]
     pub fn shadow_source_topic(&self) -> Option<String> {
-        self.shared
-            .inner
+        // ADR-0038: per-slot read, no global lock.
+        self.slot
+            .state
             .lock()
-            .consumer(self.handle)
-            .and_then(|slot| {
-                slot.state
-                    .lock()
-                    .shadow_metadata
-                    .as_ref()
-                    .map(|m| m.source_topic.clone())
-            })
+            .shadow_metadata
+            .as_ref()
+            .map(|m| m.source_topic.clone())
     }
 
     /// PIP-180 / ADR-0033: convenience predicate equivalent to
@@ -105,9 +114,11 @@ impl Consumer {
     /// Number of messages currently buffered in this consumer's receiver queue, waiting
     /// for a `receive()` call to pull them out. Mirrors Java
     /// `Consumer#getNumMessagesInQueue`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn available_in_queue(&self) -> usize {
-        self.shared.inner.lock().consumer_queue_len(self.handle)
+        self.slot.state.lock().queue.len()
     }
 
     /// Drain up to `max` already-buffered messages from this consumer's receive queue
@@ -146,12 +157,11 @@ impl Consumer {
     /// Number of dispatch permits this consumer still has with the broker — i.e. messages
     /// it has authorised the broker to push without an explicit `CommandFlow`. Mirrors
     /// Java `ConsumerBase#getAvailablePermits`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
-        self.shared
-            .inner
-            .lock()
-            .consumer_available_permits(self.handle)
+        self.slot.state.lock().available_permits
     }
 
     /// `true` if this consumer has received at least one message since opening. Mirrors
@@ -639,12 +649,10 @@ impl Consumer {
     /// Snapshot of this consumer's cumulative counters. Mirrors Java
     /// `org.apache.pulsar.client.api.Consumer#getStats`. Returns a zeroed snapshot if the
     /// consumer handle is no longer registered (closed).
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn stats(&self) -> magnetar_proto::ConsumerStats {
-        self.shared
-            .inner
-            .lock()
-            .consumer_stats(self.handle)
-            .unwrap_or_default()
+        self.slot.state.lock().stats()
     }
 
     /// Capture a rolling-window sample for this consumer. Mirrors Java
@@ -653,80 +661,71 @@ impl Consumer {
     /// and [`magnetar_proto::ConsumerStats::bytes_per_sec`]. The first call only
     /// seeds the baseline (rates stay at `0.0`); the second and subsequent calls
     /// compute the per-second deltas between consecutive samples.
+    ///
+    /// Per-slot write — does NOT take the global Connection mutex.
     pub fn record_rate_window(&self, now: std::time::Instant) {
-        self.shared
-            .inner
-            .lock()
-            .consumer_record_rate_window(self.handle, now);
+        self.slot.state.lock().record_rate_window(now);
     }
 
     /// Mirrors `org.apache.pulsar.client.api.Consumer#pause`. Stops automatic flow refills so
     /// the broker stops dispatching new messages once already-issued permits drain. Buffered
     /// messages remain receivable.
+    ///
+    /// Per-slot write — does NOT take the global Connection mutex.
     pub fn pause(&self) {
-        let mut conn = self.shared.inner.lock();
-        conn.set_paused(self.handle, true);
+        self.slot.state.lock().paused = true;
     }
 
     /// Mirrors `org.apache.pulsar.client.api.Consumer#resume`. Re-enables automatic flow
     /// refills.
     pub fn resume(&self) {
-        {
-            let mut conn = self.shared.inner.lock();
-            conn.set_paused(self.handle, false);
-        }
+        self.slot.state.lock().paused = false;
         // Nudge the driver — it may have a flow to emit now that we're un-paused.
         self.shared.driver_waker.notify_one();
     }
 
     /// Returns `true` if the consumer is currently paused.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn is_paused(&self) -> bool {
-        self.shared
-            .inner
-            .lock()
-            .is_paused(self.handle)
-            .unwrap_or(false)
+        self.slot.state.lock().paused
     }
 
     /// Returns `true` once the broker has indicated end-of-topic for this consumer (no
     /// further messages will be dispatched). Mirrors Java
     /// `Consumer#hasReachedEndOfTopic`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn has_reached_end_of_topic(&self) -> bool {
-        self.shared
-            .inner
-            .lock()
-            .consumer_reached_end_of_topic(self.handle)
+        self.slot.state.lock().reached_end_of_topic
     }
 
     /// Topic name this consumer is bound to. Returns an empty string if the consumer is
     /// no longer registered (closed).
+    ///
+    /// Identity-only read — takes no lock.
     pub fn topic(&self) -> String {
-        self.shared
-            .inner
-            .lock()
-            .consumer_topic(self.handle)
-            .unwrap_or("")
-            .to_owned()
+        self.slot.identity.topic.clone()
     }
 
     /// Subscription name. Empty string if the consumer is no longer registered.
+    ///
+    /// Identity-only read — takes no lock.
     pub fn subscription(&self) -> String {
-        self.shared
-            .inner
-            .lock()
-            .consumer_subscription(self.handle)
-            .unwrap_or("")
-            .to_owned()
+        self.slot.identity.subscription.clone()
     }
 
     /// Caller-supplied consumer name. Empty string if no name was supplied at subscribe
     /// time, or if the consumer is no longer registered. Mirrors Java
     /// `Consumer#getConsumerName`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn name(&self) -> String {
-        self.shared
-            .inner
+        self.slot
+            .state
             .lock()
-            .consumer_name(self.handle)
+            .consumer_name
+            .clone()
             .unwrap_or_default()
     }
 
@@ -1330,6 +1329,33 @@ mod tests {
         shared
     }
 
+    /// Capture the per-slot Arc for a `handle` known to be in the registry.
+    fn consumer_slot_for(
+        shared: &std::sync::Arc<ConnectionShared>,
+        handle: magnetar_proto::ConsumerHandle,
+    ) -> std::sync::Arc<magnetar_proto::ConsumerSlot> {
+        shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .cloned()
+            .expect("test consumer slot must exist")
+    }
+
+    /// Placeholder slot for tests that intentionally hold an unknown handle.
+    fn stub_consumer_slot_for_test(
+        handle: magnetar_proto::ConsumerHandle,
+    ) -> std::sync::Arc<magnetar_proto::ConsumerSlot> {
+        magnetar_proto::ConsumerSlot::new(
+            magnetar_proto::ConsumerIdentity {
+                handle,
+                topic: String::new(),
+                subscription: String::new(),
+            },
+            magnetar_proto::consumer::ConsumerState::new(handle, String::new(), String::new(), 0),
+        )
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn drain_messages_with_zero_returns_empty_vec() {
         let shared = handshake_complete_shared();
@@ -1341,9 +1367,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         assert!(
@@ -1357,9 +1385,11 @@ mod tests {
         // Even when the underlying handle is unknown to the sans-io layer (e.g. closed
         // consumer), `drain_messages` returns an empty `Vec` rather than panicking.
         let shared = ConnectionShared::new(ConnectionConfig::default());
+        let bogus_handle = magnetar_proto::ConsumerHandle(9999);
         let consumer = Consumer {
             shared,
-            handle: magnetar_proto::ConsumerHandle(9999),
+            handle: bogus_handle,
+            slot: stub_consumer_slot_for_test(bogus_handle),
             decryptor: None,
         };
         assert!(consumer.drain_messages(10).is_empty());
@@ -1416,6 +1446,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
 
@@ -1480,6 +1511,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
 
@@ -1551,9 +1583,11 @@ mod tests {
             }
         }
 
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
 
@@ -1588,6 +1622,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
 
@@ -1654,6 +1689,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
 
@@ -1716,6 +1752,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         consumer.ack_grouped(magnetar_proto::MessageId {
@@ -1744,6 +1781,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         consumer.ack_grouped_cumulative(magnetar_proto::MessageId {
@@ -1775,6 +1813,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         let txn = magnetar_proto::TxnId {
@@ -1811,6 +1850,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         let txn = magnetar_proto::TxnId {
@@ -1849,6 +1889,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         assert_eq!(consumer.available_in_queue(), 0);
@@ -1864,9 +1905,11 @@ mod tests {
         let depth = consumer.available_in_queue();
         assert!(depth <= 3, "queue depth must not exceed delivered count");
 
+        let bogus = magnetar_proto::ConsumerHandle(9999);
         let closed = Consumer {
             shared,
-            handle: magnetar_proto::ConsumerHandle(9999),
+            handle: bogus,
+            slot: stub_consumer_slot_for_test(bogus),
             decryptor: None,
         };
         assert_eq!(closed.available_in_queue(), 0);
@@ -1887,6 +1930,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         // Right after subscribe, before the initial flow is granted, the
@@ -1899,9 +1943,11 @@ mod tests {
         }
         assert_eq!(consumer.available_permits(), 64);
 
+        let bogus = magnetar_proto::ConsumerHandle(9999);
         let closed = Consumer {
             shared,
-            handle: magnetar_proto::ConsumerHandle(9999),
+            handle: bogus,
+            slot: stub_consumer_slot_for_test(bogus),
             decryptor: None,
         };
         assert_eq!(closed.available_permits(), 0);
@@ -1921,6 +1967,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         assert!(
@@ -1955,6 +2002,7 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle,
+            slot: consumer_slot_for(&shared, handle),
             decryptor: None,
         };
         assert!(!consumer.is_paused(), "default state is unpaused");
@@ -1963,9 +2011,11 @@ mod tests {
         consumer.resume();
         assert!(!consumer.is_paused(), "after resume()");
 
+        let bogus = magnetar_proto::ConsumerHandle(9999);
         let closed = Consumer {
             shared,
-            handle: magnetar_proto::ConsumerHandle(9999),
+            handle: bogus,
+            slot: stub_consumer_slot_for_test(bogus),
             decryptor: None,
         };
         assert!(!closed.is_paused());
@@ -1982,9 +2032,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         assert!(
@@ -2005,9 +2057,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         let result = consumer
@@ -2037,9 +2091,11 @@ mod tests {
             conn.handle_bytes(Instant::now(), &bytes)
                 .expect("handle CommandMessage");
         }
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         let result = consumer
@@ -2069,9 +2125,11 @@ mod tests {
                     .expect("handle CommandMessage");
             }
         }
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         let drained = consumer
@@ -2100,9 +2158,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         let zero_msgs = consumer
@@ -2135,6 +2195,7 @@ mod tests {
             let consumer = Consumer {
                 shared: shared.clone(),
                 handle,
+                slot: consumer_slot_for(&shared, handle),
                 decryptor: None,
             };
 
@@ -2204,11 +2265,19 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle: consumer_handle,
+            slot: consumer_slot_for(&shared, consumer_handle),
             decryptor: None,
         };
+        let producer_slot = shared
+            .inner
+            .lock()
+            .producer(producer_handle)
+            .cloned()
+            .expect("producer slot must exist");
         let producer = Producer {
             shared,
             handle: producer_handle,
+            slot: producer_slot,
             compression: magnetar_proto::types::CompressionKind::None,
             encryptor: None,
         };
@@ -2250,11 +2319,19 @@ mod tests {
         let consumer = Consumer {
             shared: shared.clone(),
             handle: consumer_handle,
+            slot: consumer_slot_for(&shared, consumer_handle),
             decryptor: None,
         };
+        let producer_slot = shared
+            .inner
+            .lock()
+            .producer(producer_handle)
+            .cloned()
+            .expect("producer slot must exist");
         let producer = Producer {
             shared: shared.clone(),
             handle: producer_handle,
+            slot: producer_slot,
             compression: magnetar_proto::types::CompressionKind::None,
             encryptor: None,
         };
@@ -2309,9 +2386,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer {
             shared,
             handle,
+            slot,
             decryptor: None,
         };
         assert!(

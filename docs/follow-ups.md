@@ -158,17 +158,21 @@ cursors in the same crates.
 
 ### Open — performance / contention
 
-- **Sub-mutex split for `Arc<parking_lot::Mutex<Connection>>`** [Δ
-  Claude perf: pass; codex: high-severity; resolved via phased
-  approach] — every send, receive, ack, stats, and the driver
-  read/write loop
-  serialises through `crates/magnetar-runtime-tokio/src/lib.rs:112`'s
-  global lock. Critical sections are short (no `.await` inside),
-  but the hot-path serialisation costs producer fan-out throughput.
-  Extract per-handle hot state (producer pending queue + waker,
-  consumer receive queue + waker) into per-handle sub-mutexes;
-  keep the global `Connection` lock for protocol-mutation only.
-  See the prompt-ready `/goal` block at the bottom of this section.
+- **Sub-mutex split for `Arc<parking_lot::Mutex<Connection>>`** —
+  **CLOSED ([ADR-0038](../specs/adr/0038-split-connection-mutex.md))**.
+  `Connection` now stores `Arc<ProducerSlot>` / `Arc<ConsumerSlot>`;
+  the runtime `Producer` / `Consumer` hold direct slot references.
+  Cold-path observability bypasses the global lock; `Producer::send`
+  hot path takes only the per-slot mutex via
+  `ProducerSlot::queue_send`; the driver merges per-slot staged
+  frames into the connection-wide outbound buffer through
+  `poll_transmit`'s call to `drain_producer_outbound`. Four-layer
+  test coverage in `crates/magnetar-proto/tests/slot_hot_path.rs`,
+  `crates/magnetar-runtime-{tokio,moonpool}/tests/two_producers_parallel.rs`,
+  `crates/magnetar-differential/tests/two_producers_parallel_equivalence.rs`.
+  Lock-ordering invariant **global → per-slot, never the reverse** is
+  documented in CLAUDE.md §"Non-negotiable invariants" #10 and
+  ARCHITECTURE.md §"Concurrency primitives".
 - **`drain_memory_wakers` allocates a `Vec<Waker>`** —
   `crates/magnetar-runtime-tokio/src/lib.rs:357-365` — pre-allocate
   the scratch Vec in `ConnectionShared` and reuse, or drain directly

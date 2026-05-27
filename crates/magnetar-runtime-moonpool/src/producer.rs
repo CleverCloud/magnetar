@@ -59,9 +59,20 @@ use crate::client::{Client, ClientError};
 /// Holds an [`Arc<ConnectionShared>`] plus a [`magnetar_proto::ProducerHandle`]
 /// — cheap to clone (Arc bump). Caller-facing futures park on the sans-io
 /// state machine's `Waker` slab, never on channels.
+///
+/// # Lock-ordering (ADR-0038)
+///
+/// Identity reads (topic, access mode, handle) go through `slot.identity`
+/// without locking. State-machine reads take only the per-slot mutex via
+/// `slot.state.lock()`. Operations that mutate the connection-wide state
+/// (`send`, `flush`, `close`, …) take `shared.inner.lock()`. Acquisition
+/// order: **global → per-slot, never the reverse**.
 pub struct Producer<P: Providers> {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ProducerHandle,
+    /// Direct handle to this producer's per-slot state, cloned from the
+    /// Connection's registry at create time.
+    pub(crate) slot: Arc<magnetar_proto::ProducerSlot>,
     pub(crate) compression: CompressionKind,
     /// Held only so `Producer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
@@ -74,6 +85,7 @@ impl<P: Providers> Clone for Producer<P> {
         Self {
             shared: self.shared.clone(),
             handle: self.handle,
+            slot: self.slot.clone(),
             compression: self.compression,
             _providers: std::marker::PhantomData,
         }
@@ -107,34 +119,31 @@ impl<P: Providers> Producer<P> {
 
     /// Topic name this producer is bound to. Returns an empty string if the
     /// producer is no longer registered (closed).
+    ///
+    /// Identity-only read — takes no lock (ADR-0038).
     #[must_use]
     pub fn topic(&self) -> String {
-        self.shared
-            .inner
-            .lock()
-            .producer_topic(self.handle)
-            .unwrap_or("")
-            .to_owned()
+        self.slot.identity.topic.clone()
     }
 
     /// Broker-assigned producer name. Returns an empty string until the
     /// broker assigns one (typically right after the `ProducerSuccess`
     /// round-trip) or if the producer is no longer registered.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn name(&self) -> String {
-        self.shared
-            .inner
-            .lock()
-            .producer_name(self.handle)
-            .unwrap_or_default()
+        self.slot.state.lock().name.clone().unwrap_or_default()
     }
 
     /// `true` if this producer has been closed (locally via
     /// [`Self::close`] or remotely via a broker `CloseProducer`). Mirrors
     /// Java `ProducerImpl#getState() == CLOSED`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.shared.inner.lock().producer_is_closed(self.handle)
+        self.slot.state.lock().closed
     }
 
     /// `true` while the broker connection is up. Mirrors Java
@@ -156,60 +165,62 @@ impl<P: Providers> Producer<P> {
     /// Number of in-flight sends (queued and not yet acked by the broker).
     /// Mirrors the un-batched view of Java
     /// `ProducerStats#getPendingQueueSize`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.shared.inner.lock().producer_pending_count(self.handle)
+        self.slot.state.lock().pending.len()
     }
 
     /// Last sequence id this client has pushed onto the wire. Returns `-1`
     /// if the producer has never sent. Mirrors
     /// `org.apache.pulsar.client.api.Producer#getLastSequenceId`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn last_sequence_id(&self) -> i64 {
-        self.shared
-            .inner
-            .lock()
-            .producer_last_sequence_id_pushed(self.handle)
+        self.slot.state.lock().last_sequence_id_pushed
     }
 
     /// Last sequence id the broker has acknowledged via
     /// `CommandSendReceipt`. Returns `-1` if no sends have been acked
     /// yet. Mirrors `org.apache.pulsar.client.api.Producer#getLastSequenceIdPublished`.
     /// Useful for resume-from-checkpoint flows.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn last_sequence_id_published(&self) -> i64 {
-        self.shared
-            .inner
-            .lock()
-            .producer_last_sequence_id_published(self.handle)
+        self.slot.state.lock().last_sequence_id_published
     }
 
     /// Number of messages currently buffered in the batch container,
     /// waiting for the next flush cycle. Returns `0` when batching is
     /// disabled or the batch is empty. Mirrors the tokio runtime's
     /// `Producer::batch_len`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn batch_len(&self) -> usize {
-        self.shared.inner.lock().producer_batch_len(self.handle)
+        self.slot.state.lock().batch.len()
     }
 
     /// Sum of payload bytes currently buffered in the batch container.
     /// Mirrors the tokio runtime's `Producer::batch_bytes`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
-        self.shared.inner.lock().producer_batch_bytes(self.handle)
+        self.slot.state.lock().batch.current_size_bytes
     }
 
     /// Snapshot of this producer's cumulative counters. Mirrors Java
     /// `org.apache.pulsar.client.api.Producer#getStats`. Returns a zeroed
     /// snapshot if the producer handle is no longer registered (closed).
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn stats(&self) -> ProducerStats {
-        self.shared
-            .inner
-            .lock()
-            .producer_stats(self.handle)
-            .unwrap_or_default()
+        self.slot.state.lock().stats()
     }
 
     /// Enqueue a send. The returned future resolves when the broker
@@ -339,17 +350,19 @@ impl<P: Providers> Producer<P> {
     /// taken; releases it on synchronous failure so the budget reflects
     /// only actually-in-flight bytes. Mirrors the tokio engine's helper of
     /// the same name.
+    ///
+    /// ADR-0038 Phase 3 hot path: takes only the per-slot mutex via
+    /// [`magnetar_proto::ProducerSlot::queue_send`] — does NOT acquire the
+    /// global Connection mutex. The moonpool driver merges per-slot staged
+    /// frames into the connection-wide outbound buffer on its next tick.
     fn queue_send(
         &self,
         msg: OutgoingMessage,
         publish_time_ms: u64,
         reserved_bytes: u64,
     ) -> SendFut {
-        let result = {
-            let now = std::time::Instant::now();
-            let mut conn = self.shared.inner.lock();
-            conn.send(self.handle, msg, publish_time_ms, now)
-        };
+        let now = std::time::Instant::now();
+        let result = self.slot.queue_send(msg, publish_time_ms, now);
 
         // Wake the driver so it can drain the freshly-queued frame.
         self.shared.driver_waker.notify_one();
@@ -525,15 +538,21 @@ impl<P: Providers> Client<P> {
         // lookup"). Mirrors `magnetar-runtime-tokio`'s `Client::open_producer_with` and Java's
         // `PulsarClientImpl#createProducerAsync`.
         let _ = self.lookup_topic(&req.topic, false).await?;
-        let handle = {
+        let (handle, slot) = {
             let mut conn = self.shared().inner.lock();
-            conn.create_producer(req)
+            let handle = conn.create_producer(req);
+            let slot = conn
+                .producer(handle)
+                .cloned()
+                .expect("just-created producer slot must exist");
+            (handle, slot)
         };
         self.shared().driver_waker.notify_one();
         wait_producer_ready(self.shared(), handle).await?;
         Ok(Producer {
             shared: self.shared().clone(),
             handle,
+            slot,
             compression,
             _providers: std::marker::PhantomData,
         })
@@ -888,6 +907,36 @@ mod tests {
         shared
     }
 
+    /// Capture the per-slot Arc for a `handle` known to be in the registry.
+    fn slot_for(
+        shared: &Arc<ConnectionShared>,
+        handle: ProducerHandle,
+    ) -> Arc<magnetar_proto::ProducerSlot> {
+        shared
+            .inner
+            .lock()
+            .producer(handle)
+            .cloned()
+            .expect("test producer slot must exist")
+    }
+
+    /// Placeholder slot for tests that intentionally use an unknown handle.
+    fn stub_slot_for_test(handle: ProducerHandle) -> Arc<magnetar_proto::ProducerSlot> {
+        magnetar_proto::ProducerSlot::new(
+            magnetar_proto::ProducerIdentity {
+                handle,
+                topic: String::new(),
+                access_mode: pb::ProducerAccessMode::Shared,
+            },
+            magnetar_proto::producer::ProducerState::new(
+                handle,
+                String::new(),
+                CompressionKind::None,
+                0,
+            ),
+        )
+    }
+
     /// Smoke test: a freshly-constructed producer reports defaults that
     /// match the sans-io layer (no sends pushed, none pending, no name).
     #[tokio::test(flavor = "current_thread")]
@@ -903,6 +952,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -930,9 +980,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -965,9 +1017,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::Zstd,
             _providers: std::marker::PhantomData,
         };
@@ -1001,9 +1055,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1026,9 +1082,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1090,6 +1148,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1145,6 +1204,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1270,6 +1330,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1341,6 +1402,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1405,6 +1467,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1476,6 +1539,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1538,6 +1602,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle: bogus_handle,
+            slot: stub_slot_for_test(bogus_handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1614,6 +1679,7 @@ mod tests {
         let producer: Producer<TokioProviders> = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1666,9 +1732,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1691,9 +1759,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };
@@ -1716,9 +1786,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer: Producer<TokioProviders> = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             _providers: std::marker::PhantomData,
         };

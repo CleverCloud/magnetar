@@ -22,10 +22,25 @@ use crate::crypto::MessageEncryptor;
 use crate::error::ClientError;
 
 /// User-facing producer handle.
+///
+/// # Lock-ordering (ADR-0038)
+///
+/// Identity reads (topic, access mode, handle) go through `slot.identity` and
+/// take **no lock at all**. State-machine reads (`pending_count`, `batch_len`,
+/// `last_sequence_id_*`, `stats`, `is_closed`) take only the per-slot mutex
+/// via `slot.state.lock()` — they do **not** acquire the global Connection
+/// mutex. Operations that drive protocol I/O (`send`, `flush`, `close`,
+/// `get_schema`) still take `shared.inner.lock()` because they mutate the
+/// connection-wide state machine. Acquisition order is always **global →
+/// per-slot, never the reverse**.
 #[derive(Debug, Clone)]
 pub struct Producer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ProducerHandle,
+    /// Direct handle to this producer's per-slot state, cloned from the
+    /// Connection's registry at create time. Identity reads bypass any lock;
+    /// hot-state reads/writes take only `slot.state.lock()`.
+    pub(crate) slot: Arc<magnetar_proto::ProducerSlot>,
     pub(crate) compression: CompressionKind,
     /// Optional encryption hook (PIP-4). When present, the producer encrypts every
     /// outbound payload after compression but before handing it to the sans-io layer.
@@ -49,57 +64,65 @@ impl Producer {
     /// Access mode the producer was opened with (`Shared`, `Exclusive`,
     /// `WaitForExclusive`, `ExclusiveWithFencing`). Mirrors Java
     /// `Producer#getProducerAccessMode`.
+    ///
+    /// Identity-only read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn access_mode(&self) -> magnetar_proto::pb::ProducerAccessMode {
-        self.shared.inner.lock().producer_access_mode(self.handle)
+        self.slot.identity.access_mode
     }
 
     /// `true` if this producer has been closed (locally via [`Self::close`] or remotely
     /// via a broker `CloseProducer`). Mirrors Java `ProducerImpl#getState() == CLOSED`.
     /// Use [`Self::is_connected`] for the live test — `is_closed` only flips after a
     /// terminal close, not on transient disconnects.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.shared.inner.lock().producer_is_closed(self.handle)
+        self.slot.state.lock().closed
     }
 
     /// Last sequence id this client has pushed onto the wire. Returns `-1` if the producer
     /// has never sent. Mirrors `org.apache.pulsar.client.api.Producer#getLastSequenceId`.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn last_sequence_id(&self) -> i64 {
-        self.shared
-            .inner
-            .lock()
-            .producer_last_sequence_id_pushed(self.handle)
+        self.slot.state.lock().last_sequence_id_pushed
     }
 
     /// Number of in-flight sends (queued and not yet acked by the broker). Mirrors the
     /// un-batched view of Java `ProducerStats#getPendingQueueSize`. Equivalent to
     /// `self.stats().pending_queue_size as usize` but spares the full stats snapshot.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.shared.inner.lock().producer_pending_count(self.handle)
+        self.slot.state.lock().pending.len()
     }
 
     /// Number of messages currently buffered in the batch container, waiting for the next
     /// flush cycle. Returns `0` when batching is disabled or the batch is empty.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn batch_len(&self) -> usize {
-        self.shared.inner.lock().producer_batch_len(self.handle)
+        self.slot.state.lock().batch.len()
     }
 
     /// Sum of payload bytes currently buffered in the batch container.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
-        self.shared.inner.lock().producer_batch_bytes(self.handle)
+        self.slot.state.lock().batch.current_size_bytes
     }
 
     /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. Returns `-1`
     /// if no sends have been acked yet. Useful for resume-from-checkpoint flows.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn last_sequence_id_published(&self) -> i64 {
-        self.shared
-            .inner
-            .lock()
-            .producer_last_sequence_id_published(self.handle)
+        self.slot.state.lock().last_sequence_id_published
     }
 
     /// Convenience: publish raw payload bytes with no extra metadata. Mirrors Java
@@ -257,17 +280,20 @@ impl Producer {
     /// Hand the (compressed/encrypted) message to the sans-io state machine. Assumes the
     /// `reserved_bytes` reservation has already been taken; releases it on synchronous
     /// failure so the budget reflects only actually-in-flight bytes.
+    ///
+    /// ADR-0038 Phase 3 hot path: takes only the per-slot mutex via
+    /// [`magnetar_proto::ProducerSlot::queue_send`] — does NOT acquire the
+    /// global Connection mutex. The driver merges per-slot staged frames
+    /// into the connection-wide outbound buffer on its next tick (it calls
+    /// `Connection::drain_producer_outbound` right before `poll_transmit`).
     fn queue_send(
         &self,
         msg: OutgoingMessage,
         publish_time_ms: u64,
         reserved_bytes: u64,
     ) -> SendFut {
-        let result = {
-            let now = std::time::Instant::now();
-            let mut conn = self.shared.inner.lock();
-            conn.send(self.handle, msg, publish_time_ms, now)
-        };
+        let now = std::time::Instant::now();
+        let result = self.slot.queue_send(msg, publish_time_ms, now);
 
         // Wake the driver so it can drain the freshly-queued frame.
         self.shared.driver_waker.notify_one();
@@ -315,8 +341,12 @@ impl Producer {
         // Drain by waiting on the driver waker until the producer's pending queue is empty.
         // The driver task notifies all parked tasks after every inbound packet, so each
         // `CommandSendReceipt` wakes us; we re-check the count and re-park if needed.
+        //
+        // ADR-0038: the pending-count probe reads from the per-slot mutex directly
+        // (no global Connection lock), so a parallel send on a sibling producer
+        // doesn't serialise against this drain.
         loop {
-            let pending = self.shared.inner.lock().producer_pending_count(self.handle);
+            let pending = self.slot.state.lock().pending.len();
             if pending == 0 {
                 return Ok(());
             }
@@ -344,7 +374,8 @@ impl Producer {
         if let Ok(res) = tokio::time::timeout(timeout, self.flush()).await {
             res
         } else {
-            let pending = self.shared.inner.lock().producer_pending_count(self.handle);
+            // ADR-0038: per-slot read, no global lock.
+            let pending = self.slot.state.lock().pending.len();
             Err(ClientError::Timeout(format!(
                 "producer flush exceeded {timeout:?} with {pending} sends still pending"
             )))
@@ -382,12 +413,10 @@ impl Producer {
     /// Snapshot of this producer's cumulative counters. Mirrors Java
     /// `org.apache.pulsar.client.api.Producer#getStats`. Returns a zeroed snapshot if the
     /// producer handle is no longer registered (closed).
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn stats(&self) -> magnetar_proto::ProducerStats {
-        self.shared
-            .inner
-            .lock()
-            .producer_stats(self.handle)
-            .unwrap_or_default()
+        self.slot.state.lock().stats()
     }
 
     /// Capture a rolling-window sample for this producer. Mirrors Java
@@ -396,33 +425,27 @@ impl Producer {
     /// [`magnetar_proto::ProducerStats::bytes_per_sec`]. The first call only seeds
     /// the baseline (rates stay at `0.0`); the second and subsequent calls compute
     /// the per-second deltas between consecutive samples.
+    ///
+    /// Per-slot write — does NOT take the global Connection mutex.
     pub fn record_rate_window(&self, now: std::time::Instant) {
-        self.shared
-            .inner
-            .lock()
-            .producer_record_rate_window(self.handle, now);
+        self.slot.state.lock().record_rate_window(now);
     }
 
     /// Topic name this producer is bound to. Returns an empty string if the producer is no
     /// longer registered (closed).
+    ///
+    /// Identity-only read — does NOT take any lock.
     pub fn topic(&self) -> String {
-        self.shared
-            .inner
-            .lock()
-            .producer_topic(self.handle)
-            .unwrap_or("")
-            .to_owned()
+        self.slot.identity.topic.clone()
     }
 
     /// Broker-assigned producer name. Returns an empty string until the broker assigns one
     /// (typically right after the ProducerSuccess round-trip) or if the producer is no
     /// longer registered.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
     pub fn name(&self) -> String {
-        self.shared
-            .inner
-            .lock()
-            .producer_name(self.handle)
-            .unwrap_or_default()
+        self.slot.state.lock().name.clone().unwrap_or_default()
     }
 
     /// Look up the broker-registered schema for the producer's topic (PIP-87).
@@ -440,18 +463,8 @@ impl Producer {
     /// [`magnetar_proto::schema::AutoProduceBytesSchema`]) push the resolved schema into
     /// their own `Arc<Mutex<…>>` after this future resolves.
     pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
-        let topic = self
-            .shared
-            .inner
-            .lock()
-            .producer_topic(self.handle)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                ClientError::Other(format!(
-                    "get_schema: producer handle {:?} is no longer registered",
-                    self.handle
-                ))
-            })?;
+        // ADR-0038: identity-only read, no global lock.
+        let topic = self.slot.identity.topic.clone();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.get_schema(&topic, version)
@@ -723,6 +736,42 @@ mod tests {
         shared
     }
 
+    /// Capture the per-slot Arc for `handle`, panicking if the slot is gone
+    /// (caller must hold a fresh handle from `create_producer`). Tests that
+    /// intentionally exercise an unknown handle use [`stub_slot_for_test`].
+    fn slot_for(
+        shared: &std::sync::Arc<ConnectionShared>,
+        handle: ProducerHandle,
+    ) -> std::sync::Arc<magnetar_proto::ProducerSlot> {
+        shared
+            .inner
+            .lock()
+            .producer(handle)
+            .cloned()
+            .expect("test producer slot must exist")
+    }
+
+    /// For tests that deliberately construct a `Producer` whose handle is not
+    /// in the registry (e.g. the bogus-handle stats-fallback case). The slot's
+    /// `state.lock()` will never be inspected because the caller never reaches
+    /// the per-slot paths; only used as a placeholder to satisfy the struct
+    /// initializer.
+    fn stub_slot_for_test(handle: ProducerHandle) -> std::sync::Arc<magnetar_proto::ProducerSlot> {
+        magnetar_proto::ProducerSlot::new(
+            magnetar_proto::ProducerIdentity {
+                handle,
+                topic: String::new(),
+                access_mode: pb::ProducerAccessMode::Shared,
+            },
+            magnetar_proto::producer::ProducerState::new(
+                handle,
+                String::new(),
+                CompressionKind::None,
+                0,
+            ),
+        )
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn flush_with_timeout_returns_timeout_when_nothing_acks() {
         let shared = handshake_complete_shared();
@@ -752,6 +801,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -783,9 +833,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -846,6 +898,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -906,6 +959,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -972,6 +1026,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -1079,6 +1134,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -1137,6 +1193,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle: bogus_handle,
+            slot: stub_slot_for_test(bogus_handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -1217,6 +1274,7 @@ mod tests {
         let producer = Producer {
             shared: shared.clone(),
             handle,
+            slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -1256,9 +1314,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -1281,9 +1341,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             encryptor: None,
         };
@@ -1306,9 +1368,11 @@ mod tests {
                 ..Default::default()
             })
         };
+        let slot = slot_for(&shared, handle);
         let producer = Producer {
             shared,
             handle,
+            slot,
             compression: CompressionKind::None,
             encryptor: None,
         };
