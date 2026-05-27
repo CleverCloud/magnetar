@@ -1140,6 +1140,24 @@ fn sim_chaos_produce_consume_sweep_16_seeds() {
         .run();
 }
 
+/// Regression for the moonpool `SubscribeAckedFut` parking bug
+/// (seed `2` deterministic hang). `Notified::enable()` used to be called
+/// on a stack-pinned future that was then dropped before `notify_waiters()`
+/// fired — fixed by spawning a helper task. Pin a specific failing seed
+/// so the regression remains tied to the original reproducer.
+#[test]
+fn sim_chaos_seed_2_does_not_hang() {
+    let _ = SimulationBuilder::new()
+        .workload(StatefulBrokerWorkload::new())
+        .workload(ProducerConsumerWorkload::new())
+        .invariant(MonotonicMsgIdInvariant::default())
+        .invariant(AckAfterReceiveInvariant::default())
+        .invariant(NoDupOnAckedInvariant::default())
+        .set_debug_seeds(vec![2])
+        .set_iterations(1)
+        .run();
+}
+
 // =============================================================================
 // ADR-0028 anti-thrash chaos workload — `DropsTcpAfterCreate`.
 //

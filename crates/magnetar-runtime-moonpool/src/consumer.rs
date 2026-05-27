@@ -1146,13 +1146,12 @@ impl Future for ReceiveFut {
 /// given [`ConsumerHandle`]. Drains `ConnectionEvent`s from the queue looking
 /// for [`ConnectionEvent::SubscribeAcked`].
 ///
-/// Note: the connection driver may also drain `SubscribeAcked` via its
-/// `handle_pending_events` catch-all arm; in that case this future will not
-/// see the event and will park on the driver wakeup indefinitely until a
-/// follow-up `Closed` event terminates it. Same shape as the tokio engine's
-/// `EventWaitFut`. A follow-up milestone should make `SubscribeAcked`
-/// request-id correlated through `OpOutcome::Success` so this race
-/// disappears.
+/// Parking shape mirrors the tokio engine's `EventWaitFut`: a spawned
+/// helper awaits `driver_waker.notified()` and wakes our task when the
+/// driver next signals. The earlier inline `enable()` pattern raced with
+/// `notify_waiters()` (the `Notified` was dropped before any waker was
+/// stored), which deterministically hung whenever the broker's `Success`
+/// reply arrived after the future's first poll.
 struct SubscribeAckedFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
@@ -1214,11 +1213,22 @@ impl Future for SubscribeAckedFut {
 
         // Park on the driver wakeup. The driver notifies after any inbound
         // bytes are processed.
-        let notified = self.shared.driver_waker.notified();
-        tokio::pin!(notified);
-        if notified.as_mut().enable() {
-            cx.waker().wake_by_ref();
-        }
+        //
+        // The previous shape used a stack-pinned `Notified` future with
+        // `enable()`, but `enable()` only consumes a queued permit — it
+        // does not register a waker. The `Notified` was then dropped at
+        // the end of `poll`, so a subsequent `notify_waiters()` (the
+        // driver's "bytes processed" signal) had no one to wake and the
+        // subscribe hung whenever the broker's `Success` reply lost the
+        // race with this future's first poll. Mirror the tokio engine's
+        // [`EventWaitFut`]: spawn a helper that awaits `notified().await`
+        // and wakes the caller's waker when the driver next signals.
+        let waker = cx.waker().clone();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            shared.driver_waker.notified().await;
+            waker.wake();
+        });
         Poll::Pending
     }
 }
