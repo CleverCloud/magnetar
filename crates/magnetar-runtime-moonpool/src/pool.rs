@@ -187,3 +187,71 @@ impl<P: Providers> ProxyConnectionPool<P> {
         self.entries.lock().len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moonpool_core::TokioProviders;
+
+    fn dummy_factory() -> ConnectionFactory<TokioProviders> {
+        ConnectionFactory {
+            addr: "broker.example.com:6650".to_owned(),
+            bootstrap_config: ConnectionConfig {
+                operation_timeout: Duration::from_secs(30),
+                ..ConnectionConfig::default()
+            },
+            providers: TokioProviders::default(),
+            service_url_provider: None,
+            dns_resolver: None,
+        }
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn fresh_pool_is_empty() {
+        let pool = ProxyConnectionPool::new(dummy_factory());
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn factory_clone_preserves_addr() {
+        let factory = dummy_factory();
+        let cloned = factory.clone();
+        assert_eq!(factory.addr, cloned.addr);
+        assert_eq!(
+            factory.bootstrap_config.operation_timeout,
+            cloned.bootstrap_config.operation_timeout
+        );
+    }
+
+    #[test]
+    fn debug_includes_pool_state() {
+        let pool = ProxyConnectionPool::new(dummy_factory());
+        let s = format!("{pool:?}");
+        assert!(s.contains("ProxyConnectionPool"));
+        assert!(s.contains("entries"));
+    }
+
+    #[test]
+    fn factory_debug_does_not_leak_providers() {
+        let factory = dummy_factory();
+        let s = format!("{factory:?}");
+        assert!(s.contains("ConnectionFactory"));
+        assert!(s.contains("broker.example.com:6650"));
+        // The providers bundle is intentionally NOT in Debug output —
+        // it's a verbose handle bundle, not config metadata.
+        assert!(!s.contains("TokioProviders"));
+    }
+
+    #[test]
+    fn pool_arc_is_clone() {
+        // Sanity that the `Arc<Self>` returned by `new` is cheaply
+        // shareable — the engine creates one per `Client` and the
+        // bootstrap connect path needs to hand the same Arc to every
+        // future open-producer / open-consumer call.
+        let pool = ProxyConnectionPool::new(dummy_factory());
+        let cloned: Arc<ProxyConnectionPool<TokioProviders>> = pool.clone();
+        assert_eq!(pool.len(), cloned.len());
+    }
+}
