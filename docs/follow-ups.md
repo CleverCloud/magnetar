@@ -35,16 +35,24 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — zero-copy
 
-- **`crates/magnetar-proto/src/frame.rs::encode_payload`** — single
-  `BytesMut` accumulator copies every payload into the wire buffer.
-  Return a frame descriptor `{head: BytesMut, payload: Bytes}` and
-  vectored-write for plaintext — the producer batch path then chains
-  `Bytes` segments instead of memcpy-concat. TLS path keeps the
-  contiguous coalesce. **Design landed**:
-  [ADR-0039](../specs/adr/0039-vectored-io-transmit-enum.md) (Proposed) —
-  three-wave landing plan (proto+tokio first, moonpool
-  `Providers::Network::write_vectored` second, read-path ownership
-  pass-through third). Implementation still TODO.
+- **`crates/magnetar-proto/src/frame.rs::encode_payload`** zero-copy
+  alternative — **landed**. The new
+  `frame::encode_payload_head(cmd, metadata, payload)` returns the
+  head bytes (BytesMut: `[total_size][cmd][magic][crc32c][meta]`)
+  without copying the payload; the producer batch path drains via
+  `Connection::drain_producer_outbound_vectored` which pushes
+  `[head, payload]` `Bytes` pairs into
+  `Connection::outbound_segments`. `Connection::poll_transmit_owned`
+  returns `TransmitOwned::Vectored(Vec<Bytes>)` for the producer
+  path; the tokio runtime dispatches via `AsyncWrite::write_vectored`
+  (real `writev(2)`), the moonpool runtime coalesces locally pending
+  a `moonpool-core` vectored primitive (see the syscall-reduction
+  entry below for the chaos-pack-aware moonpool work). TLS path
+  intentionally still coalesces — rustls re-encodes the bytes into
+  TLS records, so segment fidelity wouldn't survive anyway. The
+  legacy `encode_payload` stays for handshake / ack / lookup frames
+  and any path the protocol layer can't trivially split.
+  ([ADR-0039](../specs/adr/0039-vectored-io-transmit-enum.md))
 
 ### Open — syscall reduction
 
