@@ -374,10 +374,19 @@ impl ConnectionShared {
     /// outside the critical section so user code that re-polls cannot
     /// deadlock on the slab mutex.
     fn drain_memory_wakers(&self) {
+        // `slab.drain()` empties the slab in-place and yields the
+        // stored wakers. Drop the slab guard before waking — user code
+        // that re-polls on `wake()` could try to re-register a waker,
+        // which would deadlock against the slab mutex.
+        //
+        // Pre-allocate the intermediate `Vec` to the slab's current
+        // length so the drain is one allocation instead of relying on
+        // `Vec`'s growth doubling.
         let wakers: Vec<Waker> = {
             let mut slab = self.memory_wakers.lock();
-            let drained: Vec<Waker> = slab.drain().collect();
-            drained
+            let mut out = Vec::with_capacity(slab.len());
+            out.extend(slab.drain());
+            out
         };
         for w in wakers {
             w.wake();

@@ -48,10 +48,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — performance / contention
 
-- **`ConnectionShared::drain_memory_wakers` allocates a `Vec<Waker>`** —
-  `crates/magnetar-runtime-tokio/src/lib.rs` — pre-allocate the
-  scratch Vec in `ConnectionShared` and reuse, or drain directly
-  without intermediate collect.
 - **`pending_index: HashMap<SequenceId, usize>` uses SipHash** —
   `crates/magnetar-proto/src/producer.rs::ProducerState.pending_index`
   — key is a `u64` newtype. Switch to
