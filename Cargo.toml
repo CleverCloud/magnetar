@@ -30,111 +30,111 @@ categories    = ["asynchronous", "network-programming"]
 
 [workspace.dependencies]
 # Internal crates
-magnetar                 = { version = "0.1.0-dev.0", path = "crates/magnetar" }
-magnetar-admin           = { version = "0.1.0-dev.0", path = "crates/magnetar-admin" }
-magnetar-auth-athenz     = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-athenz" }
-magnetar-auth-oauth2     = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-oauth2" }
-magnetar-auth-sasl       = { version = "0.1.0-dev.0", path = "crates/magnetar-auth-sasl" }
-magnetar-differential    = { version = "0.1.0-dev.0", path = "crates/magnetar-differential" }
-magnetar-fakes           = { version = "0.1.0-dev.0", path = "crates/magnetar-fakes" }
-magnetar-messagecrypto   = { version = "0.1.0-dev.0", path = "crates/magnetar-messagecrypto" }
-magnetar-proto           = { version = "0.1.0-dev.0", path = "crates/magnetar-proto" }
-magnetar-runtime-moonpool = { version = "0.1.0-dev.0", path = "crates/magnetar-runtime-moonpool" }
-magnetar-runtime-tokio   = { version = "0.1.0-dev.0", path = "crates/magnetar-runtime-tokio" }
+magnetar                 = { version = "^0.1.0-dev.0", path = "crates/magnetar" }
+magnetar-admin           = { version = "^0.1.0-dev.0", path = "crates/magnetar-admin" }
+magnetar-auth-athenz     = { version = "^0.1.0-dev.0", path = "crates/magnetar-auth-athenz" }
+magnetar-auth-oauth2     = { version = "^0.1.0-dev.0", path = "crates/magnetar-auth-oauth2" }
+magnetar-auth-sasl       = { version = "^0.1.0-dev.0", path = "crates/magnetar-auth-sasl" }
+magnetar-differential    = { version = "^0.1.0-dev.0", path = "crates/magnetar-differential" }
+magnetar-fakes           = { version = "^0.1.0-dev.0", path = "crates/magnetar-fakes" }
+magnetar-messagecrypto   = { version = "^0.1.0-dev.0", path = "crates/magnetar-messagecrypto" }
+magnetar-proto           = { version = "^0.1.0-dev.0", path = "crates/magnetar-proto" }
+magnetar-runtime-moonpool = { version = "^0.1.0-dev.0", path = "crates/magnetar-runtime-moonpool" }
+magnetar-runtime-tokio   = { version = "^0.1.0-dev.0", path = "crates/magnetar-runtime-tokio" }
 
 # Codec
-prost           = "0.13"
-prost-build     = "0.13"
-prost-types     = "0.13"
-bytes           = "1"
-crc32c          = "0.6"
+prost           = "^0.13.5"
+prost-build     = "^0.13.5"
+prost-types     = "^0.13.5"
+bytes           = "^1.11.1"
+crc32c          = "^0.6.8"
 
 # Async runtime (engines only, NEVER magnetar-proto)
-tokio           = { version = "1", default-features = false }
-tokio-util      = { version = "0.7", default-features = false }
-futures         = { version = "0.3", default-features = false }
-futures-util    = { version = "0.3", default-features = false }
-pin-project-lite = "0.2"
-parking_lot     = "0.12"
-arc-swap        = "1"
-slab            = "0.4"
+tokio           = { version = "^1.52.3", default-features = false }
+tokio-util      = { version = "^0.7.18", default-features = false }
+futures         = { version = "^0.3.32", default-features = false }
+futures-util    = { version = "^0.3.32", default-features = false }
+pin-project-lite = "^0.2.17"
+parking_lot     = "^0.12.5"
+slab            = "^0.4.12"
 
 # TLS — rustls everywhere, no native-tls. The provider sub-feature
 # (`ring` / `aws_lc_rs` / `fips`) is selected by each downstream crate
 # via its own `crypto-*` feature so cargo does NOT silently unify two
 # providers into a single build (issue #9, ADR-0035). `tls12` and
 # `logging` stay on; both are rustls's own default-on features.
-rustls               = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls               = { version = "^0.23.40", default-features = false, features = ["std", "tls12", "logging"] }
 # rustls-pemfile was marked unmaintained (RUSTSEC-2025-0134); we now parse PEMs via
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
-rustls-pki-types     = { version = "1", features = ["std"] }
-rustls-native-certs  = "0.8"
-tokio-rustls         = { version = "0.26", default-features = false }
+rustls-pki-types     = { version = "^1.14.1", features = ["std"] }
+rustls-native-certs  = "^0.8.3"
+tokio-rustls         = { version = "^0.26.4", default-features = false }
 # `rustls-openssl` is opted-in via the façade's `crypto-openssl` feature
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
 # wraps OpenSSL; the openssl / openssl-sys carve-out in `deny.toml`
 # allows that subgraph specifically.
-rustls-openssl       = { version = "0.3", default-features = false }
+rustls-openssl       = { version = "^0.3.1", default-features = false }
 
 # Compression — Pulsar's four codecs
-lz4_flex   = { version = "0.11", default-features = false, features = ["std"] }
-zstd       = { version = "0.13", default-features = false }
-snap       = "1"
-flate2     = { version = "1", default-features = false, features = ["zlib"] }
+lz4_flex   = { version = "^0.11.6", default-features = false, features = ["std"] }
+zstd       = { version = "^0.13.3", default-features = false }
+snap       = "^1.1.1"
+flate2     = { version = "^1.1.9", default-features = false, features = ["zlib"] }
 
 # Schemas
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
-apache-avro = "0.21"
-schemars    = { version = "1", default-features = false, features = ["derive", "std"] }
+serde       = { version = "^1.0.228", features = ["derive"] }
+serde_json  = "^1.0.149"
+apache-avro = "^0.21.0"
+schemars    = { version = "^1.2.1", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "1", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.23.1", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly)
-aws-lc-rs  = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+aws-lc-rs  = { version = "^1.17.0", default-features = false, features = ["aws-lc-sys"] }
 
 # SASL Kerberos / GSSAPI. Safe Rust wrapper over the system GSS-API
 # (libkrb5 / Heimdal). Only opted-in by `magnetar-auth-sasl` under its
 # `kerberos` feature; downstream crates stay free of `libkrb5` link
 # requirements on hosts that don't enable Kerberos. See ADR-0029.
-libgssapi  = { version = "0.9", default-features = false }
+libgssapi  = { version = "^0.9.1", default-features = false }
 
-# moonpool engine
-moonpool-core = "=0.6"
+# moonpool engine — exact-pin discipline preserved (`=` sigil) so the
+# two moonpool crates stay version-compatible; see ADR-0024 + ADR-0036.
+moonpool-core = "=0.6.0"
 # moonpool-sim provides the deterministic SimProviders used by the
 # differential harness chaos pack (ADR-0024). Pinned to the same minor
 # as moonpool-core so the two crates stay version-compatible. Vendored
 # as a workspace dep but opted into per-crate (currently only the
 # differential harness needs it).
-moonpool-sim = "=0.6"
+moonpool-sim = "=0.6.0"
 
 # Admin REST + CLI. The TLS sub-feature (`rustls-tls` vs
 # `rustls-tls-no-provider`) is picked by each downstream crate from its
 # `crypto-*` feature; the workspace dep stays free of a hard-wired
 # provider sub-feature (issue #9, ADR-0035).
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-url     = "2"
-http    = "1"
-clap    = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "^0.12.28", default-features = false, features = ["json"] }
+url     = "^2.5.8"
+http    = "^1.4.1"
+clap    = { version = "^4.6.1", features = ["derive", "env"] }
 
 # Telemetry + errors
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
-thiserror          = "2"
-anyhow             = "1"
-hdrhistogram       = { version = "7", default-features = false }
+tracing            = "^0.1.44"
+tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
+thiserror          = "^2.0.18"
+anyhow             = "^1.0.102"
+hdrhistogram       = { version = "^7.5.4", default-features = false }
 
 # Test infrastructure
-testcontainers = "0.27"
-rstest         = "0.21"
-proptest       = "1"
-tempfile       = "3"
-wiremock       = "0.6"
+testcontainers = "^0.27.3"
+rstest         = "^0.21.0"
+proptest       = "^1.11.0"
+tempfile       = "^3.27.0"
+wiremock       = "^0.6.5"
 # `async-trait` is needed by moonpool-sim's `Workload` trait, which uses
 # `#[async_trait(?Send)]`. Pinned to the major version moonpool-sim 0.6
 # transitively depends on.
-async-trait    = "0.1"
+async-trait    = "^0.1.89"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
