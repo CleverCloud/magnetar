@@ -56,14 +56,21 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   — wave 1 (proto `Transmit` enum + tokio `write_vectored`), wave 2
   (moonpool `Providers::Network::write_vectored` + chaos pack
   segment-granular drops), wave 3 (read-path `BytesMut` ownership
-  pass-through). **Wave 1.0 landed**: `Transmit<'a>` enum
+  pass-through). **Waves 1.0 + 1.1 landed**: `Transmit<'a>` enum
   (`Contiguous` / `Vectored`) lives in
-  `crates/magnetar-proto/src/transmit.rs`; `Connection::poll_transmit_vectored`
-  is a slice-returning entry point that today returns the same bytes
-  as `poll_transmit` (callers wrap in `Transmit::Contiguous(slice)`).
-  Wave 1.1 (proto encoder split — `encode_payload` returns a frame
-  descriptor) and wave 2 (moonpool `write_vectored`) still TODO; the
-  three remaining waves can land independently in that order.
+  `crates/magnetar-proto/src/transmit.rs`;
+  `Connection::poll_transmit_vectored` is the typed entry point —
+  returns `Transmit<'_>`, drains the outbound buffer via the same
+  O(1) ownership transfer `poll_transmit` uses, and stashes the
+  drained `Bytes` in `Connection::pending_vectored_drain` so the
+  returned `Transmit::Contiguous(&slice)` borrows against memory
+  the `Connection` keeps alive across the runtime's `.await`. Today
+  the entry point always emits `Contiguous` and is byte-identical
+  to `poll_transmit`. Wave 1.2 (proto encoder split —
+  `encode_payload` returns `{head: BytesMut, payload: Bytes}` so
+  the producer batch path emits `Vectored`) and wave 2 (moonpool
+  `write_vectored`) still TODO; the remaining waves can land
+  independently in that order.
 - **Read path double-copy** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner`
   reads `read_buf` → `split().freeze()`. The proto-side re-copy was

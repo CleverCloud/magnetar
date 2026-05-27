@@ -41,7 +41,7 @@ pub enum Transmit<'a> {
     Vectored(&'a [Bytes]),
 }
 
-impl<'a> Transmit<'a> {
+impl Transmit<'_> {
     /// Total byte count across all segments. `Contiguous(&buf).len()`
     /// for the contiguous variant; sum of segment lengths for vectored.
     /// Used by the runtime to short-circuit empty transmits and to

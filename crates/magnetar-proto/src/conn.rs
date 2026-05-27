@@ -56,6 +56,13 @@ pub struct Connection {
     feature_flags: pb::FeatureFlags,
     /// Outbound bytes buffer drained by [`Self::poll_transmit`].
     outbound: BytesMut,
+    /// Wave-1.1 staging slot for [`Self::poll_transmit_vectored`].
+    /// Holds the most recently drained outbound `Bytes` so the
+    /// `Transmit::Contiguous(&slice)` return borrows against an owned
+    /// buffer the [`Connection`] keeps alive. Replaced on every
+    /// `poll_transmit_vectored` call; the borrow checker prevents
+    /// concurrent re-entry. `None` before the first vectored drain.
+    pending_vectored_drain: Option<Bytes>,
     /// Inbound bytes buffer; framed into commands by [`Self::handle_bytes`].
     inbound: BytesMut,
     /// Event queue.
@@ -226,6 +233,7 @@ impl Connection {
             broker_protocol_version: 0,
             feature_flags: pb::FeatureFlags::default(),
             outbound: BytesMut::with_capacity(4 * 1024),
+            pending_vectored_drain: None,
             inbound: BytesMut::with_capacity(4 * 1024),
             events: VecDeque::new(),
             outcomes: HashMap::new(),
@@ -1717,33 +1725,45 @@ impl Connection {
     }
 
     /// Drain queued outbound bytes as a [`crate::Transmit`] descriptor
-    /// (ADR-0039 wave 1.0).
+    /// (ADR-0039 waves 1.0 / 1.1).
     ///
     /// **Today** this always returns [`crate::Transmit::Contiguous`]
     /// pointing at the same `BytesMut`-backed slice
     /// [`Self::poll_transmit`] would have produced. The
     /// [`crate::Transmit::Vectored`] variant exists in the type but is
-    /// never produced yet — wave 1.1 (proto encoder split) introduces
+    /// never produced yet — wave 1.2 (proto encoder split) introduces
     /// the segment shape; wave 2 (moonpool
     /// `Providers::Network::write_vectored`) wires the chaos pack.
     ///
-    /// Runtimes that want to start passing the descriptor through
-    /// `poll_write_vectored` / `IoSlice` can switch to this entry
-    /// today — they'll get the contiguous slice and behave identically
-    /// to the legacy path, ready to gain real vectored writes when
-    /// wave 1.1 lands. Stash the returned `BytesMut::split().freeze()`
-    /// behind a `Bytes` cache so the borrow against `&mut self`
-    /// drops before the runtime's `.await`.
-    pub fn poll_transmit_vectored(&mut self) -> &[u8] {
+    /// Runtimes adopting `poll_write_vectored` / `IoSlice` should match
+    /// on the returned [`crate::Transmit`] and extract the byte data
+    /// into an owned form before any `.await` (the borrow is tied to
+    /// `&mut self` against the connection). For the
+    /// [`crate::Transmit::Contiguous`] arm, `Bytes::copy_from_slice`
+    /// produces an owned `Bytes` with the same shape that
+    /// [`Self::poll_transmit`] returns directly; the vectored arm
+    /// (wave 1.2+) hands the runtime an owned segment list it can pass
+    /// into the kernel as an `IoSlice` array.
+    pub fn poll_transmit_vectored(&mut self) -> crate::Transmit<'_> {
         self.drain_producer_outbound();
-        // We can't return `Transmit<'_>` borrowing from `self.outbound`
-        // because the legacy `poll_transmit` already takes `&mut self`
-        // and the runtime needs to drop the borrow before awaiting on
-        // the socket. Return a `&[u8]` slice instead — callers wrap it
-        // in `Transmit::Contiguous(slice)` at the call site. Wave 1.1
-        // will flip this to a real `Transmit<'_>` once the segment
-        // shape lands and the runtime adapter consumes the enum.
-        &self.outbound[..]
+        // Drain to an owned `Bytes` (same O(1) ownership transfer as
+        // `poll_transmit`) and stash it in `pending_vectored_drain`, so
+        // the returned `Transmit::Contiguous(&slice)` borrows against
+        // memory the `Connection` keeps alive across the runtime's
+        // `.await`. The borrow against `&mut self` prevents concurrent
+        // re-entry, so the previous drain is safely dropped on the next
+        // call. Replace `self.outbound` with a fresh scratch buffer the
+        // same way `poll_transmit` does so the next encode doesn't
+        // start from zero capacity.
+        let out = self.outbound.split().freeze();
+        self.outbound = BytesMut::with_capacity(4 * 1024);
+        // Wave 1.1: the `Contiguous` variant covers every path today —
+        // `outbound: BytesMut` is the single staging buffer the
+        // protocol writes into. Wave 1.2 introduces
+        // `self.outbound_segments: Vec<Bytes>` for the producer batch
+        // path and flips this between `Contiguous` and `Vectored`
+        // depending on which buffer carries the next-frame data.
+        crate::Transmit::Contiguous(&self.pending_vectored_drain.insert(out)[..])
     }
 
     /// Pull the next [`ConnectionEvent`], if any.
@@ -3424,6 +3444,52 @@ mod conn_state_tests {
         let mut buf = bytes::BytesMut::new();
         encode_command(&mut buf, &cmd).expect("encode CommandConnected");
         buf
+    }
+
+    #[test]
+    fn poll_transmit_vectored_matches_poll_transmit() {
+        // ADR-0039 wave 1.1: the new `Transmit<'_>` entry point must
+        // hand the runtime the same bytes the legacy `poll_transmit`
+        // path produces today. Wave 1.2 will start emitting `Vectored`
+        // for producer batches; until then `Contiguous` is the only
+        // variant produced and it must be byte-identical to the legacy
+        // `BytesMut::split().freeze()` payload.
+        let mut conn_a = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let mut conn_b = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Drive both connections through the same handshake so both
+        // outbound buffers carry an identical pending Connect frame.
+        conn_a.begin_handshake().expect("handshake a");
+        conn_b.begin_handshake().expect("handshake b");
+
+        let legacy = conn_a.poll_transmit();
+        let vectored = conn_b.poll_transmit_vectored();
+        match vectored {
+            crate::Transmit::Contiguous(slice) => {
+                assert_eq!(
+                    slice,
+                    &legacy[..],
+                    "poll_transmit_vectored::Contiguous must match poll_transmit bytes"
+                );
+                assert!(!slice.is_empty(), "handshake Connect frame is non-empty");
+            }
+            crate::Transmit::Vectored(_) => {
+                panic!("wave 1.1 must not emit Vectored — that is wave 1.2");
+            }
+        }
+        // Empty case: after the next round-trip with no queued ops,
+        // both entry points must report empty (poll_transmit returns an
+        // empty Bytes, poll_transmit_vectored returns an empty
+        // Contiguous slice).
+        let legacy_empty = conn_a.poll_transmit();
+        assert!(legacy_empty.is_empty());
+        let vectored_empty = conn_b.poll_transmit_vectored();
+        assert!(vectored_empty.is_empty());
     }
 
     #[test]
