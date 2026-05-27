@@ -1026,8 +1026,13 @@ impl<P: Providers> Client<P> {
         let receiver_queue_size = req.receiver_queue_size;
         // See `Client::open_producer`: subscribe also needs lookup-driven bundle
         // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`.
-        let _ = self.lookup_topic(&req.topic, false).await?;
-        let shared = self.shared().clone();
+        //
+        // ADR-0039: when the lookup answers `proxy_through_service_url = true`, the consumer
+        // rides on a pinned per-broker pool entry; otherwise it stays on the bootstrap
+        // connection (current behaviour).
+        let target = self.lookup_topic_target(&req.topic).await?;
+        let topic = req.topic.clone();
+        let shared = self.resolve_target(target, &topic).await?;
         let (handle, slot) = {
             let mut conn = shared.inner.lock();
             let handle = conn.subscribe(req);

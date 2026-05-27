@@ -537,9 +537,17 @@ impl<P: Providers> Client<P> {
         // `ServerError::ServiceNotReady` ("not served by this instance, please redo the
         // lookup"). Mirrors `magnetar-runtime-tokio`'s `Client::open_producer_with` and Java's
         // `PulsarClientImpl#createProducerAsync`.
-        let _ = self.lookup_topic(&req.topic, false).await?;
+        //
+        // ADR-0039: when the lookup answers `proxy_through_service_url = true`, the producer
+        // rides on a pinned per-broker pool entry; otherwise it stays on the bootstrap
+        // connection (current behaviour). The `Producer` keeps an `Arc<ConnectionShared>`
+        // pointing at whichever connection it was opened on so subsequent sends / closes go
+        // to the right socket.
+        let target = self.lookup_topic_target(&req.topic).await?;
+        let topic = req.topic.clone();
+        let target_shared = self.resolve_target(target, &topic).await?;
         let (handle, slot) = {
-            let mut conn = self.shared().inner.lock();
+            let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);
             let slot = conn
                 .producer(handle)
@@ -547,10 +555,10 @@ impl<P: Providers> Client<P> {
                 .expect("just-created producer slot must exist");
             (handle, slot)
         };
-        self.shared().driver_waker.notify_one();
-        wait_producer_ready(self.shared(), handle).await?;
+        target_shared.driver_waker.notify_one();
+        wait_producer_ready(&target_shared, handle).await?;
         Ok(Producer {
-            shared: self.shared().clone(),
+            shared: target_shared,
             handle,
             slot,
             compression,
