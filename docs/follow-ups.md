@@ -284,7 +284,7 @@ Status snapshot:
 | --- | --- | --- |
 | PIP-33 — Replicated subscriptions | 🟢 LIVE (Pulsar 2.4, 2019) | ✅ landed — see [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md) + [`docs/replicated-subscriptions.md`](replicated-subscriptions.md) |
 | PIP-180 — Shadow topic | 🟢 LIVE (Pulsar 2.11, 2023) | ✅ landed — see [ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md) + [`docs/shadow-topic.md`](shadow-topic.md) |
-| PIP-466 — V5 client surface | 🟠 DESIGN-PHASE (Java V5 still iterating; magnetar v0.2.0 surface is a v4-wire skin) | ⌛ unblocked — mirrors existing v4 e2e; `/goal` below |
+| PIP-466 — V5 client surface | 🟠 DESIGN-PHASE (Java V5 still iterating; magnetar v0.2.0 surface is a v4-wire skin) | 🟡 experimental scaffold landed (`feature = "experimental-v5-client"`, default off). Remaining work: per-builder type-level surface (today only the wrapper types + mapping module ship); 5 mapping tests × 2 engines + 3 e2e tests; `docs/v5-client.md`; ADR-0032 promotion to Accepted. |
 | PIP-460 — Scalable topics | 🔴 NOT LIVE (PIP `Draft`; targets Pulsar 5.0 LTS, Oct 2026; phased 4.3.0 / 4.4.0) | ⏸ blocked — needs `apachepulsar/pulsar:5.0.0-rc-*` |
 
 ### PIP-180 post-landing follow-ups

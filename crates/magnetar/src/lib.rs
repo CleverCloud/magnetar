@@ -129,6 +129,13 @@ mod crypto_bridge;
 #[cfg(all(feature = "tokio", feature = "encryption"))]
 pub use crypto_bridge::MessageCryptoBridge;
 
+/// **Experimental** — PIP-466 V5 client surface (ADR-0032). Behind
+/// `feature = "experimental-v5-client"` (default off). The wire
+/// protocol is unchanged; V5 wraps the v4 surface with `Duration`-typed
+/// timeouts and a Stream/Queue consumer split.
+#[cfg(feature = "experimental-v5-client")]
+pub mod v5;
+
 #[cfg(test)]
 mod tests {
     #[test]

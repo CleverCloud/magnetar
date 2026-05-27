@@ -44,6 +44,14 @@ e2e         = ["tokio", "admin"]
 # `.github/workflows/e2e-replicated-subs.yml`, never on per-PR CI.
 e2e-multi-cluster = ["e2e"]
 
+# PIP-466 V5 client surface (ADR-0032). Off by default — Java V5 is still
+# iterating upstream so magnetar ships the surface as experimental. The
+# V5 types are thin wrappers over v4 with `Duration`-typed timeouts and
+# explicit `Option<MessageId>` send returns; no wire change, no sans-io
+# change. Only meaningful when `tokio` is also enabled (the wrappers
+# delegate to the tokio Producer / Consumer surface).
+experimental-v5-client = ["tokio"]
+
 # --- Crypto provider features (issue #9, ADR-0035). Compile-time pluggable
 # rustls crypto backend. Under `--all-features` the cfg-priority cascade
 # resolves to aws-lc-rs (see `magnetar-runtime-{tokio,moonpool}/src/
