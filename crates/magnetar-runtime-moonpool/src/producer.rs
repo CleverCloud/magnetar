@@ -548,7 +548,7 @@ impl<P: Providers> Client<P> {
         // trait method returns `Pin<Box<dyn Future + Send>>` which would otherwise be
         // unsatisfiable on a generic `P`. Tracked as follow-up in ADR-0039.
         let target = self.lookup_topic_target(&req.topic).await?;
-        let target_shared = self.resolve_target(target, &req.topic)?;
+        let target_shared = self.resolve_target(&target, &req.topic)?;
         let (handle, slot) = {
             let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);

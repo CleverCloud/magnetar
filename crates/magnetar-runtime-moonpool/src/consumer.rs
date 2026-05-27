@@ -1030,7 +1030,7 @@ impl<P: Providers> Client<P> {
         // errors `ProxyUnsupportedOnUnsupervisedClient` on the proxy branch until the
         // pool's dial is moved onto a separately-spawned task.
         let target = self.lookup_topic_target(&req.topic).await?;
-        let shared = self.resolve_target(target, &req.topic)?;
+        let shared = self.resolve_target(&target, &req.topic)?;
         let (handle, slot) = {
             let mut conn = shared.inner.lock();
             let handle = conn.subscribe(req);

@@ -79,7 +79,7 @@ async fn spawn_proxy() -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
             };
             let sessions = sessions_for_task.clone();
             tokio::spawn(async move {
-                let _ = handle_session(stream, sessions, session_idx).await;
+                let _ = handle_session(stream, &sessions, session_idx).await;
             });
         }
     });
@@ -88,7 +88,7 @@ async fn spawn_proxy() -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
 
 async fn handle_session(
     mut stream: tokio::net::TcpStream,
-    sessions: Arc<Mutex<Vec<SessionRecord>>>,
+    sessions: &Arc<Mutex<Vec<SessionRecord>>>,
     session_idx: usize,
 ) -> std::io::Result<()> {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
@@ -111,8 +111,9 @@ async fn handle_session(
             // signal the bootstrap vs pinned distinction rides on.
             if matches!(typed, Some(pb::base_command::Type::Connect)) {
                 if let Some(c) = &frame.command.connect {
-                    sessions.lock()[session_idx].connect_proxy_to_broker_url =
-                        c.proxy_to_broker_url.clone();
+                    sessions.lock()[session_idx]
+                        .connect_proxy_to_broker_url
+                        .clone_from(&c.proxy_to_broker_url);
                 }
             } else {
                 sessions.lock()[session_idx].frames.push(kind);

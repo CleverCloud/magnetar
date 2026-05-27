@@ -315,7 +315,7 @@ impl<P: Providers> Client<P> {
     /// Production tokio paths use the tokio engine which does the routing end-to-end.
     pub(crate) fn resolve_target(
         &self,
-        target: LookupTarget,
+        target: &LookupTarget,
         topic: &str,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         match target {

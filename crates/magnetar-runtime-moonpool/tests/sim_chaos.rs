@@ -1543,8 +1543,9 @@ where
             let typed = pb::base_command::Type::try_from(kind).ok();
             if matches!(typed, Some(pb::base_command::Type::Connect)) {
                 if let Some(c) = &frame.command.connect {
-                    sessions.lock()[session_idx].connect_proxy_to_broker_url =
-                        c.proxy_to_broker_url.clone();
+                    sessions.lock()[session_idx]
+                        .connect_proxy_to_broker_url
+                        .clone_from(&c.proxy_to_broker_url);
                 }
             } else {
                 sessions.lock()[session_idx].frames.push(kind);
@@ -1697,8 +1698,7 @@ impl Workload for ProxyClientWorkload {
         let snapshot = self.sessions.lock().clone();
         let bootstrap_clean = snapshot
             .first()
-            .map(|s| s.connect_proxy_to_broker_url.is_none())
-            .unwrap_or(false);
+            .is_some_and(|s| s.connect_proxy_to_broker_url.is_none());
 
         if proxy_unsupported && bootstrap_clean {
             *self.success.lock() = true;
