@@ -95,8 +95,18 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 ### Open — cleanup and structural clarity
 
 - **`ProducerExt` trait, single impl** —
-  `crates/magnetar/src/client.rs::ProducerExt`. Inline as a direct
-  method on `magnetar_runtime_tokio::Producer`.
+  `crates/magnetar/src/client.rs::ProducerExt`. The original audit
+  suggested inlining as a direct method on
+  `magnetar_runtime_tokio::Producer`, but that requires moving
+  `MessageBuilder` + `OutgoingMessage` (currently in
+  `magnetar/src/client.rs`) **down** into `magnetar-runtime-tokio` —
+  which inverts the workspace dep graph (`magnetar-runtime-tokio` is
+  below `magnetar`). The trait sits where it sits to satisfy Rust's
+  orphan rule for the façade-defined `MessageBuilder` against the
+  runtime-defined `Producer`. Resolving cleanly needs a bigger split
+  decision (move `MessageBuilder` to a shared crate, or accept the
+  trait as the layering artefact). Documented for future
+  consideration, not actionable as a pure inline today.
 - **`ProducerBuilder<'a, E>` / `ConsumerBuilder<'a, E>` /
   `ReaderBuilder<'a, E>` are 95% tokio-bound** — phantom `E`
   parameter on builder methods that ignore it. Move the generic only
