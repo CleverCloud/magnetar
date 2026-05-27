@@ -116,11 +116,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — security hardening
 
-- **`AdminAuth::Token(String)` not redacted from `Debug`** —
-  `crates/magnetar-admin/src/lib.rs` — mirror the
-  `secrecy`/redacted-Debug pattern from
-  `crates/magnetar-auth-oauth2/src/lib.rs` (the OAuth2 access-token
-  Debug redaction).
 - **SASL PLAIN over plaintext** — no transport-security check in
   `crates/magnetar-auth-sasl/src/plain.rs`. Defensive: reject PLAIN
   when the client builder did not negotiate TLS.

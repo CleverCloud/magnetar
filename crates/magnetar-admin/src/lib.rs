@@ -56,7 +56,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// `Token(...)` adds `Authorization: Bearer <token>` to every request.
 /// Mirrors Java's `AuthenticationToken` provider.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum AdminAuth {
     /// No authentication.
     #[default]
@@ -64,6 +64,19 @@ pub enum AdminAuth {
     /// Bearer token. The string is the raw token; the `Bearer ` prefix is added
     /// at request time.
     Token(String),
+}
+
+impl std::fmt::Debug for AdminAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the token body so calling `Debug` on the admin client never
+        // spills the bearer credential to tracing or stdout. Mirrors the
+        // `Credentials`/`ClientCredentialsFlow` Debug redaction in
+        // `magnetar-auth-oauth2`.
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+        }
+    }
 }
 
 /// Apache Pulsar admin REST client.
@@ -786,6 +799,41 @@ mod tests {
             .build()
             .unwrap();
         assert!(matches!(client.auth(), AdminAuth::Token(t) if t == "abc"));
+    }
+
+    #[test]
+    fn admin_auth_token_debug_redacts_secret() {
+        let auth = AdminAuth::Token("super-secret-jwt".to_owned());
+        let rendered = format!("{auth:?}");
+        assert!(
+            !rendered.contains("super-secret-jwt"),
+            "raw token leaked through Debug: {rendered}",
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "expected redaction sentinel in {rendered}"
+        );
+        assert!(
+            rendered.contains("Token"),
+            "expected variant name in {rendered}"
+        );
+
+        let none_rendered = format!("{:?}", AdminAuth::None);
+        assert_eq!(none_rendered, "None");
+    }
+
+    #[test]
+    fn admin_client_debug_does_not_leak_token() {
+        let client = AdminClient::builder()
+            .service_url("http://localhost:8080".parse().unwrap())
+            .token("leaky-token".into())
+            .build()
+            .unwrap();
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains("leaky-token"),
+            "raw token leaked through AdminClient Debug: {rendered}",
+        );
     }
 
     #[test]
