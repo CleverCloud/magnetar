@@ -438,7 +438,16 @@ session that landed the above):**
      `v5::mapping` constants + edge cases (`Some(Duration::ZERO)` vs
      `None`, `Some(0)` vs `None`, `send_timeout` saturation).
 2. Same five files mirrored 1:1 under `SimulationBuilder` for the
-   moonpool engine.
+   moonpool engine — **blocked on item #6 (engine-genericity)**.
+   `PulsarClientV5` today wraps `PulsarClient<TokioEngine>` directly
+   (per ADR-0032); driving the V5 surface against
+   `MoonpoolEngine<P>` requires the engine-generic lift that
+   crosscuts the "Per-surface builder + impl-body lifts" work above.
+   Until then the wire-byte tests live at the magnetar façade tier
+   against a sans-io `magnetar_proto::Connection` (which IS
+   engine-agnostic — same proto state machine both engines use) so
+   the translation coverage is in place; what's missing is exercise
+   of the V5 surface through the moonpool **runtime** path.
 3. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
    `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"`
    parameterising existing e2e patterns against Pulsar 4.0.4 —
