@@ -1688,7 +1688,9 @@ impl Workload for ProxyClientWorkload {
         // is that the error path was hit, NOT that the multi-conn flow completed.
         let proxy_unsupported = matches!(
             open_res,
-            Ok(Err(magnetar_runtime_moonpool::ClientError::ProxyUnsupportedOnUnsupervisedClient { .. })),
+            Ok(Err(
+                magnetar_runtime_moonpool::ClientError::ProxyUnsupportedOnUnsupervisedClient { .. }
+            )),
         );
         // Bootstrap session should be observed with `proxy_to_broker_url = None` (no
         // pinned session because we didn't open one).

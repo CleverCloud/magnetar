@@ -19,10 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use magnetar_proto::ConnectionConfig;
-use moonpool_core::Providers;
+use moonpool_core::{NetworkProvider, Providers};
 use parking_lot::Mutex;
-
-use moonpool_core::NetworkProvider;
 
 use crate::dns::DnsResolver;
 use crate::driver::{DriverHandle, ReconnectContext, spawn_supervised as spawn_supervised_driver};
