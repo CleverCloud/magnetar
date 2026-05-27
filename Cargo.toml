@@ -98,7 +98,7 @@ aws-lc-rs  = { version = "1", default-features = false, features = ["aws-lc-sys"
 # (libkrb5 / Heimdal). Only opted-in by `magnetar-auth-sasl` under its
 # `kerberos` feature; downstream crates stay free of `libkrb5` link
 # requirements on hosts that don't enable Kerberos. See ADR-0029.
-libgssapi  = { version = "0.7", default-features = false }
+libgssapi  = { version = "0.9", default-features = false }
 
 # moonpool engine
 moonpool-core = "=0.6"
