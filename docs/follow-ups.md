@@ -32,18 +32,16 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | # | Item | Status |
 | - | --- | --- |
 | 1 | [Moonpool vectored I/O](#1-moonpool-vectored-io) | 🔗 [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) |
-| 2 | [Builder phantom-`E` cleanup](#2-builder-phantom-e-cleanup) | ⚡ |
-| 3 | [Per-surface builder + impl-body lifts (partitioned-producer / table-view)](#3-per-surface-builder--impl-body-lifts) | ⚡ |
-| 4 | [V5 engine-genericity (PIP-466 promotion)](#4-v5-engine-genericity-pip-466-promotion) | ⚡ (cross-cuts #3) |
-| 5 | [Athenz concrete `JwtSigner`](#5-athenz-concrete-jwtsigner) | 🧠 |
-| 6 | [Athenz ZTS e2e fixture](#6-athenz-zts-e2e-fixture) | 🔗 (needs #5) |
-| 7 | [PIP-180 replicator-side e2e](#7-pip-180-replicator-side-e2e) | 🔗 (Pulsar 4.x replicator fixture) |
-| 8 | [PIP-460 scalable topics](#8-pip-460-scalable-topics) | ⏳ (Pulsar 5.0 RC) |
-| 9 | [Moonpool transport TLS + supervised-loop coverage](#9-moonpool-transport-tls--supervised-loop-coverage) | ⚡ |
-| 10 | [Golden trace catalog — transactional ack + cryptoFailureAction](#10-golden-trace-catalog-extension) | ⚡ (partial) |
-| 11 | [Moonpool runner `LocalSet` pump](#11-moonpool-runner-localset-pump) | 🟡 (deferred — closed by future moonpool-sim integration) |
-| 12 | [`engine.rs` split](#12-enginers-split) | 🟡 (deferred until file is uncomfortably wide) |
-| 13 | [`ProducerExt` trait inline](#13-producerext-trait-inline) | 🧠 (needs layering decision) |
+| 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ⚡ |
+| 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ⚡ |
+| 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | 🔗 (needs #3) |
+| 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
+| 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
+| 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ⚡ |
+| 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (partial) |
+| 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | ⚡ |
+| 10 | [`engine.rs` split](#10-enginers-split) | ⚡ |
+| 11 | [`ProducerExt` trait inline — DECISION: accept as layering artefact](#11-producerext-trait-inline) | ✅ decided (doc-only) |
 
 ---
 
@@ -78,86 +76,70 @@ our side).
 
 ---
 
-## 2. Builder phantom-`E` cleanup
+## 2. Engine-generic builder & V5 unified lift
 
-**Gap.** `crates/magnetar/src/builders.rs` —
-`ProducerBuilder<'a, E: Engine>`, `ConsumerBuilder<'a, E: Engine>`,
-`ReaderBuilder<'a, E: Engine>` carry the engine generic on every
-method even though the inherent impl bodies are 95% tokio-bound
-(direct `magnetar_runtime_tokio::MessageEncryptor` /
-`MessageDecryptor` references). The generic only matters at the
-final `.create()` / `.subscribe()` dispatch — through the
-`CreateProducerApi` / `SubscribeApi` / `ReaderApi` extension
-traits — but the noise is on every chainable method.
+**Gap (combined — replaces former §2 + §3 + §4).** The v4 builders
+(`ProducerBuilder`, `ConsumerBuilder`, `ReaderBuilder` in
+`crates/magnetar/src/builders.rs`) carry a phantom `E: Engine` on
+every chainable method even though the impl bodies are 95% tokio-
+bound. The per-surface builders
+(`PartitionedProducerBuilder`, `TableViewBuilder`,
+`TypedTableViewBuilder` in `partitioned_producer.rs`,
+`table_view.rs`) reference tokio-only types directly
+(`Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`,
+`magnetar_runtime_tokio::MessageDecryptor`). The V5 wrapper
+(`PulsarClientV5`) hard-wires `PulsarClient<TokioEngine>` because
+of those leaks, which blocks the moonpool 1:1 mirror of the 5 V5
+mapping tests and ADR-0032's promotion to Accepted.
 
-**Why it stays open.** Move the generic only to dispatch is a
-breaking API change (every caller that named the builder type loses
-the parameter). Crate is not yet published — breaking is acceptable
-— but needed a green light. Florentin has given it.
+All three problems share one root: the `MessageEncryptor` /
+`MessageDecryptor` / `MessageRouter` types are tokio-defined. Lift
+them to per-engine extension traits and every dependent surface
+becomes engine-generic for free.
 
-**`/goal`.**
-
-```text
-/goal land the builder phantom-E cleanup per docs/follow-ups.md §2. In crates/magnetar/src/builders.rs: introduce two builder types per surface — a non-generic chainable form (`ProducerBuilder<'a>`, `ConsumerBuilder<'a>`, `ReaderBuilder<'a>`) that holds the v4 `CreateProducerRequest` / `SubscribeRequest` and any tokio-specific fields (encryptor / decryptor / router), and a generic dispatch form (`ProducerBuilderE<'a, E: Engine>` or similar) that the final `.create()` / `.subscribe()` consumes. Replace every public method that returned `Self` with the non-generic form. Keep the `E`-generic only on `pub async fn create()` / `pub async fn subscribe()` and route through the existing `CreateProducerApi` / `SubscribeApi` / `ReaderApi` extension traits. Update `crates/magnetar/src/client.rs::PulsarClient::producer/consumer/reader` to return the non-generic builder. Run the full validation chain per CLAUDE.md (cargo +nightly fmt, build, clippy -D warnings, test, xtask check-runtime-test-parity, check-no-channels, check-no-io-deps, check-no-internal-clock). Test layers per ADR-0024: extend the existing tokio + moonpool builder integration tests (or add per-builder type-shape tests if missing) to confirm the new shape compiles against both engines. Update docs/v5-client.md mapping table examples if the surface change touches them. BREAKING CHANGE: ProducerBuilder/ConsumerBuilder/ReaderBuilder no longer carry an Engine type parameter on chained methods; the parameter moves to .create()/.subscribe() dispatch.
-```
-
----
-
-## 3. Per-surface builder + impl-body lifts
-
-**Gap.** `PulsarClient::partitioned_producer(...)`,
-`PulsarClient::table_view(...)`,
-`PulsarClient::typed_table_view(...)` still live in
-`impl PulsarClient<TokioEngine>` rather than the engine-generic
-block. The inner builder types
-(`PartitionedProducerBuilder<'a>`, `TableViewBuilder<'a>`,
-`TypedTableViewBuilder<'a, S>`) reference tokio-only types directly
-(`Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` on the
-partitioned-producer builder,
-`magnetar_runtime_tokio::MessageDecryptor` on the table-view
-builder). See `crates/magnetar/src/partitioned_producer.rs:716`,
-`crates/magnetar/src/table_view.rs:333,763`.
-
-**Why it stays open.** Lifting these surfaces requires abstracting
-`MessageEncryptor` / `MessageDecryptor` / `MessageRouter` /
-broker-metadata lookup behind per-engine extension traits — same
-pattern §2 uses for the core builders. Cross-cuts §2; should land
-in the same wave if possible.
+**Decision (Florentin, this session).** Land all three as ONE PR.
+Breaking API change accepted (crate unpublished).
 
 **`/goal`.**
 
 ```text
-/goal lift PulsarClient::{partitioned_producer, table_view, typed_table_view} to the engine-generic impl block per docs/follow-ups.md §3 (ADR-0026 §D1 completion). Sub-steps in order: (1) Add per-engine extension traits in crates/magnetar/src/engine.rs (or a new traits module) for the tokio-only types currently leaking — `MessageEncryptorApi`, `MessageDecryptorApi`, `MessageRouterApi`, `PartitionedTopicMetadataApi`. Each carries the associated types the v4 builders need. (2) Make PartitionedProducerBuilder<'a, E: Engine> carry the Encryptor / Router types via those traits. (3) Same for TableViewBuilder<'a, E: Engine> / TypedTableViewBuilder<'a, E: Engine, S> (Decryptor + broker-metadata). (4) Route every internal `.consumer(...)` / `.producer(...)` plumbing through the engine-generic `SubscribeApi` / `CreateProducerApi` traits. (5) Lift the three entry-point methods to `impl<E: Engine> PulsarClient<E>`. Test layers per ADR-0024 — the lift is a pure delegate so existing tokio integration tests should pass unchanged; runtime parity stays at the pre-lift count (tokio=moonpool). Validation chain per CLAUDE.md. Coordinate landing with §2 (builder phantom-E) if both are in flight — same builder.rs touch points. BREAKING CHANGE: PartitionedProducerBuilder/TableViewBuilder/TypedTableViewBuilder gain an `E: Engine` type parameter and the v4 tokio-typed fields move behind per-engine API traits.
+/goal land the unified engine-genericity refactor per docs/follow-ups.md §2 — combines what used to be §2 (builder phantom-E cleanup), §3 (per-surface builder lifts: partitioned_producer / table_view / typed_table_view), and §4 (V5 engine-genericity for PIP-466 promotion) into one PR. The shared scaffolding is per-engine extension traits for `MessageEncryptor` / `MessageDecryptor` / `MessageRouter` / partitioned-topic-metadata lookup.
+
+WAVE 1 — extension trait scaffolding
+1. Add `MessageEncryptorApi`, `MessageDecryptorApi`, `MessageRouterApi`, `PartitionedTopicMetadataApi` to crates/magnetar/src/engine.rs (or a new `crates/magnetar/src/engine/api.rs` if the file is already wide). Each carries the associated types the v4 builders need (Encryptor, Decryptor, Router, metadata fetcher).
+2. Impl the traits on `TokioEngine` in crates/magnetar/src/engine.rs (or sibling) so the existing tokio surface compiles against the trait shapes.
+3. Add a no-op / unimplemented impl on `MoonpoolEngine<P>` for the encryption types if real moonpool encryption is out of scope — gate the unimplemented paths behind `#[cfg(feature = "encryption")]` so feature-off builds compile cleanly. broker-metadata lookup MUST have a real moonpool impl because partitioned producer needs it.
+
+WAVE 2 — v4 builder lift (former §2 + §3)
+4. crates/magnetar/src/builders.rs: drop the `<E: Engine>` parameter from `ProducerBuilder<'a>` / `ConsumerBuilder<'a>` / `ReaderBuilder<'a>` chainable surface. Move the `E` only to the final `.create()` / `.subscribe()` dispatch via the existing `CreateProducerApi` / `SubscribeApi` / `ReaderApi` extension traits. Store the per-engine `Encryptor` / `Decryptor` / `Router` behind the new per-engine API traits, not the tokio-concrete types.
+5. crates/magnetar/src/partitioned_producer.rs + crates/magnetar/src/table_view.rs: same lift for `PartitionedProducerBuilder<'a, E: Engine>` / `TableViewBuilder<'a, E: Engine>` / `TypedTableViewBuilder<'a, E: Engine, S>`. They DO carry the engine parameter (they need the per-engine API traits for the inner builds).
+6. Lift `PulsarClient::partitioned_producer/.table_view/.typed_table_view` from `impl PulsarClient<TokioEngine>` to `impl<E: Engine> PulsarClient<E>`.
+7. crates/magnetar/src/client.rs: update `producer/consumer/reader` entry points to return the new non-generic chainable builders.
+
+WAVE 3 — V5 lift (former §4)
+8. crates/magnetar/src/v5/client.rs: `PulsarClientV5<E: Engine>` (parametric). Replace `pub struct PulsarClientV5 { inner: PulsarClient }` with `pub struct PulsarClientV5<E: Engine = TokioEngine> { inner: PulsarClient<E> }`. Same for v5/producer.rs / v5/stream_consumer.rs / v5/queue_consumer.rs and their builder types — parametrise by `<E>`.
+9. Keep the `.v4()` / `.into_v4()` / `.from_v4(...)` escape hatch contract zero-overhead.
+10. Add moonpool 1:1 mirrors of the existing 5 V5 mapping/wire tests under crates/magnetar-runtime-moonpool/tests/v5_*_moonpool.rs. Each exercises the V5 surface against `MoonpoolEngine<TokioProviders>` + `SimulationBuilder` (or against a sans-io `Connection` via `magnetar_fakes::FrameRecorder` for parity with the magnetar-tier tests).
+11. Flip specs/adr/0032-pip-466-v5-client-surface-scope.md Status from Proposed → Accepted; update specs/README.md ADR index.
+12. Update README.md PIP-466 parity matrix row from 🟡 experimental → ✅ (the `experimental-v5-client` feature can stay default-off; the ADR-0032 acceptance is what flips the matrix).
+13. Update docs/v5-client.md "Roadmap" section: mark items #1, #4, #5 as landed.
+
+TEST LAYERS per ADR-0024 — all binding:
+- (a) `magnetar-proto` unchanged (no proto-layer change; sans-io stays sans-io).
+- (b) crates/magnetar-runtime-tokio/tests/ — verify the existing tokio integration tests still pass; the lift is a pure delegate.
+- (c) crates/magnetar-runtime-moonpool/tests/ — runtime parity test count stays at tokio=moonpool. Add per-builder shape tests if the new generic surface needs explicit type-shape pinning.
+- (d) crates/magnetar-differential/ — no new traces needed (no wire-format change); existing equivalence tests stay green.
+
+VALIDATION CHAIN per CLAUDE.md (full chain — cargo +nightly fmt, build, clippy -D warnings, test, xtask check-no-channels / check-no-io-deps / check-no-internal-clock / check-runtime-test-parity / check-sim-coverage / check-crypto-matrix). Run docs build with RUSTDOCFLAGS="-D warnings --cfg tokio_unstable".
+
+BREAKING CHANGE in the commit body: ProducerBuilder/ConsumerBuilder/ReaderBuilder drop the Engine type parameter from chainable methods; PartitionedProducerBuilder/TableViewBuilder/TypedTableViewBuilder gain an `E: Engine` parameter; PulsarClientV5 gains an `E: Engine` parameter (defaulting to TokioEngine to preserve most call sites); MessageEncryptor/MessageDecryptor/MessageRouter types move behind per-engine extension traits (callers that imported them from magnetar_runtime_tokio must switch to the trait-based API).
+
+Land in a single PR — partial landings would leave the API in an inconsistent state across surfaces.
 ```
 
 ---
 
-## 4. V5 engine-genericity (PIP-466 promotion)
-
-**Gap.** `PulsarClientV5` wraps `PulsarClient<TokioEngine>` directly
-per ADR-0032; the V5 surface cannot drive `MoonpoolEngine<P>`. This
-blocks two PIP-466 remaining-work items:
-
-- The V5 moonpool-side test mirror (the 5 V5 mapping/wire test files
-  live at the magnetar tier against a sans-io `Connection` today —
-  engine-agnostic by construction — but moonpool exercise of the V5
-  surface needs the engine-generic lift).
-- ADR-0032 promotion from Proposed → Accepted (gated on the moonpool
-  mirror landing per the ADR's own acceptance criteria).
-
-**Why it stays open.** Same `MessageEncryptor` / `MessageDecryptor`
-/ `MessageRouter` engine-generic lift that §3 needs. The V5 surface
-inherits engine-genericity once the v4 builders gain it.
-
-**`/goal`.**
-
-```text
-/goal parametrise PulsarClientV5 (and the v5::producer / v5::stream_consumer / v5::queue_consumer wrappers) by `<E: Engine>` once §3 (per-surface builder + impl-body lifts) has landed the engine-generic v4 builders. Wrap the engine-generic v4 client in PulsarClientV5<E> (replace today's PulsarClientV5 { inner: PulsarClient }). Keep the `into_v4()` / `v4()` escape hatch contract — pin it with a new test in crates/magnetar/tests/v5_client_v4_escape_hatch.rs that asserts mem::size_of::<PulsarClientV5<E>>() == mem::size_of::<PulsarClient<E>>() for both E=TokioEngine and E=MoonpoolEngine<TokioProviders>. Add the moonpool 1:1 mirror of the 5 V5 mapping/wire test files under crates/magnetar-runtime-moonpool/tests/v5_*_moonpool.rs — each exercises the V5 surface against the moonpool engine + SimulationBuilder and asserts the same wire byte shape the magnetar-tier tests do. Flip ADR-0032 status from Proposed → Accepted in specs/adr/0032-pip-466-v5-client-surface-scope.md once the moonpool mirror is green and `cargo run -p xtask -- check-crypto-matrix` (× V5 axis) passes. Update specs/README.md ADR index. Update README.md parity matrix row for PIP-466 from 🟡 experimental to ✅ default-on (or ✅ experimental if the experimental-v5-client feature stays default-off). Update docs/v5-client.md "Roadmap" section to mark items #1, #4, #5 as landed. Validation chain per CLAUDE.md (including the V5-feature build matrix). BREAKING CHANGE: PulsarClientV5 gains an `E: Engine` type parameter.
-```
-
----
-
-## 5. Athenz concrete `JwtSigner`
+## 3. Athenz concrete `JwtSigner`
 
 **Gap.** `crates/magnetar-auth-athenz/src/zts.rs` ships the
 `ZtsClient` + `JwtSigner` trait, but no concrete signer
@@ -166,45 +148,80 @@ at 🟡 — callers either supply their own signer (documented external
 pattern using `with_role_token` + sidecar mint) or the feature is
 unusable end-to-end.
 
-**Why it stays open.** Crypto-crate choice is downstream-policy-
-dependent: jsonwebtoken (ergonomic but pulls a fresh dep tree),
-aws-lc-rs (matches ADR-0035's default crypto provider, FIPS-friendly),
-ring (familiar shape, no FIPS path), HSM-backed (out-of-process via
-PKCS#11 — heaviest). Florentin's call.
-
 ADR-0030 also defers the parsed-key `zeroize::Zeroizing<…>` wrap
 here because the parsed RSA key only materialises once a concrete
 signer exists.
 
-**Needs decision.** Which crypto crate(s) to support, default vs
-optional, FIPS posture.
+**Decision (Florentin, this session).** Implement BOTH `aws-lc-rs`
+and `ring` backends, gated on the workspace crypto-provider feature
+matrix per [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md):
+`crypto-aws-lc-rs` selects the aws-lc-rs signer (FIPS-capable path),
+`crypto-ring` selects the ring signer. Mirrors the rustls
+crypto-provider selection so the workspace stays consistent.
 
-**`/goal` (post-decision).**
+**`/goal`.**
 
 ```text
-/goal land the concrete Athenz JwtSigner per docs/follow-ups.md §5 using <CRYPTO-CRATE — to be filled in from §5 decision>. Implementation in crates/magnetar-auth-athenz/src/zts.rs::<NewSignerType> (or sibling module): parse the PEM RSA key once at construction, wrap the parsed key in zeroize::Zeroizing<…> (closes ADR-0030 deferral), implement `impl JwtSigner for <NewSignerType>` with the JWS RS256 / ES256 signing the Athenz ZTS spec requires (RFC 7519 + Athenz N-tokens-as-JWT). Sign-on construction or on-demand per signer construction parameter. Test layers per ADR-0024: (a) magnetar-auth-athenz unit tests covering the signer round-trip (sign + decode via the same crate, assert iss/sub/aud/exp); (b)/(c) the existing static-signer integration tests stay; (d) optional differential — the JWT bytes are deterministic given a fixed key + fixed timestamp, so a frozen wall_clock makes the assertion stable across engines. If the chosen crate has FIPS implications, wire it behind a new `crypto-<provider>` feature on magnetar-auth-athenz mirroring the ADR-0035 pattern. Update docs/parity-status.md Athenz row from 🟡 to ✅, README parity matrix row, flip ADR-0030 deferral note in specs/adr/0030-athenz-private-key-zeroize-deferral.md. Validation chain per CLAUDE.md.
+/goal land the concrete Athenz JwtSigner per docs/follow-ups.md §3 — ship BOTH `aws-lc-rs` and `ring` backends, gated on the workspace crypto-provider feature matrix per ADR-0035 (mirrors the rustls provider selection so the whole workspace stays consistent).
+
+Module layout:
+- crates/magnetar-auth-athenz/src/jwt_signer/mod.rs (NEW) — re-export the active backend behind cfg gates.
+- crates/magnetar-auth-athenz/src/jwt_signer/aws_lc_rs.rs (NEW) — `pub struct AwsLcRsSigner`, gated `#[cfg(feature = "crypto-aws-lc-rs")]`.
+- crates/magnetar-auth-athenz/src/jwt_signer/ring.rs (NEW) — `pub struct RingSigner`, gated `#[cfg(feature = "crypto-ring")]`.
+
+Implementation per backend:
+1. Constructor parses the PEM RSA key once; wraps the parsed key in `zeroize::Zeroizing<…>` (closes ADR-0030 deferral).
+2. `impl JwtSigner for <Backend>Signer` — sign the JWS header + payload per Athenz N-token spec (RFC 7519 base64url segments; RS256 default, ES256 if the key is EC). The Athenz ZTS spec is at https://github.com/AthenZ/athenz/blob/master/docs/zts_api.md — match the existing `zts::ZtsClient` token-exchange flow.
+3. The two backends produce byte-identical signature bytes for the same key + payload + timestamp (deterministic when wall_clock is frozen).
+
+Features on `crates/magnetar-auth-athenz/Cargo.toml`:
+- `crypto-aws-lc-rs = ["dep:aws-lc-rs"]`
+- `crypto-ring = ["dep:ring"]`
+- Default: neither (preserves today's "ship the trait, downstream picks the signer" stance).
+- Mutually-exclusive runtime check (if both enabled, prefer aws-lc-rs and `#[deprecated]` note on the ring path) OR compile_error! via const assertion — pick the one matching ADR-0035's pattern in magnetar-proto's crypto feature handling.
+
+Wire the backend into AthenzProvider via a new constructor `AthenzProvider::with_default_signer(config) -> Self` that selects the cfg-active backend; falls back to `with_role_token` documentation if neither feature is on.
+
+Test layers per ADR-0024:
+- (a) crates/magnetar-auth-athenz/src/jwt_signer/aws_lc_rs.rs `#[cfg(test)] mod tests` — round-trip the signed JWT through the same crate's verify path; assert iss/sub/aud/exp; assert deterministic signature with frozen wall_clock; assert the Zeroizing wrap is correctly applied (Drop check via a stand-in type or a comment-pin to a `#[deny(unused_must_use)]` proxy).
+- Same shape for crates/magnetar-auth-athenz/src/jwt_signer/ring.rs.
+- (b)/(c) Existing static-signer integration tests stay; no runtime-layer change.
+- (d) Differential — the JWT bytes are deterministic given a fixed key + fixed timestamp; a frozen wall_clock makes the assertion stable across engines. Optional new differential test if there's appetite; not load-bearing because Athenz lives above the proto layer.
+
+Build matrix:
+- Update xtask `check-crypto-matrix` to include the Athenz crate's two crypto features in the cartesian product (verifies neither / aws-lc-rs / ring / both builds cleanly).
+
+Docs:
+- Update docs/parity-status.md Athenz row from 🟡 to ✅.
+- Update README parity matrix row for Athenz.
+- Update specs/adr/0030-athenz-private-key-zeroize-deferral.md — flip the deferral note to "closed by the concrete signer landing".
+- New section in docs/auth.md (or NEW docs/athenz.md if no auth doc exists yet) explaining the crypto-provider matching choice.
+
+Validation chain per CLAUDE.md.
+
+BREAKING CHANGE: `magnetar-auth-athenz` gains `crypto-aws-lc-rs` / `crypto-ring` mutually-exclusive features; callers wanting the new built-in signer must enable one of them. Existing `with_role_token` / `AthenzProvider::new` paths unchanged.
 ```
 
 ---
 
-## 6. Athenz ZTS e2e fixture
+## 4. Athenz ZTS e2e fixture
 
 **Gap.** No end-to-end test exercises the Athenz ZTS round-trip
 against a real ZTS server. Tests today are unit-level against the
 `zts::ZtsClient` + a static `JwtSigner` mock.
 
-**Why it stays open.** Blocked on §5 (a real signer) and on the
+**Why it stays open.** Blocked on §3 (a real signer) and on the
 Dockerised ZTS fixture image (`athenz/athenz-zts-server`).
 
-**`/goal` (post-§5).**
+**`/goal` (post-§3).**
 
 ```text
-/goal stand up the Athenz ZTS e2e fixture per docs/follow-ups.md §6. Add the `athenz/athenz-zts-server` Docker image as a testcontainers-rs spawn under crates/magnetar/tests/e2e_athenz_zts.rs (NEW), gated `feature = "e2e,auth-athenz-zts"` and `#[ignore = "e2e: requires Docker"]`. Tests: (1) ZtsClient::refresh_via_zts → cached role token returned by initial(); (2) cached token's expiry-aware refresh fires when expiry approaches; (3) the cached token is used in a subsequent AuthProvider::respond_to_challenge round-trip (mock challenge). Pre-seed the fixture with a tenant principal + role binding via the ZTS admin API on container startup. Use the §5-landed concrete JwtSigner. Validation chain per CLAUDE.md. Update docs/parity-status.md.
+/goal stand up the Athenz ZTS e2e fixture per docs/follow-ups.md §4. Add the `athenz/athenz-zts-server` Docker image as a testcontainers-rs spawn under crates/magnetar/tests/e2e_athenz_zts.rs (NEW), gated `feature = "e2e,auth-athenz-zts"` and `#[ignore = "e2e: requires Docker"]`. Tests: (1) ZtsClient::refresh_via_zts → cached role token returned by initial(); (2) cached token's expiry-aware refresh fires when expiry approaches; (3) the cached token is used in a subsequent AuthProvider::respond_to_challenge round-trip (mock challenge). Pre-seed the fixture with a tenant principal + role binding via the ZTS admin API on container startup. Use the §3-landed concrete JwtSigner (either backend — aws-lc-rs or ring — gated behind whichever crypto-provider feature the test runs with). Validation chain per CLAUDE.md. Update docs/parity-status.md.
 ```
 
 ---
 
-## 7. PIP-180 replicator-side e2e
+## 5. PIP-180 replicator-side e2e
 
 **Gap.** `crates/magnetar/tests/e2e_shadow_topic.rs` exercises the
 admin REST cycle + a regular produce-on-source / consume-on-shadow
@@ -215,19 +232,38 @@ Pulsar 4.x, the broker's authorisation flow may reject a
 client-asserted source id that doesn't match a registered
 replicator producer.
 
-**Why it stays open.** Needs a Pulsar 4.x cluster with a registered
-replicator role — not something the testcontainers single-broker
-setup gives us out of the box.
+**Decision (Florentin, this session).** Build the self-hosting
+fixture as part of the test: a 2-cluster Pulsar standalone in
+testcontainers-rs with a custom auth config registering a
+`replicator` role on the source namespace. No external dependency.
 
-**`/goal` (when fixture is available).**
+**`/goal`.**
 
 ```text
-/goal add the PIP-180 replicator-side e2e assertion per docs/follow-ups.md §7. Extend crates/magnetar/tests/e2e_shadow_topic.rs (or a new e2e_shadow_topic_replicator.rs) gated `feature = "e2e"` with an `#[ignore = "e2e: requires Pulsar 4.x with registered replicator role"]` test that: (1) bootstraps a Pulsar standalone with a custom auth config registering a "replicator" role on the source namespace; (2) opens a producer authenticated as that role; (3) calls send_with_source_message_id with a synthetic source MessageId; (4) consumes on the shadow topic and asserts the source id round-trips intact. Document the broker setup in docs/shadow-topic.md under a new "Replicator-role e2e setup" section. Validation chain per CLAUDE.md.
+/goal add the PIP-180 replicator-side e2e assertion per docs/follow-ups.md §5 with a self-hosting 2-cluster fixture (no external broker dependency).
+
+Test infrastructure (NEW under crates/magnetar/tests/):
+- e2e_shadow_topic_replicator.rs (NEW), gated `feature = "e2e"`, `#[ignore = "e2e: requires Docker"]`.
+- Helper: `start_pulsar_two_cluster_with_replicator_role()` in a shared test-helper module under crates/magnetar/tests/common/ (NEW if no such directory exists in magnetar/tests/) that:
+  1. Spins up TWO `apachepulsar/pulsar:4.0.4` standalone containers via testcontainers-rs, on separate networks.
+  2. Configures the source cluster's broker.conf with `authenticationEnabled=true`, `authenticationProviders=org.apache.pulsar.broker.authentication.AuthenticationProviderToken`, and a token-secret-key seeded with a deterministic test secret.
+  3. Configures the source cluster's namespace-policy to register `replicator` as a recognised role on `public/default` (via `pulsar-admin namespaces grant-permission public/default --role replicator --actions produce`).
+  4. Returns `(source_service_url, source_admin_url, dest_service_url, dest_admin_url, source_container, dest_container)`.
+
+Test cases:
+1. `e2e_v4_replicator_role_can_assert_source_message_id` — open a producer authenticated as `replicator` against the source cluster; call `producer.send_with_source_message_id(payload, synthetic_source_id)` (the existing PIP-180 entry); subscribe via the consumer on a shadow topic of the SAME cluster (PIP-180's `MessageReceivedFromShadow` semantics on the shadow topic, not the source); assert the received message's `replicated_from` field carries the synthetic source id verbatim.
+2. `e2e_v4_non_replicator_role_send_with_source_id_is_rejected` — repeat with a non-replicator-role token; assert the broker rejects with the expected `AuthorizationException` (negative test pins the broker contract).
+
+Documentation:
+- docs/shadow-topic.md: NEW section "Replicator-role e2e setup" describing the 2-cluster + role-grant fixture and pointing at the test file as the executable reference.
+- docs/parity-status.md: PIP-180 row gets a footnote that the replicator-side e2e is exercised by `e2e_shadow_topic_replicator.rs` (self-hosting fixture).
+
+Validation chain per CLAUDE.md (the `#[ignore]` keeps it out of the default test run; `cargo test --features e2e -- --include-ignored` exercises it).
 ```
 
 ---
 
-## 8. PIP-460 scalable topics
+## 6. PIP-460 scalable topics scaffold
 
 **Gap.** PIP-460 surface entirely. Wire-protocol delta is
 significant (3 new commands + optional `MessageId.segment_id`); the
@@ -254,7 +290,7 @@ the 4-layer in-process tests are the binding acceptance gate.
 
 ---
 
-## 9. Moonpool transport TLS + supervised-loop coverage
+## 7. Moonpool transport TLS + supervised-loop coverage
 
 **Gap.** Per-file coverage on the moonpool runtime:
 
@@ -279,12 +315,12 @@ but not architecturally blocked.
 **`/goal`.**
 
 ```text
-/goal close the residual moonpool transport TLS + driver supervised-loop coverage hunks per docs/follow-ups.md §9. Stand up an in-process rustls-enabled broker fixture (self-signed cert + `RustlsByteAdapter` peer driver) under crates/magnetar-runtime-moonpool/tests/, then add targeted tests that exercise `Transport::connect_tls`, `tls_handshake`, the TLS variants of `read_buf` / `write_all` / `flush`, and `Transport::shutdown`. Pair each new moonpool test with a same-named tokio counterpart (the tokio path is already covered via tls_handshake_chaos.rs; the mirror may be a Debug / fmt smoke if the surface is engine-private). Optionally close the remaining `driver.rs` `supervised_driver_loop` lines via a synthetic peer that drops the socket between handshakes. Validation chain per CLAUDE.md.
+/goal close the residual moonpool transport TLS + driver supervised-loop coverage hunks per docs/follow-ups.md §7. Stand up an in-process rustls-enabled broker fixture (self-signed cert + `RustlsByteAdapter` peer driver) under crates/magnetar-runtime-moonpool/tests/, then add targeted tests that exercise `Transport::connect_tls`, `tls_handshake`, the TLS variants of `read_buf` / `write_all` / `flush`, and `Transport::shutdown`. Pair each new moonpool test with a same-named tokio counterpart (the tokio path is already covered via tls_handshake_chaos.rs; the mirror may be a Debug / fmt smoke if the surface is engine-private). Optionally close the remaining `driver.rs` `supervised_driver_loop` lines via a synthetic peer that drops the socket between handshakes. Validation chain per CLAUDE.md.
 ```
 
 ---
 
-## 10. Golden trace catalog extension
+## 8. Golden trace catalog extension
 
 **Gap.** The differential harness ships seven golden traces
 (round-trip, batch, nack-redelivery, seek-to-start, many-publishes,
@@ -298,18 +334,18 @@ lookup-before-open, seek-per-partition). Missing:
 **`/goal` (transactional ack — actionable now).**
 
 ```text
-/goal add the transactional-ack golden trace per docs/follow-ups.md §10. Extend crates/magnetar-differential/src/scripted_broker.rs to handle `CommandEndTxn` (with per-txn ack ledger keyed by `TxnId`) and `CommandAck` carrying a `txn_id`. New trace at crates/magnetar-differential/tests/golden/txn_ack.json exercises: NewTxn → produce + ack-within-txn × N → CommandEndTxn(commit) → assert ledger drained. Mirror via crates/magnetar-differential/tests/golden_traces.rs::run_txn_ack_trace (tokio + moonpool both). Validation chain per CLAUDE.md.
+/goal add the transactional-ack golden trace per docs/follow-ups.md §8. Extend crates/magnetar-differential/src/scripted_broker.rs to handle `CommandEndTxn` (with per-txn ack ledger keyed by `TxnId`) and `CommandAck` carrying a `txn_id`. New trace at crates/magnetar-differential/tests/golden/txn_ack.json exercises: NewTxn → produce + ack-within-txn × N → CommandEndTxn(commit) → assert ledger drained. Mirror via crates/magnetar-differential/tests/golden_traces.rs::run_txn_ack_trace (tokio + moonpool both). Validation chain per CLAUDE.md.
 ```
 
 **`/goal` (cryptoFailureAction — blocked on crypto bridge port).**
 
 ```text
-/goal add the cryptoFailureAction matrix golden trace per docs/follow-ups.md §10 — DEPENDS on porting the PIP-4 message crypto bridge (currently in magnetar-messagecrypto + magnetar-runtime-tokio) to the moonpool runtime first. Once the moonpool MessageEncryptor/Decryptor are in place, extend the scripted broker to deliver a payload with intentionally-corrupt ciphertext and assert each `CryptoFailureAction` arm (Fail / Discard / Consume) at the consumer surface. Golden trace at crates/magnetar-differential/tests/golden/crypto_failure_action.json. Validation chain per CLAUDE.md.
+/goal add the cryptoFailureAction matrix golden trace per docs/follow-ups.md §8 — DEPENDS on porting the PIP-4 message crypto bridge (currently in magnetar-messagecrypto + magnetar-runtime-tokio) to the moonpool runtime first. Once the moonpool MessageEncryptor/Decryptor are in place, extend the scripted broker to deliver a payload with intentionally-corrupt ciphertext and assert each `CryptoFailureAction` arm (Fail / Discard / Consume) at the consumer surface. Golden trace at crates/magnetar-differential/tests/golden/crypto_failure_action.json. Validation chain per CLAUDE.md.
 ```
 
 ---
 
-## 11. Moonpool runner `LocalSet` pump
+## 9. Differential runner: plain `tokio::spawn` restructure
 
 **Gap.** The differential moonpool runner's driver task is
 `spawn_local`'d into a [`tokio::task::LocalSet`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html)
@@ -325,52 +361,55 @@ chain.
 keeps a 25 ms `Kicker` pulsing `driver_waker.notify_one()` to bridge
 the LocalSet pump gap.
 
-**Why it stays open.** Closed by the future `moonpool-sim`
-integration; the simulator's deterministic scheduler drives both
-sides without `spawn_local`. Alternative: restructure the runner to
-spawn the driver via plain `tokio::spawn` (gives up moonpool-sim
-compatibility for the differential harness specifically).
+**Decision (Florentin, this session).** Restructure the
+differential runner to spawn the driver via plain `tokio::spawn`.
+Gives up moonpool-sim compatibility for the differential harness
+specifically (other moonpool-engine surfaces stay fully sim-
+compatible). Drops the 25 ms `Kicker` workaround.
 
-**Deferred** — the 25 ms Kicker workaround is correct, just
-inelegant. Revisit when adopting moonpool-sim or when the Kicker
-becomes a measurable test-flakiness source.
+**`/goal`.**
 
----
-
-## 12. `engine.rs` split
-
-**Gap.** `crates/magnetar/src/engine.rs` is 2148 lines. Split into
-`engine/{traits.rs, tokio.rs, moonpool.rs}` once the per-engine
-impls grow further.
-
-**Deferred** — today the trait + two impls fit comfortably. Trigger
-when the next per-engine surface lift (e.g. §3, §4) makes the file
-uncomfortably wide.
+```text
+/goal restructure the differential moonpool runner per docs/follow-ups.md §9. Today the driver task is spawn_local'd into a tokio::task::LocalSet because moonpool_core::TokioProviders' TaskProvider uses spawn_local; the consequence is a ~30 s stall per consumer.receive() while the spawn_local'd driver isn't being polled, currently bridged by a 25 ms Kicker in crates/magnetar-differential/src/runner_moonpool.rs that pulses driver_waker.notify_one(). Replace this with a plain `tokio::spawn` of the driver task — gives up moonpool-sim compatibility FOR THE DIFFERENTIAL HARNESS ONLY (every other consumer of magnetar-runtime-moonpool stays fully sim-compatible). Concretely: (1) in crates/magnetar-differential/src/runner_moonpool.rs, replace the LocalSet + spawn_local with `tokio::spawn(driver_loop(...))`; (2) remove the Kicker struct + the 25 ms `tokio::time::interval` pulse loop; (3) update the module doc comment to document the trade-off (differential harness uses plain spawn for liveness; production engine usage stays sim-compatible via TokioProviders); (4) run the golden_traces test suite and verify no regression — should now run faster without the Kicker pulse overhead. Validation chain per CLAUDE.md. If any other code paths depend on the LocalSet (e.g. spawn_local'd consumers that the runner constructs), migrate them to plain tokio::spawn in the same commit.
+```
 
 ---
 
-## 13. `ProducerExt` trait inline
+## 10. `engine.rs` split
+
+**Gap.** `crates/magnetar/src/engine.rs` is 2148 lines. Pure
+refactor candidate.
+
+**Decision (Florentin, this session).** Dispatch the split now —
+landing it before §2 (which extends `engine.rs` with the new
+per-engine extension traits) keeps that PR's diff focused on the
+genuine API change rather than mixing in a 2k-line move.
+
+**`/goal`.**
+
+```text
+/goal split crates/magnetar/src/engine.rs (2148 lines) into a module per docs/follow-ups.md §10. Target layout: `crates/magnetar/src/engine/` directory with `mod.rs` (the `Engine` trait + the marker types), `tokio.rs` (the `TokioEngine` impl block + tokio-specific helpers), `moonpool.rs` (the `MoonpoolEngine<P>` impl block). Re-export every previously-public symbol from `crates/magnetar/src/engine/mod.rs` via `pub use` so the existing `magnetar::Engine` / `magnetar::TokioEngine` / `magnetar::MoonpoolEngine` paths and every internal `crate::engine::...` reference stays unchanged. Pure mechanical refactor — NO behaviour change, NO signature change. Validation chain per CLAUDE.md (the workspace should compile + test unchanged because every symbol stays at the same canonical path). ADR-0024 exemption justified: pure code-move refactor, no proto or runtime change, no test layer change. Land this BEFORE §2 (engine-generic builder lift) so the §2 PR can focus on the genuine API change rather than mixing in a 2k-line move.
+```
+
+---
+
+## 11. `ProducerExt` trait inline
 
 **Gap.** `crates/magnetar/src/client.rs::ProducerExt` is a single-
 impl extension trait that exists only to satisfy Rust's orphan rule
 for the façade-defined `MessageBuilder` against the runtime-defined
-`Producer`. The original audit suggested inlining it as a direct
-method on `magnetar_runtime_tokio::Producer` — but that requires
-moving `MessageBuilder` + `OutgoingMessage` (currently in
-`magnetar/src/client.rs`) **down** into `magnetar-runtime-tokio`,
-which inverts the workspace dep graph.
+`Producer`.
 
-**Needs decision.** Two options:
+**Decision (Florentin, this session).** Accept the trait as the
+layering artefact. Zero-cost; the trait + single impl is the
+canonical Rust workaround for the orphan rule. No code change
+needed beyond documenting the rationale in-line.
 
-1. Move `MessageBuilder` / `OutgoingMessage` to a new shared crate
-   that both `magnetar` and `magnetar-runtime-tokio` depend on
-   (cleanest but adds a crate).
-2. Accept the `ProducerExt` trait as the layering artefact
-   (zero-cost; the trait + single impl is the canonical Rust
-   workaround for this case).
+**`/goal` (trivial doc).**
 
-Florentin's call. Most projects pick option 2 unless the trait
-proliferates.
+```text
+/goal document the §11 `ProducerExt` decision per docs/follow-ups.md. Add a doc comment above `crates/magnetar/src/client.rs::ProducerExt` explaining: (1) why the trait exists (Rust orphan rule — `MessageBuilder` lives in the façade crate, `Producer` lives in `magnetar-runtime-tokio`, neither side can directly impl the conversion); (2) the two rejected alternatives (move `MessageBuilder` to a shared crate / move `MessageBuilder` down into `magnetar-runtime-tokio`); (3) the chosen path: accept the trait as a zero-cost layering artefact. Comment-only — no behaviour or signature change. Validation chain per CLAUDE.md (fmt + clippy only required). ADR-0024 exemption: comment-only.
+```
 
 ---
 
@@ -385,7 +424,13 @@ expected churn:
 3. PR merges → entry removed (the ADR / docs file carries the
    post-implementation reference).
 
-Pending **decisions** (§5 crypto crate, §13 layering) live here
-until Florentin calls them. Once decided, the decision becomes an
-ADR (or the `/goal …` block is filled in) and the entry transitions
-to ⚡ ready-to-dispatch.
+All open items now carry either a `/goal …` block ready to dispatch
+or an explicit blocker (external upstream, prior-PR dependency).
+Decision pendings from prior cuts of this doc (Athenz crypto crate,
+`ProducerExt` layering, builder-lift granularity, PIP-180 fixture,
+PIP-460 scaffold scope, deferred items §9 / §10) have all been
+resolved in the session that produced this consolidated doc.
+
+The vectored I/O moonpool primitive ([§1](#1-moonpool-vectored-io))
+remains the only fully-external blocker — tracked in
+[PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111).
