@@ -441,7 +441,19 @@ session that landed the above):**
    moonpool engine.
 3. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
    `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"`
-   parameterising existing e2e patterns against Pulsar 4.0.4.
+   parameterising existing e2e patterns against Pulsar 4.0.4 —
+   **landed**: `e2e_pulsar_v5.rs` (2 tests:
+   `e2e_v5_produce_consume_roundtrip` exercising
+   `producer.send_timeout/.max_pending_messages` + `stream_consumer`
+   with `.ack_timeout/.negative_ack_redelivery_delay`;
+   `e2e_v5_v4_escape_hatch_shares_state` proving ADR-0032's same-
+   engine-state invariant via cross-surface produce/consume);
+   `e2e_sub_types_v5.rs` (3 tests: `stream_consumer.failover()` →
+   wire `SubType::Failover`; `queue_consumer()` → `SubType::Shared`;
+   `queue_consumer().key_shared()` → `SubType::KeyShared` with
+   per-key ordering verified against the Pulsar broker). All five
+   `#[ignore]`'d behind `requires Docker`, run via
+   `cargo test --features e2e,experimental-v5-client -- --include-ignored`.
 4. `docs/v5-client.md` (NEW) including the mapping table —
    **landed**: comprehensive reference doc covering enable
    instructions, quick start, the full V5 → v4 mapping table with
