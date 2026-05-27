@@ -1240,26 +1240,17 @@ impl ClientBuilder {
         self
     }
 
-    /// Mirrors Java `ClientBuilder#tlsTrustCertsFilePath`. Supplies a PEM-encoded chain
-    /// (typically a self-signed CA used by the broker). When set, the connection's TLS
-    /// handshake validates the broker against this chain INSTEAD OF the system trust
+    /// Mirrors Java `ClientBuilder#tlsTrustCertsFilePath` (PEM-supplied
+    /// equivalent — magnetar keeps the façade I/O-free, callers read the
+    /// file themselves via `std::fs::read(path)?` and pass the bytes).
+    /// Supplies a PEM-encoded chain (typically a self-signed CA used by
+    /// the broker). When set, the connection's TLS handshake validates
+    /// the broker against this chain INSTEAD OF the system trust
     /// store. Only honoured for `pulsar+ssl://` URLs.
     #[must_use]
     pub fn tls_trust_certs_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
         self.tls_trust_certs_pem = Some(pem.into());
         self
-    }
-
-    /// Convenience: read a PEM file from `path` and apply it via [`Self::tls_trust_certs_pem`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PulsarError::Config`] if the file cannot be read.
-    pub fn tls_trust_certs_file_path(mut self, path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let bytes = std::fs::read(path.as_ref())
-            .map_err(|e| PulsarError::Config(format!("read tls trust certs file: {e}")))?;
-        self.tls_trust_certs_pem = Some(bytes);
-        Ok(self)
     }
 
     /// Mirror of Java `ClientBuilder#tlsAllowInsecureConnection`. When `true`,

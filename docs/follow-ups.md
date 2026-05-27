@@ -35,10 +35,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — sans-io / determinism
 
-- **`crates/magnetar/src/client.rs::ClientBuilder::tls_trust_certs_file_path`** —
-  calls `std::fs::read` from the generic façade. Move file-reading
-  behind `impl PulsarClient<TokioEngine>`; the generic builder should
-  keep only `tls_trust_certs_pem(Vec<u8>)`.
 - **`crates/magnetar/src/client.rs` (`Reader` subscription naming) +
   `crates/magnetar/src/table_view.rs`** —
   `Uuid::new_v4()` for default subscription names in the façade.
