@@ -154,4 +154,43 @@ mod tests {
             InitialPosition::Earliest,
         );
     }
+
+    #[test]
+    fn send_timeout_saturates_at_u64_max() {
+        // The spec mandates saturation rather than wraparound for
+        // pathological inputs (Duration::MAX has 2^64 seconds × 1000
+        // ms which overflows u64). The saturating clamp is the
+        // most-permissive interpretation.
+        let huge = Duration::from_secs(u64::MAX / 1000 + 1);
+        assert_eq!(send_timeout_to_ms(huge), u64::MAX);
+    }
+
+    #[test]
+    fn ack_timeout_zero_duration_round_trips_to_zero() {
+        // `Some(Duration::ZERO)` is distinct from `None` at the V5
+        // type level but both translate to `0` on the v4 wire (the
+        // "disabled" sentinel). Pinning this avoids accidental
+        // future refactors that would treat zero-duration as a tiny
+        // but non-disabled value.
+        assert_eq!(ack_timeout_to_ms(Some(Duration::ZERO)), 0);
+        assert_eq!(ack_timeout_to_ms(None), 0);
+    }
+
+    #[test]
+    fn max_pending_messages_zero_via_some_round_trips_to_zero() {
+        // Some(0) is the explicit "unlimited" spelling and matches None
+        // at the v4 wire layer (where `0` is the unlimited sentinel).
+        // Documenting the equivalence keeps callers from over-thinking
+        // the Some/None distinction.
+        assert_eq!(max_pending_messages_to_v4(Some(0)), 0);
+        assert_eq!(max_pending_messages_to_v4(None), 0);
+    }
+
+    #[test]
+    fn initial_position_is_copy_and_eq() {
+        // Type-level guard: the wrapper enum stays Copy + Eq so
+        // callers can pattern-match without ownership ceremony.
+        fn _assert_copy_eq<T: Copy + Eq>() {}
+        _assert_copy_eq::<V5SubscriptionInitialPosition>();
+    }
 }
