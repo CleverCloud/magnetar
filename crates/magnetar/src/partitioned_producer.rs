@@ -11,13 +11,13 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use magnetar_proto::types::CompressionKind;
 use magnetar_proto::{CreateProducerRequest, MessageId, pb};
 use magnetar_runtime_tokio::Producer;
-use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -279,7 +279,7 @@ pub struct PartitionedProducer<P: crate::ProducerApi = Producer> {
     /// Optional custom router. When set, takes precedence over [`Self::routing`] for
     /// every send.
     router: Option<std::sync::Arc<dyn MessageRouter>>,
-    cursor: Mutex<u64>,
+    cursor: AtomicU64,
     /// Optional background partition-watcher task. `Some` when the builder configured
     /// [`PartitionedProducerBuilder::auto_update_partitions_interval`], `None`
     /// otherwise (default). The task is a pure timer that signals
@@ -316,11 +316,11 @@ struct AutoUpdateTask {
     /// Last partition count observed by the watcher. Seeded with the count discovered
     /// at create time. Updated by [`PartitionedProducer::refresh_partitions`] when
     /// called.
-    observed_partitions: Arc<Mutex<u32>>,
+    observed_partitions: Arc<AtomicU32>,
     /// Monotonic counter of "partition count changed" events. Useful for tests and
     /// "did anything change since I last looked?" probes. Bumped by
     /// [`PartitionedProducer::refresh_partitions`] when a different count is observed.
-    change_count: Arc<Mutex<u64>>,
+    change_count: Arc<AtomicU64>,
     /// Signalled every time the internal timer fires, and every time
     /// [`PartitionedProducer::refresh_partitions`] detects a real partition-count
     /// change.
@@ -376,8 +376,8 @@ fn spawn_auto_update_task(
     interval: Duration,
     initial_partitions: u32,
 ) -> Arc<AutoUpdateTask> {
-    let observed_partitions = Arc::new(Mutex::new(initial_partitions));
-    let change_count = Arc::new(Mutex::new(0u64));
+    let observed_partitions = Arc::new(AtomicU32::new(initial_partitions));
+    let change_count = Arc::new(AtomicU64::new(0));
     let changed = Arc::new(Notify::new());
     let shutdown = Arc::new(Notify::new());
 
@@ -470,10 +470,8 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
         match self.routing {
             MessageRoutingMode::SinglePartition(p) => (p as usize).min(n - 1),
             MessageRoutingMode::RoundRobin => {
-                let mut c = self.cursor.lock();
-                let pick = (*c as usize) % n;
-                *c = c.wrapping_add(1);
-                pick
+                let prev = self.cursor.fetch_add(1, Ordering::Relaxed);
+                (prev as usize) % n
             }
             MessageRoutingMode::KeyHashOrRoundRobin => match key {
                 Some(k) if !k.is_empty() => {
@@ -482,10 +480,8 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
                     (h.finish() as usize) % n
                 }
                 _ => {
-                    let mut c = self.cursor.lock();
-                    let pick = (*c as usize) % n;
-                    *c = c.wrapping_add(1);
-                    pick
+                    let prev = self.cursor.fetch_add(1, Ordering::Relaxed);
+                    (prev as usize) % n
                 }
             },
         }
@@ -603,7 +599,7 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
     pub fn observed_partitions(&self) -> Option<u32> {
         self.auto_update
             .as_ref()
-            .map(|t| *t.observed_partitions.lock())
+            .map(|t| t.observed_partitions.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of partition-change events observed by the background
@@ -612,7 +608,9 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
     /// different partition count than the previous observation.
     #[must_use]
     pub fn partition_change_count(&self) -> Option<u64> {
-        self.auto_update.as_ref().map(|t| *t.change_count.lock())
+        self.auto_update
+            .as_ref()
+            .map(|t| t.change_count.load(Ordering::Relaxed))
     }
 
     /// `Arc<Notify>` signalled by the background partition-watcher on every timer
@@ -703,13 +701,10 @@ impl PartitionedProducer<Producer> {
             return Ok(None);
         };
         let count = client.partitions_for_topic(&task.topic).await?;
-        let mut observed = task.observed_partitions.lock();
-        if *observed != count {
-            *observed = count;
-            drop(observed);
-            let mut cnt = task.change_count.lock();
-            *cnt = cnt.saturating_add(1);
-            drop(cnt);
+        // Atomic swap-then-compare. See multi_topics.rs for the rationale.
+        let prev = task.observed_partitions.swap(count, Ordering::Relaxed);
+        if prev != count {
+            task.change_count.fetch_add(1, Ordering::Relaxed);
             task.changed.notify_waiters();
         }
         Ok(Some(count))
@@ -971,7 +966,7 @@ impl<'a> PartitionedProducerBuilder<'a> {
             base_topic: self.topic,
             routing: self.routing,
             router: self.router,
-            cursor: Mutex::new(0),
+            cursor: AtomicU64::new(0),
             auto_update,
         })
     }
@@ -994,7 +989,7 @@ mod tests {
             base_topic: "t".into(),
             routing: MessageRoutingMode::KeyHashOrRoundRobin,
             router: None,
-            cursor: Mutex::new(0),
+            cursor: AtomicU64::new(0),
             auto_update: None,
         };
         // We can't actually run pick_partition with 0 partitions; emulate by injecting a

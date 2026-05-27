@@ -84,8 +84,7 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     // activity from the pre-reset CommandSend frames.
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     // === Supervised reset.
@@ -224,8 +223,7 @@ fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
     // Drain the pre-reset wire frame.
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     // Supervised reset: the snapshot is taken, no outcome lands on the publish key.
@@ -250,8 +248,7 @@ fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
     // session.
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     // Feed the broker's CommandSendReceipt — the replayed OpSend resolves.
@@ -316,8 +313,7 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
             seqs.push(seq);
         }
         // Drain pre-reset wire frames so the post-rebuild drain is isolated.
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     // Reset + rebuild.
@@ -332,13 +328,10 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
     }
 
     // Drain post-rebuild wire frames and inspect the CommandSend ordering.
-    let raw_bytes = {
+    let mut cursor = {
         let mut conn = shared.inner.lock();
-        let mut buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut buf);
-        buf
+        conn.poll_transmit()
     };
-    let mut cursor = Bytes::copy_from_slice(&raw_bytes);
     let mut send_seqs: Vec<u64> = Vec::new();
     let mut send_payloads: Vec<Vec<u8>> = Vec::new();
     while !cursor.is_empty() {
@@ -392,8 +385,7 @@ fn session_epoch_bumps_exactly_once_per_reset_in_replay_cycle() {
                 t0,
             )
             .expect("queue");
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
     let epoch_before = shared.inner.lock().session_epoch();
 
@@ -406,8 +398,7 @@ fn session_epoch_bumps_exactly_once_per_reset_in_replay_cycle() {
         let _ = conn.poll_event();
         let _ = conn.rebuild_producers();
         // Drain the wire frames so the next reset's snapshot is the only OpSend in flight.
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     let epoch_after = shared.inner.lock().session_epoch();

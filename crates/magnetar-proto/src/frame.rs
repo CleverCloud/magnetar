@@ -62,7 +62,7 @@ pub const MAGIC_BROKER_ENTRY_METADATA: u16 = 0x0e02;
 /// may enforce a smaller cap; this is the absolute ceiling enforced by `decode_one`.
 pub const MAX_FRAME_SIZE: usize = 5 * 1024 * 1024;
 
-const TOTAL_SIZE_LEN: usize = 4;
+pub(crate) const TOTAL_SIZE_LEN: usize = 4;
 const CMD_SIZE_LEN: usize = 4;
 const MAGIC_LEN: usize = 2;
 const CHECKSUM_LEN: usize = 4;
@@ -212,6 +212,41 @@ pub fn encode_payload(
 
     dst.extend_from_slice(payload);
     Ok(())
+}
+
+/// Peek at the front of `inbound` to determine whether a complete frame
+/// is ready to decode.
+///
+/// Returns `Ok(None)` if fewer than `TOTAL_SIZE_LEN` header bytes are
+/// present, or if the announced frame extends past the current buffer —
+/// the caller should park and try again after more bytes arrive.
+/// Returns `Ok(Some(len))` if exactly `len` bytes at the front of
+/// `inbound` form a complete frame and can be split off via
+/// `inbound.split_to(len)` for handing to [`decode_one`].
+/// Returns `Err(BadLength)` if the announced `total_size` is zero or
+/// exceeds [`MAX_FRAME_SIZE`].
+///
+/// This is the cheap front-of-stream check that lets
+/// [`crate::Connection::handle_bytes`] avoid `Bytes::copy_from_slice`
+/// on every decode iteration; see the receive-path zero-copy entry
+/// in `docs/follow-ups.md` under the 2026-05-27 audit section.
+pub(crate) fn peek_full_frame_len(inbound: &BytesMut) -> Result<Option<usize>, FrameError> {
+    if inbound.len() < TOTAL_SIZE_LEN {
+        return Ok(None);
+    }
+    let total_size = u32::from_be_bytes([inbound[0], inbound[1], inbound[2], inbound[3]]);
+    if total_size == 0 {
+        return Err(FrameError::BadLength(total_size));
+    }
+    let total_size_usize = total_size as usize;
+    if total_size_usize > MAX_FRAME_SIZE {
+        return Err(FrameError::BadLength(total_size));
+    }
+    let full_frame_len = TOTAL_SIZE_LEN + total_size_usize;
+    if inbound.len() < full_frame_len {
+        return Ok(None);
+    }
+    Ok(Some(full_frame_len))
 }
 
 /// Decode exactly one frame from the head of `src`, advancing `src` past the consumed bytes.
@@ -615,6 +650,47 @@ mod tests {
         match decode_one(&mut bytes) {
             Err(FrameError::BadLength(0)) => {}
             other => panic!("expected BadLength(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peek_full_frame_len_distinguishes_incomplete_header_body_and_complete() {
+        // Empty buffer → need header.
+        let empty = BytesMut::new();
+        assert!(matches!(peek_full_frame_len(&empty), Ok(None)));
+
+        // 3-byte header (need 4) → still incomplete.
+        let short = BytesMut::from(&[0u8, 0, 0][..]);
+        assert!(matches!(peek_full_frame_len(&short), Ok(None)));
+
+        // 4-byte header announcing 100 bytes, only 50 follow → incomplete body.
+        let mut partial = BytesMut::with_capacity(54);
+        partial.put_u32(100);
+        partial.extend_from_slice(&[0u8; 50]);
+        assert!(matches!(peek_full_frame_len(&partial), Ok(None)));
+
+        // 4-byte header announcing 100 bytes, full 100 bytes follow → complete.
+        let mut complete = BytesMut::with_capacity(104);
+        complete.put_u32(100);
+        complete.extend_from_slice(&[0u8; 100]);
+        match peek_full_frame_len(&complete) {
+            Ok(Some(len)) => assert_eq!(len, 104),
+            other => panic!("expected Ok(Some(104)), got {other:?}"),
+        }
+
+        // total_size = 0 → BadLength.
+        let zero = BytesMut::from(&[0u8, 0, 0, 0][..]);
+        assert!(matches!(
+            peek_full_frame_len(&zero),
+            Err(FrameError::BadLength(0))
+        ));
+
+        // total_size > MAX_FRAME_SIZE → BadLength.
+        let mut oversized = BytesMut::with_capacity(4);
+        oversized.put_u32(MAX_FRAME_SIZE as u32 + 1);
+        match peek_full_frame_len(&oversized) {
+            Err(FrameError::BadLength(n)) => assert_eq!(n, MAX_FRAME_SIZE as u32 + 1),
+            other => panic!("expected BadLength, got {other:?}"),
         }
     }
 }

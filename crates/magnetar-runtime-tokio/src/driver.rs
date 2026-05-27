@@ -580,14 +580,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
-    let mut write_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER_CAPACITY);
 
     loop {
         // Drain outbound bytes + check if the state machine wants us to terminate.
-        let (deadline, should_close) = {
+        let (write_buf, deadline, should_close) = {
             let mut conn = shared.inner.lock();
-            write_buf.clear();
-            let _ = conn.poll_transmit(&mut write_buf);
+            let out = conn.poll_transmit();
             let dl = conn.poll_timeout();
             let closing = matches!(
                 conn.state(),
@@ -595,7 +593,7 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
-            (dl, closing)
+            (out, dl, closing)
         };
 
         // Flush whatever the state machine produced. This happens *outside* the lock so user
@@ -609,7 +607,6 @@ where
                 shared.inner.lock().mark_disconnected();
                 return Err(err.into());
             }
-            write_buf.clear();
         }
 
         if should_close {

@@ -287,6 +287,16 @@ impl<S: Schema> TypedMessageBuilder<'_, S> {
         self
     }
 
+    /// See [`crate::OutgoingMessage::deliver_after_ms_from`]. Engine-agnostic
+    /// alternative to [`Self::deliver_after_ms`] for moonpool-deterministic
+    /// callers — see the `deliver_after_ms` determinism warning on
+    /// [`crate::OutgoingMessage`].
+    #[must_use]
+    pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms_from(now_ms, delay_ms);
+        self
+    }
+
     /// See [`crate::OutgoingMessage::replication_clusters`].
     #[must_use]
     pub fn replication_clusters(mut self, clusters: Vec<String>) -> Self {

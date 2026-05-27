@@ -116,14 +116,40 @@ impl OutgoingMessage {
         self
     }
 
-    /// Mirrors `TypedMessageBuilder#deliverAfter`. Adds `delay_ms` to the current wall-clock
-    /// time and stamps the resulting absolute deadline on the message.
+    /// Mirrors `TypedMessageBuilder#deliverAfter`. Adds `delay_ms` to the
+    /// current wall-clock time and stamps the resulting absolute deadline
+    /// on the message.
+    ///
+    /// # Determinism warning
+    ///
+    /// This convenience reads the host's `SystemTime::now`. Code that runs
+    /// under `MoonpoolEngine` and depends on byte-identical wire output
+    /// across simulator seeds should use [`Self::deliver_after_ms_from`]
+    /// (caller-supplied `now_ms`) or [`Self::deliver_at_ms`] (absolute
+    /// timestamp) instead — the broker compares `deliver_at_ms` to its
+    /// own clock, so what matters for replay parity is that the *client*
+    /// stamp is deterministic. Tracked in `docs/follow-ups.md` under
+    /// the 2026-05-27 audit section.
     #[must_use]
     pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
         self.deliver_at_ms = Some(now.saturating_add(delay_ms));
+        self
+    }
+
+    /// Engine-agnostic variant of [`Self::deliver_after_ms`]. Stamps the
+    /// message with `now_ms + delay_ms` as the absolute UNIX-epoch
+    /// millisecond deadline. The caller supplies `now_ms` — under
+    /// `MoonpoolEngine` this should come from the engine's virtual wall
+    /// clock so the resulting wire bytes are deterministic across seeds.
+    ///
+    /// Tracked in `docs/follow-ups.md` under the 2026-05-27 audit
+    /// section ("Determinism warning" entry).
+    #[must_use]
+    pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
+        self.deliver_at_ms = Some(now_ms.saturating_add(delay_ms));
         self
     }
 
@@ -462,6 +488,16 @@ impl MessageBuilder<'_> {
     #[must_use]
     pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
         self.msg = self.msg.deliver_after_ms(delay_ms);
+        self
+    }
+
+    /// See [`OutgoingMessage::deliver_after_ms_from`]. Engine-agnostic
+    /// alternative to [`Self::deliver_after_ms`] for moonpool-deterministic
+    /// callers — see the determinism warning on
+    /// [`OutgoingMessage::deliver_after_ms`].
+    #[must_use]
+    pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms_from(now_ms, delay_ms);
         self
     }
 

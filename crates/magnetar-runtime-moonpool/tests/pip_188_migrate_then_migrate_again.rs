@@ -136,8 +136,7 @@ fn back_to_back_topic_migrations_settle() {
         let new_open_request_id = rebuilt_request_ids[0];
         // Drain the rebuilt outbound bytes so the next assertion isolates
         // the second migration's wire activity.
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
         // Ack the new producer open.
         let success = pb::BaseCommand {
             r#type: pb::base_command::Type::ProducerSuccess as i32,

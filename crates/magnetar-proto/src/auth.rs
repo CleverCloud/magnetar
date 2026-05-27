@@ -34,7 +34,7 @@ pub mod tls;
 pub mod token;
 
 pub use tls::TlsAuth;
-pub use token::TokenAuth;
+pub use token::{TokenAuth, TokenSupplier};
 
 /// Auth provider error surface.
 #[derive(Debug, thiserror::Error)]

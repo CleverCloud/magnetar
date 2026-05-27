@@ -71,8 +71,7 @@ fn one_thrash_cycle(shared: &Arc<ConnectionShared>, idx: u32, now: Instant) -> I
     let request_id = conn.peek_next_request_id_for_test();
     let _handle = conn.create_producer(req);
 
-    let mut sink: Vec<u8> = Vec::new();
-    conn.poll_transmit(&mut sink);
+    let _ = conn.poll_transmit();
 
     let attach_now = now + Duration::from_millis(1);
     let success = producer_success_bytes(request_id);

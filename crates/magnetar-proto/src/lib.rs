@@ -112,7 +112,9 @@ pub use crate::anti_thrash::{
     AntiThrashDisposition, AntiThrashState, AntiThrashThreshold, AttachOutcome, ReAttachHandle,
     ReAttachOutcomeKind,
 };
-pub use crate::auth::{AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth};
+pub use crate::auth::{
+    AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth, TokenSupplier,
+};
 pub use crate::backoff::Backoff;
 pub use crate::cluster_failover::ControlledClusterFailover;
 pub use crate::conn::{

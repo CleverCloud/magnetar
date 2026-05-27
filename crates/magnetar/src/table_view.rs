@@ -10,11 +10,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use magnetar_proto::conn::CryptoFailureAction;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -100,11 +101,11 @@ struct AutoUpdateTask {
     topic: String,
     /// Last partition count observed by the watcher. `0` for non-partitioned topics.
     /// Updated by [`TableView::refresh_partitions`] when called.
-    observed_partitions: Arc<Mutex<u32>>,
+    observed_partitions: Arc<AtomicU32>,
     /// Monotonic counter of "partition count changed" events. Useful for tests and
     /// "did anything change since I last looked?" probes. Bumped by
     /// [`TableView::refresh_partitions`] when a different count is observed.
-    change_count: Arc<Mutex<u64>>,
+    change_count: Arc<AtomicU64>,
     /// Signalled every time the internal timer fires, and every time
     /// [`TableView::refresh_partitions`] detects a real partition-count change.
     changed: Arc<Notify>,
@@ -218,7 +219,7 @@ impl<C: crate::ConsumerApi + Clone> TableView<C> {
     pub fn observed_partitions(&self) -> Option<u32> {
         self.auto_update
             .as_ref()
-            .map(|t| *t.observed_partitions.lock())
+            .map(|t| t.observed_partitions.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of partition-change events observed by the background watcher.
@@ -227,7 +228,9 @@ impl<C: crate::ConsumerApi + Clone> TableView<C> {
     /// one. Useful for tests and "did the topology change since X?" probes.
     #[must_use]
     pub fn partition_change_count(&self) -> Option<u64> {
-        self.auto_update.as_ref().map(|t| *t.change_count.lock())
+        self.auto_update
+            .as_ref()
+            .map(|t| t.change_count.load(Ordering::Relaxed))
     }
 
     /// Returns `true` if a background partition-watcher was spawned for this view
@@ -273,13 +276,10 @@ impl<C: crate::ConsumerApi + Clone> TableView<C> {
             return Ok(None);
         };
         let count = client.partitions_for_topic(&task.topic).await?;
-        let mut observed = task.observed_partitions.lock();
-        if *observed != count {
-            *observed = count;
-            drop(observed);
-            let mut cnt = task.change_count.lock();
-            *cnt = cnt.saturating_add(1);
-            drop(cnt);
+        // Atomic swap-then-compare. See multi_topics.rs for the rationale.
+        let prev = task.observed_partitions.swap(count, Ordering::Relaxed);
+        if prev != count {
+            task.change_count.fetch_add(1, Ordering::Relaxed);
             task.changed.notify_waiters();
         }
         Ok(Some(count))
@@ -630,8 +630,8 @@ impl<'a> TableViewBuilder<'a> {
 /// The `Arc<AutoUpdateTask>` returned wraps a [`Drop`] that aborts the spawned task,
 /// so the timer is bounded by the [`TableView`]'s lifetime.
 fn spawn_auto_update_task(topic: String, interval: Duration) -> Arc<AutoUpdateTask> {
-    let observed_partitions = Arc::new(Mutex::new(0u32));
-    let change_count = Arc::new(Mutex::new(0u64));
+    let observed_partitions = Arc::new(AtomicU32::new(0));
+    let change_count = Arc::new(AtomicU64::new(0));
     let changed = Arc::new(Notify::new());
     let shutdown = Arc::new(Notify::new());
 
@@ -979,10 +979,10 @@ mod tests {
         // Replicate the public getter logic against a synthesised `Option<Arc<...>>` to
         // prove the wiring without a broker.
         fn observed_partitions(t: Option<&Arc<AutoUpdateTask>>) -> Option<u32> {
-            t.map(|x| *x.observed_partitions.lock())
+            t.map(|x| x.observed_partitions.load(Ordering::Relaxed))
         }
         fn change_count(t: Option<&Arc<AutoUpdateTask>>) -> Option<u64> {
-            t.map(|x| *x.change_count.lock())
+            t.map(|x| x.change_count.load(Ordering::Relaxed))
         }
         fn has_auto_update(t: Option<&Arc<AutoUpdateTask>>) -> bool {
             t.is_some()
@@ -1001,8 +1001,8 @@ mod tests {
         // Opt-in case: synthesise an `AutoUpdateTask` directly. The watcher would
         // normally be spawned by `spawn_auto_update_task`; we replicate the surface
         // here without a broker.
-        let observed = Arc::new(Mutex::new(0u32));
-        let changes = Arc::new(Mutex::new(0u64));
+        let observed = Arc::new(AtomicU32::new(0));
+        let changes = Arc::new(AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
         let handle = tokio::spawn(async {});
@@ -1022,8 +1022,8 @@ mod tests {
 
         // Simulate a partition-count change observation and verify the counter and
         // Notify are wired through.
-        *observed.lock() = 4;
-        *changes.lock() = 1;
+        observed.store(4, Ordering::Relaxed);
+        changes.store(1, Ordering::Relaxed);
         notify.notify_waiters();
         assert_eq!(observed_partitions(with_watcher.as_ref()), Some(4));
         assert_eq!(change_count(with_watcher.as_ref()), Some(1));

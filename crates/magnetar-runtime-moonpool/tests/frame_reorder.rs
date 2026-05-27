@@ -87,8 +87,7 @@ fn out_of_order_send_receipts_resolve_by_sequence_id() {
     // pending-publish slab populated.
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let tx_buf = conn.poll_transmit();
         assert!(!tx_buf.is_empty(), "two CommandSend frames must be queued");
         assert_eq!(conn.producer_pending_count(handle), 2);
     }

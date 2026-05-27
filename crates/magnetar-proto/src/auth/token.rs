@@ -1,37 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Token-based [`AuthProvider`] — bytes from string, env, or file.
+//! Token-based [`AuthProvider`] — bytes from string, env, or caller-supplied
+//! closure.
 //!
-//! Mirrors `org.apache.pulsar.client.impl.auth.AuthenticationToken`. Three constructors are
-//! exposed:
+//! Mirrors `org.apache.pulsar.client.impl.auth.AuthenticationToken`. Three
+//! constructors are exposed:
 //!
 //! - [`TokenAuth::from_string`] — bytes held inline.
 //! - [`TokenAuth::from_env`] — bytes read at construction from an environment variable.
-//! - [`TokenAuth::from_file`] — bytes re-read from a file on **every** [`AuthProvider::initial`]
-//!   call, so on-disk token rotation is picked up without rebuilding the provider.
+//! - [`TokenAuth::from_supplier`] — bytes re-computed by a caller-supplied closure on **every**
+//!   [`AuthProvider::initial`] call, so on-disk token rotation is picked up without rebuilding the
+//!   provider. File-backed convenience lives in the runtime crates (`magnetar-runtime-tokio`,
+//!   `magnetar-runtime-moonpool`) where filesystem I/O is allowed (ADR-0004).
 //!
 //! The `method()` is always `"token"`.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
 use super::{AuthError, AuthProvider};
 
+/// Caller-supplied closure that materialises the current token bytes. Invoked
+/// on every [`AuthProvider::initial`] call, so token rotation can be plumbed
+/// in without rebuilding the provider. The closure must be `Send + Sync`
+/// because the surrounding [`crate::Connection`] is held behind a mutex that
+/// is shared across runtime tasks.
+pub type TokenSupplier = dyn Fn() -> Result<Bytes, AuthError> + Send + Sync;
+
 /// Token-bearer auth provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokenAuth {
     source: TokenSource,
 }
 
+impl std::fmt::Debug for TokenAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.source {
+            TokenSource::Inline(_) => "Inline",
+            TokenSource::Supplier(_) => "Supplier",
+        };
+        f.debug_struct("TokenAuth").field("source", &kind).finish()
+    }
+}
+
 /// Backing storage for [`TokenAuth`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum TokenSource {
     /// Token bytes held in-process.
     Inline(Bytes),
-    /// Token bytes that should be re-read from disk on every `initial()` call.
-    File(PathBuf),
+    /// Token bytes re-computed by a caller-supplied closure on every
+    /// `initial()` call. File-backed rotation lives in the runtime crates.
+    Supplier(Arc<TokenSupplier>),
 }
 
 impl TokenAuth {
@@ -51,41 +71,26 @@ impl TokenAuth {
         }
     }
 
-    /// Construct a provider by reading the named environment variable at construction time.
+    /// Construct a provider by reading the named environment variable at
+    /// construction time.
     pub fn from_env(var: &str) -> Result<Self, AuthError> {
         let value = std::env::var(var)
             .map_err(|err| AuthError::Invalid(format!("env var {var}: {err}")))?;
         Ok(Self::from_string(value))
     }
 
-    /// Construct a provider that re-reads its token file on every `initial()` call.
+    /// Construct a provider whose `initial()` calls invoke the supplied
+    /// closure to materialise the current token bytes.
     ///
-    /// The file is read eagerly at construction once to validate the path exists; subsequent
-    /// `initial()` calls re-read it so that token rotation works without restarting.
-    pub fn from_file(path: impl Into<PathBuf>) -> Result<Self, AuthError> {
-        let path = path.into();
-        // Eager validation: surface a clear error at construction if the path is broken.
-        Self::read_token_file(&path)?;
-        Ok(Self {
-            source: TokenSource::File(path),
-        })
-    }
-
-    fn read_token_file(path: &Path) -> Result<Bytes, AuthError> {
-        let raw = fs::read(path).map_err(|err| {
-            AuthError::Io(format!("reading token file {}: {err}", path.display()))
-        })?;
-        // Strip a single trailing newline if present — the Java client trims tokens read from
-        // disk.
-        let trimmed = match raw.last() {
-            Some(b'\n') => &raw[..raw.len() - 1],
-            _ => &raw[..],
-        };
-        let trimmed = match trimmed.last() {
-            Some(b'\r') => &trimmed[..trimmed.len() - 1],
-            _ => trimmed,
-        };
-        Ok(Bytes::copy_from_slice(trimmed))
+    /// Use this to plumb in token rotation (file-backed, network-backed,
+    /// vault-backed, …) without leaking I/O into `magnetar-proto`. The
+    /// runtime crates expose convenience wrappers — see
+    /// `magnetar_runtime_tokio::file_token_auth(path)` for the disk case.
+    #[must_use]
+    pub fn from_supplier(supplier: Arc<TokenSupplier>) -> Self {
+        Self {
+            source: TokenSource::Supplier(supplier),
+        }
     }
 }
 
@@ -98,16 +103,19 @@ impl AuthProvider for TokenAuth {
     fn initial(&self) -> Result<Bytes, AuthError> {
         match &self.source {
             TokenSource::Inline(b) => Ok(b.clone()),
-            TokenSource::File(path) => Self::read_token_file(path),
+            TokenSource::Supplier(f) => f(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{AuthProvider, TokenAuth};
+    use bytes::Bytes;
+
+    use super::{AuthError, AuthProvider, TokenAuth};
 
     #[test]
     fn from_string_round_trip() {
@@ -118,8 +126,9 @@ mod tests {
 
     #[test]
     fn from_env_reads_cargo_provided_var() {
-        // `CARGO_PKG_NAME` is set by cargo for every build; we use it instead of mutating the
-        // process env (forbidden under `forbid(unsafe_code)` in edition 2024).
+        // `CARGO_PKG_NAME` is set by cargo for every build; we use it instead
+        // of mutating the process env (forbidden under `forbid(unsafe_code)`
+        // in edition 2024).
         let p = TokenAuth::from_env("CARGO_PKG_NAME").expect("env var");
         assert_eq!(p.initial().expect("initial"), b"magnetar-proto".as_slice());
     }
@@ -136,28 +145,34 @@ mod tests {
     }
 
     #[test]
-    fn from_file_round_trip_and_rotation() {
-        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
-        writeln!(file, "first-token").expect("write");
-        file.flush().expect("flush");
-        let path = file.path().to_owned();
+    fn from_supplier_invokes_closure_on_every_initial() {
+        // The supplier closure is the rotation hook — `initial()` must call
+        // it every time, not cache the first value. This is what file-backed
+        // wrappers in the runtime crates rely on.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tokens: &[&[u8]] = &[b"first-token", b"second-token", b"third-token"];
+        let calls_inner = calls.clone();
+        let p = TokenAuth::from_supplier(Arc::new(move || {
+            let n = calls_inner.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::copy_from_slice(tokens[n.min(tokens.len() - 1)]))
+        }));
 
-        let p = TokenAuth::from_file(&path).expect("from_file");
         assert_eq!(p.method(), "token");
         assert_eq!(p.initial().expect("initial"), b"first-token".as_slice());
-
-        // Rotate the file in-place and re-read.
-        std::fs::write(&path, b"second-token").expect("rewrite");
-        assert_eq!(
-            p.initial().expect("initial after rotation"),
-            b"second-token".as_slice()
-        );
+        assert_eq!(p.initial().expect("initial"), b"second-token".as_slice());
+        assert_eq!(p.initial().expect("initial"), b"third-token".as_slice());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
-    fn from_file_missing_path() {
-        let err = TokenAuth::from_file("/this/path/does/not/exist/magnetar-token").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("token file"), "msg={msg}");
+    fn from_supplier_propagates_errors() {
+        let p = TokenAuth::from_supplier(Arc::new(|| {
+            Err(AuthError::Io("synthetic supplier failure".to_owned()))
+        }));
+        let err = p.initial().unwrap_err();
+        assert!(
+            err.to_string().contains("synthetic supplier failure"),
+            "err={err}",
+        );
     }
 }

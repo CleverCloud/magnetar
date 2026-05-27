@@ -558,14 +558,27 @@ where
     P: Providers,
 {
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
-    let mut write_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER_CAPACITY);
 
     loop {
+        // 0. Advance the engine's wall-clock atomic from `providers.time().now()`. The proto-layer
+        //    wall-clock closure installed by `ConnectionShared::with_auth` reads this atomic, so
+        //    `Connection::handle_timeout` batch-publish stamping flows from the moonpool
+        //    `TimeProvider` (host clock under `TokioProviders`, virtual time under `SimProviders`).
+        //    See the moonpool wall-clock bridge entry in `docs/follow-ups.md`.
+        {
+            let elapsed_ms = time.now().as_millis();
+            let now_ms = shared
+                .wall_clock_base_ms
+                .saturating_add(u64::try_from(elapsed_ms).unwrap_or(u64::MAX));
+            shared
+                .wall_clock_ms
+                .store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // 1. Drain outbound bytes + check if the state machine wants us to terminate.
-        let (deadline, should_close) = {
+        let (write_buf, deadline, should_close) = {
             let mut conn = shared.inner.lock();
-            write_buf.clear();
-            let _ = conn.poll_transmit(&mut write_buf);
+            let out = conn.poll_transmit();
             let dl = conn.poll_timeout();
             let closing = matches!(
                 conn.state(),
@@ -573,7 +586,7 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
-            (dl, closing)
+            (out, dl, closing)
         };
 
         // 2. Flush whatever the state machine produced. This happens outside the lock so user
@@ -587,7 +600,6 @@ where
                 shared.inner.lock().mark_disconnected();
                 return Err(err.into());
             }
-            write_buf.clear();
         }
 
         if should_close {

@@ -117,8 +117,7 @@ where
         };
         let request_id = conn.peek_next_request_id_for_test();
         let _h = conn.create_producer(req);
-        let mut sink: Vec<u8> = Vec::new();
-        conn.poll_transmit(&mut sink);
+        let _ = conn.poll_transmit();
         let attach_now = now + Duration::from_millis(1);
         conn.handle_bytes(attach_now, &producer_success_bytes(request_id))
             .expect("producer success");
@@ -272,8 +271,7 @@ fn drive_one(inner: &parking_lot::Mutex<magnetar_proto::Connection>, now: &mut I
             topic: "persistent://public/default/diff-anti-thrash".to_owned(),
             ..Default::default()
         });
-        let mut sink: Vec<u8> = Vec::new();
-        conn.poll_transmit(&mut sink);
+        let _ = conn.poll_transmit();
         let attach_now = *now + Duration::from_millis(1);
         conn.handle_bytes(attach_now, &producer_success_bytes(request_id))
             .expect("producer success");

@@ -140,8 +140,7 @@ fn ack_timeout_fires_at_virtual_deadline() {
     // frame in isolation.
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     // Tick before the deadline. Tracker still holds the id; no redeliver
@@ -149,10 +148,9 @@ fn ack_timeout_fires_at_virtual_deadline() {
     {
         let mut conn = shared.inner.lock();
         conn.handle_timeout(t0 + Duration::from_millis(9_900));
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let n = conn.poll_transmit(&mut tx_buf);
-        assert_eq!(
-            n, 0,
+        let tx = conn.poll_transmit();
+        assert!(
+            tx.is_empty(),
             "no redeliver-unacked frame should be queued before the virtual deadline"
         );
     }
@@ -162,15 +160,13 @@ fn ack_timeout_fires_at_virtual_deadline() {
     {
         let mut conn = shared.inner.lock();
         conn.handle_timeout(t0 + Duration::from_millis(10_500));
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let n = conn.poll_transmit(&mut tx_buf);
+        let mut src = conn.poll_transmit();
         assert!(
-            n > 0,
+            !src.is_empty(),
             "ack-timeout sweep at virtual deadline must queue a redeliver-unacked frame"
         );
         // Decode the queued frame to confirm it is the expected
         // `CommandRedeliverUnacknowledgedMessages` for the right consumer.
-        let mut src: Bytes = Bytes::copy_from_slice(&tx_buf[..n]);
         let frame = magnetar_proto::decode_one(&mut src).expect("decode redeliver frame");
         assert_eq!(
             frame.command.r#type,

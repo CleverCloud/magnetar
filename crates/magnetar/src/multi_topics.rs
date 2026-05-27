@@ -34,6 +34,7 @@
 //! [`crate::PatternConsumer`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::future::select_all;
@@ -67,7 +68,7 @@ struct Inner<C: ConsumerApi> {
     /// Round-robin cursor used by `receive` to record the index of the topic that produced
     /// the last message. Wrapped in a Mutex because [`MultiTopicsConsumer`] is `&self` —
     /// cloning the handle should not require mutable access.
-    cursor: Mutex<usize>,
+    cursor: std::sync::atomic::AtomicUsize,
     /// Template for subscribing newly-added topics. Captures every
     /// [`crate::ConsumerBuilder`] knob the user set on the original
     /// [`MultiTopicsConsumerBuilder`].
@@ -110,10 +111,10 @@ struct AutoUpdateTask {
     /// `-partition-N` suffix).
     topic: String,
     /// Last partition count observed by the watcher.
-    observed_partitions: Arc<Mutex<u32>>,
+    observed_partitions: Arc<AtomicU32>,
     /// Monotonic counter of "partition count changed" events. Useful for tests and
     /// "did anything change since I last looked?" probes.
-    change_count: Arc<Mutex<u64>>,
+    change_count: Arc<AtomicU64>,
     /// Signalled every time the internal timer fires, and every time
     /// [`MultiTopicsConsumer::refresh_partitions`] detects a real partition-count
     /// change.
@@ -145,8 +146,8 @@ fn spawn_auto_update_task(
     interval: Duration,
     initial_partitions: u32,
 ) -> Arc<AutoUpdateTask> {
-    let observed_partitions = Arc::new(Mutex::new(initial_partitions));
-    let change_count = Arc::new(Mutex::new(0u64));
+    let observed_partitions = Arc::new(AtomicU32::new(initial_partitions));
+    let change_count = Arc::new(AtomicU64::new(0));
     let changed = Arc::new(Notify::new());
     let shutdown = Arc::new(Notify::new());
 
@@ -515,7 +516,7 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
                 .receive()
                 .await
                 .map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
-            *self.inner.cursor.lock() = 0;
+            self.inner.cursor.store(0, Ordering::Relaxed);
             return Ok(MultiTopicsMessage {
                 topic: nc.topic.clone(),
                 message: msg,
@@ -526,7 +527,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         let (result, idx, _rest) = select_all(futures).await;
         let topic = snapshot[idx].topic.clone();
         let message = result.map_err(|e| PulsarError::Other(format!("receive: {e}")))?;
-        *self.inner.cursor.lock() = (idx + 1) % snapshot.len();
+        self.inner
+            .cursor
+            .store((idx + 1) % snapshot.len(), Ordering::Relaxed);
         Ok(MultiTopicsMessage { topic, message })
     }
 
@@ -817,7 +820,7 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         self.inner
             .auto_update
             .as_ref()
-            .map(|t| *t.observed_partitions.lock())
+            .map(|t| t.observed_partitions.load(Ordering::Relaxed))
     }
 
     /// Monotonic count of partition-change events observed by the background
@@ -827,7 +830,7 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         self.inner
             .auto_update
             .as_ref()
-            .map(|t| *t.change_count.lock())
+            .map(|t| t.change_count.load(Ordering::Relaxed))
     }
 
     /// `Arc<Notify>` signalled by the background partition-watcher on every timer
@@ -872,13 +875,12 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
             return Ok(None);
         };
         let count = client.partitions_for_topic(&task.topic).await?;
-        let mut observed = task.observed_partitions.lock();
-        if *observed != count {
-            *observed = count;
-            drop(observed);
-            let mut cnt = task.change_count.lock();
-            *cnt = cnt.saturating_add(1);
-            drop(cnt);
+        // Atomic swap-then-compare: a real change (prev != count) bumps the
+        // change counter and wakes the notify. The Mutex previously held
+        // here served no compound invariant — just a single u32 store.
+        let prev = task.observed_partitions.swap(count, Ordering::Relaxed);
+        if prev != count {
+            task.change_count.fetch_add(1, Ordering::Relaxed);
             task.changed.notify_waiters();
         }
         Ok(Some(count))
@@ -1237,7 +1239,7 @@ where
         Ok(MultiTopicsConsumer {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(consumers),
-                cursor: Mutex::new(0),
+                cursor: std::sync::atomic::AtomicUsize::new(0),
                 template,
                 auto_update,
             }),
@@ -1284,7 +1286,7 @@ mod tests {
     fn empty_inner_is_consistent() {
         let inner: Arc<Inner<magnetar_runtime_tokio::Consumer>> = Arc::new(Inner {
             consumers: Mutex::new(Vec::new()),
-            cursor: Mutex::new(0),
+            cursor: std::sync::atomic::AtomicUsize::new(0),
             template: empty_template(),
             auto_update: None,
         });

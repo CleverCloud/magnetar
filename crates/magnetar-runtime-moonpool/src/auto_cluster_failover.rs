@@ -51,6 +51,7 @@
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -110,8 +111,10 @@ pub struct AutoClusterFailover<P: Providers> {
     /// Health-probe trait object applied to every URL.
     probe: Arc<dyn HealthProbe>,
     /// Index of the currently-active URL inside `urls`. Mutated by the
-    /// background prober; read by `get_service_url()`.
-    active: Arc<Mutex<usize>>,
+    /// background prober; read by `get_service_url()`. Lock-free
+    /// `AtomicUsize` — the prober's compound check is collapsed into a
+    /// single `swap`, and readers do a single `load`.
+    active: Arc<AtomicUsize>,
     /// `PhantomData` so the type carries the provider bundle without
     /// holding one. Constructors are cheap; the provider bundle is only
     /// needed when [`Self::start`] spawns the probe loop.
@@ -136,7 +139,7 @@ impl<P: Providers> std::fmt::Debug for AutoClusterFailover<P> {
         f.debug_struct("AutoClusterFailover")
             .field("urls", &self.urls)
             .field("probe", &self.probe)
-            .field("active_index", &*self.active.lock())
+            .field("active_index", &self.active.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -174,7 +177,7 @@ impl<P: Providers> AutoClusterFailover<P> {
         Self {
             urls: Arc::new(urls),
             probe,
-            active: Arc::new(Mutex::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
             _providers: std::marker::PhantomData,
         }
     }
@@ -227,15 +230,14 @@ impl<P: Providers> AutoClusterFailover<P> {
                         }
                     }
                     if let Some(idx) = new_active {
-                        let mut guard = active.lock();
-                        if *guard != idx {
+                        let prev = active.swap(idx, Ordering::Relaxed);
+                        if prev != idx {
                             tracing::info!(
-                                from_index = *guard,
+                                from_index = prev,
                                 to_index = idx,
                                 to_url = %urls[idx],
                                 "AutoClusterFailover (moonpool): switching active URL",
                             );
-                            *guard = idx;
                         }
                     }
                     // No healthy candidate — keep the current active URL. The
@@ -249,7 +251,7 @@ impl<P: Providers> AutoClusterFailover<P> {
     /// tests and observability.
     #[must_use]
     pub fn active_index(&self) -> usize {
-        *self.active.lock()
+        self.active.load(Ordering::Relaxed)
     }
 }
 

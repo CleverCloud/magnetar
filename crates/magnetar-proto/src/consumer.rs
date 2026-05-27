@@ -735,9 +735,13 @@ impl ConsumerState {
                 tracker.add_with_redelivery_count(msg.message_id, msg.redelivery_count, now);
             }
             self.queue.push_back(msg);
-            DeliverOutcome::Delivered {
-                count: self.queue.len(),
-            }
+            // `classify_and_queue` always appends exactly one message to the queue (the
+            // batched-delivery loop in `deliver` calls this once per sub-message and
+            // assembles its own `count`). The caller at `conn.rs` interprets `count`
+            // as the number of *newly* delivered tail entries — returning
+            // `self.queue.len()` would emit one `ConnectionEvent::Message` per queued
+            // backlog entry on every arrival, scaling O(n²) with the receive queue.
+            DeliverOutcome::Delivered { count: 1 }
         }
     }
 

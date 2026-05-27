@@ -29,7 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::task::Waker;
 use std::time::{Instant, SystemTime};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 
 use crate::consumer::ConsumerState;
 use crate::error::ProtocolError;
@@ -1269,26 +1269,44 @@ impl Connection {
         self.last_activity = Some(now);
         self.inbound.extend_from_slice(bytes);
         loop {
-            // We must work with `Bytes` because `decode_one` advances it; we clone the buffer
-            // contents into a `Bytes` so the cursor advances inside the cloned cursor; on
-            // success we then truncate `self.inbound` by the same amount.
-            let mut snapshot = Bytes::copy_from_slice(&self.inbound);
-            let before = snapshot.len();
-            match decode_one(&mut snapshot) {
+            // Peek the front of the inbound buffer to find out whether a
+            // complete frame is ready. If not, park and wait for more
+            // bytes — `self.inbound` retains everything we've seen so far.
+            let frame_len = match crate::frame::peek_full_frame_len(&self.inbound) {
+                Ok(None) => return Ok(()),
+                Ok(Some(len)) => len,
+                Err(err) => return Err(err.into()),
+            };
+            // Carve the complete frame off the front of `inbound` via an
+            // O(1) `split_to` (no copy) and freeze the resulting BytesMut
+            // into a refcounted Bytes for `decode_one` to advance through.
+            //
+            // Earlier shapes of this loop called
+            // `Bytes::copy_from_slice(&self.inbound)` on every iteration —
+            // a full memcpy of the entire remaining inbound buffer per
+            // frame — and then `advance`d `self.inbound` by the consumed
+            // count. Now we know the exact frame length up front and
+            // never copy.
+            let mut frame_bytes = self.inbound.split_to(frame_len).freeze();
+            match decode_one(&mut frame_bytes) {
                 Ok(frame) => {
-                    let consumed = before - snapshot.len();
-                    self.inbound.advance(consumed);
                     self.handle_frame(now, frame)?;
                 }
-                Err(crate::frame::FrameError::Incomplete { .. }) => return Ok(()),
                 Err(crate::frame::FrameError::ChecksumMismatch { computed, expected }) => {
-                    let consumed = before - snapshot.len();
-                    self.inbound.advance(consumed);
+                    // CRC mismatch — drop the corrupt frame, emit the
+                    // observation event, and keep decoding.
                     self.events
                         .push_back(ConnectionEvent::ChecksumMismatch { computed, expected });
-                    // continue decoding next frames after dropping the corrupt one
                 }
-                Err(other) => return Err(other.into()),
+                Err(other) => {
+                    // Any other error — including internal `Incomplete`
+                    // arising from a malformed payload whose declared
+                    // `total_size` promised contents it lacks — is
+                    // fatal on this connection. We've already split the
+                    // declared bytes off `self.inbound`; waiting for more
+                    // cannot fix a frame whose own length field lied.
+                    return Err(other.into());
+                }
             }
         }
     }
@@ -2123,16 +2141,28 @@ impl Connection {
         }
     }
 
-    /// Drain queued outbound bytes into `buf`. Returns the number of bytes copied.
-    pub fn poll_transmit(&mut self, buf: &mut Vec<u8>) -> usize {
+    /// Drain queued outbound bytes via O(1) ownership transfer.
+    ///
+    /// Returns the previously-buffered bytes as a refcounted [`Bytes`] —
+    /// proto's internal `outbound` is left empty (capacity preserved). An
+    /// empty return signals "nothing to send".
+    ///
+    /// This is the hot path on every driver iteration: `BytesMut::split`
+    /// is O(1) (just a refcount bump on the shared buffer header) whereas
+    /// the prior `extend_from_slice(&outbound)` signature copied the
+    /// entire outbound buffer once per flush.
+    pub fn poll_transmit(&mut self) -> Bytes {
         self.drain_producer_outbound();
-        if self.outbound.is_empty() {
-            return 0;
-        }
-        let n = self.outbound.len();
-        buf.extend_from_slice(&self.outbound);
-        self.outbound.clear();
-        n
+        let out = self.outbound.split().freeze();
+        // Restore a pre-sized scratch buffer so the next encode does not
+        // start from zero capacity. `split` leaves `self.outbound` as a
+        // view at the tail of the (now-shared) underlying buffer with
+        // length 0; subsequent writes would force a realloc on first
+        // touch. Replacing with a fresh buffer keeps the next iteration's
+        // small writes fast and detaches us cleanly from the buffer the
+        // caller now owns.
+        self.outbound = BytesMut::with_capacity(4 * 1024);
+        out
     }
 
     /// Pull the next [`ConnectionEvent`], if any.
@@ -4276,9 +4306,7 @@ mod conn_state_tests {
     /// the new socket. Drains [`Connection::poll_transmit`] (clearing internal state) and
     /// returns the parsed [`pb::BaseCommand`]s in wire order.
     fn drain_outbound_commands(conn: &mut Connection) -> Vec<pb::BaseCommand> {
-        let mut buf = Vec::<u8>::new();
-        let _ = conn.poll_transmit(&mut buf);
-        let mut cursor = Bytes::copy_from_slice(&buf);
+        let mut cursor = conn.poll_transmit();
         let mut commands = Vec::new();
         while !cursor.is_empty() {
             let frame = crate::frame::decode_one(&mut cursor).expect("decode frame");
@@ -5071,11 +5099,7 @@ mod conn_state_tests {
 
         // The post-rebuild outbound buffer carries the CommandProducer first, then the
         // three replayed CommandSend frames in FIFO order. Decode payloads to verify.
-        let raw_bytes = {
-            let mut buf: Vec<u8> = Vec::new();
-            let _ = conn.poll_transmit(&mut buf);
-            buf
-        };
+        let raw_bytes = conn.poll_transmit();
         let mut cursor = bytes::Bytes::copy_from_slice(&raw_bytes);
         let mut send_payloads: Vec<Vec<u8>> = Vec::new();
         while !cursor.is_empty() {
@@ -5234,9 +5258,7 @@ mod conn_state_tests {
     }
 
     fn drain_command_subscribe(conn: &mut Connection) -> pb::CommandSubscribe {
-        let mut out = Vec::new();
-        conn.poll_transmit(&mut out);
-        let mut bytes = bytes::Bytes::from(out);
+        let mut bytes = conn.poll_transmit();
         loop {
             let frame = crate::frame::decode_one(&mut bytes).expect("decode subscribe");
             if frame.command.r#type == pb::base_command::Type::Subscribe as i32 {
@@ -5259,8 +5281,7 @@ mod conn_state_tests {
         // Default subscribe (None) MUST omit field 14 entirely so the wire bytes match v0.1.0
         // (preserves backward compat for callers that never touched the flag).
         let (mut conn_none, _) = handshake_subscribe(None);
-        let mut out_none = Vec::new();
-        conn_none.poll_transmit(&mut out_none);
+        let _ = conn_none.poll_transmit();
 
         let sub = drain_command_subscribe(&mut {
             let (c, _) = handshake_subscribe(None);
@@ -5363,8 +5384,7 @@ mod conn_state_tests {
         let _ = drain_command_subscribe(&mut conn);
         let _ = conn.initial_flow(handle);
         // Drain any flow command on the wire.
-        let mut sink = Vec::new();
-        conn.poll_transmit(&mut sink);
+        let _ = conn.poll_transmit();
 
         let frame = message_frame(handle.0, &regular_metadata(), b"hello-pip-33");
         conn.handle_bytes(Instant::now(), &frame)
@@ -5395,8 +5415,7 @@ mod conn_state_tests {
         let (mut conn, handle) = handshake_subscribe(None);
         let _ = drain_command_subscribe(&mut conn);
         let _ = conn.initial_flow(handle);
-        let mut sink = Vec::new();
-        conn.poll_transmit(&mut sink);
+        let _ = conn.poll_transmit();
 
         let mut meta = marker_metadata(21); // TXN_COMMIT
         meta.num_messages_in_batch = Some(1);
@@ -5415,6 +5434,40 @@ mod conn_state_tests {
         assert!(
             !saw_rs_marker,
             "txn markers must not fire the PIP-33 observation event",
+        );
+    }
+
+    #[test]
+    fn message_events_do_not_amplify_with_queue_depth() {
+        // Regression: `ConsumerState::classify_and_queue` used to return
+        // `count: self.queue.len()`, so the connection emitted one
+        // `ConnectionEvent::Message` per *queued* entry on every new arrival —
+        // O(n²) events for n messages received without an interleaved
+        // `pop_message`. Each event carried a full `IncomingMessage` clone.
+        // The fix returns `count: 1` for the single-append path; the batched
+        // path in `deliver` already counts its own loop iterations.
+        let (mut conn, handle) = handshake_subscribe(None);
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        // Feed three single-message frames back-to-back with no `pop_message`
+        // in between. Each must produce exactly one Message event.
+        for payload in [b"msg-a".as_slice(), b"msg-b", b"msg-c"] {
+            let frame = message_frame(handle.0, &regular_metadata(), payload);
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle regular message");
+        }
+
+        let mut message_event_count = 0_usize;
+        while let Some(ev) = conn.poll_event() {
+            if matches!(ev, ConnectionEvent::Message { handle: h, .. } if h == handle) {
+                message_event_count += 1;
+            }
+        }
+        assert_eq!(
+            message_event_count, 3,
+            "expected one Message event per arrival, not O(n²) amplification",
         );
     }
 }

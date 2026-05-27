@@ -65,6 +65,7 @@
     clippy::doc_markdown
 )]
 
+pub mod auth_file;
 pub mod auto_cluster_failover;
 mod client;
 pub mod compress;
@@ -88,6 +89,7 @@ use parking_lot::Mutex;
 use slab::Slab;
 use tokio::sync::Notify;
 
+pub use crate::auth_file::file_token_auth;
 pub use crate::auto_cluster_failover::{AutoClusterFailover, TokioHealthProbe};
 pub use crate::client::Client;
 pub use crate::compress::CompressionError;

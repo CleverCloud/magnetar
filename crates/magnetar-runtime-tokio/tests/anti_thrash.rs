@@ -99,8 +99,7 @@ fn one_thrash_cycle(shared: &Arc<ConnectionShared>, idx: u32, now: Instant) -> I
 
     // Drain the outbound bytes the state machine queued (the production driver
     // would write these to the socket; we simply discard them in this test).
-    let mut sink: Vec<u8> = Vec::new();
-    conn.poll_transmit(&mut sink);
+    conn.poll_transmit();
 
     let attach_now = now + Duration::from_millis(1);
     let success = producer_success_bytes(request_id);

@@ -74,8 +74,7 @@ fn open_producer(conn: &mut Connection, topic: &str, at: Instant) -> ProducerHan
     while let Some(_e) = conn.poll_event() {}
     // Drain the producer's outbound CommandProducer so it doesn't bleed into
     // later wire captures.
-    let mut sink = Vec::new();
-    let _ = conn.poll_transmit(&mut sink);
+    let _ = conn.poll_transmit();
     handle
 }
 
@@ -106,8 +105,7 @@ fn open_consumer(
     encode_command(&mut buf, &success).expect("encode CommandSuccess");
     conn.handle_bytes(at, &buf).expect("apply CommandSuccess");
     while let Some(_e) = conn.poll_event() {}
-    let mut sink = Vec::new();
-    let _ = conn.poll_transmit(&mut sink);
+    let _ = conn.poll_transmit();
     handle
 }
 
@@ -161,9 +159,7 @@ fn shadow_message_frame(
 /// `MessageMetadata`) from the connection's outbound queue. Returns the
 /// pair so tests can assert on `CommandSend.message_id`.
 fn pop_last_command_send(conn: &mut Connection) -> (pb::CommandSend, pb::MessageMetadata) {
-    let mut sink = Vec::new();
-    let _ = conn.poll_transmit(&mut sink);
-    let mut cursor = Bytes::from(sink);
+    let mut cursor = conn.poll_transmit();
     let mut last: Option<(pb::CommandSend, pb::MessageMetadata)> = None;
     while !cursor.is_empty() {
         let frame = magnetar_proto::decode_one(&mut cursor).expect("decode wire frame");
@@ -397,9 +393,7 @@ async fn producer_chunked_send_with_source_id_propagates_to_every_chunk() {
     conn.send(handle, msg, 1_700_000_000, at).expect("send ok");
     // Drain ALL outbound and count CommandSend frames carrying the
     // source-id field. Every chunk frame must carry it.
-    let mut sink = Vec::new();
-    let _ = conn.poll_transmit(&mut sink);
-    let mut cursor = Bytes::from(sink);
+    let mut cursor = conn.poll_transmit();
     let mut chunk_count = 0u32;
     let mut stamped_count = 0u32;
     while !cursor.is_empty() {

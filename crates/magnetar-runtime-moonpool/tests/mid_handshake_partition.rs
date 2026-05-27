@@ -63,8 +63,7 @@ fn mid_handshake_partition_keeps_state_machine_recoverable() {
     //    We discard them: in a partition the broker never received them anyway.
     {
         let mut conn = shared.inner.lock();
-        let mut buf: Vec<u8> = Vec::with_capacity(1024);
-        let n = conn.poll_transmit(&mut buf);
+        let n = conn.poll_transmit().len();
         assert!(
             n > 0,
             "begin_handshake must have queued a CommandConnect (got {n} bytes)"
@@ -100,8 +99,7 @@ fn mid_handshake_partition_keeps_state_machine_recoverable() {
 
         // Drain the second CommandConnect — the driver would have written
         // this over the freshly-dialed socket.
-        let mut buf: Vec<u8> = Vec::with_capacity(1024);
-        let n = conn.poll_transmit(&mut buf);
+        let n = conn.poll_transmit().len();
         assert!(n > 0, "re-handshake must queue a fresh CommandConnect");
 
         // The broker on the new socket replies. We feed the Connected frame

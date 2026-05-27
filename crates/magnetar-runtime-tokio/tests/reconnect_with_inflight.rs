@@ -160,8 +160,7 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     // Drain the wire frames so we observe the post-rebuild wire activity in isolation.
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     let epoch_before = shared.inner.lock().session_epoch();
@@ -216,13 +215,10 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
 
     // Drain the post-rebuild wire frames — must include one CommandProducer (the
     // re-attach) + INFLIGHT_COUNT CommandSends in original sequence-id order.
-    let raw_bytes = {
+    let mut cursor = {
         let mut conn = shared.inner.lock();
-        let mut buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut buf);
-        buf
+        conn.poll_transmit()
     };
-    let mut cursor = Bytes::copy_from_slice(&raw_bytes);
     let mut sends: Vec<u64> = Vec::new();
     while !cursor.is_empty() {
         let frame = magnetar_proto::frame::decode_one(&mut cursor).expect("decode frame");
@@ -298,8 +294,7 @@ fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
 
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     shared.inner.lock().reset();
@@ -319,8 +314,7 @@ fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
     }
     {
         let mut conn = shared.inner.lock();
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     {
@@ -378,8 +372,7 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
                 .expect("queue");
             seqs.push(seq);
         }
-        let mut tx_buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut tx_buf);
+        let _ = conn.poll_transmit();
     }
 
     shared.inner.lock().reset();
@@ -392,13 +385,10 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
         let _ = conn.rebuild_producers();
     }
 
-    let raw_bytes = {
+    let mut cursor = {
         let mut conn = shared.inner.lock();
-        let mut buf: Vec<u8> = Vec::new();
-        let _ = conn.poll_transmit(&mut buf);
-        buf
+        conn.poll_transmit()
     };
-    let mut cursor = Bytes::copy_from_slice(&raw_bytes);
     let mut send_seqs: Vec<u64> = Vec::new();
     let mut send_payloads: Vec<Vec<u8>> = Vec::new();
     while !cursor.is_empty() {

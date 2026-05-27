@@ -107,6 +107,36 @@ pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
 use crate::transport::Transport;
 
+/// Default wall-clock epoch used by deterministic-sim callers that pin a
+/// fixed base via [`ConnectionShared::with_auth_and_wall_clock_base`].
+///
+/// Picked as `2024-01-01T00:00:00Z` (1_704_067_200 seconds since
+/// `UNIX_EPOCH`, in millis). The exact value is arbitrary — what matters
+/// is that every test using `DETERMINISTIC_SIM_EPOCH_MS` reads the same
+/// wall clock, so wire bytes (and the `publish_time` field on outbound
+/// `CommandSend` frames in particular) are reproducible across runs of
+/// the same seed. Pairs with the moonpool wall-clock bridge tracked in
+/// `docs/follow-ups.md`.
+pub const DETERMINISTIC_SIM_EPOCH_MS: u64 = 1_704_067_200_000;
+
+/// Capture the host's current `SystemTime` as millis-since-`UNIX_EPOCH`.
+/// Used by [`ConnectionShared::with_auth`] for the
+/// production / dev path; deterministic-sim tests should call
+/// [`ConnectionShared::with_auth_and_wall_clock_base`] with a fixed
+/// epoch (e.g. [`DETERMINISTIC_SIM_EPOCH_MS`]) instead.
+fn current_wall_clock_base_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| {
+            let m = d.as_millis();
+            if m > u128::from(u64::MAX) {
+                u64::MAX
+            } else {
+                m as u64
+            }
+        })
+}
+
 /// Shared connection state for the moonpool engine. Mirrors the tokio
 /// engine's `ConnectionShared`: a non-async mutex over the sans-io state
 /// machine plus a single-cell driver wakeup.
@@ -192,6 +222,29 @@ pub struct ConnectionShared {
     /// *eventual* progress under `ProducerBlock`, not a specific wake
     /// order. See ADR-0022.
     pub memory_wakers: Mutex<Slab<Waker>>,
+    /// Fixed wall-clock anchor in millis-since-`UNIX_EPOCH`, captured
+    /// once at [`Self::with_auth`] time (default: host
+    /// `SystemTime::now`; tests may override via
+    /// [`Self::with_auth_and_wall_clock_base`]).
+    ///
+    /// Combined with [`Self::wall_clock_ms`] (which the driver loop
+    /// advances each iteration from `providers.time().now()`) to feed
+    /// the proto-layer wall-clock closure a deterministic `SystemTime`.
+    /// Without this bridge, `Connection::handle_timeout` reads the host
+    /// `SystemTime::now` on every batch-publish stamp, breaking
+    /// [ADR-0019](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0019-engine-scope-and-moonpool-parity.md)
+    /// determinism.
+    pub wall_clock_base_ms: u64,
+    /// Atomic millis-since-`UNIX_EPOCH`, advanced by the driver loop
+    /// (`wall_clock_base_ms + providers.time().now().as_millis()`) and
+    /// read by the proto-layer wall-clock closure installed via
+    /// [`Connection::set_wall_clock_provider`] in [`Self::with_auth`].
+    ///
+    /// `AtomicU64` is `Send + Sync` regardless of the surrounding
+    /// `P::Time` impl, which is what lets this bridge work under
+    /// `SimProviders` (whose `SimTimeProvider` holds
+    /// `Weak<RefCell<…>>` and is structurally `!Send + !Sync`).
+    pub wall_clock_ms: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for ConnectionShared {
@@ -205,16 +258,39 @@ impl std::fmt::Debug for ConnectionShared {
 
 impl ConnectionShared {
     /// Construct shared state from the given protocol-layer config.
+    ///
+    /// The wall-clock base is captured from the host `SystemTime::now`
+    /// at this point — see [`Self::with_auth_and_wall_clock_base`] for
+    /// the deterministic-sim variant that lets tests pin a fixed epoch.
     #[must_use]
     pub fn new(config: ConnectionConfig) -> Arc<Self> {
         Self::with_auth(config, None)
     }
 
     /// Construct with an auth provider for in-band challenge refresh.
+    ///
+    /// Picks up the host's current wall-clock as the engine's base.
+    /// Most callers want this; deterministic-sim tests should use
+    /// [`Self::with_auth_and_wall_clock_base`] to pin a fixed epoch
+    /// so wire output is reproducible across seeds.
     #[must_use]
     pub fn with_auth(
         config: ConnectionConfig,
         auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+    ) -> Arc<Self> {
+        Self::with_auth_and_wall_clock_base(config, auth_provider, current_wall_clock_base_ms())
+    }
+
+    /// Construct with an explicit `wall_clock_base_ms`. Use this from
+    /// deterministic-sim tests that need byte-identical wire output
+    /// across runs of the same seed — pin `wall_clock_base_ms` to a
+    /// fixed value (e.g. [`DETERMINISTIC_SIM_EPOCH_MS`]) so the
+    /// proto-layer wall-clock closure is fully reproducible.
+    #[must_use]
+    pub fn with_auth_and_wall_clock_base(
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+        wall_clock_base_ms: u64,
     ) -> Arc<Self> {
         let memory_limit_bytes = config.memory_limit_bytes;
         let memory_limit_policy = config.memory_limit_policy;
@@ -229,8 +305,18 @@ impl ConnectionShared {
             || std::time::Duration::from_secs(30),
             |s| s.max_backoff_after_thrash,
         );
+        let wall_clock_ms = Arc::new(AtomicU64::new(wall_clock_base_ms));
+        // Install the proto-layer wall-clock closure that reads our
+        // atomic instead of the host `SystemTime::now`.
+        let read_handle = wall_clock_ms.clone();
+        let wall_clock_provider: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync> =
+            Arc::new(move || {
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(read_handle.load(Ordering::Relaxed))
+            });
         let mut conn = Connection::new(config);
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
+        conn.set_wall_clock_provider(wall_clock_provider);
         Arc::new(Self {
             inner: Mutex::new(conn),
             driver_waker: Notify::new(),
@@ -244,6 +330,8 @@ impl ConnectionShared {
             memory_used: AtomicU64::new(0),
             memory_limit_policy,
             memory_wakers: Mutex::new(Slab::new()),
+            wall_clock_base_ms,
+            wall_clock_ms,
         })
     }
 
@@ -645,7 +733,6 @@ async fn handshake_plain<P: Providers>(
     transport: &mut Transport<P>,
 ) -> Result<(), EngineError> {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
-    let mut write_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
 
     {
         let mut conn = shared.inner.lock();
@@ -657,15 +744,13 @@ async fn handshake_plain<P: Providers>(
 
     loop {
         // 1. Drain outbound bytes the state machine has queued.
-        {
+        let write_buf = {
             let mut conn = shared.inner.lock();
-            write_buf.clear();
-            let _ = conn.poll_transmit(&mut write_buf);
-        }
+            conn.poll_transmit()
+        };
         if !write_buf.is_empty() {
             transport.write_all(&write_buf).await?;
             transport.flush().await?;
-            write_buf.clear();
         }
 
         // 2. If we're already past handshake, we're done.
@@ -698,10 +783,12 @@ async fn handshake_plain<P: Providers>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use magnetar_proto::ConnectionConfig;
     use moonpool_core::TokioProviders;
 
-    use super::{ConnectionShared, MoonpoolEngine, TopicListChange};
+    use super::{ConnectionShared, DETERMINISTIC_SIM_EPOCH_MS, MoonpoolEngine, TopicListChange};
 
     #[test]
     fn engine_can_be_constructed_with_tokio_providers() {
@@ -717,6 +804,41 @@ mod tests {
         let _g = s.inner.lock();
         // Topic-list buffer starts empty.
         assert!(s.topic_list_changes.lock().is_empty());
+    }
+
+    #[test]
+    fn shared_state_seeds_wall_clock_from_host_by_default() {
+        // `with_auth` (and `new` by extension) captures the host's current
+        // `SystemTime`. The atomic should be initialised to a non-zero
+        // value within a sane window of "now". Without a tighter window
+        // this test would have to construct twice and assert monotonicity,
+        // which is brittle on slow CI — so we settle for "looks like a
+        // 2020+ wall-clock millis-since-epoch".
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        let observed = s.wall_clock_ms.load(Ordering::Relaxed);
+        // Lower bound = 2020-01-01 (a value the audit-fix branch will only
+        // ever be built well after). Upper bound = year 9999.
+        assert!(observed >= 1_577_836_800_000, "got {observed}");
+        assert!(observed < 253_402_300_799_000, "got {observed}");
+        assert_eq!(s.wall_clock_base_ms, observed);
+    }
+
+    #[test]
+    fn shared_state_pins_wall_clock_base_for_deterministic_sim() {
+        // The deterministic-sim entry point pins the wall-clock base.
+        // Without the driver running, the atomic stays at exactly that
+        // base — `Connection::handle_timeout` batch-publish stamping
+        // will therefore read a reproducible `SystemTime`.
+        let s = ConnectionShared::with_auth_and_wall_clock_base(
+            ConnectionConfig::default(),
+            None,
+            DETERMINISTIC_SIM_EPOCH_MS,
+        );
+        assert_eq!(s.wall_clock_base_ms, DETERMINISTIC_SIM_EPOCH_MS);
+        assert_eq!(
+            s.wall_clock_ms.load(Ordering::Relaxed),
+            DETERMINISTIC_SIM_EPOCH_MS,
+        );
     }
 
     #[test]

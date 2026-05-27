@@ -2278,10 +2278,8 @@ mod tests {
         }
 
         let pending_publish_bytes = {
-            let mut sink = Vec::new();
             let mut conn = shared.inner.lock();
-            let _ = conn.poll_transmit(&mut sink);
-            sink.len()
+            conn.poll_transmit().len()
         };
         assert!(
             pending_publish_bytes > 0,
