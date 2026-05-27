@@ -867,6 +867,49 @@ impl PulsarClient<crate::TokioEngine> {
         crate::PartitionedProducerBuilder::new(self, topic.into())
     }
 
+    /// PIP-180 (ADR-0033): subscribe with automatic shadow-source resolution.
+    ///
+    /// Performs the `magnetar-admin` `get_shadow_source(topic)` REST lookup,
+    /// subscribes to `topic` with `subscription_name` (exclusive, durable),
+    /// and — when the broker reports `topic` is a shadow — primes the
+    /// consumer's shadow metadata via
+    /// [`magnetar_runtime_tokio::Consumer::set_shadow_source`] so the receive
+    /// path emits
+    /// [`magnetar_proto::ConnectionEvent::MessageReceivedFromShadow`]
+    /// without an out-of-band lookup per message.
+    ///
+    /// For regular (non-shadow) topics the call collapses to a plain
+    /// `.consumer(topic).subscription(subscription_name).subscribe()`.
+    ///
+    /// # Errors
+    ///
+    /// - [`PulsarError::Other`] wrapping the admin REST error if the `get_shadow_source` lookup
+    ///   fails.
+    /// - Any error from the underlying `.subscribe()` round-trip.
+    #[cfg(feature = "admin")]
+    pub async fn subscribe_shadow_aware(
+        &self,
+        admin: &magnetar_admin::AdminClient,
+        topic: impl Into<String>,
+        subscription_name: impl Into<String>,
+    ) -> Result<magnetar_runtime_tokio::Consumer, PulsarError> {
+        let topic = topic.into();
+        let subscription_name = subscription_name.into();
+        let source = admin
+            .get_shadow_source(&topic)
+            .await
+            .map_err(|e| PulsarError::Other(format!("get_shadow_source({topic}): {e}")))?;
+        let consumer = self
+            .consumer(topic)
+            .subscription(subscription_name)
+            .subscribe()
+            .await?;
+        if let Some(source_topic) = source {
+            consumer.set_shadow_source(source_topic);
+        }
+        Ok(consumer)
+    }
+
     /// PIP-33 (ADR-0034): non-blocking peek for the next replicated-subscription
     /// marker observation buffered by the driver. `None` when the buffer is empty.
     /// Mirrors [`magnetar_runtime_tokio::Client::poll_replicated_subscription_marker`].

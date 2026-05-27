@@ -294,15 +294,6 @@ Status snapshot:
 
 ### PIP-180 post-landing follow-ups
 
-- **Subscribe-time admin REST hint integration (façade-level)** —
-  the runtime engines expose `Consumer::set_shadow_source(...)` but
-  do NOT call the admin REST `get_shadow_source(topic)` automatically
-  at `subscribe()` time. Today the caller threads the source-topic
-  hint in by hand (or via the magnetar façade above the runtime,
-  which has `magnetar-admin` available behind the `admin` feature).
-  A clean addition would be a `Client::subscribe_shadow_aware(...)`
-  on the magnetar façade that performs the lookup when the `admin`
-  feature is active.
 - **Post-subscribe shadow-metadata cache race** — the per-`Consumer`
   shadow metadata is resolved once at subscribe time and cached
   for the consumer's lifetime. If a shadow is created on a topic
