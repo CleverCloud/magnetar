@@ -442,7 +442,13 @@ session that landed the above):**
 3. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
    `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"`
    parameterising existing e2e patterns against Pulsar 4.0.4.
-4. `docs/v5-client.md` (NEW) including the mapping table.
+4. `docs/v5-client.md` (NEW) including the mapping table —
+   **landed**: comprehensive reference doc covering enable
+   instructions, quick start, the full V5 → v4 mapping table with
+   translation-function references, edge cases (`None` vs
+   `Some(Duration::ZERO)`, saturation), subscription-type matrix, v4
+   escape hatch contract, test-layer cross-reference, and roadmap.
+   Linked from `docs/README.md`.
 5. ADR-0032 flip from Proposed → Accepted once (1)–(4) land + the
    matrix sweep (`check-crypto-matrix` × V5 axis) is green.
 6. Engine-genericity: today's `PulsarClientV5` wraps `PulsarClient`

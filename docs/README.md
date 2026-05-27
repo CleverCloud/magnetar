@@ -19,6 +19,7 @@ contributors; this folder goes deeper.
 | [`cli.md`](cli.md) | `magnetar` binary reference — `--version` banner, color policy, build-time metadata. |
 | [`shadow-topic.md`](shadow-topic.md) | PIP-180 shadow topics — admin REST, producer-side `send_with_source_message_id`, consumer-side `MessageReceivedFromShadow`, structural `MessageId` equality, caveats. |
 | [`replicated-subscriptions.md`](replicated-subscriptions.md) | PIP-33 replicated subscriptions — `ConsumerBuilder::replicate_subscription_state(bool)`, broker-side prerequisites (two-cluster + namespace `replicated_subscription_status=true`), receive-path marker filter, observation channel. |
+| [`v5-client.md`](v5-client.md) | PIP-466 V5 client surface — `PulsarClientV5`, V5 → v4 mapping table, escape hatch, edge cases. Experimental (`feature = "experimental-v5-client"`, default off). |
 | [`simulation-patterns.md`](simulation-patterns.md) | Research note — FoundationDB simulator, moonpool, TigerBeetle VOPR + TigerStyle, and what magnetar should adopt next. |
 | [`follow-ups.md`](follow-ups.md) | Consolidated open work tracker. |
 
