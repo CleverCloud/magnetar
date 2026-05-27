@@ -96,12 +96,6 @@ pub type LookupTopicResult = LookupOutcome;
 pub struct Client<P: Providers> {
     shared: Arc<ConnectionShared>,
     driver: Mutex<Option<DriverHandle>>,
-    /// Per-broker connection pool for the Apache Pulsar Proxy (ADR-0039).
-    /// `Some` only when the client was built via the supervised connect path
-    /// (`connect_plain_supervised`) — the non-supervised connect paths
-    /// (`connect_plain`, `from_parts`) can't host pool entries because each
-    /// entry needs its own supervised driver loop.
-    pool: Option<Arc<crate::pool::ProxyConnectionPool<P>>>,
     /// Held only so `Client` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -113,13 +107,21 @@ pub struct Client<P: Providers> {
 /// moonpool [`Client::lookup_topic`] accessor still returns the raw `LookupOutcome` so existing
 /// callers keep their full proto view; runtime code (producer / consumer open paths) uses
 /// this routing-decision enum instead.
+///
+/// **moonpool note**: the `Proxy` arm is detected but not yet routed — see
+/// [`Client::resolve_target`] for the follow-up tracker.
 #[derive(Debug, Clone)]
 pub(crate) enum LookupTarget {
     /// Bootstrap connection — same path as before ADR-0039.
     Direct,
-    /// Proxy-routed: open / reuse a pool entry keyed by `broker_url` with
-    /// `CommandConnect.proxy_to_broker_url = broker_url`.
-    Proxy { broker_url: String },
+    /// Proxy-routed: a pool entry keyed by `broker_url` with
+    /// `CommandConnect.proxy_to_broker_url = broker_url`. The `broker_url` is
+    /// captured for the follow-up wiring; on moonpool today the resolution
+    /// errors out before consuming the field.
+    Proxy {
+        #[allow(dead_code)]
+        broker_url: String,
+    },
 }
 
 impl<P: Providers> std::fmt::Debug for Client<P> {
@@ -153,10 +155,6 @@ impl<P: Providers> Client<P> {
         Ok(Self {
             shared,
             driver: Mutex::new(Some(driver)),
-            // Non-supervised connect → proxy pool disabled (each pool entry needs its own
-            // supervised driver loop). A lookup that requires proxy routing surfaces
-            // `ClientError::ProxyUnsupportedOnUnsupervisedClient`.
-            pool: None,
             _providers: std::marker::PhantomData,
         })
     }
@@ -183,22 +181,12 @@ impl<P: Providers> Client<P> {
         service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
         dns_resolver: Option<Arc<dyn crate::DnsResolver>>,
     ) -> Result<Self, ClientError> {
-        // Clone connect-time inputs into a `ConnectionFactory` so the proxy pool can lazily
-        // open per-broker pinned connections later (ADR-0039).
-        let factory = crate::pool::ConnectionFactory::<P> {
-            addr: addr.to_owned(),
-            bootstrap_config: config.clone(),
-            providers: engine.providers().clone(),
-            service_url_provider: service_url_provider.clone(),
-            dns_resolver: dns_resolver.clone(),
-        };
         let (shared, driver) = engine
             .connect_plain_supervised(addr, config, service_url_provider, dns_resolver)
             .await?;
         Ok(Self {
             shared,
             driver: Mutex::new(Some(driver)),
-            pool: Some(crate::pool::ProxyConnectionPool::new(factory)),
             _providers: std::marker::PhantomData,
         })
     }
@@ -218,9 +206,6 @@ impl<P: Providers> Client<P> {
         Self {
             shared,
             driver: Mutex::new(Some(driver)),
-            // `from_parts` skips the connect helpers, so we have no factory to seed the
-            // pool with — proxy routing requires a URL-based connect entry.
-            pool: None,
             _providers: std::marker::PhantomData,
         }
     }
@@ -275,11 +260,6 @@ impl<P: Providers> Client<P> {
             // best-effort close — drop the driver's terminal error.
             let _ = handle.join().await;
         }
-        // Tear down every per-broker pool entry (ADR-0039). Each entry has its own
-        // supervised driver loop and observes its own `is_user_closed()` flag.
-        if let Some(pool) = self.pool.as_ref() {
-            pool.close().await;
-        }
     }
 
     /// Resolve a `LookupOutcome::Connect` into a routing decision (ADR-0039). When the proxy
@@ -321,24 +301,28 @@ impl<P: Providers> Client<P> {
     }
 
     /// Resolve a [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
-    /// CommandProducer / CommandSubscribe on. Mirrors the tokio engine.
-    pub(crate) async fn resolve_target(
+    /// CommandProducer / CommandSubscribe on (ADR-0039).
+    ///
+    /// **moonpool note**: synchronous — every `.await` in the producer/consumer open path
+    /// has to stay Send-able because the facade's `CreateProducerApi` /
+    /// `SubscribeApi` traits pin their returns as `Pin<Box<dyn Future + Send>>`. The
+    /// `Proxy` branch therefore errors out with
+    /// `ClientError::ProxyUnsupportedOnUnsupervisedClient` for now; wiring the pool's
+    /// dial properly requires moving the connect work onto a separately-spawned task with
+    /// a `Send` Notify hand-off (the trait-pinned `+ Send` cast through `Box::pin` in
+    /// `engine.rs` can't accommodate a `network.connect(...).await` inside the future
+    /// body because `moonpool_core::NetworkProvider` is `#[async_trait(?Send)]`).
+    /// Production tokio paths use the tokio engine which does the routing end-to-end.
+    pub(crate) fn resolve_target(
         &self,
         target: LookupTarget,
         topic: &str,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         match target {
             LookupTarget::Direct => Ok(self.shared.clone()),
-            LookupTarget::Proxy { broker_url } => {
-                let pool = self.pool.as_ref().ok_or_else(|| {
-                    ClientError::ProxyUnsupportedOnUnsupervisedClient {
-                        topic: topic.to_owned(),
-                    }
-                })?;
-                pool.get_or_open(&broker_url)
-                    .await
-                    .map_err(ClientError::from)
-            }
+            LookupTarget::Proxy { .. } => Err(ClientError::ProxyUnsupportedOnUnsupervisedClient {
+                topic: topic.to_owned(),
+            }),
         }
     }
 

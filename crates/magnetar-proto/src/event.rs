@@ -409,7 +409,7 @@ pub struct IncomingMessage {
     /// Broker-assigned message id (with `batch_index` filled for batched messages).
     pub message_id: MessageId,
     /// Decoded metadata for the *batch* (the producer's metadata, not the
-    /// single's). Wrapped in [`Arc`] so the batched-delivery loop in
+    /// single's). Wrapped in [`std::sync::Arc`] so the batched-delivery loop in
     /// `ConsumerState::deliver` can hand every sub-message a refcount of
     /// the same parsed metadata instead of `clone()`-ing it N times per
     /// batch (a 100-message batch was 100 metadata deep-clones; with the

@@ -22,6 +22,8 @@ use magnetar_proto::ConnectionConfig;
 use moonpool_core::Providers;
 use parking_lot::Mutex;
 
+use moonpool_core::NetworkProvider;
+
 use crate::dns::DnsResolver;
 use crate::driver::{DriverHandle, ReconnectContext, spawn_supervised as spawn_supervised_driver};
 use crate::transport::Transport;
@@ -52,6 +54,10 @@ pub(crate) struct ConnectionFactory<P: Providers> {
 
 impl<P: Providers> std::fmt::Debug for ConnectionFactory<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `providers` and `bootstrap_config` are intentionally omitted —
+        // they're verbose handle bundles, not config metadata. Use
+        // `finish_non_exhaustive` so `clippy::missing_fields_in_debug`
+        // accepts the surface.
         f.debug_struct("ConnectionFactory")
             .field("addr", &self.addr)
             .field(
@@ -59,7 +65,7 @@ impl<P: Providers> std::fmt::Debug for ConnectionFactory<P> {
                 &self.service_url_provider.is_some(),
             )
             .field("has_dns_resolver", &self.dns_resolver.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -73,6 +79,17 @@ struct Entry {
 /// Moonpool pool of `ConnectionShared` keyed by
 /// `(logical broker URL, physical dial address)`. See [`crate::pool`] module
 /// docs and [`magnetar_runtime_tokio::pool::ProxyConnectionPool`].
+///
+/// **moonpool note**: kept as scaffold for the ADR-0039 follow-up. `get_or_open`
+/// and `build_entry` are not yet called from `Client::open_producer` /
+/// `Client::subscribe` because `moonpool_core::NetworkProvider` is declared
+/// `#[async_trait(?Send)]` — a dial across an `.await` in the open path breaks
+/// `Send` propagation up to the facade's `CreateProducerApi` /
+/// `SubscribeApi` traits. The trait surface, error variant, and the routing
+/// decision (`Client::lookup_topic_target` + `Client::resolve_target`) all
+/// exist; the missing piece is moving the connect into a separately-spawned
+/// task with a `Send` Notify hand-off. Tracked in ADR-0039.
+#[allow(dead_code)]
 pub(crate) struct ProxyConnectionPool<P: Providers> {
     factory: ConnectionFactory<P>,
     entries: Mutex<HashMap<PoolKey, Arc<Entry>>>,
@@ -88,6 +105,7 @@ impl<P: Providers> std::fmt::Debug for ProxyConnectionPool<P> {
     }
 }
 
+#[allow(dead_code)]
 impl<P: Providers> ProxyConnectionPool<P> {
     pub(crate) fn new(factory: ConnectionFactory<P>) -> Arc<Self> {
         Arc::new(Self {
@@ -104,7 +122,12 @@ impl<P: Providers> ProxyConnectionPool<P> {
     pub(crate) async fn get_or_open(
         &self,
         logical: &str,
-    ) -> Result<Arc<ConnectionShared>, EngineError> {
+    ) -> Result<Arc<ConnectionShared>, EngineError>
+    where
+        P: Send + Sync,
+        P::Network: Sync,
+        <P::Network as NetworkProvider>::TcpStream: Send,
+    {
         let key: PoolKey = (logical.to_owned(), self.factory.addr.clone());
 
         if let Some(entry) = self.entries.lock().get(&key) {
@@ -133,7 +156,12 @@ impl<P: Providers> ProxyConnectionPool<P> {
         Ok(entry.shared.clone())
     }
 
-    async fn build_entry(&self, logical: &str) -> Result<Arc<Entry>, EngineError> {
+    async fn build_entry(&self, logical: &str) -> Result<Arc<Entry>, EngineError>
+    where
+        P: Send + Sync,
+        P::Network: Sync,
+        <P::Network as NetworkProvider>::TcpStream: Send,
+    {
         let mut cfg = self.factory.bootstrap_config.clone();
         cfg.proxy_to_broker_url = Some(logical.to_owned());
 

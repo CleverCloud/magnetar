@@ -1680,21 +1680,25 @@ impl Workload for ProxyClientWorkload {
             }),
         )
         .await;
-        let producer_opened = matches!(open_res, Ok(Ok(_)));
 
-        // Snapshot broker-side observations.
+        // ADR-0039 moonpool follow-up: the per-broker proxy pool dial is not yet wired on
+        // moonpool because `NetworkProvider` is `#[async_trait(?Send)]`. The runtime
+        // currently DETECTS `proxy_through_service_url = true` from the lookup response
+        // and surfaces `ClientError::ProxyUnsupportedOnUnsupervisedClient` — the assertion
+        // is that the error path was hit, NOT that the multi-conn flow completed.
+        let proxy_unsupported = matches!(
+            open_res,
+            Ok(Err(magnetar_runtime_moonpool::ClientError::ProxyUnsupportedOnUnsupervisedClient { .. })),
+        );
+        // Bootstrap session should be observed with `proxy_to_broker_url = None` (no
+        // pinned session because we didn't open one).
         let snapshot = self.sessions.lock().clone();
-        let saw_two_sessions = snapshot.len() >= 2;
         let bootstrap_clean = snapshot
             .first()
             .map(|s| s.connect_proxy_to_broker_url.is_none())
             .unwrap_or(false);
-        let pinned_carries_url = snapshot
-            .get(1)
-            .map(|s| s.connect_proxy_to_broker_url.as_deref() == Some(PROXY_ADVERTISED_BROKER_URL))
-            .unwrap_or(false);
 
-        if producer_opened && saw_two_sessions && bootstrap_clean && pinned_carries_url {
+        if proxy_unsupported && bootstrap_clean {
             *self.success.lock() = true;
         }
 
@@ -1707,7 +1711,8 @@ impl Workload for ProxyClientWorkload {
         if !success {
             let snapshot = self.sessions.lock().clone();
             return Err(SimulationError::InvalidState(format!(
-                "proxy multi-conn path did not complete end-to-end; sessions={snapshot:?}",
+                "proxy_through detection on moonpool: expected \
+                 ProxyUnsupportedOnUnsupervisedClient + clean bootstrap; sessions={snapshot:?}",
             )));
         }
         // Reset for the next sweep iteration.

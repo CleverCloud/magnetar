@@ -70,6 +70,10 @@ pub(crate) struct ConnectionFactory {
 
 impl std::fmt::Debug for ConnectionFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `bootstrap_config` is omitted — `ConnectionConfig` is a verbose
+        // bundle and the surface is meant for diagnostics, not full
+        // round-tripping. `finish_non_exhaustive` silences
+        // `clippy::missing_fields_in_debug`.
         f.debug_struct("ConnectionFactory")
             .field("url", &self.url)
             .field("tls", &self.tls_config.is_some())
@@ -79,7 +83,7 @@ impl std::fmt::Debug for ConnectionFactory {
                 &self.service_url_provider.is_some(),
             )
             .field("has_dns_resolver", &self.dns_resolver.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

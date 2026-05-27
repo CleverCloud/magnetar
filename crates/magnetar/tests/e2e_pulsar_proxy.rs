@@ -141,26 +141,28 @@ async fn start_proxy(
     Ok((url, container))
 }
 
-/// Resolve a reachable hostname for the proxy container to use to talk to
-/// the standalone container's mapped Zookeeper port. On Linux we use the
-/// host's bridge IP (`172.17.0.1` by default); on Docker Desktop we fall
-/// back to `host.docker.internal`. The env var
-/// `MAGNETAR_E2E_DOCKER_HOST_GATEWAY` lets the user override.
-fn docker_host_gateway() -> String {
-    if let Ok(s) = std::env::var("MAGNETAR_E2E_DOCKER_HOST_GATEWAY") {
-        return s;
-    }
-    // 172.17.0.1 is the default Docker bridge gateway on Linux. On
-    // Docker Desktop the user should override via the env var.
-    "172.17.0.1".to_owned()
-}
-
 #[ignore = "e2e: requires Docker + reachable host gateway between proxy and standalone"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_produce_consume_through_pulsar_proxy() -> Result<(), Box<dyn std::error::Error>> {
+    // Skip when the gateway env var isn't set — the proxy container needs a
+    // reachable host gateway back to the standalone's mapped Zookeeper port,
+    // which only works on hosts where the bridge IP is routable (Linux with
+    // default Docker bridge) or via Docker Desktop's `host.docker.internal`.
+    // CI runs without this gateway, so without an explicit override we skip
+    // cleanly — the env var is the operator's affirmative "yes, my Docker
+    // network is configured for the standalone↔proxy hop".
+    let Ok(gateway) = std::env::var("MAGNETAR_E2E_DOCKER_HOST_GATEWAY") else {
+        eprintln!(
+            "skipping e2e_produce_consume_through_pulsar_proxy: \
+             MAGNETAR_E2E_DOCKER_HOST_GATEWAY not set. Run with e.g. \
+             `MAGNETAR_E2E_DOCKER_HOST_GATEWAY=172.17.0.1 cargo test --features e2e \
+             --test e2e_pulsar_proxy -- --include-ignored`."
+        );
+        return Ok(());
+    };
+
     // Step 1: standalone broker.
     let (_standalone_url, zk_port, _standalone) = start_standalone().await?;
-    let gateway = docker_host_gateway();
 
     // Step 2: proxy in front, talking to standalone's mapped zk.
     let (proxy_url, _proxy) = start_proxy(&gateway, zk_port).await?;
