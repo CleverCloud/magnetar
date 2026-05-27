@@ -1921,7 +1921,7 @@ impl<E: crate::Engine> std::fmt::Debug for ReaderBuilder<'_, E> {
 
 impl<'a, E: crate::Engine> ReaderBuilder<'a, E> {
     fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
-        let subscription = format!("reader-{}", uuid::Uuid::new_v4().simple());
+        let subscription = format!("reader-{}", E::random_subscription_suffix());
         let inner = ConsumerBuilder::new(client, topic)
             .subscription(subscription)
             .subscription_type(pb::command_subscribe::SubType::Exclusive)

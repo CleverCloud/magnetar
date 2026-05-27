@@ -35,11 +35,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — sans-io / determinism
 
-- **`crates/magnetar/src/client.rs` (`Reader` subscription naming) +
-  `crates/magnetar/src/table_view.rs`** —
-  `Uuid::new_v4()` for default subscription names in the façade.
-  Inject a random/id provider via Engine, or require explicit
-  subscription names for `MoonpoolEngine`.
 - **`crates/magnetar-auth-oauth2/src/lib.rs::SystemClock`** —
   `SystemClock::now()` is the production default for OAuth2's
   `Clock` trait; the same crate provides a `VirtualClock` in tests.

@@ -501,9 +501,12 @@ impl<'a> TableViewBuilder<'a> {
     /// background drain task is running — the initial snapshot continues to populate in
     /// the background as compacted messages arrive.
     pub async fn create(self) -> Result<TableView, PulsarError> {
-        let subscription = self
-            .subscription
-            .unwrap_or_else(|| format!("table-view-{}", uuid::Uuid::new_v4().simple()));
+        let subscription = self.subscription.unwrap_or_else(|| {
+            format!(
+                "table-view-{}",
+                <crate::TokioEngine as crate::Engine>::random_subscription_suffix(),
+            )
+        });
         let topic = self.topic.clone();
         let builder = self
             .client

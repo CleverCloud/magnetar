@@ -100,6 +100,17 @@ pub trait Engine: 'static + Send + Sync + Debug {
     fn interval_tick<'a>(
         interval: &'a mut Self::Interval,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Engine-injected id provider for the façade's auto-generated
+    /// subscription names (`Reader`, `TableView`). Tokio plugs in
+    /// `Uuid::new_v4().simple()` (RFC 4122 random); moonpool plugs in
+    /// a process-global atomic counter so deterministic-simulation runs
+    /// produce stable, reproducible names. Callers that need fully
+    /// deterministic names across processes should always pass an
+    /// explicit subscription / reader name through the builder.
+    fn random_subscription_suffix() -> String
+    where
+        Self: Sized;
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,6 +1850,10 @@ impl Engine for TokioEngine {
             interval.tick().await;
         })
     }
+
+    fn random_subscription_suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
 }
 
 /// Zero-sized marker for the moonpool deterministic-simulation engine,
@@ -1915,6 +1930,17 @@ impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
         Box::pin(async move {
             interval.tick().await;
         })
+    }
+
+    fn random_subscription_suffix() -> String {
+        // Deterministic counter — every moonpool run produces the same
+        // suffix sequence so `Reader` / `TableView` auto-names are
+        // reproducible. Tests that need stronger isolation across
+        // sub-tests should still pass an explicit subscription name.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("sim-{n:016x}")
     }
 }
 
