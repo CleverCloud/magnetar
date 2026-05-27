@@ -44,6 +44,41 @@ impl PulsarClientV5 {
     pub fn into_v4(self) -> PulsarClient {
         self.inner
     }
+
+    /// Start building a V5 [`super::producer::ProducerBuilder`] for the given
+    /// topic. The V5 builder accepts `Duration`-typed timeouts and
+    /// `Option<usize>` max-pending; the v4 wire equivalents are
+    /// computed via [`super::mapping`] at `.create()` time.
+    #[must_use]
+    pub fn producer(&self, topic: impl Into<String>) -> super::producer::ProducerBuilder<'_> {
+        super::producer::ProducerBuilder::new(self.inner.producer(topic))
+    }
+
+    /// Start building a V5 [`super::stream_consumer::StreamConsumerBuilder`]
+    /// (Exclusive / Failover subscriptions; ordered delivery on a
+    /// single active consumer per partition). Pre-pins the v4
+    /// `subscription_type` to`Exclusive` — callers can flip to
+    /// `Failover` via the builder's `failover()` selector.
+    #[must_use]
+    pub fn stream_consumer(
+        &self,
+        topic: impl Into<String>,
+    ) -> super::stream_consumer::StreamConsumerBuilder<'_> {
+        super::stream_consumer::StreamConsumerBuilder::new(self.inner.consumer(topic))
+    }
+
+    /// Start building a V5 [`super::queue_consumer::QueueConsumerBuilder`]
+    /// (Shared / `KeyShared` subscriptions; work-distribution across
+    /// multiple active consumers per partition). Pre-pins the v4
+    /// `subscription_type` to`Shared` — callers flip to `KeyShared`
+    /// via the builder's `key_shared()` selector.
+    #[must_use]
+    pub fn queue_consumer(
+        &self,
+        topic: impl Into<String>,
+    ) -> super::queue_consumer::QueueConsumerBuilder<'_> {
+        super::queue_consumer::QueueConsumerBuilder::new(self.inner.consumer(topic))
+    }
 }
 
 #[cfg(test)]
