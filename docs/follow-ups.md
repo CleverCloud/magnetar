@@ -94,29 +94,27 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   parameter on builder methods that ignore it. Move the generic only
   to the final `.create()` / `.subscribe()` dispatch.
 - **Large modules: `client.rs` (2544 lines), `engine.rs` (2148 lines),
-  `conn.rs` (5724 lines)** — split candidates. The audit's original
-  suggestion that `conn.rs` shed `txn.rs` / `dlq.rs` /
-  `anti_thrash.rs` satellites is **stale**: `txn.rs` and
+  `conn.rs` (now 5241 lines, was 5724)** — split candidates. The
+  audit's original suggestion that `conn.rs` shed `txn.rs` /
+  `dlq.rs` / `anti_thrash.rs` satellites was **stale**: `txn.rs` and
   `anti_thrash.rs` already exist as sibling files in
   `crates/magnetar-proto/src/`; `dlq.rs` lives inside
   `consumer.rs::DeadLetterPolicy` / `ConsumerState.dead_letter_pending`
-  (no separate file today). The actual splittable areas now are:
-  - `conn.rs` lines 52–534 (~480 lines of `*Request` / `*Config` /
-    `*Outcome` / `KeySharedConfig` / `AckRequest` / `SeekTarget` type
-    definitions) → `crates/magnetar-proto/src/conn/types.rs`, with
-    `pub use` re-exports at the `conn::*` level so downstream
-    `use magnetar_proto::conn::{ConnectionConfig, OpOutcome};` paths
-    stay unchanged.
+  (no separate file today).
+  - `conn.rs` type definitions (`*Request` / `*Config` / `*Outcome` /
+    `KeySharedConfig` / `AckRequest` / `SeekTarget` /
+    `HandshakeState` / `PendingOpKey` / `MemoryLimitPolicy`) → moved
+    to `crates/magnetar-proto/src/conn_types.rs` (504 lines),
+    re-exported from `conn::*` via `pub use crate::conn_types::*` so
+    downstream `use magnetar_proto::conn::{ConnectionConfig, OpOutcome};`
+    paths stay unchanged. **Landed**.
   - `client.rs` `ProducerBuilder` / `ConsumerBuilder` / `ReaderBuilder`
     blocks → `magnetar/src/builders.rs` (cross-cuts with the
-    phantom-`E` cleanup item above).
+    phantom-`E` cleanup item above). **Pending.**
   - `engine.rs` → `engine/{traits.rs, tokio.rs, moonpool.rs}` once the
     per-engine impls grow further. Today the trait + two impls fit
     comfortably; defer until the next per-engine surface lift makes
-    the file uncomfortably wide.
-  Each is a bounded but careful refactor: module reshuffling tickles
-  `pub use` re-exports and the `cargo doc -D warnings --cfg tokio_unstable`
-  sweep, so the validation chain has to re-run cleanly after each split.
+    the file uncomfortably wide. **Deferred.**
 - **Test-helper duplication** — `handshake_response_bytes()` and the
   related fixture-byte builders show up in multiple test files. The
   **cross-runtime** duplication (tokio vs. moonpool) is intentional
