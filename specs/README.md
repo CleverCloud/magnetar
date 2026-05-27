@@ -54,6 +54,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0036](adr/0036-moonpool-seed-sweep-daily-random.md) | Moonpool seed sweep: daily 16-random-seed sweep in a dedicated workflow, drop per-PR fixed 32-seed matrix — amends ADR-0024 §3 (CI cadence) | Accepted |
 | [0037](adr/0037-multi-topics-pattern-consumer-pass-2-lift.md) | MultiTopicsConsumer / PartitionedConsumer / PatternConsumer pass-2 lift: extend `ConsumerApi` (17 new methods + `type Producer`), introduce `BrokerMetadataApi`, lift the matching builders to `<'a, E: Engine>` — six-of-seven ADR-0026 §D1 surfaces now lifted | Accepted |
 | [0038](adr/0038-split-connection-mutex.md) | Split the global `Connection` mutex into per-handle `ProducerSlot` / `ConsumerSlot` mutexes — `Producer::send` hot path bypasses the global lock; ordering invariant: global → per-slot, never the reverse | Accepted |
+| [0039](adr/0039-pulsar-proxy-multi-broker-connection-model.md) | Per-broker connection pool for the Apache Pulsar Proxy — `(logical_broker_url, physical_dial_addr)` keyed pool, `bootstrap` for lookup + non-proxy ops, `proxy_to_broker_url` set on `CommandConnect` for pool entries (mirrors Java `BinaryProtoLookupService` + `ConnectionPool`) | Accepted |
 
 ## How to add an ADR
 
