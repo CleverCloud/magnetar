@@ -60,6 +60,21 @@ pub enum ClientError {
     /// The connection has been locally closed before the request completed.
     #[error("connection is closed")]
     Closed,
+    /// A lookup answered `proxy_through_service_url = true` but the client has no proxy
+    /// connection pool because it was built via [`Client::connect_plain`] or
+    /// [`Client::from_parts`] (no supervisor → no pool — each pool entry needs its own
+    /// supervised driver loop). Switch to [`Client::connect_plain_supervised`] to use
+    /// the pool. See ADR-0039.
+    #[error(
+        "lookup of topic '{topic}' requires proxy routing (proxy_through_service_url=true) \
+         but this moonpool client was built without a supervisor; rebuild with \
+         Client::connect_plain_supervised"
+    )]
+    ProxyUnsupportedOnUnsupervisedClient {
+        /// The topic whose lookup triggered the proxy-routing requirement.
+        topic: String,
+    },
+
     /// Catch-all for engine-internal misconfiguration.
     #[error("other: {0}")]
     Other(String),
@@ -85,6 +100,28 @@ pub struct Client<P: Providers> {
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
     _providers: std::marker::PhantomData<fn() -> P>,
+}
+
+/// Decision returned by [`Client::lookup_topic_target`] driving where the data ops for the
+/// resolved topic should ride (ADR-0039). Mirror of the tokio engine's `LookupTarget` — the
+/// moonpool [`Client::lookup_topic`] accessor still returns the raw `LookupOutcome` so existing
+/// callers keep their full proto view; runtime code (producer / consumer open paths) uses
+/// this routing-decision enum instead.
+///
+/// **moonpool note**: the `Proxy` arm is detected but not yet routed — see
+/// [`Client::resolve_target`] for the follow-up tracker.
+#[derive(Debug, Clone)]
+pub(crate) enum LookupTarget {
+    /// Bootstrap connection — same path as before ADR-0039.
+    Direct,
+    /// Proxy-routed: a pool entry keyed by `broker_url` with
+    /// `CommandConnect.proxy_to_broker_url = broker_url`. The `broker_url` is
+    /// captured for the follow-up wiring; on moonpool today the resolution
+    /// errors out before consuming the field.
+    Proxy {
+        #[allow(dead_code)]
+        broker_url: String,
+    },
 }
 
 impl<P: Providers> std::fmt::Debug for Client<P> {
@@ -222,6 +259,70 @@ impl<P: Providers> Client<P> {
         if let Some(handle) = handle {
             // best-effort close — drop the driver's terminal error.
             let _ = handle.join().await;
+        }
+    }
+
+    /// Resolve a `LookupOutcome::Connect` into a routing decision (ADR-0039). When the proxy
+    /// advertises `proxy_through_service_url = true`, the data ops MUST ride on a pinned
+    /// per-broker pool entry; otherwise the bootstrap connection is the data plane.
+    pub(crate) async fn lookup_topic_target(
+        &self,
+        topic: &str,
+    ) -> Result<LookupTarget, ClientError> {
+        let outcome = self.lookup_topic(topic, false).await?;
+        match outcome {
+            LookupOutcome::Connect {
+                broker_service_url,
+                broker_service_url_tls,
+                proxy_through_service_url,
+            } => {
+                if proxy_through_service_url {
+                    // The moonpool engine is plain-text only today (TLS lands via the
+                    // `RustlsByteAdapter` byte pipe — see `connect_tls`), so we always pick
+                    // the plain `broker_service_url` when both are advertised.
+                    let broker_url = broker_service_url.or(broker_service_url_tls).ok_or_else(
+                        || {
+                            ClientError::Other(format!(
+                                "lookup of '{topic}' set proxy_through_service_url=true but did \
+                             not advertise a broker_service_url"
+                            ))
+                        },
+                    )?;
+                    Ok(LookupTarget::Proxy { broker_url })
+                } else {
+                    Ok(LookupTarget::Direct)
+                }
+            }
+            // `Redirected` is surfaced for observability after the proto layer's redirect
+            // chain settles; treat as direct routing (ADR-0039 §"Consequences").
+            LookupOutcome::Redirected { .. } => Ok(LookupTarget::Direct),
+            LookupOutcome::Failed { code, message } => Err(ClientError::Broker { code, message }),
+        }
+    }
+
+    /// Resolve a [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
+    /// CommandProducer / CommandSubscribe on (ADR-0039).
+    ///
+    /// **moonpool note**: synchronous — every `.await` in the producer/consumer open path
+    /// has to stay Send-able because the facade's `CreateProducerApi` /
+    /// `SubscribeApi` traits pin their returns as `Pin<Box<dyn Future + Send>>`. The
+    /// `Proxy` branch therefore errors out with
+    /// `ClientError::ProxyUnsupportedOnUnsupervisedClient` for now; wiring the pool's
+    /// dial properly requires moving the connect work onto a separately-spawned task with
+    /// a `Send` Notify hand-off (the trait-pinned `+ Send` cast through `Box::pin` in
+    /// `engine.rs` can't accommodate a `network.connect(...).await` inside the future
+    /// body because `moonpool_core::NetworkProvider` is `#[async_trait(?Send)]`).
+    /// Production tokio paths use the tokio engine which does the routing end-to-end.
+    pub(crate) fn resolve_target(
+        &self,
+        target: &LookupTarget,
+        topic: &str,
+    ) -> Result<Arc<ConnectionShared>, ClientError> {
+        match target {
+            LookupTarget::Direct => Ok(self.shared.clone()),
+            LookupTarget::Proxy { .. } => Err(ClientError::ProxyUnsupportedOnUnsupervisedClient {
+                topic: topic.to_owned(),
+            }),
         }
     }
 

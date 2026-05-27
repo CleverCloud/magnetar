@@ -85,6 +85,21 @@ pub enum ClientError {
         requested: u64,
     },
 
+    /// A lookup answered `proxy_through_service_url = true` but the client has no proxy
+    /// connection pool because it was built via [`crate::Client::from_socket`] (a raw socket
+    /// has no URL to dial back through). Switch to a URL-based connect entry —
+    /// [`crate::Client::connect`] / [`crate::Client::connect_with_resolver_and_provider`] —
+    /// to use the pool. See ADR-0039.
+    #[error(
+        "lookup of topic '{topic}' requires proxy routing (proxy_through_service_url=true) \
+         but this client was built via from_socket and has no proxy pool; rebuild with \
+         Client::connect"
+    )]
+    ProxyUnsupportedOnSocketClient {
+        /// The topic whose lookup triggered the proxy-routing requirement.
+        topic: String,
+    },
+
     /// Catch-all for engine-internal misconfiguration.
     #[error("other: {0}")]
     Other(String),

@@ -354,9 +354,13 @@ pub(crate) fn spawn<S>(shared: Arc<ConnectionShared>, socket: S) -> DriverHandle
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // The generic-socket path always issues an explicit `flush()` after every
+    // `write_all` — we don't know whether the caller's socket is a TLS stream,
+    // a buffered transport, or a test double, so the conservative choice keeps
+    // the wire deterministic regardless.
     let join = tokio::spawn(async move {
         let mut socket = socket;
-        driver_loop_inner(&shared, &mut socket).await
+        driver_loop_inner(&shared, &mut socket, true).await
     });
     DriverHandle { join }
 }
@@ -403,9 +407,13 @@ async fn supervised_driver_loop(
     // caller if we exit without a supervisor reconnect. `socket_alive_since` lets us decide,
     // once `driver_loop_inner` returns, whether the previous socket lived long enough to
     // count as a stable reconnect (-> `backoff.reset()`) or died inside `drop_grace`
-    // (-> keep growing).
+    // (-> keep growing). `flush_after_write` short-circuits the post-`write_all` `flush()`
+    // syscall on plaintext TCP (the kernel buffer already pushes bytes onto the wire);
+    // TLS keeps the flush because `tokio_rustls` buffers plaintext until `flush()` actually
+    // emits an encrypted record.
     let mut socket_alive_since = Instant::now();
-    let mut last_inner_result = driver_loop_inner(&shared, &mut socket).await;
+    let mut flush_after_write = transport_needs_flush(&socket);
+    let mut last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
 
     loop {
         // User-requested close beats reconnect — the state machine is in `Closing` /
@@ -574,7 +582,20 @@ async fn supervised_driver_loop(
 
         socket = new_socket;
         socket_alive_since = Instant::now();
-        last_inner_result = driver_loop_inner(&shared, &mut socket).await;
+        flush_after_write = transport_needs_flush(&socket);
+        last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
+    }
+}
+
+/// Whether the inner driver loop should issue an explicit `flush()` after
+/// every `write_all`. Plaintext TCP doesn't need it — the kernel-buffered
+/// `write_all` already pushes bytes to the socket and there's no user-space
+/// buffer to drain. TLS does need it — `tokio_rustls::TlsStream::flush()` is
+/// what actually emits the encrypted record onto the wire.
+fn transport_needs_flush(transport: &Transport) -> bool {
+    match transport {
+        Transport::Plain(_) => false,
+        Transport::Tls(_) => true,
     }
 }
 
@@ -596,6 +617,7 @@ async fn supervised_driver_loop(
 pub(crate) async fn driver_loop_inner<S>(
     shared: &Arc<ConnectionShared>,
     socket: &mut S,
+    flush_after_write: bool,
 ) -> Result<(), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -624,14 +646,23 @@ where
 
         // Flush whatever the state machine produced. This happens *outside* the lock so user
         // futures can keep enqueuing while we hold the network handle.
+        //
+        // `flush_after_write` is `true` for TLS transports (the rustls layer
+        // buffers plaintext until `flush()` actually emits the record) and for
+        // unknown / generic-socket spawn paths (conservative default). For
+        // plaintext TCP it's `false` — kernel-buffered `write_all` already
+        // pushes the bytes to the socket and there's no user-space buffer to
+        // drain, so the extra `flush()` is wasted syscall overhead.
         if !write_buf.is_empty() {
             if let Err(err) = socket.write_all(&write_buf).await {
                 shared.inner.lock().mark_disconnected();
                 return Err(err.into());
             }
-            if let Err(err) = socket.flush().await {
-                shared.inner.lock().mark_disconnected();
-                return Err(err.into());
+            if flush_after_write {
+                if let Err(err) = socket.flush().await {
+                    shared.inner.lock().mark_disconnected();
+                    return Err(err.into());
+                }
             }
         }
 

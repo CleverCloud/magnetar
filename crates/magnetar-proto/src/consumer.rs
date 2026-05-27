@@ -349,9 +349,13 @@ struct ChunkBuffer {
     /// not expected over a single connection (the broker dispatches in order), but if it does,
     /// the buffer is indexed by `chunk_id` to make reassembly robust.
     chunk_payloads: HashMap<i32, Bytes>,
-    first_metadata: pb::MessageMetadata,
+    /// Arc-wrapped first-chunk metadata so the reassembled `IncomingMessage`
+    /// hands the consumer an `Arc` clone instead of a deep copy on final
+    /// assembly. Stored as `Arc` from the first-chunk arrival so the
+    /// pending-chunk path never deep-clones the metadata either.
+    first_metadata: std::sync::Arc<pb::MessageMetadata>,
     first_chunk_message_id: Option<MessageId>,
-    broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
+    broker_entry_metadata: Option<std::sync::Arc<pb::BrokerEntryMetadata>>,
     redelivery_count: u32,
 }
 
@@ -641,6 +645,11 @@ impl ConsumerState {
         if let (Some(total), Some(chunk_id)) = (metadata.num_chunks_from_msg, metadata.chunk_id) {
             if total > 1 {
                 let uuid = metadata.uuid.clone().unwrap_or_default();
+                // Arc-wrap on first-chunk arrival so the ChunkBuffer never
+                // holds a deep-cloned metadata copy across the
+                // pending-chunk window. Re-wrapping `broker_entry_metadata`
+                // is similarly one allocation per chunked message, not per
+                // chunk.
                 let entry = self
                     .chunk_reassembly
                     .entry(uuid.clone())
@@ -648,9 +657,11 @@ impl ConsumerState {
                         expected_chunks: total,
                         received_chunks: 0,
                         chunk_payloads: HashMap::new(),
-                        first_metadata: metadata.clone(),
+                        first_metadata: std::sync::Arc::new(metadata.clone()),
                         first_chunk_message_id: Some(message_id),
-                        broker_entry_metadata: broker_entry_metadata.clone(),
+                        broker_entry_metadata: broker_entry_metadata
+                            .clone()
+                            .map(std::sync::Arc::new),
                         redelivery_count: redelivery,
                     });
                 if entry
@@ -672,14 +683,24 @@ impl ConsumerState {
                     }
                 }
                 let assembled = full.freeze();
-                let mut final_meta = entry.first_metadata.clone();
-                final_meta.num_chunks_from_msg = None;
-                final_meta.chunk_id = None;
-                final_meta.total_chunk_msg_size = None;
+                // Pull the buffered Arcs out of the entry on the assembly
+                // path. The final reassembled message owns the unique
+                // `Arc`s (refcount = 1) — no clone needed, just a strip of
+                // the chunk-only fields via `Arc::make_mut`.
                 let first_chunk_message_id = entry.first_chunk_message_id;
-                let bem = entry.broker_entry_metadata.clone();
                 let redelivery_count = entry.redelivery_count;
-                self.chunk_reassembly.remove(&uuid);
+                let entry = self
+                    .chunk_reassembly
+                    .remove(&uuid)
+                    .expect("just-inserted ChunkBuffer disappeared");
+                let mut final_meta_arc = entry.first_metadata;
+                {
+                    let m = std::sync::Arc::make_mut(&mut final_meta_arc);
+                    m.num_chunks_from_msg = None;
+                    m.chunk_id = None;
+                    m.total_chunk_msg_size = None;
+                }
+                let bem = entry.broker_entry_metadata;
 
                 // The "logical" message id is the *last* chunk's id (per Java
                 // `ChunkMessageIdImpl.getLastChunkMessageId`). first_chunk_message_id is
@@ -689,7 +710,7 @@ impl ConsumerState {
 
                 let im = IncomingMessage {
                     message_id,
-                    metadata: final_meta,
+                    metadata: final_meta_arc,
                     single_metadata: None,
                     payload: assembled,
                     redelivery_count,
@@ -713,6 +734,13 @@ impl ConsumerState {
             self.batch_ack_tracker
                 .entry((message_id.ledger_id, message_id.entry_id))
                 .or_insert_with(|| BatchAckEntry::fresh(num_in_batch));
+            // Wrap the per-batch metadata once so every sub-message shares
+            // a refcount instead of deep-cloning. For a 100-message batch
+            // this collapses 100 `MessageMetadata::clone()` calls (each of
+            // which traverses every property, every encryption key, etc.)
+            // into 100 Arc bumps.
+            let shared_meta = std::sync::Arc::new(metadata);
+            let shared_bem = broker_entry_metadata.map(std::sync::Arc::new);
             let mut cursor = body;
             let mut delivered = 0usize;
             for idx in 0..num_in_batch {
@@ -738,11 +766,11 @@ impl ConsumerState {
                 single_mid.batch_size = num_in_batch;
                 let im = IncomingMessage {
                     message_id: single_mid,
-                    metadata: metadata.clone(),
+                    metadata: shared_meta.clone(),
                     single_metadata: Some(single),
                     payload,
                     redelivery_count: redelivery,
-                    broker_entry_metadata: broker_entry_metadata.clone(),
+                    broker_entry_metadata: shared_bem.clone(),
                     arrived_at: now,
                 };
                 self.classify_and_queue(im, redelivery, now);
@@ -757,11 +785,11 @@ impl ConsumerState {
         message_id.batch_size = 0;
         let im = IncomingMessage {
             message_id,
-            metadata,
+            metadata: std::sync::Arc::new(metadata),
             single_metadata: None,
             payload: body,
             redelivery_count: redelivery,
-            broker_entry_metadata,
+            broker_entry_metadata: broker_entry_metadata.map(std::sync::Arc::new),
             arrived_at: now,
         };
         let outcome = self.classify_and_queue(im, redelivery, now);
@@ -1743,7 +1771,7 @@ mod tests {
                 batch_index: -1,
                 batch_size: 0,
             },
-            metadata: meta,
+            metadata: std::sync::Arc::new(meta),
             single_metadata: None,
             payload: Bytes::from_static(b"payload"),
             redelivery_count: 0,

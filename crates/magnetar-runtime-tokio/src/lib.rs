@@ -74,6 +74,7 @@ pub mod crypto;
 pub mod dns;
 mod driver;
 mod error;
+mod pool;
 mod producer;
 pub mod tls_crypto;
 pub mod tls_insecure;

@@ -541,8 +541,12 @@ impl MessageBuilder<'_> {
 pub struct IncomingMessage {
     /// Message id assigned by the broker.
     pub id: magnetar_proto::types::MessageId,
-    /// Pulsar `MessageMetadata` for the message.
-    pub metadata: pb::MessageMetadata,
+    /// Pulsar `MessageMetadata` for the message. Refcounted (Arc) so the
+    /// batched-delivery path inside the consumer state machine can share
+    /// one parsed metadata across every sub-message of a batch instead of
+    /// deep-cloning per message. Field access works transparently
+    /// (`Arc` derefs).
+    pub metadata: std::sync::Arc<pb::MessageMetadata>,
     /// Application payload bytes (post-decompression / post-decryption).
     pub payload: Bytes,
     /// Broker-supplied redelivery count.
@@ -550,7 +554,7 @@ pub struct IncomingMessage {
     /// PIP-90 `BrokerEntryMetadata`. `None` when the broker did not stamp one (older
     /// brokers / disabled namespace policy). Carries the broker's wall-clock timestamp
     /// and per-topic index — useful for routing, dedup, and exactly-once-ish flows.
-    pub broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
+    pub broker_entry_metadata: Option<std::sync::Arc<pb::BrokerEntryMetadata>>,
 }
 
 impl IncomingMessage {
@@ -861,6 +865,49 @@ impl PulsarClient<crate::TokioEngine> {
         topic: impl Into<String>,
     ) -> crate::PartitionedProducerBuilder<'_> {
         crate::PartitionedProducerBuilder::new(self, topic.into())
+    }
+
+    /// PIP-180 (ADR-0033): subscribe with automatic shadow-source resolution.
+    ///
+    /// Performs the `magnetar-admin` `get_shadow_source(topic)` REST lookup,
+    /// subscribes to `topic` with `subscription_name` (exclusive, durable),
+    /// and — when the broker reports `topic` is a shadow — primes the
+    /// consumer's shadow metadata via
+    /// [`magnetar_runtime_tokio::Consumer::set_shadow_source`] so the receive
+    /// path emits
+    /// [`magnetar_proto::ConnectionEvent::MessageReceivedFromShadow`]
+    /// without an out-of-band lookup per message.
+    ///
+    /// For regular (non-shadow) topics the call collapses to a plain
+    /// `.consumer(topic).subscription(subscription_name).subscribe()`.
+    ///
+    /// # Errors
+    ///
+    /// - [`PulsarError::Other`] wrapping the admin REST error if the `get_shadow_source` lookup
+    ///   fails.
+    /// - Any error from the underlying `.subscribe()` round-trip.
+    #[cfg(feature = "admin")]
+    pub async fn subscribe_shadow_aware(
+        &self,
+        admin: &magnetar_admin::AdminClient,
+        topic: impl Into<String>,
+        subscription_name: impl Into<String>,
+    ) -> Result<magnetar_runtime_tokio::Consumer, PulsarError> {
+        let topic = topic.into();
+        let subscription_name = subscription_name.into();
+        let source = admin
+            .get_shadow_source(&topic)
+            .await
+            .map_err(|e| PulsarError::Other(format!("get_shadow_source({topic}): {e}")))?;
+        let consumer = self
+            .consumer(topic)
+            .subscription(subscription_name)
+            .subscribe()
+            .await?;
+        if let Some(source_topic) = source {
+            consumer.set_shadow_source(source_topic);
+        }
+        Ok(consumer)
     }
 
     /// PIP-33 (ADR-0034): non-blocking peek for the next replicated-subscription
@@ -1917,7 +1964,7 @@ impl<E: crate::Engine> std::fmt::Debug for ReaderBuilder<'_, E> {
 
 impl<'a, E: crate::Engine> ReaderBuilder<'a, E> {
     fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
-        let subscription = format!("reader-{}", uuid::Uuid::new_v4().simple());
+        let subscription = format!("reader-{}", E::random_subscription_suffix());
         let inner = ConsumerBuilder::new(client, topic)
             .subscription(subscription)
             .subscription_type(pb::command_subscribe::SubType::Exclusive)
@@ -2316,7 +2363,7 @@ mod outgoing_message_tests {
     fn message_with(metadata: pb::MessageMetadata) -> IncomingMessage {
         IncomingMessage {
             id: magnetar_proto::types::MessageId::EARLIEST,
-            metadata,
+            metadata: std::sync::Arc::new(metadata),
             payload: Bytes::new(),
             redelivery_count: 0,
             broker_entry_metadata: None,
@@ -2377,10 +2424,10 @@ mod outgoing_message_tests {
         assert_eq!(msg.broker_publish_time_ms(), None);
         assert_eq!(msg.broker_index(), None);
 
-        msg.broker_entry_metadata = Some(pb::BrokerEntryMetadata {
+        msg.broker_entry_metadata = Some(std::sync::Arc::new(pb::BrokerEntryMetadata {
             broker_timestamp: Some(1_700_000_000_000),
             index: Some(42),
-        });
+        }));
         assert_eq!(msg.broker_publish_time_ms(), Some(1_700_000_000_000));
         assert_eq!(msg.broker_index(), Some(42));
     }

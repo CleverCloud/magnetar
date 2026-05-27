@@ -26,18 +26,52 @@ use crate::driver::{
     spawn_supervised as spawn_supervised_driver,
 };
 use crate::error::ClientError;
+use crate::pool::{ConnectionFactory, ProxyConnectionPool};
 use crate::producer::Producer;
 use crate::transport::{Transport, default_tls_config};
-use crate::url_parse::ParsedUrl;
+use crate::url_parse::{ParsedUrl, Scheme};
 
 /// The top-level magnetar client.
 ///
-/// Holds the shared connection state and the driver task. Producers and consumers created from
-/// this client share the underlying connection.
+/// Holds the bootstrap connection (the one dialled at `connect` time, used for lookup and
+/// non-proxied producer / consumer ops) plus an opt-in per-broker connection pool (see
+/// the crate-private `pool` module) for the Apache Pulsar Proxy case (ADR-0039): when a
+/// `CommandLookupTopic` answer carries
+/// `proxy_through_service_url = true`, the runtime lazily opens a second connection back to
+/// the same physical address with `CommandConnect.proxy_to_broker_url` set to the logical
+/// broker URL and routes the producer / consumer onto that connection.
+///
+/// The `pool` is `None` on the [`Client::from_socket`] path (test-only, no URL available).
+/// Hitting a `proxy_through_service_url = true` lookup on that path surfaces a
+/// [`ClientError::ProxyUnsupportedOnSocketClient`] — the user is expected to switch to a
+/// URL-based connect to use the pool.
 #[derive(Debug)]
 pub struct Client {
     shared: Arc<ConnectionShared>,
     driver: Mutex<Option<DriverHandle>>,
+    /// Lazy per-broker connection pool (ADR-0039). `None` on the
+    /// non-URL [`Client::from_socket`] test path.
+    pool: Option<Arc<ProxyConnectionPool>>,
+}
+
+/// Decision returned by [`Client::lookup_topic`] driving where the data ops for the resolved
+/// topic should ride.
+///
+/// Mirrors the upstream Java client's
+/// [`LookupTopicResult`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/LookupTopicResult.java)
+/// (`logicalAddress`, `physicalAddress`, `isUseProxy`) collapsed to the variants magnetar
+/// actually distinguishes today (ADR-0039).
+#[derive(Debug, Clone)]
+enum LookupTarget {
+    /// Direct connection — the bootstrap conn is the data plane (today's behaviour for
+    /// single-broker setups without a proxy). The lookup's `broker_service_url` may name a
+    /// different broker than the one currently connected; multi-broker direct routing is
+    /// follow-up work tracked in ADR-0039 §"Consequences".
+    Direct,
+    /// Proxy connection — the broker is reachable only through the proxy. Routes through
+    /// the [`ProxyConnectionPool`] keyed by `broker_url`; dial target is the bootstrap's
+    /// physical address (the proxy).
+    Proxy { broker_url: String },
 }
 
 impl Client {
@@ -220,6 +254,10 @@ impl Client {
             Ok(()) => Ok(Self {
                 shared,
                 driver: Mutex::new(Some(driver)),
+                // `from_socket` has no URL to dial back through, so the proxy pool is
+                // disabled. A lookup that returns `proxy_through_service_url = true`
+                // surfaces `ClientError::ProxyUnsupportedOnSocketClient`.
+                pool: None,
             }),
             Err(e) => {
                 driver.abort();
@@ -237,6 +275,18 @@ impl Client {
         service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
         dns_resolver: Option<Arc<dyn DnsResolver>>,
     ) -> Result<Self, ClientError> {
+        // Clone the connect-time inputs into a `ConnectionFactory` so the proxy pool can
+        // lazily open per-broker pinned connections later (ADR-0039). The bootstrap conn
+        // itself does NOT set `proxy_to_broker_url` (it's the lookup-and-control plane).
+        let factory = ConnectionFactory {
+            url: url.clone(),
+            tls_config: tls_config.clone(),
+            bootstrap_config: config.clone(),
+            auth_provider: auth_provider.clone(),
+            service_url_provider: service_url_provider.clone(),
+            dns_resolver: dns_resolver.clone(),
+        };
+
         let shared = ConnectionShared::with_auth(config, auth_provider);
 
         shared.inner.lock().begin_handshake()?;
@@ -254,6 +304,7 @@ impl Client {
             Ok(()) => Ok(Self {
                 shared,
                 driver: Mutex::new(Some(driver)),
+                pool: Some(ProxyConnectionPool::new(factory)),
             }),
             Err(e) => {
                 driver.abort();
@@ -291,9 +342,16 @@ impl Client {
         // by some prior operation; a fresh broker rejects `CommandProducer` with
         // `ServerError::ServiceNotReady` ("not served by this instance, please redo the
         // lookup"). Java's `PulsarClientImpl#createProducerAsync` does the same lookup.
-        self.lookup_topic(&req.topic).await?;
+        //
+        // ADR-0039: the lookup result decides whether the producer rides on the bootstrap
+        // connection (direct, no proxy) or on a per-broker pool entry (proxy-routed). The
+        // `Producer` keeps an `Arc<ConnectionShared>` pointing at whichever connection it
+        // was opened against, so subsequent sends / closes go to the right socket.
+        let target = self.lookup_topic(&req.topic).await?;
+        let topic = req.topic.clone();
+        let target_shared = self.resolve_target(target, &topic).await?;
         let (handle, slot) = {
-            let mut conn = self.shared.inner.lock();
+            let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);
             let slot = conn
                 .producer(handle)
@@ -301,10 +359,10 @@ impl Client {
                 .expect("just-created producer slot must exist");
             (handle, slot)
         };
-        self.shared.driver_waker.notify_one();
-        wait_producer_ready(&self.shared, handle).await?;
+        target_shared.driver_waker.notify_one();
+        wait_producer_ready(&target_shared, handle).await?;
         Ok(Producer {
-            shared: self.shared.clone(),
+            shared: target_shared,
             handle,
             slot,
             compression,
@@ -312,17 +370,22 @@ impl Client {
         })
     }
 
-    /// Issue a `CommandLookupTopic` for `topic` and await its resolution.
+    /// Issue a `CommandLookupTopic` for `topic` and decide where the topic's data ops should
+    /// ride. Returns one of the [`LookupTarget`] variants:
     ///
-    /// Standalone clusters resolve the topic to the same broker we are already connected to,
-    /// so the call's only side effect is forcing the broker to activate the topic's
-    /// namespace bundle. A multi-broker redirect (where the returned `broker_service_url`
-    /// names a different broker) is logged as a warning and treated as success — the actual
-    /// "reconnect to that broker" reroute is not wired today. The user still hits the
-    /// bundle-not-served path if the resolved broker differs from the current one, but
-    /// the failure surfaces as a `ClientError::Broker` via the `ProducerOpenFailed` /
-    /// `SubscribeFailed` events instead of hanging.
-    async fn lookup_topic(&self, topic: &str) -> Result<(), ClientError> {
+    /// - [`LookupTarget::Direct`] — the bootstrap connection is the data plane. Either we are
+    ///   talking directly to the broker (no proxy) or the lookup resolved to the same broker we are
+    ///   already connected to. Producer / consumer rides on `self.shared`.
+    /// - [`LookupTarget::Proxy { broker_url }`] — the lookup answered `proxy_through_service_url =
+    ///   true`. The runtime opens (or reuses) a pool entry for `broker_url` with
+    ///   `CommandConnect.proxy_to_broker_url = broker_url`; the data ops ride on that pool entry.
+    ///   See ADR-0039.
+    ///
+    /// `Redirected` outcomes are folded back into `Direct` after a `tracing::warn!` —
+    /// the proto layer's `lookup` state machine chases redirect chains internally, so by the
+    /// time we observe `Redirected` the chain has settled. Multi-broker DIRECT routing
+    /// (without proxy) is still single-connection today; see ADR-0039 §"Consequences".
+    async fn lookup_topic(&self, topic: &str) -> Result<LookupTarget, ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.lookup(topic, false)
@@ -334,43 +397,103 @@ impl Client {
         }
         .await;
         match outcome {
-            OpOutcome::LookupResponse { outcome, .. } => match outcome {
-                magnetar_proto::LookupOutcome::Connect {
-                    broker_service_url,
-                    broker_service_url_tls,
-                    ..
-                } => {
-                    tracing::debug!(
-                        topic,
-                        broker_service_url = broker_service_url.as_deref(),
-                        broker_service_url_tls = broker_service_url_tls.as_deref(),
-                        "lookup resolved"
-                    );
-                    Ok(())
+            OpOutcome::LookupResponse { outcome, .. } => {
+                match outcome {
+                    magnetar_proto::LookupOutcome::Connect {
+                        broker_service_url,
+                        broker_service_url_tls,
+                        proxy_through_service_url,
+                    } => {
+                        tracing::debug!(
+                            topic,
+                            broker_service_url = broker_service_url.as_deref(),
+                            broker_service_url_tls = broker_service_url_tls.as_deref(),
+                            proxy_through_service_url,
+                            "lookup resolved"
+                        );
+                        if proxy_through_service_url {
+                            // ADR-0039: pick the broker URL that matches our TLS posture. If we
+                            // are on `pulsar+ssl://` and the broker advertises a TLS URL we
+                            // prefer it; otherwise fall back to the plain URL. If the broker
+                            // declined to advertise any URL we error out — the proxy cannot
+                            // route us.
+                            let broker_url = preferred_broker_url(
+                            broker_service_url,
+                            broker_service_url_tls,
+                            self.bootstrap_scheme(),
+                        )
+                        .ok_or_else(|| ClientError::Other(format!(
+                            "lookup of '{topic}' set proxy_through_service_url=true but did \
+                             not advertise a broker_service_url or broker_service_url_tls"
+                        )))?;
+                            Ok(LookupTarget::Proxy { broker_url })
+                        } else {
+                            Ok(LookupTarget::Direct)
+                        }
+                    }
+                    magnetar_proto::LookupOutcome::Redirected {
+                        broker_service_url,
+                        broker_service_url_tls,
+                    } => {
+                        // The proto layer already chases redirects internally and only surfaces
+                        // `Redirected` for observability after the redirect chain has settled.
+                        // Treat as a direct lookup — multi-broker direct routing (without proxy)
+                        // is follow-up work tracked in ADR-0039 §"Consequences".
+                        tracing::warn!(
+                            topic,
+                            broker_service_url = broker_service_url.as_deref(),
+                            broker_service_url_tls = broker_service_url_tls.as_deref(),
+                            "broker redirected lookup; multi-broker DIRECT redirect is follow-up work"
+                        );
+                        Ok(LookupTarget::Direct)
+                    }
+                    magnetar_proto::LookupOutcome::Failed { code, message } => {
+                        Err(ClientError::Broker { code, message })
+                    }
                 }
-                magnetar_proto::LookupOutcome::Redirected {
-                    broker_service_url,
-                    broker_service_url_tls,
-                } => {
-                    // The proto layer already chases redirects internally and only surfaces
-                    // `Redirected` for observability after the redirect chain has settled.
-                    // Treat as success.
-                    tracing::warn!(
-                        topic,
-                        broker_service_url = broker_service_url.as_deref(),
-                        broker_service_url_tls = broker_service_url_tls.as_deref(),
-                        "broker redirected lookup; multi-broker redirect is follow-up work"
-                    );
-                    Ok(())
-                }
-                magnetar_proto::LookupOutcome::Failed { code, message } => {
-                    Err(ClientError::Broker { code, message })
-                }
-            },
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
             other => Err(ClientError::Other(format!(
                 "unexpected lookup outcome: {other:?}"
             ))),
+        }
+    }
+
+    /// Resolve the [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
+    /// CommandProducer / CommandSubscribe on. [`LookupTarget::Direct`] returns the bootstrap
+    /// connection; [`LookupTarget::Proxy { broker_url }`] opens (or reuses) the pool entry
+    /// keyed by `(broker_url, bootstrap URL)`.
+    async fn resolve_target(
+        &self,
+        target: LookupTarget,
+        topic: &str,
+    ) -> Result<Arc<ConnectionShared>, ClientError> {
+        match target {
+            LookupTarget::Direct => Ok(self.shared.clone()),
+            LookupTarget::Proxy { broker_url } => {
+                let pool = self.pool.as_ref().ok_or_else(|| {
+                    ClientError::ProxyUnsupportedOnSocketClient {
+                        topic: topic.to_owned(),
+                    }
+                })?;
+                // Every pool entry dials the same physical address — the proxy URL the
+                // bootstrap was built with. The proto-layer's `CommandConnect.proxy_to_broker_url`
+                // is what tells the proxy which backend broker this connection serves.
+                let physical = pool.bootstrap_url();
+                pool.get_or_open(&broker_url, &physical).await
+            }
+        }
+    }
+
+    /// Scheme of the bootstrap connection — used by [`Self::lookup_topic`] to pick between
+    /// `broker_service_url` and `broker_service_url_tls`. We pull it back from the
+    /// `ProxyConnectionPool`'s factory snapshot when available; the `from_socket` path falls
+    /// back to `Plain` because there is no URL to consult. The result feeds
+    /// [`preferred_broker_url`] for the proxy-pool routing decision.
+    fn bootstrap_scheme(&self) -> Scheme {
+        match &self.pool {
+            Some(pool) => pool.bootstrap_scheme(),
+            None => Scheme::Plain,
         }
     }
 
@@ -426,8 +549,13 @@ impl Client {
         if self.shared.txn_bootstrapped.load(Ordering::Acquire) {
             return Ok(());
         }
-        // Step 1: lookup forces bundle ownership onto this broker.
-        self.lookup_topic("persistent://pulsar/system/transaction_coordinator_assign-partition-0")
+        // Step 1: lookup forces bundle ownership onto this broker. The TC bundle lives on the
+        // bootstrap connection regardless of what the lookup returns — `new_txn` and friends
+        // below all drive `self.shared`. (If a proxy ever advertised the TC bundle on a
+        // different broker we'd still hit the bundle-not-served path on `tc_client_connect`,
+        // which is correct: the TC client's broker is configured separately from the data plane.)
+        let _ = self
+            .lookup_topic("persistent://pulsar/system/transaction_coordinator_assign-partition-0")
             .await?;
         // Step 2: explicit TC handshake — broker only responds once the TC metadata store is
         // loaded, eliminating the race between bundle-ownership-acquire and the first newTxn.
@@ -682,10 +810,13 @@ impl Client {
         decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
     ) -> Result<Consumer, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
-        // See `open_producer_with`: subscribe also needs lookup-driven bundle activation.
-        self.lookup_topic(&req.topic).await?;
+        // See `open_producer_with`: subscribe also needs lookup-driven bundle activation,
+        // and ADR-0039 routes proxy-resolved subscribes onto a pinned pool entry.
+        let target = self.lookup_topic(&req.topic).await?;
+        let topic = req.topic.clone();
+        let target_shared = self.resolve_target(target, &topic).await?;
         let (handle, slot) = {
-            let mut conn = self.shared.inner.lock();
+            let mut conn = target_shared.inner.lock();
             let handle = conn.subscribe(req);
             let slot = conn
                 .consumer(handle)
@@ -693,12 +824,12 @@ impl Client {
                 .expect("just-created consumer slot must exist");
             (handle, slot)
         };
-        self.shared.driver_waker.notify_one();
-        wait_subscribe_acked(&self.shared, handle).await?;
+        target_shared.driver_waker.notify_one();
+        wait_subscribe_acked(&target_shared, handle).await?;
 
         // Feed an initial flow so the broker starts delivering.
         {
-            let mut conn = self.shared.inner.lock();
+            let mut conn = target_shared.inner.lock();
             // `initial_flow` returns None when there is no consumer state; ignore that.
             let _ = conn.initial_flow(handle);
             // Also send an explicit FLOW with the configured queue size as a safety net for any
@@ -707,18 +838,19 @@ impl Client {
                 conn.flow(handle, receiver_queue_size as u32);
             }
         }
-        self.shared.driver_waker.notify_one();
+        target_shared.driver_waker.notify_one();
 
         Ok(Consumer {
-            shared: self.shared.clone(),
+            shared: target_shared,
             handle,
             slot,
             decryptor,
         })
     }
 
-    /// Close the connection. Sends `CommandCloseConnection`-style state-machine close, then
-    /// waits for the driver task to exit.
+    /// Close the connection. Sends `CommandCloseConnection`-style state-machine close on the
+    /// bootstrap connection, joins its driver, then closes every entry in the proxy pool
+    /// (ADR-0039) and joins their drivers.
     ///
     /// Idempotent: calling close more than once does nothing on the subsequent calls.
     pub async fn close(self) {
@@ -732,6 +864,11 @@ impl Client {
             // We deliberately discard the join result here — close() is best-effort; consumers
             // that want the terminal error should call `join_driver` instead.
             let _ = handle.join().await;
+        }
+        // Tear down the proxy pool (ADR-0039). Pool entries are independent supervised
+        // driver loops; each one observes its own `is_user_closed()` after we call close().
+        if let Some(pool) = self.pool.as_ref() {
+            pool.close().await;
         }
     }
 
@@ -779,7 +916,23 @@ impl Client {
     }
 }
 
-async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), ClientError> {
+/// Pick the broker URL the proxy advertised for the topic — the value to thread into
+/// `CommandConnect.proxy_to_broker_url` on the pinned pool entry (ADR-0039). Prefers
+/// the TLS URL when the bootstrap connection is on `pulsar+ssl://`, otherwise picks the
+/// plain URL. Returns `None` if the broker declined to advertise any URL (which the
+/// proxy contract says shouldn't happen but the broker is the broker).
+fn preferred_broker_url(
+    broker_url: Option<String>,
+    broker_url_tls: Option<String>,
+    scheme: Scheme,
+) -> Option<String> {
+    match scheme {
+        Scheme::Tls => broker_url_tls.or(broker_url),
+        Scheme::Plain => broker_url.or(broker_url_tls),
+    }
+}
+
+pub(crate) async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), ClientError> {
     ConnectedFut {
         shared,
         helper: None,

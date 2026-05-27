@@ -408,8 +408,13 @@ pub enum LookupOutcome {
 pub struct IncomingMessage {
     /// Broker-assigned message id (with `batch_index` filled for batched messages).
     pub message_id: MessageId,
-    /// Decoded metadata for the *batch* (the producer's metadata, not the single's).
-    pub metadata: pb::MessageMetadata,
+    /// Decoded metadata for the *batch* (the producer's metadata, not the
+    /// single's). Wrapped in [`std::sync::Arc`] so the batched-delivery loop in
+    /// `ConsumerState::deliver` can hand every sub-message a refcount of
+    /// the same parsed metadata instead of `clone()`-ing it N times per
+    /// batch (a 100-message batch was 100 metadata deep-clones; with the
+    /// `Arc` it is 100 refcount bumps).
+    pub metadata: std::sync::Arc<pb::MessageMetadata>,
     /// Optional single-message metadata if the message was part of a batch.
     pub single_metadata: Option<pb::SingleMessageMetadata>,
     /// The payload bytes (post-decompression by the consumer driver; the state machine itself
@@ -418,8 +423,9 @@ pub struct IncomingMessage {
     pub payload: Bytes,
     /// Broker-supplied redelivery count.
     pub redelivery_count: u32,
-    /// Optional broker-entry metadata (PIP-90).
-    pub broker_entry_metadata: Option<pb::BrokerEntryMetadata>,
+    /// Optional broker-entry metadata (PIP-90). Refcounted for the same
+    /// batched-delivery-loop reason as `metadata`.
+    pub broker_entry_metadata: Option<std::sync::Arc<pb::BrokerEntryMetadata>>,
     /// Wall-clock instant at which the consumer state machine first saw this message (i.e. the
     /// moment `ConsumerState::deliver` queued it). The consumer uses
     /// `pop_message`-time `Instant::now() - arrived_at` to feed its

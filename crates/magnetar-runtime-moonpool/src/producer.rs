@@ -537,9 +537,20 @@ impl<P: Providers> Client<P> {
         // `ServerError::ServiceNotReady` ("not served by this instance, please redo the
         // lookup"). Mirrors `magnetar-runtime-tokio`'s `Client::open_producer_with` and Java's
         // `PulsarClientImpl#createProducerAsync`.
-        let _ = self.lookup_topic(&req.topic, false).await?;
+        //
+        // ADR-0039 routing: detect `proxy_through_service_url = true` via
+        // [`Client::lookup_topic_target`], then dispatch via the synchronous
+        // [`Client::resolve_target`]. The moonpool engine currently surfaces
+        // `ClientError::ProxyUnsupportedOnUnsupervisedClient` for the proxy branch —
+        // fully wiring the per-broker pool here requires moving the pool's dial onto a
+        // separately-spawned task because `moonpool_core::NetworkProvider` is declared
+        // `#[async_trait(?Send)]` (single-core design); the facade's `CreateProducerApi`
+        // trait method returns `Pin<Box<dyn Future + Send>>` which would otherwise be
+        // unsatisfiable on a generic `P`. Tracked as follow-up in ADR-0039.
+        let target = self.lookup_topic_target(&req.topic).await?;
+        let target_shared = self.resolve_target(&target, &req.topic)?;
         let (handle, slot) = {
-            let mut conn = self.shared().inner.lock();
+            let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);
             let slot = conn
                 .producer(handle)
@@ -547,10 +558,10 @@ impl<P: Providers> Client<P> {
                 .expect("just-created producer slot must exist");
             (handle, slot)
         };
-        self.shared().driver_waker.notify_one();
-        wait_producer_ready(self.shared(), handle).await?;
+        target_shared.driver_waker.notify_one();
+        wait_producer_ready(&target_shared, handle).await?;
         Ok(Producer {
-            shared: self.shared().clone(),
+            shared: target_shared,
             handle,
             slot,
             compression,

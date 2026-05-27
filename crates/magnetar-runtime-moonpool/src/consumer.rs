@@ -1025,9 +1025,12 @@ impl<P: Providers> Client<P> {
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer<P>, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
         // See `Client::open_producer`: subscribe also needs lookup-driven bundle
-        // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`.
-        let _ = self.lookup_topic(&req.topic, false).await?;
-        let shared = self.shared().clone();
+        // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`. See the
+        // same site for the ADR-0039 proxy-routing nuance — `resolve_target` is sync and
+        // errors `ProxyUnsupportedOnUnsupervisedClient` on the proxy branch until the
+        // pool's dial is moved onto a separately-spawned task.
+        let target = self.lookup_topic_target(&req.topic).await?;
+        let shared = self.resolve_target(&target, &req.topic)?;
         let (handle, slot) = {
             let mut conn = shared.inner.lock();
             let handle = conn.subscribe(req);
@@ -2221,7 +2224,7 @@ mod tests {
                 batch_size: 0,
             },
             payload: Bytes::from_static(b"retryme"),
-            metadata: magnetar_proto::pb::MessageMetadata::default(),
+            metadata: std::sync::Arc::new(magnetar_proto::pb::MessageMetadata::default()),
             single_metadata: None,
             redelivery_count: 0,
             broker_entry_metadata: None,

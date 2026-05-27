@@ -33,32 +33,8 @@ What remains open from that audit — bucketed by category — is below.
 Findings are `path:line`-verifiable; tags: **[codex]** = codex-only
 catch, **[Δ]** = auditor disagreement with documented resolution.
 
-### Open — sans-io / determinism
-
-- **`crates/magnetar/src/client.rs` (`Reader` subscription naming) +
-  `crates/magnetar/src/table_view.rs`** —
-  `Uuid::new_v4()` for default subscription names in the façade.
-  Inject a random/id provider via Engine, or require explicit
-  subscription names for `MoonpoolEngine`.
-- **`crates/magnetar-auth-oauth2/src/lib.rs::SystemClock`** —
-  `SystemClock::now()` is the production default for OAuth2's
-  `Clock` trait; the same crate provides a `VirtualClock` in tests.
-  Wire a `Clock` provider through the engine so the production path
-  is actually injectable.
 ### Open — zero-copy
 
-- **Batched-consumer per-message metadata clone** —
-  `crates/magnetar-proto/src/consumer.rs::classify_and_queue` (batched
-  delivery loop) — for each message in a batch (loop iterating
-  `num_in_batch` times), `pb::MessageMetadata` and `BrokerEntryMetadata`
-  are cloned into a fresh `IncomingMessage`. A 100-message batch =
-  100 metadata clones of identical data. Wrap in
-  `Arc<MessageMetadata>` so all messages in the batch share by Arc.
-- **Chunked-message metadata clone** —
-  `crates/magnetar-proto/src/consumer.rs::ChunkBuffer` (first-chunk
-  arrival + final assembly) — metadata cloned on first-chunk arrival,
-  then again on final assembly. Arc-wrap in `ChunkBuffer`, or move out
-  (not clone) on assembly.
 - **`crates/magnetar-proto/src/frame.rs::encode_payload`** — single
   `BytesMut` accumulator copies every payload into the wire buffer.
   Return a frame descriptor `{head: BytesMut, payload: Bytes}` and
@@ -83,10 +59,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   ack** — `crates/magnetar-proto/src/producer.rs` — O(in-flight) work
   per receipt. Use a `VecDeque` with monotonic head and slot
   generation.
-- **`ack.rs` uses `HashSet` then drains-and-sorts** —
-  `crates/magnetar-proto/src/trackers/ack.rs` —
-  `BTreeSet<MessageId>` removes the post-drain sort allocation, or
-  `SmallVec` with threshold-based sort for small batches.
 - **`multi_topics.rs`, `pattern_consumer.rs` receive loops** — every
   `receive()` call clones the full consumer list and rebuilds a
   `Vec<Future>`. Keep an `Arc<[NamedConsumer]>` snapshot updated only
@@ -94,11 +66,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — syscall reduction
 
-- **Explicit `flush()` after every `write_all`** —
-  `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` —
-  for plaintext TCP, `flush()` is essentially a no-op; for TLS it can
-  force extra record work. Skip flush on plaintext; flush only at
-  batch boundaries.
 - **No `writev` / `IoSlice`** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` +
   `crates/magnetar-proto/src/conn.rs::poll_transmit` — outbound
@@ -117,9 +84,11 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 ### Open — security hardening
 
 - **Athenz private key as `String`** —
-  `crates/magnetar-auth-athenz/src/lib.rs` — wrap parsed key in
-  `zeroize::Zeroizing<…>` (ADR-0030 lists this as deferred to
-  v0.2.0).
+  `crates/magnetar-auth-athenz/src/lib.rs` — `AthenzConfig::Debug` now
+  redacts `private_key_pem`. Wrapping the **parsed** RSA key in
+  `zeroize::Zeroizing<…>` is still pending; ADR-0030 defers this to
+  the actual ZTS round-trip landing (the parsed key only exists once
+  that work happens — see the Athenz ZTS round-trip entry below).
 
 ### Open — cleanup and structural clarity
 
@@ -161,13 +130,30 @@ block:
 - `PulsarClient::table_view(...)`
 - `PulsarClient::typed_table_view(...)`
 
-Lifting these to the engine-generic `impl<E: Engine> PulsarClient<E>`
-block needs the matching `BrokerMetadataApi` / partition-count
-lookups already present on both engines and a small amount of
-plumbing to surface tokio-only specialised methods
-(`refresh_partitions`, `last_sequence_id_published`) via a
-specialisation block. The inner builders are already engine-generic
-so the lift is mostly mechanical.
+A previous pass of this entry assumed the inner builders were already
+engine-generic. That is **not** the current state: as of
+`crates/magnetar/src/partitioned_producer.rs:716` and
+`crates/magnetar/src/table_view.rs:333,763`, the three builder types
+(`PartitionedProducerBuilder<'a>`, `TableViewBuilder<'a>`,
+`TypedTableViewBuilder<'a, S>`) carry no engine parameter and reference
+tokio-only types directly (e.g.
+`std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` on the
+partitioned producer builder, `magnetar_runtime_tokio::MessageDecryptor`
+on the table-view builder).
+
+Concrete sub-steps before the entry-point lift can happen:
+
+1. Make `PartitionedProducerBuilder<'a, E: Engine>` carry the
+   `MessageEncryptor` / `MessageRouter` types via per-engine API
+   extension traits.
+2. Same for `TableViewBuilder<'a, E: Engine>` /
+   `TypedTableViewBuilder<'a, E: Engine, S>`
+   (`MessageDecryptor`, broker-metadata lookup).
+3. Move all the inner `.consumer(...)` / `.producer(...)` plumbing
+   through the engine-generic `SubscribeApi` / `CreateProducerApi`
+   traits.
+4. Then lift the entry-point methods to
+   `impl<E: Engine> PulsarClient<E>`.
 
 Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
@@ -303,22 +289,6 @@ Status snapshot:
 
 ### PIP-180 post-landing follow-ups
 
-- **Subscribe-time admin REST hint integration (façade-level)** —
-  the runtime engines expose `Consumer::set_shadow_source(...)` but
-  do NOT call the admin REST `get_shadow_source(topic)` automatically
-  at `subscribe()` time. Today the caller threads the source-topic
-  hint in by hand (or via the magnetar façade above the runtime,
-  which has `magnetar-admin` available behind the `admin` feature).
-  A clean addition would be a `Client::subscribe_shadow_aware(...)`
-  on the magnetar façade that performs the lookup when the `admin`
-  feature is active.
-- **Post-subscribe shadow-metadata cache race** — the per-`Consumer`
-  shadow metadata is resolved once at subscribe time and cached
-  for the consumer's lifetime. If a shadow is created on a topic
-  AFTER a consumer subscribed to it, the consumer will not pick up
-  the new shadow attachment until it re-subscribes. Documented in
-  [`shadow-topic.md`](shadow-topic.md) §Caveats. Low priority —
-  operators inspect via `magnetar shadow list <source>`.
 - **Moonpool `BrokerWorkload::ShadowReceive`** — the differential
   `ScriptedBroker` already echoes the client-asserted source id on
   `CommandSendReceipt`, so the moonpool sim_chaos suite doesn't

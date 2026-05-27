@@ -100,6 +100,35 @@ pub trait Engine: 'static + Send + Sync + Debug {
     fn interval_tick<'a>(
         interval: &'a mut Self::Interval,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Engine-injected id provider for the façade's auto-generated
+    /// subscription names (`Reader`, `TableView`). Tokio plugs in
+    /// `Uuid::new_v4().simple()` (RFC 4122 random); moonpool plugs in
+    /// a process-global atomic counter so deterministic-simulation runs
+    /// produce stable, reproducible names. Callers that need fully
+    /// deterministic names across processes should always pass an
+    /// explicit subscription / reader name through the builder.
+    fn random_subscription_suffix() -> String
+    where
+        Self: Sized;
+
+    /// Engine-provided `OAuth2` [`magnetar_auth_oauth2::Clock`]. Used by
+    /// callers that build a `ClientCredentialsFlow` from generic-engine
+    /// code so the `OAuth2` cache deadlines flow through the same clock
+    /// the engine uses everywhere else, instead of always landing on
+    /// `Arc::new(SystemClock)` at the `OAuth2` builder boundary.
+    ///
+    /// Default is `Arc::new(magnetar_auth_oauth2::SystemClock)` —
+    /// matches the `OAuth2` builder's own default. Engines wired into a
+    /// virtual-time substrate (e.g. moonpool with `SimProviders`)
+    /// override this to return a clock that reads the simulated time.
+    #[cfg(feature = "auth-oauth2")]
+    fn oauth2_clock() -> std::sync::Arc<dyn magnetar_auth_oauth2::Clock>
+    where
+        Self: Sized,
+    {
+        std::sync::Arc::new(magnetar_auth_oauth2::SystemClock)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,6 +1868,10 @@ impl Engine for TokioEngine {
             interval.tick().await;
         })
     }
+
+    fn random_subscription_suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
 }
 
 /// Zero-sized marker for the moonpool deterministic-simulation engine,
@@ -1916,6 +1949,17 @@ impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
             interval.tick().await;
         })
     }
+
+    fn random_subscription_suffix() -> String {
+        // Deterministic counter — every moonpool run produces the same
+        // suffix sequence so `Reader` / `TableView` auto-names are
+        // reproducible. Tests that need stronger isolation across
+        // sub-tests should still pass an explicit subscription name.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("sim-{n:016x}")
+    }
 }
 
 // Per-engine storage for [`crate::PulsarClient<MoonpoolEngine<P>>`] is
@@ -1963,6 +2007,25 @@ mod tests {
         use moonpool_core::TokioProviders;
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MoonpoolEngine<TokioProviders>>();
+    }
+
+    #[cfg(all(feature = "tokio", feature = "auth-oauth2"))]
+    #[test]
+    fn tokio_engine_oauth2_clock_is_monotonic() {
+        let clock = <TokioEngine as Engine>::oauth2_clock();
+        let a = clock.now();
+        let b = clock.now();
+        assert!(b >= a, "OAuth2 clock must be monotonic");
+    }
+
+    #[cfg(all(feature = "moonpool", feature = "auth-oauth2"))]
+    #[test]
+    fn moonpool_engine_oauth2_clock_is_monotonic() {
+        use moonpool_core::TokioProviders;
+        let clock = <MoonpoolEngine<TokioProviders> as Engine>::oauth2_clock();
+        let a = clock.now();
+        let b = clock.now();
+        assert!(b >= a, "OAuth2 clock must be monotonic");
     }
 
     // -------------------------------------------------------------

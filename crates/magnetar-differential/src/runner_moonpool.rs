@@ -448,6 +448,7 @@ fn classify(err: &ClientError) -> String {
         ClientError::Engine(_) => "engine".to_owned(),
         ClientError::Broker { code, .. } => format!("broker:{code}"),
         ClientError::Closed => "closed".to_owned(),
+        ClientError::ProxyUnsupportedOnUnsupervisedClient { .. } => "proxy-unsupervised".to_owned(),
         ClientError::Other(_) => "other".to_owned(),
     }
 }

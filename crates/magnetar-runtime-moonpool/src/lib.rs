@@ -66,6 +66,7 @@ mod client;
 mod consumer;
 pub mod dns;
 mod driver;
+mod pool;
 mod producer;
 pub mod tls;
 pub mod tls_crypto;
@@ -742,7 +743,7 @@ impl<P: Providers> MoonpoolEngine<P> {
 /// driver. Without this, `poll_transmit` returns no bytes and the loop
 /// parks on `read_buf` forever (the M8 differential `golden_traces`
 /// regression).
-async fn handshake_plain<P: Providers>(
+pub(crate) async fn handshake_plain<P: Providers>(
     shared: &Arc<ConnectionShared>,
     transport: &mut Transport<P>,
 ) -> Result<(), EngineError> {
