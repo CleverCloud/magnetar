@@ -44,6 +44,7 @@
 //!
 //! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
+use std::io::IoSlice;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -599,6 +600,74 @@ fn transport_needs_flush(transport: &Transport) -> bool {
     }
 }
 
+/// Write every byte of every segment to `stream`, advancing through
+/// the segment list as the kernel reports progress (ADR-0039 wave 2).
+///
+/// Equivalent to `AsyncWriteExt::write_all` for a contiguous buffer,
+/// but lets the kernel concatenate disjoint segments via `writev(2)` —
+/// skipping the user-space memcpy that the legacy contiguous-coalesce
+/// path performs at
+/// `magnetar_proto::frame::encode_payload`'s `dst.extend_from_slice(payload)`.
+///
+/// Implementation notes:
+///
+/// - **Partial writes**. `AsyncWriteExt::write_vectored` returns the number of bytes the kernel
+///   accepted from the *front* of the slice list; not necessarily all of them. We advance
+///   per-segment offsets and re-issue `write_vectored` until every byte has been accepted.
+/// - **WriteZero**. A successful `write_vectored` returning `0` when the IoSlice array is non-empty
+///   is treated the same as `AsyncWriteExt::write_all` does — an `io::ErrorKind::WriteZero` so the
+///   driver doesn't spin.
+/// - **Vectored support detection**. We do not check `AsyncWrite::is_write_vectored`; the default
+///   `poll_write_vectored` impl falls back to a single-buffer `poll_write` with the first non-empty
+///   slice, which still makes progress (just without the syscall reduction). The fall-back loop is
+///   correct on every `AsyncWrite + Unpin`.
+async fn write_all_vectored<S>(stream: &mut S, segs: &[bytes::Bytes]) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut offsets: Vec<usize> = vec![0; segs.len()];
+    loop {
+        let slices: Vec<IoSlice<'_>> = segs
+            .iter()
+            .zip(offsets.iter())
+            .filter_map(|(seg, &off)| {
+                let rest = &seg[off..];
+                if rest.is_empty() {
+                    None
+                } else {
+                    Some(IoSlice::new(rest))
+                }
+            })
+            .collect();
+        if slices.is_empty() {
+            return Ok(());
+        }
+        let n = stream.write_vectored(&slices).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_vectored returned 0 with non-empty IoSlice array",
+            ));
+        }
+        let mut remaining = n;
+        for (seg, off) in segs.iter().zip(offsets.iter_mut()) {
+            let avail = seg.len().saturating_sub(*off);
+            if avail == 0 {
+                continue;
+            }
+            if remaining >= avail {
+                *off = seg.len();
+                remaining -= avail;
+            } else {
+                *off += remaining;
+                remaining = 0;
+                break;
+            }
+        }
+        debug_assert_eq!(remaining, 0, "kernel reported more bytes than queued");
+    }
+}
+
 /// The per-socket driver loop.
 ///
 /// Implementation notes:
@@ -631,9 +700,16 @@ where
         // `Producer::send` without taking the global lock — ADR-0038 Phase 3)
         // into the connection-wide outbound buffer before returning the byte
         // slice for the driver to flush.
-        let (write_buf, deadline, should_close) = {
+        let (write_data, deadline, should_close) = {
             let mut conn = shared.inner.lock();
-            let out = conn.poll_transmit();
+            // ADR-0039 wave 2: take the owned `TransmitOwned` so we can
+            // drop the lock before awaiting on the socket. The contiguous
+            // arm carries the same `Bytes` the legacy `poll_transmit`
+            // returned (O(1) ownership transfer via `BytesMut::split()`);
+            // the vectored arm carries the producer batch's
+            // `[head, payload]` segment list — dispatched below via
+            // `write_vectored` to skip the user-space coalesce memcpy.
+            let out = conn.poll_transmit_owned();
             let dl = conn.poll_timeout();
             let closing = matches!(
                 conn.state(),
@@ -653,8 +729,14 @@ where
         // plaintext TCP it's `false` — kernel-buffered `write_all` already
         // pushes the bytes to the socket and there's no user-space buffer to
         // drain, so the extra `flush()` is wasted syscall overhead.
-        if !write_buf.is_empty() {
-            if let Err(err) = socket.write_all(&write_buf).await {
+        if !write_data.is_empty() {
+            let write_result = match &write_data {
+                magnetar_proto::TransmitOwned::Contiguous(buf) => socket.write_all(buf).await,
+                magnetar_proto::TransmitOwned::Vectored(segs) => {
+                    write_all_vectored(socket, segs).await
+                }
+            };
+            if let Err(err) = write_result {
                 shared.inner.lock().mark_disconnected();
                 return Err(err.into());
             }

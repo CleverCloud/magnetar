@@ -56,26 +56,41 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   — wave 1 (proto `Transmit` enum + tokio `write_vectored`), wave 2
   (moonpool `Providers::Network::write_vectored` + chaos pack
   segment-granular drops), wave 3 (read-path `BytesMut` ownership
-  pass-through). **Waves 1.0 + 1.1 + 1.2 landed**: `Transmit<'a>`
-  enum (`Contiguous` / `Vectored`) lives in
-  `crates/magnetar-proto/src/transmit.rs`;
-  `Connection::poll_transmit_vectored` returns `Transmit<'_>` and
-  is wired to emit **either** arm based on which buffer carries
-  pending bytes — `Contiguous` for handshake / ack / lookup frames
-  in `outbound: BytesMut`, `Vectored` for producer-batch frames in
-  `outbound_segments: Vec<Bytes>` populated by the new
-  `Connection::drain_producer_outbound_vectored`. The latter calls
-  `frame::encode_payload_head` (the wave-1.2 zero-copy encoder)
-  which returns the head bytes without copying the payload, then
-  pushes a `[head, payload]` pair into the segment list — the
-  payload `Bytes` is re-used unchanged from the producer state.
-  When both buffers carry data, the contiguous arm wins so wire
-  order is preserved; segments stay queued and emerge on the next
-  call. **Wave 2** (moonpool `Providers::Network::write_vectored`
-  + chaos pack segment-granular drops) and **wave 3** (read-path
-  `BytesMut` ownership pass-through) still TODO; runtime adoption
-  (tokio `poll_write_vectored` on the Vectored arm) lands with
-  wave 2.
+  pass-through). **Waves 1.0 + 1.1 + 1.2 + 2 (tokio adoption +
+  moonpool API alignment) landed**. The pipeline is end-to-end:
+  - Proto: `Transmit<'a>` (borrowed) +
+    [`TransmitOwned`](../crates/magnetar-proto/src/transmit.rs)
+    (owned, used by runtimes); `Connection::poll_transmit_owned`
+    is the runtime entry point — drains via the same O(1)
+    `BytesMut::split()` ownership transfer for the contiguous
+    arm, via `std::mem::take` for the vectored arm.
+  - Encoder: `frame::encode_payload_head` returns the head
+    bytes without copying the payload; producer batches are
+    drained as `[head, payload]` pairs into
+    `Connection::outbound_segments`.
+  - tokio runtime: `driver_loop_inner` calls
+    `poll_transmit_owned` and dispatches the `Vectored` arm via
+    a new `write_all_vectored` helper that loops over
+    `AsyncWriteExt::write_vectored` with `IoSlice` advancement
+    — real `writev(2)` syscall, no user-space coalesce.
+  - moonpool runtime: same entry point; the `Vectored` arm
+    coalesces locally for now (the underlying
+    `moonpool_core::NetworkProvider::TcpStream` lacks a
+    chaos-pack-aware `write_vectored`). On-the-wire bytes are
+    byte-identical to the tokio engine; only chaos-pack
+    fidelity differs.
+
+  **Remaining**:
+  - **moonpool `Providers::Network::write_vectored` + chaos pack
+    segment-granular drops** — needs `moonpool-core` to expose a
+    vectored primitive on `NetworkProvider::TcpStream` (external
+    crate work). Once available, replace the moonpool driver's
+    local coalesce with the real vectored dispatch; the chaos
+    pack can then drop / re-order individual segments.
+  - **Wave 3** (read-path `BytesMut` ownership pass-through) —
+    runtime hands owned `BytesMut` chunks to `handle_bytes`
+    directly. The proto-side double-copy was already removed
+    (commit `bf66a5b`); wave 3 closes the runtime-side gap.
 - **Read path double-copy** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner`
   reads `read_buf` → `split().freeze()`. The proto-side re-copy was

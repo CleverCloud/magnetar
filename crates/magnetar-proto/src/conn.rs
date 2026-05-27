@@ -1761,6 +1761,36 @@ impl Connection {
     /// [`Self::poll_transmit`] returns directly; the vectored arm
     /// (wave 1.2+) hands the runtime an owned segment list it can pass
     /// into the kernel as an `IoSlice` array.
+    /// Drain queued outbound bytes as an owned [`crate::TransmitOwned`]
+    /// descriptor (ADR-0039 wave 2 — runtime adoption).
+    ///
+    /// The owned variant is what runtimes use in practice: the
+    /// borrowed [`crate::Transmit`] returned by
+    /// [`Self::poll_transmit_vectored`] is tied to `&mut Connection`
+    /// and cannot cross the runtime's `.await`. The owned variant
+    /// drains via the same O(1) ownership transfer
+    /// [`Self::poll_transmit`] uses for the contiguous arm, and via
+    /// `std::mem::take` for the segment list — no extra memcpy in
+    /// either case.
+    ///
+    /// Dispatch rule mirrors [`Self::poll_transmit_vectored`]:
+    ///   1. If the contiguous `outbound` buffer is empty, drain producers vectored; if
+    ///      `outbound_segments` is non-empty after the drain, return `Vectored`.
+    ///   2. Otherwise drain producers contiguous and return `Contiguous` (legacy path, preserves
+    ///      wire order when both buffers carry pending bytes).
+    pub fn poll_transmit_owned(&mut self) -> crate::TransmitOwned {
+        if self.outbound.is_empty() {
+            self.drain_producer_outbound_vectored();
+            if !self.outbound_segments.is_empty() {
+                return crate::TransmitOwned::Vectored(std::mem::take(&mut self.outbound_segments));
+            }
+        }
+        self.drain_producer_outbound();
+        let out = self.outbound.split().freeze();
+        self.outbound = BytesMut::with_capacity(4 * 1024);
+        crate::TransmitOwned::Contiguous(out)
+    }
+
     pub fn poll_transmit_vectored(&mut self) -> crate::Transmit<'_> {
         // Wave 1.2: prefer the `Vectored` arm when:
         //   1. The producer batch path has segments to emit, AND

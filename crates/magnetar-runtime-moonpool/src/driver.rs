@@ -599,13 +599,26 @@ where
                 .store(now_ms, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 1. Drain outbound bytes + check if the state machine wants us to terminate.
-        //    `poll_transmit` already calls `Connection::drain_producer_outbound` internally to
-        //    merge per-slot staged frames (queued by `Producer::send` without taking the global
-        //    lock — ADR-0038 Phase 3) into the connection-wide outbound buffer.
+        // 1. Drain outbound bytes + check if the state machine wants us to terminate. ADR-0039 wave
+        //    2: take the owned `TransmitOwned` — the contiguous arm uses the same O(1)
+        //    `BytesMut::split()` ownership transfer the legacy `poll_transmit` returned; the
+        //    vectored arm carries the producer batch's `[head, payload]` segment list.
+        //
+        //    moonpool's `Transport` does not yet expose a vectored
+        //    write primitive (the underlying
+        //    `moonpool_core::NetworkProvider::TcpStream` lacks a
+        //    chaos-pack-aware `write_vectored`); for now the vectored
+        //    arm coalesces locally and falls through to the same
+        //    contiguous `write_all`. Once moonpool-core adds vectored
+        //    support the chaos pack gains segment-granular drops
+        //    (ADR-0039 wave 2's chaos-pack note). The tokio engine
+        //    already dispatches `Vectored` via real `writev(2)` —
+        //    coalesce-here on moonpool means the *bytes* on the wire
+        //    are byte-identical to tokio, only the chaos-pack
+        //    fidelity differs.
         let (write_buf, deadline, should_close) = {
             let mut conn = shared.inner.lock();
-            let out = conn.poll_transmit();
+            let owned = conn.poll_transmit_owned();
             let dl = conn.poll_timeout();
             let closing = matches!(
                 conn.state(),
@@ -613,7 +626,18 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
-            (out, dl, closing)
+            let write_buf = match owned {
+                magnetar_proto::TransmitOwned::Contiguous(buf) => buf,
+                magnetar_proto::TransmitOwned::Vectored(segs) => {
+                    let total: usize = segs.iter().map(bytes::Bytes::len).sum();
+                    let mut coalesced = bytes::BytesMut::with_capacity(total);
+                    for seg in segs {
+                        coalesced.extend_from_slice(&seg);
+                    }
+                    coalesced.freeze()
+                }
+            };
+            (write_buf, dl, closing)
         };
 
         // 2. Flush whatever the state machine produced. This happens outside the lock so user

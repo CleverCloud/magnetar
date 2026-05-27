@@ -142,6 +142,6 @@ pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
 };
 pub use crate::supervisor::SupervisorConfig;
-pub use crate::transmit::Transmit;
+pub use crate::transmit::{Transmit, TransmitOwned};
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
