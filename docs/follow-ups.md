@@ -48,10 +48,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — performance / contention
 
-- **`ProducerState::refresh_pending_index` clears + rebuilds on every
-  ack** — `crates/magnetar-proto/src/producer.rs` — O(in-flight) work
-  per receipt. Use a `VecDeque` with monotonic head and slot
-  generation.
 - **`multi_topics.rs`, `pattern_consumer.rs` receive loops** — every
   `receive()` call clones the full consumer list and rebuilds a
   `Vec<Future>`. Keep an `Arc<[NamedConsumer]>` snapshot updated only

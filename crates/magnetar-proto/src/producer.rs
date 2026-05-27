@@ -1231,8 +1231,13 @@ impl ProducerState {
         self.send_latency_hist.saturating_record(latency_ms);
         op.receipt = Some(mid);
         let waker = op.waker.take();
-        // Re-index remaining positions.
-        self.refresh_pending_index();
+        // Decrement indices for entries shifted left by the
+        // `VecDeque::remove(position)` above. In-place: every entry whose
+        // stored idx > `position` lost one slot, so subtract one. This is
+        // O(in-flight) like the previous `refresh_pending_index` clear+
+        // rebuild but reuses the existing hash slots (no rehash, no
+        // re-allocation).
+        self.shift_pending_index_left(position);
         Some((seq, mid, waker))
     }
 
@@ -1246,14 +1251,21 @@ impl ProducerState {
         let position = self.pending.iter().position(|op| op.sequence_id == seq)?;
         let mut op = self.pending.remove(position)?;
         let waker = op.waker.take();
-        self.refresh_pending_index();
+        self.shift_pending_index_left(position);
         Some((seq, waker, err.error, err.message.clone()))
     }
 
-    fn refresh_pending_index(&mut self) {
-        self.pending_index.clear();
-        for (idx, op) in self.pending.iter().enumerate() {
-            self.pending_index.insert(op.sequence_id, idx);
+    /// Decrement every `pending_index` value strictly greater than
+    /// `removed_position` by 1. Used after a `VecDeque::remove(position)`
+    /// to keep the position-based index consistent without reallocating
+    /// the map. Previously this was a `clear()` + rebuild loop that
+    /// burned an `FxHashMap` insert per in-flight slot on every receipt;
+    /// now it's a single-pass `values_mut()` walk with no allocation.
+    fn shift_pending_index_left(&mut self, removed_position: usize) {
+        for v in self.pending_index.values_mut() {
+            if *v > removed_position {
+                *v -= 1;
+            }
         }
     }
 
