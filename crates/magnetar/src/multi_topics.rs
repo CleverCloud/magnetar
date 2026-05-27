@@ -62,9 +62,12 @@ pub struct MultiTopicsConsumer<C: ConsumerApi = magnetar_runtime_tokio::Consumer
 struct Inner<C: ConsumerApi> {
     /// Active consumer set. Held under a mutex so [`MultiTopicsConsumer::add_topic`] /
     /// [`MultiTopicsConsumer::remove_topic`] can mutate the set without rebuilding the
-    /// consumer. Every other method snapshots the Vec under the lock and releases before
-    /// awaiting — the mutex is never held across `.await`.
-    consumers: Mutex<Vec<NamedConsumer<C>>>,
+    /// consumer. The Vec is wrapped in an `Arc` so the many read-heavy callers
+    /// (`receive`, `seek_*`, `unsubscribe`, `last_message_ids`, stats aggregators)
+    /// snapshot via a cheap `Arc::clone` instead of a deep `Vec::clone`; writers use
+    /// `Arc::make_mut` to copy-on-write the Vec. The mutex is never held across
+    /// `.await` — readers drop the guard immediately after capturing the Arc.
+    consumers: Mutex<Arc<Vec<NamedConsumer<C>>>>,
     /// Round-robin cursor used by `receive` to record the index of the topic that produced
     /// the last message. Wrapped in a Mutex because [`MultiTopicsConsumer`] is `&self` —
     /// cloning the handle should not require mutable access.
@@ -344,7 +347,10 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
             if guard.iter().any(|nc| nc.topic == topic) {
                 Some(consumer)
             } else {
-                guard.push(NamedConsumer { topic, consumer });
+                // Copy-on-write the Vec inside the Arc so concurrent
+                // readers holding an `Arc::clone` snapshot keep their
+                // view; only the writer sees the new push.
+                Arc::make_mut(&mut guard).push(NamedConsumer { topic, consumer });
                 None
             }
         };
@@ -366,10 +372,8 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         // Remove under the lock, release, then close — never hold the mutex across await.
         let removed: Option<NamedConsumer<C>> = {
             let mut guard = self.inner.consumers.lock();
-            guard
-                .iter()
-                .position(|nc| nc.topic == topic)
-                .map(|pos| guard.remove(pos))
+            let pos = guard.iter().position(|nc| nc.topic == topic);
+            pos.map(|pos| Arc::make_mut(&mut guard).remove(pos))
         };
         if let Some(nc) = removed {
             ConsumerApi::close_owned(nc.consumer)
@@ -503,7 +507,7 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         // Snapshot the consumer set under the lock and release before awaiting — holding
         // the mutex across an await would serialise receive against add_topic /
         // remove_topic.
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         if snapshot.is_empty() {
             return Err(PulsarError::Config(
                 "no topics subscribed to receive from".to_owned(),
@@ -667,7 +671,12 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
                 return Ok(());
             }
         };
-        let consumers = inner.consumers.into_inner();
+        // Last Arc — `into_inner` on the Mutex yields the Arc, then we
+        // try to unwrap it. `Arc::try_unwrap` succeeds because the
+        // outer `arc` (the only other strong ref to `Inner`) has just
+        // been dropped or is about to be.
+        let consumers_arc = inner.consumers.into_inner();
+        let consumers = Arc::try_unwrap(consumers_arc).unwrap_or_else(|arc| (*arc).clone());
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in consumers {
             if let Err(e) = ConsumerApi::close_owned(nc.consumer).await
@@ -685,9 +694,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     pub async fn unsubscribe(&self, force: bool) -> Result<(), PulsarError> {
         // Snapshot under the lock and release before awaiting — never hold the mutex
         // across an `.await`.
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         let mut first_err: Result<(), PulsarError> = Ok(());
-        for nc in &snapshot {
+        for nc in snapshot.iter() {
             if let Err(e) = nc.consumer.unsubscribe(force).await
                 && first_err.is_ok()
             {
@@ -700,9 +709,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// Seek every child consumer to the given publish-time deadline. Mirrors Java
     /// `Consumer#seek(long)` at the multi-topic scope.
     pub async fn seek_to_timestamp(&self, publish_time_ms: u64) -> Result<(), PulsarError> {
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         let mut first_err: Result<(), PulsarError> = Ok(());
-        for nc in &snapshot {
+        for nc in snapshot.iter() {
             if let Err(e) = nc.consumer.seek_to_timestamp(publish_time_ms).await
                 && first_err.is_ok()
             {
@@ -715,9 +724,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// Seek every child consumer to the earliest message. Mirrors Java
     /// `Consumer#seek(MessageId.earliest)` at the multi-topic scope.
     pub async fn seek_to_earliest(&self) -> Result<(), PulsarError> {
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         let mut first_err: Result<(), PulsarError> = Ok(());
-        for nc in &snapshot {
+        for nc in snapshot.iter() {
             if let Err(e) = nc.consumer.seek_to_earliest().await
                 && first_err.is_ok()
             {
@@ -730,9 +739,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// Seek every child consumer to the latest (head) position. Mirrors Java
     /// `Consumer#seek(MessageId.latest)` at the multi-topic scope.
     pub async fn seek_to_latest(&self) -> Result<(), PulsarError> {
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         let mut first_err: Result<(), PulsarError> = Ok(());
-        for nc in &snapshot {
+        for nc in snapshot.iter() {
             if let Err(e) = nc.consumer.seek_to_latest().await
                 && first_err.is_ok()
             {
@@ -758,9 +767,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     where
         F: FnMut(&str) -> SeekTarget,
     {
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         let mut first_err: Result<(), PulsarError> = Ok(());
-        for nc in &snapshot {
+        for nc in snapshot.iter() {
             let target = f(nc.topic.as_str());
             let res = match target {
                 SeekTarget::MessageId(id) => nc.consumer.seek_to_message(id).await,
@@ -779,9 +788,9 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// per child consumer, in the order they appear in the current consumer set. Mirrors
     /// Java `Consumer#getLastMessageIds` for partitioned/multi-topic consumers.
     pub async fn last_message_ids(&self) -> Result<Vec<(String, MessageId)>, PulsarError> {
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         let mut out = Vec::with_capacity(snapshot.len());
-        for nc in &snapshot {
+        for nc in snapshot.iter() {
             let id = nc
                 .consumer
                 .last_message_id()
@@ -1238,7 +1247,7 @@ where
 
         Ok(MultiTopicsConsumer {
             inner: Arc::new(Inner {
-                consumers: Mutex::new(consumers),
+                consumers: Mutex::new(Arc::new(consumers)),
                 cursor: std::sync::atomic::AtomicUsize::new(0),
                 template,
                 auto_update,
@@ -1285,7 +1294,7 @@ mod tests {
     #[test]
     fn empty_inner_is_consistent() {
         let inner: Arc<Inner<magnetar_runtime_tokio::Consumer>> = Arc::new(Inner {
-            consumers: Mutex::new(Vec::new()),
+            consumers: Mutex::new(Arc::new(Vec::new())),
             cursor: std::sync::atomic::AtomicUsize::new(0),
             template: empty_template(),
             auto_update: None,

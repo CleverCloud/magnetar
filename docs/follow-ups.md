@@ -46,13 +46,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   `Providers::Network::write_vectored` second, read-path ownership
   pass-through third). Implementation still TODO.
 
-### Open — performance / contention
-
-- **`multi_topics.rs`, `pattern_consumer.rs` receive loops** — every
-  `receive()` call clones the full consumer list and rebuilds a
-  `Vec<Future>`. Keep an `Arc<[NamedConsumer]>` snapshot updated only
-  on topology change.
-
 ### Open — syscall reduction
 
 - **No `writev` / `IoSlice`** —

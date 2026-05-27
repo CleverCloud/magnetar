@@ -55,8 +55,12 @@ pub struct PatternConsumer<C: ConsumerApi = magnetar_runtime_tokio::Consumer> {
 
 #[derive(Debug)]
 struct Inner<C: ConsumerApi> {
-    /// Active consumer set, keyed by topic name.
-    consumers: Mutex<Vec<NamedConsumer<C>>>,
+    /// Active consumer set, keyed by topic name. Wrapped in an `Arc`
+    /// so read-heavy callers (`receive`, `stats`, iteration) snapshot
+    /// via a cheap `Arc::clone` instead of a deep `Vec::clone`; writes
+    /// in the pattern-reconcile loop use `Arc::make_mut` to
+    /// copy-on-write.
+    consumers: Mutex<Arc<Vec<NamedConsumer<C>>>>,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
@@ -242,7 +246,7 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
             let drained: Vec<NamedConsumer<C>> = {
                 let mut guard = self.inner.consumers.lock();
                 let mut drained = Vec::new();
-                guard.retain(|nc| {
+                Arc::make_mut(&mut guard).retain(|nc| {
                     if removed.iter().any(|t| t == &nc.topic) {
                         drained.push(nc.clone());
                         false
@@ -272,9 +276,7 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
                 }
                 let builder = self.inner.template.apply(client.consumer(topic.clone()));
                 let consumer = builder.subscribe().await?;
-                self.inner
-                    .consumers
-                    .lock()
+                Arc::make_mut(&mut self.inner.consumers.lock())
                     .push(NamedConsumer { topic, consumer });
                 report.added += 1;
             }
@@ -293,7 +295,7 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     pub async fn receive(&self) -> Result<PatternMessage, PulsarError> {
         // Snapshot the consumer set under the lock, then release before awaiting — holding the
         // mutex across an await would serialise receive against update.
-        let snapshot: Vec<NamedConsumer<C>> = { self.inner.consumers.lock().clone() };
+        let snapshot: Arc<Vec<NamedConsumer<C>>> = self.inner.consumers.lock().clone();
         if snapshot.is_empty() {
             return Err(PulsarError::Config(
                 "no topics matched the pattern — nothing to receive".to_owned(),
@@ -466,7 +468,8 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
                 return Ok(());
             }
         };
-        let consumers = inner.consumers.into_inner();
+        let consumers_arc = inner.consumers.into_inner();
+        let consumers = Arc::try_unwrap(consumers_arc).unwrap_or_else(|arc| (*arc).clone());
         let mut first_err: Result<(), PulsarError> = Ok(());
         for nc in consumers {
             if let Err(e) = ConsumerApi::close_owned(nc.consumer).await
@@ -788,7 +791,7 @@ where
 
         Ok(PatternConsumer {
             inner: Arc::new(Inner {
-                consumers: Mutex::new(opened),
+                consumers: Mutex::new(Arc::new(opened)),
                 namespace,
                 pattern,
                 template,
@@ -850,7 +853,7 @@ mod tests {
         };
         PatternConsumer {
             inner: Arc::new(Inner {
-                consumers: Mutex::new(Vec::new()),
+                consumers: Mutex::new(Arc::new(Vec::new())),
                 namespace: "public/default".to_owned(),
                 pattern: "persistent://public/default/test-.*".to_owned(),
                 template,
