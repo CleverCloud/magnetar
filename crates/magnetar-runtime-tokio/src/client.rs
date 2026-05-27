@@ -34,9 +34,9 @@ use crate::url_parse::{ParsedUrl, Scheme};
 /// The top-level magnetar client.
 ///
 /// Holds the bootstrap connection (the one dialled at `connect` time, used for lookup and
-/// non-proxied producer / consumer ops) plus an opt-in
-/// [`ProxyConnectionPool`](crate::pool::ProxyConnectionPool) for the Apache Pulsar Proxy
-/// case (ADR-0039): when a `CommandLookupTopic` answer carries
+/// non-proxied producer / consumer ops) plus an opt-in per-broker connection pool (see
+/// the crate-private `pool` module) for the Apache Pulsar Proxy case (ADR-0039): when a
+/// `CommandLookupTopic` answer carries
 /// `proxy_through_service_url = true`, the runtime lazily opens a second connection back to
 /// the same physical address with `CommandConnect.proxy_to_broker_url` set to the logical
 /// broker URL and routes the producer / consumer onto that connection.
