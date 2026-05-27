@@ -56,8 +56,14 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   — wave 1 (proto `Transmit` enum + tokio `write_vectored`), wave 2
   (moonpool `Providers::Network::write_vectored` + chaos pack
   segment-granular drops), wave 3 (read-path `BytesMut` ownership
-  pass-through). Implementation still TODO; the three waves can land
-  independently in that order.
+  pass-through). **Wave 1.0 landed**: `Transmit<'a>` enum
+  (`Contiguous` / `Vectored`) lives in
+  `crates/magnetar-proto/src/transmit.rs`; `Connection::poll_transmit_vectored`
+  is a slice-returning entry point that today returns the same bytes
+  as `poll_transmit` (callers wrap in `Transmit::Contiguous(slice)`).
+  Wave 1.1 (proto encoder split — `encode_payload` returns a frame
+  descriptor) and wave 2 (moonpool `write_vectored`) still TODO; the
+  three remaining waves can land independently in that order.
 - **Read path double-copy** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner`
   reads `read_buf` → `split().freeze()`. The proto-side re-copy was

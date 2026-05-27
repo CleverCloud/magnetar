@@ -92,6 +92,7 @@ pub mod service_url;
 pub mod supervisor;
 pub mod topic_watcher;
 pub mod trackers;
+pub mod transmit;
 pub mod txn;
 pub mod types;
 
@@ -141,5 +142,6 @@ pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
 };
 pub use crate::supervisor::SupervisorConfig;
+pub use crate::transmit::Transmit;
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};

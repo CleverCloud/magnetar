@@ -1716,6 +1716,36 @@ impl Connection {
         out
     }
 
+    /// Drain queued outbound bytes as a [`crate::Transmit`] descriptor
+    /// (ADR-0039 wave 1.0).
+    ///
+    /// **Today** this always returns [`crate::Transmit::Contiguous`]
+    /// pointing at the same `BytesMut`-backed slice
+    /// [`Self::poll_transmit`] would have produced. The
+    /// [`crate::Transmit::Vectored`] variant exists in the type but is
+    /// never produced yet — wave 1.1 (proto encoder split) introduces
+    /// the segment shape; wave 2 (moonpool
+    /// `Providers::Network::write_vectored`) wires the chaos pack.
+    ///
+    /// Runtimes that want to start passing the descriptor through
+    /// `poll_write_vectored` / `IoSlice` can switch to this entry
+    /// today — they'll get the contiguous slice and behave identically
+    /// to the legacy path, ready to gain real vectored writes when
+    /// wave 1.1 lands. Stash the returned `BytesMut::split().freeze()`
+    /// behind a `Bytes` cache so the borrow against `&mut self`
+    /// drops before the runtime's `.await`.
+    pub fn poll_transmit_vectored(&mut self) -> &[u8] {
+        self.drain_producer_outbound();
+        // We can't return `Transmit<'_>` borrowing from `self.outbound`
+        // because the legacy `poll_transmit` already takes `&mut self`
+        // and the runtime needs to drop the borrow before awaiting on
+        // the socket. Return a `&[u8]` slice instead — callers wrap it
+        // in `Transmit::Contiguous(slice)` at the call site. Wave 1.1
+        // will flip this to a real `Transmit<'_>` once the segment
+        // shape lands and the runtime adapter consumes the enum.
+        &self.outbound[..]
+    }
+
     /// Pull the next [`ConnectionEvent`], if any.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
         self.events.pop_front()
