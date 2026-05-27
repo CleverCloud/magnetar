@@ -325,21 +325,57 @@ Status snapshot:
 
 **Status.** Proposal accepted in [`specs/proposals/pip-466-v5-client-surface.md`](../specs/proposals/pip-466-v5-client-surface.md);
 scope locked by [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md).
-No proto change — V5 is a v4-wire skin. Estimate ~1080 LOC. Upstream
-Java V5 is still iterating, hence the experimental tag — but magnetar's
-surface works against current Pulsar 4.x brokers since it ultimately
-sends the v4 commands.
+No proto change — V5 is a v4-wire skin. Upstream Java V5 is still
+iterating, hence the experimental tag — but magnetar's surface works
+against current Pulsar 4.x brokers since it ultimately sends the v4
+commands.
 
-**Ships in v0.2.0.** `magnetar::v5` module behind
-`feature = "experimental-v5-client"` (default off) exposing
-`PulsarClientV5<E>`, `v5::Producer<T, E>`, `v5::StreamConsumer<T, E>`,
-`v5::QueueConsumer<T, E>`. Each is a thin wrapper holding the
-corresponding v4 type. V5 `Reader`, `TableView`, `Transaction`,
-`CheckpointConsumer` are explicit v0.3.0+.
+**Landed (v0.2.0, feature = "experimental-v5-client", default off).**
 
-```text
-/goal implement PIP-466 V5 client surface per specs/proposals/pip-466-v5-client-surface.md and ADR-0032. No wire change. No sans-io change. No new `Event` variant. The V5 surface is a thin skin over v4 — internally delegates every call. Waves: (1) `magnetar/Cargo.toml` add `experimental-v5-client = []` feature (default OFF); `magnetar/src/lib.rs` add `#[cfg(feature = "experimental-v5-client")] pub mod v5;`; (2) `magnetar/src/v5/mod.rs` (NEW) + submodules `client.rs`, `producer.rs`, `stream_consumer.rs`, `queue_consumer.rs`; (3) `magnetar/src/v5/mapping.rs` (NEW) — single source-of-truth table of V5→v4 field translations: send_timeout: Duration → ms u64 (default 30s); max_pending_messages: Option<usize> → usize with None=0 (default Some(1000)); ack_timeout: Option<Duration> → ms u64 with None=0 (default None); negative_ack_redelivery_delay: Duration → ms u64 (default 60s); receiver_queue_size: usize direct (default 1000); subscription_initial_position direct; (4) `PulsarClientV5<E: Engine>` wraps `Arc<E::ClientState>`; exposes `v4() -> PulsarClient<E>` escape hatch with the SAME state (no double init); (5) `v5::Producer<T, E>` holds `crate::Producer<T, E>`; signatures use Duration + Option<MessageId> return on send; (6) `v5::StreamConsumer<T, E>` → v4 Consumer with SubscriptionType::Exclusive / Failover; `v5::QueueConsumer<T, E>` → v4 with Shared / KeyShared; (7) every public V5 type carries `#[doc = "**Experimental** — PIP-466 V5 client surface (v0.2.0). Behaviour and signatures may change before V5 is promoted to default."]`. Test layers per ADR-0024 — claim and JUSTIFY two exemptions in the commit body via `test-exemption-proto: PIP-466 V5 surface (no wire/sans-io change)` and `test-exemption-differential: PIP-466 V5 surface (no new sans-io surface)`. Required layers: (b) `crates/magnetar/tests/v5_*.rs` — 5 files (`v5_producer_mapping.rs`, `v5_stream_consumer_mapping.rs`, `v5_queue_consumer_mapping.rs`, `v5_client_v4_escape_hatch.rs`, `v5_builder_defaults.rs` table-driven from mapping.rs), each asserting the wire bytes magnetar-fakes observes match the v4 expectation; (c) `crates/magnetar/tests/v5_*_moonpool.rs` — same five files mirrored 1:1 under SimulationBuilder. NO new moonpool BrokerWorkload variant (the v4 fakes already cover it). NO new differential test (v4 differential already covers the wire). E2E: 3 mirror tests under `crates/magnetar/tests/e2e_pulsar_v5.rs` + `e2e_sub_types_v5.rs` parameterising existing e2e patterns against Pulsar 4.0.4 — gated `feature = "e2e,experimental-v5-client"`. Docs: `docs/v5-client.md` (NEW including the mapping table), parity-status.md row → 🟡 experimental, README parity matrix row, flip ADR-0032 to Accepted. Full validation chain incl. `check-crypto-matrix` (V5 × crypto axis).
-```
+- `magnetar::v5` module + submodules `client.rs`, `producer.rs`,
+  `stream_consumer.rs`, `queue_consumer.rs`, `mapping.rs`.
+- `PulsarClientV5` wraps `PulsarClient` (default `TokioEngine`),
+  exposes `v4()` / `into_v4()` escape hatches that borrow the SAME
+  engine state.
+- `v5::Producer` / `v5::StreamConsumer` / `v5::QueueConsumer` thin
+  wrappers; receive returns `crate::IncomingMessage`, send returns
+  `Option<MessageId>`.
+- `v5::mapping`: V5 ↔ v4 field translation table + `Duration` /
+  `Option<Duration>` / `Option<usize>` converters with the spec
+  defaults (`send_timeout=30s`, `max_pending=Some(1000)`,
+  `ack_timeout=None`, `negative_ack_redelivery_delay=60s`,
+  `receiver_queue_size=1000`, `initial_position=Latest`).
+- Per-surface builders: `v5::producer::ProducerBuilder` (`send_timeout`,
+  `max_pending_messages`), `v5::stream_consumer::StreamConsumerBuilder`
+  (Exclusive default; `failover()`), `v5::queue_consumer::QueueConsumerBuilder`
+  (Shared default; `key_shared()`). Each carries `v4()` escape hatch.
+- `PulsarClientV5::producer` / `stream_consumer` / `queue_consumer`
+  entry methods return the V5 builders.
+- Six `v5::mapping` unit tests pin defaults + translation correctness.
+- parity-status.md row + README parity matrix row at 🟡 experimental.
+
+**Remaining work to flip the row to ✅ default-on (out of scope for the
+session that landed the above):**
+
+1. The five `crates/magnetar/tests/v5_*.rs` mapping/wire tests asserting
+   the bytes `magnetar-fakes` observes match the v4 expectation:
+   `v5_producer_mapping.rs`, `v5_stream_consumer_mapping.rs`,
+   `v5_queue_consumer_mapping.rs`, `v5_client_v4_escape_hatch.rs`,
+   `v5_builder_defaults.rs` (table-driven from `mapping.rs`).
+2. Same five files mirrored 1:1 under `SimulationBuilder` for the
+   moonpool engine.
+3. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
+   `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"`
+   parameterising existing e2e patterns against Pulsar 4.0.4.
+4. `docs/v5-client.md` (NEW) including the mapping table.
+5. ADR-0032 flip from Proposed → Accepted once (1)–(4) land + the
+   matrix sweep (`check-crypto-matrix` × V5 axis) is green.
+6. Engine-genericity: today's `PulsarClientV5` wraps `PulsarClient`
+   (default tokio). A future pass parametrises by `<E: Engine>` once
+   the v4 builders' tokio-bound types (`MessageEncryptor`,
+   `MessageDecryptor`, `MessageRouter`) are abstracted via per-engine
+   extension traits (cross-cuts with the
+   "Per-surface builder + impl-body lifts" section above).
 
 ### PIP-460 — Scalable topics (🔴 NOT LIVE, scaffold-now / e2e-later)
 
