@@ -214,6 +214,74 @@ pub fn encode_payload(
     Ok(())
 }
 
+/// Encode a payload-bearing frame **without** copying the payload into
+/// the head buffer — returns the encoded head bytes
+/// (`[total_size][cmd_size][BaseCommand][magic][crc32c][meta_size][MessageMetadata]`)
+/// and leaves the caller to emit the payload as a separate segment.
+///
+/// This is the wave-1.2 zero-copy path for ADR-0039: the producer batch
+/// drain pushes `[head, payload]` segment pairs into
+/// `Connection::outbound_segments`, and the runtime adapter feeds the
+/// list into `poll_write_vectored` / `IoSlice` to skip the user-space
+/// memcpy that the contiguous-coalesce [`encode_payload`] path incurs
+/// at the `dst.extend_from_slice(payload)` line.
+///
+/// The CRC32C is computed over `[meta_size u32 BE][metadata bytes][payload bytes]`
+/// exactly as in [`encode_payload`] — the two functions emit
+/// **byte-identical** wire output when the head is concatenated with
+/// the payload.
+///
+/// # Errors
+///
+/// Returns [`FrameError::Encode`] if any protobuf encode step fails, or
+/// [`FrameError::BadLength`] if the resulting frame would exceed
+/// `u32::MAX` bytes.
+pub fn encode_payload_head(
+    cmd: &pb::BaseCommand,
+    metadata: &pb::MessageMetadata,
+    payload: &[u8],
+) -> Result<BytesMut, FrameError> {
+    let cmd_size = cmd.encoded_len();
+    let meta_size = metadata.encoded_len();
+    let payload_len = payload.len();
+
+    // Mirror `encode_payload`'s size accounting exactly so the head's
+    // `total_size u32` covers the eventual payload segment.
+    let header_content_size = CMD_SIZE_LEN
+        .checked_add(cmd_size)
+        .and_then(|s| s.checked_add(MAGIC_LEN))
+        .and_then(|s| s.checked_add(CHECKSUM_LEN))
+        .and_then(|s| s.checked_add(METADATA_SIZE_LEN))
+        .and_then(|s| s.checked_add(meta_size))
+        .ok_or(FrameError::BadLength(u32::MAX))?;
+    let total_size = header_content_size
+        .checked_add(payload_len)
+        .ok_or(FrameError::BadLength(u32::MAX))?;
+    let total_size_u32 = u32::try_from(total_size).map_err(|_| FrameError::BadLength(u32::MAX))?;
+    let cmd_size_u32 = u32::try_from(cmd_size).map_err(|_| FrameError::BadLength(u32::MAX))?;
+    let meta_size_u32 = u32::try_from(meta_size).map_err(|_| FrameError::BadLength(u32::MAX))?;
+
+    let mut dst = BytesMut::with_capacity(TOTAL_SIZE_LEN + header_content_size);
+    dst.put_u32(total_size_u32);
+    dst.put_u32(cmd_size_u32);
+    cmd.encode(&mut dst)?;
+    dst.put_u16(MAGIC_CRC32C);
+
+    let checksum_offset = dst.len();
+    dst.put_u32(0);
+
+    let checksummed_start = dst.len();
+    dst.put_u32(meta_size_u32);
+    metadata.encode(&mut dst)?;
+    let pre_payload_crc = crc32c::crc32c(&dst[checksummed_start..]);
+    let full_crc = crc32c::crc32c_append(pre_payload_crc, payload);
+    dst[checksum_offset..checksum_offset + CHECKSUM_LEN].copy_from_slice(&full_crc.to_be_bytes());
+
+    // Intentionally do NOT extend with `payload` — the caller emits
+    // `[head, payload]` as two adjacent segments via vectored I/O.
+    Ok(dst)
+}
+
 /// Peek at the front of `inbound` to determine whether a complete frame
 /// is ready to decode.
 ///
@@ -445,6 +513,41 @@ mod tests {
         let mut buf = BytesMut::new();
         encode_payload(&mut buf, cmd, meta, payload).expect("encode_payload");
         buf.freeze()
+    }
+
+    #[test]
+    fn encode_payload_head_matches_encode_payload_concatenated() {
+        // ADR-0039 wave 1.2: byte-equivalence between the contiguous
+        // `encode_payload` (head + payload memcpy'd into one buffer)
+        // and the vectored `encode_payload_head` (head returned, payload
+        // emitted as a separate segment). The two paths MUST produce
+        // byte-identical wire bytes when concatenated — the kernel sees
+        // the same bytes whether they arrive via `write_all(&buf)` or
+        // `write_vectored(&[head, payload])`.
+        let cmd = send_command(7, 42);
+        let meta = message_metadata("p", 42);
+        let payload = b"hello vectored world";
+
+        let contiguous = encode_send(&cmd, &meta, payload);
+        let head = encode_payload_head(&cmd, &meta, payload).expect("encode_payload_head");
+        let mut vectored = BytesMut::with_capacity(head.len() + payload.len());
+        vectored.extend_from_slice(&head);
+        vectored.extend_from_slice(payload);
+
+        assert_eq!(
+            &contiguous[..],
+            &vectored[..],
+            "encode_payload_head + payload must be byte-identical to encode_payload"
+        );
+        // Empty payload: the head must still carry the correct CRC32C
+        // for an empty payload region.
+        let empty_contig = encode_send(&cmd, &meta, &[]);
+        let empty_head = encode_payload_head(&cmd, &meta, &[]).expect("encode_payload_head empty");
+        assert_eq!(
+            &empty_contig[..],
+            &empty_head[..],
+            "empty-payload vectored head must equal full encode_payload output"
+        );
     }
 
     #[test]

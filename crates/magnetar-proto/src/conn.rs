@@ -39,7 +39,7 @@ pub use crate::conn_types::*;
 use crate::consumer::ConsumerState;
 use crate::error::ProtocolError;
 use crate::event::{ConnectionEvent, IncomingMessage, TxnRoundTrip};
-use crate::frame::{Frame, decode_one, encode_command, encode_payload};
+use crate::frame::{Frame, decode_one, encode_command, encode_payload, encode_payload_head};
 use crate::lookup::{LookupRegistry, LookupRequest, PartitionedMetadataRequest};
 use crate::pb;
 use crate::producer::{ProducerState, SendDecision};
@@ -63,6 +63,21 @@ pub struct Connection {
     /// `poll_transmit_vectored` call; the borrow checker prevents
     /// concurrent re-entry. `None` before the first vectored drain.
     pending_vectored_drain: Option<Bytes>,
+    /// Wave-1.2 producer-batch segment buffer (ADR-0039). Drained by
+    /// [`Self::drain_producer_outbound_vectored`] — each producer
+    /// frame contributes a `[head, payload]` pair via
+    /// `frame::encode_payload_head`. Consumed by
+    /// [`Self::poll_transmit_vectored`], which returns
+    /// `Transmit::Vectored(&segments)` when this is non-empty and the
+    /// contiguous `outbound` buffer is empty (handshake / non-producer
+    /// frames take the `Contiguous` arm to preserve wire-order
+    /// correctness when both buffers carry pending bytes).
+    outbound_segments: Vec<Bytes>,
+    /// Wave-1.2 staging slot mirroring [`Self::pending_vectored_drain`]
+    /// for the segment list: holds the most recently drained vector so
+    /// the `Transmit::Vectored(&slice)` return borrows against memory
+    /// the [`Connection`] keeps alive across the runtime's `.await`.
+    pending_vectored_segments: Vec<Bytes>,
     /// Inbound bytes buffer; framed into commands by [`Self::handle_bytes`].
     inbound: BytesMut,
     /// Event queue.
@@ -234,6 +249,8 @@ impl Connection {
             feature_flags: pb::FeatureFlags::default(),
             outbound: BytesMut::with_capacity(4 * 1024),
             pending_vectored_drain: None,
+            outbound_segments: Vec::new(),
+            pending_vectored_segments: Vec::new(),
             inbound: BytesMut::with_capacity(4 * 1024),
             events: VecDeque::new(),
             outcomes: HashMap::new(),
@@ -1745,24 +1762,41 @@ impl Connection {
     /// (wave 1.2+) hands the runtime an owned segment list it can pass
     /// into the kernel as an `IoSlice` array.
     pub fn poll_transmit_vectored(&mut self) -> crate::Transmit<'_> {
+        // Wave 1.2: prefer the `Vectored` arm when:
+        //   1. The producer batch path has segments to emit, AND
+        //   2. The contiguous `outbound` buffer is empty.
+        //
+        // If both buffers carry pending bytes the contiguous path wins
+        // — `outbound` may carry handshake / ack / lookup frames whose
+        // wire order matters relative to the per-producer frames. The
+        // segments stay queued and emerge on the next call. This keeps
+        // wire-order semantics identical to the legacy `poll_transmit`
+        // (which always drains `outbound` first via
+        // `drain_producer_outbound`).
+        //
+        // The legacy `drain_producer_outbound` is intentionally NOT
+        // called here — that path is reserved for `poll_transmit` (the
+        // contiguous-coalesce route). Wave 1.2 runtimes that want the
+        // segment optimisation call `poll_transmit_vectored`, which
+        // drains via `drain_producer_outbound_vectored`. Runtimes that
+        // continue to call `poll_transmit` get the legacy behaviour
+        // unchanged.
+        if self.outbound.is_empty() {
+            self.drain_producer_outbound_vectored();
+            if !self.outbound_segments.is_empty() {
+                self.pending_vectored_segments = std::mem::take(&mut self.outbound_segments);
+                return crate::Transmit::Vectored(&self.pending_vectored_segments[..]);
+            }
+        }
+        // Contiguous arm — same drain + ownership-transfer dance as
+        // wave 1.1: `drain_producer_outbound` flushes any per-producer
+        // frames into `outbound` (using the legacy contiguous encoder),
+        // `split().freeze()` hands us the owned `Bytes`, and
+        // `pending_vectored_drain` holds it alive across the runtime's
+        // `.await`.
         self.drain_producer_outbound();
-        // Drain to an owned `Bytes` (same O(1) ownership transfer as
-        // `poll_transmit`) and stash it in `pending_vectored_drain`, so
-        // the returned `Transmit::Contiguous(&slice)` borrows against
-        // memory the `Connection` keeps alive across the runtime's
-        // `.await`. The borrow against `&mut self` prevents concurrent
-        // re-entry, so the previous drain is safely dropped on the next
-        // call. Replace `self.outbound` with a fresh scratch buffer the
-        // same way `poll_transmit` does so the next encode doesn't
-        // start from zero capacity.
         let out = self.outbound.split().freeze();
         self.outbound = BytesMut::with_capacity(4 * 1024);
-        // Wave 1.1: the `Contiguous` variant covers every path today —
-        // `outbound: BytesMut` is the single staging buffer the
-        // protocol writes into. Wave 1.2 introduces
-        // `self.outbound_segments: Vec<Bytes>` for the producer batch
-        // path and flips this between `Contiguous` and `Vectored`
-        // depending on which buffer carries the next-frame data.
         crate::Transmit::Contiguous(&self.pending_vectored_drain.insert(out)[..])
     }
 
@@ -2414,6 +2448,46 @@ impl Connection {
                     &frame.metadata,
                     &frame.payload,
                 );
+            }
+        }
+    }
+
+    /// Wave-1.2 (ADR-0039) — drain producer frames into the
+    /// segment-list buffer instead of the contiguous outbound buffer.
+    ///
+    /// Each frame contributes a `[head, payload]` pair of `Bytes`
+    /// segments. `payload` is the producer's `Bytes` payload re-used
+    /// unchanged (zero-copy); `head` is freshly encoded via
+    /// [`encode_payload_head`] and frozen. The runtime adapter pulls
+    /// the resulting list via [`Self::poll_transmit_vectored`] and
+    /// feeds it to `poll_write_vectored` / `IoSlice`, skipping the
+    /// user-space memcpy that [`Self::drain_producer_outbound`]
+    /// performs at the `dst.extend_from_slice(payload)` line.
+    ///
+    /// Lock-ordering: requires `&mut self` on Connection (i.e. the
+    /// global lock is held). Takes each per-slot mutex briefly to
+    /// drain frames — the canonical global → per-slot order.
+    pub fn drain_producer_outbound_vectored(&mut self) {
+        let handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
+        for handle in handles {
+            loop {
+                let frame = self
+                    .producers
+                    .get(&handle)
+                    .and_then(|slot| slot.state.lock().next_outbound_frame());
+                let Some(frame) = frame else { break };
+                let Ok(head) = encode_payload_head(&frame.command, &frame.metadata, &frame.payload)
+                else {
+                    // Encoding only fails for `BadLength` (>u32::MAX
+                    // frame) — the producer state machine has already
+                    // bounded the payload at `broker_max_message_size`.
+                    // Skip the frame rather than panicking; preserves
+                    // invariant #6 (no proto-side panics) and matches
+                    // the legacy `let _ = encode_payload(...)` swallow.
+                    continue;
+                };
+                self.outbound_segments.push(head.freeze());
+                self.outbound_segments.push(frame.payload);
             }
         }
     }
@@ -3444,6 +3518,106 @@ mod conn_state_tests {
         let mut buf = bytes::BytesMut::new();
         encode_command(&mut buf, &cmd).expect("encode CommandConnected");
         buf
+    }
+
+    #[test]
+    fn poll_transmit_vectored_emits_segments_when_outbound_empty() {
+        // ADR-0039 wave 1.2: when `outbound_segments` is non-empty and
+        // the contiguous `outbound` buffer is empty,
+        // `poll_transmit_vectored` must return `Vectored` carrying the
+        // segments. Directly populates `outbound_segments` to keep the
+        // test focused on the dispatch logic without the producer
+        // Ready-state setup (covered separately by the runtime
+        // integration tests in
+        // `crates/magnetar-runtime-{tokio,moonpool}/tests/poll_transmit_vectored_parity.rs`).
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Drain any handshake-init bytes left in `outbound` (a fresh
+        // Connection starts empty, but explicit-drain keeps the
+        // pre-condition obvious).
+        let _ = conn.poll_transmit();
+        assert!(
+            conn.outbound.is_empty(),
+            "outbound starts empty for this test"
+        );
+
+        // Inject two `[head, payload]` segments (4 entries) as if a
+        // producer batch had been drained via
+        // `drain_producer_outbound_vectored`.
+        let head_a = bytes::Bytes::from_static(b"HEAD-A");
+        let payload_a = bytes::Bytes::from_static(b"PAYLOAD-AAAA");
+        let head_b = bytes::Bytes::from_static(b"HEAD-B");
+        let payload_b = bytes::Bytes::from_static(b"PAYLOAD-BB");
+        conn.outbound_segments.push(head_a.clone());
+        conn.outbound_segments.push(payload_a.clone());
+        conn.outbound_segments.push(head_b.clone());
+        conn.outbound_segments.push(payload_b.clone());
+
+        match conn.poll_transmit_vectored() {
+            crate::Transmit::Vectored(segs) => {
+                assert_eq!(segs.len(), 4, "all four segments must be emitted");
+                assert_eq!(&segs[0][..], b"HEAD-A");
+                assert_eq!(&segs[1][..], b"PAYLOAD-AAAA");
+                assert_eq!(&segs[2][..], b"HEAD-B");
+                assert_eq!(&segs[3][..], b"PAYLOAD-BB");
+            }
+            crate::Transmit::Contiguous(_) => {
+                panic!("expected Vectored arm — outbound is empty and segments are populated");
+            }
+        }
+    }
+
+    #[test]
+    fn poll_transmit_vectored_prefers_contiguous_when_outbound_has_bytes() {
+        // ADR-0039 wave 1.2 wire-order invariant: when both
+        // `outbound` (handshake / ack / lookup) and `outbound_segments`
+        // (producer batch) carry pending bytes, the contiguous arm
+        // wins so wire-order is preserved. Segments stay queued and
+        // emerge on the next call.
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Mid-handshake `outbound` carries the pending Connect frame.
+        conn.begin_handshake().expect("handshake");
+        assert!(
+            !conn.outbound.is_empty(),
+            "post-begin_handshake: outbound must have the Connect frame"
+        );
+        conn.outbound_segments
+            .push(bytes::Bytes::from_static(b"queued-producer-segment"));
+
+        match conn.poll_transmit_vectored() {
+            crate::Transmit::Contiguous(slice) => {
+                assert!(
+                    !slice.is_empty(),
+                    "Contiguous arm must drain the Connect frame"
+                );
+            }
+            crate::Transmit::Vectored(_) => {
+                panic!(
+                    "expected Contiguous arm — outbound was non-empty so wire-order requires it first"
+                );
+            }
+        }
+        // The segment must still be queued for the next call.
+        assert_eq!(
+            conn.outbound_segments.len(),
+            1,
+            "queued segment must persist until outbound drains"
+        );
+        // Now outbound is empty — next call switches to Vectored.
+        match conn.poll_transmit_vectored() {
+            crate::Transmit::Vectored(segs) => {
+                assert_eq!(segs.len(), 1);
+                assert_eq!(&segs[0][..], b"queued-producer-segment");
+            }
+            crate::Transmit::Contiguous(_) => {
+                panic!("expected Vectored arm after outbound drained");
+            }
+        }
     }
 
     #[test]
