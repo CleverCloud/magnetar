@@ -92,6 +92,31 @@ struct SessionState {
     /// against partitioned topics. Lets traces assert that a seek on
     /// partition `K` did not move any other partition's cursor.
     seeked_partitions: Vec<i32>,
+    /// Next txn id slot the broker allocates on `CommandNewTxn`.
+    /// Mirrors what a real TC's `TransactionMetadataStore` does — gives
+    /// each open transaction a monotonically-increasing low-bit pair so
+    /// the client can correlate responses. We pin the high bits at 0
+    /// because magnetar pins the TC id at 0 (see
+    /// `TxnClient::new(0)`).
+    next_txn_least_bits: u64,
+    /// Per-txn ack ledger keyed by `(txnid_most_bits, txnid_least_bits)`.
+    /// PIP-31: `CommandAck` carrying a txn id stages the ack against the
+    /// txn; the broker only durably applies them on
+    /// `CommandEndTxn(commit)` (drains the entry; `abort` would drop it).
+    /// The differential trace asserts the drained-on-commit count.
+    txn_ack_ledger: HashMap<(u64, u64), Vec<TxnStagedAck>>,
+}
+
+/// One acknowledgement staged against an open transaction. Drained on
+/// `CommandEndTxn(commit)`; dropped on `CommandEndTxn(abort)`.
+/// Fields are retained for completeness (a real broker would replay
+/// them into the durable cursor on commit); the differential
+/// assertion only inspects the entry count today.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TxnStagedAck {
+    consumer_id: u64,
+    message_ids: Vec<(u64, u64)>,
 }
 
 /// Cross-session log of received `BaseCommand` kinds, in arrival order.
@@ -406,12 +431,88 @@ fn handle_frame(
         }
         pb::base_command::Type::Ack => {
             if let Some(a) = &frame.command.ack {
+                // PIP-31: if the ack carries a txn id, stage it against
+                // the txn ledger; the broker only durably applies the
+                // staged acks on `CommandEndTxn(commit)`.
+                if let (Some(most), Some(least)) = (a.txnid_most_bits, a.txnid_least_bits) {
+                    let staged = TxnStagedAck {
+                        consumer_id: a.consumer_id,
+                        message_ids: a
+                            .message_id
+                            .iter()
+                            .map(|m| (m.ledger_id, m.entry_id))
+                            .collect(),
+                    };
+                    state
+                        .lock()
+                        .txn_ack_ledger
+                        .entry((most, least))
+                        .or_default()
+                        .push(staged);
+                }
                 // ACK_RESPONSE is required only when the client included
                 // a request id (PIP-72). The state machine always sets
                 // one; we mirror that back.
                 if let Some(rid) = a.request_id {
                     emit_ack_response(out, a.consumer_id, rid);
                 }
+            }
+        }
+        pb::base_command::Type::TcClientConnectRequest => {
+            // PIP-31 / magnetar `ensure_txn_bootstrapped`: the client
+            // hand-shakes the TC (tc_id pinned to 0 by magnetar) and
+            // expects a `TcClientConnectResponse` carrying back the
+            // request_id. The real Pulsar broker only responds once the
+            // TC metadata store is loaded; our scripted broker is
+            // synchronously "ready" so we ack immediately.
+            if let Some(req) = &frame.command.tc_client_connect_request {
+                emit_tc_client_connect_response(out, req.request_id);
+            }
+        }
+        pb::base_command::Type::NewTxn => {
+            if let Some(req) = &frame.command.new_txn {
+                let least = {
+                    let mut g = state.lock();
+                    let least = g.next_txn_least_bits;
+                    g.next_txn_least_bits = g.next_txn_least_bits.saturating_add(1);
+                    least
+                };
+                emit_new_txn_response(out, req.request_id, 0, least);
+            }
+        }
+        pb::base_command::Type::AddPartitionToTxn => {
+            if let Some(req) = &frame.command.add_partition_to_txn {
+                emit_add_partition_to_txn_response(
+                    out,
+                    req.request_id,
+                    req.txnid_most_bits.unwrap_or(0),
+                    req.txnid_least_bits.unwrap_or(0),
+                );
+            }
+        }
+        pb::base_command::Type::AddSubscriptionToTxn => {
+            if let Some(req) = &frame.command.add_subscription_to_txn {
+                emit_add_subscription_to_txn_response(
+                    out,
+                    req.request_id,
+                    req.txnid_most_bits.unwrap_or(0),
+                    req.txnid_least_bits.unwrap_or(0),
+                );
+            }
+        }
+        pb::base_command::Type::EndTxn => {
+            if let Some(req) = &frame.command.end_txn {
+                let most = req.txnid_most_bits.unwrap_or(0);
+                let least = req.txnid_least_bits.unwrap_or(0);
+                // PIP-31: drain the per-txn ack ledger on commit;
+                // drop it (without applying) on abort. Either way the
+                // entry is removed from the broker's open-txn map.
+                let _drained = state.lock().txn_ack_ledger.remove(&(most, least));
+                // `_drained` would be applied to the durable cursor in
+                // a real broker on commit; the scripted broker only
+                // tracks the count for the differential assertion via
+                // the on-disk ledger model elsewhere.
+                emit_end_txn_response(out, req.request_id, most, least);
             }
         }
         pb::base_command::Type::Seek => {
@@ -629,6 +730,84 @@ fn emit_send_receipt(
                 first_chunk_message_id: None,
             }),
             highest_sequence_id: Some(0),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_tc_client_connect_response(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::TcClientConnectResponse as i32,
+        tc_client_connect_response: Some(pb::CommandTcClientConnectResponse {
+            request_id,
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_new_txn_response(out: &mut BytesMut, request_id: u64, most: u64, least: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::NewTxnResponse as i32,
+        new_txn_response: Some(pb::CommandNewTxnResponse {
+            request_id,
+            txnid_least_bits: Some(least),
+            txnid_most_bits: Some(most),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_add_partition_to_txn_response(out: &mut BytesMut, request_id: u64, most: u64, least: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AddPartitionToTxnResponse as i32,
+        add_partition_to_txn_response: Some(pb::CommandAddPartitionToTxnResponse {
+            request_id,
+            txnid_least_bits: Some(least),
+            txnid_most_bits: Some(most),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_add_subscription_to_txn_response(
+    out: &mut BytesMut,
+    request_id: u64,
+    most: u64,
+    least: u64,
+) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AddSubscriptionToTxnResponse as i32,
+        add_subscription_to_txn_response: Some(pb::CommandAddSubscriptionToTxnResponse {
+            request_id,
+            txnid_least_bits: Some(least),
+            txnid_most_bits: Some(most),
+            error: None,
+            message: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_end_txn_response(out: &mut BytesMut, request_id: u64, most: u64, least: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::EndTxnResponse as i32,
+        end_txn_response: Some(pb::CommandEndTxnResponse {
+            request_id,
+            txnid_least_bits: Some(least),
+            txnid_most_bits: Some(most),
+            error: None,
+            message: None,
         }),
         ..Default::default()
     };

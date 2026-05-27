@@ -62,6 +62,14 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
     let mut part_producers: HashMap<i32, Producer> = HashMap::new();
     let mut part_consumers: HashMap<i32, Consumer> = HashMap::new();
 
+    // PIP-31: the current open txn id, if any. `NewTxn` populates it;
+    // `EndTxn` consumes it. The harness supports one in-flight
+    // transaction per trace at a time — matches the scripted broker's
+    // per-session state. The txn-id bits are tracked here (and not
+    // surfaced on `Event::TxnCreated`) because the broker allocates
+    // them and they're not part of the differential equivalence claim.
+    let mut current_txn: Option<magnetar_proto::TxnId> = None;
+
     for op in &trace.ops {
         match op {
             Op::Send { payload } => {
@@ -181,6 +189,33 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                     Err(_) => stream.push(Event::SeekError {
                         kind: "consumer-open-failed".to_owned(),
                     }),
+                }
+            }
+            Op::NewTxn { timeout_ms } => {
+                let timeout = std::time::Duration::from_millis(*timeout_ms);
+                match client.new_txn(timeout).await {
+                    Ok(txn_id) => {
+                        current_txn = Some(txn_id);
+                        stream.push(Event::TxnCreated);
+                    }
+                    Err(e) => stream.push(Event::TxnCreateError { kind: classify(&e) }),
+                }
+            }
+            Op::EndTxn { commit } => {
+                let Some(txn_id) = current_txn.take() else {
+                    stream.push(Event::TxnEndError {
+                        kind: "no-open-txn".to_owned(),
+                    });
+                    continue;
+                };
+                let action = if *commit {
+                    magnetar_proto::TxnAction::Commit
+                } else {
+                    magnetar_proto::TxnAction::Abort
+                };
+                match client.end_txn(txn_id, action).await {
+                    Ok(_state) => stream.push(Event::TxnEnded { committed: *commit }),
+                    Err(e) => stream.push(Event::TxnEndError { kind: classify(&e) }),
                 }
             }
             Op::Close => {

@@ -322,19 +322,30 @@ but not architecturally blocked.
 
 ## 8. Golden trace catalog extension
 
-**Gap.** The differential harness ships seven golden traces
+**Gap.** The differential harness ships nine golden traces
 (round-trip, batch, nack-redelivery, seek-to-start, many-publishes,
-lookup-before-open, seek-per-partition). Missing:
+lookup-before-open, seek-per-partition, **txn-new-then-commit**,
+**txn-new-then-abort**). Missing:
 
-- **Transactional ack paths** — ~180 LOC scripted-broker addition
-  (`CommandEndTxn` + per-txn ack ledger).
+- **Transactional ack-within-txn paths** — the txn-lifecycle round-trip
+  (NewTxn → EndTxn(commit/abort)) is **landed** as
+  `txn_new_then_commit_round_trip` + `txn_new_then_abort_round_trip`
+  in `golden_traces.rs`. The scripted broker now handles
+  `CommandTcClientConnectRequest`, `CommandNewTxn`,
+  `CommandAddPartitionToTxn`, `CommandAddSubscriptionToTxn`,
+  `CommandEndTxn`, and observes `CommandAck` carrying a `txn_id` into
+  a per-txn ack ledger (drained on commit, dropped on abort). The
+  full **ack-within-txn produce/ack** assertion still needs the
+  producer/consumer txn-id plumbing wired through both runners —
+  Op::SendInTxn + Op::AckInTxn variants + their broker-side ledger
+  drain assertion. Estimate ~250 LOC; see `/goal` below.
 - **`cryptoFailureAction` matrix** — ~240 LOC; **blocked** on
   porting the PIP-4 crypto bridge to moonpool.
 
-**`/goal` (transactional ack — actionable now).**
+**`/goal` (full ack-within-txn — follow-up to txn lifecycle).**
 
 ```text
-/goal add the transactional-ack golden trace per docs/follow-ups.md §8. Extend crates/magnetar-differential/src/scripted_broker.rs to handle `CommandEndTxn` (with per-txn ack ledger keyed by `TxnId`) and `CommandAck` carrying a `txn_id`. New trace at crates/magnetar-differential/tests/golden/txn_ack.json exercises: NewTxn → produce + ack-within-txn × N → CommandEndTxn(commit) → assert ledger drained. Mirror via crates/magnetar-differential/tests/golden_traces.rs::run_txn_ack_trace (tokio + moonpool both). Validation chain per CLAUDE.md.
+/goal extend the txn lifecycle golden traces in docs/follow-ups.md §8 to cover ack-within-txn produce/ack drain semantics. Add two new Op variants in crates/magnetar-differential/src/trace.rs — `Op::SendInTxn { payload }` and `Op::AckInTxn { message_id }` — that route the publish / ack through the per-txn `txn_id` field that `OutgoingMessage` / `CommandAck` already carry. Wire them in both runners (runner_tokio.rs + runner_moonpool.rs) to use the currently-open `current_txn` set by the prior `Op::NewTxn`. Extend the scripted broker's per-txn ack ledger: today it tracks staged acks by `(txnid_most, txnid_least)` but doesn't surface the drain count to the trace's assertion path. Add an observable side-channel on `ScriptedBroker` (mirroring the existing `seeked_partitions` log) that exposes per-(most, least) the drain count on commit and the dropped count on abort. New golden traces: `txn_send_ack_then_commit` (open txn, publish 3, ack 3 within txn, commit, assert broker observed 3 staged acks drained on commit) and `txn_send_ack_then_abort` (same but abort, assert 3 staged acks dropped). Validation chain per CLAUDE.md. ADR-0024 (a/b/c/d) layers as usual — the proto txn surface is already exercised by the existing `magnetar-proto` txn unit tests.
 ```
 
 **`/goal` (cryptoFailureAction — blocked on crypto bridge port).**

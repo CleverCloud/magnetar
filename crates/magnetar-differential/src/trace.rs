@@ -108,6 +108,22 @@ pub enum Op {
         /// Raw payload bytes (uncompressed, unencrypted).
         payload: Vec<u8>,
     },
+    /// PIP-31: open a transaction at the broker-side transaction
+    /// coordinator. On success the runner stores the returned
+    /// [`magnetar_proto::TxnId`] for the next [`Self::EndTxn`] op. The
+    /// harness supports one in-flight transaction at a time per trace.
+    NewTxn {
+        /// Transaction timeout in milliseconds. The TC fails the
+        /// transaction if the client doesn't end it within this window.
+        timeout_ms: u64,
+    },
+    /// PIP-31: commit or abort the open transaction (the one returned
+    /// by the most recent [`Self::NewTxn`] op). The scripted broker
+    /// drains the per-txn ack ledger on commit; drops it on abort.
+    EndTxn {
+        /// `true` → commit; `false` → abort.
+        commit: bool,
+    },
 }
 
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`
@@ -188,6 +204,31 @@ pub enum Event {
     SeekedPartition {
         /// Zero-based partition index whose cursor was reset.
         partition: i32,
+    },
+    /// `NewTxn` succeeded. The harness suppresses the broker-allocated
+    /// txn id from the event payload (it's allocated by the scripted
+    /// broker so the two engines may disagree on the exact bits if
+    /// they're observed in different order). The Sent event is
+    /// sufficient to assert "the txn open round-trip resolved" — the
+    /// differential equivalence claim is on the event sequence, not
+    /// on the txn-id bits.
+    TxnCreated,
+    /// `NewTxn` failed at the engine surface or broker.
+    TxnCreateError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// `EndTxn` succeeded. The `committed` field mirrors the input op
+    /// (`true` → commit; `false` → abort) so the event carries the
+    /// outcome shape directly.
+    TxnEnded {
+        /// `true` → commit was acked; `false` → abort was acked.
+        committed: bool,
+    },
+    /// `EndTxn` failed at the engine surface or broker.
+    TxnEndError {
+        /// Stable error category string.
+        kind: String,
     },
 }
 

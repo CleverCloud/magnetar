@@ -504,3 +504,61 @@ async fn seek_per_partition_replays_only_one_partition() {
         "moonpool: scripted broker should have seen exactly one Seek on partition 2",
     );
 }
+
+/// Golden 9 — PIP-31 transactional lifecycle (minimal): open a txn
+/// at the TC, immediately commit it. The scripted broker handles the
+/// TC handshake (lookup of `transaction_coordinator_assign-partition-0`
+/// + `CommandTcClientConnectRequest`), allocates a txn id on
+/// `CommandNewTxn`, and acks the `CommandEndTxn(commit)` round-trip.
+/// Both engines must observe `(TxnCreated, TxnEnded { committed: true })`.
+///
+/// This proves the wire-level lifecycle round-trip is differential-
+/// equivalent. The full PIP-31 ack-within-txn assertion (send +
+/// ack-with-txn-id + commit-drains-staged-acks) is queued as a
+/// follow-up — needs the producer/consumer txn-id plumbing wired
+/// through both runners.
+#[tokio::test(flavor = "current_thread")]
+async fn txn_new_then_commit_round_trip() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-txn",
+        "sub-txn",
+        vec![
+            Op::NewTxn { timeout_ms: 60_000 },
+            Op::EndTxn { commit: true },
+            Op::Close,
+        ],
+    );
+    let stream = assert_equivalent(&trace).await;
+    assert_eq!(stream.events.len(), 3);
+    assert!(matches!(stream.events[0], Event::TxnCreated));
+    assert!(matches!(
+        stream.events[1],
+        Event::TxnEnded { committed: true }
+    ));
+    assert!(matches!(stream.events[2], Event::Closed));
+}
+
+/// Golden 10 — PIP-31 transactional abort: open a txn, then abort it.
+/// Same shape as Golden 9 but exercises the `EndTxn(abort)` path; the
+/// scripted broker drops the per-txn ack ledger entry rather than
+/// applying it.
+#[tokio::test(flavor = "current_thread")]
+async fn txn_new_then_abort_round_trip() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-txn-abort",
+        "sub-txn-abort",
+        vec![
+            Op::NewTxn { timeout_ms: 60_000 },
+            Op::EndTxn { commit: false },
+            Op::Close,
+        ],
+    );
+    let stream = assert_equivalent(&trace).await;
+    assert_eq!(stream.events.len(), 3);
+    assert!(matches!(stream.events[0], Event::TxnCreated));
+    assert!(matches!(
+        stream.events[1],
+        Event::TxnEnded { committed: false }
+    ));
+    assert!(matches!(stream.events[2], Event::Closed));
+}
