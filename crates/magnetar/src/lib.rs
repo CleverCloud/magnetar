@@ -70,6 +70,8 @@ pub use engine::{
 pub use engine::{Engine, TransactionApi};
 
 #[cfg(feature = "tokio")]
+mod builders;
+#[cfg(feature = "tokio")]
 mod client;
 #[cfg(feature = "tokio")]
 mod client_builder;
@@ -90,11 +92,13 @@ mod transaction;
 #[cfg(feature = "tokio")]
 mod typed;
 #[cfg(feature = "tokio")]
+pub use builders::{ConsumerBuilder, ProducerBuilder, ReaderBuilder};
+#[cfg(feature = "tokio")]
 pub use client::{
-    ConsumerBuilder, ConsumerInterceptor, IncomingMessage, MemoryLimit, MemoryLimitPolicy,
-    MessageBuilder, OutgoingMessage, ProducerBuilder, ProducerExt, ProducerInterceptor,
-    PulsarClient, PulsarError, Reader, ReaderBuilder, SeekTarget, ack_cumulative_with_interceptors,
-    ack_with_interceptors, receive_with_interceptors, send_with_interceptors,
+    ConsumerInterceptor, IncomingMessage, MemoryLimit, MemoryLimitPolicy, MessageBuilder,
+    OutgoingMessage, ProducerExt, ProducerInterceptor, PulsarClient, PulsarError, Reader,
+    SeekTarget, ack_cumulative_with_interceptors, ack_with_interceptors, receive_with_interceptors,
+    send_with_interceptors,
 };
 #[cfg(feature = "tokio")]
 pub use client_builder::ClientBuilder;
