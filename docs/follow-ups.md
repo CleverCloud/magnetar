@@ -40,7 +40,11 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   Return a frame descriptor `{head: BytesMut, payload: Bytes}` and
   vectored-write for plaintext — the producer batch path then chains
   `Bytes` segments instead of memcpy-concat. TLS path keeps the
-  contiguous coalesce.
+  contiguous coalesce. **Design landed**:
+  [ADR-0039](../specs/adr/0039-vectored-io-transmit-enum.md) (Proposed) —
+  three-wave landing plan (proto+tokio first, moonpool
+  `Providers::Network::write_vectored` second, read-path ownership
+  pass-through third). Implementation still TODO.
 
 ### Open — performance / contention
 
@@ -69,17 +73,19 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 - **No `writev` / `IoSlice`** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` +
   `crates/magnetar-proto/src/conn.rs::poll_transmit` — outbound
-  coalesces into a single `BytesMut` before write. With a `Transmit`
-  enum of contiguous-or-vectored segments and `poll_write_vectored`,
-  the plaintext path avoids the batch copy entirely (TLS coalesces
-  at the rustls boundary). Moonpool parity: `Providers::Network`
-  accepts segment list, records equivalent byte stream.
+  coalesces into a single `BytesMut` before write. **Design landed**:
+  [ADR-0039](../specs/adr/0039-vectored-io-transmit-enum.md) (Proposed)
+  — wave 1 (proto `Transmit` enum + tokio `write_vectored`), wave 2
+  (moonpool `Providers::Network::write_vectored` + chaos pack
+  segment-granular drops), wave 3 (read-path `BytesMut` ownership
+  pass-through). Implementation still TODO; the three waves can land
+  independently in that order.
 - **Read path double-copy** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner`
   reads `read_buf` → `split().freeze()`. The proto-side re-copy was
   removed by the `handle_bytes` `split_to` refactor (commit
-  `bf66a5b`). Once the segment-aware transmit type lands, the runtime
-  can pass owned `BytesMut` ownership directly.
+  `bf66a5b`). Once the segment-aware transmit type lands (ADR-0039
+  wave 3), the runtime can pass owned `BytesMut` ownership directly.
 
 ### Open — security hardening
 
