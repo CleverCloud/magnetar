@@ -5,13 +5,11 @@
 //!
 //! Spins up:
 //!
-//! 1. `apachepulsar/pulsar:4.0.4` in **standalone** mode (embedded
-//!    Zookeeper on `2181`, broker binary on `6650`, admin REST on
-//!    `8080`).
-//! 2. `apachepulsar/pulsar:4.0.4` in **proxy** mode, pointed at the
-//!    standalone container's Zookeeper via `--zookeeper-servers
-//!    <standalone-host>:<mapped-zk-port>` and serving the proxy binary
-//!    protocol on a random host port.
+//! 1. `apachepulsar/pulsar:4.0.4` in **standalone** mode (embedded Zookeeper on `2181`, broker
+//!    binary on `6650`, admin REST on `8080`).
+//! 2. `apachepulsar/pulsar:4.0.4` in **proxy** mode, pointed at the standalone container's
+//!    Zookeeper via `--zookeeper-servers <standalone-host>:<mapped-zk-port>` and serving the proxy
+//!    binary protocol on a random host port.
 //!
 //! The client connects to the **proxy** address, opens a producer, sends
 //! a payload, then opens a consumer and reads it back. The whole
@@ -80,9 +78,10 @@ fn init_tracing() {
 /// port, admin port, zk port, plus the container handle (drop = stop).
 async fn start_standalone() -> Result<
     (
-        String,                                                  // service_url (host:port for binary protocol)
-        u16,                                                     // mapped zk port
-        testcontainers::ContainerAsync<GenericImage>,            // standalone handle
+        String,                                       /* service_url (host:port for binary
+                                                       * protocol) */
+        u16,                                          // mapped zk port
+        testcontainers::ContainerAsync<GenericImage>, // standalone handle
     ),
     Box<dyn std::error::Error>,
 > {
@@ -124,9 +123,7 @@ async fn start_proxy(
     // start the proxy.
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(PROXY_BINARY_PORT))
-        .with_wait_for(WaitFor::message_on_stdout(
-            "Started ProxyService at",
-        ))
+        .with_wait_for(WaitFor::message_on_stdout("Started ProxyService at"))
         .with_startup_timeout(Duration::from_secs(60))
         .with_env_var("PULSAR_PREFIX_zookeeperServers", &zk_servers)
         .with_env_var("PULSAR_PREFIX_configurationStoreServers", &zk_servers)

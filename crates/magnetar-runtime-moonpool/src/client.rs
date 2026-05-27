@@ -300,12 +300,14 @@ impl<P: Providers> Client<P> {
                     // The moonpool engine is plain-text only today (TLS lands via the
                     // `RustlsByteAdapter` byte pipe — see `connect_tls`), so we always pick
                     // the plain `broker_service_url` when both are advertised.
-                    let broker_url = broker_service_url.or(broker_service_url_tls).ok_or_else(|| {
-                        ClientError::Other(format!(
-                            "lookup of '{topic}' set proxy_through_service_url=true but did \
+                    let broker_url = broker_service_url.or(broker_service_url_tls).ok_or_else(
+                        || {
+                            ClientError::Other(format!(
+                                "lookup of '{topic}' set proxy_through_service_url=true but did \
                              not advertise a broker_service_url"
-                        ))
-                    })?;
+                            ))
+                        },
+                    )?;
                     Ok(LookupTarget::Proxy { broker_url })
                 } else {
                     Ok(LookupTarget::Direct)
@@ -314,9 +316,7 @@ impl<P: Providers> Client<P> {
             // `Redirected` is surfaced for observability after the proto layer's redirect
             // chain settles; treat as direct routing (ADR-0039 §"Consequences").
             LookupOutcome::Redirected { .. } => Ok(LookupTarget::Direct),
-            LookupOutcome::Failed { code, message } => {
-                Err(ClientError::Broker { code, message })
-            }
+            LookupOutcome::Failed { code, message } => Err(ClientError::Broker { code, message }),
         }
     }
 
@@ -335,7 +335,9 @@ impl<P: Providers> Client<P> {
                         topic: topic.to_owned(),
                     }
                 })?;
-                pool.get_or_open(&broker_url).await.map_err(ClientError::from)
+                pool.get_or_open(&broker_url)
+                    .await
+                    .map_err(ClientError::from)
             }
         }
     }

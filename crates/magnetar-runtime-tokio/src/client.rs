@@ -374,12 +374,12 @@ impl Client {
     /// ride. Returns one of the [`LookupTarget`] variants:
     ///
     /// - [`LookupTarget::Direct`] — the bootstrap connection is the data plane. Either we are
-    ///   talking directly to the broker (no proxy) or the lookup resolved to the same broker
-    ///   we are already connected to. Producer / consumer rides on `self.shared`.
-    /// - [`LookupTarget::Proxy { broker_url }`] — the lookup answered
-    ///   `proxy_through_service_url = true`. The runtime opens (or reuses) a pool entry for
-    ///   `broker_url` with `CommandConnect.proxy_to_broker_url = broker_url`; the data ops
-    ///   ride on that pool entry. See ADR-0039.
+    ///   talking directly to the broker (no proxy) or the lookup resolved to the same broker we are
+    ///   already connected to. Producer / consumer rides on `self.shared`.
+    /// - [`LookupTarget::Proxy { broker_url }`] — the lookup answered `proxy_through_service_url =
+    ///   true`. The runtime opens (or reuses) a pool entry for `broker_url` with
+    ///   `CommandConnect.proxy_to_broker_url = broker_url`; the data ops ride on that pool entry.
+    ///   See ADR-0039.
     ///
     /// `Redirected` outcomes are folded back into `Direct` after a `tracing::warn!` —
     /// the proto layer's `lookup` state machine chases redirect chains internally, so by the
@@ -397,26 +397,27 @@ impl Client {
         }
         .await;
         match outcome {
-            OpOutcome::LookupResponse { outcome, .. } => match outcome {
-                magnetar_proto::LookupOutcome::Connect {
-                    broker_service_url,
-                    broker_service_url_tls,
-                    proxy_through_service_url,
-                } => {
-                    tracing::debug!(
-                        topic,
-                        broker_service_url = broker_service_url.as_deref(),
-                        broker_service_url_tls = broker_service_url_tls.as_deref(),
+            OpOutcome::LookupResponse { outcome, .. } => {
+                match outcome {
+                    magnetar_proto::LookupOutcome::Connect {
+                        broker_service_url,
+                        broker_service_url_tls,
                         proxy_through_service_url,
-                        "lookup resolved"
-                    );
-                    if proxy_through_service_url {
-                        // ADR-0039: pick the broker URL that matches our TLS posture. If we
-                        // are on `pulsar+ssl://` and the broker advertises a TLS URL we
-                        // prefer it; otherwise fall back to the plain URL. If the broker
-                        // declined to advertise any URL we error out — the proxy cannot
-                        // route us.
-                        let broker_url = preferred_broker_url(
+                    } => {
+                        tracing::debug!(
+                            topic,
+                            broker_service_url = broker_service_url.as_deref(),
+                            broker_service_url_tls = broker_service_url_tls.as_deref(),
+                            proxy_through_service_url,
+                            "lookup resolved"
+                        );
+                        if proxy_through_service_url {
+                            // ADR-0039: pick the broker URL that matches our TLS posture. If we
+                            // are on `pulsar+ssl://` and the broker advertises a TLS URL we
+                            // prefer it; otherwise fall back to the plain URL. If the broker
+                            // declined to advertise any URL we error out — the proxy cannot
+                            // route us.
+                            let broker_url = preferred_broker_url(
                             broker_service_url,
                             broker_service_url_tls,
                             self.bootstrap_scheme(),
@@ -425,31 +426,32 @@ impl Client {
                             "lookup of '{topic}' set proxy_through_service_url=true but did \
                              not advertise a broker_service_url or broker_service_url_tls"
                         )))?;
-                        Ok(LookupTarget::Proxy { broker_url })
-                    } else {
+                            Ok(LookupTarget::Proxy { broker_url })
+                        } else {
+                            Ok(LookupTarget::Direct)
+                        }
+                    }
+                    magnetar_proto::LookupOutcome::Redirected {
+                        broker_service_url,
+                        broker_service_url_tls,
+                    } => {
+                        // The proto layer already chases redirects internally and only surfaces
+                        // `Redirected` for observability after the redirect chain has settled.
+                        // Treat as a direct lookup — multi-broker direct routing (without proxy)
+                        // is follow-up work tracked in ADR-0039 §"Consequences".
+                        tracing::warn!(
+                            topic,
+                            broker_service_url = broker_service_url.as_deref(),
+                            broker_service_url_tls = broker_service_url_tls.as_deref(),
+                            "broker redirected lookup; multi-broker DIRECT redirect is follow-up work"
+                        );
                         Ok(LookupTarget::Direct)
                     }
+                    magnetar_proto::LookupOutcome::Failed { code, message } => {
+                        Err(ClientError::Broker { code, message })
+                    }
                 }
-                magnetar_proto::LookupOutcome::Redirected {
-                    broker_service_url,
-                    broker_service_url_tls,
-                } => {
-                    // The proto layer already chases redirects internally and only surfaces
-                    // `Redirected` for observability after the redirect chain has settled.
-                    // Treat as a direct lookup — multi-broker direct routing (without proxy)
-                    // is follow-up work tracked in ADR-0039 §"Consequences".
-                    tracing::warn!(
-                        topic,
-                        broker_service_url = broker_service_url.as_deref(),
-                        broker_service_url_tls = broker_service_url_tls.as_deref(),
-                        "broker redirected lookup; multi-broker DIRECT redirect is follow-up work"
-                    );
-                    Ok(LookupTarget::Direct)
-                }
-                magnetar_proto::LookupOutcome::Failed { code, message } => {
-                    Err(ClientError::Broker { code, message })
-                }
-            },
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
             other => Err(ClientError::Other(format!(
                 "unexpected lookup outcome: {other:?}"

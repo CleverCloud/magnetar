@@ -413,8 +413,7 @@ async fn supervised_driver_loop(
     // emits an encrypted record.
     let mut socket_alive_since = Instant::now();
     let mut flush_after_write = transport_needs_flush(&socket);
-    let mut last_inner_result =
-        driver_loop_inner(&shared, &mut socket, flush_after_write).await;
+    let mut last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
 
     loop {
         // User-requested close beats reconnect — the state machine is in `Closing` /
@@ -584,8 +583,7 @@ async fn supervised_driver_loop(
         socket = new_socket;
         socket_alive_since = Instant::now();
         flush_after_write = transport_needs_flush(&socket);
-        last_inner_result =
-            driver_loop_inner(&shared, &mut socket, flush_after_write).await;
+        last_inner_result = driver_loop_inner(&shared, &mut socket, flush_after_write).await;
     }
 }
 

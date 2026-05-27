@@ -6,24 +6,22 @@
 //! Wires an in-process scripted broker that emulates the proxy's wire
 //! contract:
 //!
-//! 1. The **bootstrap** connection (the one [`Client::connect`] opens) MUST
-//!    arrive with `CommandConnect.proxy_to_broker_url = None`. The fake
-//!    broker accepts it, then on `CommandLookupTopic` answers with
-//!    `proxy_through_service_url = true` plus a synthetic
-//!    `broker_service_url` advertising the backend broker. It DOES NOT serve
-//!    `CommandProducer` / `CommandSubscribe` on that connection — sending a
-//!    data frame there triggers a panic in the broker stub.
+//! 1. The **bootstrap** connection (the one [`Client::connect`] opens) MUST arrive with
+//!    `CommandConnect.proxy_to_broker_url = None`. The fake broker accepts it, then on
+//!    `CommandLookupTopic` answers with `proxy_through_service_url = true` plus a synthetic
+//!    `broker_service_url` advertising the backend broker. It DOES NOT serve `CommandProducer` /
+//!    `CommandSubscribe` on that connection — sending a data frame there triggers a panic in the
+//!    broker stub.
 //! 2. The runtime is expected to then open a **second** TCP connection with
-//!    `CommandConnect.proxy_to_broker_url = Some(<the broker URL>)`. The
-//!    fake broker accepts it and answers `CommandProducer` / `CommandSubscribe`.
+//!    `CommandConnect.proxy_to_broker_url = Some(<the broker URL>)`. The fake broker accepts it and
+//!    answers `CommandProducer` / `CommandSubscribe`.
 //!
 //! The test asserts:
 //! - Exactly **two** TCP sessions are accepted (bootstrap + per-broker entry).
 //! - The bootstrap session's `CommandConnect` carries no `proxy_to_broker_url`.
-//! - The per-broker session's `CommandConnect` carries the broker URL the proxy
-//!   advertised in the lookup response.
-//! - The producer / consumer round-trip completes end-to-end through the
-//!   pinned pool entry.
+//! - The per-broker session's `CommandConnect` carries the broker URL the proxy advertised in the
+//!   lookup response.
+//! - The producer / consumer round-trip completes end-to-end through the pinned pool entry.
 //!
 //! Sibling moonpool simulation coverage lives in
 //! `crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs` (ADR-0024
@@ -278,12 +276,16 @@ async fn open_producer_through_proxy_opens_second_connection() {
     );
 
     // The bootstrap session saw the lookup; the pinned session saw the producer create.
-    let bootstrap_kinds: Vec<_> = bootstrap.frames.iter().filter_map(|k| {
-        pb::base_command::Type::try_from(*k).ok()
-    }).collect();
-    let pinned_kinds: Vec<_> = pinned.frames.iter().filter_map(|k| {
-        pb::base_command::Type::try_from(*k).ok()
-    }).collect();
+    let bootstrap_kinds: Vec<_> = bootstrap
+        .frames
+        .iter()
+        .filter_map(|k| pb::base_command::Type::try_from(*k).ok())
+        .collect();
+    let pinned_kinds: Vec<_> = pinned
+        .frames
+        .iter()
+        .filter_map(|k| pb::base_command::Type::try_from(*k).ok())
+        .collect();
     assert!(
         bootstrap_kinds.contains(&pb::base_command::Type::Lookup),
         "bootstrap session must have seen the lookup, got {bootstrap_kinds:?}"
@@ -337,9 +339,11 @@ async fn subscribe_through_proxy_opens_second_connection() {
         Some(ADVERTISED_BROKER_URL),
         "pinned CONNECT must set proxy_to_broker_url"
     );
-    let pinned_kinds: Vec<_> = pinned.frames.iter().filter_map(|k| {
-        pb::base_command::Type::try_from(*k).ok()
-    }).collect();
+    let pinned_kinds: Vec<_> = pinned
+        .frames
+        .iter()
+        .filter_map(|k| pb::base_command::Type::try_from(*k).ok())
+        .collect();
     assert!(
         pinned_kinds.contains(&pb::base_command::Type::Subscribe),
         "pinned session must have seen the subscribe, got {pinned_kinds:?}"

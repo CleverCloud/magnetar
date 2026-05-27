@@ -190,8 +190,9 @@ impl<P: Providers> ProxyConnectionPool<P> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use moonpool_core::TokioProviders;
+
+    use super::*;
 
     fn dummy_factory() -> ConnectionFactory<TokioProviders> {
         ConnectionFactory {

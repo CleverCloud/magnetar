@@ -155,7 +155,10 @@ impl ProxyConnectionPool {
         logical: &str,
         physical: &ParsedUrl,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
-        let key: PoolKey = (logical.to_owned(), format!("{}:{}", physical.host, physical.port));
+        let key: PoolKey = (
+            logical.to_owned(),
+            format!("{}:{}", physical.host, physical.port),
+        );
 
         // Fast path — already open.
         if let Some(entry) = self.entries.lock().get(&key) {
@@ -283,9 +286,10 @@ impl ProxyConnectionPool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::url_parse::Scheme;
-    use std::time::Duration;
 
     fn dummy_factory() -> ConnectionFactory {
         ConnectionFactory {
