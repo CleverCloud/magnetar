@@ -550,7 +550,15 @@ pub struct Connection {
     /// Pending requests keyed by request id, with the kind of operation that produced them.
     pending_requests: HashMap<RequestId, PendingRequestKind>,
     /// Open producers.
-    producers: HashMap<ProducerHandle, ProducerState>,
+    ///
+    /// `ProducerState` lives behind a per-slot [`parking_lot::Mutex`] so the
+    /// runtime crates can read identity / push hot-path operations without
+    /// taking the global Connection mutex (split-connection-mutex
+    /// refactor, ADR-0038). For Phase 1 every Connection method that mutates
+    /// per-producer state still does so under the global mutex — it just
+    /// takes the slot lock briefly first. Lock-ordering: **global → per-slot,
+    /// never the reverse**.
+    producers: HashMap<ProducerHandle, std::sync::Arc<crate::producer::ProducerSlot>>,
     /// Original [`CreateProducerRequest`] for every still-open producer. Stashed at
     /// [`Self::create_producer`] time so the supervisor can replay `CommandProducer` on a
     /// freshly-handshaked transport via [`Self::rebuild_producers`]. Mirrors the parameters
@@ -567,7 +575,11 @@ pub struct Connection {
     /// without ever observing the reset).
     in_flight_publish_snapshots: HashMap<ProducerHandle, Vec<crate::producer::OpSend>>,
     /// Open consumers.
-    consumers: HashMap<ConsumerHandle, ConsumerState>,
+    ///
+    /// `ConsumerState` lives behind a per-slot [`parking_lot::Mutex`] for
+    /// the same reasons as [`Self::producers`] — see ADR-0038. Lock-ordering:
+    /// **global → per-slot, never the reverse**.
+    consumers: HashMap<ConsumerHandle, std::sync::Arc<crate::consumer::ConsumerSlot>>,
     /// Original [`SubscribeRequest`] for every still-open consumer. Stashed at
     /// [`Self::subscribe`] time so the supervisor can replay `CommandSubscribe` on a
     /// freshly-handshaked transport via [`Self::rebuild_consumers`]. Mirrors the parameters
@@ -959,8 +971,11 @@ impl Connection {
         // because anything successfully replayed is gone from the map.
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
-            if let Some(producer) = self.producers.get_mut(&handle) {
-                let (wakers, snapshots) = producer.snapshot_pending_sends();
+            let snap = self
+                .producers
+                .get(&handle)
+                .map(|slot| slot.state.lock().snapshot_pending_sends());
+            if let Some((wakers, snapshots)) = snap {
                 for (seq, waker_opt) in wakers {
                     // Prefer the producer-stored waker (registered via
                     // ProducerState::register_waker); fall back to the connection-level
@@ -1003,7 +1018,8 @@ impl Connection {
         // pinned to the now-dead session: in-flight seek, in-memory queue, ack-tracker
         // state, broker permits. The runtime layer is responsible for re-subscribing
         // and re-issuing the initial flow.
-        for consumer in self.consumers.values_mut() {
+        for slot in self.consumers.values() {
+            let mut consumer = slot.state.lock();
             consumer.queue.clear();
             consumer.pending_seek = None;
             consumer.available_permits = 0;
@@ -1013,6 +1029,7 @@ impl Connection {
             // Wake every in-flight receive so they observe the queue is empty
             // and re-register on the freshly-handshaked connection.
             let wakers: Vec<std::task::Waker> = consumer.receive_wakers.drain().collect();
+            drop(consumer); // Release the slot lock BEFORE calling user-supplied wakers.
             for w in wakers {
                 w.wake();
             }
@@ -1069,14 +1086,19 @@ impl Connection {
         let pending: Vec<(ProducerHandle, CreateProducerRequest)> = self
             .producer_create_requests
             .iter()
-            .filter(|(handle, _)| self.producers.get(*handle).is_some_and(|p| !p.closed))
+            .filter(|(handle, _)| {
+                self.producers
+                    .get(*handle)
+                    .is_some_and(|slot| !slot.state.lock().closed)
+            })
             .map(|(handle, req)| (*handle, req.clone()))
             .collect();
         let live_handles: std::collections::HashSet<ProducerHandle> =
             pending.iter().map(|(h, _)| *h).collect();
         let mut request_ids = Vec::with_capacity(pending.len());
         for (handle, req) in pending {
-            if let Some(p) = self.producers.get_mut(&handle) {
+            if let Some(slot) = self.producers.get(&handle) {
+                let mut p = slot.state.lock();
                 p.epoch = p.epoch.saturating_add(1);
             }
             let request_id = self.emit_command_producer(handle, &req);
@@ -1087,9 +1109,9 @@ impl Connection {
             // (apart from the freshly-bumped `CommandProducer.epoch` that the broker now
             // associates with this producer).
             if let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle)
-                && let Some(producer) = self.producers.get_mut(&handle)
+                && let Some(slot) = self.producers.get(&handle)
             {
-                producer.replay_snapshots(snapshots);
+                slot.state.lock().replay_snapshots(snapshots);
             }
         }
         // Drop any snapshots that belong to producers we did NOT rebuild (e.g. ones closed
@@ -1134,7 +1156,8 @@ impl Connection {
             .consumer_subscribe_requests
             .iter()
             .filter_map(|(handle, req)| {
-                let state = self.consumers.get(handle)?;
+                let slot = self.consumers.get(handle)?;
+                let state = slot.state.lock();
                 if state.closed {
                     return None;
                 }
@@ -1205,7 +1228,7 @@ impl Connection {
         // don't need to reset it here. We only need to drain the stale
         // close-by-broker events so the runtime's wait future doesn't trip
         // on them.
-        let _ = self.consumers.get_mut(&handle)?;
+        let _ = self.consumers.get(&handle)?;
         self.events.retain(
             |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
         );
@@ -1363,42 +1386,48 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation(
                         "missing CommandSendReceipt body",
                     ))?;
-                if let Some(producer) = self.producers.get_mut(&ProducerHandle(receipt.producer_id))
-                {
-                    // Batched sends now mint a per-message `OpSend` (`add_to_batch`); a
-                    // single broker receipt with `sequence_id = lowest` and
-                    // `highest_sequence_id = highest` must fan out across every entry in
-                    // `[lowest, highest]`. Collect first (no nested mut-borrow of `self`),
-                    // then drain outside the producer borrow.
-                    let lowest = receipt.sequence_id;
-                    // Pulsar's broker uses the Java `-1L` sentinel for "no batch" on the
-                    // wire — `uint64` re-encodes `-1` as `u64::MAX`, so receipts for
-                    // single-message sends arrive with `highest_sequence_id == u64::MAX`.
-                    // Treat that AND any value strictly below `lowest` as "single
-                    // message"; only `highest >= lowest && highest != u64::MAX` is a real
-                    // batch range. Java client side: see `CommandSendReceipt` parsing in
-                    // `ClientCnx#handleSendReceipt` checking `highestSequenceId >= 0`.
-                    let highest_raw = receipt.highest_sequence_id.unwrap_or(0);
-                    let highest = if highest_raw >= lowest && highest_raw != u64::MAX {
-                        highest_raw
-                    } else {
-                        lowest
-                    };
-                    let handle = producer.handle;
-                    let mut resolved: Vec<(SequenceId, MessageId, Option<Waker>)> = Vec::new();
-                    for seq in lowest..=highest {
-                        let mut synth = receipt.clone();
-                        synth.sequence_id = seq;
-                        synth.highest_sequence_id = None;
-                        if let Some(tuple) = producer.apply_receipt(&synth) {
-                            resolved.push(tuple);
+                let handle = ProducerHandle(receipt.producer_id);
+                let resolved: Vec<(SequenceId, MessageId, Option<Waker>)> =
+                    if let Some(slot) = self.producers.get(&handle) {
+                        let mut producer = slot.state.lock();
+                        // Batched sends now mint a per-message `OpSend` (`add_to_batch`); a
+                        // single broker receipt with `sequence_id = lowest` and
+                        // `highest_sequence_id = highest` must fan out across every entry in
+                        // `[lowest, highest]`. Collect first (no nested mut-borrow of `self`),
+                        // then drain outside the producer borrow.
+                        let lowest = receipt.sequence_id;
+                        // Pulsar's broker uses the Java `-1L` sentinel for "no batch" on the
+                        // wire — `uint64` re-encodes `-1` as `u64::MAX`, so receipts for
+                        // single-message sends arrive with `highest_sequence_id == u64::MAX`.
+                        // Treat that AND any value strictly below `lowest` as "single
+                        // message"; only `highest >= lowest && highest != u64::MAX` is a real
+                        // batch range. Java client side: see `CommandSendReceipt` parsing in
+                        // `ClientCnx#handleSendReceipt` checking `highestSequenceId >= 0`.
+                        let highest_raw = receipt.highest_sequence_id.unwrap_or(0);
+                        let highest = if highest_raw >= lowest && highest_raw != u64::MAX {
+                            highest_raw
+                        } else {
+                            lowest
+                        };
+                        let mut resolved: Vec<(SequenceId, MessageId, Option<Waker>)> = Vec::new();
+                        for seq in lowest..=highest {
+                            let mut synth = receipt.clone();
+                            synth.sequence_id = seq;
+                            synth.highest_sequence_id = None;
+                            if let Some(tuple) = producer.apply_receipt(&synth) {
+                                resolved.push(tuple);
+                            }
                         }
-                    }
-                    let count = resolved.len() as u64;
-                    if count > 0 {
-                        producer.total_acks_received =
-                            producer.total_acks_received.saturating_add(count);
-                    }
+                        let count = resolved.len() as u64;
+                        if count > 0 {
+                            producer.total_acks_received =
+                                producer.total_acks_received.saturating_add(count);
+                        }
+                        resolved
+                    } else {
+                        Vec::new()
+                    };
+                if !resolved.is_empty() {
                     for (seq, mid, waker) in resolved {
                         let key = PendingOpKey::Send(handle, seq);
                         self.outcomes.insert(
@@ -1425,31 +1454,40 @@ impl Connection {
                 let err = command.send_error.ok_or(ProtocolError::InvariantViolation(
                     "missing CommandSendError",
                 ))?;
-                if let Some(producer) = self.producers.get_mut(&ProducerHandle(err.producer_id)) {
-                    if let Some((seq, waker, code, message)) = producer.apply_send_error(&err) {
+                let handle = ProducerHandle(err.producer_id);
+                let resolved: Option<(SequenceId, Option<Waker>, i32, String)> = if let Some(slot) =
+                    self.producers.get(&handle)
+                {
+                    let mut producer = slot.state.lock();
+                    let outcome = producer.apply_send_error(&err);
+                    if outcome.is_some() {
                         producer.total_send_failed = producer.total_send_failed.saturating_add(1);
-                        let handle = producer.handle;
-                        let key = PendingOpKey::Send(handle, seq);
-                        self.outcomes.insert(
-                            key,
-                            OpOutcome::SendError {
-                                sequence_id: seq,
-                                code,
-                                message: message.clone(),
-                            },
-                        );
-                        if let Some(w) = waker {
-                            w.wake();
-                        } else if let Some(w) = self.wakers.remove(&key) {
-                            w.wake();
-                        }
-                        self.events.push_back(ConnectionEvent::SendError {
-                            handle,
+                    }
+                    outcome
+                } else {
+                    None
+                };
+                if let Some((seq, waker, code, message)) = resolved {
+                    let key = PendingOpKey::Send(handle, seq);
+                    self.outcomes.insert(
+                        key,
+                        OpOutcome::SendError {
                             sequence_id: seq,
                             code,
-                            message,
-                        });
+                            message: message.clone(),
+                        },
+                    );
+                    if let Some(w) = waker {
+                        w.wake();
+                    } else if let Some(w) = self.wakers.remove(&key) {
+                        w.wake();
                     }
+                    self.events.push_back(ConnectionEvent::SendError {
+                        handle,
+                        sequence_id: seq,
+                        code,
+                        message,
+                    });
                 }
             }
             pb::base_command::Type::Message => {
@@ -1475,8 +1513,8 @@ impl Connection {
                         &payload.body,
                     ) {
                         Ok(Some(marker)) => {
-                            if let Some(consumer) = self.consumers.get_mut(&handle) {
-                                consumer.record_marker_consumed();
+                            if let Some(slot) = self.consumers.get(&handle) {
+                                slot.state.lock().record_marker_consumed();
                             }
                             self.events.push_back(
                                 ConnectionEvent::ReplicatedSubscriptionMarkerObserved {
@@ -1494,60 +1532,67 @@ impl Connection {
                             // Malformed RS marker payload: drop quietly. The broker should
                             // not be emitting truncated markers; logging it would couple
                             // magnetar-proto to a logging facade.
-                            if let Some(consumer) = self.consumers.get_mut(&handle) {
-                                consumer.record_marker_consumed();
+                            if let Some(slot) = self.consumers.get(&handle) {
+                                slot.state.lock().record_marker_consumed();
                             }
                             return Ok(());
                         }
                     }
                 }
-                if let Some(consumer) = self.consumers.get_mut(&handle) {
-                    let outcome = consumer.deliver(
-                        &msg,
-                        payload.metadata.clone(),
-                        payload.broker_entry_metadata.clone(),
-                        payload.body.clone(),
-                        now,
-                    );
-                    if let Ok(crate::consumer::DeliverOutcome::Delivered { count }) = outcome {
-                        // Emit one observational event per newly delivered payload by
-                        // *cloning* the tail of the queue — the runtime drains the actual
-                        // payloads via `Connection::pop_message`, so the queue must remain
-                        // intact for `ReceiveFut::poll`. The newly delivered messages are the
-                        // last `count` entries (`deliver` appends in order).
-                        //
-                        // PIP-180 / ADR-0033: when the consumer is shadow-attached AND the
-                        // inbound entry carries `MessageMetadata.replicated_from`, the
-                        // classifier emits `MessageReceivedFromShadow` so callers see the
-                        // source-topic context without an out-of-band lookup. Regular
-                        // (non-shadow) topics keep emitting `Message` — receive-path
-                        // byte-identical to v0.1.0.
-                        let queue_len = consumer.queue.len();
-                        let start = queue_len.saturating_sub(count);
-                        for idx in start..queue_len {
-                            if let Some(im) = consumer.queue.get(idx) {
-                                if let Some((source_topic, source_message_id)) =
-                                    consumer.classify_for_shadow(im)
-                                {
-                                    let shadow_message_id = im.message_id;
-                                    self.events.push_back(
-                                        ConnectionEvent::MessageReceivedFromShadow {
+                let staged_events: Vec<ConnectionEvent> =
+                    if let Some(slot) = self.consumers.get(&handle) {
+                        let mut consumer = slot.state.lock();
+                        let outcome = consumer.deliver(
+                            &msg,
+                            payload.metadata.clone(),
+                            payload.broker_entry_metadata.clone(),
+                            payload.body.clone(),
+                            now,
+                        );
+                        let mut events = Vec::new();
+                        if let Ok(crate::consumer::DeliverOutcome::Delivered { count }) = outcome {
+                            // Emit one observational event per newly delivered payload by
+                            // *cloning* the tail of the queue — the runtime drains the actual
+                            // payloads via `Connection::pop_message`, so the queue must remain
+                            // intact for `ReceiveFut::poll`. The newly delivered messages are the
+                            // last `count` entries (`deliver` appends in order).
+                            //
+                            // PIP-180 / ADR-0033: when the consumer is shadow-attached AND the
+                            // inbound entry carries `MessageMetadata.replicated_from`, the
+                            // classifier emits `MessageReceivedFromShadow` so callers see the
+                            // source-topic context without an out-of-band lookup. Regular
+                            // (non-shadow) topics keep emitting `Message` — receive-path
+                            // byte-identical to v0.1.0.
+                            let queue_len = consumer.queue.len();
+                            let start = queue_len.saturating_sub(count);
+                            for idx in start..queue_len {
+                                if let Some(im) = consumer.queue.get(idx) {
+                                    if let Some((source_topic, source_message_id)) =
+                                        consumer.classify_for_shadow(im)
+                                    {
+                                        let shadow_message_id = im.message_id;
+                                        events.push(ConnectionEvent::MessageReceivedFromShadow {
                                             handle,
                                             source_topic,
                                             source_message_id,
                                             shadow_message_id,
                                             message: im.clone(),
-                                        },
-                                    );
-                                } else {
-                                    self.events.push_back(ConnectionEvent::Message {
-                                        handle,
-                                        message: im.clone(),
-                                    });
+                                        });
+                                    } else {
+                                        events.push(ConnectionEvent::Message {
+                                            handle,
+                                            message: im.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }
-                    }
+                        events
+                    } else {
+                        Vec::new()
+                    };
+                for ev in staged_events {
+                    self.events.push_back(ev);
                 }
             }
             pb::base_command::Type::ProducerSuccess => {
@@ -1560,7 +1605,8 @@ impl Connection {
                 if let Some(PendingRequestKind::ProducerOpen { handle }) =
                     self.pending_requests.remove(&request_id)
                 {
-                    if let Some(producer) = self.producers.get_mut(&handle) {
+                    if let Some(slot) = self.producers.get(&handle) {
+                        let mut producer = slot.state.lock();
                         producer.name = Some(ok.producer_name.clone());
                         producer.last_sequence_id_published = ok.last_sequence_id.unwrap_or(-1);
                     }
@@ -1607,8 +1653,8 @@ impl Connection {
                     );
                 }
                 if let Some(PendingRequestKind::ConsumerSeek { handle }) = kind {
-                    if let Some(c) = self.consumers.get_mut(&handle) {
-                        let _ = c.seek_acked();
+                    if let Some(slot) = self.consumers.get(&handle) {
+                        let _ = slot.state.lock().seek_acked();
                     }
                 }
             }
@@ -1703,7 +1749,8 @@ impl Connection {
                     let kind = self.pending_requests.remove(&rid);
                     if result.is_err() {
                         if let Some(PendingRequestKind::Ack { handle }) = kind {
-                            if let Some(consumer) = self.consumers.get_mut(&handle) {
+                            if let Some(slot) = self.consumers.get(&handle) {
+                                let mut consumer = slot.state.lock();
                                 consumer.total_acks_failed =
                                     consumer.total_acks_failed.saturating_add(1);
                             }
@@ -1881,11 +1928,13 @@ impl Connection {
                         "missing CommandReachedEndOfTopic",
                     ))?;
                 let handle = ConsumerHandle(rc.consumer_id);
-                if let Some(consumer) = self.consumers.get_mut(&handle) {
+                if let Some(slot) = self.consumers.get(&handle) {
+                    let mut consumer = slot.state.lock();
                     consumer.reached_end_of_topic = true;
                     // Wake every parked receive so they can observe the
                     // terminal end-of-topic flag instead of waiting forever.
                     let wakers: Vec<std::task::Waker> = consumer.receive_wakers.drain().collect();
+                    drop(consumer);
                     for w in wakers {
                         w.wake();
                     }
@@ -2202,7 +2251,8 @@ impl Connection {
                 None => deadline,
             });
         };
-        for consumer in self.consumers.values() {
+        for slot in self.consumers.values() {
+            let consumer = slot.state.lock();
             if let Some(t) = consumer.nack_tracker.as_ref() {
                 if let Some(d) = t.next_deadline() {
                     consider(d);
@@ -2219,7 +2269,8 @@ impl Connection {
                 }
             }
         }
-        for producer in self.producers.values() {
+        for slot in self.producers.values() {
+            let producer = slot.state.lock();
             if let Some(d) = producer.next_send_deadline() {
                 consider(d);
             }
@@ -2254,7 +2305,8 @@ impl Connection {
         // then emit through the shared helper.
         let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         let mut ack_actions: Vec<crate::trackers::AckAction> = Vec::new();
-        for (handle, consumer) in &mut self.consumers {
+        for (handle, slot) in &self.consumers {
+            let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 for action in tracker.poll(now) {
                     let crate::trackers::NackAction::RedeliverUnacked { message_ids, .. } = action;
@@ -2292,12 +2344,12 @@ impl Connection {
         let due_batch_handles: Vec<ProducerHandle> = self
             .producers
             .iter()
-            .filter(|(_, p)| p.batch_deadline_elapsed(now))
+            .filter(|(_, slot)| slot.state.lock().batch_deadline_elapsed(now))
             .map(|(h, _)| *h)
             .collect();
         for handle in due_batch_handles {
-            if let Some(producer) = self.producers.get_mut(&handle) {
-                let _ = producer.flush_batch(publish_time_ms, now);
+            if let Some(slot) = self.producers.get(&handle) {
+                let _ = slot.state.lock().flush_batch(publish_time_ms, now);
             }
         }
         // Drain any frames the batch flush queued so callers don't need an extra
@@ -2308,7 +2360,8 @@ impl Connection {
         // `OpOutcome::SendError` so the caller's send future resolves with the configured
         // timeout error.
         let mut send_timeouts: Vec<(ProducerHandle, SequenceId, Option<Waker>)> = Vec::new();
-        for (handle, producer) in &mut self.producers {
+        for (handle, slot) in &self.producers {
+            let mut producer = slot.state.lock();
             for (seq, waker) in producer.drain_timed_out_sends(now) {
                 producer.total_send_failed = producer.total_send_failed.saturating_add(1);
                 send_timeouts.push((*handle, seq, waker));
@@ -2350,8 +2403,8 @@ impl Connection {
         }
         match key {
             PendingOpKey::Send(handle, seq) => {
-                if let Some(p) = self.producers.get_mut(&handle) {
-                    p.register_waker(seq, waker);
+                if let Some(slot) = self.producers.get(&handle) {
+                    slot.state.lock().register_waker(seq, waker);
                     return;
                 }
             }
@@ -2386,7 +2439,13 @@ impl Connection {
         state.send_timeout = req.send_timeout;
         state.batching_max_publish_delay = req.batching_max_publish_delay;
         state.access_mode = req.access_mode;
-        self.producers.insert(handle, state);
+        let identity = crate::producer::ProducerIdentity {
+            handle,
+            topic: req.topic.clone(),
+            access_mode: req.access_mode,
+        };
+        let slot = crate::producer::ProducerSlot::new(identity, state);
+        self.producers.insert(handle, slot);
         // Stash the request so [`Self::rebuild_producers`] can replay it on a freshly-handshaked
         // session.
         self.producer_create_requests.insert(handle, req.clone());
@@ -2407,7 +2466,11 @@ impl Connection {
         req: &CreateProducerRequest,
     ) -> RequestId {
         let request_id = self.alloc_request_id();
-        let epoch = self.producers.get(&handle).map(|p| p.epoch).unwrap_or(0);
+        let epoch = self
+            .producers
+            .get(&handle)
+            .map(|slot| slot.state.lock().epoch)
+            .unwrap_or(0);
         let producer_metadata: Vec<pb::KeyValue> = req
             .producer_metadata
             .iter()
@@ -2473,7 +2536,13 @@ impl Connection {
             state.ack_tracker = Some(crate::trackers::AckGroupingTracker::new(handle, group_time));
         }
         state.crypto_failure_action = req.crypto_failure_action;
-        self.consumers.insert(handle, state);
+        let identity = crate::consumer::ConsumerIdentity {
+            handle,
+            topic: req.topic.clone(),
+            subscription: req.subscription.clone(),
+        };
+        let slot = crate::consumer::ConsumerSlot::new(identity, state);
+        self.consumers.insert(handle, slot);
         // Stash the request so [`Self::rebuild_consumers`] can replay it on a freshly-handshaked
         // session.
         self.consumer_subscribe_requests.insert(handle, req.clone());
@@ -2556,7 +2625,7 @@ impl Connection {
 
     /// Emit the initial flow command for a consumer once it's been acked.
     pub fn initial_flow(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
-        let flow_cmd = self.consumers.get_mut(&handle)?.initial_flow();
+        let flow_cmd = self.consumers.get(&handle)?.state.lock().initial_flow();
         let base = pb::BaseCommand {
             r#type: pb::base_command::Type::Flow as i32,
             flow: Some(flow_cmd),
@@ -2579,17 +2648,20 @@ impl Connection {
         publish_time_ms: u64,
         now: Instant,
     ) -> Result<SequenceId, ProtocolError> {
-        let producer = self
+        let slot = self
             .producers
-            .get_mut(&handle)
+            .get(&handle)
             .ok_or(ProtocolError::InvariantViolation("unknown producer handle"))?;
-        let decision = producer
-            .queue_send(msg, publish_time_ms, now)
-            .map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
-        let seq_id = SequenceId(producer.last_sequence_id_pushed.max(0) as u64);
-        match decision {
-            SendDecision::Emit { .. } | SendDecision::Batched => {}
-        }
+        let seq_id = {
+            let mut producer = slot.state.lock();
+            let decision = producer
+                .queue_send(msg, publish_time_ms, now)
+                .map_err(|_| ProtocolError::InvariantViolation("producer rejected send"))?;
+            match decision {
+                SendDecision::Emit { .. } | SendDecision::Batched => {}
+            }
+            SequenceId(producer.last_sequence_id_pushed.max(0) as u64)
+        };
         self.drain_producer_outbound();
         Ok(seq_id)
     }
@@ -2603,8 +2675,8 @@ impl Connection {
     ) -> usize {
         let n = self
             .producers
-            .get_mut(&handle)
-            .map(|p| p.flush_batch(publish_time_ms, now))
+            .get(&handle)
+            .map(|slot| slot.state.lock().flush_batch(publish_time_ms, now))
             .unwrap_or(0);
         self.drain_producer_outbound();
         n
@@ -2614,7 +2686,9 @@ impl Connection {
     /// Used by the runtime engines' `Producer::flush` to know when it's safe to return.
     #[must_use]
     pub fn producer_pending_count(&self, handle: ProducerHandle) -> usize {
-        self.producers.get(&handle).map_or(0, |p| p.pending.len())
+        self.producers
+            .get(&handle)
+            .map_or(0, |slot| slot.state.lock().pending.len())
     }
 
     /// Number of messages currently buffered in the producer's batch container (waiting
@@ -2622,7 +2696,9 @@ impl Connection {
     /// disabled / the batch is empty.
     #[must_use]
     pub fn producer_batch_len(&self, handle: ProducerHandle) -> usize {
-        self.producers.get(&handle).map_or(0, |p| p.batch.len())
+        self.producers
+            .get(&handle)
+            .map_or(0, |slot| slot.state.lock().batch.len())
     }
 
     /// Sum of payload bytes currently buffered in the producer's batch container.
@@ -2630,17 +2706,21 @@ impl Connection {
     pub fn producer_batch_bytes(&self, handle: ProducerHandle) -> usize {
         self.producers
             .get(&handle)
-            .map_or(0, |p| p.batch.current_size_bytes)
+            .map_or(0, |slot| slot.state.lock().batch.current_size_bytes)
     }
 
     /// Access mode the producer was opened with. Returns
     /// `ProducerAccessMode::Shared` (the broker default) for unknown handles. Mirrors Java
     /// `Producer#getProducerAccessMode`.
+    ///
+    /// Identity-only read — does not take the per-slot mutex.
     #[must_use]
     pub fn producer_access_mode(&self, handle: ProducerHandle) -> pb::ProducerAccessMode {
         self.producers
             .get(&handle)
-            .map_or(pb::ProducerAccessMode::Shared, |p| p.access_mode)
+            .map_or(pb::ProducerAccessMode::Shared, |slot| {
+                slot.identity.access_mode
+            })
     }
 
     /// Last sequence id this client has pushed onto the wire. `-1` if the producer has
@@ -2650,7 +2730,7 @@ impl Connection {
     pub fn producer_last_sequence_id_pushed(&self, handle: ProducerHandle) -> i64 {
         self.producers
             .get(&handle)
-            .map_or(-1, |p| p.last_sequence_id_pushed)
+            .map_or(-1, |slot| slot.state.lock().last_sequence_id_pushed)
     }
 
     /// Last sequence id the broker has acknowledged via `CommandSendReceipt`. `-1` if the
@@ -2659,19 +2739,23 @@ impl Connection {
     pub fn producer_last_sequence_id_published(&self, handle: ProducerHandle) -> i64 {
         self.producers
             .get(&handle)
-            .map_or(-1, |p| p.last_sequence_id_published)
+            .map_or(-1, |slot| slot.state.lock().last_sequence_id_published)
     }
 
     /// Cumulative producer counters snapshot. Returns `None` if the producer handle is unknown.
     #[must_use]
     pub fn producer_stats(&self, handle: ProducerHandle) -> Option<crate::producer::ProducerStats> {
-        self.producers.get(&handle).map(ProducerState::stats)
+        self.producers
+            .get(&handle)
+            .map(|slot| slot.state.lock().stats())
     }
 
     /// Cumulative consumer counters snapshot. Returns `None` if the consumer handle is unknown.
     #[must_use]
     pub fn consumer_stats(&self, handle: ConsumerHandle) -> Option<crate::consumer::ConsumerStats> {
-        self.consumers.get(&handle).map(ConsumerState::stats)
+        self.consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().stats())
     }
 
     /// Take a rolling-window stats snapshot on the consumer identified by `handle`. Runtime
@@ -2679,16 +2763,16 @@ impl Connection {
     /// `ConsumerStatsRecorder`'s rolling-window rate calculation. No-op if the handle is
     /// unknown.
     pub fn consumer_record_rate_window(&mut self, handle: ConsumerHandle, now: std::time::Instant) {
-        if let Some(state) = self.consumers.get_mut(&handle) {
-            state.record_rate_window(now);
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().record_rate_window(now);
         }
     }
 
     /// Take a rolling-window stats snapshot on the producer identified by `handle`. Same
     /// shape as [`Self::consumer_record_rate_window`] but for the producer side.
     pub fn producer_record_rate_window(&mut self, handle: ProducerHandle, now: std::time::Instant) {
-        if let Some(state) = self.producers.get_mut(&handle) {
-            state.record_rate_window(now);
+        if let Some(slot) = self.producers.get(&handle) {
+            slot.state.lock().record_rate_window(now);
         }
     }
 
@@ -2699,7 +2783,9 @@ impl Connection {
     /// Producer, but ProducerImpl exposes `getState() == CLOSED` for this exact purpose.
     #[must_use]
     pub fn producer_is_closed(&self, handle: ProducerHandle) -> bool {
-        self.producers.get(&handle).is_none_or(|p| p.closed)
+        self.producers
+            .get(&handle)
+            .is_none_or(|slot| slot.state.lock().closed)
     }
 
     /// `true` if the consumer with this handle has been closed (locally via
@@ -2708,7 +2794,9 @@ impl Connection {
     /// `Consumer#isClosed` semantics via ConsumerImpl's `getState() == CLOSED`.
     #[must_use]
     pub fn consumer_is_closed(&self, handle: ConsumerHandle) -> bool {
-        self.consumers.get(&handle).is_none_or(|c| c.closed)
+        self.consumers
+            .get(&handle)
+            .is_none_or(|slot| slot.state.lock().closed)
     }
 
     /// Number of messages currently buffered in the consumer's receiver queue, waiting for
@@ -2716,7 +2804,9 @@ impl Connection {
     /// `ConsumerImpl#numMessagesInQueue` / `getTotalIncomingMessages` (the in-memory side).
     #[must_use]
     pub fn consumer_queue_len(&self, handle: ConsumerHandle) -> usize {
-        self.consumers.get(&handle).map_or(0, |c| c.queue.len())
+        self.consumers
+            .get(&handle)
+            .map_or(0, |slot| slot.state.lock().queue.len())
     }
 
     /// Number of dispatch permits the consumer still has with the broker — i.e. messages
@@ -2726,7 +2816,7 @@ impl Connection {
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
         self.consumers
             .get(&handle)
-            .map_or(0, |c| c.available_permits)
+            .map_or(0, |slot| slot.state.lock().available_permits)
     }
 
     /// PIP-4 decryption failure handling configured for this consumer. Returns
@@ -2734,10 +2824,11 @@ impl Connection {
     /// treat a missing consumer as fail-fast. Mirrors Java `Consumer#getCryptoFailureAction`.
     #[must_use]
     pub fn consumer_crypto_failure_action(&self, handle: ConsumerHandle) -> CryptoFailureAction {
-        self.consumers.get(&handle).map_or(
-            CryptoFailureAction::Fail,
-            ConsumerState::crypto_failure_action,
-        )
+        self.consumers
+            .get(&handle)
+            .map_or(CryptoFailureAction::Fail, |slot| {
+                slot.state.lock().crypto_failure_action()
+            })
     }
 
     fn drain_producer_outbound(&mut self) {
@@ -2745,11 +2836,15 @@ impl Connection {
         // outbound byte buffer.
         let handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in handles {
-            while let Some(frame) = self
-                .producers
-                .get_mut(&handle)
-                .and_then(ProducerState::next_outbound_frame)
-            {
+            // SAFETY (lock-ordering): the global Connection mutex is held by the
+            // caller (Connection's `&mut self`); we take the per-slot mutex
+            // BELOW it, never above. See ADR-0038.
+            loop {
+                let frame = self
+                    .producers
+                    .get(&handle)
+                    .and_then(|slot| slot.state.lock().next_outbound_frame());
+                let Some(frame) = frame else { break };
                 let _ = encode_payload(
                     &mut self.outbound,
                     &frame.command,
@@ -2768,7 +2863,8 @@ impl Connection {
         // (caller may have nacked then acked the same id). Also remember the highest acked
         // id so [`Self::rebuild_consumers`] resumes from the post-ack position after a
         // reconnect.
-        if let Some(consumer) = self.consumers.get_mut(&handle) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
             for id in &ack.message_ids {
                 if let Some(t) = consumer.unacked_tracker.as_mut() {
                     t.remove(id);
@@ -2791,7 +2887,8 @@ impl Connection {
         // positions so the broker holds the cursor.
         let pb_ids: Vec<pb::MessageIdData> =
             if matches!(ack.ack_type, pb::command_ack::AckType::Individual) {
-                if let Some(consumer) = self.consumers.get_mut(&handle) {
+                if let Some(slot) = self.consumers.get(&handle) {
+                    let mut consumer = slot.state.lock();
                     ack.message_ids
                         .iter()
                         .map(|id| {
@@ -2827,7 +2924,8 @@ impl Connection {
                 // so any per-batch tracker entries the cumulative position covers are stale.
                 // Drop them so future individual acks on the same batch don't synthesise a
                 // partial bitset for state the broker has already moved past.
-                if let Some(consumer) = self.consumers.get_mut(&handle) {
+                if let Some(slot) = self.consumers.get(&handle) {
+                    let mut consumer = slot.state.lock();
                     let covered: Vec<(u64, u64)> = ack
                         .message_ids
                         .iter()
@@ -2865,7 +2963,8 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::Ack { handle });
-        if let Some(consumer) = self.consumers.get_mut(&handle) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
             consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
         }
         request_id
@@ -2884,11 +2983,13 @@ impl Connection {
         message_id: MessageId,
         now: Instant,
     ) {
-        let actions = self
-            .consumers
-            .get_mut(&handle)
-            .and_then(|c| c.ack_tracker.as_mut())
-            .map(|t| t.add_individual(message_id, now));
+        let actions = self.consumers.get(&handle).and_then(|slot| {
+            let mut consumer = slot.state.lock();
+            consumer
+                .ack_tracker
+                .as_mut()
+                .map(|t| t.add_individual(message_id, now))
+        });
         if let Some(actions) = actions {
             self.dispatch_ack_actions(actions);
         } else {
@@ -2912,11 +3013,13 @@ impl Connection {
         message_id: MessageId,
         now: Instant,
     ) {
-        let actions = self
-            .consumers
-            .get_mut(&handle)
-            .and_then(|c| c.ack_tracker.as_mut())
-            .map(|t| t.add_cumulative(message_id, now));
+        let actions = self.consumers.get(&handle).and_then(|slot| {
+            let mut consumer = slot.state.lock();
+            consumer
+                .ack_tracker
+                .as_mut()
+                .map(|t| t.add_cumulative(message_id, now))
+        });
         if let Some(actions) = actions {
             self.dispatch_ack_actions(actions);
         } else {
@@ -2998,8 +3101,8 @@ impl Connection {
     /// messages once already-issued permits drain. Buffered messages remain available via
     /// [`Self::pop_message`].
     pub fn set_paused(&mut self, handle: ConsumerHandle, paused: bool) {
-        if let Some(c) = self.consumers.get_mut(&handle) {
-            c.paused = paused;
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().paused = paused;
         }
     }
 
@@ -3010,15 +3113,17 @@ impl Connection {
     /// republishing them to the configured DLQ topic.
     pub fn drain_dead_letter(&mut self, handle: ConsumerHandle) -> Vec<IncomingMessage> {
         self.consumers
-            .get_mut(&handle)
-            .map(|c| std::mem::take(&mut c.dead_letter_pending))
+            .get(&handle)
+            .map(|slot| std::mem::take(&mut slot.state.lock().dead_letter_pending))
             .unwrap_or_default()
     }
 
     /// Returns the per-consumer pause flag, or `None` if the consumer handle is unknown.
     #[must_use]
     pub fn is_paused(&self, handle: ConsumerHandle) -> Option<bool> {
-        self.consumers.get(&handle).map(|c| c.paused)
+        self.consumers
+            .get(&handle)
+            .map(|slot| slot.state.lock().paused)
     }
 
     /// Returns `true` once the broker has sent `CommandReachedEndOfTopic` for this
@@ -3027,7 +3132,7 @@ impl Connection {
     pub fn consumer_reached_end_of_topic(&self, handle: ConsumerHandle) -> bool {
         self.consumers
             .get(&handle)
-            .map(|c| c.reached_end_of_topic)
+            .map(|slot| slot.state.lock().reached_end_of_topic)
             .unwrap_or(false)
     }
 
@@ -3035,37 +3140,56 @@ impl Connection {
     /// unknown.
     #[must_use]
     pub fn consumer_topic(&self, handle: ConsumerHandle) -> Option<&str> {
-        self.consumers.get(&handle).map(|c| c.topic.as_str())
+        self.consumers
+            .get(&handle)
+            .map(|slot| slot.identity.topic.as_str())
     }
 
     /// Subscription name of this consumer. Returns `None` if the consumer handle is unknown.
+    ///
+    /// Identity-only read — does not take the per-slot mutex.
     #[must_use]
     pub fn consumer_subscription(&self, handle: ConsumerHandle) -> Option<&str> {
-        self.consumers.get(&handle).map(|c| c.subscription.as_str())
+        self.consumers
+            .get(&handle)
+            .map(|slot| slot.identity.subscription.as_str())
     }
 
     /// Caller-supplied consumer name advertised at subscribe time. Returns `None` if the
     /// consumer handle is unknown or no name was supplied.
+    ///
+    /// Returns an owned `String` because `consumer_name` lives behind the
+    /// per-slot mutex.
     #[must_use]
-    pub fn consumer_name(&self, handle: ConsumerHandle) -> Option<&str> {
+    pub fn consumer_name(&self, handle: ConsumerHandle) -> Option<String> {
         self.consumers
             .get(&handle)
-            .and_then(|c| c.consumer_name.as_deref())
+            .and_then(|slot| slot.state.lock().consumer_name.clone())
     }
 
     /// Topic name this producer is bound to. Returns `None` if the producer handle is
     /// unknown.
+    ///
+    /// Identity-only read — does not take the per-slot mutex.
     #[must_use]
     pub fn producer_topic(&self, handle: ProducerHandle) -> Option<&str> {
-        self.producers.get(&handle).map(|p| p.topic.as_str())
+        self.producers
+            .get(&handle)
+            .map(|slot| slot.identity.topic.as_str())
     }
 
     /// Broker-assigned producer name (set after the CommandProducer / CommandProducerSuccess
     /// round-trip). Returns `None` if the producer handle is unknown or the name has not
     /// arrived yet.
+    ///
+    /// Returns an owned `String` (rather than `&str`) because the underlying
+    /// field is per-slot mutex-guarded mutable state — the borrow cannot
+    /// outlive the lock guard.
     #[must_use]
-    pub fn producer_name(&self, handle: ProducerHandle) -> Option<&str> {
-        self.producers.get(&handle).and_then(|p| p.name.as_deref())
+    pub fn producer_name(&self, handle: ProducerHandle) -> Option<String> {
+        self.producers
+            .get(&handle)
+            .and_then(|slot| slot.state.lock().name.clone())
     }
 
     /// Negatively acknowledge messages — request the broker to redeliver them.
@@ -3084,7 +3208,8 @@ impl Connection {
         now: Instant,
     ) {
         if !message_ids.is_empty() {
-            if let Some(consumer) = self.consumers.get_mut(&handle) {
+            if let Some(slot) = self.consumers.get(&handle) {
+                let mut consumer = slot.state.lock();
                 if let Some(tracker) = consumer.nack_tracker.as_mut() {
                     for id in &message_ids {
                         tracker.add(*id, now);
@@ -3109,7 +3234,8 @@ impl Connection {
         delay: core::time::Duration,
         now: Instant,
     ) {
-        if let Some(consumer) = self.consumers.get_mut(&handle) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 tracker.add_with_delay(message_id, delay, now);
                 return;
@@ -3175,8 +3301,8 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        if let Some(c) = self.consumers.get_mut(&handle) {
-            c.begin_seek(request_id);
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().begin_seek(request_id);
         }
         self.pending_requests
             .insert(request_id, PendingRequestKind::ConsumerSeek { handle });
@@ -3329,8 +3455,8 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        if let Some(p) = self.producers.get_mut(&handle) {
-            p.close();
+        if let Some(slot) = self.producers.get(&handle) {
+            slot.state.lock().close();
         }
         self.pending_requests
             .insert(request_id, PendingRequestKind::ProducerClose { handle });
@@ -3352,8 +3478,8 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        if let Some(c) = self.consumers.get_mut(&handle) {
-            c.close();
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().close();
         }
         self.pending_requests
             .insert(request_id, PendingRequestKind::ConsumerClose { handle });
@@ -3537,24 +3663,45 @@ impl Connection {
         }
     }
 
-    /// Access a producer state (read-only) — useful in tests + driver instrumentation.
-    pub fn producer(&self, handle: ProducerHandle) -> Option<&ProducerState> {
+    /// Access a producer's slot — useful in tests + driver instrumentation.
+    /// Returns the `Arc<ProducerSlot>` so callers can take `.state.lock()`
+    /// to read or mutate the per-producer state machine. Lock-ordering:
+    /// **global Connection mutex → per-slot mutex, never the reverse**
+    /// (see ADR-0038).
+    pub fn producer(
+        &self,
+        handle: ProducerHandle,
+    ) -> Option<&std::sync::Arc<crate::producer::ProducerSlot>> {
         self.producers.get(&handle)
     }
 
-    /// Mutable access to a producer.
-    pub fn producer_mut(&mut self, handle: ProducerHandle) -> Option<&mut ProducerState> {
-        self.producers.get_mut(&handle)
+    /// Access a producer's slot for mutation — returns the same `Arc<ProducerSlot>` as
+    /// [`Self::producer`]; the per-slot mutex provides interior mutability.
+    /// Retained as a separate method for source-compat with the pre-split call sites.
+    pub fn producer_mut(
+        &mut self,
+        handle: ProducerHandle,
+    ) -> Option<&std::sync::Arc<crate::producer::ProducerSlot>> {
+        self.producers.get(&handle)
     }
 
-    /// Access a consumer state (read-only).
-    pub fn consumer(&self, handle: ConsumerHandle) -> Option<&ConsumerState> {
+    /// Access a consumer's slot — returns the `Arc<ConsumerSlot>` so callers
+    /// can take `.state.lock()` to read or mutate per-consumer state. See
+    /// [`Self::producer`] for the symmetric API rationale.
+    pub fn consumer(
+        &self,
+        handle: ConsumerHandle,
+    ) -> Option<&std::sync::Arc<crate::consumer::ConsumerSlot>> {
         self.consumers.get(&handle)
     }
 
-    /// Mutable access to a consumer.
-    pub fn consumer_mut(&mut self, handle: ConsumerHandle) -> Option<&mut ConsumerState> {
-        self.consumers.get_mut(&handle)
+    /// Mutable access to a consumer's slot — returns the same `Arc<ConsumerSlot>` as
+    /// [`Self::consumer`]; the per-slot mutex provides interior mutability.
+    pub fn consumer_mut(
+        &mut self,
+        handle: ConsumerHandle,
+    ) -> Option<&std::sync::Arc<crate::consumer::ConsumerSlot>> {
+        self.consumers.get(&handle)
     }
 
     /// Number of bytes pending transmit.
@@ -3571,8 +3718,7 @@ impl Connection {
     pub fn peek_message_payload_size(&self, handle: ConsumerHandle) -> Option<usize> {
         self.consumers
             .get(&handle)
-            .and_then(|c| c.queue.front())
-            .map(|m| m.payload.len())
+            .and_then(|slot| slot.state.lock().queue.front().map(|m| m.payload.len()))
     }
 
     /// Register a per-consumer receive waker. Returns `Some(slab_key)` if the
@@ -3589,25 +3735,30 @@ impl Connection {
         handle: ConsumerHandle,
         waker: Waker,
     ) -> Option<usize> {
-        let consumer = self.consumers.get_mut(&handle)?;
-        Some(consumer.register_receive_waker(waker))
+        let slot = self.consumers.get(&handle)?;
+        Some(slot.state.lock().register_receive_waker(waker))
     }
 
     /// Evict a previously-registered per-consumer receive waker. Idempotent —
     /// safe to call from a `Drop` impl even if the consumer has been removed
     /// or the slot already drained.
     pub fn cancel_consumer_receive_waker(&mut self, handle: ConsumerHandle, slab_key: usize) {
-        if let Some(consumer) = self.consumers.get_mut(&handle) {
-            consumer.cancel_receive_waker(slab_key);
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().cancel_receive_waker(slab_key);
         }
     }
 
     /// Drain a single message from the given consumer's queue.
     pub fn pop_message(&mut self, handle: ConsumerHandle) -> Option<IncomingMessage> {
-        let consumer = self.consumers.get_mut(&handle)?;
-        let msg = consumer.pop_message();
-        // After popping, opportunistically check whether we owe the broker a FLOW.
-        if let Some(flow_cmd) = consumer.maybe_flow() {
+        let (msg, flow_cmd) = {
+            let slot = self.consumers.get(&handle)?;
+            let mut consumer = slot.state.lock();
+            let msg = consumer.pop_message();
+            // After popping, opportunistically check whether we owe the broker a FLOW.
+            let flow_cmd = consumer.maybe_flow();
+            (msg, flow_cmd)
+        };
+        if let Some(flow_cmd) = flow_cmd {
             let base = pb::BaseCommand {
                 r#type: pb::base_command::Type::Flow as i32,
                 flow: Some(flow_cmd),
@@ -3635,11 +3786,14 @@ impl Connection {
     /// the producer was closed / removed between the broker error and this retry.
     pub fn retry_producer_open(&mut self, handle: ProducerHandle) -> Option<RequestId> {
         let req = self.producer_create_requests.get(&handle)?.clone();
-        let p = self.producers.get_mut(&handle)?;
-        if p.closed {
-            return None;
+        {
+            let slot = self.producers.get(&handle)?;
+            let mut p = slot.state.lock();
+            if p.closed {
+                return None;
+            }
+            p.epoch = p.epoch.saturating_add(1);
         }
-        p.epoch = p.epoch.saturating_add(1);
         let request_id = self.emit_command_producer(handle, &req);
         // Pending `OpSend`s from the transient window have already had their wire frames
         // written to the socket — but the broker dropped them because the producer wasn't
@@ -3651,8 +3805,8 @@ impl Connection {
         // `ProducerImpl#resendMessages` enforces after a reattach. Mirrors the snapshot
         // replay in `rebuild_producers` (Stage 3 at-least-once parity), but targeted at a
         // single producer's already-in-`pending` ops rather than the reset-time snapshot.
-        if let Some(p) = self.producers.get_mut(&handle) {
-            p.replay_pending_outbound();
+        if let Some(slot) = self.producers.get(&handle) {
+            slot.state.lock().replay_pending_outbound();
         }
         self.drain_producer_outbound();
         Some(request_id)
@@ -3667,17 +3821,17 @@ impl Connection {
     /// that already succeeded on this session.
     pub fn retry_consumer_subscribe(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
         let req = self.consumer_subscribe_requests.get(&handle)?.clone();
-        let c = self.consumers.get(&handle)?;
-        if c.closed {
-            return None;
-        }
-        // Resume from the last acked id when we have one (same logic
-        // `rebuild_consumers` uses). The broker treats an unset
-        // `start_message_id` as "from the configured initial position".
-        let resume_from = self
-            .consumers
-            .get(&handle)
-            .and_then(|c| c.last_acked_message_id);
+        let resume_from = {
+            let slot = self.consumers.get(&handle)?;
+            let c = slot.state.lock();
+            if c.closed {
+                return None;
+            }
+            // Resume from the last acked id when we have one (same logic
+            // `rebuild_consumers` uses). The broker treats an unset
+            // `start_message_id` as "from the configured initial position".
+            c.last_acked_message_id
+        };
         let request_id = self.emit_command_subscribe(handle, &req, resume_from);
         let _ = self.initial_flow(handle);
         self.drain_producer_outbound();
@@ -4503,7 +4657,11 @@ mod conn_state_tests {
         let _ = drain_outbound_commands(&mut conn);
         conn.rebuild_producers();
         assert_eq!(
-            conn.producer(handle).expect("producer alive").epoch,
+            conn.producer(handle)
+                .expect("producer alive")
+                .state
+                .lock()
+                .epoch,
             1,
             "first rebuild bumps producer epoch from 0 to 1"
         );
@@ -4525,7 +4683,11 @@ mod conn_state_tests {
         let _ = drain_outbound_commands(&mut conn);
         conn.rebuild_producers();
         assert_eq!(
-            conn.producer(handle).expect("producer alive").epoch,
+            conn.producer(handle)
+                .expect("producer alive")
+                .state
+                .lock()
+                .epoch,
             2,
             "second rebuild bumps producer epoch from 1 to 2"
         );

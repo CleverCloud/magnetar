@@ -138,10 +138,12 @@ impl<P: Providers> Consumer<P> {
     pub fn set_shadow_source(&self, source_topic: impl Into<String>) {
         let source = source_topic.into();
         let mut conn = self.shared.inner.lock();
-        if let Some(c) = conn.consumer_mut(self.handle) {
-            c.set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
-                source_topic: source,
-            });
+        if let Some(slot) = conn.consumer_mut(self.handle) {
+            slot.state
+                .lock()
+                .set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
+                    source_topic: source,
+                });
         }
     }
 
@@ -155,7 +157,13 @@ impl<P: Providers> Consumer<P> {
             .inner
             .lock()
             .consumer(self.handle)
-            .and_then(|c| c.shadow_metadata.as_ref().map(|m| m.source_topic.clone()))
+            .and_then(|slot| {
+                slot.state
+                    .lock()
+                    .shadow_metadata
+                    .as_ref()
+                    .map(|m| m.source_topic.clone())
+            })
     }
 
     /// PIP-180 / ADR-0033: convenience predicate equivalent to
@@ -174,8 +182,7 @@ impl<P: Providers> Consumer<P> {
             .inner
             .lock()
             .consumer_name(self.handle)
-            .unwrap_or("")
-            .to_owned()
+            .unwrap_or_default()
     }
 
     /// `true` while the broker connection is up. Mirrors Java
@@ -1455,6 +1462,8 @@ mod tests {
                 .lock()
                 .consumer(handle)
                 .unwrap()
+                .state
+                .lock()
                 .receive_wakers
                 .len(),
             2,
@@ -1511,6 +1520,8 @@ mod tests {
                 .lock()
                 .consumer(handle)
                 .unwrap()
+                .state
+                .lock()
                 .receive_wakers
                 .len(),
             1,
@@ -1527,6 +1538,8 @@ mod tests {
                 .lock()
                 .consumer(handle)
                 .unwrap()
+                .state
+                .lock()
                 .receive_wakers
                 .len(),
             0,

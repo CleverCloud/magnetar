@@ -65,10 +65,12 @@ impl Consumer {
     pub fn set_shadow_source(&self, source_topic: impl Into<String>) {
         let source = source_topic.into();
         let mut conn = self.shared.inner.lock();
-        if let Some(c) = conn.consumer_mut(self.handle) {
-            c.set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
-                source_topic: source,
-            });
+        if let Some(slot) = conn.consumer_mut(self.handle) {
+            slot.state
+                .lock()
+                .set_shadow_metadata(magnetar_proto::ShadowTopicMetadata {
+                    source_topic: source,
+                });
         }
     }
 
@@ -84,7 +86,13 @@ impl Consumer {
             .inner
             .lock()
             .consumer(self.handle)
-            .and_then(|c| c.shadow_metadata.as_ref().map(|m| m.source_topic.clone()))
+            .and_then(|slot| {
+                slot.state
+                    .lock()
+                    .shadow_metadata
+                    .as_ref()
+                    .map(|m| m.source_topic.clone())
+            })
     }
 
     /// PIP-180 / ADR-0033: convenience predicate equivalent to
@@ -719,8 +727,7 @@ impl Consumer {
             .inner
             .lock()
             .consumer_name(self.handle)
-            .unwrap_or("")
-            .to_owned()
+            .unwrap_or_default()
     }
 
     /// Drain every message the state machine has flagged as dead-letter (redelivery count
@@ -1597,9 +1604,9 @@ mod tests {
         // Slab should hold both registrations now.
         {
             let conn = shared.inner.lock();
-            let consumer_state = conn.consumer(handle).expect("consumer still alive");
+            let slot = conn.consumer(handle).expect("consumer still alive");
             assert_eq!(
-                consumer_state.receive_wakers.len(),
+                slot.state.lock().receive_wakers.len(),
                 2,
                 "both in-flight receives must be parked on the slab",
             );
@@ -1662,6 +1669,8 @@ mod tests {
                 .lock()
                 .consumer(handle)
                 .unwrap()
+                .state
+                .lock()
                 .receive_wakers
                 .len(),
             1,
@@ -1680,6 +1689,8 @@ mod tests {
                 .lock()
                 .consumer(handle)
                 .unwrap()
+                .state
+                .lock()
                 .receive_wakers
                 .len(),
             0,

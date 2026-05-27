@@ -28,6 +28,11 @@ serde_json   = { workspace = true }
 apache-avro  = { workspace = true }
 schemars     = { workspace = true }
 hdrhistogram = { workspace = true }
+# Sync primitive only — no I/O, no async, no networking.
+# Used by ProducerSlot / ConsumerSlot for the per-handle hot lock
+# introduced by the split-connection-mutex refactor (see ADR-0038).
+# Already a workspace dep used by the runtime crates.
+parking_lot  = { workspace = true }
 
 [dev-dependencies]
 proptest  = { workspace = true }

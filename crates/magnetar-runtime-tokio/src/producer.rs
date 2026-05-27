@@ -422,8 +422,7 @@ impl Producer {
             .inner
             .lock()
             .producer_name(self.handle)
-            .unwrap_or("")
-            .to_owned()
+            .unwrap_or_default()
     }
 
     /// Look up the broker-registered schema for the producer's topic (PIP-87).

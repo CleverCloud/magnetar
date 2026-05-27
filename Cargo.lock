@@ -1724,6 +1724,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "hdrhistogram",
+ "parking_lot",
  "proptest",
  "prost 0.13.5",
  "rstest",

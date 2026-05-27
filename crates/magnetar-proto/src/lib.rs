@@ -122,7 +122,7 @@ pub use crate::conn::{
     HandshakeState, KeySharedConfig, MemoryLimitPolicy, OpOutcome, PendingOpKey, SeekTarget,
     SubscribeRequest,
 };
-pub use crate::consumer::{ConsumerStats, ShadowTopicMetadata};
+pub use crate::consumer::{ConsumerIdentity, ConsumerSlot, ConsumerStats, ShadowTopicMetadata};
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
 pub use crate::event::{ConnectionEvent, GetSchemaResult, IncomingMessage, LookupOutcome};
 pub use crate::frame::{
@@ -135,7 +135,7 @@ pub use crate::markers::{
     ReplicatedSubscriptionMarkerDetails, ReplicatedSubscriptionMarkerKind,
     decode_replicated_subscription_marker,
 };
-pub use crate::producer::ProducerStats;
+pub use crate::producer::{ProducerIdentity, ProducerSlot, ProducerStats};
 pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
 };

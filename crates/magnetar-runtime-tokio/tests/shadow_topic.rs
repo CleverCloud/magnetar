@@ -239,6 +239,8 @@ async fn consumer_observes_shadow_from_variant() {
     // Tell the sans-io state this consumer is shadow-attached.
     conn.consumer_mut(handle)
         .expect("consumer alive")
+        .state
+        .lock()
         .set_shadow_metadata(ShadowTopicMetadata {
             source_topic: "persistent://public/default/source-t".to_owned(),
         });
@@ -274,6 +276,8 @@ async fn consumer_message_id_equals_source_message_id() {
     let handle = open_consumer(&mut conn, "persistent://public/default/shadow-t", "sub", at);
     conn.consumer_mut(handle)
         .unwrap()
+        .state
+        .lock()
         .set_shadow_metadata(ShadowTopicMetadata {
             source_topic: "persistent://public/default/source-t".to_owned(),
         });
@@ -307,18 +311,24 @@ async fn subscribe_pre_populates_shadow_metadata() {
     let at = Instant::now();
     let mut conn = handshake_complete(at);
     let handle = open_consumer(&mut conn, "persistent://public/default/shadow-t", "sub", at);
-    assert!(conn.consumer(handle).unwrap().shadow_metadata.is_none());
+    assert!(
+        conn.consumer(handle)
+            .unwrap()
+            .state
+            .lock()
+            .shadow_metadata
+            .is_none()
+    );
     conn.consumer_mut(handle)
         .unwrap()
+        .state
+        .lock()
         .set_shadow_metadata(ShadowTopicMetadata {
             source_topic: "persistent://public/default/source-t".to_owned(),
         });
-    let meta = conn
-        .consumer(handle)
-        .unwrap()
-        .shadow_metadata
-        .as_ref()
-        .expect("metadata installed");
+    let slot = conn.consumer(handle).unwrap();
+    let state = slot.state.lock();
+    let meta = state.shadow_metadata.as_ref().expect("metadata installed");
     assert_eq!(meta.source_topic, "persistent://public/default/source-t");
 }
 
@@ -334,7 +344,8 @@ async fn producer_send_with_source_id_bypasses_batching() {
     // Force batching on by editing the producer state directly (the
     // `CreateProducerRequest` default disables it; we toggle here to make
     // the bypass explicit).
-    if let Some(p) = conn.producer_mut(handle) {
+    if let Some(slot) = conn.producer_mut(handle) {
+        let mut p = slot.state.lock();
         p.batching_enabled = true;
         p.max_messages_in_batch = 100;
         p.max_batch_size_bytes = 1_000_000;
@@ -371,7 +382,8 @@ async fn producer_chunked_send_with_source_id_propagates_to_every_chunk() {
     // Configure a tiny max_message_size + chunking to force the chunked
     // path. The state-machine config exposes both knobs.
     let handle = open_producer(&mut conn, "persistent://public/default/shadow-big", at);
-    if let Some(p) = conn.producer_mut(handle) {
+    if let Some(slot) = conn.producer_mut(handle) {
+        let mut p = slot.state.lock();
         p.max_message_size = 8;
         p.chunking_enabled = true;
     }

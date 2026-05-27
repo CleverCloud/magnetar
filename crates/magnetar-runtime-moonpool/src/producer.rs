@@ -126,8 +126,7 @@ impl<P: Providers> Producer<P> {
             .inner
             .lock()
             .producer_name(self.handle)
-            .unwrap_or("")
-            .to_owned()
+            .unwrap_or_default()
     }
 
     /// `true` if this producer has been closed (locally via

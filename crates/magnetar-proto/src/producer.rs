@@ -214,6 +214,69 @@ pub struct ProducerState {
     pub current_bytes_per_sec: f64,
 }
 
+/// Immutable per-producer metadata, set at create time and never mutated.
+/// Held inside [`ProducerSlot`] so cold-path observers can read it without
+/// taking the slot's mutex.
+///
+/// Mirrors the set of `ProducerImpl` fields that are stamped at construction
+/// from the user-supplied `ProducerBuilder` and never re-assigned: topic, the
+/// caller-visible producer handle, and the broker-negotiated access mode.
+#[derive(Debug, Clone)]
+pub struct ProducerIdentity {
+    /// Producer id assigned by the connection at create-producer time.
+    pub handle: ProducerHandle,
+    /// Topic the producer is bound to.
+    pub topic: String,
+    /// Access mode the producer was opened with. Snapshotted from
+    /// [`crate::conn::CreateProducerRequest::access_mode`] (`Shared` /
+    /// `Exclusive` / `WaitForExclusive` / `ExclusiveWithFencing`). Mirrors
+    /// Java `Producer#getProducerAccessMode`.
+    pub access_mode: pb::ProducerAccessMode,
+}
+
+/// Per-producer slot: immutable identity plus mutex-guarded state.
+///
+/// `Arc<ProducerSlot>` is the long-lived handle the runtime engines store on
+/// their `Producer` value, AND the value that [`crate::Connection`] keeps in
+/// its producer registry — both ends hold the same `Arc`. Cold-path
+/// observability (topic, access mode, handle) reads
+/// [`ProducerSlot::identity`] without locking; mutable operations take
+/// [`ProducerSlot::state`].lock()`.
+///
+/// # Lock-ordering invariant (project-wide)
+///
+/// `Connection` is wrapped in a `parking_lot::Mutex` by the runtime engines
+/// (see `magnetar-runtime-tokio::ConnectionShared::inner`); every
+/// `ProducerSlot` carries its own `parking_lot::Mutex<ProducerState>`. The
+/// allowed acquisition order is:
+///
+/// 1. **Global Connection mutex → per-slot mutex** is safe.
+/// 2. **Per-slot mutex → global Connection mutex is FORBIDDEN.** A holder of `slot.state.lock()`
+///    that needs `Connection`-level state must release the slot lock first.
+///
+/// Violating this rule will deadlock under contention.
+///
+/// See [ADR-0038 — Split Connection Mutex](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0038-split-connection-mutex.md).
+#[derive(Debug)]
+pub struct ProducerSlot {
+    /// Immutable identifying metadata. Safe to read without locking.
+    pub identity: ProducerIdentity,
+    /// Mutex-guarded state-machine state. Hot path for queue / waker /
+    /// outbound-staging operations.
+    pub state: parking_lot::Mutex<ProducerState>,
+}
+
+impl ProducerSlot {
+    /// Construct a slot for a newly-opened producer.
+    #[must_use]
+    pub fn new(identity: ProducerIdentity, state: ProducerState) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            identity,
+            state: parking_lot::Mutex::new(state),
+        })
+    }
+}
+
 /// Snapshot of cumulative producer counters. Mirrors `org.apache.pulsar.client.api.ProducerStats`
 /// for the totals; rates are derived above this layer. Latency percentiles mirror the p50/p99/max
 /// surfaced by Java `ProducerStatsRecorder`.
