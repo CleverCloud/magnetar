@@ -768,20 +768,34 @@ impl Client {
 }
 
 async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), ClientError> {
-    ConnectedFut { shared }.await
+    ConnectedFut {
+        shared,
+        helper: None,
+    }
+    .await
 }
 
 /// Future that resolves once the state machine reports `HandshakeState::Connected` (or fails if
 /// it transitions to `Failed`/`Closed` before that).
 struct ConnectedFut {
     shared: Arc<ConnectionShared>,
+    helper: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ConnectedFut {
+    fn drop(&mut self) {
+        if let Some(h) = self.helper.take() {
+            h.abort();
+        }
+    }
 }
 
 impl Future for ConnectedFut {
     type Output = Result<(), ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.shared.inner.lock();
+        let this = self.get_mut();
+        let mut conn = this.shared.inner.lock();
         // Drain events, looking for Connected. We don't care about the others at this stage.
         while let Some(ev) = conn.poll_event() {
             match ev {
@@ -804,13 +818,19 @@ impl Future for ConnectedFut {
             HandshakeState::Closed => Poll::Ready(Err(ClientError::Closed)),
             _ => {
                 // Park on the driver waker — it fires after every inbound packet.
+                // Abort any prior helper so a stale `notified()` waiter from an
+                // earlier poll can't swallow a `notify_one` permit intended for
+                // the driver loop.
                 drop(conn);
+                if let Some(prev) = this.helper.take() {
+                    prev.abort();
+                }
                 let waker = cx.waker().clone();
-                let shared = self.shared.clone();
-                tokio::spawn(async move {
+                let shared = this.shared.clone();
+                this.helper = Some(tokio::spawn(async move {
                     shared.driver_waker.notified().await;
                     waker.wake();
-                });
+                }));
                 Poll::Pending
             }
         }
@@ -845,6 +865,7 @@ async fn wait_producer_ready(
     EventWaitFut {
         shared: shared.clone(),
         matcher: EventMatcher::ProducerReady(handle),
+        helper: None,
     }
     .await
 }
@@ -856,6 +877,7 @@ pub(crate) async fn wait_subscribe_acked(
     EventWaitFut {
         shared: shared.clone(),
         matcher: EventMatcher::SubscribeAcked(handle),
+        helper: None,
     }
     .await
 }
@@ -866,35 +888,53 @@ enum EventMatcher {
     SubscribeAcked(magnetar_proto::ConsumerHandle),
 }
 
+/// Each `Pending` return spawns a helper that awaits `driver_waker.notified()`
+/// and wakes the caller; on the next poll (or on drop) the previous helper is
+/// aborted. Without that abort, the stale helper from an earlier poll keeps
+/// waiting on `driver_waker.notified()` and competes with the driver loop for
+/// the `notify_one` permits that user-facing futures emit after enqueueing
+/// outbound work — when the helper wins the race, the freshly-queued frame
+/// (e.g. the post-subscribe FLOW) sits in `outbound` and the driver stays
+/// parked, deterministically hanging the next `receive()`.
 struct EventWaitFut {
     shared: Arc<ConnectionShared>,
     matcher: EventMatcher,
+    helper: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for EventWaitFut {
+    fn drop(&mut self) {
+        if let Some(h) = self.helper.take() {
+            h.abort();
+        }
+    }
 }
 
 impl Future for EventWaitFut {
     type Output = Result<(), ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.shared.inner.lock();
+        let this = self.get_mut();
+        let mut conn = this.shared.inner.lock();
         // Inspect both events and the outcome slab.
         loop {
             match conn.poll_event() {
                 Some(ConnectionEvent::ProducerReady { handle, .. }) => {
-                    if let EventMatcher::ProducerReady(h) = self.matcher {
+                    if let EventMatcher::ProducerReady(h) = this.matcher {
                         if h == handle {
                             return Poll::Ready(Ok(()));
                         }
                     }
                 }
                 Some(ConnectionEvent::SubscribeAcked { handle }) => {
-                    if let EventMatcher::SubscribeAcked(h) = self.matcher {
+                    if let EventMatcher::SubscribeAcked(h) = this.matcher {
                         if h == handle {
                             return Poll::Ready(Ok(()));
                         }
                     }
                 }
                 Some(ConnectionEvent::ProducerClosedByBroker { handle, .. }) => {
-                    if let EventMatcher::ProducerReady(h) = self.matcher {
+                    if let EventMatcher::ProducerReady(h) = this.matcher {
                         if h == handle {
                             return Poll::Ready(Err(ClientError::Closed));
                         }
@@ -905,14 +945,14 @@ impl Future for EventWaitFut {
                     code,
                     message,
                 }) => {
-                    if let EventMatcher::ProducerReady(h) = self.matcher {
+                    if let EventMatcher::ProducerReady(h) = this.matcher {
                         if h == handle {
                             return Poll::Ready(Err(ClientError::Broker { code, message }));
                         }
                     }
                 }
                 Some(ConnectionEvent::ConsumerClosedByBroker { handle, .. }) => {
-                    if let EventMatcher::SubscribeAcked(h) = self.matcher {
+                    if let EventMatcher::SubscribeAcked(h) = this.matcher {
                         if h == handle {
                             return Poll::Ready(Err(ClientError::Closed));
                         }
@@ -923,7 +963,7 @@ impl Future for EventWaitFut {
                     code,
                     message,
                 }) => {
-                    if let EventMatcher::SubscribeAcked(h) = self.matcher {
+                    if let EventMatcher::SubscribeAcked(h) = this.matcher {
                         if h == handle {
                             return Poll::Ready(Err(ClientError::Broker { code, message }));
                         }
@@ -947,12 +987,19 @@ impl Future for EventWaitFut {
 
         drop(conn);
 
+        // Abort the prior helper (if any) before spawning a new one. Otherwise the
+        // stale helper from an earlier poll lingers on `driver_waker.notified()`
+        // and competes with the driver itself for `notify_one` permits emitted by
+        // user-facing futures (post-subscribe FLOW being the classic case).
+        if let Some(prev) = this.helper.take() {
+            prev.abort();
+        }
         let waker = cx.waker().clone();
-        let shared = self.shared.clone();
-        tokio::spawn(async move {
+        let shared = this.shared.clone();
+        this.helper = Some(tokio::spawn(async move {
             shared.driver_waker.notified().await;
             waker.wake();
-        });
+        }));
         Poll::Pending
     }
 }

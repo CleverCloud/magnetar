@@ -754,25 +754,42 @@ impl Future for RequestFut {
 /// slot, because the broker emits `CommandProducerSuccess` separately
 /// from any request-correlated outcome — the sans-io layer surfaces it
 /// as `ProducerReady`.
+///
+/// Each `Pending` return spawns a helper that awaits
+/// `driver_waker.notified()` and wakes the caller; on the next poll (or
+/// on drop) the previous helper is aborted. Without that abort, the
+/// stale helper from an earlier poll lingers on
+/// `driver_waker.notified()` and competes with the driver loop for
+/// `notify_one` permits emitted by user-facing futures.
 struct ProducerReadyFut {
     shared: Arc<ConnectionShared>,
     handle: ProducerHandle,
+    helper: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ProducerReadyFut {
+    fn drop(&mut self) {
+        if let Some(h) = self.helper.take() {
+            h.abort();
+        }
+    }
 }
 
 impl Future for ProducerReadyFut {
     type Output = Result<(), ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.shared.inner.lock();
+        let this = self.get_mut();
+        let mut conn = this.shared.inner.lock();
         loop {
             match conn.poll_event() {
                 Some(ConnectionEvent::ProducerReady { handle, .. }) => {
-                    if handle == self.handle {
+                    if handle == this.handle {
                         return Poll::Ready(Ok(()));
                     }
                 }
                 Some(ConnectionEvent::ProducerClosedByBroker { handle, .. }) => {
-                    if handle == self.handle {
+                    if handle == this.handle {
                         return Poll::Ready(Err(ClientError::Closed));
                     }
                 }
@@ -781,7 +798,7 @@ impl Future for ProducerReadyFut {
                     code,
                     message,
                 }) => {
-                    if handle == self.handle {
+                    if handle == this.handle {
                         return Poll::Ready(Err(ClientError::Broker { code, message }));
                     }
                 }
@@ -799,16 +816,16 @@ impl Future for ProducerReadyFut {
         // We have no per-event waker slot in the sans-io layer; park on the
         // driver waker. Every inbound batch ends with the driver looping
         // back to `select!`, which gives any pending `notified()` a chance
-        // to fire as the next loop tick. Mirrors the tokio engine's
-        // `EventWaitFut` (spawned helper) but without spawning — the await
-        // happens inline because moonpool needs to remain `Send`-compatible
-        // across simulators that may run on a single thread.
+        // to fire as the next loop tick.
+        if let Some(prev) = this.helper.take() {
+            prev.abort();
+        }
         let waker = cx.waker().clone();
-        let shared = self.shared.clone();
-        tokio::spawn(async move {
+        let shared = this.shared.clone();
+        this.helper = Some(tokio::spawn(async move {
             shared.driver_waker.notified().await;
             waker.wake();
-        });
+        }));
         Poll::Pending
     }
 }
@@ -820,6 +837,7 @@ async fn wait_producer_ready(
     ProducerReadyFut {
         shared: shared.clone(),
         handle,
+        helper: None,
     }
     .await
 }

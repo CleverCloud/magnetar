@@ -1033,6 +1033,7 @@ impl<P: Providers> Client<P> {
         SubscribeAckedFut {
             shared: shared.clone(),
             handle,
+            helper: None,
         }
         .await?;
 
@@ -1153,36 +1154,53 @@ impl Future for ReceiveFut {
 /// given [`ConsumerHandle`]. Drains `ConnectionEvent`s from the queue looking
 /// for [`ConnectionEvent::SubscribeAcked`].
 ///
-/// Parking shape mirrors the tokio engine's `EventWaitFut`: a spawned
-/// helper awaits `driver_waker.notified()` and wakes our task when the
-/// driver next signals. The earlier inline `enable()` pattern raced with
-/// `notify_waiters()` (the `Notified` was dropped before any waker was
-/// stored), which deterministically hung whenever the broker's `Success`
-/// reply arrived after the future's first poll.
+/// Parking shape: each `Pending` return spawns a helper that awaits
+/// `driver_waker.notified()` and wakes the caller. The previous inline
+/// `enable()` pattern raced with `notify_waiters()` (the `Notified` was
+/// dropped before any waker was stored), which deterministically hung
+/// whenever the broker's `Success` reply arrived after the future's first
+/// poll. The spawned helper closes that race because its `Notified` future
+/// stays alive — but only one helper at a time. We track the current helper
+/// in `helper` and abort the previous one on every re-poll (and on drop)
+/// so a stale helper from an earlier poll can't steal a `notify_one`
+/// permit that the user intended for the driver loop. Without that abort
+/// the post-`SubscribeAcked` `initial_flow + flow + notify_one` sequence
+/// could race the dead helper to the permit, leaving the freshly-queued
+/// FLOW frame sitting in `outbound` while the driver stayed parked.
 struct SubscribeAckedFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
+    helper: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SubscribeAckedFut {
+    fn drop(&mut self) {
+        if let Some(h) = self.helper.take() {
+            h.abort();
+        }
+    }
 }
 
 impl Future for SubscribeAckedFut {
     type Output = Result<(), ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
         // Fast-path: if the consumer is already registered as "ready" (i.e.
         // `consumer_is_closed` is false and the consumer state exists), we
         // can return immediately. The protocol layer marks the state alive
         // synchronously inside `subscribe()`, so the SubscribeAcked event is
         // really only needed to wait for the broker's CommandSuccess.
         {
-            let mut conn = self.shared.inner.lock();
+            let mut conn = this.shared.inner.lock();
             // Inspect events looking for our SubscribeAcked.
             loop {
                 match conn.poll_event() {
-                    Some(ConnectionEvent::SubscribeAcked { handle }) if handle == self.handle => {
+                    Some(ConnectionEvent::SubscribeAcked { handle }) if handle == this.handle => {
                         return Poll::Ready(Ok(()));
                     }
                     Some(ConnectionEvent::ConsumerClosedByBroker { handle, .. })
-                        if handle == self.handle =>
+                        if handle == this.handle =>
                     {
                         return Poll::Ready(Err(ClientError::Closed));
                     }
@@ -1190,18 +1208,18 @@ impl Future for SubscribeAckedFut {
                         handle,
                         code,
                         message,
-                    }) if handle == self.handle => {
+                    }) if handle == this.handle => {
                         return Poll::Ready(Err(ClientError::Broker { code, message }));
                     }
                     Some(ConnectionEvent::TopicListChanged { added, removed }) => {
                         // Forward to the per-client buffer + waker so we don't
                         // accidentally swallow a PIP-145 delta while waiting
                         // for a subscribe ack.
-                        self.shared
+                        this.shared
                             .topic_list_changes
                             .lock()
                             .push_back(TopicListChange { added, removed });
-                        self.shared.topic_list_notify.notify_waiters();
+                        this.shared.topic_list_notify.notify_waiters();
                     }
                     Some(ConnectionEvent::Closed { reason }) => {
                         return Poll::Ready(Err(ClientError::Other(
@@ -1219,23 +1237,19 @@ impl Future for SubscribeAckedFut {
         }
 
         // Park on the driver wakeup. The driver notifies after any inbound
-        // bytes are processed.
-        //
-        // The previous shape used a stack-pinned `Notified` future with
-        // `enable()`, but `enable()` only consumes a queued permit — it
-        // does not register a waker. The `Notified` was then dropped at
-        // the end of `poll`, so a subsequent `notify_waiters()` (the
-        // driver's "bytes processed" signal) had no one to wake and the
-        // subscribe hung whenever the broker's `Success` reply lost the
-        // race with this future's first poll. Mirror the tokio engine's
-        // [`EventWaitFut`]: spawn a helper that awaits `notified().await`
-        // and wakes the caller's waker when the driver next signals.
+        // bytes are processed. Abort any prior helper before spawning a new
+        // one — otherwise the stale helper from an earlier poll lingers on
+        // `driver_waker.notified()` and competes with the driver itself for
+        // `notify_one` permits emitted by user-facing futures.
+        if let Some(prev) = this.helper.take() {
+            prev.abort();
+        }
         let waker = cx.waker().clone();
-        let shared = self.shared.clone();
-        tokio::spawn(async move {
+        let shared = this.shared.clone();
+        this.helper = Some(tokio::spawn(async move {
             shared.driver_waker.notified().await;
             waker.wake();
-        });
+        }));
         Poll::Pending
     }
 }
@@ -1598,6 +1612,7 @@ mod tests {
         let fut = super::SubscribeAckedFut {
             shared: shared.clone(),
             handle,
+            helper: None,
         };
         let res = tokio::time::timeout(Duration::from_secs(2), fut)
             .await

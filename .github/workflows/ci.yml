@@ -178,6 +178,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `prost-build` (xtask codegen) shells out to `protoc`. The other
+      # workspace jobs rely on `cargo build`-time vendored bins via
+      # `protobuf-src` (transitive through `prost-build`'s build deps),
+      # but the standalone xtask invocation expects `protoc` on PATH.
+      - name: Install protoc (for prost-build via xtask codegen)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo run --manifest-path xtask/Cargo.toml -- codegen --check
 
   # NOTE: the moonpool deterministic-simulation seed sweep lives in its

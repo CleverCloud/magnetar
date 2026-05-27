@@ -22,7 +22,14 @@
 //!
 //! [`CryptoProvider`]: rustls::crypto::CryptoProvider
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
+#[cfg(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+))]
+use std::sync::Once;
 
 use rustls::crypto::CryptoProvider;
 

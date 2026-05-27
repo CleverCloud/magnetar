@@ -20,6 +20,15 @@ workspace = true
 # propagates exactly one of these via `dep?/feature` — under
 # `--all-features` the cfg cascade in `src/tls_crypto.rs` picks
 # aws-lc-rs (highest priority). `rustls/fips` implies `aws_lc_rs`.
+#
+# A default crypto provider is set so the crate compiles cleanly when built
+# directly as a workspace member (e.g. `cargo build --workspace` or the e2e
+# job's `cargo test --workspace --features e2e,…`). The magnetar facade picks
+# the provider via its own `crypto-*` features (which propagate through
+# `magnetar-runtime-tokio?/crypto-*`); the per-provider build matrix in
+# `cargo xtask check-crypto-matrix` continues to gate each provider in
+# isolation through the facade with `--no-default-features`.
+default = ["crypto-aws-lc-rs"]
 crypto-aws-lc-rs = ["rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs"]
 crypto-ring      = ["rustls/ring",      "tokio-rustls/ring"]
 crypto-fips      = ["rustls/fips"]
