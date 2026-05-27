@@ -35,14 +35,10 @@ prefixed sub-crates stay readable.
 
 - Every doc reference using `quasar*` is now wrong and gets rewritten in the
   same change-set as the rename.
-- The original ask-skill transcripts in `~/.claude/plans/` still mention
-  `quasar-pulsar` historically; the promoted `docs/research.md` etc. preserve
-  that wording as a record of the pre-decision reality.
 - Memory in `~/.claude/projects/-home-florentin-Sources-github-com-me-quasar/`
   retains the old directory id because Claude's memory store is keyed on the
   original path. That's harmless.
 
 ## References
 
-- [`docs/decisions-log.md` §"Project identity"](../../docs/decisions-log.md)
-- [`docs/research.md`](../../docs/research.md) (crate name landscape)
+- [`README.md`](../../README.md) (current project identity).

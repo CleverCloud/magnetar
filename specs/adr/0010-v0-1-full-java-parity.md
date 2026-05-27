@@ -57,8 +57,9 @@ Florentin's signoff (2026-05-20) chose **full parity at v0.1**.
 
 ## Consequences
 
-- The implementation timeline is multi-month (10 milestones M0–M9, see
-  [`docs/implementation-plan.md` §0](../../docs/implementation-plan.md)).
+- The implementation timeline is multi-month, tracked via the parity
+  matrix in [`README.md`](../../README.md) and the per-feature status in
+  [`docs/parity-status.md`](../../docs/parity-status.md).
 - The parity matrix in `README.md` is the merge-gate document — a row going
   from ❌ → ✅ requires an accompanying test (unit + ideally e2e).
 - A v0.1.0 release-cut decision becomes "the parity matrix is all ✅ or
@@ -67,9 +68,8 @@ Florentin's signoff (2026-05-20) chose **full parity at v0.1**.
 
 ## References
 
-- [`docs/decisions-log.md` §"v0.1.0 scope"](../../docs/decisions-log.md)
-- [`docs/research.md`](../../docs/research.md) (Java client surface enumeration)
-- [`docs/audit.md`](../../docs/audit.md) §D (the questions that prompted this decision)
 - [`README.md` §"Java client parity matrix"](../../README.md)
 - [`README.md` §"Supported PIPs"](../../README.md)
+- [`docs/parity-status.md`](../../docs/parity-status.md) — per-feature
+  status snapshot
 - [ADR-0009 Pulsar 4 minimum](0009-pulsar-4-minimum.md)

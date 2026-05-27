@@ -61,7 +61,8 @@ For the moonpool engine the byte-pipe adapter lives at
 
 ## References
 
-- [`docs/decisions-log.md` §"Architecture: no channels"](../../docs/decisions-log.md) (lists rustls as the sole TLS backend)
 - [`GUIDELINES.md` §"TLS"](../../GUIDELINES.md)
 - [ADR-0006 moonpool TLS](0006-moonpool-tls-byte-pipe.md)
+- [ADR-0035 pluggable crypto provider](0035-pluggable-crypto-provider.md)
+  (amendment carving out `rustls-openssl` for the `crypto-openssl` feature)
 - `deny.toml` — `[bans] deny` entries for native-tls/openssl

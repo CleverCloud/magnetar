@@ -109,8 +109,25 @@ pub use crate::url_parse::{ParsedUrl, Scheme};
 ///
 /// Cheap to share via `Arc`. The mutex is `parking_lot::Mutex` (not async), held only for the
 /// duration of a sans-io call (no `.await` inside the critical section).
+///
+/// # Lock-ordering invariant (ADR-0038)
+///
+/// `ConnectionShared.inner` guards connection-wide state (frame buffers,
+/// handshake, pending requests, the events / outcomes / wakers slabs, the
+/// handle registry). Per-handle hot state lives behind its own
+/// `parking_lot::Mutex` on [`magnetar_proto::ProducerSlot`] /
+/// [`magnetar_proto::ConsumerSlot`]. Acquisition order is strictly **global
+/// (`inner`) → per-slot (`slot.state`), never the reverse** — a holder of
+/// `slot.state.lock()` MUST release the slot lock before taking `inner.lock()`.
+/// The producer-send hot path skips the global lock entirely via
+/// [`magnetar_proto::ProducerSlot::queue_send`]; the driver merges
+/// per-slot staged frames into the connection-wide buffer through
+/// `Connection::poll_transmit` (which calls `drain_producer_outbound`
+/// internally). See [ADR-0038](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0038-split-connection-mutex.md).
 pub struct ConnectionShared {
-    /// The sans-io state machine, guarded by a non-async mutex.
+    /// The sans-io state machine, guarded by a non-async mutex. See the
+    /// type-level docs above for the lock-ordering invariant against the
+    /// per-slot mutexes.
     pub inner: Mutex<magnetar_proto::Connection>,
     /// Single-cell wakeup for the driver loop. Not a channel.
     pub driver_waker: Notify,

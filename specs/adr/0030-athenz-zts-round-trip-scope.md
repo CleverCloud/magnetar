@@ -115,8 +115,8 @@ boundary.
   v0.2.0 implements **N-Token only** (tenant private key path).
   SVC-Token (the Athenz-issued service-identity token) requires
   ZMS-side provisioning, an `instance_id` claim, and the
-  `Athenz-Service-Auth` header semantics — out of scope. Documented
-  in `docs/auth-athenz.md`.
+  `Athenz-Service-Auth` header semantics — out of scope (deferred to
+  v0.3.0+).
 
 ## Consequences
 

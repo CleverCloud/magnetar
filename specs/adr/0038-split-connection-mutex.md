@@ -10,8 +10,9 @@
 Until this change, every operation on a `magnetar::PulsarClient` went
 through one `parking_lot::Mutex<magnetar_proto::Connection>` held in
 `ConnectionShared.inner` (see `magnetar-runtime-tokio/src/lib.rs` and
-`magnetar-runtime-moonpool/src/lib.rs`). The 2026-05-27 audit
-([`docs/audit-2026-05-27.md`] — codex P1) measured ~290 lock
+`magnetar-runtime-moonpool/src/lib.rs`). The 2026-05-27 multi-agent
+code audit (codex P1 finding; the audit narrative is preserved in the
+`docs/follow-ups.md` "Audit 2026-05-27" section) measured ~290 lock
 acquisition sites in the workspace that funnelled through this one
 mutex: every `producer.send`, every `consumer.next`, every ack, every
 stats read, plus the driver loop.
@@ -177,7 +178,8 @@ and `refactor/split-connection-mutex-p2`:
 
 ## References
 
-- `docs/audit-2026-05-27.md` — codex P1 audit finding.
+- [`docs/follow-ups.md` "Audit 2026-05-27"](../../docs/follow-ups.md) —
+  the codex P1 finding that triggered this refactor.
 - `crates/magnetar-proto/src/{producer,consumer}.rs` — `ProducerSlot` /
   `ConsumerSlot` types and the lock-ordering documentation.
 - `crates/magnetar-proto/src/conn.rs::drain_producer_outbound` — the
@@ -202,5 +204,3 @@ and `refactor/split-connection-mutex-p2`:
   — preserves D-series compound-operation semantics.
 - [ADR-0028 — supervised reconnect anti-thrash policy](0028-supervised-reconnect-anti-thrash-policy.md)
   — `rebuild_producers` / `rebuild_consumers` still walks every slot.
-
-[`docs/audit-2026-05-27.md`]: ../../docs/audit-2026-05-27.md

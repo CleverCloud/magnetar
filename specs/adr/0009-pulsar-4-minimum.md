@@ -41,7 +41,6 @@ Pulsar 4 will be the deploying-Pulsar default.
 
 ## References
 
-- [`docs/decisions-log.md` §"Pulsar 4.0 baseline"](../../docs/decisions-log.md)
 - [`README.md` §"Supported broker versions"](../../README.md)
-- [`docs/implementation-plan.md` §0 executive summary](../../docs/implementation-plan.md)
+- [`docs/parity-status.md`](../../docs/parity-status.md)
 - `crates/magnetar/tests/e2e_pulsar.rs` — image pin (`apachepulsar/pulsar:4.0.4`)

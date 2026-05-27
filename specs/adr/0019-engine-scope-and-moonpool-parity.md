@@ -47,16 +47,13 @@ Concretely:
    `magnetar-runtime-tokio`.
 2. Moonpool gaps relative to tokio are tracked in
    [`docs/parity-status.md`](../../docs/parity-status.md) under
-   "Moonpool parity train" (added in this changeset) and in
-   [`docs/implementation-plan.md`](../../docs/implementation-plan.md)
-   milestones M5–M8.
+   "Moonpool parity train" (added in this changeset).
 3. ADR-0010 is **clarified, not weakened**: "full Java parity" still
    holds for the v0.1.0 release; the qualifier is "as exposed by
-   `PulsarClient<TokioEngine>`". The moonpool engine remains a
-   *test-only* deterministic-simulation surface until M6 lifts the
-   façade layer onto an `Engine` trait
-   ([Phase 2 M6](../../tasks/todo.md), gate (e)). M6 landed on
-   2026-05-22: the façade now ships `PulsarClient<E: Engine = TokioEngine>`
+   `PulsarClient<TokioEngine>`". The moonpool engine remained a
+   *test-only* deterministic-simulation surface until the façade was
+   lifted onto an `Engine` trait. That lift landed on 2026-05-22:
+   the façade now ships `PulsarClient<E: Engine = TokioEngine>`
    with a moonpool branch that re-exports the engine's shared-state and
    driver-handle plumbing without lifting the producer / consumer
    surface (that is the M7–M8 work). When dual-engine parity is reached,

@@ -282,6 +282,17 @@ SendError>>`. The "channel" is the slab entry; the "send" is the state
 machine populating it; the "receive" is the future polling it. No
 backpressure surface, no orphaned senders, no `Drop` glue.
 
+The diagram above shows the *outcome* side — the path the
+broker-response → future-wake takes through the global `inner` lock.
+The *send* side has been lifted off that global lock per
+[ADR-0038](specs/adr/0038-split-connection-mutex.md):
+`Producer::send` calls `magnetar_proto::ProducerSlot::queue_send`
+(per-slot mutex only), and the driver merges per-slot staged frames
+into the connection-wide outbound buffer through
+`Connection::poll_transmit` on its next tick. The lock-ordering rule
+**global → per-slot, never the reverse** is documented in the
+"Concurrency primitives" table above.
+
 The driver-to-driver communication path is *also* not a channel — it is a
 single-cell `tokio::sync::Notify` (the driver wakes on
 `shared.driver_waker.notified()`). `Notify` is permitted because it has no
@@ -339,6 +350,97 @@ buffer under the global lock via `poll_transmit`
 (`drain_producer_outbound`). The reconnect rebuild path
 (`Connection::rebuild_producers` / `rebuild_consumers`) takes the
 global lock and each per-slot lock in canonical order.
+
+#### Schema — state layout (where each field lives)
+
+```text
+                       Arc<ConnectionShared>            (cheap clone)
+                       ─────────────────────
+                                │
+                                │  inner: parking_lot::Mutex<Connection>   ←──── global mutex
+                                ▼
+       ┌──────────────────────────────────────────────────────────────────────┐
+       │  Connection                                                          │
+       │  ─────────                                                           │
+       │   • state (HandshakeState)                                           │
+       │   • inbound / outbound: BytesMut         (connection-wide buffers)   │
+       │   • events: VecDeque<ConnectionEvent>                                │
+       │   • outcomes / wakers slabs               (PendingOpKey → ...)       │
+       │   • pending_requests: HashMap<RequestId, Kind>                       │
+       │   • producers: HashMap<ProducerHandle, Arc<ProducerSlot>> ─────┐     │
+       │   • consumers: HashMap<ConsumerHandle, Arc<ConsumerSlot>> ─┐   │     │
+       └────────────────────────────────────────────────────────────┼───┼─────┘
+                                                                    │   │
+                          Arc clone (also held on Consumer/Producer ┘   │
+                           runtime handle, cloned at create-time)       │
+                                                                        │
+                                                                        ▼
+        ┌─────────────────────────────────────┐    ┌─────────────────────────────────────┐
+        │  ProducerSlot                       │    │  ConsumerSlot                       │
+        │  ────────────                       │    │  ────────────                       │
+        │   identity: ProducerIdentity        │    │   identity: ConsumerIdentity        │
+        │     (frozen — lock-free read)       │    │     (frozen — lock-free read)       │
+        │     ─ handle, topic, access_mode    │    │     ─ handle, topic, subscription   │
+        │                                     │    │                                     │
+        │   state: parking_lot::Mutex<…>  ←── │    │   state: parking_lot::Mutex<…>  ←── │ per-slot mutex
+        │     ─ pending: VecDeque<OpSend>     │    │     ─ queue: VecDeque<…>            │
+        │     ─ batch: BatchContainer         │    │     ─ receive_wakers: Slab<Waker>   │
+        │     ─ outbound: VecDeque<Frame>     │    │     ─ available_permits, ack_tracker│
+        │     ─ name, epoch, stats, ...       │    │     ─ paused, reached_end_of_topic  │
+        └─────────────────────────────────────┘    └─────────────────────────────────────┘
+```
+
+#### Schema — producer-send hot path (lock-free w.r.t. the global mutex)
+
+```text
+   Producer::send                                         driver task
+   ──────────────                                         ───────────
+
+       │ slot.queue_send(msg, publish_time_ms, now)
+       │   takes  ──►  slot.state.lock()
+       │   work:  ──►   • assigns SequenceId
+       │                • appends to state.pending
+       │                • stages frame in state.outbound
+       │   drops  ──►  slot.state.lock()
+       │
+       │ shared.driver_waker.notify_one()  ──notify──►   ◯ wakes
+       │                                                  │
+       ▼                                                  ▼
+   returns SendFut                                  takes  ──►  inner.lock()
+   (futures wait on the                             work :  ──►   conn.poll_transmit()
+    per-op Waker slab inside                                       └─ drain_producer_outbound():
+    Connection — drained                                              for each slot:
+    when broker replies)                                                slot.state.lock()        ← briefly,
+                                                                        drain state.outbound       global
+                                                                          into conn.outbound       lock held
+                                                                        drop slot.state.lock()
+                                                                       returns Bytes
+                                                  drops ──►  inner.lock()
+                                                  socket.write_all(&out)
+```
+
+The "no global lock on send" is the headline win: two producers on
+the same connection contend only on their own per-slot mutexes when
+each calls `Producer::send` from a different task.
+
+#### Schema — lock-ordering rule (legal vs forbidden)
+
+```text
+LEGAL (global → per-slot)                FORBIDDEN (per-slot → global)
+─────────────────────────                ─────────────────────────────
+                                                          ✗
+let mut conn = inner.lock();             let mut state = slot.state.lock();
+let slot = conn.producer(h).cloned();    let mut conn = inner.lock();   ← DEADLOCK
+drop(conn);                              //   thread A: holds slot.state, waits for inner
+let mut state = slot.state.lock();       //   thread B: holds inner,     waits for slot.state
+// ... per-slot work ...                 //
+drop(state);                             // Wrong-order acquisition under
+                                         // contention -> cyclic wait.
+```
+
+The contract is enforced by code review + the
+`lock_ordering_global_then_per_slot_does_not_deadlock` smoke test in
+[`crates/magnetar-proto/tests/slot_hot_path.rs`](crates/magnetar-proto/tests/slot_hot_path.rs).
 
 ---
 

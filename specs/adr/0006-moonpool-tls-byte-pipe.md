@@ -13,7 +13,7 @@ AsyncWrite` socket — it has a byte pipe with its own `Providers::Network`
 abstractions. We can't drop `tokio-rustls` in front of that — `tokio-rustls`
 assumes a `tokio` `AsyncRead + AsyncWrite`.
 
-Four options were considered (in [`docs/research.md`](../../docs/research.md)):
+Four options were considered:
 
 - **(a)** skip TLS in the moonpool engine — punt TLS handshake testing
   entirely.
@@ -57,8 +57,7 @@ byte queues, no async runtime needed.
 
 ## References
 
-- [`docs/research.md`](../../docs/research.md) §"moonpool TLS options"
-- [`docs/decisions-log.md` §"moonpool TLS strategy (option d)"](../../docs/decisions-log.md)
 - [`ARCHITECTURE.md` §"TLS sites"](../../ARCHITECTURE.md)
+- [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md) (TLS adapter walkthrough)
 - `crates/magnetar-runtime-moonpool/src/tls.rs`
 - [ADR-0005 rustls-only](0005-rustls-only-tls.md)

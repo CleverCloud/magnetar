@@ -20,100 +20,31 @@ explicitly out of scope for v0.2.0 ([ADR-0026](../specs/adr/0026-design-decision
 
 ---
 
-## Audit 2026-05-27 — multi-agent code audit
+## Audit 2026-05-27 — open items
 
-Authored by Claude (engineering-manager mode) paired with codex
-(gpt-5.5). Eight agents (seven Claude subagents + one codex run)
-audited the codebase in parallel across eight dimensions: invariant
-conformance, sans-io syscall boundary, zero-copy in hot paths,
-security, lock contention and allocations, syscall reduction,
-simplification, and an independent codex second opinion. Findings
-are `path:line`-verifiable; tags: **[codex]** = codex-only catch,
-**[Δ]** = auditor disagreement with documented resolution.
+The 2026-05-27 multi-agent code audit (eight parallel agents, seven
+Claude + one codex run) shipped its correctness, performance, and
+sans-io fixes in `fix/audit-p0-findings` (commits `1644cb7`,
+`bf66a5b`, `710241d`, `2727f49`, `a31dcaa`, `1ded2f3`, `7f2faee`,
+`7ca836e`). The Sub-mutex split for the global Connection mutex
+landed separately in [ADR-0038](../specs/adr/0038-split-connection-mutex.md).
 
-### Resolved — correctness + performance fixes
-
-All audit-flagged correctness and hot-path performance bugs landed
-on `fix/audit-p0-findings`.
-
-- **Receive-path event amplification** [codex] —
-  `ConsumerState::classify_and_queue` returned
-  `count: self.queue.len()` instead of newly-appended count →
-  O(n²) `ConnectionEvent::Message` allocations + `IncomingMessage`
-  clones for n queued messages without an interleaved `pop_message`.
-  Commit `1644cb7` returns `count: 1` on the single-append path;
-  the batched-delivery loop already had its own counter.
-
-- **Full-buffer copy per frame in `handle_bytes`** [codex] —
-  `Connection::handle_bytes` did
-  `Bytes::copy_from_slice(&self.inbound)` at the top of every
-  decode iteration → full-buffer memcpy per frame. Commit `bf66a5b`
-  introduces `frame::peek_full_frame_len(&BytesMut)` and switches
-  `handle_bytes` to `inbound.split_to(full_len).freeze()` — O(1)
-  ownership transfer, no copy.
-
-- **Full-outbound copy in `poll_transmit`** [codex] —
-  `Connection::poll_transmit(&mut Vec<u8>)` did
-  `buf.extend_from_slice(&self.outbound); self.outbound.clear()` →
-  full-outbound memcpy per flush. Commit `710241d` changes the
-  signature to `-> Bytes` via
-  `mem::take(&mut self.outbound).freeze()`. Updated ~20 callers
-  across both runtimes + differential tests.
-
-- **`TokenAuth::read_token_file` proto-layer `fs::read`** —
-  Violated ADR-0004 (zero I/O deps). Commit `2727f49` drops
-  `std::fs`/`std::path` from `crates/magnetar-proto/src/auth/`,
-  replaces `TokenSource::File(PathBuf)` with
-  `TokenSource::Supplier(Arc<TokenSupplier>)`, and moves file-backed
-  convenience to `magnetar_runtime_tokio::file_token_auth(path)` in
-  the new `crates/magnetar-runtime-tokio/src/auth_file.rs`. The
-  byte-trimming + eager-path-validation contract is preserved by the
-  runtime wrapper.
-
-- **Moonpool wall-clock default fell through to host
-  `SystemTime::now`** [Δ codex strict; xtask blind-spot] —
-  `Connection::new` defaulted `wall_clock` to host clock; neither
-  runtime overrode it, so moonpool's `handle_timeout` batch-publish
-  stamping read the host clock and broke ADR-0019 determinism.
-  Commit `a31dcaa` (followed by `1ded2f3` clippy polish) wires an
-  `Arc<AtomicU64>` bridge on `ConnectionShared`: the driver loop
-  ticks `wall_clock_ms` from `providers.time().now()` each
-  iteration; the proto-layer closure reads the atomic and returns
-  `UNIX_EPOCH + Duration::from_millis(load)`. The bridge sidesteps
-  the structural `!Send + !Sync` of `SimTimeProvider` (which holds
-  `Weak<RefCell<world::SimInner>>`) — the atomic is trivially
-  `Send + Sync` regardless of the underlying provider.
-  Deterministic-sim callers can pin `DETERMINISTIC_SIM_EPOCH_MS`
-  via `ConnectionShared::with_auth_and_wall_clock_base`.
-
-- **Façade `deliver_after_ms` reading host clock in code generic
-  over `E: Engine`** — Commit `7f2faee` adds
-  `deliver_after_ms_from(now_ms, delay_ms)` (also on
-  `MessageBuilder` and `TypedMessageBuilder`) so moonpool-deterministic
-  callers can pass their virtual-clock reading; the existing
-  `deliver_after_ms` keeps the host-clock convenience for tokio
-  callers and now carries an explicit determinism warning in
-  rustdoc.
-
-Companion atomic-conversion sweep (commit `7ca836e`) replaced every
-production `Arc<Mutex<{u32|u64|usize|bool}>>` with the matching
-`Arc<Atomic*>`: `auto_cluster_failover::active`, the partition-watcher
-`observed_partitions` / `change_count` on `multi_topics`,
-`partitioned_producer`, `table_view`, and round-robin selector
-cursors in the same crates.
+What remains open from that audit — bucketed by category — is below.
+Findings are `path:line`-verifiable; tags: **[codex]** = codex-only
+catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — sans-io / determinism
 
-- **`crates/magnetar/src/client.rs:1223`** —
-  `ClientBuilder::tls_trust_certs_file_path` calls `std::fs::read`
-  from the generic façade. Move file-reading behind
-  `impl PulsarClient<TokioEngine>`; the generic builder should keep
-  only `tls_trust_certs_pem(Vec<u8>)`.
-- **`crates/magnetar/src/client.rs:1898`, `table_view.rs:506`** —
+- **`crates/magnetar/src/client.rs::ClientBuilder::tls_trust_certs_file_path`** —
+  calls `std::fs::read` from the generic façade. Move file-reading
+  behind `impl PulsarClient<TokioEngine>`; the generic builder should
+  keep only `tls_trust_certs_pem(Vec<u8>)`.
+- **`crates/magnetar/src/client.rs` (`Reader` subscription naming) +
+  `crates/magnetar/src/table_view.rs`** —
   `Uuid::new_v4()` for default subscription names in the façade.
   Inject a random/id provider via Engine, or require explicit
   subscription names for `MoonpoolEngine`.
-- **`crates/magnetar-auth-oauth2/src/lib.rs:179`** —
+- **`crates/magnetar-auth-oauth2/src/lib.rs::SystemClock`** —
   `SystemClock::now()` is the production default for OAuth2's
   `Clock` trait; the same crate provides a `VirtualClock` in tests.
   Wire a `Clock` provider through the engine so the production path
@@ -121,11 +52,12 @@ cursors in the same crates.
 - **`Connection::new(wall_clock)` explicit-injection refactor**
   (follow-on to the moonpool wall-clock bridge already landed).
   Currently the `wall_clock_base_ms` flows through
-  `ConnectionShared`, but `Connection::new` itself still has a
-  `SystemTime::now` default. ~45 in-tree call sites, mostly proto
-  tests. Forces every caller to make an explicit clock choice and
-  lets `xtask check-no-internal-clock` validate the construction
-  site. Estimate: ~1–2 hours of mechanical call-site updates.
+  `ConnectionShared`, but `Connection::new` itself still defaults
+  `wall_clock` to `SystemTime::now` (`crates/magnetar-proto/src/conn.rs::Connection::new`).
+  ~45 in-tree call sites, mostly proto tests. Forces every caller
+  to make an explicit clock choice and lets
+  `xtask check-no-internal-clock` validate the construction site.
+  Estimate: ~1–2 hours of mechanical call-site updates.
 
 ### Open — zero-copy
 
@@ -138,60 +70,46 @@ cursors in the same crates.
   `Vec<u8>`; `:192`, `:224` already use `Bytes` (inconsistent
   codegen). One-line manifest change + regenerate.
 - **Batched-consumer per-message metadata clone** —
-  `crates/magnetar-proto/src/consumer.rs:681, 685` — for each
-  message in a batch (loop iterating `num_in_batch` times),
-  `pb::MessageMetadata` and `BrokerEntryMetadata` are cloned into a
-  fresh `IncomingMessage`. A 100-message batch = 100 metadata clones
-  of identical data. Wrap in `Arc<MessageMetadata>` so all messages
-  in the batch share by Arc.
+  `crates/magnetar-proto/src/consumer.rs::classify_and_queue` (batched
+  delivery loop) — for each message in a batch (loop iterating
+  `num_in_batch` times), `pb::MessageMetadata` and `BrokerEntryMetadata`
+  are cloned into a fresh `IncomingMessage`. A 100-message batch =
+  100 metadata clones of identical data. Wrap in
+  `Arc<MessageMetadata>` so all messages in the batch share by Arc.
 - **Chunked-message metadata clone** —
-  `crates/magnetar-proto/src/consumer.rs:591, 593, 615, 620` —
-  metadata cloned on first-chunk arrival, then again on final
-  assembly. Arc-wrap in `ChunkBuffer`, or move out (not clone) on
-  assembly.
-- **`crates/magnetar-proto/src/frame.rs:213` `encode_payload`** —
-  single `BytesMut` accumulator copies every payload into the wire
-  buffer. Return a frame descriptor `{head: BytesMut, payload: Bytes}`
-  and vectored-write for plaintext — the producer batch path then
-  chains `Bytes` segments instead of memcpy-concat. TLS path keeps
-  the contiguous coalesce.
+  `crates/magnetar-proto/src/consumer.rs::ChunkBuffer` (first-chunk
+  arrival + final assembly) — metadata cloned on first-chunk arrival,
+  then again on final assembly. Arc-wrap in `ChunkBuffer`, or move out
+  (not clone) on assembly.
+- **`crates/magnetar-proto/src/frame.rs::encode_payload`** — single
+  `BytesMut` accumulator copies every payload into the wire buffer.
+  Return a frame descriptor `{head: BytesMut, payload: Bytes}` and
+  vectored-write for plaintext — the producer batch path then chains
+  `Bytes` segments instead of memcpy-concat. TLS path keeps the
+  contiguous coalesce.
 
 ### Open — performance / contention
 
-- **Sub-mutex split for `Arc<parking_lot::Mutex<Connection>>`** —
-  **CLOSED ([ADR-0038](../specs/adr/0038-split-connection-mutex.md))**.
-  `Connection` now stores `Arc<ProducerSlot>` / `Arc<ConsumerSlot>`;
-  the runtime `Producer` / `Consumer` hold direct slot references.
-  Cold-path observability bypasses the global lock; `Producer::send`
-  hot path takes only the per-slot mutex via
-  `ProducerSlot::queue_send`; the driver merges per-slot staged
-  frames into the connection-wide outbound buffer through
-  `poll_transmit`'s call to `drain_producer_outbound`. Four-layer
-  test coverage in `crates/magnetar-proto/tests/slot_hot_path.rs`,
-  `crates/magnetar-runtime-{tokio,moonpool}/tests/two_producers_parallel.rs`,
-  `crates/magnetar-differential/tests/two_producers_parallel_equivalence.rs`.
-  Lock-ordering invariant **global → per-slot, never the reverse** is
-  documented in CLAUDE.md §"Non-negotiable invariants" #10 and
-  ARCHITECTURE.md §"Concurrency primitives".
-- **`drain_memory_wakers` allocates a `Vec<Waker>`** —
-  `crates/magnetar-runtime-tokio/src/lib.rs:357-365` — pre-allocate
-  the scratch Vec in `ConnectionShared` and reuse, or drain directly
+- **`ConnectionShared::drain_memory_wakers` allocates a `Vec<Waker>`** —
+  `crates/magnetar-runtime-tokio/src/lib.rs` — pre-allocate the
+  scratch Vec in `ConnectionShared` and reuse, or drain directly
   without intermediate collect.
 - **`pending_index: HashMap<SequenceId, usize>` uses SipHash** —
-  `crates/magnetar-proto/src/producer.rs:158` — key is `u64`
-  newtype. Switch to `nohash_hasher::NoHashHasher<u64>` or
-  `ahash::AHashMap`.
+  `crates/magnetar-proto/src/producer.rs::ProducerState.pending_index`
+  — key is a `u64` newtype. Switch to
+  `nohash_hasher::NoHashHasher<u64>` or `ahash::AHashMap`.
 - **`batch_ack_tracker: HashMap<(u64, u64), …>`** —
-  `crates/magnetar-proto/src/consumer.rs:145` — same SipHash overkill.
-- **`refresh_pending_index` clears + rebuilds on every ack** —
-  `crates/magnetar-proto/src/producer.rs:1154` — O(in-flight) work
+  `crates/magnetar-proto/src/consumer.rs::ConsumerState.batch_ack_tracker`
+  — same SipHash overkill.
+- **`ProducerState::refresh_pending_index` clears + rebuilds on every
+  ack** — `crates/magnetar-proto/src/producer.rs` — O(in-flight) work
   per receipt. Use a `VecDeque` with monotonic head and slot
   generation.
 - **`ack.rs` uses `HashSet` then drains-and-sorts** —
-  `crates/magnetar-proto/src/trackers/ack.rs:47, 121` —
+  `crates/magnetar-proto/src/trackers/ack.rs` —
   `BTreeSet<MessageId>` removes the post-drain sort allocation, or
   `SmallVec` with threshold-based sort for small batches.
-- **`multi_topics.rs:505`, `pattern_consumer.rs:296`** — every
+- **`multi_topics.rs`, `pattern_consumer.rs` receive loops** — every
   `receive()` call clones the full consumer list and rebuilds a
   `Vec<Future>`. Keep an `Arc<[NamedConsumer]>` snapshot updated only
   on topology change.
@@ -199,31 +117,32 @@ cursors in the same crates.
 ### Open — syscall reduction
 
 - **Explicit `flush()` after every `write_all`** —
-  `crates/magnetar-runtime-tokio/src/driver.rs:604, 608` — for
-  plaintext TCP, `flush()` is essentially a no-op; for TLS it can
+  `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` —
+  for plaintext TCP, `flush()` is essentially a no-op; for TLS it can
   force extra record work. Skip flush on plaintext; flush only at
   batch boundaries.
 - **No `writev` / `IoSlice`** —
-  `crates/magnetar-runtime-tokio/src/driver.rs:583, 604` and
+  `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` +
   `crates/magnetar-proto/src/conn.rs::poll_transmit` — outbound
   coalesces into a single `BytesMut` before write. With a `Transmit`
   enum of contiguous-or-vectored segments and `poll_write_vectored`,
   the plaintext path avoids the batch copy entirely (TLS coalesces
   at the rustls boundary). Moonpool parity: `Providers::Network`
   accepts segment list, records equivalent byte stream.
-- **Read path double-copy** — `driver.rs:639, 653` does
-  `read_buf` → `split().freeze()`; proto used to re-copy at
-  `conn.rs:1275` (now fixed by the `handle_bytes` `split_to`
-  refactor — commit `bf66a5b`). Once the segment-aware transmit
-  type lands, the runtime can pass owned `BytesMut` ownership
-  directly.
+- **Read path double-copy** —
+  `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner`
+  reads `read_buf` → `split().freeze()`. The proto-side re-copy was
+  removed by the `handle_bytes` `split_to` refactor (commit
+  `bf66a5b`). Once the segment-aware transmit type lands, the runtime
+  can pass owned `BytesMut` ownership directly.
 
 ### Open — security hardening
 
 - **`AdminAuth::Token(String)` not redacted from `Debug`** —
   `crates/magnetar-admin/src/lib.rs` — mirror the
   `secrecy`/redacted-Debug pattern from
-  `magnetar-auth-oauth2/src/lib.rs:146-164`.
+  `crates/magnetar-auth-oauth2/src/lib.rs` (the OAuth2 access-token
+  Debug redaction).
 - **SASL PLAIN over plaintext** — no transport-security check in
   `crates/magnetar-auth-sasl/src/plain.rs`. Defensive: reject PLAIN
   when the client builder did not negotiate TLS.
@@ -235,162 +154,20 @@ cursors in the same crates.
 ### Open — cleanup and structural clarity
 
 - **`ProducerExt` trait, single impl** —
-  `crates/magnetar/src/client.rs:400-413`. Inline as a direct method
-  on `magnetar_runtime_tokio::Producer`.
+  `crates/magnetar/src/client.rs::ProducerExt`. Inline as a direct
+  method on `magnetar_runtime_tokio::Producer`.
 - **`ProducerBuilder<'a, E>` / `ConsumerBuilder<'a, E>` /
   `ReaderBuilder<'a, E>` are 95% tokio-bound** — phantom `E`
   parameter on builder methods that ignore it. Move the generic only
   to the final `.create()` / `.subscribe()` dispatch.
-- **`client.rs` (2475 lines), `engine.rs` (2085 lines), `conn.rs`
-  (5422 lines)** — split candidates. `conn.rs` could shed `txn.rs`,
-  `dlq.rs`, `anti_thrash.rs` satellites (~500 lines each).
-  `client.rs` could move builders to `builders.rs`. `engine.rs`
-  could become `engine/{traits,tokio,moonpool}.rs`.
+- **Large modules: `client.rs`, `engine.rs`, `conn.rs`** — split
+  candidates. `conn.rs` could shed `txn.rs`, `dlq.rs`,
+  `anti_thrash.rs` satellites (~500 lines each). `client.rs` could
+  move builders to `builders.rs`. `engine.rs` could become
+  `engine/{traits,tokio,moonpool}.rs`.
 - **Test-helper duplication** — `handshake_response_bytes()` defined
-  in both `magnetar-runtime-tokio/tests/anti_thrash.rs:45-59` and
-  `magnetar-runtime-moonpool/tests/common/mod.rs:34-48`. Consolidate
-  (or document intentional per ADR-0024).
-
-### Invariant conformance — clean pass
-
-Claude's invariant agent verified all nine binding invariants pass
-canonical xtask checks: `check-no-channels`, `check-no-io-deps`,
-`check-no-internal-clock`, `check-sim-coverage`,
-`check-runtime-test-parity`, plus rustls-only via `deny.toml`, no
-panics in proto (outside `#[cfg(test)]`), schema canonicalisation
-across AVRO/JSON/PROTOBUF/KeyValue, all 79 `#[ignore]` env-gated and
-documented, and the 4-layer test policy holds on recent commits
-(anti-thrash ADR-0028, PIP-180 shadow topic).
-
-Codex's catches on the proto-layer `fs::read` and the default
-wall-clock closure showed **the canonical xtask checks have blind
-spots**: they grep for direct calls and consult an allowlist, but do
-not detect host syscalls reached via a default closure or a function
-that's "below the allowlisted bootstrap". Worth strengthening the
-xtask validators to follow closure construction sites and to enforce
-required-not-default for clock injection — see the
-`Connection::new(wall_clock)` follow-on entry under "Open — sans-io
-/ determinism" above.
-
-### Where the auditors disagreed
-
-- **Big `Arc<Mutex<Connection>>`** — Claude perf passed (short
-  critical sections, no `.await` inside); codex flagged it as
-  high-severity. Resolution: both right; phased as the sub-mutex
-  split (see prompt below). Critical sections genuinely are short,
-  but every hot path funnels through the global lock and the
-  per-handle split is the next big throughput unlock.
-- **`Connection::new` wall-clock default** — Claude invariant agent
-  passed (xtask check green); codex flagged it. Resolution: codex's
-  strict reading is correct for moonpool; the xtask
-  `check-no-internal-clock` has a blind spot for default closures.
-  Landed via the moonpool wall-clock bridge (commit `a31dcaa`),
-  with a follow-on to remove the proto-layer default outright.
-- **`TokenAuth::read_token_file`** — Claude sans-io agent flagged
-  but noted it was "outside proto scope"; codex flagged it inside
-  proto. Resolution: codex is correct — `read_token_file` was
-  defined in `crates/magnetar-proto/`, so it was a proto-layer leak
-  regardless of who called it. Landed via commit `2727f49`.
-
-### Methodology footnote
-
-Seven Claude subagents (`Explore` type, ~32K output ceiling each)
-and one codex run (gpt-5.5, sandbox-bypass mode) executed in
-parallel. Each had a self-contained briefing with the workspace
-layout, binding invariants, and exact dimensions to cover. Codex
-caught what Claude missed primarily by (a) reading more lines per
-file rather than relying on grep, and (b) applying stricter
-invariant interpretation than the xtask validators. The binôme
-arrangement — both auditors blind to each other's notes — produced
-the disagreements above, which is the point.
-
-### How to pick up — next major unlock
-
-The sub-mutex split is the biggest concurrency win still on the
-board. Prompt-ready:
-
-```
-/goal Split the global `Arc<parking_lot::Mutex<Connection>>` lock
-by extracting per-handle hot state — see the "Sub-mutex split"
-entry under "Open — performance / contention" in the 2026-05-27
-audit section of `docs/follow-ups.md`. Keep `Mutex<Connection>`
-for protocol-mutation
-only; move producer pending queue + waker and consumer receive
-queue + waker into per-handle sub-mutexes. Lock-ordering: global
-→ per-handle, never reverse. Ships with ADR-0024 four-layer test
-coverage + an ADR documenting the split. Acceptance criteria
-include a measurable two-producer parallel-throughput improvement
-over `main` baseline under `MoonpoolEngine<SimProviders>`. See the
-full prompt template generated in the audit-fix session for the
-exact constraints + reading order.
-```
-
-### `sim_chaos_produce_consume_sweep_16_seeds` — sequential-seed hang
-
-**Gap.** When the moonpool `sim_chaos.rs` integration suite is run with
-`--test-threads=1` and the alphabetical test order places
-`sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds` *before*
-`sim_chaos_produce_consume_sweep_16_seeds`, the second test
-deterministically hangs forever at certain seeds (reproduced at
-`MOONPOOL_SEED=2`; possibly others). The cargo test process spins at
-0% CPU with no output. Killing the test binary lets cargo exit with
-status 1.
-
-Reproduction (on `main`, no audit-fix patches required):
-
-```bash
-timeout 60 cargo test -p magnetar-runtime-moonpool \
-  --features magnetar-runtime-moonpool/crypto-aws-lc-rs \
-  --test sim_chaos -- --test-threads=1 \
-  sim_chaos_anti sim_chaos_produce_consume_sweep
-# → "running 2 tests"
-# → "test sim_chaos_anti_thrash_… ... ok"
-# → "test sim_chaos_produce_consume_sweep_… ..." (hangs)
-```
-
-Each test passes in isolation in under a second. The combination
-hangs.
-
-**Hypothesis.** Two candidates:
-
-1. Process-scoped state from the anti-thrash workload (a thread, a
-   tokio runtime, a moonpool-sim driver state, or some `Once`-init'd
-   global) carries into the produce/consume sim and blocks event
-   delivery for specific RNG sequences. Tests use `SimulationBuilder`
-   which should isolate, but global state (rustls crypto-provider
-   `Once`, tracing subscriber, etc.) is shared across tests in the
-   same process.
-2. moonpool's deterministic-seed RNG sweep produces a workload that
-   exposes a pre-existing dispatch deadlock in the
-   `ProducerConsumerWorkload` + `StatefulBrokerWorkload` combination,
-   independent of the anti-thrash test — but only when an earlier
-   test has consumed enough tokio-runtime ticks to land on that
-   specific scheduling state.
-
-**Investigation path.**
-
-- Attach `gdb -p $(pgrep -af sim_chaos | head -1 | awk '{print $1}')`
-  during the hang, `thread apply all bt`, look for a deadlocked tokio
-  waker or a moonpool-sim `time-advance` loop with no events.
-- Run with `RUST_LOG=trace,moonpool_sim=trace` and `--nocapture` to
-  see which sim tick the second test stops emitting on.
-- Bisect: drop one workload at a time from the second test's
-  `SimulationBuilder` until it stops hanging.
-- Check `Once`-init'd globals (rustls `install_default`, tracing
-  subscriber, anything in moonpool's own statics) for state that
-  could persist across `SimulationBuilder::run()` calls.
-
-**Workaround.** Run sim_chaos tests individually rather than as a
-single sequential suite. The local validation chain runs them one
-test file at a time (`cargo test --test sim_chaos sim_chaos_<name>`),
-which works. CI's per-seed sweep also runs them individually per the
-GitHub Actions matrix.
-
-**Status.** Pre-existing on `main` @ `25998e2` (well before the audit
-fixes). Not caused by any of the receive-path event-count,
-`handle_bytes` `split_to`, `poll_transmit` ownership, or
-`deliver_after_ms` commits. Tracked separately so the audit-fix
-branch doesn't carry blame.
+  in multiple test files across both runtimes. Consolidate (or
+  document intentional per ADR-0024).
 
 ---
 
@@ -426,7 +203,7 @@ Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
 the trait additions are pure delegates so they don't introduce new
 behavior to mirror; the post-lift runtime test count stays at parity
-(tokio=moonpool, currently 151/151).
+(tokio=moonpool, currently 155/155).
 
 ---
 
@@ -489,8 +266,9 @@ moonpool first.
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
 landed with both `cargo xtask check-sim-coverage` and
 `cargo xtask check-runtime-test-parity` enabled and hard-failing.
-Runtime test parity sits at **`tokio=151 moonpool=151`** as of this
-refresh (pass-1 coverage closure plus subsequent landings).
+Runtime test parity sits at **`tokio=155 moonpool=155`** as of this
+refresh (pass-1 coverage closure plus subsequent landings, including
+the ADR-0038 split-connection-mutex parallel-send tests).
 Per-file coverage on the five target files at the last measurement
 reads:
 

@@ -71,9 +71,8 @@ allowed. `tokio::task::JoinSet` is allowed too.
 
 ## References
 
-- [`docs/decisions-log.md` §"Architecture: no channels"](../../docs/decisions-log.md)
-- [`docs/research.md`](../../docs/research.md) (channel pathology survey)
 - [`ARCHITECTURE.md` §"The no-channels rationale"](../../ARCHITECTURE.md)
+- [`GUIDELINES.md` §"No-channels rule"](../../GUIDELINES.md)
 - `deny.toml` — `[bans] deny` entries
 - `clippy.toml` — `disallowed-types`
 - `xtask/src/main.rs` — `check-no-channels` command

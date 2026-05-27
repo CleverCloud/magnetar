@@ -60,8 +60,7 @@ No cycle, no upward arrow.
 
 ## References
 
-- [`docs/implementation-plan.md` §1](../../docs/implementation-plan.md) (crate
-  topology + diagram + workspace `Cargo.toml` snippet)
+- [`ARCHITECTURE.md` §"Crate topology"](../../ARCHITECTURE.md)
 - `Cargo.toml` (workspace `[workspace.members]`)
 - `xtask/src/main.rs` — `check-no-io-deps` command
 - [ADR-0004 sans-io](0004-sans-io-protocol-core.md)

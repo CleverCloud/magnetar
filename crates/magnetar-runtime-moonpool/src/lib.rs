@@ -140,8 +140,23 @@ fn current_wall_clock_base_ms() -> u64 {
 /// Shared connection state for the moonpool engine. Mirrors the tokio
 /// engine's `ConnectionShared`: a non-async mutex over the sans-io state
 /// machine plus a single-cell driver wakeup.
+///
+/// # Lock-ordering invariant (ADR-0038)
+///
+/// `ConnectionShared.inner` guards connection-wide state. Per-handle hot
+/// state lives behind its own `parking_lot::Mutex` on
+/// [`magnetar_proto::ProducerSlot`] / [`magnetar_proto::ConsumerSlot`].
+/// Acquisition order is strictly **global (`inner`) → per-slot
+/// (`slot.state`), never the reverse**. The producer-send hot path skips
+/// the global lock entirely via
+/// [`magnetar_proto::ProducerSlot::queue_send`]; the moonpool driver
+/// merges per-slot staged frames into the connection-wide buffer through
+/// `Connection::poll_transmit`. See
+/// [ADR-0038](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0038-split-connection-mutex.md).
 pub struct ConnectionShared {
-    /// The sans-io state machine, guarded by a non-async mutex.
+    /// The sans-io state machine, guarded by a non-async mutex. See the
+    /// type-level docs above for the lock-ordering invariant against the
+    /// per-slot mutexes.
     pub inner: Mutex<Connection>,
     /// Single-cell wakeup for the driver loop. Not a channel — just a
     /// `Notify` notified after every user-facing future enqueues work

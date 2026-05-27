@@ -129,6 +129,48 @@ sections. The driver is woken via a single `tokio::sync::Notify` cell
 (`Notify` is a condvar, not a channel; per
 [ADR-0003](../specs/adr/0003-no-channels-rule.md)).
 
+Per-handle hot state (producer pending queue, consumer receive queue,
+per-slot wakers) lives behind its own `parking_lot::Mutex` on
+`magnetar_proto::ProducerSlot` / `ConsumerSlot`. The producer-send hot
+path takes ONLY the per-slot lock — `Producer::send` goes through
+`ProducerSlot::queue_send` without touching `lock(state)`. The driver's
+`poll_transmit` step merges per-slot staged frames into the
+connection-wide outbound buffer under the global lock on its next
+tick. Acquisition order is strictly **global → per-slot, never the
+reverse**; see
+[ADR-0038](../specs/adr/0038-split-connection-mutex.md).
+
+```text
+   Producer::send                            driver task
+   ──────────────                            ───────────
+        │ slot.queue_send(msg, now)
+        │   slot.state.lock()  ← per-slot only; no global lock
+        │     append to pending, stage frame
+        │   drop slot.state.lock()
+        │
+        │ shared.driver_waker.notify_one() ──notify──▶  wakes
+        ▼                                                 │
+   returns SendFut                                        ▼
+                                                lock(state).poll_transmit()
+                                                  └─ drain_producer_outbound():
+                                                       for each slot:
+                                                         slot.state.lock()  ← briefly,
+                                                         move state.outbound  global
+                                                         into conn.outbound   lock held
+                                                  returns Bytes
+                                                drop(lock(state))
+                                                socket.write_all(out)
+```
+
+Two producers on the same connection therefore run their `send` hot
+paths in parallel — they contend only on their own per-slot mutexes,
+not on the connection-wide one. Cold-path observability
+(`Producer::topic`, `name`, `stats`, `Consumer::available_in_queue`,
+`is_paused`, …) reads identity directly from the slot's frozen
+`identity` block (no lock) or takes only the per-slot mutex. See the
+full lock-layout schemas in
+[`../ARCHITECTURE.md#lock-ordering-invariant-adr-0038`](../ARCHITECTURE.md#lock-ordering-invariant-adr-0038).
+
 When `driver_loop_inner` returns due to an error, a supervisor wraps
 it and reconnects:
 

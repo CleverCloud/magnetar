@@ -71,9 +71,9 @@ Three-layer split:
 
 ## References
 
-- [`docs/research.md`](../../docs/research.md) (quinn-proto + Pulsar
-  architecture comparison)
-- [`docs/implementation-plan.md` §1, §4](../../docs/implementation-plan.md)
 - [`ARCHITECTURE.md` §"Sans-io design"](../../ARCHITECTURE.md)
+- [`GUIDELINES.md` §"I/O isolation"](../../GUIDELINES.md)
+- `quinn-proto` (the architectural template for the
+  `handle_bytes` / `poll_transmit` / `poll_event` / `poll_timeout` shape)
 - [ADR-0003 no-channels](0003-no-channels-rule.md) (related concurrency rule)
 - [ADR-0011 clock injection](0011-clock-injection-sans-io.md) (related sans-io rule)

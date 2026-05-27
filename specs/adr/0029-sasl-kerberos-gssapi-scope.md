@@ -104,8 +104,8 @@ plan has a concrete sizing and acceptance contract.
   reads a **scoped subset** from `SaslKerberosConfig` rather than a
   JAAS file: `principal`, `keytab`, `ticket_cache`, `use_keytab`,
   `use_ticket_cache`. A JAAS-file parser is **out of scope** for
-  v0.2.0; we document the equivalence table in
-  `docs/auth-kerberos.md`.
+  v0.2.0; the equivalence table will land alongside the v0.3.0+
+  parser work.
 
 - **Service principal naming.** Pulsar's `serverType=broker` resolves
   to a service principal of the form `<serverType>/<broker-hostname>@<realm>`.

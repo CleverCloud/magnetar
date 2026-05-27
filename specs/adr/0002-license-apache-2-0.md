@@ -36,6 +36,5 @@ Apache-2.0.
 
 ## References
 
-- [`docs/decisions-log.md` §"License"](../../docs/decisions-log.md)
-- `deny.toml` (allow-list enforced in CI)
+- `deny.toml` (license allow-list enforced in CI)
 - `LICENSE`, `NOTICE` (committed at the repo root)
