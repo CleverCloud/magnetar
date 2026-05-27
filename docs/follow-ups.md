@@ -133,13 +133,30 @@ block:
 - `PulsarClient::table_view(...)`
 - `PulsarClient::typed_table_view(...)`
 
-Lifting these to the engine-generic `impl<E: Engine> PulsarClient<E>`
-block needs the matching `BrokerMetadataApi` / partition-count
-lookups already present on both engines and a small amount of
-plumbing to surface tokio-only specialised methods
-(`refresh_partitions`, `last_sequence_id_published`) via a
-specialisation block. The inner builders are already engine-generic
-so the lift is mostly mechanical.
+A previous pass of this entry assumed the inner builders were already
+engine-generic. That is **not** the current state: as of
+`crates/magnetar/src/partitioned_producer.rs:716` and
+`crates/magnetar/src/table_view.rs:333,763`, the three builder types
+(`PartitionedProducerBuilder<'a>`, `TableViewBuilder<'a>`,
+`TypedTableViewBuilder<'a, S>`) carry no engine parameter and reference
+tokio-only types directly (e.g.
+`std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` on the
+partitioned producer builder, `magnetar_runtime_tokio::MessageDecryptor`
+on the table-view builder).
+
+Concrete sub-steps before the entry-point lift can happen:
+
+1. Make `PartitionedProducerBuilder<'a, E: Engine>` carry the
+   `MessageEncryptor` / `MessageRouter` types via per-engine API
+   extension traits.
+2. Same for `TableViewBuilder<'a, E: Engine>` /
+   `TypedTableViewBuilder<'a, E: Engine, S>`
+   (`MessageDecryptor`, broker-metadata lookup).
+3. Move all the inner `.consumer(...)` / `.producer(...)` plumbing
+   through the engine-generic `SubscribeApi` / `CreateProducerApi`
+   traits.
+4. Then lift the entry-point methods to
+   `impl<E: Engine> PulsarClient<E>`.
 
 Test parity per
 [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
