@@ -133,7 +133,7 @@ mod tests {
     fn sample_schema() -> pb::Schema {
         pb::Schema {
             name: "test.topic-schema".to_owned(),
-            schema_data: b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}".to_vec(),
+            schema_data: Bytes::from_static(b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}"),
             r#type: pb::schema::Type::Avro as i32,
             properties: Vec::new(),
         }
@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(encoded_after, payload);
         assert_eq!(
             schema.schema_data().as_ref(),
-            sample_schema().schema_data.as_slice(),
+            sample_schema().schema_data.as_ref(),
         );
         assert_eq!(schema.schema_type(), pb::schema::Type::None);
 

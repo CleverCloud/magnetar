@@ -297,7 +297,7 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// schema; pass `Some(schema_version_bytes)` to re-resolve.
     fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>;
 
     /// Cumulative producer-side counters. Mirrors Java
@@ -442,7 +442,7 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// pass `Some(schema_version_bytes)` to re-resolve.
     fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>;
 
     /// Topic this consumer is subscribed to.
@@ -962,7 +962,7 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
 
     fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
     {
         Box::pin(magnetar_runtime_tokio::Producer::get_schema(self, version))
@@ -1052,7 +1052,7 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
     {
         Box::pin(magnetar_runtime_tokio::Consumer::get_schema(self, version))
@@ -1321,7 +1321,7 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
 
     fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
     {
         Box::pin(magnetar_runtime_moonpool::Producer::get_schema(
@@ -1415,7 +1415,7 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::pb::Schema, Self::Error>> + Send + '_>>
     {
         Box::pin(magnetar_runtime_moonpool::Consumer::get_schema(

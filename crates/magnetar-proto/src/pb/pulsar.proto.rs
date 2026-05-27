@@ -3,8 +3,8 @@
 pub struct Schema {
     #[prost(string, required, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", required, tag = "3")]
-    pub schema_data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", required, tag = "3")]
+    pub schema_data: ::prost::bytes::Bytes,
     #[prost(enumeration = "schema::Type", required, tag = "4")]
     pub r#type: i32,
     #[prost(message, repeated, tag = "5")]
@@ -156,8 +156,8 @@ pub struct IntRange {
 pub struct EncryptionKeys {
     #[prost(string, required, tag = "1")]
     pub key: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", required, tag = "2")]
-    pub value: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", required, tag = "2")]
+    pub value: ::prost::bytes::Bytes,
     #[prost(message, repeated, tag = "3")]
     pub metadata: ::prost::alloc::vec::Vec<KeyValue>,
 }
@@ -262,8 +262,8 @@ pub struct CommandConnect {
     pub auth_method: ::core::option::Option<i32>,
     #[prost(string, optional, tag = "5")]
     pub auth_method_name: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bytes = "vec", optional, tag = "3")]
-    pub auth_data: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", optional, tag = "3")]
+    pub auth_data: ::core::option::Option<::prost::bytes::Bytes>,
     #[prost(int32, optional, tag = "4", default = "0")]
     pub protocol_version: ::core::option::Option<i32>,
     #[prost(string, optional, tag = "6")]
@@ -333,8 +333,8 @@ pub struct CommandAuthChallenge {
 pub struct AuthData {
     #[prost(string, optional, tag = "1")]
     pub auth_method_name: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bytes = "vec", optional, tag = "2")]
-    pub auth_data: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", optional, tag = "2")]
+    pub auth_data: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KeySharedMeta {
@@ -980,8 +980,8 @@ pub struct CommandProducerSuccess {
     pub producer_name: ::prost::alloc::string::String,
     #[prost(int64, optional, tag = "3", default = "-1")]
     pub last_sequence_id: ::core::option::Option<i64>,
-    #[prost(bytes = "vec", optional, tag = "4")]
-    pub schema_version: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", optional, tag = "4")]
+    pub schema_version: ::core::option::Option<::prost::bytes::Bytes>,
     #[prost(uint64, optional, tag = "5")]
     pub topic_epoch: ::core::option::Option<u64>,
     #[prost(bool, optional, tag = "6", default = "true")]
@@ -1351,8 +1351,8 @@ pub struct CommandGetSchema {
     pub request_id: u64,
     #[prost(string, required, tag = "2")]
     pub topic: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", optional, tag = "3")]
-    pub schema_version: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", optional, tag = "3")]
+    pub schema_version: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandGetSchemaResponse {
@@ -1364,8 +1364,8 @@ pub struct CommandGetSchemaResponse {
     pub error_message: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]
     pub schema: ::core::option::Option<Schema>,
-    #[prost(bytes = "vec", optional, tag = "5")]
-    pub schema_version: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", optional, tag = "5")]
+    pub schema_version: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandGetOrCreateSchema {
@@ -1386,8 +1386,8 @@ pub struct CommandGetOrCreateSchemaResponse {
     pub error_code: ::core::option::Option<i32>,
     #[prost(string, optional, tag = "3")]
     pub error_message: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(bytes = "vec", optional, tag = "4")]
-    pub schema_version: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", optional, tag = "4")]
+    pub schema_version: ::core::option::Option<::prost::bytes::Bytes>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct CommandTcClientConnectRequest {

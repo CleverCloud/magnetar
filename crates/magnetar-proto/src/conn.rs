@@ -84,7 +84,7 @@ pub struct ConnectionConfig {
     /// Authentication method name (e.g. `"none"`, `"token"`).
     pub auth_method_name: String,
     /// Initial auth data (when an auth provider already has a token).
-    pub auth_data: Option<Vec<u8>>,
+    pub auth_data: Option<Bytes>,
     /// Protocol version to advertise; `21` covers Pulsar 4.x.
     pub protocol_version: i32,
     /// Capabilities to advertise on connect.
@@ -3372,7 +3372,7 @@ impl Connection {
     /// Used by [`crate::schema::AutoConsumeSchema`] and
     /// [`crate::schema::AutoProduceBytesSchema`] to populate their per-instance schema cache
     /// (PIP-87 broker-side schema lookup).
-    pub fn get_schema(&mut self, topic: &str, version: Option<Vec<u8>>) -> RequestId {
+    pub fn get_schema(&mut self, topic: &str, version: Option<Bytes>) -> RequestId {
         let request_id = self.alloc_request_id();
         let cmd = pb::CommandGetSchema {
             request_id: request_id.0,
@@ -3654,7 +3654,7 @@ impl Connection {
     }
 
     /// Submit a `CommandAuthResponse` in answer to a server `CommandAuthChallenge`.
-    pub fn submit_auth_response(&mut self, auth_data: Vec<u8>, auth_method: Option<String>) {
+    pub fn submit_auth_response(&mut self, auth_data: Bytes, auth_method: Option<String>) {
         let resp = pb::CommandAuthResponse {
             client_version: Some(self.config.client_version.clone()),
             response: Some(pb::AuthData {

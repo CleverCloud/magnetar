@@ -469,7 +469,10 @@ impl Consumer {
     /// The result is **not** cached here — callers that need a per-instance cache (e.g.
     /// [`magnetar_proto::schema::AutoConsumeSchema`]) push the resolved schema into their own
     /// `Arc<Mutex<…>>` after this future resolves.
-    pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
+    pub async fn get_schema(
+        &self,
+        version: Option<bytes::Bytes>,
+    ) -> Result<pb::Schema, ClientError> {
         let topic = self
             .shared
             .inner
@@ -1401,7 +1404,7 @@ mod tests {
             get_schema_response: Some(pb::CommandGetSchemaResponse {
                 request_id,
                 schema,
-                schema_version: Some(b"v1".to_vec()),
+                schema_version: Some(bytes::Bytes::from_static(b"v1")),
                 error_code: None,
                 error_message: None,
             }),
@@ -1453,7 +1456,9 @@ mod tests {
         let request_id = shared.inner.lock().peek_next_request_id_for_test();
         let response_schema = pb::Schema {
             name: "persistent://public/default/auto-schema-ok-schema".to_owned(),
-            schema_data: b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}".to_vec(),
+            schema_data: bytes::Bytes::from_static(
+                b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}",
+            ),
             r#type: pb::schema::Type::Avro as i32,
             properties: Vec::new(),
         };

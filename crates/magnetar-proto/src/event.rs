@@ -23,7 +23,7 @@ use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, Sequenc
 /// `Ok((schema, version))` on success — the broker-resolved [`pb::Schema`] and the optional
 /// schema version assigned by the registry. `Err((code, message))` carries the wire-protocol
 /// `ServerError` code and broker-supplied message on failure (e.g. `TopicNotFound`).
-pub type GetSchemaResult = Result<(pb::Schema, Option<Vec<u8>>), (i32, String)>;
+pub type GetSchemaResult = Result<(pb::Schema, Option<Bytes>), (i32, String)>;
 
 /// Result variants of one round-trip against the Transaction Coordinator.
 ///
@@ -62,7 +62,7 @@ pub enum ConnectionEvent {
         /// Auth method requested by the broker, if it differs from the original.
         method: Option<String>,
         /// Server-supplied challenge data (opaque to the protocol layer).
-        challenge: Option<Vec<u8>>,
+        challenge: Option<Bytes>,
     },
 
     /// A producer that was queued via `create_producer` is now ready to send.
@@ -74,7 +74,7 @@ pub enum ConnectionEvent {
         /// Last sequence id seen by the broker for this producer (`-1` if none).
         last_sequence_id: i64,
         /// Schema version assigned by the broker (empty if none).
-        schema_version: Vec<u8>,
+        schema_version: Bytes,
     },
 
     /// The broker rejected a `CommandProducer` open with `CommandError`.

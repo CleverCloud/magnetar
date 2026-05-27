@@ -117,7 +117,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                 shared
                     .inner
                     .lock()
-                    .submit_auth_response(refreshed.to_vec(), Some(method));
+                    .submit_auth_response(refreshed, Some(method));
                 shared.driver_waker.notify_one();
             }
             ConnectionEvent::TopicListChanged { added, removed } => {

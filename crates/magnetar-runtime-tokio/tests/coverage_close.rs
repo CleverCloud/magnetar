@@ -194,11 +194,11 @@ fn handle_full_frame(
                         error_message: None,
                         schema: Some(pb::Schema {
                             name: "test-schema".to_owned(),
-                            schema_data: vec![1, 2, 3],
+                            schema_data: bytes::Bytes::from_static(&[1u8, 2, 3]),
                             r#type: pb::schema::Type::Json as i32,
                             properties: vec![],
                         }),
-                        schema_version: Some(vec![0xaa]),
+                        schema_version: Some(bytes::Bytes::from_static(&[0xaau8])),
                     }),
                     ..Default::default()
                 };

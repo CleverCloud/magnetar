@@ -61,14 +61,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — zero-copy
 
-- **Prost `bytes` feature** — workspace `prost = "0.13"` at root
-  `Cargo.toml` omits the `bytes` feature. Generated protobuf decodes
-  `bytes` fields into `Vec<u8>` instead of refcounted `bytes::Bytes`.
-  Affects every `BaseCommand`, `MessageMetadata`,
-  `BrokerEntryMetadata`, `Schema.schema_data`, auth data. Evidence:
-  `crates/magnetar-proto/src/pb/pulsar.proto.rs:6, 159, 265` show
-  `Vec<u8>`; `:192`, `:224` already use `Bytes` (inconsistent
-  codegen). One-line manifest change + regenerate.
 - **Batched-consumer per-message metadata clone** —
   `crates/magnetar-proto/src/consumer.rs::classify_and_queue` (batched
   delivery loop) — for each message in a batch (loop iterating

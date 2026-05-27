@@ -51,15 +51,12 @@ const FORBIDDEN_IO_DEPS: &[&str] = &[
 /// does not care, but stable order keeps the generated module deterministic.
 const PROTO_FILES: &[&str] = &["PulsarApi.proto", "PulsarMarkers.proto"];
 
-/// Protobuf fully-qualified message paths whose `bytes` fields should be
-/// generated as `bytes::Bytes` instead of `Vec<u8>`. These are the payload-
-/// bearing messages on the hot path — zero-copy decode matters here.
-const BYTES_MESSAGES: &[&str] = &[
-    ".pulsar.proto.MessageMetadata",
-    ".pulsar.proto.SingleMessageMetadata",
-    ".pulsar.proto.CommandSend",
-    ".pulsar.proto.CommandMessage",
-];
+/// Protobuf prefixes whose `bytes` fields should be generated as
+/// `bytes::Bytes` instead of `Vec<u8>`. `["."]` opts every `bytes` field
+/// in the descriptor set into refcounted `Bytes` so payload, metadata,
+/// auth, and schema-version fields all decode zero-copy out of the
+/// inbound `BytesMut` slice.
+const BYTES_MESSAGES: &[&str] = &["."];
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask", version, about = "magnetar build helpers", long_about = None)]

@@ -83,14 +83,19 @@ fn run_handshake_under(engine: Engine) -> (Vec<u8>, [Vec<u8>; 2]) {
             server_version: Some("test/0".to_owned()),
             challenge: Some(pb::AuthData {
                 auth_method_name: Some("sasl".to_owned()),
-                auth_data: Some(server_token.to_vec()),
+                auth_data: Some(bytes::Bytes::copy_from_slice(server_token)),
             }),
             protocol_version: Some(21),
         };
         let response = state
             .handle_challenge(&cmd, &*stored)
             .expect("handle_challenge");
-        rounds[idx] = response.response.expect("payload").auth_data.unwrap();
+        rounds[idx] = response
+            .response
+            .expect("payload")
+            .auth_data
+            .unwrap()
+            .to_vec();
     }
 
     (initial.to_vec(), rounds)

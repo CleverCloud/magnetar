@@ -52,7 +52,7 @@ fn sasl_kerberos_multi_round_challenge_completes_on_moonpool() {
         server_version: Some("test/0".to_owned()),
         challenge: Some(pb::AuthData {
             auth_method_name: Some("sasl".to_owned()),
-            auth_data: Some(b"server-mutual-nonce".to_vec()),
+            auth_data: Some(bytes::Bytes::from_static(b"server-mutual-nonce")),
         }),
         protocol_version: Some(21),
     };
@@ -69,7 +69,7 @@ fn sasl_kerberos_multi_round_challenge_completes_on_moonpool() {
         server_version: Some("test/0".to_owned()),
         challenge: Some(pb::AuthData {
             auth_method_name: Some("sasl".to_owned()),
-            auth_data: Some(b"sasl-layer-choice".to_vec()),
+            auth_data: Some(bytes::Bytes::from_static(b"sasl-layer-choice")),
         }),
         protocol_version: Some(21),
     };

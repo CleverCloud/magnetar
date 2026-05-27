@@ -35,7 +35,7 @@ pub struct GenericRecord {
     /// Resolved schema name (mirrors Java's `getSchemaName`).
     pub schema_name: String,
     /// Optional schema version assigned by the broker.
-    pub schema_version: Option<Vec<u8>>,
+    pub schema_version: Option<Bytes>,
     /// Decoded fields (name → byte slice). Order is preserved from the schema definition.
     pub fields: Vec<GenericRecordField>,
 }
@@ -160,7 +160,7 @@ mod tests {
     fn sample_schema() -> pb::Schema {
         pb::Schema {
             name: "test.topic-schema".to_owned(),
-            schema_data: b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}".to_vec(),
+            schema_data: Bytes::from_static(b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}"),
             r#type: pb::schema::Type::Avro as i32,
             properties: Vec::new(),
         }
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(decoded.as_ref(), payload);
         assert_eq!(
             schema.schema_data().as_ref(),
-            sample_schema().schema_data.as_slice(),
+            sample_schema().schema_data.as_ref(),
             "schema_data must reflect cached broker schema after lookup"
         );
 
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(cached.schema_data, broker_schema.schema_data);
         assert_eq!(
             schema.schema_data().as_ref(),
-            broker_schema.schema_data.as_slice(),
+            broker_schema.schema_data.as_ref(),
             "schema_data() reflects the broker-resolved bytes after trait-driven cache fill"
         );
     }

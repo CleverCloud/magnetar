@@ -143,7 +143,7 @@ impl AuthChallengeState {
             protocol_version: cmd.protocol_version,
             response: Some(pb::AuthData {
                 auth_method_name: Some(provider.method().to_owned()),
-                auth_data: Some(response.to_vec()),
+                auth_data: Some(bytes::Bytes::copy_from_slice(&response)),
             }),
         };
         self.in_progress = false;
@@ -198,7 +198,7 @@ mod tests {
             server_version: Some("test/0".to_owned()),
             challenge: Some(pb::AuthData {
                 auth_method_name: Some("token".to_owned()),
-                auth_data: Some(b"server-nonce".to_vec()),
+                auth_data: Some(Bytes::from_static(b"server-nonce")),
             }),
             protocol_version: Some(21),
         };
@@ -329,7 +329,7 @@ mod tests {
                 server_version: Some("test/0".to_owned()),
                 challenge: Some(pb::AuthData {
                     auth_method_name: Some("sasl".to_owned()),
-                    auth_data: Some(challenge.clone()),
+                    auth_data: Some(Bytes::copy_from_slice(challenge)),
                 }),
                 protocol_version: Some(*version as i32),
             };

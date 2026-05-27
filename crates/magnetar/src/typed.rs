@@ -480,7 +480,7 @@ where
     {
         let schema_pb = pb::Schema {
             name: self.topic.clone(),
-            schema_data: self.schema.schema_data().to_vec(),
+            schema_data: self.schema.schema_data(),
             r#type: self.schema.schema_type() as i32,
             properties: self
                 .schema
@@ -543,7 +543,7 @@ impl<S: Schema> TypedProducerBuilder<'_, S, crate::TokioEngine> {
     pub async fn create_with_encryption(self) -> Result<TypedProducer<S>, PulsarError> {
         let schema_pb = pb::Schema {
             name: self.topic.clone(),
-            schema_data: self.schema.schema_data().to_vec(),
+            schema_data: self.schema.schema_data(),
             r#type: self.schema.schema_type() as i32,
             properties: self
                 .schema
@@ -1326,7 +1326,7 @@ where
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;
         let schema_pb = pb::Schema {
             name: self.topic.clone(),
-            schema_data: self.schema.schema_data().to_vec(),
+            schema_data: self.schema.schema_data(),
             r#type: self.schema.schema_type() as i32,
             properties: self
                 .schema

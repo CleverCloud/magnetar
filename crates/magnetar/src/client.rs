@@ -1072,7 +1072,7 @@ pub struct ClientBuilder {
     keepalive: Option<Duration>,
     operation_timeout: Option<Duration>,
     auth_method_name: Option<String>,
-    auth_data: Option<Vec<u8>>,
+    auth_data: Option<bytes::Bytes>,
     auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
     tls_trust_certs_pem: Option<Vec<u8>>,
     tls_allow_insecure_connection: bool,
@@ -1235,7 +1235,7 @@ impl ClientBuilder {
     #[must_use]
     pub fn auth(mut self, provider: std::sync::Arc<dyn magnetar_proto::AuthProvider>) -> Self {
         self.auth_method_name = Some(provider.method().to_owned());
-        self.auth_data = provider.initial().ok().map(|bytes| bytes.to_vec());
+        self.auth_data = provider.initial().ok();
         self.auth_provider = Some(provider);
         self
     }

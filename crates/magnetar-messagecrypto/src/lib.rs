@@ -183,7 +183,7 @@ impl MessageCrypto {
             .into_iter()
             .map(|(name, value)| pb::EncryptionKeys {
                 key: name,
-                value,
+                value: Bytes::from(value),
                 metadata: Vec::new(),
             })
             .collect();

@@ -462,7 +462,10 @@ impl Producer {
     /// The result is **not** cached here — callers that need a per-instance cache (e.g.
     /// [`magnetar_proto::schema::AutoProduceBytesSchema`]) push the resolved schema into
     /// their own `Arc<Mutex<…>>` after this future resolves.
-    pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
+    pub async fn get_schema(
+        &self,
+        version: Option<bytes::Bytes>,
+    ) -> Result<pb::Schema, ClientError> {
         // ADR-0038: identity-only read, no global lock.
         let topic = self.slot.identity.topic.clone();
         let request_id = {
@@ -854,7 +857,7 @@ mod tests {
             get_schema_response: Some(pb::CommandGetSchemaResponse {
                 request_id,
                 schema,
-                schema_version: Some(b"v1".to_vec()),
+                schema_version: Some(bytes::Bytes::from_static(b"v1")),
                 error_code: None,
                 error_message: None,
             }),
@@ -906,7 +909,9 @@ mod tests {
         let request_id = shared.inner.lock().peek_next_request_id_for_test();
         let response_schema = pb::Schema {
             name: "persistent://public/default/auto-produce-ok-schema".to_owned(),
-            schema_data: b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}".to_vec(),
+            schema_data: bytes::Bytes::from_static(
+                b"{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}",
+            ),
             r#type: pb::schema::Type::Avro as i32,
             properties: Vec::new(),
         };
@@ -1039,7 +1044,7 @@ mod tests {
         let request_id = shared.inner.lock().peek_next_request_id_for_test();
         let response_schema = pb::Schema {
             name: "persistent://public/default/auto-produce-cache-schema".to_owned(),
-            schema_data: b"avro-schema-bytes".to_vec(),
+            schema_data: bytes::Bytes::from_static(b"avro-schema-bytes"),
             r#type: pb::schema::Type::Avro as i32,
             properties: Vec::new(),
         };
@@ -1079,7 +1084,7 @@ mod tests {
         );
         assert_eq!(
             schema.schema_data().as_ref(),
-            response_schema.schema_data.as_slice(),
+            response_schema.schema_data.as_ref(),
             "cached schema_data must round-trip from the broker reply"
         );
         // Encode remains pass-through whether or not the cache is populated (Java parity).

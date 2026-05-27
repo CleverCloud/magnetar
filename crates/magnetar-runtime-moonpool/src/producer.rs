@@ -478,7 +478,7 @@ impl<P: Providers> Producer<P> {
     ///   outcome arrives.
     pub async fn get_schema(
         &self,
-        version: Option<Vec<u8>>,
+        version: Option<bytes::Bytes>,
     ) -> Result<magnetar_proto::pb::Schema, ClientError> {
         let topic = self
             .shared

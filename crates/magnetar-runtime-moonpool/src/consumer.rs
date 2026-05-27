@@ -848,7 +848,10 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Broker`] when the broker rejects the lookup (e.g. `TopicNotFound`).
     /// - [`ClientError::Other`] when the consumer handle is no longer registered or an unexpected
     ///   outcome arrives.
-    pub async fn get_schema(&self, version: Option<Vec<u8>>) -> Result<pb::Schema, ClientError> {
+    pub async fn get_schema(
+        &self,
+        version: Option<bytes::Bytes>,
+    ) -> Result<pb::Schema, ClientError> {
         let topic = self
             .shared
             .inner
