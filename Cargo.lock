@@ -1583,6 +1583,7 @@ dependencies = [
  "magnetar-auth-athenz",
  "magnetar-auth-oauth2",
  "magnetar-auth-sasl",
+ "magnetar-fakes",
  "magnetar-messagecrypto",
  "magnetar-proto",
  "magnetar-runtime-moonpool",

@@ -424,9 +424,13 @@ session that landed the above):**
 
 1. The five `crates/magnetar/tests/v5_*.rs` mapping/wire tests asserting
    the bytes `magnetar-fakes` observes match the v4 expectation:
-   `v5_producer_mapping.rs`, `v5_stream_consumer_mapping.rs`,
-   `v5_queue_consumer_mapping.rs`, `v5_client_v4_escape_hatch.rs`,
-   `v5_builder_defaults.rs` (table-driven from `mapping.rs`).
+   `v5_producer_mapping.rs` (**landed** — 2 tests via the new
+   `magnetar_fakes::FrameRecorder` API drained against a sans-io
+   `Connection`; default-config and named-producer paths covered),
+   `v5_stream_consumer_mapping.rs`, `v5_queue_consumer_mapping.rs`,
+   `v5_client_v4_escape_hatch.rs`, `v5_builder_defaults.rs`
+   (table-driven from `mapping.rs`) — these four follow the same
+   `FrameRecorder` shape and can ride the scaffolding.
 2. Same five files mirrored 1:1 under `SimulationBuilder` for the
    moonpool engine.
 3. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
