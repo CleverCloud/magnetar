@@ -389,8 +389,22 @@ async fn supervised_driver_loop(
     // splitmix default; using the (stable, unique) Arc pointer mixes in per-Client entropy.
     let seed: u64 = Arc::as_ptr(&shared) as usize as u64;
 
+    // Backoff schedule lives outside the reconnect loop and PERSISTS across cycles for this
+    // client. `reset()` snaps `next_delay` back to `initial` only when the previous socket
+    // survived past `cfg.drop_grace` — i.e. when the previous reconnect was stable. This
+    // stops the "broker accepts handshake then drops in <drop_grace, backoff snaps to
+    // initial" storm that ADR-0028's anti-thrash detector escalates against as the second
+    // line of defence. Lazy-init from the in-loop cfg snapshot so dynamic config edits to
+    // `initial_backoff` / `max_backoff` / `mandatory_stop` (future work) still take effect
+    // before the supervisor has had to redial once.
+    let mut backoff: Option<magnetar_proto::Backoff> = None;
+
     // First pass uses the current socket. The inner-loop result is what we propagate to the
-    // caller if we exit without a supervisor reconnect.
+    // caller if we exit without a supervisor reconnect. `socket_alive_since` lets us decide,
+    // once `driver_loop_inner` returns, whether the previous socket lived long enough to
+    // count as a stable reconnect (-> `backoff.reset()`) or died inside `drop_grace`
+    // (-> keep growing).
+    let mut socket_alive_since = Instant::now();
     let mut last_inner_result = driver_loop_inner(&shared, &mut socket).await;
 
     loop {
@@ -460,10 +474,16 @@ async fn supervised_driver_loop(
             shared.inner.lock().anti_thrash_state_mut().clear_cooldown();
         }
 
-        // Fresh Backoff per disconnect: Java resets the schedule on a successful reconnect, so
-        // we reset on a *successful* handshake too. The attempt counter is the only piece of
-        // state that survives across reconnect attempts here.
-        let mut backoff = cfg.build_backoff(seed);
+        // Backoff persistence policy (ADR-0028 alignment): lazy-init on the first redial,
+        // then reuse across cycles. `reset()` is gated on the previous socket surviving past
+        // `cfg.drop_grace` — sockets that died inside that window count as thrashes, so the
+        // schedule keeps growing and successive ProducerReady-then-drop cycles slow down
+        // geometrically up to `max_backoff`. The attempt counter is per-cycle (it gates
+        // `max_attempts` give-up, not the cadence).
+        let backoff = backoff.get_or_insert_with(|| cfg.build_backoff(seed));
+        if cfg.should_reset_backoff(socket_alive_since.elapsed()) {
+            backoff.reset();
+        }
         let mut attempt: u32 = 0;
 
         // Reconnect loop — keep trying until we land a fresh socket + handshake OR exhaust
@@ -553,6 +573,7 @@ async fn supervised_driver_loop(
         shared.driver_waker.notify_one();
 
         socket = new_socket;
+        socket_alive_since = Instant::now();
         last_inner_result = driver_loop_inner(&shared, &mut socket).await;
     }
 }
