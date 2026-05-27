@@ -13,9 +13,9 @@
 //!
 //! - timeouts are typed `Duration` instead of millis-as-`u64` (the mapping module documents the
 //!   conversion).
-//! - the consumer surface splits into [`StreamConsumer`] (Exclusive / Failover) and
-//!   [`QueueConsumer`] (Shared / KeyShared) so the subscription-type pivot is enforced by the type
-//!   system rather than at runtime.
+//! - the consumer surface splits into [`crate::v5::StreamConsumer`] (Exclusive / Failover) and
+//!   [`crate::v5::QueueConsumer`] (Shared / KeyShared) so the subscription-type pivot is enforced
+//!   by the type system rather than at runtime.
 //! - the producer's `send` returns `Option<MessageId>` (the broker may not assign one for
 //!   fire-and-forget paths).
 //!

@@ -419,6 +419,30 @@ pub async fn ack_cumulative_with_interceptors(
 /// `producer.new_message().key(..).value(..).send().await` entry point.
 ///
 /// Bring it into scope with `use magnetar::ProducerExt;`.
+///
+/// # Why an extension trait
+///
+/// The trait exists to satisfy Rust's orphan rule: [`MessageBuilder`]
+/// lives in this façade crate (`magnetar`), and `Producer` lives in
+/// `magnetar-runtime-tokio` (a downstream crate from `magnetar`'s
+/// perspective in the workspace dep graph). Neither side can directly
+/// `impl MessageBuilder<'_>` against the foreign `Producer` without
+/// the trait indirection.
+///
+/// Two alternatives were considered and rejected (see
+/// `docs/follow-ups.md` §11):
+///
+/// - **Move `MessageBuilder` + `OutgoingMessage` to a new shared crate** that both `magnetar` and
+///   `magnetar-runtime-tokio` depend on. Cleanest layering but adds a crate to publish.
+/// - **Move `MessageBuilder` down into `magnetar-runtime-tokio`**. Inverts the workspace dep graph
+///   and ties `MessageBuilder` to the tokio engine specifically — bad fit because the V5 surface
+///   and any future engine-generic producer surface want `MessageBuilder` at the façade tier.
+///
+/// **Chosen path: accept the trait as a zero-cost layering artefact.**
+/// The single-impl trait is the canonical Rust workaround for this
+/// shape; bringing it into scope with `use magnetar::ProducerExt;` is
+/// a one-line cost at every call site, and the trait + impl produce
+/// no runtime overhead.
 pub trait ProducerExt {
     /// Start a new [`OutgoingMessage`] bound to this producer. Chain the same setters as
     /// `OutgoingMessage` ([`OutgoingMessage::key`], [`OutgoingMessage::value`],
@@ -805,9 +829,10 @@ impl PulsarClient<crate::TokioEngine> {
         &self.inner
     }
 
-    /// Start building a client. Returns a tokio-engine [`ClientBuilder`] —
-    /// the default `E = TokioEngine` on [`PulsarClient<E>`]. Users targeting
-    /// the moonpool engine open the engine directly via
+    /// Start building a client. Returns a tokio-engine
+    /// [`crate::ClientBuilder`] — the default `E = TokioEngine` on
+    /// [`PulsarClient<E>`]. Users targeting the moonpool engine open
+    /// the engine directly via
     /// [`magnetar_runtime_moonpool::MoonpoolEngine`] (see
     /// [`PulsarClient::<MoonpoolEngine<P>>::from_moonpool`](crate::PulsarClient)
     /// for the equivalent constructor).
@@ -821,7 +846,7 @@ impl PulsarClient<crate::TokioEngine> {
     /// configured (the Java default).
     ///
     /// **Note**: today this is configuration-only — the runtime does not yet
-    /// enforce the limit. See [`ClientBuilder::memory_limit`] for the planned
+    /// enforce the limit. See [`crate::ClientBuilder::memory_limit`] for the planned
     /// follow-up.
     #[must_use]
     pub fn memory_limit(&self) -> Option<MemoryLimit> {
@@ -966,23 +991,27 @@ impl PulsarClient<crate::TokioEngine> {
 }
 
 impl<E: crate::Engine> PulsarClient<E> {
-    /// Open a [`ProducerBuilder`] for the given topic. Engine-generic — the
-    /// underlying transport is selected at construction time.
+    /// Open a [`crate::ProducerBuilder`] for the given topic.
+    /// Engine-generic — the underlying transport is selected at
+    /// construction time.
     #[must_use]
     pub fn producer(&self, topic: impl Into<String>) -> crate::builders::ProducerBuilder<'_, E> {
         crate::builders::ProducerBuilder::new(self, topic.into())
     }
 
-    /// Open a [`ConsumerBuilder`] for the given topic. Engine-generic — the
-    /// underlying transport is selected at construction time.
+    /// Open a [`crate::ConsumerBuilder`] for the given topic.
+    /// Engine-generic — the underlying transport is selected at
+    /// construction time.
     #[must_use]
     pub fn consumer(&self, topic: impl Into<String>) -> crate::builders::ConsumerBuilder<'_, E> {
         crate::builders::ConsumerBuilder::new(self, topic.into())
     }
 
-    /// Open a [`ReaderBuilder`] for the given topic. A reader is a non-durable, exclusive
-    /// consumer with an auto-generated subscription — useful for log inspection and replay.
-    /// Engine-generic — the underlying transport is selected at construction time.
+    /// Open a [`crate::ReaderBuilder`] for the given topic. A reader is a
+    /// non-durable, exclusive consumer with an auto-generated
+    /// subscription — useful for log inspection and replay.
+    /// Engine-generic — the underlying transport is selected at
+    /// construction time.
     #[must_use]
     pub fn reader(&self, topic: impl Into<String>) -> crate::builders::ReaderBuilder<'_, E> {
         crate::builders::ReaderBuilder::new(self, topic.into())
@@ -1080,7 +1109,7 @@ where
 /// Java parity: `org.apache.pulsar.client.api.MemoryLimitPolicy`.
 ///
 /// Selects how the client behaves when the configured global publish memory budget is
-/// exhausted (see [`ClientBuilder::memory_limit`]).
+/// exhausted (see [`crate::ClientBuilder::memory_limit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryLimitPolicy {
     /// Fail new sends immediately with an `out of memory` error. Mirrors Java
@@ -1092,7 +1121,7 @@ pub enum MemoryLimitPolicy {
 }
 
 /// Java parity: configured global publish memory budget. Stored verbatim on
-/// [`ClientBuilder`] and exposed to consumers via [`PulsarClient::memory_limit`].
+/// [`crate::ClientBuilder`] and exposed to consumers via [`PulsarClient::memory_limit`].
 ///
 /// **Note**: today this is configuration storage only — the actual enforcement
 /// (accounting against in-flight publish bytes per the policy) is a follow-up
