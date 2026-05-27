@@ -39,7 +39,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
 | 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ⚡ |
 | 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (partial) |
-| 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | ⚡ |
+| 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | 🔗 (blocked on upstream moonpool TaskProvider — see in-section investigation note) |
 | 10 | [`engine.rs` split](#10-enginers-split) | ⚡ |
 | 11 | [`ProducerExt` trait inline — DECISION: accept as layering artefact](#11-producerext-trait-inline) | ✅ decided (doc-only) |
 
@@ -363,14 +363,43 @@ the LocalSet pump gap.
 
 **Decision (Florentin, this session).** Restructure the
 differential runner to spawn the driver via plain `tokio::spawn`.
-Gives up moonpool-sim compatibility for the differential harness
-specifically (other moonpool-engine surfaces stay fully sim-
-compatible). Drops the 25 ms `Kicker` workaround.
+**Investigation result (this session, before dispatch).** The
+restructure as originally framed is structurally blocked: the
+driver task is not spawned BY `runner_moonpool.rs` — it is spawned
+INSIDE `magnetar_runtime_moonpool::Client::connect_plain` via the
+engine's `TaskProvider`, which is the moonpool-core
+`TokioTaskProvider` and hardcodes `tokio::task::Builder::new().spawn_local(...)`.
+The `TaskProvider` trait itself is `#[async_trait(?Send)]` with
+`spawn_task<F>(...) -> JoinHandle<()> where F: Future<Output = ()> + 'static`
+— no `Send` bound. `tokio::spawn` requires `Send`, so a drop-in
+`tokio::spawn` provider is not possible at the trait level without
+upstream changes.
 
-**`/goal`.**
+Two real paths forward, both substantial:
+
+1. **Upstream moonpool change.** Extend `TaskProvider` (or add a
+   sibling `SendTaskProvider`) so the trait accepts `Send + 'static`
+   futures and a tokio-side impl can use `tokio::spawn`. Files in
+   the magnetar workspace stay sim-compatible via the original
+   provider; the differential runner picks the Send-bound provider.
+   Coordinate with [PierreZ/moonpool](https://github.com/PierreZ/moonpool/) —
+   could ride on the same window as
+   [#111](https://github.com/PierreZ/moonpool/issues/111).
+2. **Bypass `Client::connect_plain` in the differential runner.**
+   Rebuild the driver-spawn path manually in
+   `runner_moonpool.rs` — call `Transport::connect_plain` directly,
+   construct `ConnectionShared` ourselves, `tokio::spawn` the
+   `driver_loop_inner` future. Substantial duplication of the
+   engine's wiring; brittle against future engine changes.
+
+Until one of those lands, keep the 25 ms `Kicker` workaround. It's
+correct, just ugly. Updated `/goal` (post-upstream-or-bypass-
+decision) below.
+
+**`/goal` (post-upstream).**
 
 ```text
-/goal restructure the differential moonpool runner per docs/follow-ups.md §9. Today the driver task is spawn_local'd into a tokio::task::LocalSet because moonpool_core::TokioProviders' TaskProvider uses spawn_local; the consequence is a ~30 s stall per consumer.receive() while the spawn_local'd driver isn't being polled, currently bridged by a 25 ms Kicker in crates/magnetar-differential/src/runner_moonpool.rs that pulses driver_waker.notify_one(). Replace this with a plain `tokio::spawn` of the driver task — gives up moonpool-sim compatibility FOR THE DIFFERENTIAL HARNESS ONLY (every other consumer of magnetar-runtime-moonpool stays fully sim-compatible). Concretely: (1) in crates/magnetar-differential/src/runner_moonpool.rs, replace the LocalSet + spawn_local with `tokio::spawn(driver_loop(...))`; (2) remove the Kicker struct + the 25 ms `tokio::time::interval` pulse loop; (3) update the module doc comment to document the trade-off (differential harness uses plain spawn for liveness; production engine usage stays sim-compatible via TokioProviders); (4) run the golden_traces test suite and verify no regression — should now run faster without the Kicker pulse overhead. Validation chain per CLAUDE.md. If any other code paths depend on the LocalSet (e.g. spawn_local'd consumers that the runner constructs), migrate them to plain tokio::spawn in the same commit.
+/goal restructure the differential moonpool runner per docs/follow-ups.md §9 ONCE the upstream moonpool TaskProvider gains a Send-bound spawn entry point (see the investigation note in §9 — magnetar cannot land this in-tree without either upstream change or duplicating the engine's driver-spawn wiring). When the upstream lands: (1) construct a custom Providers type in crates/magnetar-differential/src/runner_moonpool.rs that uses the Send-bound provider for Task and reuses TokioNetworkProvider / TokioTimeProvider / TokioRandomProvider / TokioStorageProvider for the rest; (2) drop the LocalSet wrapper in `pub async fn run(...)` — `local.run_until(run_inner(...))` becomes `run_inner(...).await`; (3) delete the Kicker struct + 25 ms pulse loop; (4) update the module doc comment to document the trade-off (differential harness uses Send-bound provider for liveness; production engine usage stays sim-compatible via TokioProviders); (5) run golden_traces, verify no regression. Validation chain per CLAUDE.md.
 ```
 
 ---
