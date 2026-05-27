@@ -2221,7 +2221,7 @@ mod tests {
                 batch_size: 0,
             },
             payload: Bytes::from_static(b"retryme"),
-            metadata: magnetar_proto::pb::MessageMetadata::default(),
+            metadata: std::sync::Arc::new(magnetar_proto::pb::MessageMetadata::default()),
             single_metadata: None,
             redelivery_count: 0,
             broker_entry_metadata: None,

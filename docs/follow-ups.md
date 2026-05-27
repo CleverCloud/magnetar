@@ -47,18 +47,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   is actually injectable.
 ### Open — zero-copy
 
-- **Batched-consumer per-message metadata clone** —
-  `crates/magnetar-proto/src/consumer.rs::classify_and_queue` (batched
-  delivery loop) — for each message in a batch (loop iterating
-  `num_in_batch` times), `pb::MessageMetadata` and `BrokerEntryMetadata`
-  are cloned into a fresh `IncomingMessage`. A 100-message batch =
-  100 metadata clones of identical data. Wrap in
-  `Arc<MessageMetadata>` so all messages in the batch share by Arc.
-- **Chunked-message metadata clone** —
-  `crates/magnetar-proto/src/consumer.rs::ChunkBuffer` (first-chunk
-  arrival + final assembly) — metadata cloned on first-chunk arrival,
-  then again on final assembly. Arc-wrap in `ChunkBuffer`, or move out
-  (not clone) on assembly.
 - **`crates/magnetar-proto/src/frame.rs::encode_payload`** — single
   `BytesMut` accumulator copies every payload into the wire buffer.
   Return a frame descriptor `{head: BytesMut, payload: Bytes}` and
