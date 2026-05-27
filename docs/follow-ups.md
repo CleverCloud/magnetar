@@ -110,9 +110,24 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   `anti_thrash.rs` satellites (~500 lines each). `client.rs` could
   move builders to `builders.rs`. `engine.rs` could become
   `engine/{traits,tokio,moonpool}.rs`.
-- **Test-helper duplication** — `handshake_response_bytes()` defined
-  in multiple test files across both runtimes. Consolidate (or
-  document intentional per ADR-0024).
+- **Test-helper duplication** — `handshake_response_bytes()` and the
+  related fixture-byte builders show up in multiple test files. The
+  **cross-runtime** duplication (tokio vs. moonpool) is intentional
+  per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
+  — the strict tokio ↔ moonpool 1:1 test-count parity check requires
+  each runtime to carry its own copy of the fixture (a shared crate
+  would be one file in either runtime, not one per test). The
+  **within-runtime** duplication can collapse:
+  `magnetar-runtime-moonpool/tests/common/mod.rs` already exposes a
+  shared `pub fn handshake_response_bytes()`; `magnetar-runtime-tokio`
+  has no equivalent `tests/common/` module yet, and the four tokio
+  integration tests + two `#[cfg(test)]` modules in
+  `producer.rs` / `consumer.rs` each carry their own copy. Adding a
+  `crates/magnetar-runtime-tokio/tests/common/mod.rs` mirroring the
+  moonpool layout closes the redundant 4× copies in the tokio test
+  files. The `src/` `#[cfg(test)]` copies cannot share via that
+  module (test mods inside `src/` can't import from `tests/`); those
+  stay co-located with the unit tests they support.
 
 ---
 
