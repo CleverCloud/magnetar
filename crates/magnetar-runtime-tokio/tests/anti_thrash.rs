@@ -29,6 +29,9 @@ use magnetar_proto::{
 };
 use magnetar_runtime_tokio::ConnectionShared;
 
+mod common;
+use common::handshake_response_bytes;
+
 fn supervisor_with_anti_thrash() -> SupervisorConfig {
     SupervisorConfig {
         anti_thrash_threshold: Some(AntiThrashThreshold {
@@ -40,22 +43,6 @@ fn supervisor_with_anti_thrash() -> SupervisorConfig {
         max_backoff_after_thrash: Duration::from_secs(30),
         ..SupervisorConfig::default()
     }
-}
-
-fn handshake_response_bytes() -> BytesMut {
-    let cmd = pb::BaseCommand {
-        r#type: pb::base_command::Type::Connected as i32,
-        connected: Some(pb::CommandConnected {
-            server_version: "magnetar-test".to_owned(),
-            protocol_version: Some(21),
-            max_message_size: Some(5 * 1024 * 1024),
-            feature_flags: Some(pb::FeatureFlags::default()),
-        }),
-        ..Default::default()
-    };
-    let mut buf = BytesMut::new();
-    encode_command(&mut buf, &cmd).expect("encode CommandConnected");
-    buf
 }
 
 fn producer_success_bytes(request_id: u64) -> BytesMut {

@@ -14,26 +14,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use magnetar_proto::producer::OutgoingMessage;
-use magnetar_proto::{ConnectionConfig, CreateProducerRequest, encode_command, pb};
+use magnetar_proto::{ConnectionConfig, CreateProducerRequest, pb};
 use magnetar_runtime_tokio::ConnectionShared;
 
-fn handshake_response_bytes() -> BytesMut {
-    let cmd = pb::BaseCommand {
-        r#type: pb::base_command::Type::Connected as i32,
-        connected: Some(pb::CommandConnected {
-            server_version: "magnetar-test".to_owned(),
-            protocol_version: Some(21),
-            max_message_size: Some(5 * 1024 * 1024),
-            feature_flags: Some(pb::FeatureFlags::default()),
-        }),
-        ..Default::default()
-    };
-    let mut buf = BytesMut::new();
-    encode_command(&mut buf, &cmd).expect("encode CommandConnected");
-    buf
-}
+mod common;
+use common::handshake_response_bytes;
 
 /// Bring a `ConnectionShared` to `Connected` so `create_producer` runs
 /// cleanly.

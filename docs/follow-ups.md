@@ -119,21 +119,19 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 - **Test-helper duplication** — `handshake_response_bytes()` and the
   related fixture-byte builders show up in multiple test files. The
   **cross-runtime** duplication (tokio vs. moonpool) is intentional
-  per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
-  — the strict tokio ↔ moonpool 1:1 test-count parity check requires
-  each runtime to carry its own copy of the fixture (a shared crate
-  would be one file in either runtime, not one per test). The
-  **within-runtime** duplication can collapse:
-  `magnetar-runtime-moonpool/tests/common/mod.rs` already exposes a
-  shared `pub fn handshake_response_bytes()`; `magnetar-runtime-tokio`
-  has no equivalent `tests/common/` module yet, and the four tokio
-  integration tests + two `#[cfg(test)]` modules in
-  `producer.rs` / `consumer.rs` each carry their own copy. Adding a
-  `crates/magnetar-runtime-tokio/tests/common/mod.rs` mirroring the
-  moonpool layout closes the redundant 4× copies in the tokio test
-  files. The `src/` `#[cfg(test)]` copies cannot share via that
-  module (test mods inside `src/` can't import from `tests/`); those
-  stay co-located with the unit tests they support.
+  per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md):
+  the strict tokio ↔ moonpool 1:1 test-count parity check requires
+  each runtime to carry its own copy. The **within-runtime tokio**
+  duplication has been collapsed: a shared
+  `crates/magnetar-runtime-tokio/tests/common/mod.rs` mirrors the
+  moonpool layout, and `anti_thrash.rs` / `reconnect_with_inflight.rs`
+  / `two_producers_parallel.rs` all import the helper from there
+  instead of re-defining it. The `src/` `#[cfg(test)]` copies in
+  `producer.rs` / `consumer.rs` cannot share via that module (test
+  mods inside `src/` can't import from `tests/`); those stay
+  co-located with the unit tests they support — they're the
+  remaining duplication and are out of scope unless rearranged into
+  a `pub(crate)` test-helper module under `src/`.
 
 ---
 
