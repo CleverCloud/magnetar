@@ -26,6 +26,11 @@ crypto-aws-lc-rs = ["rustls/aws_lc_rs"]
 crypto-ring      = ["rustls/ring"]
 crypto-fips      = ["rustls/fips"]
 crypto-openssl   = []
+# ZTS round-trip — opt-in HTTP client + caching layer that exchanges a
+# caller-signed JWT for an Athenz role token via the ZTS REST endpoint.
+# Off by default; callers without `zts` keep the lightweight
+# `with_role_token` path (the caller hands an already-minted role token).
+zts              = ["dep:reqwest", "dep:tokio", "dep:url"]
 
 [dependencies]
 bytes          = { workspace = true }
@@ -35,3 +40,6 @@ serde          = { workspace = true }
 serde_json     = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
+reqwest        = { workspace = true, optional = true }
+tokio          = { workspace = true, optional = true, features = ["sync", "time"] }
+url            = { workspace = true, optional = true }

@@ -1625,11 +1625,14 @@ version = "0.1.0-dev.0"
 dependencies = [
  "bytes",
  "magnetar-proto",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

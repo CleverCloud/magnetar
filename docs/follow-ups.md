@@ -254,23 +254,29 @@ which are substantial scaffolding work.
 
 ### Athenz ZTS round-trip
 
-**Status.** `AthenzProvider::with_role_token` ships (callers that
-already hold a valid ZTS role token can hand it directly to the
-provider). `AthenzProvider::new(...).initial` returns
-`AuthError::Unsupported`.
+**Status.** Scaffold landed behind
+`feature = "auth-athenz-zts"` (default off). `zts::ZtsClient` wraps the
+reqwest-backed `POST /zts/v1/oauth2/token` exchange with
+`tokio::sync::Mutex`-guarded, expiry-aware caching;
+`AthenzProvider::with_zts_client(...)` + `refresh_via_zts(...)` (async)
+primes the cache; `initial()` (sync) returns the cached role token.
+JWT signing is intentionally factored into a pluggable
+`zts::JwtSigner` trait — the magnetar workspace ships no concrete
+signer because the choice (jsonwebtoken vs. aws-lc-rs vs. ring vs.
+HSM-backed) is downstream-policy-dependent (FIPS posture,
+key-management story, hardware-backed key support).
 
-**Unblock.** Deferred to v0.2.0 per
-[ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D3 and [ADR-0030](../specs/adr/0030-athenz-zts-round-trip-scope.md).
-The work item is implementing a minimal `reqwest`-backed ZTS client
-that exchanges the tenant private key for a role token, caches it
-with an expiry-aware refresh, and surfaces failures through
-`AuthError`. Scope is ~400–600 LOC plus a Dockerised ZTS fixture
-(`athenz/athenz-zts-server`) for the e2e suite.
+**Remaining work** before flipping the parity matrix row from 🟡 to ✅:
 
-```text
-/goal land Athenz ZTS round-trip in magnetar-auth-athenz. Implement a reqwest-backed ZTS client that signs a token request with the tenant private key, caches the response with expiry-aware refresh, and uses it as the `auth_data` payload from `AthenzProvider::initial`. Add a Dockerised ZTS fixture behind the `e2e` feature, and flip the README parity matrix row from 🟡 to ✅. Test layers per ADR-0024.
-```
+1. A concrete `JwtSigner` impl (or documented external pattern using
+   `with_role_token` + a sidecar mint).
+2. A Dockerised Athenz ZTS fixture (`athenz/athenz-zts-server`) under
+   the `e2e` feature.
+3. The corresponding e2e tests gated `feature = "e2e,auth-athenz-zts"`.
+
+ADR-0030 deferral stays in place for the parsed-key `zeroize` wrap —
+that work belongs with the concrete `JwtSigner` impl since the parsed
+RSA key only materialises there.
 
 ---
 

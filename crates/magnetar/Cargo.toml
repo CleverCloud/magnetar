@@ -33,6 +33,9 @@ auth-sasl   = ["dep:magnetar-auth-sasl"]
 # or Heimdal runtime to be installed on the build host.
 auth-sasl-kerberos = ["auth-sasl", "magnetar-auth-sasl/kerberos"]
 auth-athenz = ["dep:magnetar-auth-athenz"]
+# Optional ZTS round-trip on top of `auth-athenz`. Pulls reqwest + tokio
+# into the athenz crate (see `magnetar-auth-athenz/zts`).
+auth-athenz-zts = ["auth-athenz", "magnetar-auth-athenz/zts"]
 encryption  = ["dep:magnetar-messagecrypto"]
 # End-to-end tests against a real Pulsar 4.x standalone broker via
 # `testcontainers-rs`. Requires Docker on the host. CI runs these in

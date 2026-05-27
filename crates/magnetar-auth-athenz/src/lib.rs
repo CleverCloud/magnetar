@@ -21,6 +21,36 @@ use bytes::Bytes;
 use magnetar_proto::{AuthError, AuthProvider};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "zts")]
+pub mod zts;
+
+/// Athenz-specific error returned by the optional ZTS client.
+/// Surfaced through [`AuthError::Provider`] when the high-level
+/// `AuthProvider::initial` path needs to bubble a ZTS failure.
+#[cfg(feature = "zts")]
+#[derive(Debug, thiserror::Error)]
+pub enum AthenzError {
+    /// Configuration problem (bad URL, missing field, etc.).
+    #[error("athenz config error: {0}")]
+    Config(String),
+    /// HTTP / network failure talking to the ZTS endpoint.
+    #[error("athenz transport: {0}")]
+    Transport(String),
+    /// Caller-supplied JWT signer returned an error.
+    #[error("athenz signer failure: {0}")]
+    SignerFailure(String),
+    /// ZTS endpoint returned a non-2xx response.
+    #[error("athenz ZTS rejected the role-token request: {0}")]
+    ZtsRejected(String),
+}
+
+#[cfg(feature = "zts")]
+impl From<AthenzError> for AuthError {
+    fn from(e: AthenzError) -> Self {
+        AuthError::Provider(Box::new(e))
+    }
+}
+
 /// Athenz tenant/service configuration.
 ///
 /// The `Debug` impl is manual: the `private_key_pem` field is redacted
@@ -65,24 +95,40 @@ impl std::fmt::Debug for AthenzConfig {
 }
 
 /// Athenz auth provider.
+///
+/// `AuthProvider::initial` is sync; the ZTS round-trip is async. The
+/// provider therefore exposes two construction paths:
+///
+/// - [`Self::with_role_token`] — the caller hands a pre-fetched role token (e.g. minted by an
+///   external `zts-agent` sidecar). `initial` returns it verbatim.
+/// - [`Self::with_zts_client`] (behind `feature = "zts"`) — the provider holds a
+///   [`zts::ZtsClient`]. The caller pumps the cache by calling [`Self::refresh_via_zts`] (async)
+///   before the connection's first `initial()` invocation; the cached token is what `initial()`
+///   returns. The runtime engine's `CommandAuthChallenge` path re-invokes `initial` on every
+///   challenge, so subsequent refreshes can be driven from outside.
 #[derive(Debug, Clone)]
 pub struct AthenzProvider {
     config: AthenzConfig,
     /// Optional pre-fetched role token. When set, `initial()` returns these bytes instead of
     /// performing a ZTS round-trip.
-    role_token: Option<Bytes>,
+    role_token: std::sync::Arc<std::sync::Mutex<Option<Bytes>>>,
+    #[cfg(feature = "zts")]
+    zts: Option<std::sync::Arc<zts::ZtsClient>>,
 }
 
 impl AthenzProvider {
     /// Construct an Athenz provider configured for ZTS-backed token fetch.
     ///
-    /// **M6 status:** the ZTS round-trip is not implemented; calling [`AuthProvider::initial`]
-    /// on this provider returns [`AuthError::Unsupported`].
+    /// Without [`Self::with_zts_client`], calling [`AuthProvider::initial`]
+    /// on this provider returns [`AuthError::Unsupported`] (the legacy
+    /// pre-`zts`-feature behaviour).
     #[must_use]
     pub fn new(config: AthenzConfig) -> Self {
         Self {
             config,
-            role_token: None,
+            role_token: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "zts")]
+            zts: None,
         }
     }
 
@@ -92,8 +138,43 @@ impl AthenzProvider {
     pub fn with_role_token(config: AthenzConfig, role_token: Bytes) -> Self {
         Self {
             config,
-            role_token: Some(role_token),
+            role_token: std::sync::Arc::new(std::sync::Mutex::new(Some(role_token))),
+            #[cfg(feature = "zts")]
+            zts: None,
         }
+    }
+
+    /// Construct an Athenz provider that exchanges a caller-signed JWT
+    /// for a role token via the supplied [`zts::ZtsClient`]. Call
+    /// [`Self::refresh_via_zts`] before the connection's first use to
+    /// warm the cache; subsequent challenges re-invoke `initial()` so
+    /// callers wanting automatic refresh wrap a `tokio::task::spawn`
+    /// loop around `refresh_via_zts` keyed on the cache's TTL.
+    #[cfg(feature = "zts")]
+    #[must_use]
+    pub fn with_zts_client(config: AthenzConfig, zts: std::sync::Arc<zts::ZtsClient>) -> Self {
+        Self {
+            config,
+            role_token: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            zts: Some(zts),
+        }
+    }
+
+    /// Refresh the cached role token via the configured ZTS client.
+    /// No-op when the provider was not built with [`Self::with_zts_client`].
+    ///
+    /// # Errors
+    /// Propagates [`AthenzError`] from the ZTS round-trip.
+    #[cfg(feature = "zts")]
+    pub async fn refresh_via_zts(&self) -> Result<(), AthenzError> {
+        let Some(zts) = self.zts.as_ref() else {
+            return Ok(());
+        };
+        let token = zts.fetch_role_token().await?;
+        if let Ok(mut guard) = self.role_token.lock() {
+            *guard = Some(token);
+        }
+        Ok(())
     }
 
     /// Borrow the Athenz configuration.
@@ -109,11 +190,12 @@ impl AuthProvider for AthenzProvider {
     }
 
     fn initial(&self) -> Result<Bytes, AuthError> {
-        match &self.role_token {
-            Some(token) => Ok(token.clone()),
+        let cached = self.role_token.lock().ok().and_then(|g| g.clone());
+        match cached {
+            Some(token) => Ok(token),
             None => Err(AuthError::Unsupported(
-                "Athenz ZTS round-trip not yet implemented; provide a pre-fetched role token \
-                 via AthenzProvider::with_role_token"
+                "Athenz role token not yet fetched; provide one via AthenzProvider::with_role_token \
+                 or call AthenzProvider::refresh_via_zts before the connection's first use"
                     .to_owned(),
             )),
         }
@@ -155,7 +237,13 @@ mod tests {
         let p = AthenzProvider::new(sample_config());
         assert_eq!(p.method(), "athenz");
         let err = p.initial().unwrap_err();
-        assert!(err.to_string().contains("ZTS"), "err={err}");
+        // Error message names the two recovery paths: pre-fetch via
+        // `with_role_token` or refresh via the optional ZTS client.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("role token") && rendered.contains("with_role_token"),
+            "err={rendered}",
+        );
     }
 
     #[test]
