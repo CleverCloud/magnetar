@@ -46,7 +46,7 @@ fn make_command(input: &FuzzInput) -> pb::BaseCommand {
             cmd.set_type(pb::base_command::Type::Flow);
             let mut f = pb::CommandFlow::default();
             f.consumer_id = u64::from(input.payload.len() as u32);
-            f.messages_permits = 1024;
+            f.message_permits = 1024;
             cmd.flow = Some(f);
         }
         4 => {
