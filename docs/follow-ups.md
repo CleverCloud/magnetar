@@ -93,11 +93,30 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   `ReaderBuilder<'a, E>` are 95% tokio-bound** — phantom `E`
   parameter on builder methods that ignore it. Move the generic only
   to the final `.create()` / `.subscribe()` dispatch.
-- **Large modules: `client.rs`, `engine.rs`, `conn.rs`** — split
-  candidates. `conn.rs` could shed `txn.rs`, `dlq.rs`,
-  `anti_thrash.rs` satellites (~500 lines each). `client.rs` could
-  move builders to `builders.rs`. `engine.rs` could become
-  `engine/{traits,tokio,moonpool}.rs`.
+- **Large modules: `client.rs` (2544 lines), `engine.rs` (2148 lines),
+  `conn.rs` (5724 lines)** — split candidates. The audit's original
+  suggestion that `conn.rs` shed `txn.rs` / `dlq.rs` /
+  `anti_thrash.rs` satellites is **stale**: `txn.rs` and
+  `anti_thrash.rs` already exist as sibling files in
+  `crates/magnetar-proto/src/`; `dlq.rs` lives inside
+  `consumer.rs::DeadLetterPolicy` / `ConsumerState.dead_letter_pending`
+  (no separate file today). The actual splittable areas now are:
+  - `conn.rs` lines 52–534 (~480 lines of `*Request` / `*Config` /
+    `*Outcome` / `KeySharedConfig` / `AckRequest` / `SeekTarget` type
+    definitions) → `crates/magnetar-proto/src/conn/types.rs`, with
+    `pub use` re-exports at the `conn::*` level so downstream
+    `use magnetar_proto::conn::{ConnectionConfig, OpOutcome};` paths
+    stay unchanged.
+  - `client.rs` `ProducerBuilder` / `ConsumerBuilder` / `ReaderBuilder`
+    blocks → `magnetar/src/builders.rs` (cross-cuts with the
+    phantom-`E` cleanup item above).
+  - `engine.rs` → `engine/{traits.rs, tokio.rs, moonpool.rs}` once the
+    per-engine impls grow further. Today the trait + two impls fit
+    comfortably; defer until the next per-engine surface lift makes
+    the file uncomfortably wide.
+  Each is a bounded but careful refactor: module reshuffling tickles
+  `pub use` re-exports and the `cargo doc -D warnings --cfg tokio_unstable`
+  sweep, so the validation chain has to re-run cleanly after each split.
 - **Test-helper duplication** — `handshake_response_bytes()` and the
   related fixture-byte builders show up in multiple test files. The
   **cross-runtime** duplication (tokio vs. moonpool) is intentional
