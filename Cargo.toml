@@ -57,6 +57,11 @@ futures-util    = { version = "^0.3.32", default-features = false }
 pin-project-lite = "^0.2.17"
 parking_lot     = "^0.12.5"
 slab            = "^0.4.12"
+# rustc-hash (FxHash) for hot-path HashMaps whose keys are u64-shaped
+# (SequenceId, batch tuples). The default SipHash is overkill for keys
+# we control end-to-end; FxHash is a tiny no-dep crate maintained by
+# the rust-lang team and used in rustc itself.
+rustc-hash      = "^2.1.2"
 
 # TLS — rustls everywhere, no native-tls. The provider sub-feature
 # (`ring` / `aws_lc_rs` / `fips`) is selected by each downstream crate

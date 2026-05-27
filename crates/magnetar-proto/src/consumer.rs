@@ -202,7 +202,7 @@ pub struct ConsumerState {
     /// is acked. When a batched message is acked individually, the client sends a partial
     /// ack carrying this bitset so the broker knows not to advance the cursor past the
     /// batch until every position is acked.
-    pub batch_ack_tracker: HashMap<(u64, u64), BatchAckEntry>,
+    pub batch_ack_tracker: rustc_hash::FxHashMap<(u64, u64), BatchAckEntry>,
     /// Optional ack-grouping tracker. When configured via
     /// `SubscribeRequest::ack_group_time`, the runtime's `Consumer::ack_grouped` family
     /// stages individual / cumulative acks here and the state machine flushes them as one
@@ -406,7 +406,7 @@ impl ConsumerState {
             total_chunked_msgs_received: 0,
             nack_tracker: None,
             unacked_tracker: None,
-            batch_ack_tracker: HashMap::new(),
+            batch_ack_tracker: rustc_hash::FxHashMap::default(),
             ack_tracker: None,
             crypto_failure_action: crate::conn::CryptoFailureAction::Fail,
             // 3 significant digits, auto-resizing — same precision the Java client uses for its

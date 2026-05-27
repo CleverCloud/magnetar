@@ -33,6 +33,10 @@ hdrhistogram = { workspace = true }
 # introduced by the split-connection-mutex refactor (see ADR-0038).
 # Already a workspace dep used by the runtime crates.
 parking_lot  = { workspace = true }
+# FxHash for the producer's `pending_index` and the consumer's
+# `batch_ack_tracker` hot maps. SipHash is overkill on u64-shaped
+# keys we control end-to-end.
+rustc-hash   = { workspace = true }
 
 [dev-dependencies]
 proptest  = { workspace = true }

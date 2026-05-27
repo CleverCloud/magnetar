@@ -28,7 +28,7 @@
 //! - `BatchMessageContainerImpl.java:172-179` (canAdd)
 //! - `BatchMessageContainerImpl.java:267-327` (flush)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::task::Waker;
 
 use bytes::Bytes;
@@ -155,7 +155,7 @@ pub struct ProducerState {
     /// In-flight `OpSend`s, ordered by sequence id.
     pub pending: VecDeque<OpSend>,
     /// Fast lookup for "is this sequence id pending?".
-    pending_index: HashMap<SequenceId, usize>,
+    pending_index: rustc_hash::FxHashMap<SequenceId, usize>,
     /// Batch container (only used when batching is enabled).
     pub batch: BatchContainer,
     /// Frames the user-pump should drain via [`Self::next_outbound_frame`].
@@ -467,7 +467,7 @@ impl ProducerState {
             last_sequence_id_pushed: -1,
             last_sequence_id_published: -1,
             pending: VecDeque::new(),
-            pending_index: HashMap::new(),
+            pending_index: rustc_hash::FxHashMap::default(),
             batch: BatchContainer::default(),
             outbound: VecDeque::new(),
             closed: false,

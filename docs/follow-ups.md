@@ -48,13 +48,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — performance / contention
 
-- **`pending_index: HashMap<SequenceId, usize>` uses SipHash** —
-  `crates/magnetar-proto/src/producer.rs::ProducerState.pending_index`
-  — key is a `u64` newtype. Switch to
-  `nohash_hasher::NoHashHasher<u64>` or `ahash::AHashMap`.
-- **`batch_ack_tracker: HashMap<(u64, u64), …>`** —
-  `crates/magnetar-proto/src/consumer.rs::ConsumerState.batch_ack_tracker`
-  — same SipHash overkill.
 - **`ProducerState::refresh_pending_index` clears + rebuilds on every
   ack** — `crates/magnetar-proto/src/producer.rs` — O(in-flight) work
   per receipt. Use a `VecDeque` with monotonic head and slot
