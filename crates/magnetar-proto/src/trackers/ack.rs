@@ -15,7 +15,7 @@
 //! - `ConsumerImpl.java:528-531` (creation)
 
 use core::time::Duration;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::types::{ConsumerHandle, MessageId};
@@ -44,7 +44,10 @@ pub enum AckAction {
 pub struct AckGroupingTracker {
     handle: ConsumerHandle,
     ack_group_time: Duration,
-    pending_individuals: HashSet<MessageId>,
+    /// `BTreeSet` (not `HashSet`) so `flush()` can drain in already-sorted
+    /// order — wire-traffic determinism without an extra `Vec::sort` per
+    /// flush.
+    pending_individuals: BTreeSet<MessageId>,
     pending_cumulative: Option<MessageId>,
     last_flush: Option<Instant>,
 }
@@ -56,7 +59,7 @@ impl AckGroupingTracker {
         Self {
             handle,
             ack_group_time,
-            pending_individuals: HashSet::new(),
+            pending_individuals: BTreeSet::new(),
             pending_cumulative: None,
             last_flush: None,
         }
@@ -118,9 +121,11 @@ impl AckGroupingTracker {
             });
         }
         if !self.pending_individuals.is_empty() {
-            let mut ids: Vec<MessageId> = self.pending_individuals.drain().collect();
-            // Sort to keep wire traffic deterministic across runs.
-            ids.sort();
+            // `BTreeSet` drains in sorted order, so the previous explicit
+            // `Vec::sort` is unnecessary.
+            let ids: Vec<MessageId> = std::mem::take(&mut self.pending_individuals)
+                .into_iter()
+                .collect();
             out.push(AckAction::SendIndividualAck {
                 handle: self.handle,
                 message_ids: ids,

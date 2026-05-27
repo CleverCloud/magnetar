@@ -59,10 +59,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
   ack** — `crates/magnetar-proto/src/producer.rs` — O(in-flight) work
   per receipt. Use a `VecDeque` with monotonic head and slot
   generation.
-- **`ack.rs` uses `HashSet` then drains-and-sorts** —
-  `crates/magnetar-proto/src/trackers/ack.rs` —
-  `BTreeSet<MessageId>` removes the post-drain sort allocation, or
-  `SmallVec` with threshold-based sort for small batches.
 - **`multi_topics.rs`, `pattern_consumer.rs` receive loops** — every
   `receive()` call clones the full consumer list and rebuilds a
   `Vec<Future>`. Keep an `Arc<[NamedConsumer]>` snapshot updated only
