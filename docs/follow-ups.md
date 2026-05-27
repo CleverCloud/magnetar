@@ -66,11 +66,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — syscall reduction
 
-- **Explicit `flush()` after every `write_all`** —
-  `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` —
-  for plaintext TCP, `flush()` is essentially a no-op; for TLS it can
-  force extra record work. Skip flush on plaintext; flush only at
-  batch boundaries.
 - **No `writev` / `IoSlice`** —
   `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` +
   `crates/magnetar-proto/src/conn.rs::poll_transmit` — outbound
