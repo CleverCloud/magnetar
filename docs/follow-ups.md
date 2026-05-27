@@ -294,13 +294,6 @@ Status snapshot:
 
 ### PIP-180 post-landing follow-ups
 
-- **Post-subscribe shadow-metadata cache race** — the per-`Consumer`
-  shadow metadata is resolved once at subscribe time and cached
-  for the consumer's lifetime. If a shadow is created on a topic
-  AFTER a consumer subscribed to it, the consumer will not pick up
-  the new shadow attachment until it re-subscribes. Documented in
-  [`shadow-topic.md`](shadow-topic.md) §Caveats. Low priority —
-  operators inspect via `magnetar shadow list <source>`.
 - **Moonpool `BrokerWorkload::ShadowReceive`** — the differential
   `ScriptedBroker` already echoes the client-asserted source id on
   `CommandSendReceipt`, so the moonpool sim_chaos suite doesn't
