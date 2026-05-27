@@ -116,9 +116,6 @@ catch, **[Δ]** = auditor disagreement with documented resolution.
 
 ### Open — security hardening
 
-- **SASL PLAIN over plaintext** — no transport-security check in
-  `crates/magnetar-auth-sasl/src/plain.rs`. Defensive: reject PLAIN
-  when the client builder did not negotiate TLS.
 - **Athenz private key as `String`** —
   `crates/magnetar-auth-athenz/src/lib.rs` — wrap parsed key in
   `zeroize::Zeroizing<…>` (ADR-0030 lists this as deferred to

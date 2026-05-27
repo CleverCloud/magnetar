@@ -112,6 +112,27 @@ impl SupervisorConfig {
             seed,
         )
     }
+
+    /// Policy gate for the engine drivers' persisted [`Backoff`] schedule:
+    /// returns `true` when the previous socket survived past [`Self::drop_grace`]
+    /// — i.e. when the previous reconnect counts as stable and the engine
+    /// should call [`Backoff::reset`] at the top of the next reconnect cycle.
+    ///
+    /// Sockets that died inside `drop_grace` of the most recent successful
+    /// attach are treated as thrashes: the schedule keeps growing, so
+    /// successive ProducerReady-then-drop cycles slow down geometrically up
+    /// to `max_backoff`. This is the per-handle defence in depth that pairs
+    /// with the connection-level anti-thrash cooldown (ADR-0028) — both must
+    /// be wired for the supervisor to bound CPU under the storm pattern hit
+    /// by clients sitting behind the Apache Pulsar Proxy.
+    ///
+    /// Engines call this from the top of the supervisor outer loop with the
+    /// wall-clock-elapsed time between the previous socket coming up and
+    /// `driver_loop_inner` returning (i.e. the socket's lifetime).
+    #[must_use]
+    pub fn should_reset_backoff(&self, socket_alive: Duration) -> bool {
+        socket_alive > self.drop_grace
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +179,87 @@ mod tests {
         assert_eq!(recommended.successful_attaches, 5);
         assert_eq!(recommended.window, Duration::from_secs(2));
         assert_eq!(recommended.drop_within, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn should_reset_backoff_gates_on_drop_grace() {
+        let cfg = SupervisorConfig::default();
+        assert_eq!(cfg.drop_grace, Duration::from_millis(500));
+        assert!(!cfg.should_reset_backoff(Duration::ZERO));
+        assert!(!cfg.should_reset_backoff(Duration::from_millis(50)));
+        assert!(!cfg.should_reset_backoff(Duration::from_millis(499)));
+        assert!(
+            !cfg.should_reset_backoff(Duration::from_millis(500)),
+            "drop_grace itself is the upper bound of the thrash window — strict >"
+        );
+        assert!(cfg.should_reset_backoff(Duration::from_millis(501)));
+        assert!(cfg.should_reset_backoff(Duration::from_secs(1)));
+        assert!(cfg.should_reset_backoff(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn should_reset_backoff_respects_custom_drop_grace() {
+        let cfg_tight = SupervisorConfig {
+            drop_grace: Duration::from_millis(50),
+            ..SupervisorConfig::default()
+        };
+        assert!(!cfg_tight.should_reset_backoff(Duration::from_millis(40)));
+        assert!(cfg_tight.should_reset_backoff(Duration::from_millis(60)));
+
+        let cfg_lax = SupervisorConfig {
+            drop_grace: Duration::from_secs(5),
+            ..SupervisorConfig::default()
+        };
+        assert!(!cfg_lax.should_reset_backoff(Duration::from_secs(4)));
+        assert!(cfg_lax.should_reset_backoff(Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn supervisor_storm_schedule_grows_geometrically_without_reset() {
+        let cfg = SupervisorConfig {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(60),
+            mandatory_stop: Duration::from_secs(60 * 60),
+            drop_grace: Duration::from_millis(500),
+            ..SupervisorConfig::default()
+        };
+        let mut backoff = cfg.build_backoff(1);
+        let mut delays = Vec::new();
+        for _ in 0..10 {
+            let socket_alive = Duration::from_millis(5);
+            if cfg.should_reset_backoff(socket_alive) {
+                backoff.reset();
+            }
+            delays.push(backoff.next());
+        }
+        let first = delays[0];
+        assert!(
+            first <= Duration::from_millis(100),
+            "first delay starts at initial (with jitter), got {first:?}"
+        );
+        let third = delays[2];
+        assert!(
+            third >= Duration::from_millis(320),
+            "third delay must reflect at least 4x growth (got {third:?})"
+        );
+        // 8th call: base 12.8 s (= initial × 2^7), with up to 20 % jitter
+        // → 10.24 – 12.8 s. The lower bound proves the schedule is no
+        // longer near `initial`; the higher you go, the more obvious the
+        // storm is bounded.
+        let eighth = delays[7];
+        assert!(
+            eighth >= Duration::from_secs(10) || eighth == cfg.max_backoff,
+            "schedule must approach max_backoff under sustained thrash, got {eighth:?}"
+        );
+
+        if cfg.should_reset_backoff(Duration::from_secs(2)) {
+            backoff.reset();
+        }
+        let after_reset = backoff.next();
+        assert!(
+            after_reset <= Duration::from_millis(100),
+            "schedule resets to initial after a stable socket, got {after_reset:?}"
+        );
     }
 
     #[test]
