@@ -9,7 +9,7 @@
 //!
 //! # Surface
 //!
-//! Three construction paths, mirroring [`magnetar_auth_oauth2::ClientCredentialsFlow`]'s
+//! Three construction paths, mirroring `magnetar_auth_oauth2::ClientCredentialsFlow`'s
 //! cache-then-serve shape:
 //!
 //! - [`AthenzProvider::with_role_token`] — the caller hands a pre-fetched role token (e.g. minted

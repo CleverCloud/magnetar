@@ -38,7 +38,7 @@
 //! the module is empty, [`crate::AthenzProvider::with_default_signer`]
 //! is not compiled, and callers wire their own [`crate::zts::JwtSigner`]
 //! impl (jsonwebtoken, an HSM bridge, …) via
-//! [`crate::AthenzProvider::with_zts_client`].
+//! [`crate::AthenzProvider::builder`].
 //!
 //! # Zeroization (ADR-0030 close-out)
 //!
@@ -75,7 +75,7 @@ use crate::AthenzError;
 /// Only compiled when at least one of `crypto-aws-lc-rs` /
 /// `crypto-ring` is enabled. Callers without either feature wire their
 /// own [`crate::zts::JwtSigner`] (jsonwebtoken / HSM bridge / etc.) via
-/// [`crate::AthenzProvider::with_zts_client`].
+/// [`crate::AthenzProvider::builder`].
 ///
 /// # Errors
 /// Surfaces [`AthenzError::Config`] or [`AthenzError::SignerFailure`]

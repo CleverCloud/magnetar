@@ -366,6 +366,8 @@ async fn e2e_v4_replicator_role_can_assert_source_message_id()
         partition: -1,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
     let payload = b"replicated-payload-pip180".to_vec();
 
@@ -559,6 +561,8 @@ async fn e2e_v4_non_replicator_role_send_with_source_id_is_rejected()
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
             };
             let send_result = tokio::time::timeout(
                 Duration::from_secs(30),

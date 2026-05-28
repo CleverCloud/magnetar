@@ -83,7 +83,7 @@ impl RingSigner {
     }
 
     /// Wrap the signer in [`Arc`] for handing to
-    /// [`crate::zts::ZtsClient::new`].
+    /// [`crate::zts::HttpZtsClient::new`] or [`crate::AthenzProvider::builder`].
     #[must_use]
     pub fn into_arc(self) -> Arc<dyn JwtSigner> {
         Arc::new(self)

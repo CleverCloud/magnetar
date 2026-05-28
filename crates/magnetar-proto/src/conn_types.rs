@@ -39,8 +39,9 @@ pub enum HandshakeState {
     Failed,
 }
 
-/// Identifier for a pending operation. Used by [`Connection::register_waker`] /
-/// [`Connection::take_outcome`].
+/// Identifier for a pending operation. Used by
+/// [`Connection::register_waker`](crate::conn::Connection::register_waker) /
+/// [`Connection::take_outcome`](crate::conn::Connection::take_outcome).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingOpKey {
     /// A pending request keyed by request id (lookup, seek, ack-response, etc.).
@@ -138,7 +139,8 @@ impl Default for ConnectionConfig {
     }
 }
 
-/// Result of consuming a pending op via [`Connection::take_outcome`].
+/// Result of consuming a pending op via
+/// [`Connection::take_outcome`](crate::conn::Connection::take_outcome).
 #[derive(Debug, Clone)]
 pub enum OpOutcome {
     /// A `CommandSendReceipt` correlated with the publish.
@@ -233,7 +235,8 @@ pub enum OpOutcome {
         /// Topics currently matching the watcher's namespace + pattern.
         topics: Vec<String>,
     },
-    /// `CommandGetSchemaResponse` correlated with a [`Connection::get_schema`] call.
+    /// `CommandGetSchemaResponse` correlated with a
+    /// [`Connection::get_schema`](crate::conn::Connection::get_schema) call.
     ///
     /// Carries the schema-registry round-trip outcome: `Ok((schema, version))` on success,
     /// `Err((code, message))` on failure.
