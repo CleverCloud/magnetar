@@ -17,6 +17,7 @@ contributors; this folder goes deeper.
 | [`testing.md`](testing.md) | Test categories (unit, integration, deterministic chaos, differential, e2e/Docker) and how to run them. |
 | [`parity-status.md`](parity-status.md) | Java parity snapshot — engine surface table and moonpool parity train. |
 | [`cli.md`](cli.md) | `magnetar` binary reference — `--version` banner, color policy, build-time metadata. |
+| [`athenz.md`](athenz.md) | Athenz auth provider — `AthenzProvider::with_default_signer`, the per-backend `AwsLcRsSigner` / `RingSigner`, crypto-provider matching, deterministic-signature guarantee. |
 | [`shadow-topic.md`](shadow-topic.md) | PIP-180 shadow topics — admin REST, producer-side `send_with_source_message_id`, consumer-side `MessageReceivedFromShadow`, structural `MessageId` equality, caveats. |
 | [`replicated-subscriptions.md`](replicated-subscriptions.md) | PIP-33 replicated subscriptions — `ConsumerBuilder::replicate_subscription_state(bool)`, broker-side prerequisites (two-cluster + namespace `replicated_subscription_status=true`), receive-path marker filter, observation channel. |
 | [`v5-client.md`](v5-client.md) | PIP-466 V5 client surface — `PulsarClientV5`, V5 → v4 mapping table, escape hatch, edge cases. Experimental (`feature = "experimental-v5-client"`, default off). |

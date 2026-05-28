@@ -1300,6 +1300,15 @@ fn run_git_in_capture(repo: &Path, args: &[&str]) -> Result<String> {
 /// `cargo build --workspace --all-features` already validates the cfg
 /// cascade in `magnetar-runtime-{tokio,moonpool}/src/tls_crypto.rs`;
 /// this check is the per-cell complement (issue #9, ADR-0035).
+///
+/// A second pass also builds the `magnetar-auth-athenz` crate in
+/// isolation across the cartesian product `{none, crypto-aws-lc-rs,
+/// crypto-ring, both}` × `{zts off, zts on}` so the concrete
+/// `JwtSigner` backends (ADR-0030 close-out — see
+/// `crates/magnetar-auth-athenz/src/jwt_signer/`) compile cleanly in
+/// every callable shape. The `none` cell preserves the "ship the
+/// trait, downstream picks the signer" stance from before the
+/// concrete backends landed.
 fn check_crypto_matrix() -> Result<()> {
     const PROVIDERS: &[&str] = &[
         "crypto-aws-lc-rs",
@@ -1307,11 +1316,22 @@ fn check_crypto_matrix() -> Result<()> {
         "crypto-openssl",
         "crypto-fips",
     ];
+    // Athenz signer matrix: `none` exercises the trait-only surface
+    // (existing v0.1.0 behaviour). `both` validates the cfg cascade —
+    // aws-lc-rs wins per ADR-0035 priority.
+    const ATHENZ_CELLS: &[&str] = &[
+        "",
+        "crypto-aws-lc-rs",
+        "crypto-ring",
+        "crypto-aws-lc-rs,crypto-ring",
+    ];
 
     let workspace_root = workspace_root()?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut failures: Vec<String> = Vec::new();
+    let mut total_cells: usize = 0;
 
+    // ── Façade matrix ─────────────────────────────────────────────
     for crypto in PROVIDERS {
         for base in ["tokio", "tokio,moonpool"] {
             let features = format!("{base},{crypto}");
@@ -1332,21 +1352,59 @@ fn check_crypto_matrix() -> Result<()> {
                 .with_context(|| {
                     format!("failed to invoke `cargo build` for features `{features}`")
                 })?;
+            total_cells += 1;
             if !status.success() {
-                failures.push(features);
+                failures.push(format!("magnetar:{features}"));
+            }
+        }
+    }
+
+    // ── Athenz signer matrix ──────────────────────────────────────
+    for athenz_features in ATHENZ_CELLS {
+        for base in ["", "zts"] {
+            let features = match (base.is_empty(), athenz_features.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => (*athenz_features).to_owned(),
+                (false, true) => (*base).to_owned(),
+                (false, false) => format!("{base},{athenz_features}"),
+            };
+            let mut args: Vec<&str> = vec![
+                "build",
+                "-p",
+                "magnetar-auth-athenz",
+                "--no-default-features",
+            ];
+            if !features.is_empty() {
+                args.extend(["--features", features.as_str()]);
+            }
+            eprintln!(
+                "xtask check-crypto-matrix: cargo build -p magnetar-auth-athenz --no-default-features --features '{features}'"
+            );
+            let status = StdCommand::new(&cargo)
+                .current_dir(&workspace_root)
+                .args(&args)
+                .status()
+                .with_context(|| {
+                    format!(
+                        "failed to invoke `cargo build -p magnetar-auth-athenz` for features `{features}`"
+                    )
+                })?;
+            total_cells += 1;
+            if !status.success() {
+                failures.push(format!("magnetar-auth-athenz:{features}"));
             }
         }
     }
 
     if failures.is_empty() {
-        eprintln!("xtask check-crypto-matrix: all 8 cells built successfully.");
+        eprintln!("xtask check-crypto-matrix: all {total_cells} cells built successfully.");
         Ok(())
     } else {
         for cell in &failures {
             eprintln!("xtask check-crypto-matrix: FAILED cell: {cell}");
         }
         bail!(
-            "xtask check-crypto-matrix: {} of 8 cell(s) failed.",
+            "xtask check-crypto-matrix: {} of {total_cells} cell(s) failed.",
             failures.len()
         );
     }

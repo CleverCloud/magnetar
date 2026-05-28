@@ -33,8 +33,8 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | - | --- | --- |
 | 1 | [Moonpool vectored I/O](#1-moonpool-vectored-io) | 🔗 [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) |
 | 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ✅ landed 2026-05-28 |
-| 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ⚡ |
-| 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | 🔗 (needs #3) |
+| 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ✅ landed 2026-05-28 |
+| 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | ⚡ (unblocked by #3) |
 | 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
 | 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
 | 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ✅ landed 2026-05-28 (TLS hunk); supervised-loop driver lines remain |
@@ -196,6 +196,34 @@ Land in a single PR — partial landings would leave the API in an inconsistent 
 ---
 
 ## 3. Athenz concrete `JwtSigner`
+
+**Status update (2026-05-28).** ✅ Landed in `feat/athenz-jwt-signer`.
+
+Two concrete backends ship in
+`crates/magnetar-auth-athenz/src/jwt_signer/{aws_lc_rs,ring}.rs`,
+gated on the workspace crypto-provider feature matrix per
+[ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md). New
+`AthenzProvider::with_default_signer(config)` constructor selects
+the cfg-active backend (aws-lc-rs first when both are enabled).
+Parsed PKCS#8 DER bytes wrapped in `zeroize::Zeroizing<Vec<u8>>`
+(closes the ADR-0030 deferral note); the keypair is rebuilt on each
+sign because aws-lc-rs / ring `RsaKeyPair` types are opaque
+C-allocated `EVP_PKEY`/`BIGNUM` wrappers that cannot be made
+`Zeroize`-friendly from Rust.
+
+Tests: 11 per-backend (parse / round-trip-verify / payload-claims /
+deterministic-signature / debug-redaction / zeroize-type-pin) plus 1
+cross-backend byte-identity test gated on both features (RSASSA-
+PKCS1-v1_5 SHA-256 is deterministic per RFC 8017 §8.2, so aws-lc-rs
+and ring must produce identical signature bytes). `xtask
+check-crypto-matrix` extended from 8 to 16 cells (façade ×
+`{none, aws-lc-rs, ring, both}` × `{zts off, zts on}` for the
+athenz crate). Docs: [`docs/athenz.md`](athenz.md), parity-status
+row + README parity row flipped to ✅.
+
+§4 is unblocked.
+
+### Original entry (kept for historical reference)
 
 **Gap.** `crates/magnetar-auth-athenz/src/zts.rs` ships the
 `ZtsClient` + `JwtSigner` trait, but no concrete signer

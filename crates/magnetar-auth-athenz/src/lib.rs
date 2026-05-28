@@ -21,6 +21,18 @@ use bytes::Bytes;
 use magnetar_proto::{AuthError, AuthProvider};
 use serde::{Deserialize, Serialize};
 
+// The concrete `JwtSigner` backends are only meaningful when paired
+// with the `zts` feature — they exist to feed the `zts::ZtsClient`,
+// and the `zts::{JwtSigner, ZtsClaims}` trait surface they implement
+// itself lives behind `feature = "zts"`. Gating the module on the
+// `(zts, crypto-*)` intersection keeps the standalone `crypto-*`
+// cells in the `cargo xtask check-crypto-matrix` cartesian product
+// compiling cleanly (no orphan-trait references).
+#[cfg(all(
+    feature = "zts",
+    any(feature = "crypto-aws-lc-rs", feature = "crypto-ring"),
+))]
+pub mod jwt_signer;
 #[cfg(feature = "zts")]
 pub mod zts;
 
@@ -158,6 +170,44 @@ impl AthenzProvider {
             role_token: std::sync::Arc::new(std::sync::Mutex::new(None)),
             zts: Some(zts),
         }
+    }
+
+    /// Construct an Athenz provider wired to the cfg-active concrete
+    /// [`zts::JwtSigner`] (aws-lc-rs or ring, per the workspace
+    /// crypto-provider feature matrix — ADR-0035). Mirrors the rustls
+    /// provider selection: enabling `crypto-aws-lc-rs` lights up the
+    /// aws-lc-rs signer, `crypto-ring` lights up the ring signer.
+    /// Under `--all-features` the cfg cascade picks aws-lc-rs first.
+    ///
+    /// Only compiled when at least one of `crypto-aws-lc-rs` /
+    /// `crypto-ring` is enabled **and** the `zts` feature is on.
+    /// Without either crypto feature, callers must hand-roll their
+    /// own `JwtSigner` impl (jsonwebtoken, an HSM bridge, …) and
+    /// build the provider via [`Self::with_zts_client`]. Without
+    /// `zts`, the lightweight [`Self::with_role_token`] path is the
+    /// only entry point (the caller hands an already-minted role
+    /// token).
+    ///
+    /// The `grant` argument follows [`zts::ZtsGrant`]'s default
+    /// (`ClientCredentials`) — call [`zts::ZtsClient::new`] directly
+    /// if the legacy `NToken` flavour is required.
+    ///
+    /// # Errors
+    /// Surfaces [`AthenzError::Config`] / [`AthenzError::SignerFailure`]
+    /// from the signer construction (PEM parse failure, ASN.1 reject,
+    /// …) or from the [`zts::ZtsClient::new`] HTTP-client build.
+    #[cfg(all(
+        feature = "zts",
+        any(feature = "crypto-aws-lc-rs", feature = "crypto-ring"),
+    ))]
+    pub fn with_default_signer(config: AthenzConfig) -> Result<Self, AthenzError> {
+        let signer = jwt_signer::default_signer_for(&config)?;
+        let zts_client = std::sync::Arc::new(zts::ZtsClient::new(
+            &config.zts_url,
+            zts::ZtsGrant::default(),
+            signer,
+        )?);
+        Ok(Self::with_zts_client(config, zts_client))
     }
 
     /// Refresh the cached role token via the configured ZTS client.

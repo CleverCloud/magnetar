@@ -95,8 +95,20 @@ schemars    = { version = "^1.2.1", default-features = false, features = ["deriv
 # PIP-37 chunking + identifiers
 uuid       = { version = "^1.23.1", default-features = false, features = ["v4", "fast-rng", "std"] }
 
-# PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly)
+# PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
+# Also serves as the default RSA backend for the Athenz JwtSigner under
+# `magnetar-auth-athenz/crypto-aws-lc-rs` (ADR-0030 + ADR-0035).
 aws-lc-rs  = { version = "^1.17.0", default-features = false, features = ["aws-lc-sys"] }
+# Alternate RSA backend for the Athenz JwtSigner under
+# `magnetar-auth-athenz/crypto-ring`. Same RSASSA-PKCS1-v1_5 SHA-256
+# signature bytes as aws-lc-rs (RFC 8017 deterministic encoding).
+ring       = { version = "^0.17.14", default-features = false }
+# Defense-in-depth: zero parsed-key material on drop. Used by the Athenz
+# concrete JwtSigner backends (ADR-0030).
+zeroize    = { version = "^1.8.2", default-features = false }
+# URL-safe-without-padding base64 for the JWS compact serialisation
+# emitted by the Athenz JwtSigner backends (RFC 7515 §3.1).
+base64     = { version = "^0.22.1", default-features = false, features = ["std"] }
 
 # SASL Kerberos / GSSAPI. Safe Rust wrapper over the system GSS-API
 # (libkrb5 / Heimdal). Only opted-in by `magnetar-auth-sasl` under its

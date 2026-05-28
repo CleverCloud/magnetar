@@ -1624,16 +1624,21 @@ dependencies = [
 name = "magnetar-auth-athenz"
 version = "0.1.0-dev.0"
 dependencies = [
+ "aws-lc-rs",
+ "base64",
  "bytes",
  "magnetar-proto",
  "reqwest",
+ "ring",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
  "url",
+ "zeroize",
 ]
 
 [[package]]

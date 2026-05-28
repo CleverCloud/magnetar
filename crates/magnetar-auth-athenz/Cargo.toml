@@ -16,14 +16,21 @@ categories    = { workspace = true }
 workspace = true
 
 [features]
-# Pluggable rustls crypto provider (issue #9, ADR-0035). This crate
-# only uses rustls types (cert / material), not the crypto provider
-# itself; the features exist so the façade's propagation chain compiles
-# uniformly across all rustls consumers. `crypto-openssl` is a no-op
-# here because rustls-openssl is a runtime provider crate, not a type
-# surface.
-crypto-aws-lc-rs = ["rustls/aws_lc_rs"]
-crypto-ring      = ["rustls/ring"]
+# Pluggable rustls crypto provider (issue #9, ADR-0035). Two roles:
+#
+# 1. propagate the rustls provider sub-feature so the façade's feature
+#    chain compiles uniformly across every rustls consumer; and
+# 2. select the RSA backend used by the concrete `JwtSigner` (ADR-0030).
+#
+# Both backends are mutually pluggable — under `--all-features` the cfg
+# cascade in `src/jwt_signer/mod.rs` picks aws-lc-rs first, mirroring
+# the rustls priority order in `magnetar-runtime-{tokio,moonpool}/src/
+# tls_crypto.rs`. `crypto-openssl` and `crypto-fips` propagate the
+# rustls provider sub-feature only — there is no `rustls-openssl` /
+# FIPS-specific signer backend (the FIPS-validated path comes from
+# `aws-lc-rs`'s FIPS feature, picked via `crypto-fips` upstream).
+crypto-aws-lc-rs = ["rustls/aws_lc_rs", "dep:aws-lc-rs", "dep:zeroize", "dep:base64", "dep:rustls-pki-types"]
+crypto-ring      = ["rustls/ring",      "dep:ring",      "dep:zeroize", "dep:base64", "dep:rustls-pki-types"]
 crypto-fips      = ["rustls/fips"]
 crypto-openssl   = []
 # ZTS round-trip — opt-in HTTP client + caching layer that exchanges a
@@ -33,13 +40,24 @@ crypto-openssl   = []
 zts              = ["dep:reqwest", "dep:tokio", "dep:url"]
 
 [dependencies]
-bytes          = { workspace = true }
-magnetar-proto = { workspace = true }
-rustls         = { workspace = true }
-serde          = { workspace = true }
-serde_json     = { workspace = true }
-thiserror      = { workspace = true }
-tracing        = { workspace = true }
-reqwest        = { workspace = true, optional = true }
-tokio          = { workspace = true, optional = true, features = ["sync", "time"] }
-url            = { workspace = true, optional = true }
+bytes            = { workspace = true }
+magnetar-proto   = { workspace = true }
+rustls           = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+reqwest          = { workspace = true, optional = true }
+tokio            = { workspace = true, optional = true, features = ["sync", "time"] }
+url              = { workspace = true, optional = true }
+# Concrete `JwtSigner` backends (ADR-0030 + ADR-0035). At most one is
+# active per build; under `--all-features` the cfg cascade in
+# `src/jwt_signer/mod.rs` prefers aws-lc-rs.
+aws-lc-rs        = { workspace = true, optional = true }
+ring             = { workspace = true, optional = true }
+zeroize          = { workspace = true, optional = true }
+base64           = { workspace = true, optional = true }
+# Used by the concrete signer backends to parse the tenant PKCS#8 PEM
+# into raw DER bytes; cheaper than pulling a dedicated PEM crate, and
+# `rustls-pki-types` is already a workspace dep.
+rustls-pki-types = { workspace = true, optional = true }

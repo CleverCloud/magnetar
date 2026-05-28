@@ -157,8 +157,16 @@ boundary.
 - **Security implications.** The tenant **RSA private key** is the
   hot artefact. Decisions: (a) the key is held as a `String` PEM in
   `AthenzConfig` per the current scaffold (no zeroization), but the
-  parsed `RsaPrivateKey` lives behind `Zeroizing<...>` in the
-  provider after parse-time; (b) N-Token signature uses
+  parsed PKCS#8 DER bytes live behind `Zeroizing<Vec<u8>>` in the
+  concrete signer backends — **closed by the
+  `crates/magnetar-auth-athenz/src/jwt_signer/{aws_lc_rs,ring}.rs`
+  landing**. Both `AwsLcRsSigner` and `RingSigner` wrap the parsed
+  DER under `zeroize::Zeroizing` and rebuild the `RsaKeyPair` on each
+  sign (the aws-lc-rs / ring `RsaKeyPair` types are opaque C-allocated
+  wrappers around `EVP_PKEY` / BIGNUM and cannot be made
+  `Zeroize`-friendly from Rust); the extra cost is one PKCS#8 ASN.1
+  parse per N-token mint, negligible alongside the 2048-bit modular
+  exponentiation. (b) N-Token signature uses
   RSASSA-PKCS1-v1_5 with SHA-256, matching Athenz; the `rsa` crate
   is reviewed and pinned; (c) the cached RoleToken is held in
   memory only — never written to disk; (d) ZTS HTTPS uses
