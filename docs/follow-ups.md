@@ -35,7 +35,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ✅ landed 2026-05-28 |
 | 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ✅ landed 2026-05-28 |
 | 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | ✅ landed 2026-05-28 |
-| 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
+| 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ✅ landed 2026-05-28 (self-hosting single-cluster fixture) |
 | 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
 | 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ✅ landed 2026-05-28 (TLS hunk); supervised-loop driver lines remain |
 | 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (cryptoFailureAction remains; txn ack-within-txn landed 2026-05-28) |
@@ -357,6 +357,67 @@ Dockerised ZTS fixture image (`athenz/athenz-zts-server`).
 ---
 
 ## 5. PIP-180 replicator-side e2e
+
+**Status update (2026-05-28).** ✅ Landed in
+`test/pip-180-replicator-e2e`. The e2e suite lives at
+[`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs)
+behind `feature = "e2e"`, both tests `#[ignore = "e2e: requires
+Docker"]`. Verified green against `apachepulsar/pulsar:4.0.4`
+(2 passed, ~24 s wall).
+
+**Scope adjustment vs the `/goal` — single cluster, not two.** PIP-180
+shadow topics are **intra-cluster** (the shadow shares the source's
+BookKeeper ledgers within one broker); cross-cluster replication is
+PIP-33, covered separately. The two-cluster framing in the original
+`/goal` conflated the two. The fixture is therefore one
+`testcontainers-rs` standalone container — still self-hosting, no
+external broker dependency — with token auth + a `replicator` role
+grant on `public/default`.
+
+**Broker contract observed (the load-bearing finding).** Running against
+a live 4.0.4 broker surfaced two things the scripted-broker differential
+test could not:
+
+1. `send_with_source_message_id` is gated by the broker on the **topic
+   type**, not the role: a regular topic rejects it with `SendRejected
+   { code: 22, message: "Only shadow topic supports sending messages
+   with messageId" }` (`code 22` = `ServerError::NotAllowedError`). The
+   producer must be on a registered **shadow** topic.
+2. On a live shadow topic the managed ledger is *source-backed*
+   (`ShadowManagedLedgerImpl`) — a client-fabricated source id pointing
+   at no real source entry is silently absorbed (no receipt, no
+   delivery). The `receipt_id == source_id` echo documented in
+   `docs/shadow-topic.md` is a property of the **scripted** broker, not
+   the live one.
+
+The positive test (`e2e_v4_replicator_role_can_assert_source_message_id`)
+therefore pins the topic-type gate from both sides with one authorised
+producer (regular → `code 22`; shadow → accepted on the wire). The
+negative test (`e2e_v4_non_replicator_role_send_with_source_id_is_rejected`)
+pins the orthogonal authorisation gate (no `produce` grant → rejected at
+producer attach). See
+[`docs/shadow-topic.md` §Replicator-role e2e setup](shadow-topic.md#replicator-role-e2e-setup).
+
+**Tokens** are hand-minted HS256 JWTs (`aws-lc-rs::hmac` + `base64`,
+both already dev-deps) — no `jsonwebtoken` added. The shadow topic is
+created via in-container `pulsar-admin topics create-shadow-topic`
+rather than `magnetar_admin::AdminClient::create_shadow_topic`, which
+sidesteps a discovered admin-client wire-shape bug (see below).
+
+**Spin-off follow-up — `create_shadow_topic` wire shape.** Pulsar
+4.0.4's `PUT /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics`
+endpoint deserialises the request body as a bare
+`List<String>`, but `magnetar_admin::AdminClient::create_shadow_topic`
+sends a `{"shadowTopics":[…]}` JSON object — the broker rejects with
+HTTP 400 *"Cannot deserialize value of type
+java.util.ArrayList<java.lang.String> from Object value"*. The admin
+client's own rustdoc claims the broker "accepts either", but 4.0.4 does
+not. Low priority (the CLI / `set-shadow-topics` path works; the bug
+only bites the dedicated `createShadowTopic` helper), but worth fixing:
+send the bare `List<String>` body, or probe the broker version. Filed
+here pending a dedicated fix PR.
+
+### Original entry (kept for historical reference)
 
 **Gap.** `crates/magnetar/tests/e2e_shadow_topic.rs` exercises the
 admin REST cycle + a regular produce-on-source / consume-on-shadow

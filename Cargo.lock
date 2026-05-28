@@ -1577,6 +1577,7 @@ name = "magnetar"
 version = "0.1.0-dev.0"
 dependencies = [
  "aws-lc-rs",
+ "base64",
  "bytes",
  "futures-util",
  "magnetar-admin",

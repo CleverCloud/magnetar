@@ -114,6 +114,10 @@ uuid                       = { workspace = true }
 # `MessageCrypto` round-trip. The non-test crate path stays free of this
 # heavy dep — encryption itself lives in `magnetar-messagecrypto`.
 aws-lc-rs          = { workspace = true }
+# `base64` powers the HS256 JWT minting in
+# `tests/e2e_shadow_topic_replicator.rs` (URL-safe-no-pad JWS segments).
+# Pure dev-dep — not pulled in for non-test builds.
+base64             = { workspace = true }
 magnetar-fakes     = { workspace = true }
 reqwest            = { workspace = true }
 schemars           = { workspace = true }

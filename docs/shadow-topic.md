@@ -228,6 +228,82 @@ to add the arm. By convention, magnetar treats `ConnectionEvent` as
 `#[non_exhaustive]`, so the addition is non-breaking — but a stale
 match arm will fail to compile.
 
+## Replicator-role e2e setup
+
+The producer-side replicator entry
+(`Producer::send_with_source_message_id`) is exercised against a real
+Apache Pulsar 4.0.4 broker by
+[`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs)
+(the executable reference). The fixture is **self-hosting** — one
+standalone container via `testcontainers-rs`, no external broker
+dependency, no second cluster (PIP-180 is intra-cluster; cross-cluster
+geo-replication is PIP-33, covered separately by
+[`docs/replicated-subscriptions.md`](replicated-subscriptions.md)).
+
+### Fixture (`start_pulsar_with_token_auth_and_replicator_role`)
+
+1. Boot a single `apachepulsar/pulsar:4.0.4` standalone container with
+   token auth turned on via `PULSAR_PREFIX_*` env overrides
+   (`authenticationEnabled=true`,
+   `authenticationProviders=…AuthenticationProviderToken`,
+   `authorizationEnabled=true`, `superUserRoles=admin`). The HS256
+   signing secret is seeded inline as
+   `tokenSecretKey=data:;base64,<b64>` — no bind-mount.
+2. Mint three HS256 JWTs in-process (`sub` claim = role), hand-encoded
+   with `aws-lc-rs::hmac`: `admin` (super-user), `replicator`,
+   `magnetar-test-user`.
+3. Pre-seed the namespace by exec'ing `pulsar-admin namespaces
+   grant-permission public/default --role replicator --actions
+   produce,consume` inside the container (waits for exit). The
+   non-replicator role is deliberately left **un-granted**.
+
+### Broker contract pinned
+
+The replicator-style send is gated by the broker on **two orthogonal
+axes**:
+
+| Gate | Enforced on | Failure surfaced |
+| --- | --- | --- |
+| **Authorisation** | producer attach | role lacks `produce` on the namespace → wire-level rejection on `producer.create()` |
+| **Topic type** | `CommandSend.message_id` | target is not a registered shadow → `SendRejected { code: 22, message: "Only shadow topic supports sending messages with messageId" }` (`code 22` = `ServerError::NotAllowedError`) |
+
+The two tests pin both:
+
+- `e2e_v4_replicator_role_can_assert_source_message_id` — one authorised
+  `replicator` producer. On a **regular** topic the source-id assertion
+  is refused with `code 22`; on a **shadow** topic (created via
+  in-container `pulsar-admin topics create-shadow-topic`) the same call
+  is **accepted** on the wire.
+- `e2e_v4_non_replicator_role_send_with_source_id_is_rejected` — a
+  producer whose role has no `produce` grant is rejected at attach time,
+  before the topic-type gate is even reached.
+
+### Caveat — no receipt echo on a live shadow
+
+The receipt-echo contract documented under
+[Producer — replicator-style send](#producer--replicator-style-send)
+(`receipt_id == source_id`) is a property of the **scripted** broker in
+the differential harness, which deterministically reflects the asserted
+id back. A **live** Pulsar 4.0.4 shadow topic does NOT: its managed
+ledger is *source-backed* (`ShadowManagedLedgerImpl`), so a
+client-fabricated source id pointing at no real source entry is silently
+absorbed — no `CommandSendReceipt`, no consumer delivery. The e2e test
+therefore pins "the send is **accepted** on a shadow but **rejected** on
+a regular topic", not a receipt round-trip. Running the suite:
+
+```sh
+cargo test --features e2e -p magnetar \
+    --test e2e_shadow_topic_replicator -- --include-ignored --nocapture
+```
+
+> **Admin-client wire-shape note.** The e2e creates the shadow topic via
+> the broker's own `pulsar-admin` CLI, not
+> `magnetar_admin::AdminClient::create_shadow_topic`, because Pulsar
+> 4.0.4's `PUT .../{source}/shadowTopics` endpoint deserialises the body
+> as a bare `List<String>` while the admin client sends a
+> `{"shadowTopics":[…]}` object (HTTP 400). That mismatch is tracked in
+> [`docs/follow-ups.md`](follow-ups.md).
+
 ## See also
 
 - [PIP-180 (upstream)](https://github.com/apache/pulsar/blob/master/pip/pip-180.md)
