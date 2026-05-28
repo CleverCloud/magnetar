@@ -16,6 +16,16 @@ publish       = false
 [lints]
 workspace = true
 
+[features]
+# PIP-460 scalable topics (ADR-0031). Turns on the scalable-topic golden
+# trace equivalence tests (tokio ↔ moonpool DagWatch event-stream parity).
+# Propagates the proto wire surface plus the engine `ScalableTopicsApi` impls.
+scalable-topics = [
+    "magnetar-proto/scalable-topics",
+    "magnetar-runtime-tokio/scalable-topics",
+    "magnetar-runtime-moonpool/scalable-topics",
+]
+
 [dependencies]
 magnetar-proto            = { workspace = true }
 magnetar-runtime-tokio    = { workspace = true }

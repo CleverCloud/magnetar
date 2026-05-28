@@ -15,6 +15,19 @@ categories    = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+# PIP-460 scalable topics (ADR-0031). Default OFF — until upstream cuts a
+# Pulsar 5.0 RC that includes PIP-460, the new wire commands are
+# hand-encoded as `#[derive(prost::Message)]` structs in
+# `src/pb/scalable_topics.rs` rather than vendored into the generated
+# `pb/pulsar.proto.rs`. Enabling the feature compiles the
+# `pb::scalable_topics` module, the `dag_watch` state machine, the new
+# `Conn` entries, the new `ConnectionEvent` variants, and the
+# `MessageId.segment_id` extension. No new dependency — `prost` is already
+# in the dependency set.
+default          = []
+scalable-topics  = []
+
 [dependencies]
 bytes        = { workspace = true }
 crc32c       = { workspace = true }

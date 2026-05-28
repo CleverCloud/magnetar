@@ -61,6 +61,129 @@ impl fmt::Display for SequenceId {
     }
 }
 
+/// PIP-460 segment identifier — unique within a scalable topic's segment DAG.
+///
+/// **Experimental** (PIP-460, ADR-0031). Only meaningful under
+/// `feature = "scalable-topics"`; carried on [`MessageId::segment_id`] for
+/// messages read from a scalable topic.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SegmentId(pub u64);
+
+#[cfg(feature = "scalable-topics")]
+impl fmt::Display for SegmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// PIP-460 hash key range `[start, end)` a segment is responsible for.
+///
+/// **Experimental** (PIP-460, ADR-0031). v0.2.0 surfaces the key range for
+/// observation only — segment-aware sticky-key dispatch (Key_Shared across
+/// the full DAG) is out of scope (v0.3.0+).
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KeyRange {
+    /// Inclusive start of the hash range.
+    pub start: u32,
+    /// Exclusive end of the hash range.
+    pub end: u32,
+}
+
+/// PIP-460 segment lifecycle state.
+///
+/// **Experimental** (PIP-460, ADR-0031). `#[non_exhaustive]` so a future
+/// broker enum value cannot break a `match` on this type downstream.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum SegmentState {
+    /// Segment is live and serving reads/writes.
+    #[default]
+    Active,
+    /// Segment is splitting into children.
+    Splitting,
+    /// Segment is merging into a child.
+    Merging,
+    /// Segment is sealed (no more writes); reads drain then it is removed.
+    Sealed,
+}
+
+#[cfg(feature = "scalable-topics")]
+impl SegmentState {
+    /// Convert from the wire enum integer, saturating unknown values to
+    /// [`Self::Active`] (forward-compatibility with a future broker enum).
+    #[must_use]
+    pub fn from_pb_i32(value: i32) -> Self {
+        match crate::pb::scalable_topics::SegmentStatePb::from_i32(value) {
+            crate::pb::scalable_topics::SegmentStatePb::Active => Self::Active,
+            crate::pb::scalable_topics::SegmentStatePb::Splitting => Self::Splitting,
+            crate::pb::scalable_topics::SegmentStatePb::Merging => Self::Merging,
+            crate::pb::scalable_topics::SegmentStatePb::Sealed => Self::Sealed,
+        }
+    }
+
+    /// Convert to the wire enum integer.
+    #[must_use]
+    pub fn to_pb_i32(self) -> i32 {
+        match self {
+            Self::Active => crate::pb::scalable_topics::SegmentStatePb::Active as i32,
+            Self::Splitting => crate::pb::scalable_topics::SegmentStatePb::Splitting as i32,
+            Self::Merging => crate::pb::scalable_topics::SegmentStatePb::Merging as i32,
+            Self::Sealed => crate::pb::scalable_topics::SegmentStatePb::Sealed as i32,
+        }
+    }
+}
+
+/// PIP-460 segment descriptor — one node of a scalable topic's segment DAG.
+///
+/// **Experimental** (PIP-460, ADR-0031). Returned by the scalable-topic
+/// lookup and carried in DAG-watch updates. `broker_url` is the segment
+/// leader's plaintext URL.
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentDescriptor {
+    /// Segment id, unique within the topic DAG.
+    pub segment_id: SegmentId,
+    /// Hash key range this segment serves.
+    pub key_range: KeyRange,
+    /// Plaintext broker URL serving this segment.
+    pub broker_url: String,
+    /// Lifecycle state.
+    pub state: SegmentState,
+}
+
+#[cfg(feature = "scalable-topics")]
+impl SegmentDescriptor {
+    /// Decode from the wire [`crate::pb::scalable_topics::SegmentDescriptor`].
+    #[must_use]
+    pub fn from_pb(pb: &crate::pb::scalable_topics::SegmentDescriptor) -> Self {
+        Self {
+            segment_id: SegmentId(pb.segment_id),
+            key_range: KeyRange {
+                start: pb.key_range_start,
+                end: pb.key_range_end,
+            },
+            broker_url: pb.broker_url.clone(),
+            state: SegmentState::from_pb_i32(pb.state),
+        }
+    }
+
+    /// Encode into the wire [`crate::pb::scalable_topics::SegmentDescriptor`].
+    #[must_use]
+    pub fn to_pb(&self) -> crate::pb::scalable_topics::SegmentDescriptor {
+        crate::pb::scalable_topics::SegmentDescriptor {
+            segment_id: self.segment_id.0,
+            broker_url: self.broker_url.clone(),
+            broker_url_tls: None,
+            key_range_start: self.key_range.start,
+            key_range_end: self.key_range.end,
+            state: self.state.to_pb_i32(),
+        }
+    }
+}
+
 /// A logical message identifier (ledger / entry / batch / partition).
 ///
 /// Mirrors the Java `MessageId` interface. `partition` defaults to `-1` for non-partitioned
@@ -74,6 +197,16 @@ impl fmt::Display for SequenceId {
 /// (same ledger/entry pointers as the original write), so a shadow-side reader
 /// observes ids that compare equal to the source-side reader's ids — "same
 /// message" is structurally evident and needs no out-of-band correlation key.
+///
+/// # PIP-460 scalable-topic segment (experimental)
+///
+/// Under `feature = "scalable-topics"` the id carries an optional
+/// `segment_id` field. The derived `PartialEq` / `Ord` / `Hash`
+/// give exactly the cross-mode contract ADR-0031 specifies: two v4 ids both
+/// carry `None`, so the segment field is a tie and the v4 invariant is
+/// preserved bit-for-bit; a scalable id (`Some(_)`) never compares equal to a
+/// v4 id (`None`) — so callers can't accidentally deduplicate across the
+/// scalable / partitioned mode boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId {
     /// Bookkeeper ledger id where the entry lives.
@@ -86,6 +219,12 @@ pub struct MessageId {
     pub batch_index: i32,
     /// Size of the batch the message came from, `-1` if not batched.
     pub batch_size: i32,
+    /// PIP-460 segment id (experimental). `None` for v4 partitioned /
+    /// non-partitioned topics — this preserves the v4 wire layout and
+    /// structural-equality contract. `Some(_)` only for messages read from a
+    /// scalable topic.
+    #[cfg(feature = "scalable-topics")]
+    pub segment_id: Option<SegmentId>,
 }
 
 impl MessageId {
@@ -96,6 +235,8 @@ impl MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
 
     /// A sentinel "latest" position. Mirrors `MessageId.latest`.
@@ -105,6 +246,8 @@ impl MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
 
     /// Construct a message id from the wire protobuf representation.
@@ -115,6 +258,8 @@ impl MessageId {
             partition: pb.partition.unwrap_or(-1),
             batch_index: pb.batch_index.unwrap_or(-1),
             batch_size: pb.batch_size.unwrap_or(-1),
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         }
     }
 
@@ -152,6 +297,25 @@ impl MessageId {
         use prost::Message as _;
         let pb = pb::MessageIdData::decode(bytes).ok()?;
         Some(Self::from_pb(&pb))
+    }
+
+    /// PIP-460: attach a [`SegmentId`] to this message id, marking it as read
+    /// from a scalable topic's segment. The runtime scalable layer calls this
+    /// when surfacing a message delivered on a per-segment v4 consumer so the
+    /// caller can correlate the id back to its DAG node.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn with_segment(mut self, segment_id: SegmentId) -> Self {
+        self.segment_id = Some(segment_id);
+        self
+    }
+
+    /// PIP-460: the segment this message was read from, if any. `None` for v4
+    /// partitioned / non-partitioned topics.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn segment(&self) -> Option<SegmentId> {
+        self.segment_id
     }
 }
 
@@ -221,6 +385,8 @@ mod tests {
             partition,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         }
     }
 
@@ -233,7 +399,57 @@ mod tests {
             partition,
             batch_index,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         }
+    }
+
+    /// Layer (a) test #4: `MessageId { segment_id: Some(..) }` round-trips
+    /// through [`MessageId::with_segment`] / [`MessageId::segment`], and the
+    /// v4-shape (`segment_id: None`) `to_bytes` is **byte-identical** to a
+    /// plain v4 id — the wire `MessageIdData` carries no segment field, so a
+    /// legacy producer / consumer round-trips bit-for-bit (ADR-0031 §2.1).
+    #[cfg(feature = "scalable-topics")]
+    #[test]
+    fn message_id_with_segment_roundtrip() {
+        let v4 = mid(10, 20, 1);
+        assert_eq!(v4.segment(), None, "v4 id has no segment");
+
+        // In-process segment attach / read.
+        let scaled = v4.with_segment(SegmentId(7));
+        assert_eq!(scaled.segment(), Some(SegmentId(7)));
+
+        // Cross-mode equality contract: scalable (`Some`) != v4 (`None`).
+        assert_ne!(scaled, v4, "Some(_) segment never equals None segment");
+        // Same segment + same coords == equal.
+        let scaled2 = mid(10, 20, 1).with_segment(SegmentId(7));
+        assert_eq!(scaled, scaled2);
+        // Different segment, same coords != equal.
+        let other_seg = mid(10, 20, 1).with_segment(SegmentId(8));
+        assert_ne!(scaled, other_seg);
+
+        // v4 invariant preserved: two `None`-segment ids compare exactly as
+        // the 5-field v4 contract did.
+        let v4b = mid(10, 20, 1);
+        assert_eq!(v4, v4b);
+
+        // Byte-identical guard: the wire `MessageIdData` has no segment field,
+        // so `to_bytes` for a `None`-segment id matches a freshly-built v4 id
+        // with the same coords. (The segment rides the lookup / DAG, not the
+        // per-message wire id, until the Pulsar 5.0 RC vendor bump.)
+        let none_seg = mid(10, 20, 1);
+        assert_eq!(
+            none_seg.to_bytes(),
+            v4.to_bytes(),
+            "None-segment wire encoding is byte-identical to v4"
+        );
+        // A `Some`-segment id encodes the same wire bytes (segment is dropped
+        // on the v0.2.0 wire) — documented scaffold behaviour.
+        assert_eq!(
+            scaled.to_bytes(),
+            v4.to_bytes(),
+            "segment is in-process only on the v0.2.0 scaffold wire"
+        );
     }
 
     #[test]
@@ -244,6 +460,8 @@ mod tests {
             partition: 2,
             batch_index: 7,
             batch_size: 16,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let bytes = id.to_bytes();
         let back = MessageId::from_bytes(&bytes).expect("decode");
@@ -351,6 +569,8 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let bytes = id.to_bytes();
         let back = MessageId::from_bytes(&bytes).expect("decode non-partitioned id");
@@ -371,6 +591,8 @@ mod tests {
             partition: 3,
             batch_index: 4,
             batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let bytes = id.to_bytes();
         let back = MessageId::from_bytes(&bytes).expect("decode batched id w/o batch_size");
@@ -397,6 +619,8 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: -1,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
             },
             "empty buffer decodes to wire-format defaults"
         );
@@ -414,6 +638,8 @@ mod tests {
             partition: 9,
             batch_index: 10,
             batch_size: 11,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let b = a;
         let mut set = HashSet::new();
@@ -456,6 +682,8 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let shadow_side = MessageId {
             ledger_id: 42,
@@ -463,6 +691,8 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         assert_eq!(source_side, shadow_side, "PIP-180 structural equality");
         // Hash consistency — must collide so callers can use the id as a HashSet/HashMap key
@@ -477,6 +707,8 @@ mod tests {
             partition: 0,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         assert_ne!(source_side, other);
     }

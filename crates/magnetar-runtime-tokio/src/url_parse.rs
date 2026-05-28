@@ -67,6 +67,32 @@ impl ParsedUrl {
     }
 }
 
+/// **Experimental** (PIP-460, ADR-0031). `true` when `topic` uses the
+/// scalable-topic `topic://...` URL scheme (as opposed to the v4
+/// `persistent://` / `non-persistent://` schemes). The builder routes a
+/// `topic://` URL to the scalable lookup path
+/// ([`crate::Client::scalable_topic_lookup`]); every other scheme keeps the v4
+/// path untouched.
+#[cfg(feature = "scalable-topics")]
+#[must_use]
+pub fn is_scalable_topic_url(topic: &str) -> bool {
+    topic.starts_with("topic://")
+}
+
+#[cfg(all(test, feature = "scalable-topics"))]
+mod scalable_url_tests {
+    use super::is_scalable_topic_url;
+
+    #[test]
+    fn recognises_scalable_and_v4_schemes() {
+        assert!(is_scalable_topic_url("topic://public/default/scaled"));
+        assert!(!is_scalable_topic_url(
+            "persistent://public/default/regular"
+        ));
+        assert!(!is_scalable_topic_url("non-persistent://public/default/np"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ParsedUrl, Scheme};

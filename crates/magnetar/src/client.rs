@@ -1530,6 +1530,8 @@ mod outgoing_message_tests {
             partition: -1,
             batch_index: 3,
             batch_size: 10,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         assert!(batched.is_batched());
         assert!(!batched.is_partitioned());
@@ -1541,6 +1543,8 @@ mod outgoing_message_tests {
             partition: 4,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         assert!(!partitioned.is_batched());
         assert!(partitioned.is_partitioned());

@@ -143,6 +143,16 @@ pub use crypto_bridge::MessageCryptoBridge;
 #[cfg(feature = "experimental-v5-client")]
 pub mod v5;
 
+/// **Experimental** — PIP-460 scalable-topic surface (ADR-0031). Behind
+/// `feature = "scalable-topics"` (default off). Exposes the
+/// [`scalable::ScalableTopicsApi`] engine hook and the
+/// [`scalable::StreamConsumer`] (StreamConsumer-only, drops on DAG change).
+/// No broker ships PIP-460 today; e2e is gated on a Pulsar 5.0 RC.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+pub mod scalable;
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+pub use engine::{ScalableEvent, ScalableLookup, ScalableTopicsApi};
+
 #[cfg(test)]
 mod tests {
     #[test]

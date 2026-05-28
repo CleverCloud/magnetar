@@ -1,7 +1,7 @@
 # ADR-0031 — PIP-460 scalable-topic / subscription scope for v0.2.0
 
-- **Status**: Proposed
-- **Date**: 2026-05-26
+- **Status**: Accepted
+- **Date**: 2026-05-26 (accepted 2026-05-28)
 - **Decider**: Florentin Dubois
 - **Tags**: pip-460, scalable-topics, segments, v0.2.0, scope, experimental
 
@@ -165,7 +165,17 @@ will be revisited in a v0.3.0+ ADR.
 
 ## Status
 
-Proposed (awaiting Florentin sign-off, 2026-05-26)
+Accepted (2026-05-28). The scaffold landed per the scope locked above:
+proto wire commands (hand-encoded behind `feature = "scalable-topics"` until
+the Pulsar 5.0 RC vendor bump), the `DagWatchSession` state machine, the
+`MessageId.segment_id` extension, both-engine `ScalableTopicsApi` impls, the
+`magnetar::scalable::StreamConsumer` surface (drop-on-DAG-change), the CLI
+`topic-info` subcommand, and the four-layer test set (proto unit + tokio +
+moonpool 1:1 + differential equivalence with a golden trace). E2E is
+`#[ignore]`'d behind `feature = "e2e,scalable-topics"` and **does not block
+the v0.2.0 release-cut** — it can only run once upstream cuts a Pulsar 5.0 RC
+shipping PIP-460. See [`docs/scalable-topics.md`](../../docs/scalable-topics.md)
+and the implementation in `git log`.
 
 ## References
 

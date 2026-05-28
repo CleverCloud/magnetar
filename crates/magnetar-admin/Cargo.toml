@@ -25,6 +25,9 @@ crypto-aws-lc-rs = ["reqwest/rustls-tls"]
 crypto-ring      = ["reqwest/rustls-tls-no-provider"]
 crypto-openssl   = ["reqwest/rustls-tls-no-provider"]
 crypto-fips      = ["reqwest/rustls-tls-no-provider"]
+# PIP-460 scalable topics (ADR-0031). Keeps admin's `MessageId` construction
+# in sync with the proto-layer `segment_id` field gate. Default OFF.
+scalable-topics  = ["magnetar-proto/scalable-topics"]
 
 [dependencies]
 magnetar-proto = { workspace = true }

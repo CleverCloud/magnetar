@@ -1491,6 +1491,8 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         // chunkMsgId2 := (first=2/2/2, last=3/3/3) — its "logical" id is 3/3/3.
         let id2 = MessageId {
@@ -1499,6 +1501,8 @@ mod tests {
             partition: 3,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         use core::cmp::Ordering;
         assert_eq!(id1.cmp(&id2), Ordering::Less);
@@ -1523,6 +1527,8 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let logical_id_of_chunk2 = MessageId {
             ledger_id: 3,
@@ -1530,6 +1536,8 @@ mod tests {
             partition: 3,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
 
         // A plain `MessageId` matching the lastChunkMessageId of chunk1.
@@ -1539,6 +1547,8 @@ mod tests {
             partition: 1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         // Equal to itself.
         assert_eq!(logical_id_of_chunk1, logical_id_of_chunk1);
@@ -1770,6 +1780,8 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
             },
             metadata: std::sync::Arc::new(meta),
             single_metadata: None,

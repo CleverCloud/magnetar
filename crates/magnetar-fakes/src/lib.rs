@@ -236,3 +236,195 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PIP-460 scalable topics (ADR-0031, experimental). Scripted controller-broker
+// fake — replies to `CommandScalableTopicLookup` with a fixed DAG, acks a
+// `CommandSegmentDagWatch`, and emits a scripted sequence of
+// `CommandSegmentDagUpdate` frames (one split + one merge), then closes.
+// ---------------------------------------------------------------------------
+
+/// **Experimental** (PIP-460). Scripted controller-broker fake for the
+/// scalable-topic surface. Drives the client end-to-end through the real
+/// `pb::scalable_topics` wire commands: feed the client's outbound bytes via
+/// [`Self::on_client_bytes`], collect the broker's reply bytes, and pull the
+/// scripted DAG updates via [`Self::next_scripted_update`].
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone)]
+pub struct ScriptedScalableBroker {
+    controller_broker_url: String,
+    lookup_token: u64,
+    initial_dag: Vec<magnetar_proto::pb::scalable_topics::SegmentDescriptor>,
+    /// Watch session id observed from the client's subscribe (filled on watch).
+    watch_session_id: Option<u64>,
+    /// Next `update_seq` the broker will stamp.
+    next_update_seq: u64,
+}
+
+#[cfg(feature = "scalable-topics")]
+impl ScriptedScalableBroker {
+    /// Construct a broker with a two-segment initial DAG (`[0,32768)` /
+    /// `[32768,65536)`), a fixed controller URL, and `lookup_token = 42`.
+    #[must_use]
+    pub fn two_segment() -> Self {
+        use magnetar_proto::pb::scalable_topics::{SegmentDescriptor, SegmentStatePb};
+        Self {
+            controller_broker_url: "pulsar://controller:6650".to_owned(),
+            lookup_token: 42,
+            initial_dag: vec![
+                SegmentDescriptor {
+                    segment_id: 1,
+                    broker_url: "pulsar://seg1:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 0,
+                    key_range_end: 32_768,
+                    state: SegmentStatePb::Active as i32,
+                },
+                SegmentDescriptor {
+                    segment_id: 2,
+                    broker_url: "pulsar://seg2:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 32_768,
+                    key_range_end: 65_536,
+                    state: SegmentStatePb::Active as i32,
+                },
+            ],
+            watch_session_id: None,
+            next_update_seq: 1,
+        }
+    }
+
+    /// The controller-broker URL this fake advertises in lookup responses.
+    #[must_use]
+    pub fn controller_broker_url(&self) -> &str {
+        &self.controller_broker_url
+    }
+
+    /// The lookup token this fake mints.
+    #[must_use]
+    pub fn lookup_token(&self) -> u64 {
+        self.lookup_token
+    }
+
+    /// The initial DAG snapshot.
+    #[must_use]
+    pub fn initial_dag(&self) -> &[magnetar_proto::pb::scalable_topics::SegmentDescriptor] {
+        &self.initial_dag
+    }
+
+    /// The watch session id the client allocated (after a subscribe was seen).
+    #[must_use]
+    pub fn watch_session_id(&self) -> Option<u64> {
+        self.watch_session_id
+    }
+
+    /// Feed one frame of the client's outbound bytes. Returns the broker's
+    /// reply bytes (a lookup response, a watch ack, or empty for frames that
+    /// need no immediate reply). Records the watch session id on a subscribe.
+    #[must_use]
+    pub fn on_client_bytes(&mut self, frame_bytes: &mut bytes::BytesMut) -> bytes::BytesMut {
+        use magnetar_proto::pb::scalable_topics as st;
+        let mut out = bytes::BytesMut::new();
+        let Ok(Some(scmd)) = st::decode(frame_bytes) else {
+            return out;
+        };
+        if let Some(lookup) = scmd.scalable_topic_lookup {
+            let resp = st::CommandScalableTopicLookupResponse {
+                request_id: lookup.request_id,
+                response: st::scalable_lookup_response::LookupType::Connect as i32,
+                controller_broker_url: Some(self.controller_broker_url.clone()),
+                controller_broker_url_tls: None,
+                segments: self.initial_dag.clone(),
+                lookup_token: Some(self.lookup_token),
+                error: None,
+                message: None,
+            };
+            let _ = st::encode(&mut out, &st::ScalableBaseCommand::lookup_response(resp));
+        } else if let Some(watch) = scmd.segment_dag_watch {
+            self.watch_session_id = Some(watch.watch_session_id);
+            let resp = st::CommandSegmentDagWatchResponse {
+                watch_session_id: watch.watch_session_id,
+                request_id: watch.request_id,
+                error: None,
+                message: None,
+            };
+            let _ = st::encode(&mut out, &st::ScalableBaseCommand::dag_watch_response(resp));
+        }
+        // Close frames need no reply.
+        out
+    }
+
+    /// Produce the scripted **split** update for the current watch session: the
+    /// initial segment `1` splits into children `3` + `4`. Returns the encoded
+    /// `CommandSegmentDagUpdate` frame bytes, or `None` if no watch is open.
+    #[must_use]
+    pub fn split_update(&mut self) -> Option<bytes::BytesMut> {
+        use magnetar_proto::pb::scalable_topics as st;
+        let sid = self.watch_session_id?;
+        let upd = st::CommandSegmentDagUpdate {
+            watch_session_id: sid,
+            update_seq: self.next_update_seq,
+            added: vec![
+                st::SegmentDescriptor {
+                    segment_id: 3,
+                    broker_url: "pulsar://seg3:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 0,
+                    key_range_end: 16_384,
+                    state: st::SegmentStatePb::Active as i32,
+                },
+                st::SegmentDescriptor {
+                    segment_id: 4,
+                    broker_url: "pulsar://seg4:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 16_384,
+                    key_range_end: 32_768,
+                    state: st::SegmentStatePb::Active as i32,
+                },
+            ],
+            removed: vec![],
+            split_events: vec![st::SplitEvent {
+                parent_segment_id: 1,
+                child_segment_ids: vec![3, 4],
+                split_at_entry: 1000,
+            }],
+            merge_events: vec![],
+        };
+        self.next_update_seq += 1;
+        let mut out = bytes::BytesMut::new();
+        st::encode(&mut out, &st::ScalableBaseCommand::dag_update(upd)).ok()?;
+        Some(out)
+    }
+
+    /// Produce the scripted **merge** update: segments `3` + `4` merge into a
+    /// single child `5`. Returns the encoded frame, or `None` if no watch is
+    /// open.
+    #[must_use]
+    pub fn merge_update(&mut self) -> Option<bytes::BytesMut> {
+        use magnetar_proto::pb::scalable_topics as st;
+        let sid = self.watch_session_id?;
+        let upd = st::CommandSegmentDagUpdate {
+            watch_session_id: sid,
+            update_seq: self.next_update_seq,
+            added: vec![st::SegmentDescriptor {
+                segment_id: 5,
+                broker_url: "pulsar://seg5:6650".to_owned(),
+                broker_url_tls: None,
+                key_range_start: 0,
+                key_range_end: 32_768,
+                state: st::SegmentStatePb::Active as i32,
+            }],
+            removed: vec![],
+            split_events: vec![],
+            merge_events: vec![st::MergeEvent {
+                parent_segment_ids: vec![3, 4],
+                child_segment_id: 5,
+                merge_at_entry: 2000,
+            }],
+        };
+        self.next_update_seq += 1;
+        let mut out = bytes::BytesMut::new();
+        st::encode(&mut out, &st::ScalableBaseCommand::dag_update(upd)).ok()?;
+        Some(out)
+    }
+}

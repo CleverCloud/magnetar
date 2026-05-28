@@ -529,6 +529,10 @@ impl MessageIdResponse {
             partition: self.partition_index,
             batch_index: -1,
             batch_size: -1,
+            // PIP-460 (ADR-0031): admin REST never resolves a scalable
+            // segment id; the field only exists under `scalable-topics`.
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         })
     }
 }

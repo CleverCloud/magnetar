@@ -25,6 +25,12 @@ doc  = false
 [lints]
 workspace = true
 
+[features]
+# PIP-460 scalable topics (ADR-0031). Default OFF. Adds the `topic-info`
+# subcommand (prints a scalable topic's segment DAG). Propagates the façade's
+# experimental scalable surface.
+scalable-topics = ["magnetar/scalable-topics", "magnetar-admin/scalable-topics"]
+
 [dependencies]
 magnetar           = { workspace = true, features = ["tokio"] }
 magnetar-admin     = { workspace = true }

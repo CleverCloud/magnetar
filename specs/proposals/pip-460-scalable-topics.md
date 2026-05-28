@@ -1,6 +1,6 @@
 # PIP-460 — Scalable topics / DAG-watch consumer (experimental, v0.2.0)
 
-- **Status**: Draft
+- **Status**: Accepted (scaffold landed 2026-05-28; ADR-0031 Accepted)
 - **ADR**: [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md)
 - **Target**: v0.2.0
 - **Date**: 2026-05-26

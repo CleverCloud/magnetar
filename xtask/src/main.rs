@@ -250,8 +250,18 @@ fn tempdir(base: &Path) -> Result<PathBuf> {
     Ok(base.to_path_buf())
 }
 
+/// Hand-maintained files that live in `pb/` but are NOT produced by codegen,
+/// so the drift check must ignore them. PIP-460's `scalable_topics.rs` is
+/// hand-encoded behind `feature = "scalable-topics"` until upstream cuts a
+/// Pulsar 5.0 RC including PIP-460 — at which point a dedicated
+/// `vendor-proto` commit (ADR-0026 §D4) replaces it and this carve-out is
+/// removed. See `crates/magnetar-proto/src/pb/scalable_topics.rs` and
+/// ADR-0031.
+const PB_HAND_MAINTAINED_FILES: &[&str] = &["scalable_topics.rs"];
+
 /// Compare files in `lhs` against `rhs`. Returns a list of human-readable
 /// difference descriptions. An empty Vec means the two trees are identical.
+/// Files in [`PB_HAND_MAINTAINED_FILES`] are skipped on both sides.
 fn diff_dirs(lhs: &Path, rhs: &Path) -> Result<Vec<String>> {
     use std::collections::BTreeMap;
 
@@ -269,6 +279,9 @@ fn diff_dirs(lhs: &Path, rhs: &Path) -> Result<Vec<String>> {
                 .to_str()
                 .ok_or_else(|| anyhow!("non-utf8 filename in {}", dir.display()))?
                 .to_owned();
+            if PB_HAND_MAINTAINED_FILES.contains(&name.as_str()) {
+                continue;
+            }
             let bytes = fs::read(entry.path())?;
             into.insert(name, bytes);
         }

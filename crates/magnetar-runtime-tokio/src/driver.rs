@@ -73,6 +73,16 @@ use crate::url_parse::ParsedUrl;
 fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientError> {
     loop {
         let event = shared.inner.lock().poll_event_if(|ev| {
+            #[cfg(feature = "scalable-topics")]
+            if matches!(
+                ev,
+                ConnectionEvent::ScalableTopicLookupResolved { .. }
+                    | ConnectionEvent::SegmentDagUpdated { .. }
+                    | ConnectionEvent::DagChangedDuringConsume { .. }
+                    | ConnectionEvent::DagWatchClosed { .. }
+            ) {
+                return true;
+            }
             matches!(
                 ev,
                 ConnectionEvent::AuthChallenge { .. }
@@ -231,6 +241,67 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                         shared_for_retry.driver_waker.notify_one();
                     }
                 });
+            }
+            // PIP-460 (ADR-0031): drain scalable-topic events off the proto
+            // queue into the per-client buffer + wake `next_scalable_event`.
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::ScalableTopicLookupResolved {
+                request_id,
+                controller_broker_url,
+                segments,
+                lookup_token,
+            } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::LookupResolved {
+                        request_id,
+                        controller_broker_url,
+                        segments,
+                        lookup_token,
+                    });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::SegmentDagUpdated {
+                watch_session_id,
+                delta,
+            } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::DagUpdated {
+                        watch_session_id,
+                        delta,
+                    });
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::DagChangedDuringConsume {
+                watch_session_id,
+                reason,
+            } => {
+                shared.scalable_events.lock().push_back(
+                    crate::ScalableEvent::DagChangedDuringConsume {
+                        watch_session_id,
+                        reason,
+                    },
+                );
+                shared.scalable_notify.notify_waiters();
+            }
+            #[cfg(feature = "scalable-topics")]
+            ConnectionEvent::DagWatchClosed {
+                watch_session_id,
+                reason,
+            } => {
+                shared
+                    .scalable_events
+                    .lock()
+                    .push_back(crate::ScalableEvent::DagWatchClosed {
+                        watch_session_id,
+                        reason,
+                    });
+                shared.scalable_notify.notify_waiters();
             }
             _ => {}
         }

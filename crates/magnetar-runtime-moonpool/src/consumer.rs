@@ -1702,6 +1702,8 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         });
         // Sanity: the consumer is still registered after the call.
         assert!(!consumer.is_closed());
@@ -1727,6 +1729,8 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         });
         assert!(!consumer.is_closed());
     }
@@ -1758,6 +1762,8 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let fut = consumer.ack_with_txn(mid, txn);
         let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
@@ -1793,6 +1799,8 @@ mod tests {
             partition: -1,
             batch_index: -1,
             batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let fut = consumer.ack_cumulative_with_txn(mid, txn);
         let res = tokio::time::timeout(Duration::from_millis(10), fut).await;
@@ -2222,6 +2230,8 @@ mod tests {
                 partition: -1,
                 batch_index: -1,
                 batch_size: 0,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
             },
             payload: Bytes::from_static(b"retryme"),
             metadata: std::sync::Arc::new(magnetar_proto::pb::MessageMetadata::default()),

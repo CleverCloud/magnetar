@@ -26,6 +26,8 @@ fn mid(ledger_id: u64, entry_id: u64) -> MessageId {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     }
 }
 

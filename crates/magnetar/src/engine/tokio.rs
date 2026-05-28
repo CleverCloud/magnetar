@@ -255,6 +255,89 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
     }
 }
 
+// PIP-460 scalable topics (ADR-0031, experimental). Maps the façade's
+// engine-agnostic `ScalableLookup` / `ScalableEvent` onto the tokio runtime's
+// identically-shaped types.
+#[cfg(feature = "scalable-topics")]
+impl super::ScalableTopicsApi for magnetar_runtime_tokio::Client {
+    type Error = magnetar_runtime_tokio::ClientError;
+
+    fn scalable_topic_lookup<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ScalableLookup, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let l = magnetar_runtime_tokio::Client::scalable_topic_lookup(self, topic).await?;
+            Ok(super::ScalableLookup {
+                controller_broker_url: l.controller_broker_url,
+                segments: l.segments,
+                lookup_token: l.lookup_token,
+            })
+        })
+    }
+
+    fn open_dag_watch(
+        &self,
+        topic: &str,
+        lookup_token: u64,
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+    ) -> u64 {
+        magnetar_runtime_tokio::Client::open_scalable_dag_watch(self, topic, lookup_token, segments)
+    }
+
+    fn close_dag_watch(&self, watch_session_id: u64) {
+        magnetar_runtime_tokio::Client::close_scalable_dag_watch(self, watch_session_id);
+    }
+
+    fn next_scalable_event(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<super::ScalableEvent>> + Send + '_>> {
+        Box::pin(async move {
+            magnetar_runtime_tokio::Client::next_scalable_event(self)
+                .await
+                .map(map_scalable_event)
+        })
+    }
+}
+
+/// Map a tokio-runtime `ScalableEvent` onto the façade's engine-agnostic one.
+#[cfg(feature = "scalable-topics")]
+fn map_scalable_event(ev: magnetar_runtime_tokio::ScalableEvent) -> super::ScalableEvent {
+    match ev {
+        magnetar_runtime_tokio::ScalableEvent::LookupResolved {
+            controller_broker_url,
+            segments,
+            lookup_token,
+            ..
+        } => super::ScalableEvent::LookupResolved {
+            controller_broker_url,
+            segments,
+            lookup_token,
+        },
+        magnetar_runtime_tokio::ScalableEvent::DagUpdated {
+            watch_session_id,
+            delta,
+        } => super::ScalableEvent::DagUpdated {
+            watch_session_id,
+            delta,
+        },
+        magnetar_runtime_tokio::ScalableEvent::DagChangedDuringConsume {
+            watch_session_id,
+            reason,
+        } => super::ScalableEvent::DagChangedDuringConsume {
+            watch_session_id,
+            reason,
+        },
+        magnetar_runtime_tokio::ScalableEvent::DagWatchClosed {
+            watch_session_id,
+            reason,
+        } => super::ScalableEvent::DagWatchClosed {
+            watch_session_id,
+            reason,
+        },
+    }
+}
+
 impl ConsumerApi for magnetar_runtime_tokio::Consumer {
     type Error = magnetar_runtime_tokio::ClientError;
     type Producer = magnetar_runtime_tokio::Producer;

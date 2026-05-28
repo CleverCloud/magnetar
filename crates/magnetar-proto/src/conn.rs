@@ -172,6 +172,19 @@ pub struct Connection {
     /// outcomes into it and polls [`Self::anti_thrash_tick`] to decide
     /// whether to delay the next redial.
     anti_thrash: crate::anti_thrash::AntiThrashState,
+    /// PIP-460 (ADR-0031) scalable-topic lookup registry: in-flight
+    /// `CommandScalableTopicLookup` request id → topic name. Drained when the
+    /// matching `CommandScalableTopicLookupResponse` arrives.
+    #[cfg(feature = "scalable-topics")]
+    scalable_lookups: HashMap<RequestId, String>,
+    /// PIP-460 (ADR-0031) DAG-watch sessions, keyed by client-allocated watch
+    /// session id. Each tracks the current segment DAG + monotonic
+    /// `update_seq`. See [`crate::dag_watch::DagWatchSession`].
+    #[cfg(feature = "scalable-topics")]
+    dag_watch_sessions: HashMap<u64, crate::dag_watch::DagWatchSession>,
+    /// PIP-460 (ADR-0031) next client-allocated watch session id.
+    #[cfg(feature = "scalable-topics")]
+    next_watch_session_id: u64,
 }
 
 impl core::fmt::Debug for Connection {
@@ -213,21 +226,47 @@ fn is_transient_open_error(code: i32) -> bool {
 enum PendingRequestKind {
     Lookup,
     PartitionedMetadata,
-    ProducerOpen { handle: ProducerHandle },
-    ConsumerSubscribe { handle: ConsumerHandle },
-    ConsumerSeek { handle: ConsumerHandle },
-    ConsumerUnsubscribe { handle: ConsumerHandle },
-    ConsumerGetLastMessageId { handle: ConsumerHandle },
-    Ack { handle: ConsumerHandle },
-    ProducerClose { handle: ProducerHandle },
-    ConsumerClose { handle: ConsumerHandle },
-    TopicWatcher { watcher_id: u64 },
+    ProducerOpen {
+        handle: ProducerHandle,
+    },
+    ConsumerSubscribe {
+        handle: ConsumerHandle,
+    },
+    ConsumerSeek {
+        handle: ConsumerHandle,
+    },
+    ConsumerUnsubscribe {
+        handle: ConsumerHandle,
+    },
+    ConsumerGetLastMessageId {
+        handle: ConsumerHandle,
+    },
+    Ack {
+        handle: ConsumerHandle,
+    },
+    ProducerClose {
+        handle: ProducerHandle,
+    },
+    ConsumerClose {
+        handle: ConsumerHandle,
+    },
+    TopicWatcher {
+        watcher_id: u64,
+    },
     NewTxn,
     AddPartitionToTxn,
     AddSubscriptionToTxn,
     EndTxn,
     TcClientConnect,
     GetSchema,
+    /// PIP-460 (ADR-0031) scalable-topic lookup in flight.
+    #[cfg(feature = "scalable-topics")]
+    ScalableTopicLookup,
+    /// PIP-460 (ADR-0031) DAG-watch subscribe in flight.
+    #[cfg(feature = "scalable-topics")]
+    DagWatch {
+        watch_session_id: u64,
+    },
 }
 
 impl Connection {
@@ -274,6 +313,12 @@ impl Connection {
             session_epoch: 0,
             wall_clock,
             anti_thrash: crate::anti_thrash::AntiThrashState::disabled(),
+            #[cfg(feature = "scalable-topics")]
+            scalable_lookups: HashMap::new(),
+            #[cfg(feature = "scalable-topics")]
+            dag_watch_sessions: HashMap::new(),
+            #[cfg(feature = "scalable-topics")]
+            next_watch_session_id: 1,
         }
     }
 
@@ -882,6 +927,24 @@ impl Connection {
             // count. Now we know the exact frame length up front and
             // never copy.
             let mut frame_bytes = self.inbound.split_to(frame_len).freeze();
+
+            // PIP-460 (ADR-0031): the scalable-topic commands (`BaseCommand`
+            // types 80-85) are hand-encoded and NOT present in the generated
+            // `pb::BaseCommand`, so `decode_one` → `Type::try_from` would
+            // reject them as `UnsupportedCommand`. Intercept them here: the
+            // command region decodes as a `ScalableBaseCommand` (which
+            // captures the shared field-1 `type` tag plus the additive 80-85
+            // fields, skipping every v4 field it doesn't know). A v4 frame
+            // decoded this way carries a non-scalable `type`, so we fall
+            // through to the normal path untouched.
+            #[cfg(feature = "scalable-topics")]
+            {
+                if let Some(scmd) = Self::try_decode_scalable_command(&frame_bytes) {
+                    self.handle_scalable_frame(now, scmd)?;
+                    continue;
+                }
+            }
+
             match decode_one(&mut frame_bytes) {
                 Ok(frame) => {
                     self.handle_frame(now, frame)?;
@@ -3486,6 +3549,248 @@ impl Connection {
         RequestId(id)
     }
 
+    // -------------------------------------------------------------------
+    // PIP-460 scalable topics (ADR-0031). Hand-encoded wire commands ride
+    // the existing connection via `pb::scalable_topics::encode`; inbound
+    // responses are intercepted in `handle_bytes_decode_loop` and routed
+    // through `handle_scalable_frame`.
+    // -------------------------------------------------------------------
+
+    /// **Experimental** (PIP-460, ADR-0031). Issue a `CommandScalableTopicLookup`
+    /// for `topic`. Returns the request id the caller correlates with the
+    /// resulting [`ConnectionEvent::ScalableTopicLookupResolved`].
+    #[cfg(feature = "scalable-topics")]
+    pub fn send_scalable_topic_lookup(&mut self, topic: &str, authoritative: bool) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = pb::scalable_topics::CommandScalableTopicLookup {
+            topic: topic.to_owned(),
+            request_id: request_id.0,
+            authoritative: Some(authoritative),
+            original_principal: None,
+            original_auth_data: None,
+            original_auth_method: None,
+        };
+        let env = pb::scalable_topics::ScalableBaseCommand::lookup(cmd);
+        let _ = pb::scalable_topics::encode(&mut self.outbound, &env);
+        self.scalable_lookups.insert(request_id, topic.to_owned());
+        self.pending_requests
+            .insert(request_id, PendingRequestKind::ScalableTopicLookup);
+        request_id
+    }
+
+    /// **Experimental** (PIP-460, ADR-0031). Open a DAG-watch session for
+    /// `topic`, seeded with the lookup's `segments` snapshot and `lookup_token`.
+    /// Allocates and returns a client-side watch session id; the caller MUST
+    /// have an open connection to the controller broker the lookup returned.
+    /// Emits the `CommandSegmentDagWatch` subscribe frame.
+    #[cfg(feature = "scalable-topics")]
+    pub fn open_dag_watch(
+        &mut self,
+        topic: &str,
+        lookup_token: u64,
+        segments: Vec<crate::types::SegmentDescriptor>,
+    ) -> u64 {
+        let watch_session_id = self.next_watch_session_id;
+        self.next_watch_session_id = self.next_watch_session_id.wrapping_add(1);
+        let request_id = self.alloc_request_id();
+        let cmd = pb::scalable_topics::CommandSegmentDagWatch {
+            topic: topic.to_owned(),
+            request_id: request_id.0,
+            watch_session_id,
+            lookup_token,
+        };
+        let env = pb::scalable_topics::ScalableBaseCommand::dag_watch(cmd);
+        let _ = pb::scalable_topics::encode(&mut self.outbound, &env);
+        self.dag_watch_sessions.insert(
+            watch_session_id,
+            crate::dag_watch::DagWatchSession::new(watch_session_id, lookup_token, segments),
+        );
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::DagWatch { watch_session_id },
+        );
+        watch_session_id
+    }
+
+    /// **Experimental** (PIP-460, ADR-0031). Close a DAG-watch session,
+    /// emitting `CommandCloseSegmentDagWatch` and dropping the session state.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_dag_watch(&mut self, watch_session_id: u64) -> RequestId {
+        let request_id = self.alloc_request_id();
+        let cmd = pb::scalable_topics::CommandCloseSegmentDagWatch {
+            watch_session_id,
+            request_id: request_id.0,
+        };
+        let env = pb::scalable_topics::ScalableBaseCommand::close_dag_watch(cmd);
+        let _ = pb::scalable_topics::encode(&mut self.outbound, &env);
+        self.dag_watch_sessions.remove(&watch_session_id);
+        self.events.push_back(ConnectionEvent::DagWatchClosed {
+            watch_session_id,
+            reason: Some("client-initiated close".to_owned()),
+        });
+        request_id
+    }
+
+    /// Snapshot the current DAG for a watch session (for the CLI `topic-info`
+    /// and tests). `None` if no session with that id is open.
+    #[cfg(feature = "scalable-topics")]
+    #[must_use]
+    pub fn dag_snapshot(
+        &self,
+        watch_session_id: u64,
+    ) -> Option<Vec<crate::types::SegmentDescriptor>> {
+        self.dag_watch_sessions
+            .get(&watch_session_id)
+            .map(crate::dag_watch::DagWatchSession::snapshot)
+    }
+
+    /// Try to decode the command region of a complete frame as a
+    /// [`pb::scalable_topics::ScalableBaseCommand`] and return it only when
+    /// the `type` discriminator is one of the PIP-460 commands (80-85). A v4
+    /// frame decodes with a non-scalable `type`, so we return `None` and let
+    /// the normal `decode_one` path handle it.
+    #[cfg(feature = "scalable-topics")]
+    fn try_decode_scalable_command(
+        frame_bytes: &Bytes,
+    ) -> Option<pb::scalable_topics::ScalableBaseCommand> {
+        use pb::scalable_topics::base_command_type as sct;
+        // Frame layout: [total_size u32][cmd_size u32][cmd bytes...]. The
+        // command region begins at offset 8.
+        if frame_bytes.len() < 8 {
+            return None;
+        }
+        let cmd_size = u32::from_be_bytes([
+            frame_bytes[4],
+            frame_bytes[5],
+            frame_bytes[6],
+            frame_bytes[7],
+        ]) as usize;
+        let cmd_end = 8usize.checked_add(cmd_size)?;
+        if frame_bytes.len() < cmd_end {
+            return None;
+        }
+        let cmd_region = &frame_bytes[8..cmd_end];
+        let scmd = <pb::scalable_topics::ScalableBaseCommand as prost::Message>::decode(cmd_region)
+            .ok()?;
+        match scmd.r#type {
+            sct::SCALABLE_TOPIC_LOOKUP
+            | sct::SCALABLE_TOPIC_LOOKUP_RESPONSE
+            | sct::SEGMENT_DAG_WATCH
+            | sct::SEGMENT_DAG_WATCH_RESPONSE
+            | sct::SEGMENT_DAG_UPDATE
+            | sct::CLOSE_SEGMENT_DAG_WATCH => Some(scmd),
+            _ => None,
+        }
+    }
+
+    /// Dispatch one decoded PIP-460 command frame. Mirrors the per-type arms
+    /// of [`Self::handle_frame`] for the scalable command family. Only the
+    /// broker→client commands carry handling here; the client never receives
+    /// its own outbound lookup / subscribe / close.
+    #[cfg(feature = "scalable-topics")]
+    fn handle_scalable_frame(
+        &mut self,
+        _now: Instant,
+        scmd: pb::scalable_topics::ScalableBaseCommand,
+    ) -> Result<(), ProtocolError> {
+        use pb::scalable_topics::scalable_lookup_response::LookupType;
+
+        if let Some(resp) = scmd.scalable_topic_lookup_response {
+            let request_id = RequestId(resp.request_id);
+            self.scalable_lookups.remove(&request_id);
+            self.pending_requests.remove(&request_id);
+            match LookupType::from_i32(resp.response) {
+                LookupType::Connect => {
+                    let segments = resp
+                        .segments
+                        .iter()
+                        .map(crate::types::SegmentDescriptor::from_pb)
+                        .collect();
+                    self.events
+                        .push_back(ConnectionEvent::ScalableTopicLookupResolved {
+                            request_id,
+                            controller_broker_url: resp
+                                .controller_broker_url
+                                .clone()
+                                .unwrap_or_default(),
+                            segments,
+                            lookup_token: resp.lookup_token.unwrap_or(0),
+                        });
+                }
+                // v0.2.0: redirect / failure surface as a closed lookup with a
+                // reason; the runtime re-resolves. (Controller-election-aware
+                // redirect handling is v0.3.0+ per ADR-0031.)
+                LookupType::Redirect | LookupType::Failed => {
+                    self.events.push_back(ConnectionEvent::DagWatchClosed {
+                        watch_session_id: 0,
+                        reason: Some(resp.message.clone().unwrap_or_else(|| {
+                            "scalable-topic lookup failed or redirected".to_owned()
+                        })),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(resp) = scmd.segment_dag_watch_response {
+            let request_id = RequestId(resp.request_id);
+            self.pending_requests.remove(&request_id);
+            if let Some(err) = resp.error {
+                // Subscribe rejected — drop the session and surface a close.
+                self.dag_watch_sessions.remove(&resp.watch_session_id);
+                self.events.push_back(ConnectionEvent::DagWatchClosed {
+                    watch_session_id: resp.watch_session_id,
+                    reason: Some(format!(
+                        "dag-watch subscribe rejected (code {err}): {}",
+                        resp.message.unwrap_or_default()
+                    )),
+                });
+            }
+            // Success: the session is already installed by `open_dag_watch`.
+            return Ok(());
+        }
+
+        if let Some(upd) = scmd.segment_dag_update {
+            let watch_session_id = upd.watch_session_id;
+            let Some(session) = self.dag_watch_sessions.get_mut(&watch_session_id) else {
+                // Update for an unknown session — drop silently (stale frame
+                // after a close, mirroring the lookup-registry one-shot guard).
+                return Ok(());
+            };
+            match session.handle_update(&upd) {
+                Ok(delta) => {
+                    let consume_affecting = delta.is_consume_affecting();
+                    let reason = delta.change_reason();
+                    self.events.push_back(ConnectionEvent::SegmentDagUpdated {
+                        watch_session_id,
+                        delta,
+                    });
+                    if consume_affecting {
+                        self.events
+                            .push_back(ConnectionEvent::DagChangedDuringConsume {
+                                watch_session_id,
+                                reason,
+                            });
+                    }
+                }
+                Err(err) => {
+                    // A malformed / non-monotonic update closes the session
+                    // (drop-on-change). The runtime re-resolves.
+                    self.dag_watch_sessions.remove(&watch_session_id);
+                    self.events.push_back(ConnectionEvent::DagWatchClosed {
+                        watch_session_id,
+                        reason: Some(format!("dag update rejected: {err}")),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        // Lookup / subscribe / close are client→broker only; receiving one is
+        // a protocol-shape surprise but not fatal. Ignore for forward-compat.
+        Ok(())
+    }
+
     /// Re-emit `CommandProducer` for a SINGLE producer handle. Used by the supervised
     /// driver loop to retry a producer-open that the broker rejected with a transient
     /// error (`ServiceNotReady`, `MetadataError`, `TopicNotFound` — see #71). The full
@@ -4556,6 +4861,8 @@ mod conn_state_tests {
             partition: -1,
             batch_index: -1,
             batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
         };
         let _ = conn.ack(
             c_handle,
@@ -5643,5 +5950,196 @@ mod conn_state_tests {
             message_event_count, 3,
             "expected one Message event per arrival, not O(n²) amplification",
         );
+    }
+}
+
+#[cfg(all(test, feature = "scalable-topics"))]
+mod scalable_conn_tests {
+    use super::*;
+    use crate::pb::scalable_topics as st;
+
+    fn connected_conn() -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(crate::SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        crate::frame::encode_command(&mut buf, &cmd).expect("encode Connected");
+        conn.handle_bytes(Instant::now(), &buf).expect("connected");
+        // Drain the handshake `Connected` event so per-test assertions only
+        // see the scalable-topic events.
+        while conn.poll_event().is_some() {}
+        conn
+    }
+
+    /// Layer (a) test: feed a `CommandScalableTopicLookupResponse` and assert
+    /// the connection emits `ScalableTopicLookupResolved` with the segment
+    /// list + controller URL + lookup token.
+    #[test]
+    fn conn_emits_scalable_topic_lookup_resolved() {
+        let mut conn = connected_conn();
+        let rid = conn.send_scalable_topic_lookup("topic://public/default/scaled", false);
+        let _ = conn.poll_transmit();
+
+        let resp = st::CommandScalableTopicLookupResponse {
+            request_id: rid.0,
+            response: st::scalable_lookup_response::LookupType::Connect as i32,
+            controller_broker_url: Some("pulsar://controller:6650".to_owned()),
+            controller_broker_url_tls: None,
+            segments: vec![
+                st::SegmentDescriptor {
+                    segment_id: 1,
+                    broker_url: "pulsar://seg1:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 0,
+                    key_range_end: 32_768,
+                    state: st::SegmentStatePb::Active as i32,
+                },
+                st::SegmentDescriptor {
+                    segment_id: 2,
+                    broker_url: "pulsar://seg2:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 32_768,
+                    key_range_end: 65_536,
+                    state: st::SegmentStatePb::Active as i32,
+                },
+            ],
+            lookup_token: Some(42),
+            error: None,
+            message: None,
+        };
+        let mut buf = bytes::BytesMut::new();
+        st::encode(&mut buf, &st::ScalableBaseCommand::lookup_response(resp))
+            .expect("encode response");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle lookup response");
+
+        let mut resolved = None;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ScalableTopicLookupResolved {
+                request_id,
+                controller_broker_url,
+                segments,
+                lookup_token,
+            } = ev
+            {
+                resolved = Some((request_id, controller_broker_url, segments, lookup_token));
+            }
+        }
+        let (request_id, url, segments, token) =
+            resolved.expect("ScalableTopicLookupResolved emitted");
+        assert_eq!(request_id, rid);
+        assert_eq!(url, "pulsar://controller:6650");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(token, 42);
+        assert_eq!(segments[0].segment_id, crate::types::SegmentId(1));
+    }
+
+    /// Layer (a) test: open a DagWatch session, feed a `SegmentDagUpdate`
+    /// carrying a split, and assert the connection emits both
+    /// `SegmentDagUpdated` and `DagChangedDuringConsume { reason: Split }`.
+    #[test]
+    fn conn_emits_dag_changed_during_consume() {
+        let mut conn = connected_conn();
+        let initial = vec![crate::types::SegmentDescriptor {
+            segment_id: crate::types::SegmentId(1),
+            key_range: crate::types::KeyRange {
+                start: 0,
+                end: 65_536,
+            },
+            broker_url: "pulsar://seg1:6650".to_owned(),
+            state: crate::types::SegmentState::Active,
+        }];
+        let sid = conn.open_dag_watch("topic://public/default/scaled", 42, initial);
+        let _ = conn.poll_transmit();
+
+        // Broker acks the watch subscribe.
+        let watch_resp = st::CommandSegmentDagWatchResponse {
+            watch_session_id: sid,
+            request_id: 1,
+            error: None,
+            message: None,
+        };
+        let mut buf = bytes::BytesMut::new();
+        st::encode(
+            &mut buf,
+            &st::ScalableBaseCommand::dag_watch_response(watch_resp),
+        )
+        .expect("encode watch resp");
+        conn.handle_bytes(Instant::now(), &buf).expect("watch ack");
+
+        // Broker pushes a split update.
+        let upd = st::CommandSegmentDagUpdate {
+            watch_session_id: sid,
+            update_seq: 1,
+            added: vec![
+                st::SegmentDescriptor {
+                    segment_id: 2,
+                    broker_url: "pulsar://seg2:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 0,
+                    key_range_end: 32_768,
+                    state: st::SegmentStatePb::Active as i32,
+                },
+                st::SegmentDescriptor {
+                    segment_id: 3,
+                    broker_url: "pulsar://seg3:6650".to_owned(),
+                    broker_url_tls: None,
+                    key_range_start: 32_768,
+                    key_range_end: 65_536,
+                    state: st::SegmentStatePb::Active as i32,
+                },
+            ],
+            removed: vec![],
+            split_events: vec![st::SplitEvent {
+                parent_segment_id: 1,
+                child_segment_ids: vec![2, 3],
+                split_at_entry: 1000,
+            }],
+            merge_events: vec![],
+        };
+        let mut buf = bytes::BytesMut::new();
+        st::encode(&mut buf, &st::ScalableBaseCommand::dag_update(upd)).expect("encode update");
+        conn.handle_bytes(Instant::now(), &buf).expect("update");
+
+        let mut saw_updated = false;
+        let mut saw_changed = false;
+        while let Some(ev) = conn.poll_event() {
+            match ev {
+                ConnectionEvent::SegmentDagUpdated {
+                    watch_session_id,
+                    delta,
+                } => {
+                    assert_eq!(watch_session_id, sid);
+                    assert_eq!(delta.split_events.len(), 1);
+                    saw_updated = true;
+                }
+                ConnectionEvent::DagChangedDuringConsume {
+                    watch_session_id,
+                    reason,
+                } => {
+                    assert_eq!(watch_session_id, sid);
+                    assert_eq!(reason, crate::dag_watch::DagChangeReason::Split);
+                    saw_changed = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_updated, "SegmentDagUpdated emitted");
+        assert!(saw_changed, "DagChangedDuringConsume emitted on split");
+        // Post-split DAG: parent gone, two children present.
+        let snap = conn.dag_snapshot(sid).expect("session still open");
+        assert_eq!(snap.len(), 2);
     }
 }

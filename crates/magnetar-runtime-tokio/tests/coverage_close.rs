@@ -504,6 +504,8 @@ async fn consumer_last_message_id_returns_broker_response() {
         partition: msg_id.partition,
         batch_index: msg_id.batch_index,
         batch_size: msg_id.batch_size,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
     let has_more = tokio::time::timeout(Duration::from_secs(3), consumer.has_message_after(lower))
         .await
@@ -544,6 +546,8 @@ async fn consumer_seek_paths_complete() {
         partition: -1,
         batch_index: -1,
         batch_size: -1,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
     tokio::time::timeout(Duration::from_secs(3), consumer.seek_to_message(target))
         .await

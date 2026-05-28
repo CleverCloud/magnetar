@@ -461,6 +461,100 @@ impl<P: Providers> Client<P> {
         self.shared.topic_list_changes.lock().pop_front()
     }
 
+    // -------------------------------------------------------------------
+    // PIP-460 scalable topics (ADR-0031, experimental). 1:1 with the tokio
+    // engine's `Client` methods — drives the proto `Connection` scalable
+    // entries + reads driver-drained events via the same buffer + Notify
+    // pattern as the PIP-145 topic-list deltas. No channels.
+    // -------------------------------------------------------------------
+
+    /// **Experimental** (PIP-460, ADR-0031). Resolve a `topic://...` scalable
+    /// topic. Mirrors the tokio engine's `Client::scalable_topic_lookup`.
+    #[cfg(feature = "scalable-topics")]
+    pub async fn scalable_topic_lookup(
+        &self,
+        topic: &str,
+    ) -> Result<crate::ScalableLookup, ClientError> {
+        let request_id = {
+            let mut conn = self.shared.inner.lock();
+            conn.send_scalable_topic_lookup(topic, false)
+        };
+        self.shared.driver_waker.notify_one();
+        loop {
+            let drained = {
+                let mut buf = self.shared.scalable_events.lock();
+                let pos = buf.iter().position(|ev| {
+                    matches!(
+                        ev,
+                        crate::ScalableEvent::LookupResolved { request_id: r, .. } if *r == request_id
+                    )
+                });
+                pos.and_then(|p| buf.remove(p))
+            };
+            if let Some(crate::ScalableEvent::LookupResolved {
+                controller_broker_url,
+                segments,
+                lookup_token,
+                ..
+            }) = drained
+            {
+                return Ok(crate::ScalableLookup {
+                    controller_broker_url,
+                    segments,
+                    lookup_token,
+                });
+            }
+            if self.shared.inner.lock().is_closed() {
+                return Err(ClientError::Other(
+                    "connection closed before scalable lookup resolved".to_owned(),
+                ));
+            }
+            self.shared.scalable_notify.notified().await;
+        }
+    }
+
+    /// **Experimental** (PIP-460, ADR-0031). Open a DAG-watch session.
+    /// Mirrors the tokio engine's `Client::open_scalable_dag_watch`.
+    #[cfg(feature = "scalable-topics")]
+    pub fn open_scalable_dag_watch(
+        &self,
+        topic: &str,
+        lookup_token: u64,
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+    ) -> u64 {
+        let sid = {
+            let mut conn = self.shared.inner.lock();
+            conn.open_dag_watch(topic, lookup_token, segments)
+        };
+        self.shared.driver_waker.notify_one();
+        sid
+    }
+
+    /// **Experimental** (PIP-460, ADR-0031). Close a DAG-watch session.
+    #[cfg(feature = "scalable-topics")]
+    pub fn close_scalable_dag_watch(&self, watch_session_id: u64) {
+        {
+            let mut conn = self.shared.inner.lock();
+            let _ = conn.close_dag_watch(watch_session_id);
+        }
+        self.shared.driver_waker.notify_one();
+    }
+
+    /// **Experimental** (PIP-460, ADR-0031). Await the next scalable-topic
+    /// event. Mirrors the tokio engine's `Client::next_scalable_event`.
+    #[cfg(feature = "scalable-topics")]
+    pub async fn next_scalable_event(&self) -> Option<crate::ScalableEvent> {
+        loop {
+            if let Some(ev) = self.shared.scalable_events.lock().pop_front() {
+                return Some(ev);
+            }
+            if self.shared.inner.lock().is_closed() {
+                return None;
+            }
+            self.shared.scalable_notify.notified().await;
+        }
+    }
+
     /// PIP-33: await the next replicated-subscription marker observed on any
     /// consumer of this connection. Mirrors the tokio engine's identically-
     /// named method. Resolves with the buffered observation, or `None` if the

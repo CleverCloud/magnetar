@@ -194,6 +194,8 @@ async fn producer_send_with_source_id_emits_field() {
         partition: 0,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
     let msg = magnetar_proto::producer::OutgoingMessage {
         payload: Bytes::from_static(b"replicated"),
@@ -360,6 +362,8 @@ async fn producer_send_with_source_id_bypasses_batching() {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
     let msg = magnetar_proto::producer::OutgoingMessage {
         payload: Bytes::from_static(b"data"),
@@ -397,6 +401,8 @@ async fn producer_chunked_send_with_source_id_propagates_to_every_chunk() {
         partition: -1,
         batch_index: -1,
         batch_size: 0,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
     };
     let msg = magnetar_proto::producer::OutgoingMessage {
         payload: Bytes::from_static(b"123456789012345678"), // 18 bytes > 8 → 3 chunks

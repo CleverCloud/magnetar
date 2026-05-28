@@ -129,6 +129,16 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: ShadowCmd,
     },
+    /// **Experimental** (PIP-460 / ADR-0031). Print a scalable topic's current
+    /// segment DAG. Resolves a `topic://...` URL against the controller broker
+    /// and prints each segment's id, key range, state, and broker URL.
+    /// Requires a Pulsar 5.0+ broker with PIP-460 enabled (no broker ships it
+    /// today — see `docs/scalable-topics.md`).
+    #[cfg(feature = "scalable-topics")]
+    TopicInfo {
+        /// Scalable topic URL (`topic://tenant/namespace/topic`).
+        topic: String,
+    },
 }
 
 /// `shadow` subcommands.
@@ -318,7 +328,49 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Shadow { sub } => {
             run_shadow(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
         }
+        #[cfg(feature = "scalable-topics")]
+        Cmd::TopicInfo { topic } => run_topic_info(&service_url, token_for_data, &topic).await,
     }
+}
+
+/// **Experimental** (PIP-460 / ADR-0031). Resolve a scalable topic's segment
+/// DAG and print it as a table. Wraps
+/// [`magnetar::PulsarClient::lookup_scalable_topic`].
+// Width-formatted string-literal column headers are the idiomatic CLI table
+// shape; `print_literal` would have us synthesise owned `String`s for no gain.
+#[allow(clippy::print_literal)]
+#[cfg(feature = "scalable-topics")]
+async fn run_topic_info(
+    service_url: &str,
+    token: Option<String>,
+    topic: &str,
+) -> Result<(), CliError> {
+    if !magnetar::runtime_tokio::is_scalable_topic_url(topic) {
+        return Err(CliError::BadArg(format!(
+            "topic-info expects a scalable `topic://...` URL, got `{topic}`"
+        )));
+    }
+    let client = build_data_client(service_url, token.as_deref()).await?;
+    let lookup = client
+        .lookup_scalable_topic(topic)
+        .await
+        .map_err(|e| CliError::BadArg(format!("scalable lookup failed: {e}")))?;
+    println!("topic: {topic}");
+    println!("controller-broker: {}", lookup.controller_broker_url);
+    println!("lookup-token: {}", lookup.lookup_token);
+    println!(
+        "{:<10} {:<18} {:<10} BROKER",
+        "SEGMENT", "KEY-RANGE", "STATE"
+    );
+    for seg in &lookup.segments {
+        let state = format!("{:?}", seg.state);
+        println!(
+            "{:<10} [{:>5},{:>5}) {state:<10} {}",
+            seg.segment_id.0, seg.key_range.start, seg.key_range.end, seg.broker_url,
+        );
+    }
+    println!("({} segment(s))", lookup.segments.len());
+    Ok(())
 }
 
 /// PIP-180 / ADR-0033: dispatch shadow-topic subcommands over the admin

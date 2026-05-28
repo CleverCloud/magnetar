@@ -861,6 +861,108 @@ pub trait MessageDecryptorApi {
     type Decryptor: Clone + Send + Sync + 'static;
 }
 
+// ---------------------------------------------------------------------------
+// PIP-460 scalable topics (ADR-0031, experimental). The `ScalableTopicsApi`
+// extension trait follows the same ADR-0026 §D1 pattern as `TransactionApi`:
+// defined here, implemented by each runtime on its `Client` type (which is the
+// engine's `ClientState`), dispatched through
+//   `impl<E: Engine> PulsarClient<E> where E::ClientState: ScalableTopicsApi`.
+// Gated on `feature = "scalable-topics"` so the default surface is unchanged.
+// ---------------------------------------------------------------------------
+
+/// **Experimental** (PIP-460, ADR-0031). Engine-side scalable-topic hooks —
+/// implemented by each runtime on its `Client` type. The façade's
+/// [`crate::scalable::StreamConsumer`] dispatches through this trait once
+/// [`crate::PulsarClient<E>`] carries the
+/// `where E::ClientState: ScalableTopicsApi` bound.
+///
+/// **Sans-io.** Async methods return `Pin<Box<dyn Future + Send + '_>>`; no
+/// tokio / mio / socket types appear in the surface. Each impl drives the
+/// [`magnetar_proto::Connection`] scalable entries (`send_scalable_topic_lookup`,
+/// `open_dag_watch`, `close_dag_watch`) and reads the driver-drained events.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+pub trait ScalableTopicsApi: 'static + Send + Sync {
+    /// Per-runtime client error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Resolve a `topic://...` scalable topic: lookup → segment DAG snapshot +
+    /// controller broker + lookup token.
+    fn scalable_topic_lookup<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ScalableLookup, Self::Error>> + Send + 'a>>;
+
+    /// Open a DAG-watch session, seeded with the lookup snapshot + token.
+    /// Returns the client-allocated watch session id.
+    fn open_dag_watch(
+        &self,
+        topic: &str,
+        lookup_token: u64,
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+    ) -> u64;
+
+    /// Close a DAG-watch session.
+    fn close_dag_watch(&self, watch_session_id: u64);
+
+    /// Await the next scalable-topic event (DAG update / drop-on-change /
+    /// close). Resolves `None` once the connection closes.
+    fn next_scalable_event(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<ScalableEvent>> + Send + '_>>;
+}
+
+/// **Experimental** (PIP-460, ADR-0031). Engine-agnostic resolved
+/// scalable-topic lookup surfaced through [`ScalableTopicsApi`]. Façade-side
+/// analogue of each runtime's `ScalableLookup`.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[derive(Debug, Clone)]
+pub struct ScalableLookup {
+    /// Controller broker to open the DAG-watch session against.
+    pub controller_broker_url: String,
+    /// Current DAG snapshot for the topic.
+    pub segments: Vec<magnetar_proto::SegmentDescriptor>,
+    /// Monotonic lookup token, echoed into the DAG-watch subscribe.
+    pub lookup_token: u64,
+}
+
+/// **Experimental** (PIP-460, ADR-0031). Engine-agnostic scalable-topic event
+/// surfaced through [`ScalableTopicsApi::next_scalable_event`]. Façade-side
+/// analogue of each runtime's `ScalableEvent`.
+#[cfg(all(feature = "tokio", feature = "scalable-topics"))]
+#[derive(Debug, Clone)]
+pub enum ScalableEvent {
+    /// A scalable-topic lookup resolved into the current DAG.
+    LookupResolved {
+        /// Controller broker to open the DAG-watch session against.
+        controller_broker_url: String,
+        /// Current DAG snapshot.
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+        /// Monotonic lookup token.
+        lookup_token: u64,
+    },
+    /// A DAG-watch session received and applied an update.
+    DagUpdated {
+        /// Watch session id.
+        watch_session_id: u64,
+        /// The applied delta.
+        delta: magnetar_proto::DagDelta,
+    },
+    /// The segment DAG changed under a live consumer (drop-on-change).
+    DagChangedDuringConsume {
+        /// Watch session id whose DAG changed.
+        watch_session_id: u64,
+        /// Why the DAG changed.
+        reason: magnetar_proto::DagChangeReason,
+    },
+    /// The DAG-watch session closed.
+    DagWatchClosed {
+        /// Watch session id that closed.
+        watch_session_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
+}
+
 /// Zero-sized stub for engines that don't yet wire real encryption.
 /// Used by [`MoonpoolEngine`] as both `MessageEncryptorApi::Encryptor`
 /// and `MessageDecryptorApi::Decryptor`. Constructing one is meaningless

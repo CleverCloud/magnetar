@@ -123,6 +123,96 @@ impl<P: moonpool_core::Providers> MessageDecryptorApi for MoonpoolEngine<P> {
     type Decryptor = NoEncryption;
 }
 
+// PIP-460 scalable topics (ADR-0031, experimental). 1:1 with the tokio
+// engine's `ScalableTopicsApi` impl — maps the façade's engine-agnostic
+// `ScalableLookup` / `ScalableEvent` onto the moonpool runtime's types.
+#[cfg(feature = "scalable-topics")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static> super::ScalableTopicsApi
+    for magnetar_runtime_moonpool::Client<P>
+{
+    type Error = magnetar_runtime_moonpool::ClientError;
+
+    fn scalable_topic_lookup<'a>(
+        &'a self,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<super::ScalableLookup, Self::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let l = magnetar_runtime_moonpool::Client::scalable_topic_lookup(self, topic).await?;
+            Ok(super::ScalableLookup {
+                controller_broker_url: l.controller_broker_url,
+                segments: l.segments,
+                lookup_token: l.lookup_token,
+            })
+        })
+    }
+
+    fn open_dag_watch(
+        &self,
+        topic: &str,
+        lookup_token: u64,
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+    ) -> u64 {
+        magnetar_runtime_moonpool::Client::open_scalable_dag_watch(
+            self,
+            topic,
+            lookup_token,
+            segments,
+        )
+    }
+
+    fn close_dag_watch(&self, watch_session_id: u64) {
+        magnetar_runtime_moonpool::Client::close_scalable_dag_watch(self, watch_session_id);
+    }
+
+    fn next_scalable_event(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Option<super::ScalableEvent>> + Send + '_>> {
+        Box::pin(async move {
+            magnetar_runtime_moonpool::Client::next_scalable_event(self)
+                .await
+                .map(map_scalable_event)
+        })
+    }
+}
+
+/// Map a moonpool-runtime `ScalableEvent` onto the façade's engine-agnostic one.
+#[cfg(feature = "scalable-topics")]
+fn map_scalable_event(ev: magnetar_runtime_moonpool::ScalableEvent) -> super::ScalableEvent {
+    match ev {
+        magnetar_runtime_moonpool::ScalableEvent::LookupResolved {
+            controller_broker_url,
+            segments,
+            lookup_token,
+            ..
+        } => super::ScalableEvent::LookupResolved {
+            controller_broker_url,
+            segments,
+            lookup_token,
+        },
+        magnetar_runtime_moonpool::ScalableEvent::DagUpdated {
+            watch_session_id,
+            delta,
+        } => super::ScalableEvent::DagUpdated {
+            watch_session_id,
+            delta,
+        },
+        magnetar_runtime_moonpool::ScalableEvent::DagChangedDuringConsume {
+            watch_session_id,
+            reason,
+        } => super::ScalableEvent::DagChangedDuringConsume {
+            watch_session_id,
+            reason,
+        },
+        magnetar_runtime_moonpool::ScalableEvent::DagWatchClosed {
+            watch_session_id,
+            reason,
+        } => super::ScalableEvent::DagWatchClosed {
+            watch_session_id,
+            reason,
+        },
+    }
+}
+
 impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi
     for magnetar_runtime_moonpool::Client<P>
 {

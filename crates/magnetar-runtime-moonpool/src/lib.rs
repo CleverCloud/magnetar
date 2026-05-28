@@ -261,6 +261,14 @@ pub struct ConnectionShared {
     /// `SimProviders` (whose `SimTimeProvider` holds
     /// `Weak<RefCell<…>>` and is structurally `!Send + !Sync`).
     pub wall_clock_ms: Arc<AtomicU64>,
+    /// PIP-460 (ADR-0031) scalable-topic events the driver drained off the
+    /// proto queue. Mirrors the tokio engine's identically-named buffer.
+    /// Surface via [`Client::next_scalable_event`].
+    #[cfg(feature = "scalable-topics")]
+    pub scalable_events: Mutex<std::collections::VecDeque<crate::ScalableEvent>>,
+    /// Wakeup for `next_scalable_event` futures.
+    #[cfg(feature = "scalable-topics")]
+    pub scalable_notify: Notify,
 }
 
 impl std::fmt::Debug for ConnectionShared {
@@ -347,8 +355,15 @@ impl ConnectionShared {
             memory_wakers: Mutex::new(Slab::new()),
             wall_clock_base_ms,
             wall_clock_ms,
+            #[cfg(feature = "scalable-topics")]
+            scalable_events: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(feature = "scalable-topics")]
+            scalable_notify: Notify::new(),
         })
     }
+
+    // PIP-460 (ADR-0031) types mirror the tokio engine's
+    // `ScalableLookup` / `ScalableEvent` (see `magnetar_runtime_tokio`).
 
     /// Try to reserve `bytes` against the configured memory budget.
     ///
@@ -523,6 +538,85 @@ pub struct ObservedReplicatedSubscriptionMarker {
     pub handle: magnetar_proto::ConsumerHandle,
     /// Decoded marker payload.
     pub marker: magnetar_proto::ReplicatedSubscriptionMarker,
+}
+
+/// **Experimental** (PIP-460, ADR-0031). `true` when `topic` uses the
+/// scalable-topic `topic://...` URL scheme. 1:1 with the tokio engine's
+/// `is_scalable_topic_url` (proposal §3.2 — `topic://` URL parser parity).
+#[cfg(feature = "scalable-topics")]
+#[must_use]
+pub fn is_scalable_topic_url(topic: &str) -> bool {
+    topic.starts_with("topic://")
+}
+
+#[cfg(all(test, feature = "scalable-topics"))]
+mod scalable_url_tests {
+    use super::is_scalable_topic_url;
+
+    /// 1:1 mirror of the tokio engine's
+    /// `url_parse::scalable_url_tests::recognises_scalable_and_v4_schemes`
+    /// (keeps `check-runtime-test-parity` balanced — ADR-0024).
+    #[test]
+    fn recognises_scalable_and_v4_schemes() {
+        assert!(is_scalable_topic_url("topic://public/default/scaled"));
+        assert!(!is_scalable_topic_url(
+            "persistent://public/default/regular"
+        ));
+        assert!(!is_scalable_topic_url("non-persistent://public/default/np"));
+    }
+}
+
+/// PIP-460 (ADR-0031) resolved scalable-topic lookup. Mirrors the tokio
+/// engine's `ScalableLookup`. **Experimental.**
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone)]
+pub struct ScalableLookup {
+    /// Controller broker to open the DagWatch session against.
+    pub controller_broker_url: String,
+    /// Current DAG snapshot for the topic.
+    pub segments: Vec<magnetar_proto::SegmentDescriptor>,
+    /// Monotonic lookup token, echoed into the DagWatch subscribe.
+    pub lookup_token: u64,
+}
+
+/// PIP-460 (ADR-0031) scalable-topic event surfaced from the driver to the
+/// user-facing [`Client`]. Mirrors the tokio engine's `ScalableEvent`.
+/// **Experimental.**
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone)]
+pub enum ScalableEvent {
+    /// A `CommandScalableTopicLookup` resolved into the current segment DAG.
+    LookupResolved {
+        /// Request id of the originating lookup.
+        request_id: magnetar_proto::RequestId,
+        /// Controller broker to open the DagWatch session against.
+        controller_broker_url: String,
+        /// Current DAG snapshot for the topic.
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+        /// Monotonic lookup token.
+        lookup_token: u64,
+    },
+    /// A DAG-watch session received and applied an update.
+    DagUpdated {
+        /// Watch session id the update belongs to.
+        watch_session_id: u64,
+        /// The applied delta.
+        delta: magnetar_proto::DagDelta,
+    },
+    /// The segment DAG changed under a live consumer (drop-on-change).
+    DagChangedDuringConsume {
+        /// Watch session id whose DAG changed.
+        watch_session_id: u64,
+        /// Why the DAG changed.
+        reason: magnetar_proto::DagChangeReason,
+    },
+    /// The DAG-watch session closed.
+    DagWatchClosed {
+        /// Watch session id that closed.
+        watch_session_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
 }
 
 /// Errors surfaced by the moonpool engine.

@@ -33,6 +33,10 @@ crypto-aws-lc-rs = ["rustls/aws_lc_rs"]
 crypto-ring      = ["rustls/ring"]
 crypto-fips      = ["rustls/fips"]
 crypto-openssl   = ["dep:rustls-openssl"]
+# PIP-460 scalable topics (ADR-0031). Default OFF — turns on the
+# `magnetar-proto/scalable-topics` wire surface that the moonpool engine's
+# `ScalableTopicsApi` impl drives. Additive: no new dependency.
+scalable-topics  = ["magnetar-proto/scalable-topics"]
 
 [dependencies]
 magnetar-proto = { workspace = true }

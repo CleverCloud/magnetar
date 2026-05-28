@@ -103,6 +103,8 @@ pub use crate::producer::{Producer, SendFut};
 pub use crate::tls_insecure::insecure_tls_config;
 pub use crate::tls_no_hostname::tls_config_no_hostname;
 pub use crate::transport::default_tls_config;
+#[cfg(feature = "scalable-topics")]
+pub use crate::url_parse::is_scalable_topic_url;
 pub use crate::url_parse::{ParsedUrl, Scheme};
 
 /// Shared connection state — the lock-protected sans-io state machine + a single-cell driver
@@ -209,6 +211,18 @@ pub struct ConnectionShared {
     /// flips this flag, and subsequent calls skip the bootstrap. Persists across reconnects
     /// (broker keeps the TC store loaded on disk).
     pub txn_bootstrapped: AtomicBool,
+    /// PIP-460 (ADR-0031) scalable-topic events the driver drained off the
+    /// proto queue (`ScalableTopicLookupResolved`, `SegmentDagUpdated`,
+    /// `DagChangedDuringConsume`, `DagWatchClosed`). Surface via
+    /// [`Client::next_scalable_event`]. Not a channel — a `VecDeque` behind
+    /// the same `parking_lot::Mutex` + `Notify` wake pattern as the PIP-145
+    /// topic-list deltas.
+    #[cfg(feature = "scalable-topics")]
+    pub scalable_events: Mutex<std::collections::VecDeque<crate::ScalableEvent>>,
+    /// Wakeup for `next_scalable_event` futures. Notified after every push to
+    /// `scalable_events`.
+    #[cfg(feature = "scalable-topics")]
+    pub scalable_notify: Notify,
 }
 
 /// PIP-145 topic-list-watcher delta surfaced from the driver to the user-facing
@@ -428,8 +442,66 @@ impl ConnectionShared {
             memory_limit_policy,
             memory_wakers: Mutex::new(Slab::new()),
             txn_bootstrapped: AtomicBool::new(false),
+            #[cfg(feature = "scalable-topics")]
+            scalable_events: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(feature = "scalable-topics")]
+            scalable_notify: Notify::new(),
         })
     }
+}
+
+/// PIP-460 (ADR-0031) resolved scalable-topic lookup. Returned by
+/// [`Client::scalable_topic_lookup`]. **Experimental.**
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone)]
+pub struct ScalableLookup {
+    /// Controller broker to open the DagWatch session against.
+    pub controller_broker_url: String,
+    /// Current DAG snapshot for the topic.
+    pub segments: Vec<magnetar_proto::SegmentDescriptor>,
+    /// Monotonic lookup token, echoed into the DagWatch subscribe.
+    pub lookup_token: u64,
+}
+
+/// PIP-460 (ADR-0031) scalable-topic event surfaced from the driver to the
+/// user-facing [`Client`]. Owned snapshot of the relevant
+/// [`magnetar_proto::ConnectionEvent`] variants so callers can hold them
+/// across `.await` boundaries. **Experimental.**
+#[cfg(feature = "scalable-topics")]
+#[derive(Debug, Clone)]
+pub enum ScalableEvent {
+    /// A `CommandScalableTopicLookup` resolved into the current segment DAG.
+    LookupResolved {
+        /// Request id of the originating lookup.
+        request_id: magnetar_proto::RequestId,
+        /// Controller broker to open the DagWatch session against.
+        controller_broker_url: String,
+        /// Current DAG snapshot for the topic.
+        segments: Vec<magnetar_proto::SegmentDescriptor>,
+        /// Monotonic lookup token, echoed into the DagWatch subscribe.
+        lookup_token: u64,
+    },
+    /// A DAG-watch session received and applied an update.
+    DagUpdated {
+        /// Watch session id the update belongs to.
+        watch_session_id: u64,
+        /// The applied delta.
+        delta: magnetar_proto::DagDelta,
+    },
+    /// The segment DAG changed under a live consumer (drop-on-change).
+    DagChangedDuringConsume {
+        /// Watch session id whose DAG changed.
+        watch_session_id: u64,
+        /// Why the DAG changed.
+        reason: magnetar_proto::DagChangeReason,
+    },
+    /// The DAG-watch session closed.
+    DagWatchClosed {
+        /// Watch session id that closed.
+        watch_session_id: u64,
+        /// Optional close reason.
+        reason: Option<String>,
+    },
 }
 
 #[cfg(test)]

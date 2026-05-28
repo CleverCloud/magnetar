@@ -73,6 +73,19 @@
 /// drift risk of two parallel literals.
 pub const SUPPORTED_PROTOCOL_VERSION: i32 = 21;
 
+/// Pulsar wire-protocol version a `scalable-topics`-enabled client
+/// advertises in `CommandConnect.protocol_version` (PIP-460, ADR-0031).
+///
+/// **Experimental.** One past the v4 ceiling
+/// ([`SUPPORTED_PROTOCOL_VERSION`]). Only advertised when the
+/// `scalable-topics` feature is on; a client compiled without the feature
+/// caps at [`SUPPORTED_PROTOCOL_VERSION`] and stays Pulsar-4.0+ compatible.
+/// The number is the proposal's best-effort guess for the upstream
+/// assignment and will be reconciled by the Pulsar 5.0 RC vendor bump.
+#[cfg(feature = "scalable-topics")]
+pub const SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS: i32 =
+    crate::pb::scalable_topics::PROTOCOL_VERSION_SCALABLE_TOPICS;
+
 pub mod anti_thrash;
 pub mod auth;
 pub mod backoff;
@@ -80,6 +93,9 @@ pub mod cluster_failover;
 pub mod conn;
 pub(crate) mod conn_types;
 pub mod consumer;
+/// PIP-460 segment-DAG-watch session state machine (experimental, ADR-0031).
+#[cfg(feature = "scalable-topics")]
+pub mod dag_watch;
 pub mod error;
 pub mod event;
 pub mod frame;
@@ -108,6 +124,29 @@ pub mod types;
 )]
 pub mod pb {
     include!("pb/pulsar.proto.rs");
+
+    /// PIP-460 (scalable topics) hand-encoded wire commands.
+    ///
+    /// **Experimental** (PIP-460, ADR-0031). Default OFF. PIP-460 introduces
+    /// three new wire commands (`CommandScalableTopicLookup`,
+    /// `CommandSegmentDagWatch`, `CommandSegmentDagUpdate`) plus their
+    /// responses, an extended `MessageIdData.segment_id` field, and six new
+    /// `BaseCommand.Type` discriminators (80-85). **None of these are in the
+    /// vendored `PulsarApi.proto`** — upstream PIP-460 is `Draft` and no
+    /// Pulsar broker ships the wire surface today.
+    ///
+    /// Until upstream cuts a Pulsar 5.0 RC including PIP-460, these commands
+    /// are hand-maintained `#[derive(prost::Message)]` structs rather than
+    /// vendored into `pulsar.proto.rs`; the authoritative proto bump lands
+    /// when upstream tags the RC (`cargo run -p xtask -- vendor-proto` as a
+    /// dedicated commit per ADR-0026 §D4). Commands ride the standard Pulsar
+    /// command-only frame via the hand-built
+    /// [`scalable_topics::ScalableBaseCommand`] envelope (shared `type`
+    /// field-1 tag), so a v4 peer skips the new additive fields.
+    #[cfg(feature = "scalable-topics")]
+    pub mod scalable_topics {
+        include!("pb/scalable_topics.rs");
+    }
 }
 
 pub use crate::anti_thrash::{
@@ -125,6 +164,10 @@ pub use crate::conn::{
     SubscribeRequest,
 };
 pub use crate::consumer::{ConsumerIdentity, ConsumerSlot, ConsumerStats, ShadowTopicMetadata};
+#[cfg(feature = "scalable-topics")]
+pub use crate::dag_watch::{
+    DagChangeReason, DagDelta, DagError, DagWatchSession, MergeEvent, SplitEvent,
+};
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
 pub use crate::event::{ConnectionEvent, GetSchemaResult, IncomingMessage, LookupOutcome};
 pub use crate::frame::{
@@ -145,3 +188,5 @@ pub use crate::supervisor::SupervisorConfig;
 pub use crate::transmit::{Transmit, TransmitOwned};
 pub use crate::txn::{TransactionMetadata, TxnAction, TxnClient, TxnError, TxnId, TxnState};
 pub use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, SequenceId};
+#[cfg(feature = "scalable-topics")]
+pub use crate::types::{KeyRange, SegmentDescriptor, SegmentId, SegmentState};

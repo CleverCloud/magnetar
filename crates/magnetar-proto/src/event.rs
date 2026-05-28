@@ -372,6 +372,59 @@ pub enum ConnectionEvent {
     /// or because the broker stabilised and the driver called
     /// [`Connection::record_first_op_success`](crate::Connection::record_first_op_success).
     AntiThrashCleared,
+
+    /// **Experimental** (PIP-460, ADR-0031). A `CommandScalableTopicLookup`
+    /// resolved into the topic's current segment DAG plus the controller
+    /// broker the client must open a [`crate::dag_watch::DagWatchSession`]
+    /// against. The runtime opens a connection to `controller_broker_url`
+    /// and issues `open_dag_watch` carrying `lookup_token`.
+    #[cfg(feature = "scalable-topics")]
+    ScalableTopicLookupResolved {
+        /// Request id of the originating `CommandScalableTopicLookup`.
+        request_id: RequestId,
+        /// Controller broker to open the DagWatch session against.
+        controller_broker_url: String,
+        /// Current DAG snapshot for the topic.
+        segments: Vec<crate::types::SegmentDescriptor>,
+        /// Monotonic lookup token, echoed into the DagWatch subscribe.
+        lookup_token: u64,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0031). A DAG-watch session received and
+    /// applied a `CommandSegmentDagUpdate`. Carries the [`crate::DagDelta`]
+    /// so the runtime can reconcile its per-segment consumers.
+    #[cfg(feature = "scalable-topics")]
+    SegmentDagUpdated {
+        /// Watch session id the update belongs to.
+        watch_session_id: u64,
+        /// The applied delta (added / removed / split / merge).
+        delta: crate::dag_watch::DagDelta,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0031). The segment DAG changed
+    /// (split / merge / removal) while a `StreamConsumer` was actively
+    /// consuming. This is the v0.2.0 "drop-on-change" guarantee — the
+    /// runtime closes all per-segment v4 consumers and the caller must
+    /// re-resolve + re-subscribe. No transparent failover in v0.2.0.
+    #[cfg(feature = "scalable-topics")]
+    DagChangedDuringConsume {
+        /// Watch session id whose DAG changed.
+        watch_session_id: u64,
+        /// Why the DAG changed (split / merge / removal).
+        reason: crate::dag_watch::DagChangeReason,
+    },
+
+    /// **Experimental** (PIP-460, ADR-0031). The controller-broker connection
+    /// backing a DAG-watch session closed. v0.2.0 surfaces this for the
+    /// caller to decide (no automatic re-lookup — controller-election
+    /// awareness is v0.3.0+ per ADR-0031).
+    #[cfg(feature = "scalable-topics")]
+    DagWatchClosed {
+        /// Watch session id that closed.
+        watch_session_id: u64,
+        /// Optional close reason for diagnostics.
+        reason: Option<String>,
+    },
 }
 
 /// Outcome of a `CommandLookupTopic` round-trip.

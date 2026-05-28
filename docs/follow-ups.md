@@ -36,7 +36,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ✅ landed 2026-05-28 |
 | 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | ✅ landed 2026-05-28 |
 | 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ✅ landed 2026-05-28 (self-hosting single-cluster fixture) |
-| 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
+| 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ✅ landed 2026-05-28 (scaffold; e2e deferred until a Pulsar 5.0 RC) |
 | 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ✅ landed 2026-05-28 (TLS hunk); supervised-loop driver lines remain |
 | 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (cryptoFailureAction remains; txn ack-within-txn landed 2026-05-28) |
 | 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | 🔗 (blocked on upstream moonpool TaskProvider — see in-section investigation note) |
@@ -466,6 +466,68 @@ Validation chain per CLAUDE.md (the `#[ignore]` keeps it out of the default test
 ---
 
 ## 6. PIP-460 scalable topics scaffold
+
+**Status update (2026-05-28).** ✅ **Scaffold landed** in
+`feat/pip-460-scalable-topics`. ADR-0031 flipped Proposed → Accepted; the
+proposal + parity-status + README parity rows flipped to 🟡 experimental;
+[`docs/scalable-topics.md`](scalable-topics.md) ships with the experimental
+banner + drop-on-change semantics. What landed:
+
+- **Proto (wave 1).** Hand-encoded wire commands behind
+  `feature = "scalable-topics"` in
+  `crates/magnetar-proto/src/pb/scalable_topics.rs` (`CommandScalableTopicLookup`
+  / `CommandSegmentDagWatch` / `CommandSegmentDagUpdate` + responses + close,
+  via a shared-`type`-tag `ScalableBaseCommand` envelope — the generated
+  `pb/pulsar.proto.rs` stays vendor-clean). New types `SegmentId` / `KeyRange`
+  / `SegmentState` (`#[non_exhaustive]`) / `SegmentDescriptor`; additive
+  default-`None` `MessageId::segment_id` (the derived `Eq` / `Ord` / `Hash`
+  give exactly the cross-mode contract — v4 ids both `None` so the v4 invariant
+  is bit-for-bit preserved, `Some(_) != None`). `DagWatchSession` sans-io state
+  machine (monotonic `update_seq` → `DagError::NonMonotonic`, split / merge /
+  removal). `Conn` entries `send_scalable_topic_lookup` / `open_dag_watch` /
+  `close_dag_watch` + a decode-loop interception that routes the new
+  `BaseCommand` types (80-85) through `handle_scalable_frame`.
+  `ConnectionEvent::{ScalableTopicLookupResolved, SegmentDagUpdated,
+  DagChangedDuringConsume, DagWatchClosed}`. `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS`.
+- **Façade (wave 2).** `magnetar::scalable` module behind the feature:
+  `ScalableTopicsApi` extension trait (ADR-0026 §D1, mirrors `TransactionApi`),
+  `StreamConsumer<T, E> where E::ClientState: ScalableTopicsApi`,
+  `ConsumerEvent::DagChanged` on drop-on-change, plus
+  `PulsarClient::scalable_stream_consumer` / `lookup_scalable_topic`. The §2
+  engine-generic surface composed cleanly with the bound — no workaround.
+- **Engines (waves 5-6).** `is_scalable_topic_url` `topic://` recogniser on
+  both engines; `ScalableTopicsApi` impl'd on both `Client` types; the driver
+  drains the scalable events into a per-client `VecDeque` + `Notify` (same
+  no-channels pattern as the PIP-145 topic-list deltas). `ScriptedScalableBroker`
+  fake in `magnetar-fakes` (replies to lookup, acks DagWatch, scripts a
+  split + a merge).
+- **Tests (4 layers, ADR-0024).** (a) ~14 proto unit tests (encoder
+  roundtrips + v4-shape byte-identical guard + monotonic `update_seq` +
+  split/merge + conn event emission); (b) tokio
+  `tests/scalable_topic.rs` (4); (c) moonpool 1:1 mirror (4) — parity stays
+  172/172; (d) differential `tests/scalable_topic_equivalence.rs` (2) +
+  golden `tests/golden/scalable_topic_drop_on_split.json`.
+- **CLI (wave 7).** `magnetar topic-info topic://...` behind
+  `magnetar-cli/scalable-topics`.
+
+**E2E deferred — does NOT block v0.2.0 release-cut.**
+`crates/magnetar/tests/e2e_scalable_topic.rs` is `#[ignore]`'d behind
+`feature = "e2e,scalable-topics"` with three named tests that can never run
+today (no broker ships PIP-460). When upstream cuts a Pulsar 5.0 RC, run
+`cargo run -p xtask -- vendor-proto --rev <pulsar-5.0-rc-sha>` as a dedicated
+commit ([ADR-0026 §D4](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md))
+to replace the hand-encoded module + reconcile field numbers, then flesh out
+the e2e bodies.
+
+**Remaining (v0.3.0+, out of scope — explicit markers).** QueueConsumer,
+CheckpointConsumer, controller-election awareness, transparent segment
+failover during consume, in-place key-range repartition, segment-aware
+sticky-key dispatch. Also deferred from this PR (not load-bearing): the
+`BrokerWorkload::ScalableTopic` variant in `sim_chaos.rs` (the parity-exempt
+full-sim chaos broker) — the binding 4-layer set drives the surface via the
+shared sans-io `Connection`, which both engines run verbatim.
+
+### Original entry (kept for historical reference)
 
 **Gap.** PIP-460 surface entirely. Wire-protocol delta is
 significant (3 new commands + optional `MessageId.segment_id`); the
