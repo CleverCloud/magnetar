@@ -38,7 +38,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
 | 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
 | 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ✅ landed 2026-05-28 (TLS hunk); supervised-loop driver lines remain |
-| 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (partial) |
+| 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (cryptoFailureAction remains; txn ack-within-txn landed 2026-05-28) |
 | 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | 🔗 (blocked on upstream moonpool TaskProvider — see in-section investigation note) |
 | 10 | [`engine.rs` split](#10-enginers-split) | ⚡ |
 | 11 | [`ProducerExt` trait inline — DECISION: accept as layering artefact](#11-producerext-trait-inline) | ✅ decided (doc-only) |
@@ -390,31 +390,31 @@ follow-up if the diff coverage gate flags it.
 
 ## 8. Golden trace catalog extension
 
-**Gap.** The differential harness ships nine golden traces
+**Gap.** The differential harness ships **eleven** golden traces
 (round-trip, batch, nack-redelivery, seek-to-start, many-publishes,
 lookup-before-open, seek-per-partition, **txn-new-then-commit**,
-**txn-new-then-abort**). Missing:
+**txn-new-then-abort**, **txn-send-ack-then-commit**,
+**txn-send-ack-then-abort**). Missing:
 
-- **Transactional ack-within-txn paths** — the txn-lifecycle round-trip
-  (NewTxn → EndTxn(commit/abort)) is **landed** as
-  `txn_new_then_commit_round_trip` + `txn_new_then_abort_round_trip`
-  in `golden_traces.rs`. The scripted broker now handles
+- **Transactional ack-within-txn paths** — **landed** in full. The
+  txn-lifecycle round-trip (NewTxn → EndTxn(commit/abort)) lives in
+  `txn_new_then_commit_round_trip` + `txn_new_then_abort_round_trip`;
+  the produce/ack drain semantics live in `txn_send_ack_then_commit`
+  + `txn_send_ack_then_abort`. The scripted broker handles
   `CommandTcClientConnectRequest`, `CommandNewTxn`,
   `CommandAddPartitionToTxn`, `CommandAddSubscriptionToTxn`,
-  `CommandEndTxn`, and observes `CommandAck` carrying a `txn_id` into
-  a per-txn ack ledger (drained on commit, dropped on abort). The
-  full **ack-within-txn produce/ack** assertion still needs the
-  producer/consumer txn-id plumbing wired through both runners —
-  Op::SendInTxn + Op::AckInTxn variants + their broker-side ledger
-  drain assertion. Estimate ~250 LOC; see `/goal` below.
+  `CommandEndTxn`, observes `CommandAck` carrying a `txn_id` into a
+  per-txn ack ledger (drained on commit, dropped on abort), and
+  surfaces the drain/drop count via
+  `ScriptedBroker::txn_drain_log_snapshot` (mirrors the existing
+  `seeked_partitions` log). The runner-side `Op::SendInTxn` /
+  `Op::AckInTxn` variants route the publish / ack through the
+  `OutgoingMessage::txn_id` and `Consumer::ack_with_txn` entries
+  respectively. The differential equivalence claim is now: both
+  engines emit identical event streams AND the scripted broker
+  observes identical (drained, ack_count) tuples on commit/abort.
 - **`cryptoFailureAction` matrix** — ~240 LOC; **blocked** on
   porting the PIP-4 crypto bridge to moonpool.
-
-**`/goal` (full ack-within-txn — follow-up to txn lifecycle).**
-
-```text
-/goal extend the txn lifecycle golden traces in docs/follow-ups.md §8 to cover ack-within-txn produce/ack drain semantics. Add two new Op variants in crates/magnetar-differential/src/trace.rs — `Op::SendInTxn { payload }` and `Op::AckInTxn { message_id }` — that route the publish / ack through the per-txn `txn_id` field that `OutgoingMessage` / `CommandAck` already carry. Wire them in both runners (runner_tokio.rs + runner_moonpool.rs) to use the currently-open `current_txn` set by the prior `Op::NewTxn`. Extend the scripted broker's per-txn ack ledger: today it tracks staged acks by `(txnid_most, txnid_least)` but doesn't surface the drain count to the trace's assertion path. Add an observable side-channel on `ScriptedBroker` (mirroring the existing `seeked_partitions` log) that exposes per-(most, least) the drain count on commit and the dropped count on abort. New golden traces: `txn_send_ack_then_commit` (open txn, publish 3, ack 3 within txn, commit, assert broker observed 3 staged acks drained on commit) and `txn_send_ack_then_abort` (same but abort, assert 3 staged acks dropped). Validation chain per CLAUDE.md. ADR-0024 (a/b/c/d) layers as usual — the proto txn surface is already exercised by the existing `magnetar-proto` txn unit tests.
-```
 
 **`/goal` (cryptoFailureAction — blocked on crypto bridge port).**
 

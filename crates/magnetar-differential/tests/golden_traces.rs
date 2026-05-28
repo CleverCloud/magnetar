@@ -13,8 +13,8 @@
 
 use std::time::Duration;
 
-use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};
+use magnetar_differential::broker::{ScriptedBroker, TxnDrainEvent};
+use magnetar_differential::{Event, EventStream, Op, Trace, runner_moonpool, runner_tokio};
 use magnetar_proto::{MessageId, pb};
 
 /// Helper: build a message id with default partition/batch fields so
@@ -561,4 +561,204 @@ async fn txn_new_then_abort_round_trip() {
         Event::TxnEnded { committed: false }
     ));
     assert!(matches!(stream.events[2], Event::Closed));
+}
+
+/// Build the publish-3 / ack-3 / end-txn op sequence shared by the
+/// `txn_send_ack_then_*` traces. The 3 receives in between are needed
+/// to surface broker-assigned ids on the consumer side so the ack ops
+/// target ids the broker actually stored. We hard-code the message ids
+/// (`(1, 0)`, `(1, 1)`, `(1, 2)`) — these match the scripted broker's
+/// per-producer `next_entry_id` allocation pattern on `CommandSend`.
+fn txn_send_ack_then_end_ops(commit: bool) -> Vec<Op> {
+    vec![
+        Op::NewTxn { timeout_ms: 60_000 },
+        Op::SendInTxn {
+            payload: b"txn-payload-0".to_vec(),
+        },
+        Op::SendInTxn {
+            payload: b"txn-payload-1".to_vec(),
+        },
+        Op::SendInTxn {
+            payload: b"txn-payload-2".to_vec(),
+        },
+        Op::Recv {
+            timeout: Duration::from_secs(2),
+        },
+        Op::Recv {
+            timeout: Duration::from_secs(2),
+        },
+        Op::Recv {
+            timeout: Duration::from_secs(2),
+        },
+        Op::AckInTxn {
+            message_id: mid(1, 0),
+        },
+        Op::AckInTxn {
+            message_id: mid(1, 1),
+        },
+        Op::AckInTxn {
+            message_id: mid(1, 2),
+        },
+        Op::EndTxn { commit },
+        Op::Close,
+    ]
+}
+
+/// Run `trace` against both engines using fresh broker instances and
+/// return each engine's [`EventStream`] alongside the broker's
+/// [`TxnDrainEvent`] snapshot. Mirrors the per-leg pattern used by
+/// `seek_per_partition_replays_only_one_partition`: we need
+/// per-engine broker state (the drain log) on top of the byte-for-byte
+/// `EventStream` equality check.
+async fn run_per_leg_with_drain_log(
+    trace: &Trace,
+) -> (
+    EventStream,
+    Vec<TxnDrainEvent>,
+    EventStream,
+    Vec<TxnDrainEvent>,
+) {
+    let broker_t = ScriptedBroker::bind().await.expect("broker bind");
+    let tokio_stream = runner_tokio::run(&broker_t.pulsar_url(), trace)
+        .await
+        .expect("tokio runner");
+    let tokio_drains = broker_t.txn_drain_log_snapshot();
+    broker_t.shutdown().await;
+
+    let broker_m = ScriptedBroker::bind().await.expect("broker bind");
+    let moonpool_stream = runner_moonpool::run(&broker_m.host_port(), trace)
+        .await
+        .expect("moonpool runner");
+    let moonpool_drains = broker_m.txn_drain_log_snapshot();
+    broker_m.shutdown().await;
+
+    (tokio_stream, tokio_drains, moonpool_stream, moonpool_drains)
+}
+
+/// Assert the event stream shape shared by both `txn_send_ack_then_*`
+/// traces: `[TxnCreated, SentInTxn × 3, Received × 3, AckedInTxn × 3,
+/// TxnEnded { committed }, Closed]` — 12 events total.
+fn assert_txn_send_ack_stream(stream: &EventStream, committed: bool) {
+    assert_eq!(
+        stream.events.len(),
+        12,
+        "expected 12 events; got {stream:?}",
+    );
+    assert!(matches!(stream.events[0], Event::TxnCreated));
+    for (i, ev) in stream.events.iter().enumerate().skip(1).take(3) {
+        assert!(
+            matches!(ev, Event::SentInTxn { .. }),
+            "event[{i}] = {ev:?} (expected SentInTxn)",
+        );
+    }
+    for (i, ev) in stream.events.iter().enumerate().skip(4).take(3) {
+        assert!(
+            matches!(ev, Event::Received { .. }),
+            "event[{i}] = {ev:?} (expected Received)",
+        );
+    }
+    for (i, ev) in stream.events.iter().enumerate().skip(7).take(3) {
+        assert!(
+            matches!(ev, Event::AckedInTxn),
+            "event[{i}] = {ev:?} (expected AckedInTxn)",
+        );
+    }
+    assert_eq!(stream.events[10], Event::TxnEnded { committed });
+    assert!(matches!(stream.events[11], Event::Closed));
+}
+
+/// Golden 11 — PIP-31 ack-within-txn + commit: open a txn, publish 3
+/// messages stamped with the txn id, receive each, ack each within the
+/// txn, then commit. Asserts the broker observed three staged-ack
+/// entries drained on commit (`drained: true`, `ack_count: 3`).
+///
+/// The drain assertion runs against
+/// [`ScriptedBroker::txn_drain_log_snapshot`] for each engine leg —
+/// proves the per-txn ack ledger fills correctly AND the
+/// commit/abort branch is observed on the wire (the `Op::EndTxn`
+/// arm carries the `TxnAction` enum value).
+#[tokio::test(flavor = "current_thread")]
+async fn txn_send_ack_then_commit() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-txn-send-ack-commit",
+        "sub-txn-send-ack-commit",
+        txn_send_ack_then_end_ops(true),
+    );
+
+    let (tokio_stream, tokio_drains, moonpool_stream, moonpool_drains) =
+        run_per_leg_with_drain_log(&trace).await;
+
+    // Cross-engine event-stream parity (the differential equivalence claim).
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged for trace {trace:?}",
+    );
+
+    assert_txn_send_ack_stream(&tokio_stream, true);
+    assert_txn_send_ack_stream(&moonpool_stream, true);
+
+    // Broker-side invariant: exactly one EndTxn, drained on commit,
+    // with three staged acks. The txn id halves are broker-allocated
+    // (`most = 0`, `least` is monotonic per session) so the per-leg
+    // numbers may differ; we only assert structure (count + flag).
+    for (engine, drains) in [("tokio", &tokio_drains), ("moonpool", &moonpool_drains)] {
+        assert_eq!(
+            drains.len(),
+            1,
+            "{engine}: expected one TxnDrainEvent; got {drains:?}",
+        );
+        assert!(
+            drains[0].drained,
+            "{engine}: expected drained=true on commit; got {:?}",
+            drains[0],
+        );
+        assert_eq!(
+            drains[0].ack_count, 3,
+            "{engine}: expected 3 staged acks on commit; got {:?}",
+            drains[0],
+        );
+    }
+}
+
+/// Golden 12 — PIP-31 ack-within-txn + abort: same shape as Golden 11
+/// but the `EndTxn(abort)` path drops the staged-ack ledger entry
+/// rather than applying it. Asserts the broker recorded the abort
+/// (`drained: false`) with the staged-ack count it would have dropped
+/// (`ack_count: 3`).
+#[tokio::test(flavor = "current_thread")]
+async fn txn_send_ack_then_abort() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-txn-send-ack-abort",
+        "sub-txn-send-ack-abort",
+        txn_send_ack_then_end_ops(false),
+    );
+
+    let (tokio_stream, tokio_drains, moonpool_stream, moonpool_drains) =
+        run_per_leg_with_drain_log(&trace).await;
+
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged for trace {trace:?}",
+    );
+
+    assert_txn_send_ack_stream(&tokio_stream, false);
+    assert_txn_send_ack_stream(&moonpool_stream, false);
+
+    for (engine, drains) in [("tokio", &tokio_drains), ("moonpool", &moonpool_drains)] {
+        assert_eq!(
+            drains.len(),
+            1,
+            "{engine}: expected one TxnDrainEvent; got {drains:?}",
+        );
+        assert!(
+            !drains[0].drained,
+            "{engine}: expected drained=false on abort; got {:?}",
+            drains[0],
+        );
+        assert_eq!(
+            drains[0].ack_count, 3,
+            "{engine}: expected 3 staged acks dropped on abort; got {:?}",
+            drains[0],
+        );
+    }
 }

@@ -124,6 +124,31 @@ pub enum Op {
         /// `true` → commit; `false` → abort.
         commit: bool,
     },
+    /// PIP-31: publish a single message stamped with the currently-open
+    /// transaction id (set by the most recent [`Self::NewTxn`]). The
+    /// runner stamps the `OutgoingMessage::txn_id` field; the broker
+    /// observes the send the same way it observes a non-txn publish
+    /// (the staged-ack ledger only tracks acks, not sends, in our
+    /// scripted model — the real broker would route the send to the
+    /// txn's per-partition pending entries). With no open txn, the
+    /// runner emits [`Event::SendInTxnError`] without contacting the
+    /// broker. Mirrors Java
+    /// `Producer#newMessage(Transaction).value(...).send()`.
+    SendInTxn {
+        /// Raw payload bytes (uncompressed, unencrypted).
+        payload: Vec<u8>,
+    },
+    /// PIP-31: acknowledge a single message id against the currently-
+    /// open transaction id (set by the most recent [`Self::NewTxn`]).
+    /// The scripted broker stages the ack against the per-txn ledger
+    /// keyed by `(most, least)`; the staged acks drain on commit and
+    /// drop on abort. With no open txn, the runner emits
+    /// [`Event::AckInTxnError`] without contacting the broker. Mirrors
+    /// Java `Consumer#acknowledgeAsync(MessageId, Transaction)`.
+    AckInTxn {
+        /// Target message id.
+        message_id: MessageId,
+    },
 }
 
 /// Outcome of one [`Op`]. Returned positionally — `Trace::ops[i]`
@@ -227,6 +252,33 @@ pub enum Event {
     },
     /// `EndTxn` failed at the engine surface or broker.
     TxnEndError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// `SendInTxn` succeeded; broker assigned [`MessageId`]. Mirrors
+    /// [`Event::Sent`] — the txn id is intentionally not surfaced (it's
+    /// broker-allocated and not part of the differential equivalence
+    /// claim; the drain assertion runs against the broker's per-txn
+    /// ledger snapshot, see
+    /// [`crate::broker::ScriptedBroker::txn_drain_log_snapshot`]).
+    SentInTxn {
+        /// Sequence id the engine surfaced on success.
+        message_id: MessageId,
+    },
+    /// `SendInTxn` was attempted with no open transaction, or failed at
+    /// the engine surface / broker.
+    SendInTxnError {
+        /// Stable error category string.
+        kind: String,
+    },
+    /// `AckInTxn` was acknowledged by the broker as staged against the
+    /// open transaction. The drain/drop semantics surface on
+    /// `EndTxn(commit|abort)` via
+    /// [`crate::broker::ScriptedBroker::txn_drain_log_snapshot`].
+    AckedInTxn,
+    /// `AckInTxn` was attempted with no open transaction, or failed at
+    /// the engine surface / broker.
+    AckInTxnError {
         /// Stable error category string.
         kind: String,
     },

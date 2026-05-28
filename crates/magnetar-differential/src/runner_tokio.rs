@@ -218,6 +218,32 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                     Err(e) => stream.push(Event::TxnEndError { kind: classify(&e) }),
                 }
             }
+            Op::SendInTxn { payload } => {
+                let Some(txn_id) = current_txn else {
+                    stream.push(Event::SendInTxnError {
+                        kind: "no-open-txn".to_owned(),
+                    });
+                    continue;
+                };
+                let bytes = Bytes::from(payload.clone());
+                stream.push(run_send_in_txn(&producer, txn_id, bytes).await);
+            }
+            Op::AckInTxn { message_id } => {
+                let Some(txn_id) = current_txn else {
+                    stream.push(Event::AckInTxnError {
+                        kind: "no-open-txn".to_owned(),
+                    });
+                    continue;
+                };
+                match ensure_consumer(&client, &mut consumer, &trace.topic, &trace.subscription)
+                    .await
+                {
+                    Ok(c) => stream.push(run_ack_in_txn(c, *message_id, txn_id).await),
+                    Err(_) => stream.push(Event::AckInTxnError {
+                        kind: "consumer-open-failed".to_owned(),
+                    }),
+                }
+            }
             Op::Close => {
                 // Drain by closing producer and (if open) consumer.
                 // Producer/Consumer expose `close(self)`; clone the
@@ -438,6 +464,46 @@ async fn run_seek(consumer: &Consumer, message_id: MessageId) -> Event {
     match consumer.seek_to_message(message_id).await {
         Ok(()) => Event::Seeked,
         Err(e) => Event::SeekError { kind: classify(&e) },
+    }
+}
+
+/// PIP-31: publish stamped with `txn_id`. The proto `OutgoingMessage`
+/// already carries `txn_id: Option<TxnId>`; the runner just plugs the
+/// currently-open txn into that slot. The scripted broker treats the
+/// send the same as a non-txn publish (the staged-ack ledger only
+/// tracks acks; a real broker would route the send to the txn's
+/// per-partition pending entries).
+async fn run_send_in_txn(
+    producer: &Producer,
+    txn_id: magnetar_proto::TxnId,
+    payload: Bytes,
+) -> Event {
+    let msg = OutgoingMessage {
+        payload: payload.clone(),
+        metadata: magnetar_proto::pb::MessageMetadata::default(),
+        uncompressed_size: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        num_messages: 1,
+        txn_id: Some(txn_id),
+        source_message_id: None,
+    };
+    match producer.send(msg).await {
+        Ok(message_id) => Event::SentInTxn { message_id },
+        Err(e) => Event::SendInTxnError { kind: classify(&e) },
+    }
+}
+
+/// PIP-31: ack stamped with `txn_id`. Routes through the runtime's
+/// `Consumer::ack_with_txn` entry which stamps the txn-id halves onto
+/// the `CommandAck` so the scripted broker can stage it against the
+/// per-txn ack ledger.
+async fn run_ack_in_txn(
+    consumer: &Consumer,
+    message_id: MessageId,
+    txn_id: magnetar_proto::TxnId,
+) -> Event {
+    match consumer.ack_with_txn(message_id, txn_id).await {
+        Ok(()) => Event::AckedInTxn,
+        Err(e) => Event::AckInTxnError { kind: classify(&e) },
     }
 }
 

@@ -119,6 +119,36 @@ struct TxnStagedAck {
     message_ids: Vec<(u64, u64)>,
 }
 
+/// One observable txn-end event surfaced via [`ScriptedBroker::txn_drain_log_snapshot`].
+///
+/// Pushed by the `CommandEndTxn` arm of the broker's per-frame
+/// dispatcher whenever a transaction is closed. `ack_count` is the
+/// number of staged-ack
+/// entries the broker had accumulated under `(most, least)` at the
+/// moment of end; `drained == true` means the transaction was
+/// committed (a real broker would apply the staged acks to the
+/// durable cursor here); `drained == false` means it was aborted (the
+/// staged acks were dropped without applying).
+///
+/// Lets the `txn_send_ack_then_commit` / `txn_send_ack_then_abort`
+/// golden traces assert the drain count and the commit/abort flag
+/// without crawling the raw frame log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxnDrainEvent {
+    /// `txnid_most_bits` carried by the closing `CommandEndTxn`.
+    pub most: u64,
+    /// `txnid_least_bits` carried by the closing `CommandEndTxn`.
+    pub least: u64,
+    /// `true` → committed (staged acks would be applied);
+    /// `false` → aborted (staged acks were dropped).
+    pub drained: bool,
+    /// Number of staged-ack entries the broker held for
+    /// `(most, least)` at the moment of `CommandEndTxn`. One per
+    /// `CommandAck` carrying a `txn_id` observed since the matching
+    /// `CommandNewTxn`.
+    pub ack_count: usize,
+}
+
 /// Cross-session log of received `BaseCommand` kinds, in arrival order.
 /// Mutated by every session task that the broker accepts; the equivalence
 /// harness reads it after each engine run to assert ordering invariants
@@ -134,6 +164,15 @@ pub type FrameLog = Arc<Mutex<Vec<i32>>>;
 /// partition's cursor was moved by a `SeekPartition` op.
 pub type SeekedPartitionLog = Arc<Mutex<Vec<i32>>>;
 
+/// Cross-session, append-only log of every `CommandEndTxn` the broker
+/// observed, in arrival order. Each entry records the txn id halves,
+/// whether the end was a commit (`drained: true`) or an abort
+/// (`drained: false`), and how many staged acks the broker held for
+/// the txn at end time. Lets the `txn_send_ack_then_commit` /
+/// `txn_send_ack_then_abort` golden traces assert the drain count
+/// directly.
+pub type TxnDrainLog = Arc<Mutex<Vec<TxnDrainEvent>>>;
+
 /// Handle to a running scripted broker. Drop to shut down.
 pub struct ScriptedBroker {
     /// `host:port` the broker is bound to.
@@ -146,6 +185,10 @@ pub struct ScriptedBroker {
     /// Shared, append-only log of partition indices that received a
     /// `CommandSeek`.
     seeked_partitions: SeekedPartitionLog,
+    /// Shared, append-only log of every `CommandEndTxn` and its drain
+    /// count. Surfaces the per-txn ack ledger's drain/drop side-effect
+    /// to the golden-trace assertion path.
+    txn_drain_log: TxnDrainLog,
 }
 
 impl std::fmt::Debug for ScriptedBroker {
@@ -171,6 +214,8 @@ impl ScriptedBroker {
         let frame_log_clone = frame_log.clone();
         let seeked_partitions: SeekedPartitionLog = Arc::new(Mutex::new(Vec::new()));
         let seeked_partitions_clone = seeked_partitions.clone();
+        let txn_drain_log: TxnDrainLog = Arc::new(Mutex::new(Vec::new()));
+        let txn_drain_log_clone = txn_drain_log.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let accept = listener.accept();
@@ -180,7 +225,8 @@ impl ScriptedBroker {
                             Ok((stream, _)) => {
                                 let log = frame_log_clone.clone();
                                 let seeks = seeked_partitions_clone.clone();
-                                tokio::spawn(handle_session(stream, log, seeks));
+                                let drains = txn_drain_log_clone.clone();
+                                tokio::spawn(handle_session(stream, log, seeks, drains));
                             }
                             Err(_) => break,
                         }
@@ -195,6 +241,7 @@ impl ScriptedBroker {
             accept_task: Some(accept_task),
             frame_log,
             seeked_partitions,
+            txn_drain_log,
         })
     }
 
@@ -225,6 +272,25 @@ impl ScriptedBroker {
     /// the same broker instance.
     pub fn clear_seeked_partitions(&self) {
         self.seeked_partitions.lock().clear();
+    }
+
+    /// Snapshot every txn-drain event observed so far, in arrival order
+    /// across all sessions. Each [`TxnDrainEvent`] records the
+    /// `(most, least)` txn-id halves, whether the end was a commit
+    /// (`drained: true`) or an abort (`drained: false`), and the
+    /// staged-ack count at end time. Used by the `txn_send_ack_*` golden
+    /// traces to assert the drain count without crawling the raw frame
+    /// log.
+    #[must_use]
+    pub fn txn_drain_log_snapshot(&self) -> Vec<TxnDrainEvent> {
+        self.txn_drain_log.lock().clone()
+    }
+
+    /// Clear the txn-drain log. Mirrors [`Self::clear_frame_log`] for
+    /// isolating per-engine snapshots when running both legs against the
+    /// same broker instance.
+    pub fn clear_txn_drain_log(&self) {
+        self.txn_drain_log.lock().clear();
     }
 
     /// `pulsar://127.0.0.1:<port>` URL the engines should connect to.
@@ -281,6 +347,7 @@ async fn handle_session(
     mut stream: TcpStream,
     frame_log: FrameLog,
     seeked_partitions: SeekedPartitionLog,
+    txn_drain_log: TxnDrainLog,
 ) {
     let state = Arc::new(Mutex::new(SessionState::default()));
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
@@ -310,7 +377,13 @@ async fn handle_session(
             let _ = read_buf.split_to(consumed);
             eprintln!("[broker] decoded frame type={}", frame.command.r#type);
             frame_log.lock().push(frame.command.r#type);
-            handle_frame(&state, &frame, &mut out_buf, &seeked_partitions);
+            handle_frame(
+                &state,
+                &frame,
+                &mut out_buf,
+                &seeked_partitions,
+                &txn_drain_log,
+            );
         }
 
         // Push any queued messages to consumers with outstanding permits.
@@ -346,6 +419,7 @@ fn handle_frame(
     frame: &magnetar_proto::Frame,
     out: &mut BytesMut,
     seeked_partitions: &SeekedPartitionLog,
+    txn_drain_log: &TxnDrainLog,
 ) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
@@ -507,11 +581,28 @@ fn handle_frame(
                 // PIP-31: drain the per-txn ack ledger on commit;
                 // drop it (without applying) on abort. Either way the
                 // entry is removed from the broker's open-txn map.
-                let _drained = state.lock().txn_ack_ledger.remove(&(most, least));
-                // `_drained` would be applied to the durable cursor in
-                // a real broker on commit; the scripted broker only
-                // tracks the count for the differential assertion via
-                // the on-disk ledger model elsewhere.
+                // The `action` (commit vs abort) is encoded as a
+                // `TxnAction` enum on the wire (`Commit = 0`, `Abort = 1`).
+                let drained = state.lock().txn_ack_ledger.remove(&(most, least));
+                let ack_count = drained.as_ref().map_or(0, Vec::len);
+                // `txn_action` is `Option<i32>` mapping to `pb::TxnAction`
+                // (`Commit = 0`, `Abort = 1`). Magnetar's `Op::EndTxn`
+                // always sets it; treat `None` as commit defensively.
+                let committed = req
+                    .txn_action
+                    .is_none_or(|a| a == pb::TxnAction::Commit as i32);
+                // `drained.unwrap_or_default()` would be applied to the
+                // durable cursor in a real broker on commit; the
+                // scripted broker surfaces the (drain/drop, count) pair
+                // through the cross-session `TxnDrainLog` instead so the
+                // golden traces can assert the per-txn ack ledger's
+                // commit/abort side-effect directly.
+                txn_drain_log.lock().push(TxnDrainEvent {
+                    most,
+                    least,
+                    drained: committed,
+                    ack_count,
+                });
                 emit_end_txn_response(out, req.request_id, most, least);
             }
         }
