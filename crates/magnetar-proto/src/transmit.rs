@@ -2,7 +2,7 @@
 
 //! [`Transmit`] — the sans-io ↔ runtime outbound-byte descriptor.
 //!
-//! ADR-0039 wave 1.0: introduces the [`Transmit`] enum and a
+//! ADR-0040 wave 1.0: introduces the [`Transmit`] enum and a
 //! `poll_transmit_vectored` entry point on [`crate::Connection`]
 //! returning the enum, without changing the legacy
 //! [`crate::Connection::poll_transmit`] signature yet.
@@ -13,7 +13,7 @@
 //! `Vectored` for producer batches; wave 2 (moonpool
 //! `Providers::Network::write_vectored`) makes the chaos pack
 //! segment-aware. See
-//! [ADR-0039](../../specs/adr/0039-vectored-io-transmit-enum.md).
+//! [ADR-0040](../../specs/adr/0040-vectored-io-transmit-enum.md).
 
 use bytes::Bytes;
 
@@ -67,7 +67,7 @@ impl Transmit<'_> {
 /// (the borrowed [`Transmit`] is tied to `&mut Connection` and cannot
 /// cross an `.await`).
 ///
-/// Returned by [`crate::Connection::poll_transmit_owned`] (ADR-0039
+/// Returned by [`crate::Connection::poll_transmit_owned`] (ADR-0040
 /// wave 2). The contiguous arm carries the `Bytes` produced by the
 /// same `BytesMut::split().freeze()` O(1) ownership transfer the
 /// legacy [`crate::Connection::poll_transmit`] uses — no extra memcpy.

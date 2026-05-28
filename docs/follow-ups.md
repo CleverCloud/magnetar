@@ -71,7 +71,7 @@ our side).
 **`/goal` (post-upstream).**
 
 ```text
-/goal flip magnetar-runtime-moonpool to true vectored dispatch once PierreZ/moonpool#111 lands. Replace the local coalesce in crates/magnetar-runtime-moonpool/src/driver.rs::driver_loop_inner's `Vectored` arm with a `write_all_vectored` helper mirroring crates/magnetar-runtime-tokio/src/driver.rs::write_all_vectored — loop `AsyncWriteExt::write_vectored` with per-IoSlice offset advancement, handle partial accepts, WriteZero on n==0 with non-empty slices. Test layers per ADR-0024: extend crates/magnetar-runtime-moonpool/tests/poll_transmit_vectored_parity.rs::poll_transmit_vectored_emits_vectored_for_queued_producer_send to assert the underlying transport observed N separate segment events (not one coalesced write). Validation chain per CLAUDE.md. ADR-0039 wave 2 chaos-fidelity gap closes when this lands.
+/goal flip magnetar-runtime-moonpool to true vectored dispatch once PierreZ/moonpool#111 lands. Replace the local coalesce in crates/magnetar-runtime-moonpool/src/driver.rs::driver_loop_inner's `Vectored` arm with a `write_all_vectored` helper mirroring crates/magnetar-runtime-tokio/src/driver.rs::write_all_vectored — loop `AsyncWriteExt::write_vectored` with per-IoSlice offset advancement, handle partial accepts, WriteZero on n==0 with non-empty slices. Test layers per ADR-0024: extend crates/magnetar-runtime-moonpool/tests/poll_transmit_vectored_parity.rs::poll_transmit_vectored_emits_vectored_for_queued_producer_send to assert the underlying transport observed N separate segment events (not one coalesced write). Validation chain per CLAUDE.md. ADR-0040 wave 2 chaos-fidelity gap closes when this lands.
 ```
 
 ---

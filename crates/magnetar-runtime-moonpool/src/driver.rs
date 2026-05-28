@@ -670,7 +670,7 @@ where
                 .store(now_ms, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 1. Drain outbound bytes + check if the state machine wants us to terminate. ADR-0039 wave
+        // 1. Drain outbound bytes + check if the state machine wants us to terminate. ADR-0040 wave
         //    2: take the owned `TransmitOwned` — the contiguous arm uses the same O(1)
         //    `BytesMut::split()` ownership transfer the legacy `poll_transmit` returned; the
         //    vectored arm carries the producer batch's `[head, payload]` segment list.
@@ -682,7 +682,7 @@ where
         //    arm coalesces locally and falls through to the same
         //    contiguous `write_all`. Once moonpool-core adds vectored
         //    support the chaos pack gains segment-granular drops
-        //    (ADR-0039 wave 2's chaos-pack note). The tokio engine
+        //    (ADR-0040 wave 2's chaos-pack note). The tokio engine
         //    already dispatches `Vectored` via real `writev(2)` —
         //    coalesce-here on moonpool means the *bytes* on the wire
         //    are byte-identical to tokio, only the chaos-pack
@@ -754,7 +754,7 @@ where
                     shared.inner.lock().mark_disconnected();
                     return Err(EngineError::PeerClosed);
                 }
-                // ADR-0039 wave 3 (read-path ownership pass-through):
+                // ADR-0040 wave 3 (read-path ownership pass-through):
                 // hand the freshly-read `BytesMut` chunk to the state
                 // machine via `handle_bytes_owned`. When proto's
                 // internal `inbound` buffer is empty (the common case

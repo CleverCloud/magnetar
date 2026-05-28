@@ -63,7 +63,7 @@ pub struct Connection {
     /// `poll_transmit_vectored` call; the borrow checker prevents
     /// concurrent re-entry. `None` before the first vectored drain.
     pending_vectored_drain: Option<Bytes>,
-    /// Wave-1.2 producer-batch segment buffer (ADR-0039). Drained by
+    /// Wave-1.2 producer-batch segment buffer (ADR-0040). Drained by
     /// [`Self::drain_producer_outbound_vectored`] — each producer
     /// frame contributes a `[head, payload]` pair via
     /// `frame::encode_payload_head`. Consumed by
@@ -860,7 +860,7 @@ impl Connection {
     }
 
     /// Feed inbound bytes to the state machine — **owned-chunk** entry
-    /// point (ADR-0039 wave 3 — read-path ownership pass-through).
+    /// point (ADR-0040 wave 3 — read-path ownership pass-through).
     ///
     /// When the protocol's internal `inbound` buffer is empty (the
     /// common case: every full frame consumed by the previous call
@@ -1849,7 +1849,7 @@ impl Connection {
     }
 
     /// Drain queued outbound bytes as a [`crate::Transmit`] descriptor
-    /// (ADR-0039 waves 1.0 / 1.1).
+    /// (ADR-0040 waves 1.0 / 1.1).
     ///
     /// **Today** this always returns [`crate::Transmit::Contiguous`]
     /// pointing at the same `BytesMut`-backed slice
@@ -1869,7 +1869,7 @@ impl Connection {
     /// (wave 1.2+) hands the runtime an owned segment list it can pass
     /// into the kernel as an `IoSlice` array.
     /// Drain queued outbound bytes as an owned [`crate::TransmitOwned`]
-    /// descriptor (ADR-0039 wave 2 — runtime adoption).
+    /// descriptor (ADR-0040 wave 2 — runtime adoption).
     ///
     /// The owned variant is what runtimes use in practice: the
     /// borrowed [`crate::Transmit`] returned by
@@ -2589,7 +2589,7 @@ impl Connection {
         }
     }
 
-    /// Wave-1.2 (ADR-0039) — drain producer frames into the
+    /// Wave-1.2 (ADR-0040) — drain producer frames into the
     /// segment-list buffer instead of the contiguous outbound buffer.
     ///
     /// Each frame contributes a `[head, payload]` pair of `Bytes`
@@ -3901,7 +3901,7 @@ mod conn_state_tests {
 
     #[test]
     fn handle_bytes_owned_swaps_empty_inbound_with_zero_copy() {
-        // ADR-0039 wave 3: when the proto's inbound buffer is empty,
+        // ADR-0040 wave 3: when the proto's inbound buffer is empty,
         // `handle_bytes_owned` must take ownership of the caller's
         // `BytesMut` without an `extend_from_slice` memcpy.
         // We verify by feeding a complete handshake frame and
@@ -3963,7 +3963,7 @@ mod conn_state_tests {
 
     #[test]
     fn poll_transmit_vectored_emits_segments_when_outbound_empty() {
-        // ADR-0039 wave 1.2: when `outbound_segments` is non-empty and
+        // ADR-0040 wave 1.2: when `outbound_segments` is non-empty and
         // the contiguous `outbound` buffer is empty,
         // `poll_transmit_vectored` must return `Vectored` carrying the
         // segments. Directly populates `outbound_segments` to keep the
@@ -4012,7 +4012,7 @@ mod conn_state_tests {
 
     #[test]
     fn poll_transmit_vectored_prefers_contiguous_when_outbound_has_bytes() {
-        // ADR-0039 wave 1.2 wire-order invariant: when both
+        // ADR-0040 wave 1.2 wire-order invariant: when both
         // `outbound` (handshake / ack / lookup) and `outbound_segments`
         // (producer batch) carry pending bytes, the contiguous arm
         // wins so wire-order is preserved. Segments stay queued and
@@ -4063,7 +4063,7 @@ mod conn_state_tests {
 
     #[test]
     fn poll_transmit_vectored_matches_poll_transmit() {
-        // ADR-0039 wave 1.1: the new `Transmit<'_>` entry point must
+        // ADR-0040 wave 1.1: the new `Transmit<'_>` entry point must
         // hand the runtime the same bytes the legacy `poll_transmit`
         // path produces today. Wave 1.2 will start emitting `Vectored`
         // for producer batches; until then `Contiguous` is the only

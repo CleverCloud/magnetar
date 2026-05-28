@@ -672,7 +672,7 @@ fn transport_needs_flush(transport: &Transport) -> bool {
 }
 
 /// Write every byte of every segment to `stream`, advancing through
-/// the segment list as the kernel reports progress (ADR-0039 wave 2).
+/// the segment list as the kernel reports progress (ADR-0040 wave 2).
 ///
 /// Equivalent to `AsyncWriteExt::write_all` for a contiguous buffer,
 /// but lets the kernel concatenate disjoint segments via `writev(2)` —
@@ -773,7 +773,7 @@ where
         // slice for the driver to flush.
         let (write_data, deadline, should_close) = {
             let mut conn = shared.inner.lock();
-            // ADR-0039 wave 2: take the owned `TransmitOwned` so we can
+            // ADR-0040 wave 2: take the owned `TransmitOwned` so we can
             // drop the lock before awaiting on the socket. The contiguous
             // arm carries the same `Bytes` the legacy `poll_transmit`
             // returned (O(1) ownership transfer via `BytesMut::split()`);
@@ -857,7 +857,7 @@ where
                     shared.inner.lock().mark_disconnected();
                     return Err(ClientError::PeerClosed);
                 }
-                // ADR-0039 wave 3 (read-path ownership pass-through):
+                // ADR-0040 wave 3 (read-path ownership pass-through):
                 // hand the freshly-read `BytesMut` chunk to the state
                 // machine via `handle_bytes_owned`. When the proto's
                 // internal `inbound` buffer is empty (the common case

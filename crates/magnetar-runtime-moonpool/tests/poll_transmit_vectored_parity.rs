@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ADR-0039 waves 1.1 + 1.2 — runtime integration tests for
+//! ADR-0040 waves 1.1 + 1.2 — runtime integration tests for
 //! `Connection::poll_transmit_vectored` (layer (c) of the ADR-0024
 //! four-layer policy on the moonpool engine; 1:1 mirror of
 //! `magnetar-runtime-tokio/tests/poll_transmit_vectored_parity.rs`).
@@ -88,7 +88,7 @@ fn poll_transmit_vectored_is_empty_after_drain() {
 
 #[test]
 fn poll_transmit_vectored_emits_vectored_for_queued_producer_send() {
-    // ADR-0039 wave 1.2: with a Ready producer carrying a queued send
+    // ADR-0040 wave 1.2: with a Ready producer carrying a queued send
     // and `outbound` drained, `poll_transmit_vectored` must return
     // `Vectored` carrying the producer's `[head, payload]` segment
     // pair. Concatenating the segments must equal the bytes the

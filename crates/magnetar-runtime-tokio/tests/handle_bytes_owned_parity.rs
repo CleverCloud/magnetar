@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ADR-0039 wave 3 — runtime integration test for
+//! ADR-0040 wave 3 — runtime integration test for
 //! `Connection::handle_bytes_owned` (layer (b) of the ADR-0024
 //! four-layer policy on the tokio engine; 1:1 mirror of
 //! `magnetar-runtime-moonpool/tests/handle_bytes_owned_parity.rs`).

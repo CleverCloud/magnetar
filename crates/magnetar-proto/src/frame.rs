@@ -219,7 +219,7 @@ pub fn encode_payload(
 /// (`[total_size][cmd_size][BaseCommand][magic][crc32c][meta_size][MessageMetadata]`)
 /// and leaves the caller to emit the payload as a separate segment.
 ///
-/// This is the wave-1.2 zero-copy path for ADR-0039: the producer batch
+/// This is the wave-1.2 zero-copy path for ADR-0040: the producer batch
 /// drain pushes `[head, payload]` segment pairs into
 /// `Connection::outbound_segments`, and the runtime adapter feeds the
 /// list into `poll_write_vectored` / `IoSlice` to skip the user-space
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn encode_payload_head_matches_encode_payload_concatenated() {
-        // ADR-0039 wave 1.2: byte-equivalence between the contiguous
+        // ADR-0040 wave 1.2: byte-equivalence between the contiguous
         // `encode_payload` (head + payload memcpy'd into one buffer)
         // and the vectored `encode_payload_head` (head returned, payload
         // emitted as a separate segment). The two paths MUST produce

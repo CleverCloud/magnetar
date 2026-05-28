@@ -1,4 +1,4 @@
-# ADR-0039 — Adopt a vectored `Transmit` descriptor on the sans-io ↔ runtime boundary
+# ADR-0040 — Adopt a vectored `Transmit` descriptor on the sans-io ↔ runtime boundary
 
 - **Status**: Proposed
 - **Date**: 2026-05-27
