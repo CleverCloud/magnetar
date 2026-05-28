@@ -81,6 +81,20 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
+      # The `--all-features` build (aws-lc-fips-sys's C build + every
+      # crate + every test binary, test profile) outgrew the ~14GB
+      # GitHub runner disk. Reclaim ~25GB of preinstalled SDKs first.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          # Leave Docker, the tool-cache (rust toolchain), and swap alone.
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
@@ -206,6 +220,19 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
+      # Same disk pressure as the `test` job; reclaim before the build +
+      # Docker pulls. `docker-images: false` so the Docker subsystem the
+      # e2e suite relies on is left intact.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # ADR-0029: e2e_sasl_kerberos.rs links `libgssapi`; install MIT
