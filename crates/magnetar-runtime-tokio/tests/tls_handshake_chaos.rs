@@ -20,6 +20,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 fn make_session() -> ClientConnection {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Arc::new(
         ClientConfig::builder_with_provider(active_provider())
             .with_safe_default_protocol_versions()

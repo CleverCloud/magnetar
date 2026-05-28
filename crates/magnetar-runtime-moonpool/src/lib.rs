@@ -1002,6 +1002,7 @@ mod tests {
     #[test]
     #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
     fn connect_tls_compiles() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let providers = TokioProviders::new();
         let engine = MoonpoolEngine::new(providers);
         let tls_config = std::sync::Arc::new(

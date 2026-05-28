@@ -569,10 +569,10 @@ fn visit(root: &Path, callback: &mut dyn FnMut(&Path, &str)) -> Result<()> {
                 continue;
             }
             visit(&path, callback)?;
-        } else if entry.file_type()?.is_file() {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                callback(&path, &contents);
-            }
+        } else if entry.file_type()?.is_file()
+            && let Ok(contents) = fs::read_to_string(&path)
+        {
+            callback(&path, &contents);
         }
     }
     Ok(())
@@ -777,20 +777,20 @@ fn parse_lcov_coverage(
             current_file = None;
             continue;
         }
-        if let Some(rest) = line.strip_prefix("DA:") {
-            if let Some(file) = current_file.as_deref() {
-                let mut parts = rest.split(',');
-                let Some(line_no) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
-                    continue;
-                };
-                let Some(count) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
-                    continue;
-                };
-                let entry = by_file.entry(file.to_owned()).or_default();
-                entry.0.insert(line_no);
-                if count > 0 {
-                    entry.1.insert(line_no);
-                }
+        if let Some(rest) = line.strip_prefix("DA:")
+            && let Some(file) = current_file.as_deref()
+        {
+            let mut parts = rest.split(',');
+            let Some(line_no) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Some(count) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            let entry = by_file.entry(file.to_owned()).or_default();
+            entry.0.insert(line_no);
+            if count > 0 {
+                entry.1.insert(line_no);
             }
         }
     }

@@ -22,7 +22,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0004](adr/0004-sans-io-protocol-core.md) | Sans-io `magnetar-proto` + swappable I/O engines | Accepted |
 | [0005](adr/0005-rustls-only-tls.md) | TLS: `rustls` only, no `native-tls` / `openssl` | Amended by [ADR-0035](adr/0035-pluggable-crypto-provider.md) (openssl ban portion) |
 | [0006](adr/0006-moonpool-tls-byte-pipe.md) | moonpool engine drives `rustls::ClientConnection` directly | Accepted |
-| [0007](adr/0007-edition-2024-msrv-1-85.md) | Rust edition 2024, MSRV 1.85 | Accepted |
+| [0007](adr/0007-edition-2024-msrv-1-85.md) | Rust edition 2024, MSRV 1.85 | Superseded by ADR-0042 |
 | [0008](adr/0008-crate-topology.md) | 11-crate workspace topology | Accepted |
 | [0009](adr/0009-pulsar-4-minimum.md) | Pulsar 4.0+ minimum broker version | Accepted |
 | [0010](adr/0010-v0-1-full-java-parity.md) | v0.1.0 ships full Java-client parity (no deferrals) | Accepted |
@@ -57,6 +57,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0039](adr/0039-pulsar-proxy-multi-broker-connection-model.md) | Per-broker connection pool for the Apache Pulsar Proxy — `(logical_broker_url, physical_dial_addr)` keyed pool, `bootstrap` for lookup + non-proxy ops, `proxy_to_broker_url` set on `CommandConnect` for pool entries (mirrors Java `BinaryProtoLookupService` + `ConnectionPool`) | Accepted |
 | [0040](adr/0040-vectored-io-transmit-enum.md) | Adopt a vectored `Transmit` descriptor on the sans-io ↔ runtime boundary — `{Contiguous, Vectored}` enum + frame descriptor `{head, payload}` + `Providers::Network::write_vectored`; three landings (proto+tokio, moonpool, read-path ownership pass-through) | Proposed |
 | [0041](adr/0041-athenz-provider-testability-seams.md) | Athenz provider testability seams (`ensure_role_token(now)`, injected `wall_clock`, pluggable `ZtsClient` trait + `HttpZtsClient`) on the aws-lc-rs/ring RS256 JWT exchange — lands the ADR-0024 tokio/moonpool/differential layers; supersedes ADR-0030 (drops the RUSTSEC-flagged `rsa`-crate N-Token path) | Accepted |
+| [0042](adr/0042-msrv-bump-1-88.md) | Bump MSRV to Rust 1.88 (`let_chains`); supersedes ADR-0007 | Accepted |
 
 ## How to add an ADR
 

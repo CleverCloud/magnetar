@@ -131,21 +131,21 @@ pub struct MessageIdData {
         ::prost::alloc::boxed::Box<MessageIdData>,
     >,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KeyValue {
     #[prost(string, required, tag = "1")]
     pub key: ::prost::alloc::string::String,
     #[prost(string, required, tag = "2")]
     pub value: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KeyLongValue {
     #[prost(string, required, tag = "1")]
     pub key: ::prost::alloc::string::String,
     #[prost(uint64, required, tag = "2")]
     pub value: u64,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IntRange {
     #[prost(int32, required, tag = "1")]
     pub start: i32,
@@ -247,14 +247,14 @@ pub struct SingleMessageMetadata {
     #[prost(bool, optional, tag = "10", default = "false")]
     pub null_partition_key: ::core::option::Option<bool>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BrokerEntryMetadata {
     #[prost(uint64, optional, tag = "1")]
     pub broker_timestamp: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "2")]
     pub index: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandConnect {
     #[prost(string, required, tag = "1")]
     pub client_version: ::prost::alloc::string::String,
@@ -279,7 +279,7 @@ pub struct CommandConnect {
     #[prost(string, optional, tag = "11")]
     pub proxy_version: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FeatureFlags {
     #[prost(bool, optional, tag = "1", default = "false")]
     pub supports_auth_refresh: ::core::option::Option<bool>,
@@ -300,7 +300,7 @@ pub struct FeatureFlags {
     #[prost(bool, optional, tag = "8", default = "false")]
     pub supports_scalable_topics: ::core::option::Option<bool>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandConnected {
     #[prost(string, required, tag = "1")]
     pub server_version: ::prost::alloc::string::String,
@@ -311,7 +311,7 @@ pub struct CommandConnected {
     #[prost(message, optional, tag = "4")]
     pub feature_flags: ::core::option::Option<FeatureFlags>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAuthResponse {
     #[prost(string, optional, tag = "1")]
     pub client_version: ::core::option::Option<::prost::alloc::string::String>,
@@ -320,7 +320,7 @@ pub struct CommandAuthResponse {
     #[prost(int32, optional, tag = "3", default = "0")]
     pub protocol_version: ::core::option::Option<i32>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAuthChallenge {
     #[prost(string, optional, tag = "1")]
     pub server_version: ::core::option::Option<::prost::alloc::string::String>,
@@ -329,7 +329,7 @@ pub struct CommandAuthChallenge {
     #[prost(int32, optional, tag = "3", default = "0")]
     pub protocol_version: ::core::option::Option<i32>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthData {
     #[prost(string, optional, tag = "1")]
     pub auth_method_name: ::core::option::Option<::prost::alloc::string::String>,
@@ -472,7 +472,7 @@ pub mod command_subscribe {
         }
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandPartitionedTopicMetadata {
     #[prost(string, required, tag = "1")]
     pub topic: ::prost::alloc::string::String,
@@ -487,7 +487,7 @@ pub struct CommandPartitionedTopicMetadata {
     #[prost(bool, optional, tag = "6", default = "true")]
     pub metadata_auto_creation_enabled: ::core::option::Option<bool>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandPartitionedTopicMetadataResponse {
     #[prost(uint32, optional, tag = "1")]
     pub partitions: ::core::option::Option<u32>,
@@ -562,7 +562,7 @@ pub struct CommandLookupTopic {
     #[prost(message, repeated, tag = "8")]
     pub properties: ::prost::alloc::vec::Vec<KeyValue>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandLookupTopicResponse {
     #[prost(string, optional, tag = "1")]
     pub broker_service_url: ::core::option::Option<::prost::alloc::string::String>,
@@ -695,7 +695,7 @@ pub struct CommandSendReceipt {
     #[prost(uint64, optional, tag = "4", default = "0")]
     pub highest_sequence_id: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandSendError {
     #[prost(uint64, required, tag = "1")]
     pub producer_id: u64,
@@ -822,7 +822,7 @@ pub mod command_ack {
         }
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAckResponse {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
@@ -837,21 +837,21 @@ pub struct CommandAckResponse {
     #[prost(uint64, optional, tag = "6")]
     pub request_id: ::core::option::Option<u64>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandActiveConsumerChange {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
     #[prost(bool, optional, tag = "2", default = "false")]
     pub is_active: ::core::option::Option<bool>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandFlow {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
     #[prost(uint32, required, tag = "2")]
     pub message_permits: u32,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandUnsubscribe {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
@@ -871,12 +871,12 @@ pub struct CommandSeek {
     #[prost(uint64, optional, tag = "4")]
     pub message_publish_time: ::core::option::Option<u64>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandReachedEndOfTopic {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandTopicMigrated {
     #[prost(uint64, required, tag = "1")]
     pub resource_id: u64,
@@ -926,7 +926,7 @@ pub mod command_topic_migrated {
         }
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandCloseProducer {
     #[prost(uint64, required, tag = "1")]
     pub producer_id: u64,
@@ -941,7 +941,7 @@ pub struct CommandCloseProducer {
         ::prost::alloc::string::String,
     >,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandCloseConsumer {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
@@ -972,7 +972,7 @@ pub struct CommandSuccess {
     #[prost(message, optional, tag = "2")]
     pub schema: ::core::option::Option<Schema>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandProducerSuccess {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -987,7 +987,7 @@ pub struct CommandProducerSuccess {
     #[prost(bool, optional, tag = "6", default = "true")]
     pub producer_ready: ::core::option::Option<bool>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandError {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -996,11 +996,11 @@ pub struct CommandError {
     #[prost(string, required, tag = "3")]
     pub message: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandPing {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandPong {}
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandConsumerStats {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1042,7 +1042,7 @@ pub struct CommandConsumerStatsResponse {
     #[prost(double, optional, tag = "16")]
     pub message_ack_rate: ::core::option::Option<f64>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandGetLastMessageId {
     #[prost(uint64, required, tag = "1")]
     pub consumer_id: u64,
@@ -1120,7 +1120,7 @@ pub mod command_get_topics_of_namespace {
         }
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandGetTopicsOfNamespaceResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1133,7 +1133,7 @@ pub struct CommandGetTopicsOfNamespaceResponse {
     #[prost(bool, optional, tag = "5", default = "true")]
     pub changed: ::core::option::Option<bool>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandWatchTopicList {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1146,7 +1146,7 @@ pub struct CommandWatchTopicList {
     #[prost(string, optional, tag = "5")]
     pub topics_hash: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandWatchTopicListSuccess {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1157,7 +1157,7 @@ pub struct CommandWatchTopicListSuccess {
     #[prost(string, required, tag = "4")]
     pub topics_hash: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandWatchTopicUpdate {
     #[prost(uint64, required, tag = "1")]
     pub watcher_id: u64,
@@ -1168,14 +1168,14 @@ pub struct CommandWatchTopicUpdate {
     #[prost(string, required, tag = "4")]
     pub topics_hash: ::prost::alloc::string::String,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandWatchTopicListClose {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
     #[prost(uint64, required, tag = "2")]
     pub watcher_id: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SegmentInfoProto {
     #[prost(uint64, required, tag = "1")]
     pub segment_id: u64,
@@ -1198,7 +1198,7 @@ pub struct SegmentInfoProto {
     #[prost(uint64, optional, tag = "10")]
     pub sealed_at_ms: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SegmentBrokerAddress {
     #[prost(uint64, required, tag = "1")]
     pub segment_id: u64,
@@ -1222,7 +1222,7 @@ pub struct ScalableTopicDag {
         ::prost::alloc::string::String,
     >,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandScalableTopicLookup {
     #[prost(uint64, required, tag = "1")]
     pub session_id: u64,
@@ -1240,12 +1240,12 @@ pub struct CommandScalableTopicUpdate {
     #[prost(string, optional, tag = "4")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandScalableTopicClose {
     #[prost(uint64, required, tag = "1")]
     pub session_id: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScalableAssignedSegment {
     #[prost(uint64, required, tag = "1")]
     pub segment_id: u64,
@@ -1263,7 +1263,7 @@ pub struct ScalableConsumerAssignment {
     #[prost(message, repeated, tag = "2")]
     pub segments: ::prost::alloc::vec::Vec<ScalableAssignedSegment>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandScalableTopicSubscribe {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1307,19 +1307,19 @@ pub struct CommandWatchScalableTopics {
     #[prost(string, optional, tag = "4")]
     pub current_hash: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScalableTopicsSnapshot {
     #[prost(string, repeated, tag = "1")]
     pub topics: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ScalableTopicsDiff {
     #[prost(string, repeated, tag = "1")]
     pub added: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "2")]
     pub removed: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandWatchScalableTopicsUpdate {
     #[prost(uint64, required, tag = "1")]
     pub watch_id: u64,
@@ -1332,7 +1332,7 @@ pub struct CommandWatchScalableTopicsUpdate {
 }
 /// Nested message and enum types in `CommandWatchScalableTopicsUpdate`.
 pub mod command_watch_scalable_topics_update {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Event {
         #[prost(message, tag = "2")]
         Snapshot(super::ScalableTopicsSnapshot),
@@ -1340,12 +1340,12 @@ pub mod command_watch_scalable_topics_update {
         Diff(super::ScalableTopicsDiff),
     }
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandWatchScalableTopicsClose {
     #[prost(uint64, required, tag = "1")]
     pub watch_id: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandGetSchema {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1378,7 +1378,7 @@ pub struct CommandGetOrCreateSchema {
     #[prost(string, optional, tag = "4")]
     pub producer_name: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandGetOrCreateSchemaResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1389,14 +1389,14 @@ pub struct CommandGetOrCreateSchemaResponse {
     #[prost(bytes = "bytes", optional, tag = "4")]
     pub schema_version: ::core::option::Option<::prost::bytes::Bytes>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandTcClientConnectRequest {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
     #[prost(uint64, required, tag = "2", default = "0")]
     pub tc_id: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandTcClientConnectResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1405,7 +1405,7 @@ pub struct CommandTcClientConnectResponse {
     #[prost(string, optional, tag = "3")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandNewTxn {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1414,7 +1414,7 @@ pub struct CommandNewTxn {
     #[prost(uint64, optional, tag = "3", default = "0")]
     pub tc_id: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandNewTxnResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1427,7 +1427,7 @@ pub struct CommandNewTxnResponse {
     #[prost(string, optional, tag = "5")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAddPartitionToTxn {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1438,7 +1438,7 @@ pub struct CommandAddPartitionToTxn {
     #[prost(string, repeated, tag = "4")]
     pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAddPartitionToTxnResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1451,7 +1451,7 @@ pub struct CommandAddPartitionToTxnResponse {
     #[prost(string, optional, tag = "5")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Subscription {
     #[prost(string, required, tag = "1")]
     pub topic: ::prost::alloc::string::String,
@@ -1469,7 +1469,7 @@ pub struct CommandAddSubscriptionToTxn {
     #[prost(message, repeated, tag = "4")]
     pub subscription: ::prost::alloc::vec::Vec<Subscription>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandAddSubscriptionToTxnResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1482,7 +1482,7 @@ pub struct CommandAddSubscriptionToTxnResponse {
     #[prost(string, optional, tag = "5")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxn {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1493,7 +1493,7 @@ pub struct CommandEndTxn {
     #[prost(enumeration = "TxnAction", optional, tag = "4")]
     pub txn_action: ::core::option::Option<i32>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxnResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1506,7 +1506,7 @@ pub struct CommandEndTxnResponse {
     #[prost(string, optional, tag = "5")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxnOnPartition {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1521,7 +1521,7 @@ pub struct CommandEndTxnOnPartition {
     #[prost(uint64, optional, tag = "6")]
     pub txnid_least_bits_of_low_watermark: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxnOnPartitionResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1534,7 +1534,7 @@ pub struct CommandEndTxnOnPartitionResponse {
     #[prost(string, optional, tag = "5")]
     pub message: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxnOnSubscription {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -1549,7 +1549,7 @@ pub struct CommandEndTxnOnSubscription {
     #[prost(uint64, optional, tag = "6")]
     pub txnid_least_bits_of_low_watermark: ::core::option::Option<u64>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CommandEndTxnOnSubscriptionResponse {
     #[prost(uint64, required, tag = "1")]
     pub request_id: u64,
@@ -2375,14 +2375,14 @@ impl TxnAction {
         }
     }
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReplicatedSubscriptionsSnapshotRequest {
     #[prost(string, required, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
     #[prost(string, optional, tag = "2")]
     pub source_cluster: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReplicatedSubscriptionsSnapshotResponse {
     #[prost(string, required, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
@@ -2405,14 +2405,14 @@ pub struct ReplicatedSubscriptionsUpdate {
     #[prost(message, repeated, tag = "2")]
     pub clusters: ::prost::alloc::vec::Vec<ClusterMessageId>,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClusterMessageId {
     #[prost(string, required, tag = "1")]
     pub cluster: ::prost::alloc::string::String,
     #[prost(message, required, tag = "2")]
     pub message_id: MarkersMessageIdData,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MarkersMessageIdData {
     #[prost(uint64, required, tag = "1")]
     pub ledger_id: u64,

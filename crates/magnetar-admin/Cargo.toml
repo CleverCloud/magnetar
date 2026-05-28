@@ -16,15 +16,16 @@ categories    = { workspace = true }
 workspace = true
 
 [features]
-# Pluggable rustls crypto provider (issue #9, ADR-0035). reqwest 0.12's
-# `rustls-tls` resolves to aws-lc-rs internally; `rustls-tls-no-provider`
-# trusts the caller to `install_default()` whichever provider is in use
-# (the tokio engine boot does that idempotently via the
+# Pluggable rustls crypto provider (issue #9, ADR-0035). reqwest 0.13's
+# `rustls` (renamed from `rustls-tls`) resolves to aws-lc-rs internally;
+# `rustls-no-provider` (renamed from `rustls-tls-no-provider`) trusts the
+# caller to `install_default()` whichever provider is in use (the tokio
+# engine boot does that idempotently via the
 # `magnetar_runtime_tokio::tls_crypto::install_default_provider()` shim).
-crypto-aws-lc-rs = ["reqwest/rustls-tls"]
-crypto-ring      = ["reqwest/rustls-tls-no-provider"]
-crypto-openssl   = ["reqwest/rustls-tls-no-provider"]
-crypto-fips      = ["reqwest/rustls-tls-no-provider"]
+crypto-aws-lc-rs = ["reqwest/rustls"]
+crypto-ring      = ["reqwest/rustls-no-provider"]
+crypto-openssl   = ["reqwest/rustls-no-provider"]
+crypto-fips      = ["reqwest/rustls-no-provider"]
 # PIP-460 scalable topics (ADR-0031). Keeps admin's `MessageId` construction
 # in sync with the proto-layer `segment_id` field gate. Default OFF.
 scalable-topics  = ["magnetar-proto/scalable-topics"]

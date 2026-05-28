@@ -3,7 +3,7 @@
 > A blazing-fast, async, sans-io Apache Pulsar client for Rust.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-orange.svg)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](rust-toolchain.toml)
 [![Status](https://img.shields.io/badge/status-pre--alpha-red.svg)](#status)
 [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
@@ -853,7 +853,7 @@ V5 surface, and the **Athenz ZTS** round-trip — are still scoped per
 
 ## Validation
 
-The whole workspace builds against stable Rust 1.85.
+The whole workspace builds against stable Rust 1.88.
 
 ```sh
 # Build / lint / format

@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-- Rust **stable ≥ 1.85** (edition 2024). `rust-toolchain.toml` pins this.
+- Rust **stable ≥ 1.88** (edition 2024). `rust-toolchain.toml` pins this.
 - Rust **nightly** is needed only for `cargo +nightly fmt` (unstable rustfmt features).
 - **`protoc` ≥ 3.19** if you re-run `xtask codegen`. End users don't need it — generated code is committed to `crates/magnetar-proto/src/pb/`.
 - **`cargo-deny`**, **`cargo-mutants`** for the relevant CI jobs. Install via `cargo install`.

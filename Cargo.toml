@@ -19,7 +19,7 @@ members = [
 [workspace.package]
 version       = "0.1.0-dev.0"
 edition       = "2024"
-rust-version  = "1.85"
+rust-version  = "1.88"
 license       = "Apache-2.0"
 authors       = ["Florentin Dubois <florentin.dubois@clever-cloud.com>"]
 repository    = "https://github.com/CleverCloud/magnetar"
@@ -43,9 +43,9 @@ magnetar-runtime-moonpool = { version = "^0.1.0-dev.0", path = "crates/magnetar-
 magnetar-runtime-tokio   = { version = "^0.1.0-dev.0", path = "crates/magnetar-runtime-tokio" }
 
 # Codec
-prost           = "^0.13.5"
-prost-build     = "^0.13.5"
-prost-types     = "^0.13.5"
+prost           = "^0.14.3"
+prost-build     = "^0.14.3"
+prost-types     = "^0.14.3"
 bytes           = "^1.11.1"
 crc32c          = "^0.6.8"
 
@@ -81,14 +81,14 @@ tokio-rustls         = { version = "^0.26.4", default-features = false }
 rustls-openssl       = { version = "^0.3.1", default-features = false }
 
 # Compression — Pulsar's four codecs
-lz4_flex   = { version = "^0.11.6", default-features = false, features = ["std"] }
+lz4_flex   = { version = "^0.13.1", default-features = false, features = ["std"] }
 zstd       = { version = "^0.13.3", default-features = false }
 snap       = "^1.1.1"
 flate2     = { version = "^1.1.9", default-features = false, features = ["zlib"] }
 
 # Schemas
 serde       = { version = "^1.0.228", features = ["derive"] }
-serde_json  = "^1.0.149"
+serde_json  = "^1.0.150"
 apache-avro = "^0.21.0"
 schemars    = { version = "^1.2.1", default-features = false, features = ["derive", "std"] }
 
@@ -126,11 +126,13 @@ moonpool-core = "=0.6.0"
 # differential harness needs it).
 moonpool-sim = "=0.6.0"
 
-# Admin REST + CLI. The TLS sub-feature (`rustls-tls` vs
-# `rustls-tls-no-provider`) is picked by each downstream crate from its
-# `crypto-*` feature; the workspace dep stays free of a hard-wired
-# provider sub-feature (issue #9, ADR-0035).
-reqwest = { version = "^0.12.28", default-features = false, features = ["json"] }
+# Admin REST + CLI. The TLS sub-feature (`rustls` vs `rustls-no-provider`,
+# renamed from `rustls-tls` / `rustls-tls-no-provider` in reqwest 0.13) is
+# picked by each downstream crate from its `crypto-*` feature; the workspace
+# dep stays free of a hard-wired provider sub-feature (issue #9, ADR-0035).
+# `form` (gated behind its own feature in 0.13) powers the OAuth2 token
+# exchange's `RequestBuilder::form`.
+reqwest = { version = "^0.13.4", default-features = false, features = ["json", "form"] }
 url     = "^2.5.8"
 http    = "^1.4.1"
 clap    = { version = "^4.6.1", features = ["derive", "env"] }
@@ -144,7 +146,7 @@ hdrhistogram       = { version = "^7.5.4", default-features = false }
 
 # Test infrastructure
 testcontainers = "^0.27.3"
-rstest         = "^0.21.0"
+rstest         = "^0.26.1"
 proptest       = "^1.11.0"
 tempfile       = "^3.27.0"
 wiremock       = "^0.6.5"
@@ -174,6 +176,12 @@ missing_panics_doc        = "allow"
 # trait signature is borrow-bound to `&self` so clippy wants us to narrow to
 # `&'static str`. Changing the trait signature is more disruptive than the lint payoff.
 unnecessary_literal_bound = "allow"
+# clippy 1.95 + MSRV 1.88 (ADR-0042) surfaces `collapsible_if` suggestions that
+# collapse nested `if let A { if let B { … } }` into a let-chain
+# `if let A && let B { … }`. The two forms compile identically and the nested
+# form is often clearer once the body grows. Refactor tracked separately; do
+# not block the validation chain on this lint.
+collapsible_if = "allow"
 
 [profile.release]
 lto           = "thin"

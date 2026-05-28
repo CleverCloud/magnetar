@@ -1,5 +1,5 @@
 avoid-breaking-exported-api = false
-msrv                        = "1.85"
+msrv                        = "1.88"
 disallowed-types = [
     { path = "tokio::sync::mpsc::Sender",         reason = "magnetar bans channels — use Arc<Mutex<State>> + Notify + Waker slabs" },
     { path = "tokio::sync::mpsc::Receiver",       reason = "magnetar bans channels — use Arc<Mutex<State>> + Notify + Waker slabs" },

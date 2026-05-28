@@ -1634,7 +1634,7 @@ Round-trip-encodes `BaseCommand` shapes and asserts re-decode equality.
 
 ## Build & validation
 
-Stable Rust **1.85** (workspace MSRV in `rust-toolchain.toml`).
+Stable Rust **1.88** (workspace MSRV in `rust-toolchain.toml` — see ADR-0042).
 
 ### Per-commit chain
 

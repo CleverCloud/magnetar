@@ -34,6 +34,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 /// rustls crypto provider is picked by the workspace's `crypto-*`
 /// feature (issue #9, ADR-0035).
 fn make_session() -> ClientConnection {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Arc::new(
         ClientConfig::builder_with_provider(active_provider())
             .with_safe_default_protocol_versions()
