@@ -64,3 +64,12 @@ async-trait    = { workspace = true }
 magnetar-auth-sasl = { workspace = true }
 # PIP-33 marker encoding in tests/replicated_subscriptions.rs.
 prost          = { workspace = true }
+# In-process TLS server fixture for `tests/tls_transport_coverage.rs`. The
+# moonpool engine's `connect_tls` drives `RustlsByteAdapter` over the
+# `TokioNetworkProvider`'s `tokio::net::TcpStream`; the test peer binds a
+# `TlsAcceptor` on `127.0.0.1` and completes the handshake against it.
+# `rcgen` mints a self-signed cert at fixture build time so the suite has
+# no on-disk PEM dependency. Both crates are dev-only — neither leaks
+# into the published crate's surface.
+rcgen          = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio-rustls   = { workspace = true, features = ["aws_lc_rs"] }

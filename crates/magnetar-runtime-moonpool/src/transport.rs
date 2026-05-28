@@ -261,25 +261,35 @@ impl<P: Providers> Transport<P> {
                     plaintext_overflow.clear();
                     return Ok(n);
                 }
-                // 2. Pull ciphertext off the wire, then keep stepping until rustls yields plaintext
-                //    (or the peer closes).
-                let mut wire = BytesMut::with_capacity(TLS_WIRE_BUFFER);
-                let read_n = stream.read_buf(&mut wire).await?;
-                if read_n == 0 {
-                    return Ok(0);
+                // 2. Pull ciphertext off the wire and keep looping until rustls surfaces
+                //    application plaintext (or the peer closes). Post-handshake messages such as
+                //    `NewSessionTicket` (TLS 1.3) decrypt to nothing user-visible — they bump
+                //    `take_plaintext` to empty but `read_n` to non-zero. Returning `Ok(0)` here
+                //    would mis-signal EOF to the caller (the driver treats `0` as `PeerClosed`), so
+                //    we re-issue the wire read until we either have plaintext or the peer actually
+                //    drops.
+                loop {
+                    let mut wire = BytesMut::with_capacity(TLS_WIRE_BUFFER);
+                    let read_n = stream.read_buf(&mut wire).await?;
+                    if read_n == 0 {
+                        return Ok(0);
+                    }
+                    adapter.push_encrypted(&wire);
+                    adapter
+                        .step()
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    let plaintext = adapter.take_plaintext();
+                    if !plaintext.is_empty() {
+                        buf.extend_from_slice(&plaintext);
+                        return Ok(plaintext.len());
+                    }
+                    // Plaintext empty but wire produced bytes — keep
+                    // looping. Common cause: TLS 1.3 NewSessionTicket
+                    // arrives post-handshake and is consumed silently.
+                    // Looping rather than returning `Ok(0)` matches the
+                    // tokio engine's `tokio_rustls::TlsStream` semantics
+                    // (which transparently retries on internal records).
                 }
-                adapter.push_encrypted(&wire);
-                adapter
-                    .step()
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                let plaintext = adapter.take_plaintext();
-                if plaintext.is_empty() {
-                    // Mid-handshake / rekey traffic — nothing to surface yet.
-                    // The driver will park on the read again.
-                    return Ok(0);
-                }
-                buf.extend_from_slice(&plaintext);
-                Ok(plaintext.len())
             }
         }
     }

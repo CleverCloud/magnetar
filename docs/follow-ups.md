@@ -37,7 +37,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | 🔗 (needs #3) |
 | 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
 | 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
-| 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ⚡ |
+| 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ✅ landed 2026-05-28 (TLS hunk); supervised-loop driver lines remain |
 | 8 | [Golden trace catalog — transactional ack + cryptoFailureAction](#8-golden-trace-catalog-extension) | ⚡ (partial) |
 | 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | 🔗 (blocked on upstream moonpool TaskProvider — see in-section investigation note) |
 | 10 | [`engine.rs` split](#10-enginers-split) | ⚡ |
@@ -348,31 +348,43 @@ the 4-layer in-process tests are the binding acceptance gate.
 
 ## 7. Moonpool transport TLS + supervised-loop coverage
 
-**Gap.** Per-file coverage on the moonpool runtime:
+**Status update (2026-05-28).** ✅ TLS hunk landed in
+`test/moonpool-tls-coverage`. The in-process rustls broker fixture
+(self-signed cert via `rcgen` + `tokio_rustls::TlsAcceptor`) lives in
+`crates/magnetar-runtime-moonpool/tests/tls_transport_coverage.rs`.
+Four end-to-end tests drive the moonpool engine's `connect_tls`
+against the fixture:
 
-| File | Coverage | Gap |
-| --- | --- | --- |
-| `src/consumer.rs`  | 75.4% | 154 lines |
-| `src/driver.rs`    | 54.7% | 141 lines |
-| `src/lib.rs`       | 92.4% |  16 lines |
-| `src/producer.rs`  | 85.4% |  55 lines |
-| `src/transport.rs` | 30.3% | 124 lines |
+- `connect_tls_completes_handshake_then_drives_pulsar_connected` —
+  full TLS handshake + Pulsar `CommandConnect` / `CommandConnected`
+  round-trip over the encrypted channel.
+- `connect_tls_rejects_invalid_server_name` — invalid SNI surfaces as
+  `EngineError::Config` before any wire traffic.
+- `connect_tls_propagates_peer_drop_after_tls_handshake` — the broker
+  drops mid-Pulsar-handshake; the engine surfaces `PeerClosed` (or
+  `Io` if a TCP RST beats the TLS `close_notify`).
+- `connect_tls_clean_shutdown_releases_resources` — user-initiated
+  close exercises the TLS `Transport::shutdown` arm without hanging.
 
-The largest hunks live in `src/transport.rs` (TLS pump incl.
-`connect_tls` / `tls_handshake` / TLS-side `read_buf` /
-`write_all` / `flush`) and `src/driver.rs` (supervised reconnect
-loop + anti-thrash cooldown).
+Paired tokio mirrors with the same names live in
+`crates/magnetar-runtime-tokio/tests/tls_transport_coverage.rs` (Debug
+/ fmt / crypto-provider smoke against `rustls::ClientConnection`),
+keeping `xtask check-runtime-test-parity` balanced at 167/167.
 
-**Why it stays open.** Needs either a TLS-enabled in-process broker
-fixture (rustls server cert + `RustlsByteAdapter` peer driver) or a
-`moonpool_core::SimProviders` substrate. Both are scaffolding work
-but not architecturally blocked.
+**Engine bug fixed alongside.** `Transport::read_buf`'s TLS arm
+previously returned `Ok(0)` when a TLS record decrypted to no
+application bytes (e.g. TLS 1.3 `NewSessionTicket`). The driver loop
+treats `0` as `PeerClosed`, so every TLS connection broke on the
+first post-handshake server message. The arm now loops until
+plaintext is available or the wire actually EOFs — matching
+`tokio_rustls::TlsStream` semantics.
 
-**`/goal`.**
-
-```text
-/goal close the residual moonpool transport TLS + driver supervised-loop coverage hunks per docs/follow-ups.md §7. Stand up an in-process rustls-enabled broker fixture (self-signed cert + `RustlsByteAdapter` peer driver) under crates/magnetar-runtime-moonpool/tests/, then add targeted tests that exercise `Transport::connect_tls`, `tls_handshake`, the TLS variants of `read_buf` / `write_all` / `flush`, and `Transport::shutdown`. Pair each new moonpool test with a same-named tokio counterpart (the tokio path is already covered via tls_handshake_chaos.rs; the mirror may be a Debug / fmt smoke if the surface is engine-private). Optionally close the remaining `driver.rs` `supervised_driver_loop` lines via a synthetic peer that drops the socket between handshakes. Validation chain per CLAUDE.md.
-```
+**Remaining gap.** The supervised reconnect loop in
+`src/driver.rs::supervised_driver_loop` (anti-thrash cooldown,
+multi-attempt redial) still carries uncovered lines. Closing them
+needs a multi-cycle peer-drop fixture (drop, accept, drop, …) which
+is mechanically straightforward but was descoped from this PR. Open
+follow-up if the diff coverage gate flags it.
 
 ---
 
