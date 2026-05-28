@@ -23,7 +23,7 @@ use super::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
     SubscribeApi, TopicListChange, WatchTopicListFut,
 };
-use super::{Engine, TransactionApi};
+use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 
 /// Zero-sized marker for the moonpool deterministic-simulation engine,
 /// parametrised by the [`moonpool_core::Providers`] bundle the underlying
@@ -106,6 +106,21 @@ impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         format!("sim-{n:016x}")
     }
+}
+
+// PIP-4 encryption hookup for the moonpool engine. Moonpool doesn't yet
+// drive real on-the-wire encryption (the producer / consumer push paths
+// don't take an encryptor parameter), so both associated types resolve to
+// the engine-agnostic [`NoEncryption`] stub. Builders that flow through
+// the engine-generic `.create()` / `.subscribe()` paths simply ignore
+// the field; tokio-specialised `.create_with_encryption` /
+// `.subscribe_with_decryption` methods stay tokio-only.
+impl<P: moonpool_core::Providers> MessageEncryptorApi for MoonpoolEngine<P> {
+    type Encryptor = NoEncryption;
+}
+
+impl<P: moonpool_core::Providers> MessageDecryptorApi for MoonpoolEngine<P> {
+    type Decryptor = NoEncryption;
 }
 
 impl<P: moonpool_core::Providers + Send + Sync + 'static> TransactionApi

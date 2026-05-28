@@ -67,7 +67,7 @@ pub use engine::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, OpenProducerFut, ProducerApi,
     ReceiveBatchFut, ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange, WatchTopicListFut,
 };
-pub use engine::{Engine, TransactionApi};
+pub use engine::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 
 #[cfg(feature = "tokio")]
 mod builders;

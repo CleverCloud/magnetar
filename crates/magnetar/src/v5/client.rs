@@ -8,7 +8,7 @@
 //! no second handshake. Callers can mix V5 and v4 surfaces on the same
 //! connection while the V5 surface is still iterating upstream.
 
-use crate::PulsarClient;
+use crate::{Engine, PulsarClient, TokioEngine};
 
 /// **Experimental** — PIP-466 V5 client surface (ADR-0032). Behaviour
 /// and signatures may change before V5 is promoted to default.
@@ -16,17 +16,29 @@ use crate::PulsarClient;
 /// Holds the same engine state as [`crate::PulsarClient`]. Use the
 /// [`Self::v4`] escape hatch to fall back to the v4 surface on the
 /// same connection without re-handshaking.
-#[derive(Debug)]
-pub struct PulsarClientV5 {
-    inner: PulsarClient,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 3: `E: Engine`
+/// defaults to [`crate::TokioEngine`] so call sites that write
+/// `PulsarClientV5` keep resolving to the tokio specialisation;
+/// moonpool callers name `PulsarClientV5<MoonpoolEngine<P>>` directly.
+pub struct PulsarClientV5<E: Engine = TokioEngine> {
+    inner: PulsarClient<E>,
 }
 
-impl PulsarClientV5 {
+impl<E: Engine> std::fmt::Debug for PulsarClientV5<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PulsarClientV5")
+            .field("engine", &E::name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Engine> PulsarClientV5<E> {
     /// Wrap an already-built v4 [`PulsarClient`] in the V5 surface.
     /// The V5 wrapper holds no state of its own — every call delegates
     /// to the wrapped v4 client.
     #[must_use]
-    pub fn from_v4(inner: PulsarClient) -> Self {
+    pub fn from_v4(inner: PulsarClient<E>) -> Self {
         Self { inner }
     }
 
@@ -34,14 +46,14 @@ impl PulsarClientV5 {
     /// state — useful when the caller needs a v4-only feature (e.g.
     /// `Reader`, `TableView`, transactions) that V5 has not yet lifted.
     #[must_use]
-    pub fn v4(&self) -> &PulsarClient {
+    pub fn v4(&self) -> &PulsarClient<E> {
         &self.inner
     }
 
     /// Consume the V5 wrapper and return the inner v4 client. Useful
     /// when migrating call sites off the experimental surface.
     #[must_use]
-    pub fn into_v4(self) -> PulsarClient {
+    pub fn into_v4(self) -> PulsarClient<E> {
         self.inner
     }
 
@@ -50,7 +62,7 @@ impl PulsarClientV5 {
     /// `Option<usize>` max-pending; the v4 wire equivalents are
     /// computed via [`super::mapping`] at `.create()` time.
     #[must_use]
-    pub fn producer(&self, topic: impl Into<String>) -> super::producer::ProducerBuilder<'_> {
+    pub fn producer(&self, topic: impl Into<String>) -> super::producer::ProducerBuilder<'_, E> {
         super::producer::ProducerBuilder::new(self.inner.producer(topic))
     }
 
@@ -63,7 +75,7 @@ impl PulsarClientV5 {
     pub fn stream_consumer(
         &self,
         topic: impl Into<String>,
-    ) -> super::stream_consumer::StreamConsumerBuilder<'_> {
+    ) -> super::stream_consumer::StreamConsumerBuilder<'_, E> {
         super::stream_consumer::StreamConsumerBuilder::new(self.inner.consumer(topic))
     }
 
@@ -76,7 +88,7 @@ impl PulsarClientV5 {
     pub fn queue_consumer(
         &self,
         topic: impl Into<String>,
-    ) -> super::queue_consumer::QueueConsumerBuilder<'_> {
+    ) -> super::queue_consumer::QueueConsumerBuilder<'_, E> {
         super::queue_consumer::QueueConsumerBuilder::new(self.inner.consumer(topic))
     }
 }
@@ -97,6 +109,27 @@ mod tests {
             PulsarClientV5::from_v4(c).into_v4()
         }
         fn _borrow_v4(v5: &PulsarClientV5) -> &PulsarClient {
+            v5.v4()
+        }
+    }
+
+    /// Compile-time witness that the V5 wrapper is parametric over
+    /// `E: Engine` (WAVE 3 lift). Mirrors the tokio assertion above
+    /// against the moonpool engine.
+    #[cfg(feature = "moonpool")]
+    #[test]
+    fn moonpool_type_surface_compiles() {
+        use moonpool_core::TokioProviders;
+
+        use crate::MoonpoolEngine;
+        fn _round_trip(
+            c: PulsarClient<MoonpoolEngine<TokioProviders>>,
+        ) -> PulsarClient<MoonpoolEngine<TokioProviders>> {
+            PulsarClientV5::<MoonpoolEngine<TokioProviders>>::from_v4(c).into_v4()
+        }
+        fn _borrow_v4(
+            v5: &PulsarClientV5<MoonpoolEngine<TokioProviders>>,
+        ) -> &PulsarClient<MoonpoolEngine<TokioProviders>> {
             v5.v4()
         }
     }

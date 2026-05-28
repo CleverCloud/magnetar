@@ -70,7 +70,9 @@ pub use tokio::TokioEngine;
 /// `TableView::drain_task`, `MultiTopicsConsumer::auto_update`, and the
 /// other surface lifts off `impl PulsarClient<TokioEngine>`. See
 /// [ADR-0025](../../specs/adr/0025-engine-trait-task-and-timer-primitives.md).
-pub trait Engine: 'static + Send + Sync + Debug {
+pub trait Engine:
+    'static + Send + Sync + Debug + MessageEncryptorApi + MessageDecryptorApi
+{
     /// Per-engine state stored inside [`crate::PulsarClient<E>`]. The tokio
     /// engine plugs in [`magnetar_runtime_tokio::Client`]; the moonpool
     /// engine plugs in `(Arc<moonpool::ConnectionShared>,
@@ -808,6 +810,67 @@ pub type OpenProducerFut<'a, P> = Pin<
             + 'a,
     >,
 >;
+
+// ---------------------------------------------------------------------------
+// PIP-4 per-engine encryption extension traits (docs/follow-ups.md §2 WAVE 1).
+//
+// Tokio defines `magnetar_runtime_tokio::MessageEncryptor` and
+// `magnetar_runtime_tokio::MessageDecryptor` for its own producer / consumer
+// surfaces. The façade builders historically stored
+// `Option<Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>` directly,
+// hard-locking them to the tokio engine. The two extension traits below
+// lift that storage off tokio: each engine declares its own concrete
+// encryptor / decryptor type, the façade stores
+// `Option<<E as MessageEncryptorApi>::Encryptor>` instead, and engines
+// that don't support encryption can supply a zero-sized stub
+// (e.g. moonpool's `NoEncryption`).
+//
+// The traits live on the engine marker (not on `Client`) because the
+// encryptor identity is engine-global config rather than per-connection
+// state. The associated `Encryptor` / `Decryptor` types are `Clone +
+// Send + Sync + 'static` so the builders can pass them to the runtime's
+// `open_producer_with` / `subscribe_with` without further bounds churn.
+//
+// Sans-io: the traits define types only. Real encryption happens in the
+// runtime crates that supply the concrete types (`magnetar-runtime-tokio`
+// today; moonpool ships a no-op stub).
+// ---------------------------------------------------------------------------
+
+/// Engine-side message-encryptor selection. Each engine declares its own
+/// concrete encryptor type; the façade's `ProducerBuilder` stores
+/// `Option<E::Encryptor>` (engine-typed) instead of an
+/// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` (tokio-locked).
+///
+/// Implemented on the engine marker ([`TokioEngine`] / [`MoonpoolEngine<P>`]).
+/// Tokio plugs in `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`;
+/// moonpool plugs in [`NoEncryption`] (a zero-sized stub) until real
+/// moonpool-side encryption lands. The choice of `Encryptor: Clone` lets
+/// the façade fan out the encryptor across child producers in
+/// `PartitionedProducer`.
+pub trait MessageEncryptorApi {
+    /// Concrete per-engine encryptor type. `Clone + Send + Sync + 'static`
+    /// so it survives spawn boundaries and fan-out into child producers.
+    type Encryptor: Clone + Send + Sync + 'static;
+}
+
+/// Engine-side message-decryptor selection. Mirror of
+/// [`MessageEncryptorApi`] for the consume path. Implemented on the
+/// engine marker.
+pub trait MessageDecryptorApi {
+    /// Concrete per-engine decryptor type. `Clone + Send + Sync + 'static`.
+    type Decryptor: Clone + Send + Sync + 'static;
+}
+
+/// Zero-sized stub for engines that don't yet wire real encryption.
+/// Used by [`MoonpoolEngine`] as both `MessageEncryptorApi::Encryptor`
+/// and `MessageDecryptorApi::Decryptor`. Constructing one is meaningless
+/// — engines that hand a `NoEncryption` to the façade signal "encryption
+/// not supported on this engine"; the builders' generic `.create()` /
+/// `.subscribe()` paths ignore the field. Tokio-specialised builder
+/// methods (`.create_with_encryption` / `.subscribe_with_decryption`)
+/// remain available on the tokio engine for real encryption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoEncryption;
 
 // Per-engine storage for [`crate::PulsarClient<MoonpoolEngine<P>>`] is
 // [`magnetar_runtime_moonpool::Client<P>`] directly — see

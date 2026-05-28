@@ -21,8 +21,8 @@ use magnetar_runtime_tokio::Producer;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::PulsarClient;
 use crate::client::{OutgoingMessage, PulsarError};
+use crate::{Engine, PulsarClient, TokioEngine};
 
 /// How a [`PartitionedProducer`] picks the partition for an outgoing message.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -713,8 +713,17 @@ impl PartitionedProducer<Producer> {
 
 /// Builder for [`PartitionedProducer`]. Mirrors Java's `ProducerBuilder` at the partitioned
 /// layer.
-pub struct PartitionedProducerBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 2: the type parameter
+/// `E: Engine` (defaults to [`crate::TokioEngine`]) selects the
+/// per-partition child producer type via the engine-side
+/// [`crate::CreateProducerApi`] + [`crate::BrokerMetadataApi`]
+/// extension traits. The encryptor slot is engine-typed via
+/// [`crate::MessageEncryptorApi`] (tokio plugs in
+/// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs in
+/// [`crate::NoEncryption`] no-op stub).
+pub struct PartitionedProducerBuilder<'a, E: Engine = TokioEngine> {
+    client: &'a PulsarClient<E>,
     topic: String,
     name: Option<String>,
     compression: CompressionKind,
@@ -729,12 +738,12 @@ pub struct PartitionedProducerBuilder<'a> {
     send_timeout: Option<std::time::Duration>,
     batching_max_publish_delay: Option<std::time::Duration>,
     schema: Option<pb::Schema>,
-    encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
+    encryptor: Option<<E as crate::MessageEncryptorApi>::Encryptor>,
     router: Option<std::sync::Arc<dyn MessageRouter>>,
     auto_update_partitions_interval: Option<Duration>,
 }
 
-impl std::fmt::Debug for PartitionedProducerBuilder<'_> {
+impl<E: Engine> std::fmt::Debug for PartitionedProducerBuilder<'_, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartitionedProducerBuilder")
             .field("topic", &self.topic)
@@ -744,8 +753,8 @@ impl std::fmt::Debug for PartitionedProducerBuilder<'_> {
     }
 }
 
-impl<'a> PartitionedProducerBuilder<'a> {
-    pub(crate) fn new(client: &'a PulsarClient, topic: String) -> Self {
+impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
         Self {
             client,
             topic,
@@ -863,16 +872,6 @@ impl<'a> PartitionedProducerBuilder<'a> {
         self
     }
 
-    /// Configure PIP-4 end-to-end encryption (applied to every per-partition producer).
-    #[must_use]
-    pub fn encryption(
-        mut self,
-        encryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>,
-    ) -> Self {
-        self.encryptor = Some(encryptor);
-        self
-    }
-
     /// Enable a background timer that signals every `interval`, intended to drive
     /// re-checks of the topic's partition count. Mirrors Java
     /// `ProducerBuilder#autoUpdatePartitionsInterval`.
@@ -903,7 +902,117 @@ impl<'a> PartitionedProducerBuilder<'a> {
 
     /// Query partition count, then open one producer per partition. If the broker reports
     /// `0` partitions, fall back to a single producer on the original topic.
-    pub async fn create(self) -> Result<PartitionedProducer, PulsarError> {
+    ///
+    /// Dispatches through the engine-generic
+    /// [`crate::BrokerMetadataApi`] (partition count lookup) and
+    /// [`crate::CreateProducerApi`] (per-partition producer creation)
+    /// extension traits, so the same builder shape works for both the
+    /// tokio and moonpool engines. The configured PIP-4 encryptor is
+    /// ignored on this engine-generic path — tokio-engine callers that
+    /// need encryption use [`PartitionedProducerBuilder::create_with_encryption`].
+    ///
+    /// # Errors
+    ///
+    /// - [`PulsarError::Other`] (stringified) on the broker metadata lookup or on a per-partition
+    ///   producer open failure.
+    pub async fn create(
+        self,
+    ) -> Result<
+        PartitionedProducer<<E::ClientState as crate::CreateProducerApi>::Producer>,
+        PulsarError,
+    >
+    where
+        E::ClientState: crate::BrokerMetadataApi + crate::CreateProducerApi,
+    {
+        let partitions_count =
+            crate::BrokerMetadataApi::partitioned_topic_metadata(&self.client.inner, &self.topic)
+                .await
+                .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
+
+        let partition_topics: Vec<String> = if partitions_count == 0 {
+            vec![self.topic.clone()]
+        } else {
+            (0..partitions_count)
+                .map(|i| format!("{}-partition-{}", self.topic, i))
+                .collect()
+        };
+
+        let mut child_producers: Vec<<E::ClientState as crate::CreateProducerApi>::Producer> =
+            Vec::with_capacity(partition_topics.len());
+        for child_topic in &partition_topics {
+            let req = CreateProducerRequest {
+                topic: child_topic.clone(),
+                producer_name: self.name.clone(),
+                compression: self.compression,
+                enable_batching: self.enable_batching,
+                enable_chunking: self.enable_chunking,
+                max_batch_size_bytes: self.max_batch_size_bytes,
+                max_messages_in_batch: self.max_messages_in_batch,
+                schema: self.schema.clone(),
+                initial_sequence_id: self.initial_sequence_id,
+                access_mode: self.access_mode,
+                producer_metadata: self.producer_metadata.clone(),
+                send_timeout: self.send_timeout,
+                batching_max_publish_delay: self.batching_max_publish_delay,
+            };
+            let result = crate::CreateProducerApi::open_producer(&self.client.inner, req).await;
+            match result {
+                Ok(p) => child_producers.push(p),
+                Err(e) => {
+                    for p in child_producers {
+                        let _ = crate::ProducerApi::close_owned(p).await;
+                    }
+                    return Err(PulsarError::Other(format!("open_producer: {e}")));
+                }
+            }
+        }
+
+        // Spawn the partition-watcher timer iff the builder configured a non-zero
+        // interval. The timer itself only emits ticks via `Notify`; callers drive the
+        // actual `partitions_for_topic` call via
+        // [`PartitionedProducer::refresh_partitions`] (the crate-wide
+        // `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into
+        // a `'static` spawn).
+        let auto_update = self
+            .auto_update_partitions_interval
+            .map(|interval| spawn_auto_update_task(self.topic.clone(), interval, partitions_count));
+
+        Ok(PartitionedProducer {
+            partitions: child_producers,
+            base_topic: self.topic,
+            routing: self.routing,
+            router: self.router,
+            cursor: AtomicU64::new(0),
+            auto_update,
+        })
+    }
+}
+
+/// Tokio-engine-specific `PartitionedProducerBuilder` methods that need
+/// the `open_producer_with(encryptor)` runtime carve-out (PIP-4 not yet
+/// wired on moonpool).
+impl PartitionedProducerBuilder<'_, TokioEngine> {
+    /// Configure PIP-4 end-to-end encryption (applied to every per-partition producer).
+    /// Tokio-engine-only — call [`Self::create_with_encryption`] to honor the
+    /// encryptor on the open path. The engine-generic [`Self::create`] ignores
+    /// the field.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        encryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>,
+    ) -> Self {
+        self.encryptor = Some(encryptor);
+        self
+    }
+
+    /// Open every per-partition producer honoring the configured PIP-4
+    /// encryptor. Tokio-engine-only — use [`Self::create`] for the
+    /// engine-generic path that ignores the encryptor field.
+    ///
+    /// # Errors
+    ///
+    /// - [`PulsarError::Client`] on broker metadata lookup or per-partition open failure.
+    pub async fn create_with_encryption(self) -> Result<PartitionedProducer, PulsarError> {
         let partitions_count = self
             .client
             .runtime_client()
@@ -951,12 +1060,6 @@ impl<'a> PartitionedProducerBuilder<'a> {
             }
         }
 
-        // Spawn the partition-watcher timer iff the builder configured a non-zero
-        // interval. The timer itself only emits ticks via `Notify`; callers drive the
-        // actual `partitions_for_topic` call via
-        // [`PartitionedProducer::refresh_partitions`] (the crate-wide
-        // `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into
-        // a `'static` spawn).
         let auto_update = self
             .auto_update_partitions_interval
             .map(|interval| spawn_auto_update_task(self.topic.clone(), interval, partitions_count));

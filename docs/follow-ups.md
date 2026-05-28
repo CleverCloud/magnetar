@@ -32,7 +32,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | # | Item | Status |
 | - | --- | --- |
 | 1 | [Moonpool vectored I/O](#1-moonpool-vectored-io) | 🔗 [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) |
-| 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ⚡ |
+| 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ✅ landed 2026-05-28 |
 | 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ⚡ |
 | 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | 🔗 (needs #3) |
 | 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
@@ -77,6 +77,62 @@ our side).
 ---
 
 ## 2. Engine-generic builder & V5 unified lift
+
+**Status update (2026-05-28).** ✅ Landed. The unified refactor shipped
+in `feat/engine-generic-unified` (commits squashed for the merge).
+Summary of what landed:
+
+- **WAVE 1** — `MessageEncryptorApi` / `MessageDecryptorApi` /
+  `NoEncryption` extension traits added as supertraits of `Engine` in
+  `crates/magnetar/src/engine/mod.rs`. Tokio plugs in
+  `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` /
+  `Arc<dyn …::MessageDecryptor>`; moonpool plugs in `NoEncryption`
+  (no-op stub). Broker-metadata lookups already had real moonpool
+  impls via the existing `BrokerMetadataApi`; reused without change.
+- **WAVE 2** — `ProducerBuilder<'_, E>` / `ConsumerBuilder<'_, E>` /
+  `ReaderBuilder<'_, E>` lifted: encryptor / decryptor storage is now
+  engine-typed (`Option<<E as MessageEncryptorApi>::Encryptor>`);
+  tokio-only `encryption()` / `create_with_encryption()` /
+  `subscribe_with_decryption()` setters live in
+  `impl …Builder<'_, TokioEngine>` blocks. `PartitionedProducerBuilder<'a, E>` /
+  `TableViewBuilder<'a, E>` / `TypedTableViewBuilder<'a, S, E>` gained the
+  `E` parameter; their `.create()` paths dispatch through
+  `CreateProducerApi` / `SubscribeApi` / `BrokerMetadataApi`.
+  `PulsarClient::partitioned_producer` / `.table_view` /
+  `.typed_table_view` lifted from `impl PulsarClient<TokioEngine>` to
+  `impl<E: Engine> PulsarClient<E>`.
+- **WAVE 3** — `PulsarClientV5<E: Engine = TokioEngine>` parametric,
+  same for `v5::Producer<E>`, `v5::StreamConsumer<E>`,
+  `v5::QueueConsumer<E>` and their builders. Five moonpool 1:1
+  mirrors landed at `crates/magnetar/tests/v5_*_moonpool.rs`. ADR-0032
+  flipped Proposed → Accepted; README parity matrix row flipped 🟡 →
+  ✅; `docs/v5-client.md` Roadmap updated.
+
+**BREAKING CHANGES** (crate unpublished, accepted per the API stability
+stance at the top of this file):
+
+- `PartitionedProducerBuilder` / `TableViewBuilder` /
+  `TypedTableViewBuilder` gain an `E: Engine` parameter (defaults
+  preserve most call sites).
+- `PulsarClientV5` and the V5 `Producer` / `StreamConsumer` /
+  `QueueConsumer` types gain an `E: Engine` parameter.
+- The encryptor / decryptor types move behind per-engine extension
+  traits. Tokio call sites that imported
+  `magnetar_runtime_tokio::MessageEncryptor` /
+  `MessageDecryptor` continue to compile (the trait objects are still
+  the tokio-engine's associated types via `MessageEncryptorApi`).
+  Moonpool callers that want a no-op stub get `magnetar::NoEncryption`.
+- `TableViewBuilder` / `TypedTableViewBuilder`: the generic `.create()`
+  now ignores the encryption field. Tokio callers that need PIP-4
+  decryption call `.create_with_decryption()` (new tokio-specialised
+  method, parity with `ConsumerBuilder::subscribe_with_decryption`).
+- `PartitionedProducerBuilder`: same split — generic `.create()` is
+  encryption-free; tokio callers that need PIP-4 encryption call
+  `.create_with_encryption()`.
+
+---
+
+### Original entry (kept for historical reference)
 
 **Gap (combined — replaces former §2 + §3 + §4).** The v4 builders
 (`ProducerBuilder`, `ConsumerBuilder`, `ReaderBuilder` in

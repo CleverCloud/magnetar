@@ -853,40 +853,9 @@ impl PulsarClient<crate::TokioEngine> {
         self.memory_limit
     }
 
-    // producer / consumer / reader are engine-generic — see the dedicated
+    // producer / consumer / reader / table_view / typed_table_view /
+    // partitioned_producer are engine-generic — see the dedicated
     // `impl<E: Engine> PulsarClient<E>` block below.
-
-    /// Open a [`crate::TableViewBuilder`] for the given topic. A [`crate::TableView`] is a
-    /// key/value snapshot built from a compacted topic — useful for config snapshots and
-    /// similar "latest value wins per key" patterns. Mirrors
-    /// `PulsarClient#newTableViewBuilder`.
-    #[must_use]
-    pub fn table_view(&self, topic: impl Into<String>) -> crate::TableViewBuilder<'_> {
-        crate::TableViewBuilder::new(self, topic.into())
-    }
-
-    /// Schema-aware [`crate::TypedTableView`] builder. Mirrors Java
-    /// `pulsar.tableViewBuilder(Schema)` — the view decodes payloads on read so getters
-    /// return `S::Owned` directly.
-    #[must_use]
-    pub fn typed_table_view<S: magnetar_proto::schema::Schema>(
-        &self,
-        topic: impl Into<String>,
-        schema: std::sync::Arc<S>,
-    ) -> crate::TypedTableViewBuilder<'_, S> {
-        crate::TypedTableViewBuilder::new(self, topic.into(), schema)
-    }
-
-    /// Open a [`crate::PartitionedProducerBuilder`] for the given topic. The builder queries
-    /// the broker for the partition count and opens one child producer per partition.
-    /// Mirrors Java's `PulsarClient#newProducer()` against a partitioned topic.
-    #[must_use]
-    pub fn partitioned_producer(
-        &self,
-        topic: impl Into<String>,
-    ) -> crate::PartitionedProducerBuilder<'_> {
-        crate::PartitionedProducerBuilder::new(self, topic.into())
-    }
 
     /// PIP-180 (ADR-0033): subscribe with automatic shadow-source resolution.
     ///
@@ -1067,6 +1036,47 @@ impl<E: crate::Engine> PulsarClient<E> {
         topic: impl Into<String>,
     ) -> crate::PartitionedConsumerBuilder<'_, E> {
         crate::PartitionedConsumerBuilder::new(self, topic.into())
+    }
+
+    /// Open a [`crate::PartitionedProducerBuilder`] for the given topic.
+    /// The builder queries the broker for the partition count and opens
+    /// one child producer per partition. Mirrors Java's
+    /// `PulsarClient#newProducer()` against a partitioned topic.
+    /// Engine-generic per docs/follow-ups.md §2 WAVE 2 — both runtimes'
+    /// `Client` types implement [`crate::BrokerMetadataApi`] +
+    /// [`crate::CreateProducerApi`] so the same builder shape works
+    /// against tokio or moonpool.
+    #[must_use]
+    pub fn partitioned_producer(
+        &self,
+        topic: impl Into<String>,
+    ) -> crate::PartitionedProducerBuilder<'_, E> {
+        crate::PartitionedProducerBuilder::new(self, topic.into())
+    }
+
+    /// Open a [`crate::TableViewBuilder`] for the given topic. A
+    /// [`crate::TableView`] is a key/value snapshot built from a
+    /// compacted topic — useful for config snapshots and similar
+    /// "latest value wins per key" patterns. Mirrors
+    /// `PulsarClient#newTableViewBuilder`. Engine-generic per
+    /// docs/follow-ups.md §2 WAVE 2 — dispatches through
+    /// [`crate::SubscribeApi`] under the hood.
+    #[must_use]
+    pub fn table_view(&self, topic: impl Into<String>) -> crate::TableViewBuilder<'_, E> {
+        crate::TableViewBuilder::new(self, topic.into())
+    }
+
+    /// Schema-aware [`crate::TypedTableView`] builder. Mirrors Java
+    /// `pulsar.tableViewBuilder(Schema)` — the view decodes payloads on
+    /// read so getters return `S::Owned` directly. Engine-generic per
+    /// docs/follow-ups.md §2 WAVE 2.
+    #[must_use]
+    pub fn typed_table_view<S: magnetar_proto::schema::Schema>(
+        &self,
+        topic: impl Into<String>,
+        schema: std::sync::Arc<S>,
+    ) -> crate::TypedTableViewBuilder<'_, S, E> {
+        crate::TypedTableViewBuilder::new(self, topic.into(), schema)
     }
 }
 

@@ -8,9 +8,8 @@
 //! active consumers per partition.
 
 use magnetar_proto::types::MessageId;
-use magnetar_runtime_tokio::{ClientError, Consumer as V4Consumer};
 
-use crate::IncomingMessage;
+use crate::{ConsumerApi, Engine, IncomingMessage, SubscribeApi, TokioEngine};
 
 /// **Experimental** — PIP-466 V5 queue consumer (ADR-0032). Behaviour
 /// and signatures may change before V5 is promoted to default.
@@ -19,50 +18,74 @@ use crate::IncomingMessage;
 /// consumers per partition, work-distribution semantics. Use
 /// [`super::StreamConsumer`] for Exclusive / Failover ordered
 /// delivery.
-#[derive(Debug)]
-pub struct QueueConsumer {
-    inner: V4Consumer,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+pub struct QueueConsumer<E: Engine = TokioEngine>
+where
+    E::ClientState: SubscribeApi,
+{
+    inner: <E::ClientState as SubscribeApi>::Consumer,
 }
 
-impl QueueConsumer {
+impl<E: Engine> std::fmt::Debug for QueueConsumer<E>
+where
+    E::ClientState: SubscribeApi,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("v5::QueueConsumer")
+            .field("engine", &E::name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Engine> QueueConsumer<E>
+where
+    E::ClientState: SubscribeApi,
+{
     /// Wrap an already-built v4 consumer. Callers are responsible for
     /// ensuring the underlying v4 subscription type is one of
     /// `Shared` / `KeyShared` — V5's separation between Queue and
     /// Stream is enforced at the builder layer (out of scope for this
     /// initial scaffold).
     #[must_use]
-    pub fn from_v4(inner: V4Consumer) -> Self {
+    pub fn from_v4(inner: <E::ClientState as SubscribeApi>::Consumer) -> Self {
         Self { inner }
     }
 
     /// Escape hatch back to the v4 consumer.
     #[must_use]
-    pub fn v4(&self) -> &V4Consumer {
+    pub fn v4(&self) -> &<E::ClientState as SubscribeApi>::Consumer {
         &self.inner
     }
 
     /// Consume the V5 wrapper and return the inner v4 consumer.
     #[must_use]
-    pub fn into_v4(self) -> V4Consumer {
+    pub fn into_v4(self) -> <E::ClientState as SubscribeApi>::Consumer {
         self.inner
     }
 
     /// Receive the next message from the queue.
     ///
     /// # Errors
-    /// Propagates [`ClientError`] from the underlying v4 consumer
+    /// Propagates the runtime error from the underlying v4 consumer
     /// (transport drop, consumer-closed, decrypt failure, …).
-    pub async fn receive(&self) -> Result<IncomingMessage, ClientError> {
-        let msg = self.inner.receive().await?;
+    pub async fn receive(
+        &self,
+    ) -> Result<IncomingMessage, <<E::ClientState as SubscribeApi>::Consumer as ConsumerApi>::Error>
+    {
+        let msg = ConsumerApi::receive(&self.inner).await?;
         Ok(msg.into())
     }
 
     /// Acknowledge a single message.
     ///
     /// # Errors
-    /// Propagates [`ClientError`] from the underlying v4 consumer.
-    pub async fn ack(&self, id: MessageId) -> Result<(), ClientError> {
-        self.inner.ack(id).await
+    /// Propagates the runtime error from the underlying v4 consumer.
+    pub async fn ack(
+        &self,
+        id: MessageId,
+    ) -> Result<(), <<E::ClientState as SubscribeApi>::Consumer as ConsumerApi>::Error> {
+        ConsumerApi::ack(&self.inner, id).await
     }
 }
 
@@ -70,8 +93,10 @@ impl QueueConsumer {
 /// the v4 `subscription_type` to `Shared`; callers flip to `KeyShared`
 /// via [`Self::key_shared`]. Same V5-typed knob set as
 /// [`super::stream_consumer::StreamConsumerBuilder`].
-pub struct QueueConsumerBuilder<'a> {
-    inner: crate::ConsumerBuilder<'a>,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+pub struct QueueConsumerBuilder<'a, E: Engine = TokioEngine> {
+    inner: crate::ConsumerBuilder<'a, E>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     initial_position: super::mapping::V5SubscriptionInitialPosition,
     receiver_queue_size: usize,
@@ -79,7 +104,7 @@ pub struct QueueConsumerBuilder<'a> {
     negative_ack_redelivery_delay: std::time::Duration,
 }
 
-impl std::fmt::Debug for QueueConsumerBuilder<'_> {
+impl<E: Engine> std::fmt::Debug for QueueConsumerBuilder<'_, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("v5::QueueConsumerBuilder")
             .field("sub_type", &self.sub_type)
@@ -94,8 +119,8 @@ impl std::fmt::Debug for QueueConsumerBuilder<'_> {
     }
 }
 
-impl<'a> QueueConsumerBuilder<'a> {
-    pub(crate) fn new(inner: crate::ConsumerBuilder<'a>) -> Self {
+impl<'a, E: Engine> QueueConsumerBuilder<'a, E> {
+    pub(crate) fn new(inner: crate::ConsumerBuilder<'a, E>) -> Self {
         Self {
             inner,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Shared,
@@ -152,7 +177,7 @@ impl<'a> QueueConsumerBuilder<'a> {
 
     /// Escape hatch back to the v4 builder.
     #[must_use]
-    pub fn v4(self) -> crate::ConsumerBuilder<'a> {
+    pub fn v4(self) -> crate::ConsumerBuilder<'a, E> {
         self.inner
     }
 
@@ -160,7 +185,10 @@ impl<'a> QueueConsumerBuilder<'a> {
     ///
     /// # Errors
     /// Propagates the v4 builder's `.subscribe()` error path.
-    pub async fn subscribe(self) -> Result<QueueConsumer, crate::PulsarError> {
+    pub async fn subscribe(self) -> Result<QueueConsumer<E>, crate::PulsarError>
+    where
+        E::ClientState: SubscribeApi,
+    {
         let _ack_timeout_ms = super::mapping::ack_timeout_to_ms(self.ack_timeout);
         let _nack_ms =
             super::mapping::negative_ack_redelivery_delay_to_ms(self.negative_ack_redelivery_delay);

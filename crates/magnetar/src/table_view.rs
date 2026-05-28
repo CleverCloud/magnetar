@@ -19,8 +19,8 @@ use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::PulsarClient;
 use crate::client::PulsarError;
+use crate::{Engine, PulsarClient, TokioEngine};
 
 /// Callback fired for every mutation applied to the table view.
 ///
@@ -330,8 +330,14 @@ impl<C: crate::ConsumerApi + Clone> TableView<C> {
 }
 
 /// Builder for a [`TableView`]. Mirrors `org.apache.pulsar.client.api.TableViewBuilder`.
-pub struct TableViewBuilder<'a> {
-    client: &'a PulsarClient,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 2: the type parameter
+/// `E: Engine` (defaults to [`crate::TokioEngine`]) selects the
+/// per-engine consumer type via the engine-side [`crate::SubscribeApi`]
+/// extension trait. The decryptor slot is engine-typed via
+/// [`crate::MessageDecryptorApi`].
+pub struct TableViewBuilder<'a, E: Engine = TokioEngine> {
+    client: &'a PulsarClient<E>,
     topic: String,
     subscription: Option<String>,
     receiver_queue_size: usize,
@@ -341,10 +347,10 @@ pub struct TableViewBuilder<'a> {
     start_message_id: Option<magnetar_proto::MessageId>,
     crypto_failure_action: CryptoFailureAction,
     auto_update_partitions_interval: Option<Duration>,
-    decryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
+    decryptor: Option<<E as crate::MessageDecryptorApi>::Decryptor>,
 }
 
-impl std::fmt::Debug for TableViewBuilder<'_> {
+impl<E: Engine> std::fmt::Debug for TableViewBuilder<'_, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableViewBuilder")
             .field("topic", &self.topic)
@@ -367,8 +373,8 @@ impl std::fmt::Debug for TableViewBuilder<'_> {
     }
 }
 
-impl<'a> TableViewBuilder<'a> {
-    pub(crate) fn new(client: &'a PulsarClient, topic: String) -> Self {
+impl<'a, E: Engine> TableViewBuilder<'a, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>, topic: String) -> Self {
         Self {
             client,
             topic,
@@ -447,20 +453,6 @@ impl<'a> TableViewBuilder<'a> {
         self
     }
 
-    /// Configure PIP-4 end-to-end decryption on the underlying consumer. The
-    /// decryptor is consulted on every received message whose
-    /// `MessageMetadata.encryption_keys` is non-empty. Mirrors Java
-    /// `TableViewBuilder#cryptoKeyReader` (which delegates to
-    /// `ConsumerBuilder#cryptoKeyReader`).
-    #[must_use]
-    pub fn encryption(
-        mut self,
-        decryptor: Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
-    ) -> Self {
-        self.decryptor = Some(decryptor);
-        self
-    }
-
     /// Enable a background timer that signals every `interval`, intended to drive
     /// re-checks of the topic's partition count. Mirrors Java
     /// `TableViewBuilder#autoUpdatePartitionsInterval`.
@@ -500,15 +492,27 @@ impl<'a> TableViewBuilder<'a> {
     /// Subscribe, drain backlog, and return the view. The future resolves once the
     /// background drain task is running — the initial snapshot continues to populate in
     /// the background as compacted messages arrive.
-    pub async fn create(self) -> Result<TableView, PulsarError> {
-        let subscription = self.subscription.unwrap_or_else(|| {
-            format!(
-                "table-view-{}",
-                <crate::TokioEngine as crate::Engine>::random_subscription_suffix(),
-            )
-        });
+    ///
+    /// Dispatches through the engine-generic [`crate::SubscribeApi`]
+    /// extension trait — works against any engine whose `ClientState`
+    /// implements it. The configured PIP-4 decryptor is ignored on
+    /// this engine-generic path; tokio-engine callers that need
+    /// decryption use [`TableViewBuilder::create_with_decryption`].
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] on broker rejection or wire failure (stringified).
+    pub async fn create(
+        self,
+    ) -> Result<TableView<<E::ClientState as crate::SubscribeApi>::Consumer>, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+        <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
+    {
+        let subscription = self
+            .subscription
+            .unwrap_or_else(|| format!("table-view-{}", E::random_subscription_suffix()));
         let topic = self.topic.clone();
-        let builder = self
+        let mut builder = self
             .client
             .consumer(self.topic)
             .subscription(subscription)
@@ -518,7 +522,69 @@ impl<'a> TableViewBuilder<'a> {
             .read_compacted(true)
             .receiver_queue_size(self.receiver_queue_size)
             .crypto_failure_action(self.crypto_failure_action);
-        let mut builder = builder;
+        for (k, v) in self.properties {
+            builder = builder.property(k, v);
+        }
+        for (k, v) in self.subscription_properties {
+            builder = builder.subscription_property(k, v);
+        }
+        if let Some(id) = self.start_message_id {
+            builder = builder.start_message_id(id);
+        }
+        let consumer = builder.subscribe().await?;
+        let consumer_view = consumer.clone();
+        let auto_update = self
+            .auto_update_partitions_interval
+            .map(|interval| spawn_auto_update_task(topic, interval));
+        Ok(spawn_drain::<
+            <E::ClientState as crate::SubscribeApi>::Consumer,
+        >(
+            consumer, consumer_view, self.listener, auto_update
+        ))
+    }
+}
+
+/// Tokio-engine-specific `TableViewBuilder` methods that need the
+/// tokio `MessageDecryptor` extension (PIP-4 not yet wired on moonpool).
+impl TableViewBuilder<'_, TokioEngine> {
+    /// Configure PIP-4 end-to-end decryption on the underlying consumer. The
+    /// decryptor is consulted on every received message whose
+    /// `MessageMetadata.encryption_keys` is non-empty. Mirrors Java
+    /// `TableViewBuilder#cryptoKeyReader` (which delegates to
+    /// `ConsumerBuilder#cryptoKeyReader`).
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.decryptor = Some(decryptor);
+        self
+    }
+
+    /// Subscribe with the configured decryptor (PIP-4). Tokio-engine-only.
+    /// Use [`Self::create`] for the engine-generic path that ignores the
+    /// decryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Client`] on broker rejection or wire failure.
+    pub async fn create_with_decryption(self) -> Result<TableView, PulsarError> {
+        let subscription = self.subscription.unwrap_or_else(|| {
+            format!(
+                "table-view-{}",
+                <TokioEngine as Engine>::random_subscription_suffix(),
+            )
+        });
+        let topic = self.topic.clone();
+        let mut builder = self
+            .client
+            .consumer(self.topic)
+            .subscription(subscription)
+            .subscription_type(magnetar_proto::pb::command_subscribe::SubType::Exclusive)
+            .durable(false)
+            .initial_position(magnetar_proto::pb::command_subscribe::InitialPosition::Earliest)
+            .read_compacted(true)
+            .receiver_queue_size(self.receiver_queue_size)
+            .crypto_failure_action(self.crypto_failure_action);
         for (k, v) in self.properties {
             builder = builder.property(k, v);
         }
@@ -531,82 +597,80 @@ impl<'a> TableViewBuilder<'a> {
         if let Some(decryptor) = self.decryptor {
             builder = builder.encryption(decryptor);
         }
-        // Use the tokio-specialised `subscribe_with_decryption` path
-        // to honor the decryptor configured above. Engine-generic
-        // callers (post-Builder-lift) use `.subscribe()` which
-        // dispatches through `SubscribeApi` and ignores the
-        // decryptor field (PIP-4 not yet wired on moonpool).
+        // Use the tokio-specialised `subscribe_with_decryption` path to
+        // honor the decryptor configured above.
         let consumer = builder.subscribe_with_decryption().await?;
-
-        let state: Arc<RwLock<HashMap<String, Bytes>>> = Arc::new(RwLock::new(HashMap::new()));
-        let state_drain = state.clone();
-        // Seed the listeners vec with the build-time listener (if any). Post-create
-        // `TableView::listen` calls push onto the same vec, so the drain picks them up
-        // immediately on the next message.
-        let listeners: Arc<RwLock<Vec<TableViewListener>>> =
-            Arc::new(RwLock::new(self.listener.into_iter().collect()));
-        let listeners_drain = listeners.clone();
-        // Hold a separate clone for read-only introspection on the public TableView. Both
-        // clones share the same Arc<ConnectionShared>, so close()/disconnect propagates.
         let consumer_view = consumer.clone();
-        let join = tokio::spawn(async move {
-            loop {
-                let Ok(msg) = consumer.receive().await else {
-                    break;
-                };
-                let key = msg
-                    .single_metadata
-                    .as_ref()
-                    .and_then(|sm| sm.partition_key.clone())
-                    .or_else(|| msg.metadata.partition_key.clone());
-                let Some(key) = key else {
-                    // Pulsar compaction key is required; messages without one are skipped.
-                    let _ = consumer.ack(msg.message_id).await;
-                    continue;
-                };
-                let payload = msg.payload.clone();
-                let is_tombstone = payload.is_empty();
-                {
-                    let mut s = state_drain.write();
-                    if is_tombstone {
-                        s.remove(&key);
-                    } else {
-                        s.insert(key.clone(), payload.clone());
-                    }
-                }
-                // Snapshot under the read lock then drop it before invoking the callbacks
-                // so a listener that tries to call `TableView::listen` recursively does not
-                // deadlock against itself.
-                let snapshot: Vec<TableViewListener> = listeners_drain.read().clone();
-                for l in &snapshot {
-                    if is_tombstone {
-                        l(&key, None);
-                    } else {
-                        l(&key, Some(&payload));
-                    }
-                }
-                let _ = consumer.ack(msg.message_id).await;
-            }
-        });
-
-        // Spawn the partition-watcher timer iff the builder configured a non-zero
-        // interval. The timer itself only emits ticks via `Notify`; callers drive the
-        // actual `partitions_for_topic` call via [`TableView::refresh_partitions`] (the
-        // crate-wide `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient`
-        // lifetime into a `'static` spawn).
         let auto_update = self
             .auto_update_partitions_interval
             .map(|interval| spawn_auto_update_task(topic, interval));
-
-        Ok(TableView {
-            state,
-            listeners,
-            drain: Arc::new(DrainTask {
-                handle: tokio::sync::Mutex::new(Some(join)),
-            }),
+        Ok(spawn_drain::<magnetar_runtime_tokio::Consumer>(
+            consumer,
+            consumer_view,
+            self.listener,
             auto_update,
-            consumer: consumer_view,
-        })
+        ))
+    }
+}
+
+/// Helper: spawn the per-consumer drain task and assemble the
+/// [`TableView`]. Pulled out of [`TableViewBuilder::create`] /
+/// [`TableViewBuilder::create_with_decryption`] so both code paths
+/// share the drain loop's lock-discipline + dead-letter handling.
+fn spawn_drain<C: crate::ConsumerApi + Clone>(
+    consumer: C,
+    consumer_view: C,
+    listener: Option<TableViewListener>,
+    auto_update: Option<Arc<AutoUpdateTask>>,
+) -> TableView<C> {
+    let state: Arc<RwLock<HashMap<String, Bytes>>> = Arc::new(RwLock::new(HashMap::new()));
+    let state_drain = state.clone();
+    let listeners: Arc<RwLock<Vec<TableViewListener>>> =
+        Arc::new(RwLock::new(listener.into_iter().collect()));
+    let listeners_drain = listeners.clone();
+    let join = tokio::spawn(async move {
+        loop {
+            let Ok(msg) = crate::ConsumerApi::receive(&consumer).await else {
+                break;
+            };
+            let key = msg
+                .single_metadata
+                .as_ref()
+                .and_then(|sm| sm.partition_key.clone())
+                .or_else(|| msg.metadata.partition_key.clone());
+            let Some(key) = key else {
+                let _ = crate::ConsumerApi::ack(&consumer, msg.message_id).await;
+                continue;
+            };
+            let payload = msg.payload.clone();
+            let is_tombstone = payload.is_empty();
+            {
+                let mut s = state_drain.write();
+                if is_tombstone {
+                    s.remove(&key);
+                } else {
+                    s.insert(key.clone(), payload.clone());
+                }
+            }
+            let snapshot: Vec<TableViewListener> = listeners_drain.read().clone();
+            for l in &snapshot {
+                if is_tombstone {
+                    l(&key, None);
+                } else {
+                    l(&key, Some(&payload));
+                }
+            }
+            let _ = crate::ConsumerApi::ack(&consumer, msg.message_id).await;
+        }
+    });
+    TableView {
+        state,
+        listeners,
+        drain: Arc::new(DrainTask {
+            handle: tokio::sync::Mutex::new(Some(join)),
+        }),
+        auto_update,
+        consumer: consumer_view,
     }
 }
 
@@ -671,12 +735,22 @@ fn spawn_auto_update_task(topic: String, interval: Duration) -> Arc<AutoUpdateTa
 /// Schema-aware [`TableView`]. Wraps a raw `TableView` plus an `Arc<S>` and exposes
 /// typed accessors that decode the payload on demand. Mirrors Java's
 /// `pulsar.tableView(Schema)` shape.
-pub struct TypedTableView<S: magnetar_proto::schema::Schema> {
-    inner: TableView,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 2. Defaults `C =
+/// magnetar_runtime_tokio::Consumer` so existing call sites
+/// (`TypedTableView<MySchema>` without a second type argument) keep
+/// resolving to the tokio specialisation.
+pub struct TypedTableView<
+    S: magnetar_proto::schema::Schema,
+    C: crate::ConsumerApi + Clone = magnetar_runtime_tokio::Consumer,
+> {
+    inner: TableView<C>,
     schema: Arc<S>,
 }
 
-impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableView<S> {
+impl<S: magnetar_proto::schema::Schema, C: crate::ConsumerApi + Clone> std::fmt::Debug
+    for TypedTableView<S, C>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypedTableView")
             .field("inner", &self.inner)
@@ -685,7 +759,9 @@ impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableView<S> {
     }
 }
 
-impl<S: magnetar_proto::schema::Schema> Clone for TypedTableView<S> {
+impl<S: magnetar_proto::schema::Schema, C: crate::ConsumerApi + Clone> Clone
+    for TypedTableView<S, C>
+{
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -694,11 +770,13 @@ impl<S: magnetar_proto::schema::Schema> Clone for TypedTableView<S> {
     }
 }
 
-impl<S: magnetar_proto::schema::Schema + 'static> TypedTableView<S> {
+impl<S: magnetar_proto::schema::Schema + 'static, C: crate::ConsumerApi + Clone>
+    TypedTableView<S, C>
+{
     /// Borrow the underlying raw [`TableView`]. Useful for the unchanged getters
     /// (`len`, `is_empty`, `keys`, listener registration, etc.).
     #[must_use]
-    pub fn inner(&self) -> &TableView {
+    pub fn inner(&self) -> &TableView<C> {
         &self.inner
     }
 
@@ -760,18 +838,23 @@ impl<S: magnetar_proto::schema::Schema + 'static> TypedTableView<S> {
 
 /// Builder for a [`TypedTableView`]. Mirrors Java's schema-aware
 /// `pulsar.tableViewBuilder(Schema)` shape.
-pub struct TypedTableViewBuilder<'a, S: magnetar_proto::schema::Schema> {
-    client: &'a PulsarClient,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 2. Same shape as
+/// [`TableViewBuilder<E>`]; the `S` schema parameter is decoder-only.
+pub struct TypedTableViewBuilder<'a, S: magnetar_proto::schema::Schema, E: Engine = TokioEngine> {
+    client: &'a PulsarClient<E>,
     topic: String,
     schema: Arc<S>,
     subscription: Option<String>,
     receiver_queue_size: usize,
     crypto_failure_action: CryptoFailureAction,
     auto_update_partitions_interval: Option<Duration>,
-    decryptor: Option<Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
+    decryptor: Option<<E as crate::MessageDecryptorApi>::Decryptor>,
 }
 
-impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableViewBuilder<'_, S> {
+impl<S: magnetar_proto::schema::Schema, E: Engine> std::fmt::Debug
+    for TypedTableViewBuilder<'_, S, E>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypedTableViewBuilder")
             .field("topic", &self.topic)
@@ -788,8 +871,8 @@ impl<S: magnetar_proto::schema::Schema> std::fmt::Debug for TypedTableViewBuilde
     }
 }
 
-impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
-    pub(crate) fn new(client: &'a PulsarClient, topic: String, schema: Arc<S>) -> Self {
+impl<'a, S: magnetar_proto::schema::Schema, E: Engine> TypedTableViewBuilder<'a, S, E> {
+    pub(crate) fn new(client: &'a PulsarClient<E>, topic: String, schema: Arc<S>) -> Self {
         Self {
             client,
             topic,
@@ -825,18 +908,6 @@ impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
         self
     }
 
-    /// Configure PIP-4 end-to-end decryption on the underlying consumer.
-    /// Mirrors Java `TableViewBuilder#cryptoKeyReader` (typed view variant). See
-    /// [`TableViewBuilder::encryption`] for semantics.
-    #[must_use]
-    pub fn encryption(
-        mut self,
-        decryptor: Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
-    ) -> Self {
-        self.decryptor = Some(decryptor);
-        self
-    }
-
     /// Periodically re-check the topic's partition count. Mirrors Java
     /// `TableViewBuilder#autoUpdatePartitionsInterval` (typed view variant). See
     /// [`TableViewBuilder::auto_update_partitions_interval`] for semantics (zero
@@ -851,8 +922,61 @@ impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
         self
     }
 
-    /// Subscribe and return the schema-aware view.
-    pub async fn create(self) -> Result<TypedTableView<S>, PulsarError> {
+    /// Subscribe and return the schema-aware view via the engine-generic
+    /// [`TableViewBuilder::create`] path. The configured PIP-4 decryptor
+    /// is ignored on this path; tokio-engine callers that need
+    /// decryption use [`TypedTableViewBuilder::create_with_decryption`].
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] on broker rejection or wire failure (stringified).
+    pub async fn create(
+        self,
+    ) -> Result<TypedTableView<S, <E::ClientState as crate::SubscribeApi>::Consumer>, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+        <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
+    {
+        let mut builder = self
+            .client
+            .table_view(self.topic)
+            .receiver_queue_size(self.receiver_queue_size)
+            .crypto_failure_action(self.crypto_failure_action);
+        if let Some(name) = self.subscription {
+            builder = builder.subscription_name(name);
+        }
+        if let Some(interval) = self.auto_update_partitions_interval {
+            builder = builder.auto_update_partitions_interval(interval);
+        }
+        let inner = builder.create().await?;
+        Ok(TypedTableView {
+            inner,
+            schema: self.schema,
+        })
+    }
+}
+
+/// Tokio-engine-specific `TypedTableViewBuilder` methods.
+impl<S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'_, S, TokioEngine> {
+    /// Configure PIP-4 end-to-end decryption on the underlying consumer.
+    /// Mirrors Java `TableViewBuilder#cryptoKeyReader` (typed view variant). See
+    /// [`TableViewBuilder::encryption`] for semantics. Tokio-engine-only;
+    /// pair with [`Self::create_with_decryption`] to honor the decryptor.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
+    ) -> Self {
+        self.decryptor = Some(decryptor);
+        self
+    }
+
+    /// Subscribe and return the schema-aware view, honoring the
+    /// configured PIP-4 decryptor. Tokio-engine-only. Use [`Self::create`]
+    /// for the engine-generic path that ignores the decryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Client`] on broker rejection or wire failure.
+    pub async fn create_with_decryption(self) -> Result<TypedTableView<S>, PulsarError> {
         let mut builder = self
             .client
             .table_view(self.topic)
@@ -867,7 +991,7 @@ impl<'a, S: magnetar_proto::schema::Schema> TypedTableViewBuilder<'a, S> {
         if let Some(decryptor) = self.decryptor {
             builder = builder.encryption(decryptor);
         }
-        let inner = builder.create().await?;
+        let inner = builder.create_with_decryption().await?;
         Ok(TypedTableView {
             inner,
             schema: self.schema,

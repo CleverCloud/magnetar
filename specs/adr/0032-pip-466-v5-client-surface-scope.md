@@ -1,9 +1,28 @@
 # ADR-0032 — PIP-466 V5 client surface scope for v0.2.0
 
-- **Status**: Proposed
-- **Date**: 2026-05-26
+- **Status**: Accepted
+- **Date**: 2026-05-26 (Proposed), 2026-05-28 (Accepted)
 - **Decider**: Florentin Dubois
 - **Tags**: pip-466, v5-client, api-surface, v0.2.0, scope, experimental
+
+## Acceptance note (2026-05-28)
+
+Accepted alongside the unified engine-generic refactor that landed under
+`docs/follow-ups.md` §2 (former §2 phantom-E + §3 per-surface lifts +
+§4 V5 engine-genericity, single PR). The V5 surface (`PulsarClientV5`,
+`v5::Producer`, `v5::StreamConsumer`, `v5::QueueConsumer` and their
+builders) is now parametric over `E: Engine` with default
+`E = TokioEngine`. Moonpool callers can name
+`PulsarClientV5<MoonpoolEngine<P>>` directly; existing tokio call
+sites that write `PulsarClientV5` without a second type argument keep
+resolving to the tokio specialisation. The `experimental-v5-client`
+feature gate stays default-off — acceptance flips the ADR status, not
+the feature default. The 5 V5 magnetar-tier tests
+(`v5_producer_mapping.rs`, `v5_stream_consumer_mapping.rs`,
+`v5_queue_consumer_mapping.rs`, `v5_client_v4_escape_hatch.rs`,
+`v5_builder_defaults.rs`) now have moonpool 1:1 mirrors at
+`crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape pinning +
+sans-io wire assertions), satisfying the acceptance gate.
 
 ## Context
 

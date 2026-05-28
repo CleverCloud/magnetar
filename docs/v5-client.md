@@ -169,25 +169,40 @@ assert that V5 builder calls translate to the expected v4
 
 ## Roadmap
 
-Remaining work to flip the parity-matrix row from 🟡 experimental to ✅
-default-on (tracked in [`follow-ups.md`](follow-ups.md) under
-"PIP-466 — V5 client surface"):
+Status snapshot — the parity-matrix row flipped from 🟡 experimental
+to ✅ on 2026-05-28 when ADR-0032 was Accepted alongside the unified
+engine-generic refactor (`docs/follow-ups.md` §2). The
+`experimental-v5-client` feature stays default-off; acceptance flips
+the matrix and unlocks moonpool-engine V5 usage, not the default-on
+flag.
 
-1. The five mapping/wire test files mirrored 1:1 under
-   `SimulationBuilder` for the moonpool engine (so the V5 surface
-   gets the same deterministic-simulation coverage the v4 surface
-   already has).
+1. **✅ Landed (2026-05-28).** The five mapping/wire test files now
+   have moonpool 1:1 mirrors at
+   `crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape pinning +
+   sans-io wire assertions against
+   `MoonpoolEngine<TokioProviders>`). The V5 surface has full
+   deterministic-simulation coverage symmetric with the v4 surface.
 2. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
    `e2e_sub_types_v5.rs`) gated
    `feature = "e2e,experimental-v5-client"` against Pulsar 4.0.4.
-3. ADR-0032 promotion from Proposed → Accepted once (1)–(2) land and
-   the matrix sweep (`check-crypto-matrix` × V5 axis) is green.
-4. Engine-genericity: `PulsarClientV5` today wraps `PulsarClient`
-   (default tokio). A future pass parametrises by `<E: Engine>` once
-   the v4 builders' tokio-bound types (`MessageEncryptor`,
-   `MessageDecryptor`, `MessageRouter`) are abstracted via per-engine
-   extension traits — cross-cuts with the "Per-surface builder +
-   impl-body lifts" section of `follow-ups.md`.
+3. **✅ Landed (2026-05-28).** ADR-0032 promoted from Proposed →
+   Accepted; matrix sweep (`check-crypto-matrix` × V5 axis) green.
+4. **✅ Landed (2026-05-28).** Engine-genericity:
+   `PulsarClientV5<E: Engine = TokioEngine>` is parametric.
+   `MessageEncryptor` / `MessageDecryptor` types now live behind the
+   per-engine [`MessageEncryptorApi`] / [`MessageDecryptorApi`]
+   extension traits (tokio plugs in
+   `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs
+   in `NoEncryption` no-op stub). `MessageRouter` is a façade-level
+   trait (pure routing math), already engine-agnostic.
+5. **✅ Landed (2026-05-28).** Per-surface builder lifts —
+   `PartitionedProducerBuilder<E>`, `TableViewBuilder<E>`,
+   `TypedTableViewBuilder<S, E>` are now engine-generic. The
+   tokio-specialised `.create_with_encryption` /
+   `.create_with_decryption` impls retain the PIP-4 carve-out.
+
+[`MessageEncryptorApi`]: ../crates/magnetar/src/engine/mod.rs
+[`MessageDecryptorApi`]: ../crates/magnetar/src/engine/mod.rs
 
 ## References
 

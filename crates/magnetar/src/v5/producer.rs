@@ -16,21 +16,41 @@
 
 use bytes::Bytes;
 use magnetar_proto::types::MessageId;
-use magnetar_runtime_tokio::{ClientError, Producer as V4Producer};
 
-use crate::OutgoingMessage;
+use crate::{CreateProducerApi, Engine, OutgoingMessage, ProducerApi, TokioEngine};
 
 /// **Experimental** — PIP-466 V5 producer (ADR-0032). Behaviour and
 /// signatures may change before V5 is promoted to default.
-#[derive(Debug)]
-pub struct Producer {
-    inner: V4Producer,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 3: `E: Engine`
+/// defaults to [`crate::TokioEngine`] so the existing alias `Producer`
+/// (no second type argument) keeps resolving to the tokio
+/// specialisation. Moonpool callers name `Producer<MoonpoolEngine<P>>`.
+pub struct Producer<E: Engine = TokioEngine>
+where
+    E::ClientState: CreateProducerApi,
+{
+    inner: <E::ClientState as CreateProducerApi>::Producer,
 }
 
-impl Producer {
+impl<E: Engine> std::fmt::Debug for Producer<E>
+where
+    E::ClientState: CreateProducerApi,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("v5::Producer")
+            .field("engine", &E::name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Engine> Producer<E>
+where
+    E::ClientState: CreateProducerApi,
+{
     /// Wrap an already-built v4 producer.
     #[must_use]
-    pub fn from_v4(inner: V4Producer) -> Self {
+    pub fn from_v4(inner: <E::ClientState as CreateProducerApi>::Producer) -> Self {
         Self { inner }
     }
 
@@ -38,13 +58,13 @@ impl Producer {
     /// underlying state — useful when the caller needs a v4-only
     /// feature.
     #[must_use]
-    pub fn v4(&self) -> &V4Producer {
+    pub fn v4(&self) -> &<E::ClientState as CreateProducerApi>::Producer {
         &self.inner
     }
 
     /// Consume the V5 wrapper and return the inner v4 producer.
     #[must_use]
-    pub fn into_v4(self) -> V4Producer {
+    pub fn into_v4(self) -> <E::ClientState as CreateProducerApi>::Producer {
         self.inner
     }
 
@@ -53,12 +73,17 @@ impl Producer {
     /// every send round-trips and the broker always assigns one.
     ///
     /// # Errors
-    /// Propagates [`ClientError`] from the underlying v4 producer
+    /// Propagates the runtime error from the underlying v4 producer
     /// (transport drop, broker reject, etc.).
-    pub async fn send(&self, payload: Bytes) -> Result<Option<MessageId>, ClientError> {
-        let msg: magnetar_proto::producer::OutgoingMessage =
-            OutgoingMessage::with_payload(payload).into();
-        let id = self.inner.send(msg).await?;
+    pub async fn send(
+        &self,
+        payload: Bytes,
+    ) -> Result<
+        Option<MessageId>,
+        <<E::ClientState as CreateProducerApi>::Producer as ProducerApi>::Error,
+    > {
+        let msg = OutgoingMessage::with_payload(payload);
+        let id = ProducerApi::send(&self.inner, msg).await?;
         Ok(Some(id))
     }
 }
@@ -67,13 +92,15 @@ impl Producer {
 /// `Duration`-typed timeouts and `Option<usize>` max-pending; the v4
 /// wire equivalents are computed via [`super::mapping`] at
 /// [`Self::create`] time.
-pub struct ProducerBuilder<'a> {
-    inner: crate::ProducerBuilder<'a>,
+///
+/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+pub struct ProducerBuilder<'a, E: Engine = TokioEngine> {
+    inner: crate::ProducerBuilder<'a, E>,
     send_timeout: std::time::Duration,
     max_pending_messages: Option<usize>,
 }
 
-impl std::fmt::Debug for ProducerBuilder<'_> {
+impl<E: Engine> std::fmt::Debug for ProducerBuilder<'_, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("v5::ProducerBuilder")
             .field("send_timeout", &self.send_timeout)
@@ -82,10 +109,10 @@ impl std::fmt::Debug for ProducerBuilder<'_> {
     }
 }
 
-impl<'a> ProducerBuilder<'a> {
+impl<'a, E: Engine> ProducerBuilder<'a, E> {
     /// Wrap an engine-generic v4 builder. The V5-specific defaults
     /// from [`super::mapping`] are seeded here.
-    pub(crate) fn new(inner: crate::ProducerBuilder<'a>) -> Self {
+    pub(crate) fn new(inner: crate::ProducerBuilder<'a, E>) -> Self {
         Self {
             inner,
             send_timeout: super::mapping::DEFAULT_SEND_TIMEOUT,
@@ -112,7 +139,7 @@ impl<'a> ProducerBuilder<'a> {
     /// Escape hatch back to the v4 builder — useful when the V5 builder
     /// hasn't yet lifted a particular v4 knob.
     #[must_use]
-    pub fn v4(self) -> crate::ProducerBuilder<'a> {
+    pub fn v4(self) -> crate::ProducerBuilder<'a, E> {
         self.inner
     }
 
@@ -120,7 +147,10 @@ impl<'a> ProducerBuilder<'a> {
     ///
     /// # Errors
     /// Propagates the v4 builder's `.create()` error path.
-    pub async fn create(self) -> Result<Producer, crate::PulsarError> {
+    pub async fn create(self) -> Result<Producer<E>, crate::PulsarError>
+    where
+        E::ClientState: CreateProducerApi,
+    {
         // Translate V5 → v4 wire types via the mapping table. The v4
         // `send_timeout` is already `Duration`-typed (millis happens
         // on the wire); the explicit

@@ -13,11 +13,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{
-    BrokerMetadataApi, ConsumerApi, CreateProducerApi, Engine, ProducerApi, ReceiveBatchFut,
-    ReceiveOptFut, SubscribeApi, TopicListChange, TransactionApi, WatchTopicListFut,
+    BrokerMetadataApi, ConsumerApi, CreateProducerApi, Engine, MessageDecryptorApi,
+    MessageEncryptorApi, ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi,
+    TopicListChange, TransactionApi, WatchTopicListFut,
 };
 
 /// Zero-sized marker for the tokio production engine. Default `E` on
@@ -64,6 +66,19 @@ impl Engine for TokioEngine {
     fn random_subscription_suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
     }
+}
+
+// PIP-4 encryption hookup for the tokio engine. The associated types
+// plug the existing `magnetar_runtime_tokio::MessageEncryptor` /
+// `MessageDecryptor` trait objects (already `Send + Sync + Debug`) into
+// the engine-generic builder storage via the API extension traits added
+// in WAVE 1 of docs/follow-ups.md §2.
+impl MessageEncryptorApi for TokioEngine {
+    type Encryptor = Arc<dyn magnetar_runtime_tokio::MessageEncryptor>;
+}
+
+impl MessageDecryptorApi for TokioEngine {
+    type Decryptor = Arc<dyn magnetar_runtime_tokio::MessageDecryptor>;
 }
 
 impl TransactionApi for magnetar_runtime_tokio::Client {

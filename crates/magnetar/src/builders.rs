@@ -10,6 +10,16 @@
 //! `consumer(...)` / `reader(...)` dispatch through the
 //! engine-generic factory traits.
 //!
+//! **Engine-genericity (docs/follow-ups.md §2 WAVE 2).** The encryptor
+//! / decryptor storage is engine-typed via the per-engine
+//! [`crate::MessageEncryptorApi`] / [`crate::MessageDecryptorApi`]
+//! extension traits: tokio plugs in
+//! `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` and moonpool
+//! plugs in [`crate::NoEncryption`] (no-op stub). The chainable
+//! surface stays engine-agnostic — the `E: Engine` parameter only
+//! surfaces in the terminal `.create()` / `.subscribe()` dispatch
+//! through [`crate::CreateProducerApi`] / [`crate::SubscribeApi`].
+//!
 //! All three builders are re-exported from `magnetar::*` via the
 //! façade `lib.rs` so existing call sites keep working unchanged.
 
@@ -35,7 +45,16 @@ type Result<T, E = PulsarError> = std::result::Result<T, E>;
 pub struct ProducerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     client: &'a PulsarClient<E>,
     req: CreateProducerRequest,
-    encryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>>,
+    /// Engine-typed encryptor slot. Tokio resolves
+    /// `<TokioEngine as MessageEncryptorApi>::Encryptor` to
+    /// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool
+    /// resolves it to [`crate::NoEncryption`] (no-op stub). The generic
+    /// `.create()` path ignores this field — only the tokio-specialised
+    /// `.create_with_encryption()` consults it.
+    ///
+    /// `MessageEncryptorApi` is a supertrait of [`crate::Engine`], so the
+    /// resolution is automatic — no extra bound needed at the use site.
+    encryptor: Option<<E as crate::MessageEncryptorApi>::Encryptor>,
 }
 
 impl<E: crate::Engine> std::fmt::Debug for ProducerBuilder<'_, E> {
@@ -178,6 +197,9 @@ impl ProducerBuilder<'_, crate::TokioEngine> {
         mut self,
         encryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageEncryptor>,
     ) -> Self {
+        // `<TokioEngine as MessageEncryptorApi>::Encryptor` resolves
+        // exactly to `Arc<dyn MessageEncryptor>` so we store the arg
+        // directly into the engine-typed slot.
         self.encryptor = Some(encryptor);
         self
     }
@@ -207,7 +229,12 @@ impl ProducerBuilder<'_, crate::TokioEngine> {
 pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     client: &'a PulsarClient<E>,
     req: SubscribeRequest,
-    decryptor: Option<std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>>,
+    /// Engine-typed decryptor slot. See
+    /// [`ProducerBuilder`] for the analogous tokio /
+    /// moonpool split; same per-engine
+    /// [`crate::MessageDecryptorApi`] resolution (supertrait of
+    /// [`crate::Engine`], so no extra bound needed at the use site).
+    decryptor: Option<<E as crate::MessageDecryptorApi>::Decryptor>,
 }
 
 impl<E: crate::Engine> std::fmt::Debug for ConsumerBuilder<'_, E> {
@@ -478,6 +505,9 @@ impl ConsumerBuilder<'_, crate::TokioEngine> {
         mut self,
         decryptor: std::sync::Arc<dyn magnetar_runtime_tokio::MessageDecryptor>,
     ) -> Self {
+        // `<TokioEngine as MessageDecryptorApi>::Decryptor` resolves
+        // exactly to `Arc<dyn MessageDecryptor>` so we store the arg
+        // directly into the engine-typed slot.
         self.decryptor = Some(decryptor);
         self
     }
