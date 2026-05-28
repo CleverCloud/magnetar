@@ -9,7 +9,7 @@
 //! `getShadowTopics`, `getShadowSource` on
 //! `pulsar-broker/.../v2/PersistentTopics.java`.
 
-use magnetar_admin::{AdminClient, AdminError, ShadowTopicProperties};
+use magnetar_admin::{AdminClient, AdminError};
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -21,62 +21,33 @@ fn client(mock: &MockServer) -> AdminClient {
 }
 
 #[tokio::test]
-async fn create_shadow_topic_puts_correct_url_and_body() {
+async fn create_shadow_topic_puts_correct_url_and_bare_array_body() {
     let mock = MockServer::start().await;
-    // PIP-180: `@PUT @Path("/{tenant}/{namespace}/{topic}/shadowTopics")` on the
-    // source topic. Body is a JSON envelope with `shadowTopics` + `properties`.
+    // PIP-180: `@PUT @Path("/{tenant}/{namespace}/{topic}/shadowTopics")` on
+    // the source topic. The broker's `setShadowTopics(List<String>)` handler
+    // deserialises the body directly into a `List<String>` — the body MUST be
+    // a bare JSON array, NOT a `{ "shadowTopics": [...] }` envelope (Pulsar
+    // 4.0.4 rejects the envelope with HTTP 400; see docs/follow-ups.md §5).
     Mock::given(method("PUT"))
         .and(path(
             "/admin/v2/persistent/public/default/source-t/shadowTopics",
         ))
-        .and(body_json(serde_json::json!({
-            "shadowTopics": ["persistent://public/default/shadow-t"],
-            "properties": {"team": "ingest"},
-        })))
+        .and(body_json(serde_json::json!([
+            "persistent://public/default/shadow-t"
+        ])))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&mock)
         .await;
 
-    let mut properties = ShadowTopicProperties::default();
-    properties
-        .properties
-        .insert("team".to_owned(), "ingest".to_owned());
     let admin = client(&mock);
     admin
         .create_shadow_topic(
             "public/default/source-t",
             "persistent://public/default/shadow-t",
-            properties,
         )
         .await
         .expect("PIP-180 createShadowTopic returns 204");
-}
-
-#[tokio::test]
-async fn create_shadow_topic_elides_empty_properties_map() {
-    // Java's `@JsonInclude(NON_EMPTY)` on `properties` means an empty map is
-    // dropped from the JSON. Mirror that so the wire bytes match Java byte-
-    // for-byte when callers pass `ShadowTopicProperties::default()`.
-    let mock = MockServer::start().await;
-    Mock::given(method("PUT"))
-        .and(path("/admin/v2/persistent/public/default/src/shadowTopics"))
-        .and(body_json(serde_json::json!({
-            "shadowTopics": ["persistent://public/default/shadow"],
-        })))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&mock)
-        .await;
-    let admin = client(&mock);
-    admin
-        .create_shadow_topic(
-            "public/default/src",
-            "persistent://public/default/shadow",
-            ShadowTopicProperties::default(),
-        )
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -97,7 +68,6 @@ async fn create_shadow_topic_propagates_409_conflict() {
         .create_shadow_topic(
             "public/default/source-t",
             "persistent://public/default/shadow-t",
-            ShadowTopicProperties::default(),
         )
         .await
         .unwrap_err();
@@ -240,11 +210,7 @@ async fn shadow_admin_methods_reject_malformed_topic_name() {
         .unwrap_err();
     assert!(matches!(err, AdminError::InvalidName(_)));
     let err = admin
-        .create_shadow_topic(
-            "ok/ns/source",
-            "bad-shadow-name",
-            ShadowTopicProperties::default(),
-        )
+        .create_shadow_topic("ok/ns/source", "bad-shadow-name")
         .await
         .unwrap_err();
     assert!(matches!(err, AdminError::InvalidName(_)));

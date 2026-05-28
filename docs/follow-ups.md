@@ -404,18 +404,24 @@ created via in-container `pulsar-admin topics create-shadow-topic`
 rather than `magnetar_admin::AdminClient::create_shadow_topic`, which
 sidesteps a discovered admin-client wire-shape bug (see below).
 
-**Spin-off follow-up — `create_shadow_topic` wire shape.** Pulsar
-4.0.4's `PUT /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics`
-endpoint deserialises the request body as a bare
-`List<String>`, but `magnetar_admin::AdminClient::create_shadow_topic`
-sends a `{"shadowTopics":[…]}` JSON object — the broker rejects with
-HTTP 400 *"Cannot deserialize value of type
-java.util.ArrayList<java.lang.String> from Object value"*. The admin
-client's own rustdoc claims the broker "accepts either", but 4.0.4 does
-not. Low priority (the CLI / `set-shadow-topics` path works; the bug
-only bites the dedicated `createShadowTopic` helper), but worth fixing:
-send the bare `List<String>` body, or probe the broker version. Filed
-here pending a dedicated fix PR.
+**Spin-off follow-up — `create_shadow_topic` wire shape: ✅ FIXED
+2026-05-28.** Pulsar 4.0.4's
+`PUT /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics` endpoint
+deserialises the request body as a bare `List<String>`, but
+`magnetar_admin::AdminClient::create_shadow_topic` was sending a
+`{"shadowTopics":[…], "properties":{…}}` JSON object — the broker
+rejected it with HTTP 400 *"Cannot deserialize value of type
+java.util.ArrayList<java.lang.String> from Object value"*. Fixed:
+`create_shadow_topic(source, shadow)` now sends a bare JSON array and
+drops the `properties` parameter (the `setShadowTopics` REST handler
+cannot carry properties — per-shadow metadata requires pre-creating
+the shadow as a normal topic with properties first, then linking it,
+which magnetar keeps as two explicit calls). BREAKING CHANGE:
+`create_shadow_topic` lost its third `ShadowTopicProperties` argument;
+the `ShadowTopicProperties` type and the CLI `topic shadow create
+--property` flag are removed. The `magnetar-admin` wire-level unit
+tests were updated to assert the bare-array body (they previously
+pinned the buggy envelope shape).
 
 ### Original entry (kept for historical reference)
 

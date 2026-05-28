@@ -38,7 +38,6 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use magnetar_proto::MessageId;
@@ -302,44 +301,45 @@ impl AdminClient {
     ///
     /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/shadowTopics`
     /// where `{topic}` is the **source** topic name. The request body is a
-    /// JSON array `["persistent://tenant/ns/shadow"]` listing the shadow
-    /// topics to create on top of the source. The Java reference accepts a
-    /// `List<String>` of fully-qualified shadow topic names (see
-    /// `org.apache.pulsar.client.admin.Topics#createShadowTopic`), so a
-    /// single-call magnetar entry stays explicit by taking one shadow at a
-    /// time — call multiple times for a fan-out.
+    /// **bare JSON array** `["persistent://tenant/ns/shadow"]` listing the
+    /// shadow topics to set on the source — the broker's
+    /// `@PUT setShadowTopics(List<String> shadowTopics)` handler
+    /// deserialises the body directly into a `List<String>`, NOT an
+    /// envelope object. magnetar takes one shadow at a time for an
+    /// explicit single-call surface; call multiple times for a fan-out.
     ///
     /// Java:
     /// `pulsar-broker/src/main/java/org/apache/pulsar/broker/admin/v2/PersistentTopics.java`
-    /// (`@PUT @Path("/{tenant}/{namespace}/{topic}/shadowTopics")`).
+    /// (`@PUT @Path("/{tenant}/{namespace}/{topic}/shadowTopics")` →
+    /// `setShadowTopics(List<String>)`).
+    ///
+    /// **No per-shadow properties on this endpoint.** The Pulsar
+    /// `setShadowTopics` REST handler carries only the topic-name list.
+    /// To attach metadata to the shadow topic, pre-create it as a normal
+    /// topic with properties (a separate topic-create call) *before*
+    /// linking it to the source here — that's what the Java
+    /// `Topics#createShadowTopic(shadow, source, props)` convenience does
+    /// under the hood (create-with-props, then set-shadow). magnetar keeps
+    /// the two steps explicit. A previous version of this method sent a
+    /// `{ "shadowTopics": [...], "properties": {...} }` envelope that
+    /// Pulsar 4.0.4 rejects with HTTP 400 (caught by the §5 replicator
+    /// e2e fixture; see docs/follow-ups.md §5).
     ///
     /// Errors mirror the existing `AdminError` taxonomy: 404 → `Status { code:
     /// 404, .. }` (the source topic does not exist), 409 → `Status { code:
     /// 409, .. }` (the shadow topic already exists on this source),
     /// 401/403 → `Status { code: 401|403, .. }` (auth).
-    pub async fn create_shadow_topic(
-        &self,
-        source: &str,
-        shadow: &str,
-        properties: ShadowTopicProperties,
-    ) -> Result<(), AdminError> {
+    pub async fn create_shadow_topic(&self, source: &str, shadow: &str) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(source)?;
         // Validate the shadow name eagerly so a misformatted argument errors
         // out with `InvalidName` rather than as a broker 4xx after we've
         // already crossed the wire.
         let _ = split_topic(shadow)?;
         let url = self.url(&["persistent", tenant, namespace, name, "shadowTopics"])?;
-        // The broker accepts either a bare `List<String>` (the historical
-        // shape) or a `{ "shadowTopics": [...], "properties": {...} }`
-        // envelope. We always send the envelope so the `properties` map is
-        // honoured for any future broker-side use (today it's pass-through
-        // metadata on the shadow). When `properties` is empty the JSON
-        // shrinks to the minimal `{"shadowTopics":["..."]}` shape that
-        // Pulsar 2.11+ accepts.
-        let body = ShadowTopicCreateRequest {
-            shadow_topics: vec![shadow.to_owned()],
-            properties: properties.properties,
-        };
+        // Bare `List<String>` — the broker's `setShadowTopics` handler
+        // deserialises the body directly into a `List<String>`. Any
+        // wrapping object yields HTTP 400.
+        let body = vec![shadow.to_owned()];
         let resp = self
             .send(self.http.request(Method::PUT, url).json(&body))
             .await?;
@@ -481,38 +481,6 @@ pub struct TenantInfo {
     /// Cluster names the tenant may use.
     #[serde(rename = "allowedClusters")]
     pub allowed_clusters: Vec<String>,
-}
-
-/// PIP-180 / ADR-0033: per-shadow-topic policy data carried on
-/// `create_shadow_topic`.
-///
-/// Today the only PIP-180 broker policy is the `properties` map (free-form
-/// `String → String` carrying caller-supplied metadata). The struct is
-/// kept as a future-proofing wrapper so adding shadow-topic policies later
-/// (e.g. `replicationDelayMs`, `allowedClusters`) is a non-breaking
-/// addition to the same constructor signature.
-///
-/// Mirrors Java's
-/// `org.apache.pulsar.client.admin.Topics#createShadowTopic(String, String,
-/// Map<String, String>)` third argument.
-#[derive(Debug, Clone, Default)]
-pub struct ShadowTopicProperties {
-    /// Caller-supplied free-form metadata, propagated to the broker's
-    /// `Map<String, String>` shadow topic property bag.
-    pub properties: std::collections::BTreeMap<String, String>,
-}
-
-/// JSON envelope sent on `create_shadow_topic`. Wire schema matches the
-/// Java handler — `pulsar-broker/.../v2/PersistentTopics.java` accepts a
-/// `CreateShadowTopicRequest` shape with `shadowTopics: List<String>` and a
-/// `properties: Map<String, String>` (the latter `@JsonInclude(NON_EMPTY)`
-/// so an empty map is elided).
-#[derive(Debug, Clone, Serialize)]
-struct ShadowTopicCreateRequest {
-    #[serde(rename = "shadowTopics")]
-    shadow_topics: Vec<String>,
-    #[serde(rename = "properties", skip_serializing_if = "BTreeMap::is_empty")]
-    properties: std::collections::BTreeMap<String, String>,
 }
 
 /// Wire shape of the PIP-415 `getMessageIdByIndex` response.

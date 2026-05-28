@@ -24,9 +24,7 @@ use magnetar::proto::TokenAuth;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{OutgoingMessage, PulsarClient};
-use magnetar_admin::{
-    AdminClient, AdminClientBuilder, AdminError, ShadowTopicProperties, TenantInfo,
-};
+use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
 #[derive(Debug, Parser)]
@@ -143,9 +141,6 @@ pub(crate) enum ShadowCmd {
         source: String,
         /// Shadow topic (`persistent://tenant/namespace/topic`).
         shadow: String,
-        /// Optional shadow-topic property in `key=value` form. Repeatable.
-        #[arg(long = "property", value_parser = parse_property)]
-        properties: Vec<(String, String)>,
     },
     /// Delete a shadow topic.
     /// `DELETE /admin/v2/persistent/{tenant}/{namespace}/{shadow}`.
@@ -337,16 +332,8 @@ async fn run_shadow(
 ) -> Result<(), CliError> {
     let admin = build_admin(admin_url, token, timeout_secs)?;
     match cmd {
-        ShadowCmd::Create {
-            source,
-            shadow,
-            properties,
-        } => {
-            let mut props = ShadowTopicProperties::default();
-            for (k, v) in properties {
-                props.properties.insert(k, v);
-            }
-            admin.create_shadow_topic(&source, &shadow, props).await?;
+        ShadowCmd::Create { source, shadow } => {
+            admin.create_shadow_topic(&source, &shadow).await?;
             Ok(())
         }
         ShadowCmd::Delete { shadow, force } => {

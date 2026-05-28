@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::{OutgoingMessage, PulsarClient};
-use magnetar_admin::{AdminClient, ShadowTopicProperties};
+use magnetar_admin::AdminClient;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -107,9 +107,7 @@ async fn e2e_shadow_topic_full_cycle() -> Result<(), Box<dyn std::error::Error>>
     }
 
     // 2. Create the shadow topic via the admin REST.
-    admin
-        .create_shadow_topic(source, shadow, ShadowTopicProperties::default())
-        .await?;
+    admin.create_shadow_topic(source, shadow).await?;
 
     // 3. List the shadow topics on the source — must include the created shadow.
     let shadows = admin.get_shadow_topics(source).await?;
