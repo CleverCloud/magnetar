@@ -248,7 +248,7 @@ mod tests {
 /// scalable-topic surface. Drives the client end-to-end through the real
 /// `pb::scalable_topics` wire commands: feed the client's outbound bytes via
 /// [`Self::on_client_bytes`], collect the broker's reply bytes, and pull the
-/// scripted DAG updates via [`Self::next_scripted_update`].
+/// scripted DAG updates via [`Self::split_update`] / [`Self::merge_update`].
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone)]
 pub struct ScriptedScalableBroker {

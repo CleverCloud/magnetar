@@ -4,7 +4,7 @@
 //!
 //! PIP-460 introduces a `topic://<...>` URL scheme backed by a controller
 //! broker and a segment DAG. magnetar v0.2.0 ships **only** the
-//! [`StreamConsumer`] happy path, behind the default-off `scalable-topics`
+//! `StreamConsumer` happy path, behind the default-off `scalable-topics`
 //! feature, with **drop-on-DAG-change** semantics (no transparent segment
 //! failover). See [ADR-0031](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0031-pip-460-scalable-subscription-scope.md)
 //! and the [proposal](https://github.com/CleverCloud/magnetar/blob/main/specs/proposals/pip-460-scalable-topics.md).
@@ -12,7 +12,7 @@
 //! # Surface
 //!
 //! [`ScalableTopicsApi`] is the engine-side hook (re-exported from the engine
-//! module): each runtime implements it on its `Client` type. [`StreamConsumer`]
+//! module): each runtime implements it on its `Client` type. `StreamConsumer`
 //! is generic over `E: Engine where E::ClientState: ScalableTopicsApi` per
 //! ADR-0026 §D1 — the same extension-trait pattern the transaction / producer /
 //! consumer surfaces use, so it composes with the engine-generic
@@ -21,8 +21,8 @@
 //! # Drop-on-change (v0.2.0)
 //!
 //! When the controller broker pushes a segment split / merge / removal while
-//! the [`StreamConsumer`] is active, the runtime surfaces
-//! [`ConsumerEvent::DagChanged`]; the caller must re-resolve and re-subscribe.
+//! the `StreamConsumer` is active, the runtime surfaces
+//! `ConsumerEvent::DagChanged`; the caller must re-resolve and re-subscribe.
 //! Transparent failover, in-place repartition, `QueueConsumer`,
 //! `CheckpointConsumer`, and controller-election awareness are explicit
 //! v0.3.0+ work (out of scope, ADR-0031).
