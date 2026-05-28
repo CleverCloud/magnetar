@@ -70,3 +70,10 @@ magnetar-auth-sasl = { workspace = true }
 prost = { workspace = true }
 # Tempfile-backed token rotation tests in src/auth_file.rs.
 tempfile = { workspace = true }
+# Athenz ZTS round-trip integration test (ADR-0030, ADR-0024 layer b).
+# `zts` + `crypto-aws-lc-rs` match this crate's default rustls provider so
+# no second provider is unified into the test binary; the test drives the
+# real `HttpZtsClient` against a `wiremock` ZTS stub over plain HTTP.
+magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"] }
+wiremock = { workspace = true }
+serde_json = { workspace = true }

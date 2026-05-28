@@ -1,40 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Athenz ZTS round-trip — opt-in HTTP client + caching layer.
+//! Athenz ZTS round-trip — opt-in HTTP exchange behind a pluggable trait.
 //!
 //! The Athenz `ZTS` REST endpoint takes a caller-signed JWT (an Athenz
 //! `n-token` or `OAuth2` `client_credentials` grant) and returns an
-//! Athenz role token. This module wraps the HTTP exchange + the
-//! expiry-aware caching, leaving the JWT signing as a pluggable
-//! [`JwtSigner`] trait — the magnetar workspace doesn't currently
-//! ship a concrete signer impl because the choice (jsonwebtoken vs.
-//! aws-lc-rs vs. ring) is downstream-policy-dependent (FIPS posture,
-//! key-management story, hardware-backed key support, …).
+//! Athenz role token. The exchange is split into two cleanly-separated
+//! pieces so the deterministic-simulation engine (which cannot speak
+//! HTTPS) can still exercise the refresh / cache mechanics
+//! (ADR-0030 §moonpool, ADR-0024 layers c/d):
+//!
+//! - [`ZtsClient`] — the **trait**. `exchange` takes a signed JWT bearer credential and returns a
+//!   [`RoleTokenResponse`]. Tests inject a scripted fake; production wires [`HttpZtsClient`].
+//! - [`HttpZtsClient`] — the production `reqwest`-backed impl. Tokio-only at runtime.
+//!
+//! Claim construction + JWT signing + the expiry-aware cache live in
+//! [`crate::AthenzProvider`], which owns the tenant [`crate::AthenzConfig`],
+//! the [`JwtSigner`], and the injected `wall_clock` — keeping this module
+//! a thin HTTP seam.
 //!
 //! Callers that already have a role token out-of-band can keep using
 //! [`AthenzProvider::with_role_token`](crate::AthenzProvider::with_role_token)
 //! — the lightweight path that skips this module entirely.
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use bytes::Bytes;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::AthenzError;
 
-/// Pluggable JWT signer. The magnetar workspace doesn't ship a
-/// concrete implementation today — callers wire one based on their
-/// crypto-provider posture (jsonwebtoken with `aws-lc-rs`, `ring`, or
-/// an external signing service / HSM).
+/// Pluggable JWT signer (RS256). Concrete backends ship behind the
+/// crypto-provider feature matrix in [`crate::jwt_signer`]
+/// (`AwsLcRsSigner` / `RingSigner`, ADR-0030 + ADR-0035); callers without
+/// either crypto feature wire their own (jsonwebtoken, an HSM bridge, …).
 ///
 /// The signed JWT is sent to the `ZTS` endpoint as the bearer credential
-/// in the `Authorization` header (or as the `client_assertion` form
-/// field on the `OAuth2` grant flavour, depending on
-/// [`ZtsGrant::ClientCredentials`]).
+/// in the `Authorization` header.
 pub trait JwtSigner: Send + Sync + std::fmt::Debug {
     /// Sign the supplied JOSE-encoded claims and return the compact
     /// serialisation (`header.payload.signature`, all base64url).
+    ///
+    /// # Errors
+    /// Surfaces [`AthenzError::SignerFailure`] when the underlying RSA
+    /// signing operation fails.
     fn sign(&self, claims: &ZtsClaims) -> Result<String, AthenzError>;
 }
 
@@ -59,7 +65,7 @@ pub struct ZtsClaims {
 /// Which ZTS grant flavour to use. Default is
 /// [`Self::ClientCredentials`] (modern `OAuth2` grant); `NToken` is kept
 /// for callers stuck on older ZTS deployments.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ZtsGrant {
     /// Athenz `n-token` over the legacy `/zts/v1/domain/<provider>/token` path.
     NToken,
@@ -68,20 +74,11 @@ pub enum ZtsGrant {
     ClientCredentials,
 }
 
-/// ZTS-issued role token + the deadline at which it should be
-/// refreshed. The cache evicts entries past `refresh_at` so the next
-/// `initial()` triggers a fresh round-trip.
-#[derive(Debug, Clone)]
-pub(crate) struct CachedRoleToken {
-    pub token: Bytes,
-    pub refresh_at: std::time::Instant,
-}
-
 /// ZTS endpoint response — narrow subset of what the Athenz ZTS server
 /// returns. The full schema carries lots of optional fields that
 /// magnetar doesn't need (`granted_role_name`, `signed_policy_data`, …).
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ZtsTokenResponse {
+pub struct RoleTokenResponse {
     /// The opaque role token bytes (base64-encoded by the server).
     pub access_token: String,
     /// Token validity in seconds.
@@ -94,31 +91,39 @@ fn default_token_ttl() -> u64 {
     3600
 }
 
-/// HTTP client for the Athenz ZTS REST endpoint. Wraps a `reqwest`
-/// client with the role-token cache + a refresh leeway so the next
-/// `initial()` after a near-expiry hit pre-fetches without waiting
-/// for the token to actually expire.
-#[derive(Debug)]
-pub struct ZtsClient {
-    zts_url: url::Url,
-    grant: ZtsGrant,
-    signer: Arc<dyn JwtSigner>,
-    http: reqwest::Client,
-    cache: tokio::sync::Mutex<Option<CachedRoleToken>>,
-    refresh_leeway: Duration,
+/// The ZTS exchange seam. Given a signed JWT bearer credential, return a
+/// fresh [`RoleTokenResponse`]. Production uses [`HttpZtsClient`]; the
+/// moonpool / differential test layers inject a scripted fake so the
+/// provider's refresh + cache state machine is exercised without HTTPS.
+#[async_trait]
+pub trait ZtsClient: Send + Sync + std::fmt::Debug {
+    /// Exchange the signed JWT for an Athenz role token.
+    ///
+    /// # Errors
+    /// - [`AthenzError::Transport`] on HTTP failure (connect, TLS, timeout).
+    /// - [`AthenzError::ZtsRejected`] on a non-2xx response.
+    /// - [`AthenzError::Config`] when the response body is not decodable.
+    async fn exchange(&self, signed_jwt: &str) -> Result<RoleTokenResponse, AthenzError>;
 }
 
-impl ZtsClient {
-    /// Construct a fresh ZTS client.
+/// Production `reqwest`-backed [`ZtsClient`]. Posts the signed JWT to the
+/// Athenz ZTS REST endpoint and parses the role-token response. The
+/// expiry-aware cache lives in [`crate::AthenzProvider`]; this type is a
+/// stateless HTTP shim.
+#[derive(Debug)]
+pub struct HttpZtsClient {
+    zts_url: url::Url,
+    grant: ZtsGrant,
+    http: reqwest::Client,
+}
+
+impl HttpZtsClient {
+    /// Construct a fresh HTTP ZTS client.
     ///
     /// # Errors
     /// Returns [`AthenzError::Config`] if `zts_url` is not a valid URL
     /// or if the default `reqwest::Client` cannot be built.
-    pub fn new(
-        zts_url: impl AsRef<str>,
-        grant: ZtsGrant,
-        signer: Arc<dyn JwtSigner>,
-    ) -> Result<Self, AthenzError> {
+    pub fn new(zts_url: impl AsRef<str>, grant: ZtsGrant) -> Result<Self, AthenzError> {
         let zts_url = url::Url::parse(zts_url.as_ref())
             .map_err(|e| AthenzError::Config(format!("invalid zts_url: {e}")))?;
         let http = reqwest::Client::builder()
@@ -127,78 +132,20 @@ impl ZtsClient {
         Ok(Self {
             zts_url,
             grant,
-            signer,
             http,
-            cache: tokio::sync::Mutex::new(None),
-            refresh_leeway: Duration::from_secs(60),
         })
     }
 
-    /// Override the refresh leeway (default 60s). When the cached
-    /// token's remaining TTL drops below this, the next request
-    /// triggers a fresh ZTS round-trip.
+    /// The grant flavour this client posts under.
     #[must_use]
-    pub fn with_refresh_leeway(mut self, leeway: Duration) -> Self {
-        self.refresh_leeway = leeway;
-        self
+    pub fn grant(&self) -> ZtsGrant {
+        self.grant
     }
+}
 
-    /// Fetch a fresh role token, populating the cache. The caller is
-    /// expected to drive this from `AuthProvider::initial` — magnetar
-    /// itself doesn't run a background refresh loop for the cache
-    /// (the connection driver re-invokes the provider on auth
-    /// challenges).
-    ///
-    /// # Errors
-    /// - [`AthenzError::SignerFailure`] if the JWT signer trips.
-    /// - [`AthenzError::Transport`] on HTTP failure (connect, TLS, timeout).
-    /// - [`AthenzError::ZtsRejected`] on a non-2xx response.
-    pub async fn fetch_role_token(&self) -> Result<Bytes, AthenzError> {
-        // Cache hit?
-        {
-            let guard = self.cache.lock().await;
-            if let Some(entry) = guard.as_ref() {
-                if entry.refresh_at > std::time::Instant::now() {
-                    return Ok(entry.token.clone());
-                }
-            }
-        }
-
-        // Cache miss — sign + POST + cache.
-        let claims = self.claims_now()?;
-        let jwt = self.signer.sign(&claims)?;
-        let response = self.post_token(&jwt).await?;
-        let token = Bytes::from(response.access_token.into_bytes());
-        let ttl = Duration::from_secs(response.expires_in);
-        let refresh_at =
-            std::time::Instant::now() + ttl.checked_sub(self.refresh_leeway).unwrap_or(ttl);
-        *self.cache.lock().await = Some(CachedRoleToken {
-            token: token.clone(),
-            refresh_at,
-        });
-        Ok(token)
-    }
-
-    fn claims_now(&self) -> Result<ZtsClaims, AthenzError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| AthenzError::Config(format!("system clock pre-epoch: {e}")))?
-            .as_secs();
-        Ok(ZtsClaims {
-            // The caller's signer is expected to override iss/sub/kid
-            // with its own configuration; the placeholders here just
-            // stamp now / exp so callers that wrap a partial signer
-            // don't have to recompute them.
-            iss: String::new(),
-            sub: String::new(),
-            aud: self.zts_url.as_str().to_owned(),
-            kid: String::new(),
-            iat: now,
-            exp: now + 60,
-        })
-    }
-
-    async fn post_token(&self, jwt: &str) -> Result<ZtsTokenResponse, AthenzError> {
+#[async_trait]
+impl ZtsClient for HttpZtsClient {
+    async fn exchange(&self, signed_jwt: &str) -> Result<RoleTokenResponse, AthenzError> {
         let path = match self.grant {
             ZtsGrant::NToken => "domain/sys.auth/token",
             ZtsGrant::ClientCredentials => "oauth2/token",
@@ -210,7 +157,7 @@ impl ZtsClient {
         let response = self
             .http
             .post(url)
-            .bearer_auth(jwt)
+            .bearer_auth(signed_jwt)
             .send()
             .await
             .map_err(|e| AthenzError::Transport(format!("zts post: {e}")))?;
@@ -236,44 +183,19 @@ impl ZtsClient {
 mod tests {
     use super::*;
 
-    #[derive(Debug)]
-    struct StaticJwtSigner;
-
-    impl JwtSigner for StaticJwtSigner {
-        fn sign(&self, _claims: &ZtsClaims) -> Result<String, AthenzError> {
-            Ok("header.payload.signature".to_owned())
-        }
-    }
-
     #[test]
-    fn zts_client_builds_with_static_signer() {
-        let signer: Arc<dyn JwtSigner> = Arc::new(StaticJwtSigner);
-        let client = ZtsClient::new(
+    fn http_client_builds_with_valid_url() {
+        let client = HttpZtsClient::new(
             "https://zts.example.invalid:4443/zts/v1/",
             ZtsGrant::ClientCredentials,
-            signer,
         )
         .expect("client builds");
-        assert_eq!(client.refresh_leeway, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn refresh_leeway_override() {
-        let signer: Arc<dyn JwtSigner> = Arc::new(StaticJwtSigner);
-        let client = ZtsClient::new(
-            "https://zts.example.invalid:4443/zts/v1/",
-            ZtsGrant::ClientCredentials,
-            signer,
-        )
-        .expect("client builds")
-        .with_refresh_leeway(Duration::from_secs(120));
-        assert_eq!(client.refresh_leeway, Duration::from_secs(120));
+        assert_eq!(client.grant(), ZtsGrant::ClientCredentials);
     }
 
     #[test]
     fn invalid_zts_url_returns_config_error() {
-        let signer: Arc<dyn JwtSigner> = Arc::new(StaticJwtSigner);
-        let err = ZtsClient::new("not-a-url", ZtsGrant::ClientCredentials, signer).unwrap_err();
+        let err = HttpZtsClient::new("not-a-url", ZtsGrant::ClientCredentials).unwrap_err();
         assert!(matches!(err, AthenzError::Config(_)));
     }
 

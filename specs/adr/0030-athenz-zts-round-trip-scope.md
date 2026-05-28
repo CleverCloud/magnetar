@@ -1,6 +1,6 @@
 # ADR-0030 — Athenz ZTS round-trip scope for v0.2.0
 
-- **Status**: Proposed
+- **Status**: Superseded by [ADR-0041](0041-athenz-provider-testability-seams.md)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: auth, athenz, zts, v0.2.0, scope
@@ -180,7 +180,12 @@ boundary.
 
 ## Status
 
-Proposed (awaiting Florentin sign-off, 2026-05-26)
+Superseded by [ADR-0041](0041-athenz-provider-testability-seams.md)
+(2026-05-28). The implementation kept this ADR's *seam* design
+(`ensure_role_token(now)`, the ZtsClient trait + scripted fake, clock
+injection, expiry-aware cache, the four-layer test plan) but replaced the
+`rsa`-crate N-Token crypto with the aws-lc-rs / ring RS256 JWT exchange —
+see ADR-0041 for the rationale (RUSTSEC-2023-0071 + ADR-0011 determinism).
 
 ## References
 

@@ -43,5 +43,11 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-u
 # (per ADR-0024 layer 4). Provider lives in `magnetar-auth-sasl`; we
 # pull it WITHOUT the `kerberos` feature so no libgssapi linkage leaks.
 magnetar-auth-sasl = { workspace = true }
+# Athenz auth_data equivalence (ADR-0030, ADR-0024 layer d). A scripted
+# `ZtsClient` fake (needs `async-trait`) + a fixed `wall_clock` prove the
+# minted JWT and cached CONNECT auth_data are byte-identical across the
+# two engine-shaped drivers. `crypto-aws-lc-rs` for the deterministic RS256.
+magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"] }
+async-trait = { workspace = true }
 # PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
 prost = { workspace = true }

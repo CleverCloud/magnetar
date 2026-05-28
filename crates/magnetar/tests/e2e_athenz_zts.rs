@@ -61,11 +61,10 @@
 #![cfg(all(feature = "e2e", feature = "auth-athenz-zts"))]
 #![cfg(any(feature = "crypto-aws-lc-rs", feature = "crypto-ring"))]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use magnetar::proto::pb;
-use magnetar_auth_athenz::zts::{ZtsClient, ZtsGrant};
-use magnetar_auth_athenz::{AthenzConfig, AthenzProvider, jwt_signer};
+use magnetar_auth_athenz::{AthenzConfig, AthenzProvider};
 use magnetar_proto::{AuthChallengeState, AuthProvider};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -224,7 +223,7 @@ async fn e2e_athenz_zts_refresh_then_cached_initial() -> Result<(), Box<dyn std:
     );
 
     // Refresh — hits the wiremock once, cache is now populated.
-    provider.refresh_via_zts().await?;
+    provider.ensure_role_token(Instant::now()).await?;
 
     // First `initial()` post-refresh — returns the cached bytes.
     let token_a = provider.initial()?;
@@ -272,53 +271,52 @@ async fn e2e_athenz_zts_refresh_then_cached_initial() -> Result<(), Box<dyn std:
 // =============================================================================
 
 /// Second test in the goal's enumeration: when the cached token's
-/// remaining TTL drops inside the `refresh_leeway` window, the next
-/// `fetch_role_token` call must hit ZTS again and rotate the cached
+/// remaining TTL drops inside the `refresh_margin` window, the next
+/// `ensure_role_token` call must hit ZTS again and rotate the cached
 /// bytes.
 ///
-/// We drive the expiry via the ZTS-provided `expires_in` rather than a
-/// virtual clock: `ZtsClient` keys its expiry off
-/// `Instant::now() + (expires_in - refresh_leeway)`. Setting
-/// `expires_in = 0` (or `refresh_leeway >= expires_in`) makes the
-/// computed `refresh_at` deadline equal to "now," so the next call
-/// detects the cache as past-deadline and re-fetches.
+/// We drive the expiry via the injected monotonic `now: Instant`
+/// (ADR-0011): the provider keys its deadline off
+/// `now + (expires_in - refresh_margin)`, so advancing the instant we
+/// pass into `ensure_role_token` past that deadline forces a fresh
+/// exchange — no real wall-clock wait, no `expires_in = 0` hack.
 #[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry()
 -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
-    // First response: TTL 0 (already expired by the time the cache
-    // checks). wiremock matchers fire in registration order, so the
-    // second `.mount()` below picks up the second POST.
-    let mock = start_zts_stub("athenz-role-token-near-expiry", 0).await;
+    // First response: TTL 600 s. With the default 300 s refresh margin
+    // the cached entry's deadline lands at `t0 + 300 s`.
+    let mock = start_zts_stub("athenz-role-token-first", 600).await;
     let zts_url = format!("{}/zts/v1/", mock.uri());
+    let provider = build_provider(&zts_url);
 
-    // Use the lower-level `ZtsClient` directly so we can assert on the
-    // raw `fetch_role_token` cache behaviour (rather than going through
-    // the `AthenzProvider::role_token` mutex, which only reflects the
-    // last `refresh_via_zts` snapshot).
-    let config = sample_config(&zts_url);
-    let signer = jwt_signer::default_signer_for(&config)?;
-    let client = ZtsClient::new(&config.zts_url, ZtsGrant::ClientCredentials, signer)?
-        // `refresh_leeway` defaults to 60 s; for this test we want the
-        // cache to honour the broker's TTL verbatim so `expires_in=0`
-        // immediately marks the entry as past-deadline.
-        .with_refresh_leeway(Duration::ZERO);
+    let t0 = Instant::now();
+    provider.ensure_role_token(t0).await?;
+    assert_eq!(provider.initial()?.as_ref(), b"athenz-role-token-first");
 
-    // First fetch — populates cache with the near-expiry token.
-    let first = client.fetch_role_token().await?;
-    assert_eq!(first.as_ref(), b"athenz-role-token-near-expiry");
+    // A second ensure well inside the window is absorbed by the cache —
+    // no extra ZTS round-trip.
+    provider
+        .ensure_role_token(t0 + Duration::from_secs(60))
+        .await?;
+    assert_eq!(provider.initial()?.as_ref(), b"athenz-role-token-first");
 
     // Pre-mount the rotated response so the second matcher (registered
     // *after* the one-shot in `start_zts_stub`) picks up the next POST.
-    mount_rotated_response(&mock, "athenz-role-token-rotated", 60).await;
+    mount_rotated_response(&mock, "athenz-role-token-rotated", 600).await;
 
-    // Second fetch — cache is past `refresh_at`, must hit ZTS again
-    // and return the rotated bytes.
-    let second = client.fetch_role_token().await?;
+    // Drive `now` strictly past the deadline (`t0 + (600 - 300) s`) to
+    // force a fresh exchange that rotates the cached bytes.
+    let past_deadline = t0 + Duration::from_secs(600 - 300 + 1);
+    assert!(
+        provider.needs_refresh(past_deadline),
+        "must be inside the refresh window",
+    );
+    provider.ensure_role_token(past_deadline).await?;
     assert_eq!(
-        second.as_ref(),
+        provider.initial()?.as_ref(),
         b"athenz-role-token-rotated",
         "expiry-aware refresh must rotate the cached token",
     );
@@ -356,7 +354,7 @@ async fn e2e_athenz_zts_cached_token_used_on_auth_challenge()
     let provider = build_provider(&zts_url);
 
     // Warm the cache.
-    provider.refresh_via_zts().await?;
+    provider.ensure_role_token(Instant::now()).await?;
     let cached = provider.initial()?;
     assert_eq!(cached.as_ref(), b"athenz-role-token-challenge");
 

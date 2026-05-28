@@ -1625,10 +1625,12 @@ dependencies = [
 name = "magnetar-auth-athenz"
 version = "0.1.0-dev.0"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "base64",
  "bytes",
  "magnetar-proto",
+ "parking_lot",
  "reqwest",
  "ring",
  "rustls",
@@ -1636,7 +1638,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
  "tracing",
  "url",
  "zeroize",
@@ -1692,7 +1693,9 @@ dependencies = [
 name = "magnetar-differential"
 version = "0.1.0-dev.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
  "magnetar-runtime-moonpool",
@@ -1755,6 +1758,7 @@ version = "0.1.0-dev.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
  "moonpool-core",
@@ -1778,6 +1782,7 @@ dependencies = [
  "bytes",
  "flate2",
  "lz4_flex",
+ "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
  "parking_lot",
@@ -1787,6 +1792,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-openssl",
  "rustls-pki-types",
+ "serde_json",
  "slab",
  "snap",
  "tempfile",
@@ -1796,6 +1802,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "wiremock",
  "zstd",
 ]
 

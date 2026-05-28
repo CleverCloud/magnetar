@@ -66,6 +66,11 @@ async-trait    = { workspace = true }
 # `ScriptedGssapiClient` without enabling the `kerberos` feature so this
 # dev-dep does NOT pull libgssapi into the build (ADR-0029 + ADR-0024 §3).
 magnetar-auth-sasl = { workspace = true }
+# Athenz refresh-edge test (ADR-0030, ADR-0024 layer c). Drives the real
+# `AthenzProvider` with a scripted `ZtsClient` fake (impl uses the
+# `async-trait` dev-dep above) + an injected `now: Instant` schedule — no
+# HTTPS, no Docker. `crypto-aws-lc-rs` matches the crate default provider.
+magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"] }
 # PIP-33 marker encoding in tests/replicated_subscriptions.rs.
 prost          = { workspace = true }
 # In-process TLS server fixture for `tests/tls_transport_coverage.rs`. The
