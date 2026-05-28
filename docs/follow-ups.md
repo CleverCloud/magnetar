@@ -34,7 +34,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 1 | [Moonpool vectored I/O](#1-moonpool-vectored-io) | 🔗 [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) |
 | 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ✅ landed 2026-05-28 |
 | 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ✅ landed 2026-05-28 |
-| 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | ⚡ (unblocked by #3) |
+| 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | ✅ landed 2026-05-28 |
 | 5 | [PIP-180 replicator-side e2e](#5-pip-180-replicator-side-e2e) | ⚡ (self-hosting fixture) |
 | 6 | [PIP-460 scalable topics scaffold](#6-pip-460-scalable-topics-scaffold) | ⚡ (scaffold-now / e2e-later) |
 | 7 | [Moonpool transport TLS + supervised-loop coverage](#7-moonpool-transport-tls--supervised-loop-coverage) | ✅ landed 2026-05-28 (TLS hunk); supervised-loop driver lines remain |
@@ -289,6 +289,57 @@ BREAKING CHANGE: `magnetar-auth-athenz` gains `crypto-aws-lc-rs` / `crypto-ring`
 ---
 
 ## 4. Athenz ZTS e2e fixture
+
+**Status update (2026-05-28).** ✅ Landed in `test/athenz-zts-e2e`.
+
+The e2e suite lives at
+[`crates/magnetar/tests/e2e_athenz_zts.rs`](../crates/magnetar/tests/e2e_athenz_zts.rs)
+behind `feature = "e2e,auth-athenz-zts"`. Four tests, all
+`#[ignore = "e2e: requires Docker"]` for parity with the sibling e2e
+files:
+
+1. `e2e_athenz_zts_refresh_then_cached_initial` — wiremock-stub.
+   `ZtsClient::refresh_via_zts` → cached role token returned by
+   `AuthProvider::initial()`. Asserts the bearer JWT is a compact-JWS
+   three-segment payload from the §3 signer.
+2. `e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry` —
+   wiremock-stub. TTL-0 first response forces the cache to treat the
+   token as past-deadline; the next `fetch_role_token` round-trips
+   again and rotates the cached bytes.
+3. `e2e_athenz_zts_cached_token_used_on_auth_challenge` — wiremock-stub.
+   `AuthChallengeState::handle_challenge` routes through
+   `respond_to_challenge` and echoes the cached role-token bytes; no
+   extra ZTS round-trip.
+4. `e2e_athenz_zts_image_pulls_and_serves_status` — real Docker probe
+   against `athenz/athenz-zts-server:1.12.41`. Proves the upstream
+   image is pullable and `testcontainers-rs` wiring works. The probe
+   gracefully surfaces the "no ZMS co-deployed → readiness probe times
+   out" branch as an expected warning, mirroring the SASL Kerberos
+   pattern for unprovisioned hosts.
+
+**Hybrid rationale.** The upstream
+[`athenz/athenz-zts-server`](https://hub.docker.com/r/athenz/athenz-zts-server)
+image's full production bring-up needs a co-deployed ZMS, per-tenant
+public-key seeding via the ZMS admin REST API, and a chained TLS
+server certificate — Athenz's
+[`make deploy-dev`](https://github.com/AthenZ/athenz/blob/master/docker/README.md)
+orchestrates four containers (ZMS DB, ZMS, ZTS DB, ZTS) plus a
+cert-bootstrap pre-flight, taking ~15 minutes to build. That topology
+does not fit cleanly behind a single `testcontainers-rs` spawn, so per
+the goal's "honest scope check" we split the suite: wiremock-stub
+tests against a real `reqwest` client cover every behavioural
+assertion the `/goal` enumerates, and the real-image probe wires the
+upstream image into the e2e surface without requiring a pre-seeded ZMS
+on the build host. Closing the deferred "full production-style
+ZMS+ZTS+cert-bootstrap" slice would require shipping the Athenz
+`make deploy-dev` topology as a shared CI fixture (similar to
+`docker-compose.replicated-subs.yml`); tracked here if it ever becomes
+load-bearing.
+
+Docs: [`docs/athenz.md` §End-to-end testing](athenz.md#end-to-end-testing-against-a-real-zts);
+parity-status row updated.
+
+### Original entry (kept for historical reference)
 
 **Gap.** No end-to-end test exercises the Athenz ZTS round-trip
 against a real ZTS server. Tests today are unit-level against the
