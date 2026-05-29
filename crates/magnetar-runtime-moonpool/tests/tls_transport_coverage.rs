@@ -453,9 +453,10 @@ async fn connect_tls_clean_shutdown_releases_resources() {
                 tokio::task::yield_now().await;
             }
 
-            // Abort explicitly — `JoinHandle::drop` detaches on tokio;
-            // `abort()` is what populates the driver's result slot so
-            // a subsequent `.join().await` resolves rather than hangs.
+            // Abort explicitly — dropping the handle only detaches the task.
+            // Cooperative `abort()` closes the connection and wakes the driver
+            // so it runs its shutdown path and exits, letting a subsequent
+            // `.join().await` resolve rather than hang.
             driver.abort();
             let join_outcome = tokio::time::timeout(Duration::from_secs(3), driver.join()).await;
             assert!(

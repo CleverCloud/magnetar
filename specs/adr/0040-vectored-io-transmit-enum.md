@@ -5,6 +5,21 @@
 - **Decider**: Florentin Dubois
 - **Tags**: performance, sans-io, runtime, network, zero-copy
 
+> **Wave-2 prerequisite resolved (2026-05-29, [ADR-0043](0043-temporary-floating-moonpool-git-dep.md)).**
+> The wave-2 dependency below — "`moonpool_core::Providers::Network`
+> grows a `write_vectored` method" — has landed upstream
+> ([PR #113](https://github.com/PierreZ/moonpool/pull/113),
+> [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111)).
+> magnetar consumes it via a temporary git `branch = "main"` dependency
+> ([ADR-0043](0043-temporary-floating-moonpool-git-dep.md)) until a
+> crates.io release ships it. The moonpool engine now dispatches
+> `TransmitOwned::Vectored` through real `write_vectored` on the plaintext
+> arm (segment-granular delivery events under `SimProviders`; single-write
+> fallback under `TokioProviders`, whose `Compat` stream does not forward
+> vectored writes; TLS stays contiguous). The original decision text below
+> is unchanged. See [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md)
+> §"Transport + vectored writes".
+
 ## Context
 
 The current sans-io ↔ runtime boundary uses a single `BytesMut` outbound

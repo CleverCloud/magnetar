@@ -934,3 +934,111 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! ADR-0040 wave 2 — `driver::write_all_vectored` over a real
+    //! `tokio::net::TcpStream`. 1:1 mirror of
+    //! `magnetar-runtime-moonpool/src/transport.rs`'s `write_all_vectored`
+    //! Plain-arm tests (ADR-0024 layer (b) + the strict runtime-test-parity
+    //! count). The tokio engine writes byte-identical output to the moonpool
+    //! engine; real TCP coalesces, so these assert the *reassembled stream*
+    //! rather than per-segment delivery boundaries (which only the sim
+    //! `SimTcpStream` preserves).
+
+    use bytes::Bytes;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::write_all_vectored;
+
+    /// A small multi-segment vectored write reassembles, in order, to the
+    /// concatenation of its segments on the peer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_all_vectored_delivers_segments_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let (mut server, _peer) = listener.accept().await.expect("accept");
+
+        let segs = vec![
+            Bytes::from_static(b"AAAA"),
+            Bytes::from_static(b"BBBBBB"),
+            Bytes::from_static(b"CC"),
+        ];
+        let mut expected: Vec<u8> = Vec::new();
+        for s in &segs {
+            expected.extend_from_slice(s);
+        }
+
+        write_all_vectored(&mut client, &segs)
+            .await
+            .expect("vectored write");
+        drop(client); // clean EOF so the read loop terminates
+
+        let mut received = Vec::new();
+        server
+            .read_to_end(&mut received)
+            .await
+            .expect("read_to_end");
+        assert_eq!(
+            received, expected,
+            "reassembled stream must equal the segment concatenation, in order",
+        );
+    }
+
+    /// Segments whose combined length far exceeds the socket send buffer
+    /// force at least one short `write_vectored`. The offset-tracking loop
+    /// must re-issue the writev for the unflushed tail until every byte
+    /// lands; the peer's reassembled stream must be byte-identical to the
+    /// concatenation. The reader drains concurrently so the writer's
+    /// backpressure clears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_all_vectored_handles_partial_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let (mut server, _peer) = listener.accept().await.expect("accept");
+
+        // 4 MiB per segment, 3 segments = 12 MiB — comfortably larger than
+        // any default loopback socket buffer, guaranteeing partial accepts.
+        let seg_len = 4 * 1024 * 1024;
+        let segs = vec![
+            Bytes::from(vec![1u8; seg_len]),
+            Bytes::from(vec![2u8; seg_len]),
+            Bytes::from(vec![3u8; seg_len]),
+        ];
+        let mut expected: Vec<u8> = Vec::with_capacity(seg_len * 3);
+        for s in &segs {
+            expected.extend_from_slice(s);
+        }
+        let total = expected.len();
+
+        let writer = tokio::spawn(async move {
+            write_all_vectored(&mut client, &segs)
+                .await
+                .expect("vectored write (partial-accept)");
+            // Drop closes the socket → reader sees EOF after the last byte.
+            drop(client);
+        });
+
+        let mut received: Vec<u8> = Vec::with_capacity(total);
+        server
+            .read_to_end(&mut received)
+            .await
+            .expect("read_to_end");
+        writer.await.expect("writer task joined");
+
+        assert_eq!(
+            received.len(),
+            total,
+            "partial-accept loop must flush every byte",
+        );
+        assert_eq!(
+            received, expected,
+            "reassembled stream must equal the segment concatenation",
+        );
+    }
+}

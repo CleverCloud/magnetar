@@ -1,9 +1,20 @@
 # ADR-0036 — Moonpool seed sweep: daily random, not fixed per-PR
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0043](0043-temporary-floating-moonpool-git-dep.md), exact-pin discipline scoped exception)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: testing, moonpool, ci, process
+
+> **Amendment (2026-05-29, [ADR-0043](0043-temporary-floating-moonpool-git-dep.md)).**
+> The exact-pin reproducibility discipline this ADR relies on is
+> temporarily relaxed for **two named crates only** — `moonpool-core` and
+> `moonpool-sim` now track git `branch = "main"` to consume the futures-io
+> `TcpStream` + segment-granular `write_vectored` change ([ADR-0040](0040-vectored-io-transmit-enum.md)
+> wave 2) ahead of a crates.io release. `Cargo.lock` still records a
+> concrete rev, the daily seed sweep below is one of the mitigations, and
+> the float is re-pinned to an exact `=x.y.z` once
+> [PR #113](https://github.com/PierreZ/moonpool/pull/113) ships. Nothing
+> else in this ADR changes.
 
 ## Context
 

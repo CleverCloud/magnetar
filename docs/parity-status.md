@@ -15,6 +15,7 @@ follow-up train; the gap is tracked below.
 | Surface | tokio | moonpool |
 | --- | --- | --- |
 | Engine driver loop + transport scaffold | ✅ | ✅ |
+| Vectored producer-batch writes ([ADR-0040](../specs/adr/0040-vectored-io-transmit-enum.md)) | ✅ (`writev` on plaintext) | ✅ (real `futures` `write_vectored`: segment-granular under `SimProviders`, single-write fallback under `TokioProviders`' `Compat`; TLS contiguous — [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)) |
 | Client (lookup + partitioned-metadata + topic-watch) | ✅ | ✅ |
 | Producer façade (send / flush / close) | ✅ | ✅ |
 | Consumer façade (subscribe / receive / ack) | ✅ | ✅ |

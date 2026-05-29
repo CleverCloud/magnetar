@@ -58,7 +58,6 @@ use magnetar_proto::ConnectionEvent;
 use moonpool_core::{Providers, TaskProvider, TimeProvider};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
 use crate::dns::DnsResolver;
 use crate::transport::Transport;
@@ -248,15 +247,30 @@ struct DriverResult {
 
 /// Handle to the driver task. Dropping the handle does not stop the driver
 /// (it keeps running as long as the [`ConnectionShared`] arc is alive); call
-/// [`DriverHandle::join`] to wait for it.
+/// [`DriverHandle::abort`] to stop it or [`DriverHandle::join`] to wait for
+/// it.
 ///
 /// Joining is implemented over [`tokio::sync::Notify`] rather than the
-/// tokio `JoinHandle` of the spawned task because moonpool's
-/// [`TaskProvider::spawn_task`] returns `JoinHandle<()>`. We surface the
-/// terminal `Result<(), EngineError>` via a shared slot instead.
+/// task's join handle because moonpool main's
+/// [`TaskProvider::JoinHandle`] is an opaque
+/// `Future<Output = Result<(), moonpool_core::JoinError>>` with no
+/// `abort()` (it dropped the raw `tokio::task::JoinHandle<()>` it used to
+/// expose). We surface the terminal `Result<(), EngineError>` via a shared
+/// slot instead, and stop the task *cooperatively* (see [`Self::abort`])
+/// because the provider can no longer cancel it.
 pub struct DriverHandle {
-    join: JoinHandle<()>,
+    /// Type-erased keep-alive for the spawned task handle. `spawn_task`
+    /// detaches the task on drop (it lives until its future completes —
+    /// i.e. until the connection closes), so this is a lifetime marker
+    /// rather than a cancellation lever; moonpool main no longer exposes a
+    /// task-level abort through the provider.
+    _join: Box<dyn core::any::Any + Send>,
     result: Arc<DriverResult>,
+    /// Connection used by [`Self::abort`] to drive a cooperative shutdown:
+    /// moonpool main has no task-level cancel, so stopping the driver means
+    /// `close()`-ing the connection and waking the loop so it runs its
+    /// `should_close` exit path.
+    shared: Arc<ConnectionShared>,
 }
 
 impl std::fmt::Debug for DriverHandle {
@@ -284,19 +298,20 @@ impl DriverHandle {
         }
     }
 
-    /// Abort the driver task. The result slot is populated with a
-    /// `Config("aborted")` error so callers awaiting [`Self::join`] don't
-    /// hang.
+    /// Stop the driver task. moonpool main's [`TaskProvider`] exposes no
+    /// task-level cancellation, so abort is *cooperative*: it `close()`-es the
+    /// connection and wakes the driver loop, which observes `should_close`,
+    /// runs its shutdown path, and populates the result slot with its real
+    /// terminal outcome. A subsequent [`Self::join`] therefore waits for the
+    /// task to actually finish rather than returning a synthetic result while
+    /// the task is still parked. Idempotent — `close()` on an
+    /// already-closing connection is a no-op.
     pub fn abort(&self) {
-        self.join.abort();
-        // Populate the result slot so any pending `join().await` wakes up.
         {
-            let mut slot = self.result.result.lock();
-            if slot.is_none() {
-                *slot = Some(Err(EngineError::Config("driver aborted".to_owned())));
-            }
+            let mut conn = self.shared.inner.lock();
+            conn.close();
         }
-        self.result.done.notify_waiters();
+        self.shared.driver_waker.notify_one();
     }
 }
 
@@ -359,12 +374,20 @@ where
         done: Notify::new(),
     });
     let result_for_task = result.clone();
+    let shared_for_handle = shared.clone();
     let join = task.spawn_task("magnetar-moonpool-driver", async move {
         let outcome = driver_loop_inner::<P>(shared, transport, time).await;
         *result_for_task.result.lock() = Some(outcome);
-        result_for_task.done.notify_waiters();
+        // `notify_one` (not `notify_waiters`) so a `join()` that registers
+        // *after* the task finishes still observes completion via the stored
+        // permit instead of missing the wake and hanging.
+        result_for_task.done.notify_one();
     });
-    DriverHandle { join, result }
+    DriverHandle {
+        _join: Box::new(join),
+        result,
+        shared: shared_for_handle,
+    }
 }
 
 /// Spawn the driver with the auto-reconnect supervisor wired in.
@@ -387,15 +410,20 @@ where
         done: Notify::new(),
     });
     let result_for_task = result.clone();
+    let shared_for_handle = shared.clone();
     let time = providers.time().clone();
     let task = providers.task().clone();
     let join = task.spawn_task("magnetar-moonpool-driver-supervised", async move {
         let outcome =
             supervised_driver_loop::<P>(shared, transport, reconnect_ctx, providers, time).await;
         *result_for_task.result.lock() = Some(outcome);
-        result_for_task.done.notify_waiters();
+        result_for_task.done.notify_one();
     });
-    DriverHandle { join, result }
+    DriverHandle {
+        _join: Box::new(join),
+        result,
+        shared: shared_for_handle,
+    }
 }
 
 /// The supervised driver loop. Runs [`driver_loop_inner`] on the current
@@ -675,21 +703,26 @@ where
         //    `BytesMut::split()` ownership transfer the legacy `poll_transmit` returned; the
         //    vectored arm carries the producer batch's `[head, payload]` segment list.
         //
-        //    moonpool's `Transport` does not yet expose a vectored
-        //    write primitive (the underlying
-        //    `moonpool_core::NetworkProvider::TcpStream` lacks a
-        //    chaos-pack-aware `write_vectored`); for now the vectored
-        //    arm coalesces locally and falls through to the same
-        //    contiguous `write_all`. Once moonpool-core adds vectored
-        //    support the chaos pack gains segment-granular drops
-        //    (ADR-0040 wave 2's chaos-pack note). The tokio engine
-        //    already dispatches `Vectored` via real `writev(2)` —
-        //    coalesce-here on moonpool means the *bytes* on the wire
-        //    are byte-identical to tokio, only the chaos-pack
-        //    fidelity differs.
-        let (write_buf, deadline, should_close) = {
+        //    moonpool main now exposes vectored writes, so the engine
+        //    dispatches the `Vectored` arm via real futures
+        //    `write_vectored` on the Plain path (§2 below). moonpool-sim's
+        //    `SimTcpStream` records each `IoSlice` as its own ordered
+        //    delivery event → segment-granular chaos (drops / reorders at
+        //    frame-head vs payload boundaries). `TokioProviders`' `Compat`
+        //    stream lacks vectored forwarding so it falls back to a
+        //    single-buffer `poll_write` (still correct, just no syscall
+        //    reduction). TLS coalesces (rustls owns its own record
+        //    buffering). Either way the *bytes* on the wire stay
+        //    byte-identical to before and to the tokio engine.
+        //
+        //    ADR-0038: drain `poll_transmit_owned()` UNDER the connection
+        //    lock, then carry the owned `TransmitOwned` out (cheap — each
+        //    segment is `Arc`-backed `Bytes`) and drop the lock BEFORE
+        //    awaiting the network write. The `parking_lot::Mutex` is never
+        //    held across an `.await`.
+        let (out, deadline, should_close) = {
             let mut conn = shared.inner.lock();
-            let owned = conn.poll_transmit_owned();
+            let out = conn.poll_transmit_owned();
             let dl = conn.poll_timeout();
             let closing = matches!(
                 conn.state(),
@@ -697,24 +730,19 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
-            let write_buf = match owned {
-                magnetar_proto::TransmitOwned::Contiguous(buf) => buf,
-                magnetar_proto::TransmitOwned::Vectored(segs) => {
-                    let total: usize = segs.iter().map(bytes::Bytes::len).sum();
-                    let mut coalesced = bytes::BytesMut::with_capacity(total);
-                    for seg in segs {
-                        coalesced.extend_from_slice(&seg);
-                    }
-                    coalesced.freeze()
-                }
-            };
-            (write_buf, dl, closing)
+            (out, dl, closing)
         };
 
         // 2. Flush whatever the state machine produced. This happens outside the lock so user
         //    futures can keep enqueuing.
-        if !write_buf.is_empty() {
-            if let Err(err) = transport.write_all(&write_buf).await {
+        if !out.is_empty() {
+            let write_result = match &out {
+                magnetar_proto::TransmitOwned::Contiguous(buf) => transport.write_all(buf).await,
+                magnetar_proto::TransmitOwned::Vectored(segs) => {
+                    transport.write_all_vectored(segs).await
+                }
+            };
+            if let Err(err) = write_result {
                 shared.inner.lock().mark_disconnected();
                 return Err(err.into());
             }

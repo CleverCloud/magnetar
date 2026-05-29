@@ -671,12 +671,13 @@ async fn producer_and_consumer_close_complete() {
         .await;
 }
 
-/// `DriverHandle::abort` (`src/driver.rs:208-218`) writes a `Config`
-/// error into the result slot, wakes any pending joiner, and aborts
-/// the underlying task. Spin up a long-lived broker connection, abort,
-/// and confirm `join()` resolves with the expected error.
+/// `DriverHandle::abort` drives a *cooperative* shutdown under moonpool
+/// main (the `TaskProvider` has no task-level cancel): it closes the
+/// connection and wakes the driver, which runs its shutdown path and exits.
+/// Spin up a long-lived broker connection, abort, and confirm `join()`
+/// resolves with the driver's clean terminal result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn driver_handle_abort_populates_result_slot() {
+async fn driver_handle_abort_drives_cooperative_shutdown() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -692,14 +693,17 @@ async fn driver_handle_abort_populates_result_slot() {
             // Debug on the handle is also otherwise unhit (src/driver.rs:181-183).
             let rendered = format!("{driver:?}");
             assert!(rendered.contains("DriverHandle"));
+            // Cooperative abort: moonpool main has no task-level cancel, so
+            // `abort()` closes the connection and wakes the driver, which runs
+            // its shutdown path and exits cleanly. `join()` waits for that real
+            // terminal outcome (no synthetic "aborted" result) and must resolve.
             driver.abort();
-            let err = tokio::time::timeout(Duration::from_secs(3), driver.join())
+            let res = tokio::time::timeout(Duration::from_secs(3), driver.join())
                 .await
-                .expect("join did not time out")
-                .expect_err("aborted driver returns an error");
+                .expect("join did not time out");
             assert!(
-                matches!(&err, EngineError::Config(msg) if msg.contains("aborted")),
-                "expected Config(aborted), got {err:?}"
+                res.is_ok(),
+                "cooperatively-aborted driver exits cleanly, got {res:?}"
             );
         })
         .await;

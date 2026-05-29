@@ -31,7 +31,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 
 | # | Item | Status |
 | - | --- | --- |
-| 1 | [Moonpool vectored I/O](#1-moonpool-vectored-io) | 🔗 [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) |
+| 1 | [Moonpool vectored I/O](#1-moonpool-vectored-io) | ✅ landed 2026-05-29 ([PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) / [PR #113](https://github.com/PierreZ/moonpool/pull/113); consumed via git `main`, [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)) |
 | 2 | [Engine-generic builder & V5 unified lift (§2 phantom-E + §3 per-surface lifts + §4 V5)](#2-engine-generic-builder--v5-unified-lift) | ✅ landed 2026-05-28 |
 | 3 | [Athenz concrete `JwtSigner`](#3-athenz-concrete-jwtsigner) | ✅ landed 2026-05-28 |
 | 4 | [Athenz ZTS e2e fixture](#4-athenz-zts-e2e-fixture) | ✅ landed 2026-05-28 |
@@ -42,10 +42,33 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 9 | [Differential runner: plain `tokio::spawn` restructure](#9-differential-runner-plain-tokiospawn-restructure) | 🔗 (blocked on upstream moonpool TaskProvider — see in-section investigation note) |
 | 10 | [`engine.rs` split](#10-enginers-split) | ⚡ |
 | 11 | [`ProducerExt` trait inline — DECISION: accept as layering artefact](#11-producerext-trait-inline) | ✅ decided (doc-only) |
+| 12 | [Re-pin moonpool off git `branch = "main"` to a crates.io release](#12-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
 
 ---
 
 ## 1. Moonpool vectored I/O
+
+**Status update (2026-05-29).** ✅ **Landed.** Upstream merged the
+segment-granular `poll_write_vectored` + `is_write_vectored` on
+`SimTcpStream` (alongside the `NetworkProvider::TcpStream` migration from
+`tokio::io` to `futures::io`) in
+[PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) /
+[PR #113](https://github.com/PierreZ/moonpool/pull/113). magnetar consumes
+it via a temporary git `branch = "main"` dependency
+([ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md) —
+re-pin tracked as [§12](#12-re-pin-moonpool-off-git-branch-main)). The
+moonpool engine's transport is ported to the `futures::io` ext traits and
+now dispatches `TransmitOwned::Vectored` through real `write_vectored` on
+the plaintext arm: segment-granular delivery events under `SimProviders`;
+single-write fallback under `TokioProviders` (the `Compat` stream does not
+forward vectored writes — byte-identical wire output, no syscall
+reduction); TLS stays contiguous (rustls owns its record buffering). The
+local coalesce placeholder is gone. This closes ADR-0040 wave 2's
+chaos-fidelity gap. Docs:
+[`docs/moonpool-engine.md` §Transport + vectored writes](moonpool-engine.md#transport--vectored-writes);
+parity-status row updated.
+
+### Original entry (kept for historical reference)
 
 **Gap.** `magnetar-runtime-moonpool/src/driver.rs` coalesces
 `TransmitOwned::Vectored` segment lists into a single `BytesMut`
@@ -729,6 +752,32 @@ needed beyond documenting the rationale in-line.
 
 ---
 
+## 12. Re-pin moonpool off git `branch = "main"`
+
+**Gap.** `Cargo.toml`'s `[workspace.dependencies]` tracks
+`moonpool-core` / `moonpool-sim` on git `branch = "main"` to consume the
+futures-io `TcpStream` + segment-granular `write_vectored` change
+([§1](#1-moonpool-vectored-io), ADR-0040 wave 2) ahead of a crates.io
+release. This is a **documented, time-boxed exception** to ADR-0036's
+exact-pin reproducibility discipline
+([ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
+While it stands, `cargo update -p moonpool-core` can advance the rev to
+an arbitrary later `main` commit; `Cargo.lock`'s concrete rev is the only
+reproducibility anchor.
+
+**Why it stays open.** Blocked on upstream cutting a **moonpool crates.io
+release that contains [PR #113](https://github.com/PierreZ/moonpool/pull/113)**.
+The last published release is `0.6.0`, which predates both the futures-io
+migration and the vectored entry.
+
+**`/goal` (post-release).**
+
+```text
+/goal re-pin moonpool off the git `branch = "main"` floating dependency per docs/follow-ups.md §12, once a moonpool crates.io release ships PR #113 (futures-io `NetworkProvider::TcpStream` + `SimTcpStream::poll_write_vectored`). In Cargo.toml `[workspace.dependencies]`, replace the two `{ git = "https://github.com/PierreZ/moonpool", branch = "main" }` entries for `moonpool-core` / `moonpool-sim` with exact `=x.y.z` version pins matching the release that carries PR #113. Run `cargo update -p moonpool-core -p moonpool-sim` to refresh Cargo.lock to the released artefact. Confirm the transport still compiles against the `futures::io` ext traits (the release keeps the same surface). Flip specs/adr/0043-temporary-floating-moonpool-git-dep.md Status to `Superseded by ADR-NNNN` and write the re-pin ADR (restores ADR-0036 exact-pin in full); flip the ADR-0036 amendment pointer + index status accordingly; update specs/README.md index. Update docs/simulation-patterns.md §2 ("vendored at `=x.y.z`") and any other version statement. Validation chain per CLAUDE.md (incl. `cargo deny check` — the release re-enables the version/advisory gates the git dep bypassed).
+```
+
+---
+
 ## Notes on this file
 
 Items move from this file to `git log` when their commit lands. The
@@ -747,6 +796,10 @@ Decision pendings from prior cuts of this doc (Athenz crypto crate,
 PIP-460 scaffold scope, deferred items §9 / §10) have all been
 resolved in the session that produced this consolidated doc.
 
-The vectored I/O moonpool primitive ([§1](#1-moonpool-vectored-io))
-remains the only fully-external blocker — tracked in
-[PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111).
+The vectored I/O moonpool primitive ([§1](#1-moonpool-vectored-io)) has
+landed upstream and is now consumed via a temporary git `branch = "main"`
+dependency ([ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
+The only remaining fully-external blocker is re-pinning that dependency
+to a crates.io release ([§12](#12-re-pin-moonpool-off-git-branch-main)),
+pending a moonpool release carrying
+[PR #113](https://github.com/PierreZ/moonpool/pull/113).

@@ -116,15 +116,21 @@ base64     = { version = "^0.22.1", default-features = false, features = ["std"]
 # requirements on hosts that don't enable Kerberos. See ADR-0029.
 libgssapi  = { version = "^0.9.1", default-features = false }
 
-# moonpool engine — exact-pin discipline preserved (`=` sigil) so the
-# two moonpool crates stay version-compatible; see ADR-0024 + ADR-0036.
-moonpool-core = "=0.6.0"
+# moonpool engine — temporarily floating on git `main` (per ADR-0043) to
+# pick up the futures-io `TcpStream` + segment-granular `write_vectored`
+# breaking change ahead of the next crates.io release. The explicit
+# `version` is not redundant with `branch`: it keeps the dep off cargo-deny's
+# wildcard ban AND guards against a silent moonpool major bump — when main
+# crosses 0.7 the build fails resolution, which is exactly the ADR-0043
+# re-pin trigger. Both crates track the same rev so they stay
+# version-compatible; see ADR-0024 + ADR-0036.
+moonpool-core = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }
 # moonpool-sim provides the deterministic SimProviders used by the
-# differential harness chaos pack (ADR-0024). Pinned to the same minor
-# as moonpool-core so the two crates stay version-compatible. Vendored
-# as a workspace dep but opted into per-crate (currently only the
-# differential harness needs it).
-moonpool-sim = "=0.6.0"
+# differential harness chaos pack (ADR-0024). Tracks the same git rev as
+# moonpool-core so the two crates stay version-compatible. Vendored as a
+# workspace dep but opted into per-crate (currently only the differential
+# harness needs it).
+moonpool-sim = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }
 
 # Admin REST + CLI. The TLS sub-feature (`rustls` vs `rustls-no-provider`,
 # renamed from `rustls-tls` / `rustls-tls-no-provider` in reqwest 0.13) is

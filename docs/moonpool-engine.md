@@ -75,6 +75,36 @@ close / stats / ack variants / nack / seek / pause / DLQ drain) is
 identical. The difference is which `now: Instant` source the engine
 snapshots at the call site and which byte pipe carries the wire bytes.
 
+## Transport + vectored writes
+
+The engine's transport adapter
+([`crates/magnetar-runtime-moonpool/src/transport.rs`](../crates/magnetar-runtime-moonpool/src/transport.rs))
+drives the `moonpool_core::NetworkProvider::TcpStream` directly. As of
+moonpool `main` (consumed via the temporary git dependency in
+[ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md))
+that stream bounds on the **`futures::io::{AsyncRead, AsyncWrite}`** ext
+traits rather than `tokio::io` — `TokioNetworkProvider` wraps its
+`tokio::net::TcpStream` in
+[`tokio_util::compat::Compat`](https://docs.rs/tokio-util/latest/tokio_util/compat/struct.Compat.html)
+to bridge the two ecosystems. The transport adapter therefore imports the
+`futures::io` ext traits (`AsyncReadExt` / `AsyncWriteExt`) accordingly.
+
+The driver dispatches the sans-io `TransmitOwned` descriptor
+([ADR-0040](../specs/adr/0040-vectored-io-transmit-enum.md)) as follows:
+
+| `TransmitOwned` arm | Transport | Behaviour |
+| --- | --- | --- |
+| `Vectored` on the **plaintext** path under `SimProviders` | `futures::io::AsyncWriteExt::write_vectored` over `SimTcpStream` | **Segment-granular.** moonpool records each `IoSlice` as its own ordered delivery event, with `writev`-style partial-accept semantics — the chaos pack can drop / re-order individual segments. |
+| `Vectored` on the **plaintext** path under `TokioProviders` | `futures::io::write_vectored` over the `Compat` wrapper | **Single-write fallback.** The `Compat` stream does not forward vectored writes (`is_write_vectored()` is `false`), so the slices collapse to one buffer write. Byte-identical wire output, no syscall reduction. |
+| `Contiguous` (handshake, small frames) | single-buffer `write_all` | unchanged. |
+| `Vectored` on the **TLS** path | `Transport::write_all_vectored` coalesces, then writes ciphertext | **Always contiguous.** The TLS arm still *receives* the segment list, but pushes each segment's plaintext through rustls in order and ships one ciphertext stream — rustls owns its own record buffering, so segment boundaries cannot survive encryption. See the TLS adapter section below. |
+
+This replaces the earlier placeholder that coalesced the `Vectored`
+segment list into one contiguous `write_all` "until moonpool-core adds
+vectored support" — that prerequisite is now satisfied (ADR-0040 wave 2,
+[PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) /
+[PR #113](https://github.com/PierreZ/moonpool/pull/113)).
+
 ## Supervised reconnect
 
 The moonpool driver loop mirrors the tokio supervisor exactly. See
@@ -116,6 +146,18 @@ The handshake therefore stays deterministic under `SimProviders` chaos
 (connection drops, partial reads, virtual-clock timeouts). The
 adapter never blocks on a network call inside `process_new_packets` —
 reads and writes go through the byte pipe under simulation control.
+
+The TLS write path is **always contiguous**, including for producer
+batches the plaintext path would emit as a `Vectored` segment list
+([ADR-0040](../specs/adr/0040-vectored-io-transmit-enum.md)): rustls
+buffers and frames its own records, so per-segment boundaries cannot
+survive encryption. The driver still dispatches `Vectored` to
+`Transport::write_all_vectored` for TLS connections, but the TLS arm
+coalesces the segment list — pushing each segment's plaintext through
+rustls in order — before shipping one ciphertext stream. The
+segment-granular `write_vectored` benefit therefore applies to the
+plaintext arm only — see the
+[Transport + vectored writes](#transport--vectored-writes) table.
 
 See [ADR-0006](../specs/adr/0006-moonpool-tls-byte-pipe.md) for the
 binding decision.
@@ -169,6 +211,16 @@ PIP-121 + PIP-188 paths under deterministic seeds. Tests are normal
 | Stateful broker + invariant assertions (D2 chaos pack) | [`sim_chaos.rs`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs) |
 | Targeted ADR-0024 coverage closure for `src/{driver,producer,consumer,lib,transport}.rs` | [`coverage_close.rs`](../crates/magnetar-runtime-moonpool/tests/coverage_close.rs) (mirror: [tokio side](../crates/magnetar-runtime-tokio/tests/coverage_close.rs)) |
 
+Since the engine dispatches plaintext producer batches through real
+`write_vectored` (see
+[Transport + vectored writes](#transport--vectored-writes)), the chaos
+pack now operates at **segment granularity** on the plaintext arm:
+`SimTcpStream` records each `IoSlice` as its own ordered delivery event
+with `writev`-style partial-accept semantics, so per-segment drop /
+re-order / short-write modelling is available where the pack previously
+saw only one coalesced write. The TLS arm stays contiguous, so its chaos
+fidelity is unchanged (rustls owns record buffering).
+
 Reproduce a flaky run under a specific seed:
 
 ```bash
@@ -219,19 +271,33 @@ The harness components:
 | [`tests/golden_traces.rs`](../crates/magnetar-differential/tests/golden_traces.rs) | Asserts the two engines produce equivalent event streams on the shipped golden traces. |
 
 The moonpool runner uses `TokioProviders` rather than
-`SimProviders` — once `moonpool-sim` is vendored as a workspace
-dependency, swapping the provider bundle in the runner is a one-line
-change. The harness still exercises the engine surface that diverges
-between tokio and moonpool (memory-limit policy plumbing, future
-shapes, generic bounds) which is the load-bearing part for
-equivalence.
+`SimProviders`. `moonpool-sim` is now a workspace dependency (pulled in
+for the chaos pack via the git `main` float —
+[ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)), so
+the remaining obstacle to swapping the runner's provider bundle is the
+`TaskProvider` `Send`-bound issue, not the dependency itself — tracked in
+[`follow-ups.md` §9](follow-ups.md#9-differential-runner-plain-tokiospawn-restructure).
+The harness still exercises the engine surface that diverges between
+tokio and moonpool (memory-limit policy plumbing, future shapes, generic
+bounds) which is the load-bearing part for equivalence.
+
+Equivalence holds across the vectored-write change because the
+comparison is on wire bytes + user-visible events, not syscall shape:
+under `TokioProviders` the moonpool transport's `Compat` stream does not
+forward vectored writes (it collapses the `Vectored` segment list to a
+single buffer write — see
+[Transport + vectored writes](#transport--vectored-writes)), so it emits
+byte-identical wire output to the tokio engine's `write_all`. The
+segment-granular delivery events are a `SimProviders`-only refinement
+and do not perturb the `TokioProviders`-backed differential trace.
 
 The harness ships per [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
 M8. The remaining structural caveat — the moonpool runner's
 `spawn_local` driver requires a 25 ms `Kicker` to bridge the
 `LocalSet` pump gap — is tracked in
-[`follow-ups.md`](follow-ups.md) §"Differential equivalence harness"
-and closes once the moonpool-sim provider lands.
+[`follow-ups.md` §9](follow-ups.md#9-differential-runner-plain-tokiospawn-restructure)
+and closes once the upstream `TaskProvider` gains a `Send`-bound spawn
+entry point.
 
 ## What is *not* yet exercised under simulation
 

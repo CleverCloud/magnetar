@@ -58,6 +58,7 @@ use std::time::{Duration, Instant};
 use magnetar_proto::{HealthProbe, ServiceUrlProvider};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TimeProvider};
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 /// PIP-121 health-driven cluster failover service URL provider — moonpool
 /// engine variant.
@@ -96,8 +97,9 @@ use parking_lot::Mutex;
 ///     ],
 ///     Arc::new(AlwaysHealthy),
 /// );
-/// // Start the background prober. Returns a JoinHandle; drop it to detach.
-/// let _ = failover.start(&providers, Duration::from_secs(5));
+/// // Start the background prober. Hold the handle to keep it running;
+/// // `abort()` it (or drop it) to stop the prober on shutdown.
+/// let _handle = failover.start(&providers, Duration::from_secs(5));
 /// # }
 /// ```
 #[allow(
@@ -183,9 +185,12 @@ impl<P: Providers> AutoClusterFailover<P> {
     }
 
     /// Spawn the background prober on the [`moonpool_core::TaskProvider`]
-    /// carried by `providers`. Returns the [`tokio::task::JoinHandle`] the
-    /// task provider produces so the caller can abort it (typically on
-    /// client shutdown).
+    /// carried by `providers`. Returns a [`FailoverProbeHandle`]; call
+    /// [`FailoverProbeHandle::abort`] or drop it to stop the prober on client
+    /// shutdown. moonpool main's [`TaskProvider::JoinHandle`] has no
+    /// `abort()`, so the handle carries an explicit cooperative-stop signal
+    /// rather than relying on task cancellation (which would otherwise leak
+    /// the infinite prober loop until runtime teardown).
     ///
     /// The prober sleeps for `interval` between ticks via
     /// [`moonpool_core::TimeProvider::sleep`]; on every tick it probes each
@@ -200,22 +205,35 @@ impl<P: Providers> AutoClusterFailover<P> {
     ///
     /// `providers` is consumed by reference; the task provider's
     /// `spawn_task` clones the bits it needs.
-    pub fn start(&self, providers: &P, interval: Duration) -> tokio::task::JoinHandle<()> {
+    pub fn start(&self, providers: &P, interval: Duration) -> FailoverProbeHandle<P> {
         let urls = self.urls.clone();
         let probe = self.probe.clone();
         let active = self.active.clone();
         let time = providers.time().clone();
-        providers
+        let stop = Arc::new(Notify::new());
+        let stop_for_task = stop.clone();
+        let join = providers
             .task()
             .spawn_task("magnetar-moonpool-auto-cluster-failover", async move {
                 loop {
-                    // Sleep first — matches the tokio engine, which consumes its
-                    // immediate `interval.tick()` so the first probe runs on
-                    // tick 2. Under sim the sleep is virtual.
-                    if time.sleep(interval).await.is_err() {
-                        // The time provider shut down (sim run ending). Treat
-                        // it as a clean stop — nothing left to probe.
-                        return;
+                    // Park until whichever fires first: the cooperative stop
+                    // signal ([`FailoverProbeHandle`] aborted / dropped) or the
+                    // next tick. moonpool main removed task-level cancellation,
+                    // so this `Notify` is the only way to stop the otherwise
+                    // infinite prober. `biased` checks stop first so a stop that
+                    // races the tick wins. Sleeping first matches the tokio
+                    // engine (first probe runs on tick 2); under sim the sleep
+                    // is virtual.
+                    tokio::select! {
+                        biased;
+                        () = stop_for_task.notified() => return,
+                        slept = time.sleep(interval) => {
+                            // The time provider shut down (sim run ending).
+                            // Treat it as a clean stop — nothing left to probe.
+                            if slept.is_err() {
+                                return;
+                            }
+                        }
                     }
                     let deadline = Instant::now() + interval;
                     let mut new_active: Option<usize> = None;
@@ -223,7 +241,18 @@ impl<P: Providers> AutoClusterFailover<P> {
                         // Adapt the sans-io `poll_probe` into an async wait via
                         // `poll_fn` — the probe parks `cx.waker()` while pending
                         // and we get re-polled on completion. No channels.
-                        let healthy = poll_fn(|cx| probe.poll_probe(url, deadline, cx)).await;
+                        //
+                        // Race the stop signal here too: a custom `HealthProbe`
+                        // (or a sim probe waiting on virtual time) can stay
+                        // pending arbitrarily long, so without this arm an
+                        // `abort()`/drop mid-probe would not be observed until
+                        // the probe resolves — leaking the prober. `biased` so a
+                        // pending stop wins over a just-ready probe.
+                        let healthy = tokio::select! {
+                            biased;
+                            () = stop_for_task.notified() => return,
+                            healthy = poll_fn(|cx| probe.poll_probe(url, deadline, cx)) => healthy,
+                        };
                         if healthy {
                             new_active = Some(idx);
                             break;
@@ -244,7 +273,11 @@ impl<P: Providers> AutoClusterFailover<P> {
                     // supervisor's reconnect attempts will still try the
                     // unreachable URL; the next probe cycle reconsiders.
                 }
-            })
+            });
+        FailoverProbeHandle {
+            stop,
+            _join: join,
+        }
     }
 
     /// Snapshot the index of the currently-active URL. Mostly useful for
@@ -252,6 +285,47 @@ impl<P: Providers> AutoClusterFailover<P> {
     #[must_use]
     pub fn active_index(&self) -> usize {
         self.active.load(Ordering::Relaxed)
+    }
+}
+
+/// Handle to a running moonpool auto-failover prober (returned by
+/// [`AutoClusterFailover::start`]).
+///
+/// moonpool main's [`TaskProvider`] exposes no task-level abort, so the
+/// background prober — an otherwise infinite tick loop — is stopped
+/// *cooperatively*: [`Self::abort`], or simply dropping the handle, signals
+/// the loop to exit at its next tick/probe boundary. This mirrors the tokio
+/// engine, where aborting/dropping the returned `JoinHandle` ends the prober.
+/// Holding the handle keeps the prober running.
+pub struct FailoverProbeHandle<P: Providers> {
+    /// Single-cell stop signal. `notify_one` stores a permit, so a stop that
+    /// races the prober between ticks is still observed on the next
+    /// `notified()` rather than being lost.
+    stop: Arc<Notify>,
+    /// Keep-alive for the spawned task handle — detaches on drop; the task
+    /// itself exits once `stop` fires. Never polled here.
+    _join: <P::Task as TaskProvider>::JoinHandle,
+}
+
+impl<P: Providers> FailoverProbeHandle<P> {
+    /// Signal the prober to stop at its next tick/probe boundary. Idempotent.
+    pub fn abort(&self) {
+        self.stop.notify_one();
+    }
+}
+
+impl<P: Providers> Drop for FailoverProbeHandle<P> {
+    fn drop(&mut self) {
+        // The provider can't cancel the task, so dropping the handle stops the
+        // prober cooperatively. Idempotent with `abort()`.
+        self.stop.notify_one();
+    }
+}
+
+impl<P: Providers> std::fmt::Debug for FailoverProbeHandle<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailoverProbeHandle")
+            .finish_non_exhaustive()
     }
 }
 
@@ -366,30 +440,34 @@ impl<P: Providers> MoonpoolHealthProbe<P> {
         let endpoint_owned = endpoint.to_owned();
         let providers = self.providers.clone();
         let inflight = self.inflight.clone();
-        providers
-            .task()
-            .clone()
-            .spawn_task("magnetar-moonpool-health-probe", async move {
-                let verdict = run_probe::<P>(&providers, &endpoint_owned, deadline).await;
-                // Publish the verdict + wake whoever was parked. The slot
-                // value is kept until `poll_probe` drains it; the
-                // `inflight` map entry stays in place until then so the
-                // first re-poll observes the verdict and removes it.
-                let waker_opt = {
-                    let mut g = slot.lock();
-                    g.verdict = Some(verdict);
-                    g.waker.take()
-                };
-                if let Some(w) = waker_opt {
-                    w.wake();
-                }
-                // Belt-and-braces: if `poll_probe` raced our wake and never
-                // re-polled (e.g. its future was dropped), the slot will sit
-                // in `inflight` until the next call against this endpoint
-                // sees `verdict.is_some()` and clears it. That's fine — the
-                // map is bounded by the URL list length.
-                let _ = inflight; // silence unused-Arc lint
-            });
+        // Fire-and-forget: detach the probe task. moonpool main's
+        // `TaskProvider::JoinHandle` is a `must_use` future (it used to be a
+        // raw `tokio::task::JoinHandle`), so drop it explicitly.
+        let _detached =
+            providers
+                .task()
+                .clone()
+                .spawn_task("magnetar-moonpool-health-probe", async move {
+                    let verdict = run_probe::<P>(&providers, &endpoint_owned, deadline).await;
+                    // Publish the verdict + wake whoever was parked. The slot
+                    // value is kept until `poll_probe` drains it; the
+                    // `inflight` map entry stays in place until then so the
+                    // first re-poll observes the verdict and removes it.
+                    let waker_opt = {
+                        let mut g = slot.lock();
+                        g.verdict = Some(verdict);
+                        g.waker.take()
+                    };
+                    if let Some(w) = waker_opt {
+                        w.wake();
+                    }
+                    // Belt-and-braces: if `poll_probe` raced our wake and never
+                    // re-polled (e.g. its future was dropped), the slot will sit
+                    // in `inflight` until the next call against this endpoint
+                    // sees `verdict.is_some()` and clears it. That's fine — the
+                    // map is bounded by the URL list length.
+                    let _ = inflight; // silence unused-Arc lint
+                });
     }
 }
 
@@ -701,6 +779,10 @@ mod tests {
                 tokio::time::sleep(tick + Duration::from_millis(10)).await;
                 assert_eq!(f.active_index(), 0);
 
+                // Cooperatively stop the prober (moonpool main's
+                // `TaskProvider::JoinHandle` has no `abort()`, so the handle
+                // carries an explicit stop signal). Dropping it would do the
+                // same; `abort()` exercises the explicit path.
                 handle.abort();
             })
             .await;

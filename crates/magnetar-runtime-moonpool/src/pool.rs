@@ -140,12 +140,11 @@ impl<P: Providers> ProxyConnectionPool<P> {
                 let shared = existing.shared.clone();
                 drop(entries);
                 // Lost the race: tear down our half-built entry.
+                // `DriverHandle::abort()` is cooperative under moonpool main —
+                // it `close()`-es the connection and wakes the driver, which
+                // then runs its shutdown path and exits.
                 if let Some(handle) = entry.driver.lock().take() {
                     handle.abort();
-                }
-                {
-                    let mut conn = entry.shared.inner.lock();
-                    conn.close();
                 }
                 return Ok(shared);
             }

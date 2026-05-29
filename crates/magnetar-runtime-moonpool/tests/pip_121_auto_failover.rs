@@ -147,7 +147,11 @@ async fn probe_loop_flips_active_url_in_sync_with_scripted_verdicts() {
             tick("tick-5").await;
             assert_eq!(failover.active_index(), 1);
 
-            handle.abort();
+            // moonpool main's `TaskProvider::JoinHandle` is an opaque
+            // `must_use` future with no `abort()`; detaching the background
+            // prober is now a plain drop (the `LocalSet` tears the spawned
+            // task down when this future returns).
+            drop(handle);
         })
         .await;
 }

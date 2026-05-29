@@ -75,7 +75,11 @@ inside the byte-pipe).
 
 ## 2. moonpool — where we are today
 
-`moonpool-core` (vendored at `=0.6`) exposes a
+`moonpool-core` (temporarily tracking git `branch = "main"` to pick up
+the futures-io `TcpStream` + segment-granular `write_vectored` change
+ahead of a crates.io release —
+[ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md);
+re-pins to an exact `=x.y.z` once that release ships) exposes a
 [`Providers`](https://crates.io/crates/moonpool-core) trait bundle:
 
 | Provider | Production (`TokioProviders`) | Simulation (`SimProviders`) |

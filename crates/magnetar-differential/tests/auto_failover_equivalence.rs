@@ -136,6 +136,9 @@ async fn tokio_and_moonpool_observe_same_active_index_sequence() {
             );
 
             tokio_handle.abort();
+            // The moonpool engine's `FailoverProbeHandle` exposes a cooperative
+            // `abort()` (moonpool main's `TaskProvider::JoinHandle` has no
+            // task-level cancel), symmetric with the tokio handle above.
             moonpool_handle.abort();
         })
         .await;

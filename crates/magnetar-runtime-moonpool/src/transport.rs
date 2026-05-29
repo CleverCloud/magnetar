@@ -20,13 +20,14 @@
 //! [ADR-0006](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0006-moonpool-tls-byte-pipe.md).
 
 use std::io;
+use std::io::IoSlice;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use moonpool_core::{NetworkProvider, Providers};
 use rustls::ClientConnection;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::EngineError;
 use crate::dns::DnsResolver;
@@ -70,6 +71,25 @@ pub(crate) enum Transport<P: Providers> {
 }
 
 impl<P: Providers> Transport<P> {
+    /// Perform a single `poll_read` into `buf`, mirroring tokio's
+    /// `AsyncReadExt::read_buf` (which `futures::io::AsyncReadExt` does
+    /// not provide). One read, `0` == EOF, matching the single-`poll_read`
+    /// semantics the old `stream.read_buf(&mut buf)` calls relied on.
+    ///
+    /// The scratch is heap-allocated (not a `[u8; TLS_WIRE_BUFFER]` on the
+    /// stack) so the returned future doesn't carry a 16 KiB frame across
+    /// its `.await` — that tripped clippy's `large_futures` once this
+    /// helper got inlined into the handshake / read futures.
+    async fn read_into<S: futures::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        buf: &mut BytesMut,
+    ) -> io::Result<usize> {
+        let mut tmp = vec![0u8; TLS_WIRE_BUFFER];
+        let n = stream.read(&mut tmp).await?;
+        buf.extend_from_slice(&tmp[..n]);
+        Ok(n)
+    }
+
     /// Establish a plaintext connection to `addr` (a moonpool-format
     /// `host:port` string, NOT a `pulsar://` URL).
     ///
@@ -194,8 +214,7 @@ impl<P: Providers> Transport<P> {
             }
             // Pull more ciphertext off the wire.
             wire_buf.clear();
-            let n = stream
-                .read_buf(&mut wire_buf)
+            let n = Self::read_into(stream, &mut wire_buf)
                 .await
                 .map_err(EngineError::Io)?;
             if n == 0 {
@@ -248,7 +267,7 @@ impl<P: Providers> Transport<P> {
     /// decrypt failures (translated to [`io::ErrorKind::InvalidData`]).
     pub(crate) async fn read_buf(&mut self, buf: &mut bytes::BytesMut) -> io::Result<usize> {
         match self {
-            Self::Plain { stream } => stream.read_buf(buf).await,
+            Self::Plain { stream } => Self::read_into(stream, buf).await,
             Self::Tls {
                 stream,
                 adapter,
@@ -270,7 +289,7 @@ impl<P: Providers> Transport<P> {
                 //    drops.
                 loop {
                     let mut wire = BytesMut::with_capacity(TLS_WIRE_BUFFER);
-                    let read_n = stream.read_buf(&mut wire).await?;
+                    let read_n = Self::read_into(stream, &mut wire).await?;
                     if read_n == 0 {
                         return Ok(0);
                     }
@@ -321,6 +340,90 @@ impl<P: Providers> Transport<P> {
         }
     }
 
+    /// Write every segment in `segs` to the wire, preserving segment
+    /// boundaries on the Plain arm via real `write_vectored`. The bytes on
+    /// the wire are byte-identical to coalescing into one buffer — vectored
+    /// only skips the user-space coalesce memcpy. Mirrors the tokio engine's
+    /// `write_all_vectored` (ADR-0040 wave 2).
+    ///
+    /// # Errors
+    /// Propagates the underlying `AsyncWrite::poll_write_vectored` error and
+    /// rustls encryption failures (translated to [`io::ErrorKind::InvalidData`]).
+    /// A `write_vectored` returning `0` with a non-empty slice list surfaces
+    /// as [`io::ErrorKind::WriteZero`] so the driver doesn't spin.
+    pub(crate) async fn write_all_vectored(&mut self, segs: &[bytes::Bytes]) -> io::Result<()> {
+        match self {
+            Self::Plain { stream } => {
+                // Real segment-granular writev: moonpool's `SimTcpStream`
+                // records each `IoSlice` as its own ordered delivery event,
+                // so the chaos pack can drop / reorder at segment boundaries.
+                // `TokioProviders`' `Compat` stream lacks vectored
+                // forwarding and falls back to a single-buffer `poll_write`
+                // (still correct, just no syscall reduction).
+                let mut offsets: Vec<usize> = vec![0; segs.len()];
+                loop {
+                    let slices: Vec<IoSlice<'_>> = segs
+                        .iter()
+                        .zip(offsets.iter())
+                        .filter_map(|(seg, &off)| {
+                            let rest = &seg[off..];
+                            if rest.is_empty() {
+                                None
+                            } else {
+                                Some(IoSlice::new(rest))
+                            }
+                        })
+                        .collect();
+                    if slices.is_empty() {
+                        return Ok(());
+                    }
+                    let n = stream.write_vectored(&slices).await?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write_vectored returned 0 with non-empty IoSlice array",
+                        ));
+                    }
+                    let mut remaining = n;
+                    for (seg, off) in segs.iter().zip(offsets.iter_mut()) {
+                        let avail = seg.len().saturating_sub(*off);
+                        if avail == 0 {
+                            continue;
+                        }
+                        if remaining >= avail {
+                            *off = seg.len();
+                            remaining -= avail;
+                        } else {
+                            *off += remaining;
+                            remaining = 0;
+                            break;
+                        }
+                    }
+                    debug_assert_eq!(remaining, 0, "kernel reported more bytes than queued");
+                }
+            }
+            Self::Tls {
+                stream, adapter, ..
+            } => {
+                // TLS stays semantically contiguous: rustls owns its own
+                // record buffering, so segment boundaries cannot survive
+                // encryption. Push each segment's plaintext through the
+                // adapter, then ship the resulting ciphertext.
+                for seg in segs {
+                    adapter.push_plaintext(seg);
+                }
+                adapter
+                    .step()
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                let ciphertext = adapter.take_encrypted_outbound();
+                if !ciphertext.is_empty() {
+                    stream.write_all(&ciphertext).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Flush any buffered bytes. For TLS transports, also pumps any pending
     /// outbound ciphertext.
     ///
@@ -351,13 +454,13 @@ impl<P: Providers> Transport<P> {
     /// # Errors
     /// Propagates the underlying `AsyncWrite::poll_shutdown` error.
     pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
-        // The two arms look identical but resolve `shutdown` against different
-        // concrete types (`tokio::io::AsyncWriteExt::shutdown` on the moonpool
+        // The two arms look identical but resolve `close` against different
+        // concrete types (`futures::io::AsyncWriteExt::close` on the moonpool
         // `TcpStream` vs the `rustls`-wrapped stream) — clippy can't see that.
         #[allow(clippy::match_same_arms)]
         match self {
-            Self::Plain { stream } => stream.shutdown().await,
-            Self::Tls { stream, .. } => stream.shutdown().await,
+            Self::Plain { stream } => stream.close().await,
+            Self::Tls { stream, .. } => stream.close().await,
         }
     }
 }
@@ -430,5 +533,196 @@ mod tests {
         let (host, port) = split_host_port("broker:65535").expect("parse");
         assert_eq!(host, "broker");
         assert_eq!(port, 65535);
+    }
+
+    // =====================================================================
+    // ADR-0040 wave 2 — `Transport::write_all_vectored` Plain arm over a
+    // real `moonpool-sim` `SimTcpStream`. `Transport` is `pub(crate)`, so
+    // these live in-crate rather than under `tests/`. They drive the same
+    // `write_vectored` path the moonpool driver dispatches `TransmitOwned
+    // ::Vectored` through (ADR-0024 layer (c) for the moonpool engine), and
+    // exercise the offset-tracking short-count loop that the byte-identical
+    // e2e produce path can't deterministically hit.
+    // =====================================================================
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use bytes::Bytes;
+    use futures::io::{AsyncRead, AsyncWriteExt};
+    use moonpool_core::{NetworkProvider, TcpListenerTrait};
+    use moonpool_sim::providers::SimProviders;
+    use moonpool_sim::{NetworkConfiguration, SimWorld};
+
+    use super::Transport;
+
+    /// One non-blocking `poll_read` into `buf`, returning the byte count on
+    /// a `Ready(Ok(n>0))` and `None` otherwise. Mirrors the helper in
+    /// moonpool-sim's own `network/vectored.rs`.
+    fn try_read(server: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Option<usize> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(server).poll_read(&mut cx, buf) {
+            Poll::Ready(Ok(n)) if n > 0 => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Small multi-segment vectored write completes in a single
+    /// `poll_write_vectored` (the 64 KiB send buffer has room), and the sim
+    /// records each `IoSlice` as its own ordered delivery event — so the
+    /// server reads the segments back as distinct chunks in order. Proves
+    /// the Plain arm performs a *real* segment-granular writev, not a
+    /// coalescing fallback.
+    #[test]
+    fn write_all_vectored_plain_delivers_segments_in_order() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build current-thread runtime");
+
+        rt.block_on(async move {
+            let mut sim = SimWorld::new_with_network_config(NetworkConfiguration::fast_local());
+            let provider = sim.network_provider();
+            let addr = "vectored-segments";
+
+            let listener = provider.bind(addr).await.expect("bind");
+            let client_stream = provider.connect(addr).await.expect("connect");
+            let (mut server, _peer) = listener.accept().await.expect("accept");
+
+            let mut transport: Transport<SimProviders> = Transport::Plain {
+                stream: client_stream,
+            };
+
+            let segs = vec![
+                Bytes::from_static(b"AAAA"),
+                Bytes::from_static(b"BBBBBB"),
+                Bytes::from_static(b"CC"),
+            ];
+            let total: usize = segs.iter().map(Bytes::len).sum();
+            transport
+                .write_all_vectored(&segs)
+                .await
+                .expect("vectored write");
+
+            // Drain the sim, collecting each delivery event as a chunk.
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            while sim.pending_event_count() > 0 {
+                sim.step();
+                if let Some(n) = try_read(&mut server, &mut buf) {
+                    chunks.push(buf[..n].to_vec());
+                }
+            }
+
+            assert_eq!(
+                chunks,
+                vec![b"AAAA".to_vec(), b"BBBBBB".to_vec(), b"CC".to_vec()],
+                "each IoSlice must surface as its own ordered delivery event",
+            );
+            let reassembled: Vec<u8> = chunks.concat();
+            assert_eq!(reassembled.len(), total);
+        });
+    }
+
+    /// Segments whose combined length exceeds the sim's 64 KiB send buffer
+    /// force a short `write_vectored` (partial accept). The Plain arm's
+    /// offset-tracking loop must re-issue the writev for the unflushed tail
+    /// until every byte lands — and the reassembled stream on the server
+    /// must equal the concatenation of all segments, byte-for-byte.
+    #[test]
+    fn write_all_vectored_plain_handles_partial_accept() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build current-thread runtime");
+
+        rt.block_on(async move {
+            let mut sim = SimWorld::new_with_network_config(NetworkConfiguration::fast_local());
+            let provider = sim.network_provider();
+            let addr = "vectored-partial";
+
+            let listener = provider.bind(addr).await.expect("bind");
+            let client_stream = provider.connect(addr).await.expect("connect");
+            let (mut server, _peer) = listener.accept().await.expect("accept");
+
+            // Three segments totalling 96 KiB > the 64 KiB send buffer, so
+            // the first writev cannot accept everything and the loop must
+            // advance offsets across re-issues. Distinct fill bytes per
+            // segment let us assert the reassembled order.
+            let seg_len = 32 * 1024;
+            let segs = vec![
+                Bytes::from(vec![1u8; seg_len]),
+                Bytes::from(vec![2u8; seg_len]),
+                Bytes::from(vec![3u8; seg_len]),
+            ];
+            let mut expected: Vec<u8> = Vec::with_capacity(seg_len * 3);
+            for s in &segs {
+                expected.extend_from_slice(s);
+            }
+            let total = expected.len();
+
+            // The writer parks on backpressure once the 64 KiB buffer fills;
+            // it only completes as the server drains. Spawn it so the main
+            // task can step the sim + read concurrently. `SimTcpStream` is
+            // `Send`, so a plain `tokio::spawn` on the current-thread runtime
+            // works.
+            let done = Arc::new(AtomicBool::new(false));
+            let done_writer = done.clone();
+            let writer = tokio::spawn(async move {
+                transport_write_all_vectored(client_stream, segs).await;
+                done_writer.store(true, Ordering::SeqCst);
+            });
+
+            let mut received: Vec<u8> = Vec::with_capacity(total);
+            let mut buf = vec![0u8; 16 * 1024];
+            // Bounded loop: step the sim (which polls the parked writer and
+            // delivers buffered bytes), drain the server, repeat until the
+            // writer finished and every byte arrived. The cap guards against
+            // a regression that fails to make progress.
+            for _ in 0..100_000 {
+                if done.load(Ordering::SeqCst) && received.len() >= total {
+                    break;
+                }
+                sim.step();
+                tokio::task::yield_now().await;
+                while let Some(n) = try_read(&mut server, &mut buf) {
+                    received.extend_from_slice(&buf[..n]);
+                }
+            }
+
+            writer.await.expect("writer task joined");
+            assert_eq!(
+                received.len(),
+                total,
+                "partial-accept loop must flush every byte",
+            );
+            assert_eq!(
+                received, expected,
+                "reassembled stream must equal the segment concatenation",
+            );
+        });
+    }
+
+    /// Helper so the spawned writer owns a concrete `Transport::Plain`
+    /// without leaking the generic param into the closure capture.
+    async fn transport_write_all_vectored(
+        stream: <<SimProviders as moonpool_core::Providers>::Network as NetworkProvider>::TcpStream,
+        segs: Vec<Bytes>,
+    ) {
+        let mut transport: Transport<SimProviders> = Transport::Plain { stream };
+        transport
+            .write_all_vectored(&segs)
+            .await
+            .expect("vectored write (partial-accept)");
+        // Close so the server sees a clean EOF after the last byte.
+        let _ = AsyncWriteExt::close(&mut match transport {
+            Transport::Plain { stream } => stream,
+            Transport::Tls { .. } => unreachable!("constructed Plain"),
+        })
+        .await;
     }
 }
