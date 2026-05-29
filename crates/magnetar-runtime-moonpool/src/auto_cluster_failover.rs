@@ -212,9 +212,9 @@ impl<P: Providers> AutoClusterFailover<P> {
         let time = providers.time().clone();
         let stop = Arc::new(Notify::new());
         let stop_for_task = stop.clone();
-        let join = providers
-            .task()
-            .spawn_task("magnetar-moonpool-auto-cluster-failover", async move {
+        let join = providers.task().spawn_task(
+            "magnetar-moonpool-auto-cluster-failover",
+            async move {
                 loop {
                     // Park until whichever fires first: the cooperative stop
                     // signal ([`FailoverProbeHandle`] aborted / dropped) or the
@@ -273,11 +273,9 @@ impl<P: Providers> AutoClusterFailover<P> {
                     // supervisor's reconnect attempts will still try the
                     // unreachable URL; the next probe cycle reconsiders.
                 }
-            });
-        FailoverProbeHandle {
-            stop,
-            _join: join,
-        }
+            },
+        );
+        FailoverProbeHandle { stop, _join: join }
     }
 
     /// Snapshot the index of the currently-active URL. Mostly useful for

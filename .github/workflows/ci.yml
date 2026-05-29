@@ -18,8 +18,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings --cfg tokio_unstable"
-  RUSTDOCFLAGS: "-D warnings --cfg tokio_unstable"
+  RUSTFLAGS: "-D warnings --cfg tokio_unstable --cfg tracing_unstable"
+  RUSTDOCFLAGS: "-D warnings --cfg tokio_unstable --cfg tracing_unstable"
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 5
   CARGO_NET_GIT_FETCH_WITH_CLI: true
