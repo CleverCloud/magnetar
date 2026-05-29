@@ -150,7 +150,7 @@ These are the two explicit non-goals locked in
   `CommandSubscribe` wire field. Run via `cargo test -p magnetar-proto`.
 - **Runtime parity (ADR-0024)**: 5 tokio + 5 moonpool integration tests under
   `crates/magnetar-runtime-{tokio,moonpool}/tests/replicated_subscriptions.rs`
-  with identical names — verified by `cargo xtask check-runtime-test-parity`.
+  with identical names — verified by `cargo run -p xtask -- check-runtime-test-parity`.
 - **Differential**: 2 equivalence tests at
   `crates/magnetar-differential/tests/replicated_subscriptions_equivalence.rs`
   assert tokio ↔ moonpool produce the same `EventStream` + byte-identical

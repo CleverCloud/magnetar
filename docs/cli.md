@@ -24,7 +24,7 @@ The CLI exposes two forms, modeled on `sozu` and `systemd`:
 
   ```
   magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
-  built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.85.0 (…) · target=x86_64-unknown-linux-gnu
+  built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21
   os: linux · report bugs at https://github.com/CleverCloud/magnetar

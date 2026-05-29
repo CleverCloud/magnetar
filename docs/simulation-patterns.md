@@ -191,8 +191,8 @@ Two TigerBeetle patterns transfer cleanly to magnetar:
 
 1. **Assertion density** — `magnetar-proto::Connection` has many
    `Option::expect` / `unwrap` paths in tests but few `debug_assert!`
-   in production code. Doubling those would let `cargo xtask
-   check-sim-coverage` discover invariant violations the
+   in production code. Doubling those would let
+   `cargo run -p xtask -- check-sim-coverage` discover invariant violations the
    differential harness doesn't catch.
 2. **Pair assertions** — the in-flight publish snapshot
    accumulation (commit `0e47e14`) had a subtle bug: `reset()`
@@ -265,7 +265,7 @@ simulation surface, easily landed as separate ADRs + commits.
   — engine scope.
 - [`ADR-0024`](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)
   — four-layer test policy + 1:1 runtime parity.
-- [`ADR-0026 §D2`](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md#d2-vendor-moonpool-sim-into-the-workspace)
+- [`ADR-0026 §D2`](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md#d2--wire-moonpool-sim-option-1-pure-sim-chaos-suite--converged)
   — chaos pack scope.
 - [`ADR-0036`](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)
   — daily 16-random-seed CI policy.

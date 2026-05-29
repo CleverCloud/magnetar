@@ -47,7 +47,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0029](adr/0029-sasl-kerberos-gssapi-scope.md) | SASL Kerberos / GSSAPI binding: libgssapi behind `kerberos` feature, AUTH_CHALLENGE continuation via existing `respond_to_challenge`, Dockerised KDC fixture | Accepted (landed ahead of v0.2.0) |
 | [0030](adr/0030-athenz-zts-round-trip-scope.md) | v0.2.0 scope for Athenz ZTS round-trip: reqwest-backed ZTS client with expiry-aware caching, Dockerised ZTS fixture | Superseded by ADR-0041 |
 | [0031](adr/0031-pip-460-scalable-subscription-scope.md) | v0.2.0 scope for PIP-460 scalable subscription model — wire-protocol delta, sans-io additions, test plan | Accepted (scaffold landed 2026-05-28; e2e deferred until a Pulsar 5.0 RC ships PIP-460) |
-| [0032](adr/0032-pip-466-v5-client-surface-scope.md) | v0.2.0 scope for PIP-466 V5 client surface — API-shape decision (no wire change); rename evaluation | Accepted (engine-generic V5 lifted 2026-05-28 via docs/follow-ups.md §2) |
+| [0032](adr/0032-pip-466-v5-client-surface-scope.md) | v0.2.0 scope for PIP-466 V5 client surface — API-shape decision (no wire change); rename evaluation | Accepted (engine-generic V5 lifted 2026-05-28) |
 | [0033](adr/0033-pip-180-shadow-topic-scope.md) | v0.2.0 scope for PIP-180 shadow topic — producer-side `CommandSend.message_id` propagation, consumer-side `MessageReceivedFromShadow` event, admin REST (`createShadowTopic` / `deleteShadowTopic` / `getShadowTopics`) | Accepted (landed in v0.2.0) |
 | [0034](adr/0034-pip-33-replicated-subscriptions-scope.md) | v0.2.0 scope for PIP-33 replicated subscriptions — snapshot markers + `CommandReplicatedSubscriptionSnapshot{Request,Response}` | Accepted (landed in v0.2.0) |
 | [0035](adr/0035-pluggable-crypto-provider.md) | Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) — amends ADR-0005 openssl ban via `deny.toml` `wrappers = ["rustls-openssl"]` carve-out | Accepted |
@@ -84,6 +84,6 @@ the **implementation map** that turns the decision into a landed PR: wire
 delta, sans-io additions, runtime ports, four-layer test plan, e2e plan.
 
 See [`proposals/README.md`](proposals/README.md) for the index. The v0.2.0
-wave currently has two open proposals (PIP-460, PIP-466); the PIP-180 and
-PIP-33 proposals were folded back into their ADRs (0033, 0034) once the
-work landed — see each ADR's "Implementation footprint" section.
+proposal set covers PIP-460 and PIP-466; the PIP-180 and PIP-33 proposals
+were folded back into their ADRs (0033, 0034) once the work landed — see
+each ADR's "Implementation footprint" section.

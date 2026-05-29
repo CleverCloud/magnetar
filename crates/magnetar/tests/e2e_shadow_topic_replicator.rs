@@ -411,17 +411,16 @@ async fn e2e_v4_replicator_role_can_assert_source_message_id()
     }
 
     // Create the shadow topic over the source via the in-container
-    // `pulsar-admin`. We do NOT use the magnetar `AdminClient`'s
-    // `create_shadow_topic` here: Pulsar 4.0.4's
-    // `PUT .../{source}/shadowTopics` endpoint deserialises the body as a
-    // bare `List<String>`, but the admin client sends a
-    // `{"shadowTopics":[...]}` JSON object — the broker rejects with HTTP
-    // 400 "Cannot deserialize value of type java.util.ArrayList<...> from
-    // Object value". That admin-client wire-shape mismatch is filed as a
-    // follow-up (docs/follow-ups.md); it is orthogonal to the PIP-180
-    // replicator-side contract this test pins, so we route around it via
-    // the broker's own CLI (which always sends the shape the broker
-    // expects).
+    // `pulsar-admin`, keeping this replicator-contract test independent of
+    // the magnetar `AdminClient` surface. Historical note: this route was
+    // originally a workaround for an `AdminClient::create_shadow_topic`
+    // wire-shape bug — it sent a `{"shadowTopics":[...]}` JSON object where
+    // Pulsar 4.0.4's `PUT .../{source}/shadowTopics` endpoint expects a bare
+    // `List<String>` (the broker rejected with HTTP 400 "Cannot deserialize
+    // value of type java.util.ArrayList<...> from Object value"). That bug
+    // has since been fixed (the admin client now sends a bare JSON array),
+    // so the CLI route is a deliberate simplification rather than a
+    // necessity.
     let create_shadow = container
         .exec(
             ExecCommand::new([

@@ -85,9 +85,9 @@ client at v0.1.0.
   SASL `PLAIN` (RFC 4616, working), SASL Kerberos / GSSAPI via `libgssapi`
   under the `auth-sasl-kerberos` feature (working — multi-round
   `AUTH_CHALLENGE` initiate loop), Athenz with a pre-fetched role token
-  (`AthenzProvider::with_role_token`, working). The Athenz ZTS round-trip
-  still returns `AuthError::Unsupported` and is deferred to v0.2.0 per
-  [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
+  (`AthenzProvider::with_role_token`, working), and the opt-in Athenz ZTS
+  round-trip (`auth-athenz-zts`, working via `AthenzProvider::with_default_signer`
+  or a custom `zts::JwtSigner` / `zts::ZtsClient`).
 - **Trackers**: ack grouping, unacked-message tracker (ack timeout +
   redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff`
   (PIP-37), batch-index ACK set (PIP-54).
@@ -119,8 +119,12 @@ The default feature set enables the tokio engine. The feature flags catalog:
 | `auth-sasl` | no | Pulls in `magnetar-auth-sasl` (SASL PLAIN + the sans-io Kerberos surface). |
 | `auth-sasl-kerberos` | no | Implies `auth-sasl` and turns on `magnetar-auth-sasl/kerberos`, which binds `libgssapi`. Build host needs the MIT KRB5 / Heimdal headers (`krb5-devel` / `libkrb5-dev`) **and** `libclang` (`clang-libs` / `libclang-dev`) — `libgssapi-sys` runs `bindgen` at build time. See [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | `auth-athenz` | no | Pulls in `magnetar-auth-athenz`. |
+| `auth-athenz-zts` | no | Implies `auth-athenz` and turns on the reqwest-backed ZTS exchange plus in-tree JWT signer support. |
 | `encryption` | no | Pulls in `magnetar-messagecrypto` plus the PIP-4 bridge type. |
 | `e2e` | no | Implies `tokio` + `admin`; flips on the `testcontainers`-backed end-to-end suite (requires Docker). |
+| `e2e-multi-cluster` | no | Implies `e2e`; enables the slower replicated-subscription two-cluster fixture. |
+| `experimental-v5-client` | no | Enables the PIP-466 V5 wrapper surface (`magnetar::v5`) over the v4 wire commands. |
+| `scalable-topics` | no | Enables the experimental PIP-460 scalable-topic scaffold (`topic://`, DAG watch, StreamConsumer, `topic-info`). |
 | `crypto-aws-lc-rs` | yes | rustls crypto provider: `aws-lc-rs`; brings post-quantum hybrid KEX (X25519MLKEM768). See [TLS crypto provider](#tls-crypto-provider). |
 | `crypto-ring` | no | rustls crypto provider: `ring`. |
 | `crypto-openssl` | no | rustls crypto provider: `rustls-openssl` (wraps system OpenSSL via `deny.toml` carve-out). |
@@ -172,8 +176,8 @@ cargo build -p magnetar --no-default-features --features tokio,crypto-fips      
 
 Under `cargo build --workspace --all-features` the compile-time cfg
 cascade resolves to aws-lc-rs (highest priority). Single-provider builds
-go through `cargo xtask check-crypto-matrix`. A single `compile_error!`
-fires if no `crypto-*` feature is enabled.
+go through `cargo run -p xtask -- check-crypto-matrix`. A single
+`compile_error!` fires if no `crypto-*` feature is enabled.
 
 The `crypto-aws-lc-rs` default picks up rustls 0.23's built-in
 `prefer-post-quantum` feature, so the wire client negotiates the
@@ -195,7 +199,7 @@ banner:
 ```
 $ magnetar --version
 magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
-built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.85.0 (…) · target=x86_64-unknown-linux-gnu
+built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
 os: linux · report bugs at https://github.com/CleverCloud/magnetar
@@ -695,42 +699,22 @@ known-missing feature.
 ### Open structural gaps
 
 - **Moonpool engine parity.** v0.1.0 Java parity is satisfied by
-  the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
-  Transactions (PIP-31), Reader, and typed schemas (via
-  `TypedProducer<S, P>` / `TypedConsumer<S, C>`) now ride on
-  `impl<E: Engine + ...> PulsarClient<E>` per ADR-0026 §D1 + the
-  ConsumerApi/ProducerApi + SubscribeApi/CreateProducerApi
-  extension traits, and work on both engines.
-  **MultiTopicsConsumer**, **PartitionedConsumer** (a type alias
-  for MultiTopicsConsumer), and **PatternConsumer** (PIP-145)
-  have now landed pass-2: `MultiTopicsConsumer<C>` /
-  `PatternConsumer<C>` are engine-generic via the
-  `ConsumerApi` trait (extended with the pass-1 helper methods,
-  `pause`/`resume`, `seek_to_message`/`seek_to_timestamp`, and
-  the DLQ/retry helpers backed by a matched
-  `type Producer: ProducerApi`); the matching
-  `MultiTopicsConsumerBuilder<'a, E>` /
-  `PartitionedConsumerBuilder<'a, E>` /
-  `PatternConsumerBuilder<'a, E>` route `.subscribe()` through
-  the engine-generic `ConsumerBuilder` (which dispatches via
-  `SubscribeApi`). Topic-list lookups +
-  `partitioned_topic_metadata` use the new `BrokerMetadataApi`
-  extension trait. The remaining façade entry-points still
-  bound to `PulsarClient<TokioEngine>` are
-  **partitioned_producer** and **TableView** (`table_view` /
-  `typed_table_view`; the inner `PartitionedProducer<P>` /
-  `TableView<C>` / `TypedTableView<S, C>` *types* do carry an
-  engine-generic parameter, but the builders + entry methods
-  still live in `impl PulsarClient<TokioEngine>`). See
-  [`docs/parity-status.md`](docs/parity-status.md) and
-  [`docs/follow-ups.md#per-surface-builder--impl-body-lifts`](docs/follow-ups.md#per-surface-builder--impl-body-lifts).
+  the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)),
+  but the façade's dependent surfaces are now engine-generic through
+  ADR-0026 §D1 extension traits. Producers, consumers, readers,
+  partitioned producer/consumer, multi-topics, pattern consumers,
+  TableView, transactions, and typed schema builders all dispatch through
+  `impl<E: Engine> PulsarClient<E>` where the selected runtime implements
+  the matching `*Api` trait. See [`docs/parity-status.md`](docs/parity-status.md).
 - **PIP-180 shadow topic** landed in v0.2.0 ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md),
   [`docs/shadow-topic.md`](docs/shadow-topic.md)).
 - **PIP-33 replicated subscriptions** landed in v0.2.0
   ([ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md),
   [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md)).
-- **PIP-460 scalable topics** + **PIP-466 V5 surface** are scoped for
-  v0.2.0.
+- **PIP-460 scalable topics** ship as an experimental scaffold behind
+  `scalable-topics`; e2e waits for a Pulsar 5.0 RC with PIP-460.
+- **PIP-466 V5 surface** ships as an experimental, engine-generic wrapper
+  behind `experimental-v5-client`.
 - **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616)
   under the default `auth-sasl` feature, and Kerberos/GSSAPI via
   `libgssapi` under the `auth-sasl-kerberos` feature. The
@@ -739,10 +723,9 @@ known-missing feature.
   layers drive a deterministic `ScriptedGssapiClient`; the e2e
   layer runs against a Dockerised KDC. See
   [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md).
-- **Athenz** ships `with_role_token` (use a pre-fetched ZTS role token
-  directly); the `new()` path that contacts ZTS itself returns
-  `AuthError::Unsupported`. Full ZTS/ZMS client is deferred to v0.2.0
-  per [ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D3.
+- **Athenz** ships both the pre-fetched role-token path and the opt-in
+  ZTS round-trip (`auth-athenz-zts`). Production-style ZMS+ZTS+certificate
+  bootstrap remains out of scope for the local fixture.
 
 ---
 
@@ -842,12 +825,10 @@ The v0.2.0 wave items already landed on `main`:
 - **Anti-thrash supervised reconnect policy** (opt-in,
   [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
-Open v0.2.0 wave items — **PIP-460** scalable topics, **PIP-466**
-V5 surface, and the **Athenz ZTS** round-trip — are still scoped per
-[ADR-0026](specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D3 and the per-PIP scope ADRs ([ADR-0030](specs/adr/0030-athenz-zts-round-trip-scope.md),
-[ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md),
-[ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md)).
+The current open v0.2.0 follow-ups are narrower: PIP-460 e2e waits for a
+Pulsar 5.0 RC, the moonpool git dependency waits for a release containing
+upstream PR #113, and a few simulation/test-harness gaps remain tracked in
+[`docs/follow-ups.md`](docs/follow-ups.md).
 
 ---
 
@@ -868,7 +849,8 @@ cargo test --workspace
 cargo deny check
 
 # Docs
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
+  cargo doc --workspace --all-features --no-deps
 ```
 
 End-to-end tests against a real broker (Docker required, runs `pulsar:4.0.4`):
@@ -880,9 +862,9 @@ cargo test --workspace --features e2e
 Additional `xtask` checks specific to the sans-io invariants:
 
 ```sh
-cargo xtask check-no-channels   # greps src/** for banned channel crates
-cargo xtask check-no-io-deps    # magnetar-proto must not depend on any I/O crate
-cargo xtask codegen --check     # asserts proto codegen has no drift
+cargo run -p xtask -- check-no-channels   # greps src/** for banned channel crates
+cargo run -p xtask -- check-no-io-deps    # magnetar-proto must not depend on any I/O crate
+cargo run -p xtask -- codegen --check     # asserts proto codegen has no drift
 ```
 
 ---

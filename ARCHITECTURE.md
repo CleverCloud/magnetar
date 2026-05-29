@@ -118,7 +118,7 @@ engines. The auth + messagecrypto crates are gated by feature flags on
 `magnetar-proto::Connection` is a synchronous state machine. It has **no
 sockets, no `tokio`, no `async`, no threads**, and **never reads its own
 clock**. The whole crate's [`Cargo.toml`] forbids I/O-bound dependencies
-— the rule is enforced by a `cargo xtask check-no-io-deps` step that
+— the rule is enforced by a `cargo run -p xtask -- check-no-io-deps` step that
 walks `cargo tree -p magnetar-proto -e features` and trips on `tokio`,
 `mio`, `socket2`, … ([GUIDELINES.md §I/O isolation](GUIDELINES.md#io-isolation)).
 
@@ -174,7 +174,7 @@ Two non-time sources of host-environment dependency remain in
    resolve `$ENV_VAR -> token text`. This is a one-shot bootstrap read,
    not on the state-machine hot path.
 
-A `cargo xtask check-no-internal-clock` step (planned) will treepunch
+A `cargo run -p xtask -- check-no-internal-clock` step treepunches
 the call graph for any new `Instant::now()` / `SystemTime::now()` /
 `uuid::new_v4` / `env::var` site introduced outside the documented
 leaks above.
@@ -221,7 +221,7 @@ ban is enforced three ways:
 1. `cargo deny check bans` rejects the crates outright in CI.
 2. `clippy.toml`'s `disallowed-types` covers `tokio::sync::mpsc::*` and
    friends so even an accidental local import trips a lint.
-3. `cargo xtask check-no-channels` greps the entire source tree for
+3. `cargo run -p xtask -- check-no-channels` greps the entire source tree for
    `::mpsc`, `::broadcast`, `::watch`, `::oneshot` paths as a final
    belt-and-braces.
 
@@ -1201,7 +1201,7 @@ a marker trait selecting per-engine storage; engine-specific methods
 live in concrete `impl PulsarClient<TokioEngine>` /
 `impl PulsarClient<MoonpoolEngine<P>>` blocks rather than on the trait
 ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md);
-source: [`crates/magnetar/src/engine.rs`](crates/magnetar/src/engine.rs)).
+source: [`crates/magnetar/src/engine/mod.rs`](crates/magnetar/src/engine/mod.rs)).
 
 ### Per-surface extension traits (ADR-0026 §D1)
 
@@ -1575,8 +1575,8 @@ The schema is advertised on `CommandProducer.schema` /
 | PIP-34 / 119 / 282 / 379 | Key_Shared family | ✅ | `magnetar_proto::KeySharedConfig` + builder routing |
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
 | PIP-409 | DLQ + retry-letter polish | ✅ | DLQ + reconsume_later wiring |
-| PIP-460 | Scalable topics | ❌ | v0.2.0 wave open (upstream `Draft`; targets Pulsar 5.0 LTS) — see [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md) + [`specs/proposals/pip-460-scalable-topics.md`](specs/proposals/pip-460-scalable-topics.md) |
-| PIP-466 | V5 client API surface | ❌ | v0.2.0 wave open (upstream design-phase; thin skin over v4 wire) — see [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md) + [`specs/proposals/pip-466-v5-client-surface.md`](specs/proposals/pip-466-v5-client-surface.md) |
+| PIP-460 | Scalable topics | 🟡 | Experimental scaffold behind `feature = "scalable-topics"`; e2e deferred until a Pulsar 5.0 RC ships PIP-460. See [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md) + [`docs/scalable-topics.md`](docs/scalable-topics.md) |
+| PIP-466 | V5 client API surface | ✅ | Experimental, engine-generic wrapper behind `feature = "experimental-v5-client"`; no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md) + [`docs/v5-client.md`](docs/v5-client.md) |
 | PIP-180 | Shadow topic | ✅ | v0.2.0 — admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
 | PIP-415 | `getMessageIdByIndex` | ✅ | `crates/magnetar-admin/src/lib.rs::AdminClient::topic_get_message_id_by_index` — REST-only ([PIP-415 spec](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) leaves "Binary protocol" empty; canonical impl [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin/broker/CLI only) |
 | PIP-33 | Replicated subscriptions | ✅ | v0.2.0 — `ConsumerBuilder::replicate_subscription_state(bool)` on the façade flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
@@ -1644,16 +1644,16 @@ cargo clippy --workspace --all-features -- -D warnings
 cargo +nightly fmt --check
 cargo test --workspace
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
   cargo doc --no-deps --all-features --workspace --locked
 ```
 
 ### When touching `magnetar-proto`
 
 ```sh
-cargo xtask check-no-channels   # greps src/** for banned channel paths
-cargo xtask check-no-io-deps    # asserts magnetar-proto has no I/O deps
-cargo xtask codegen --check     # asserts proto codegen has no drift
+cargo run -p xtask -- check-no-channels   # greps src/** for banned channel paths
+cargo run -p xtask -- check-no-io-deps    # asserts magnetar-proto has no I/O deps
+cargo run -p xtask -- codegen --check     # asserts proto codegen has no drift
 ```
 
 ### Workspace lints

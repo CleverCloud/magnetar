@@ -21,10 +21,10 @@ and whether the target is gated behind a feature flag or `#[ignore]`.
 # - `crypto-fips` (native FIPS toolchain isn't universally available);
 # - `auth-sasl-kerberos` (needs `libkrb5-dev` + `libclang-dev` for
 #   `libgssapi-sys`).
-# `cargo xtask check-crypto-matrix` covers FIPS exhaustively in CI;
+# `cargo run -p xtask -- check-crypto-matrix` covers FIPS exhaustively in CI;
 # the GSSAPI provider is exercised by the `e2e_sasl_kerberos.rs`
 # Docker e2e test (see [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
-FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,crypto-aws-lc-rs"
 
 # Unit + integration (no broker, no Docker).
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
@@ -55,7 +55,7 @@ cargo test --workspace --features e2e -- --include-ignored
 
 Contributors with a FIPS toolchain installed locally can substitute
 `--all-features` for `--no-default-features --features "$FEATURES"`
-above. `cargo xtask check-crypto-matrix` is the authoritative
+above. `cargo run -p xtask -- check-crypto-matrix` is the authoritative
 per-provider sweep regardless.
 
 The validation chain documented in

@@ -276,7 +276,7 @@ for the chaos pack via the git `main` float —
 [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)), so
 the remaining obstacle to swapping the runner's provider bundle is the
 `TaskProvider` `Send`-bound issue, not the dependency itself — tracked in
-[`follow-ups.md` §9](follow-ups.md#9-differential-runner-plain-tokiospawn-restructure).
+[`follow-ups.md` §4](follow-ups.md#4-differential-runner-send-bound-spawn-restructure).
 The harness still exercises the engine surface that diverges between
 tokio and moonpool (memory-limit policy plumbing, future shapes, generic
 bounds) which is the load-bearing part for equivalence.
@@ -295,7 +295,7 @@ The harness ships per [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-par
 M8. The remaining structural caveat — the moonpool runner's
 `spawn_local` driver requires a 25 ms `Kicker` to bridge the
 `LocalSet` pump gap — is tracked in
-[`follow-ups.md` §9](follow-ups.md#9-differential-runner-plain-tokiospawn-restructure)
+[`follow-ups.md` §4](follow-ups.md#4-differential-runner-send-bound-spawn-restructure)
 and closes once the upstream `TaskProvider` gains a `Send`-bound spawn
 entry point.
 

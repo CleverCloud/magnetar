@@ -19,7 +19,7 @@ crates/
   magnetar-messagecrypto/         PIP-4 AES-GCM (aws-lc-rs)
   magnetar-auth-oauth2/           ClientCredentialsFlow + token caching
   magnetar-auth-sasl/             SASL PLAIN + Kerberos/GSSAPI (libgssapi behind `kerberos` feature)
-  magnetar-auth-athenz/           Athenz pre-fetched role token (ZTS round-trip deferred)
+  magnetar-auth-athenz/           Athenz role-token auth + optional ZTS round-trip
   magnetar-differential/          tokio ↔ moonpool differential equivalence harness (test-only)
 xtask/                            Workspace automation (check-no-channels, check-no-io-deps, check-no-internal-clock, codegen)
 ```
@@ -50,12 +50,12 @@ has a corresponding ADR.
 
 | Invariant | ADR | Enforcement |
 | --- | --- | --- |
-| `magnetar-proto` has zero I/O deps | [ADR-0004](../specs/adr/0004-sans-io-protocol-core.md) | `cargo xtask check-no-io-deps` |
-| No channel crates anywhere | [ADR-0003](../specs/adr/0003-no-channels-rule.md) | `cargo xtask check-no-channels` + `clippy.toml::disallowed-types` + `cargo deny bans` |
-| `magnetar-proto` does not read the host clock | [ADR-0011](../specs/adr/0011-clock-injection-sans-io.md) | `cargo xtask check-no-internal-clock` |
-| Generated proto code stays in lockstep with the vendored `.proto` | [ADR-0004](../specs/adr/0004-sans-io-protocol-core.md) | `cargo xtask codegen --check` |
+| `magnetar-proto` has zero I/O deps | [ADR-0004](../specs/adr/0004-sans-io-protocol-core.md) | `cargo run -p xtask -- check-no-io-deps` |
+| No channel crates anywhere | [ADR-0003](../specs/adr/0003-no-channels-rule.md) | `cargo run -p xtask -- check-no-channels` + `clippy.toml::disallowed-types` + `cargo deny bans` |
+| `magnetar-proto` does not read the host clock | [ADR-0011](../specs/adr/0011-clock-injection-sans-io.md) | `cargo run -p xtask -- check-no-internal-clock` |
+| Generated proto code stays in lockstep with the vendored `.proto` | [ADR-0004](../specs/adr/0004-sans-io-protocol-core.md) | `cargo run -p xtask -- codegen --check` |
 | `rustls` only (openssl admitted only via `rustls-openssl`) | [ADR-0005](../specs/adr/0005-rustls-only-tls.md) amended by [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) | `deny.toml` bans `native-tls`; `openssl` / `openssl-sys` scoped via `wrappers = ["rustls-openssl"]` |
-| Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) | [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) | `cargo xtask check-crypto-matrix` + cfg-cascade `compile_error!` |
+| Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) | [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) | `cargo run -p xtask -- check-crypto-matrix` + cfg-cascade `compile_error!` |
 
 The clock-injection check has two documented leak sites in
 [`crates/magnetar-proto`](../crates/magnetar-proto): the PIP-37
@@ -70,7 +70,7 @@ allowlisted in `xtask/src/main.rs::CLOCK_LEAK_ALLOWLIST` and listed in
 
 `PulsarClient<E: Engine = TokioEngine>` is generic over an `Engine`
 marker trait that selects per-engine storage
-([`crates/magnetar/src/engine.rs`](../crates/magnetar/src/engine.rs)).
+([`crates/magnetar/src/engine/mod.rs`](../crates/magnetar/src/engine/mod.rs)).
 Two engines ship:
 
 - `TokioEngine` — production default. Pulls in `tokio` +
@@ -90,10 +90,12 @@ typing or reintroduce per-engine duplication
 ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)
 §"Option B rejected").
 
-The façade surface that lives on `PulsarClient<TokioEngine>` only
-(partitioned, multi-topics, pattern, reader, table-view, transactions,
-typed schemas) yields a clean compile error when called against
-`PulsarClient<MoonpoolEngine<P>>` rather than a silent fallback.
+Most user-facing builders and dependent surfaces live on the
+engine-generic `impl<E: Engine> PulsarClient<E>` block and dispatch
+through per-surface extension traits (`SubscribeApi`, `CreateProducerApi`,
+`BrokerMetadataApi`, `TransactionApi`, `ProducerApi`, `ConsumerApi`).
+Tokio-only helper methods still yield a clean compile error when called
+against `PulsarClient<MoonpoolEngine<P>>` rather than a silent fallback.
 
 ## Driver loop
 

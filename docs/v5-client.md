@@ -8,7 +8,7 @@ a thin wrapper around the v4 wire commands, with V5-shaped types
 caller-facing builders.
 
 Locked by [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)
-(Proposed). See [`docs/parity-status.md`](parity-status.md) for the
+(Accepted). See [`docs/parity-status.md`](parity-status.md) for the
 parity-matrix row.
 
 ## When to use V5
@@ -31,8 +31,9 @@ parity-matrix row.
   transactions. Stay on the v4 surface; the V5 wrapper exposes
   `v4()` if you need a mixed setup.
 - You're shipping to production with strict surface-stability
-  requirements. V5 is experimental until ADR-0032 flips to Accepted
-  and the parity-matrix row to ✅ default-on.
+  requirements. V5 is still default-off behind
+  `experimental-v5-client` even though ADR-0032 is Accepted and the
+  parity-matrix row is ✅.
 
 ## Enable the feature
 
@@ -171,7 +172,7 @@ assert that V5 builder calls translate to the expected v4
 
 Status snapshot — the parity-matrix row flipped from 🟡 experimental
 to ✅ on 2026-05-28 when ADR-0032 was Accepted alongside the unified
-engine-generic refactor (`docs/follow-ups.md` §2). The
+engine-generic refactor. The
 `experimental-v5-client` feature stays default-off; acceptance flips
 the matrix and unlocks moonpool-engine V5 usage, not the default-on
 flag.

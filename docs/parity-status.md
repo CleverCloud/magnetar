@@ -45,7 +45,7 @@ bundle. `TokioProviders` runs it against a real broker;
 `moonpool-sim`'s `SimProviders` runs it under deterministic seeds
 ([`moonpool-engine.md`](moonpool-engine.md)).
 
-**Six of seven dependent surfaces fully lifted** per ADR-0026 §D1
+**All dependent façade surfaces are lifted** per ADR-0026 §D1
 and now work on both engines:
 
 - **Transaction (PIP-31)** via the `TransactionApi` extension
@@ -78,11 +78,8 @@ struct *and* builder level:
 `TypedProducerBuilder<'a, S, E: Engine = TokioEngine>` /
 `TypedConsumerBuilder<'a, S, E: Engine = TokioEngine>` build via
 `E::ClientState: CreateProducerApi` / `SubscribeApi`. The
-remaining gap is at the **entry-point** level on `PulsarClient<E>`
-itself — `partitioned_producer`, `table_view`, and
-`typed_table_view` still live in `impl PulsarClient<TokioEngine>`
-rather than the engine-generic block (see
-[`follow-ups.md` §Per-surface builder + impl-body lifts](follow-ups.md#per-surface-builder--impl-body-lifts)).
+`partitioned_producer`, `table_view`, and `typed_table_view`
+entry-points are now in the engine-generic `PulsarClient<E>` block.
 
 The **base** `ConsumerBuilder<'a, E: Engine = TokioEngine>` /
 `ProducerBuilder<'a, E: Engine = TokioEngine>` /
@@ -132,7 +129,7 @@ Everything else with a `🟡` or `❌` in the README parity matrix is one of:
 | **Athenz (pre-fetched role token)** | ✅ landed | `AthenzProvider::with_role_token` uses the supplied token as the `auth_data` payload — useful when an out-of-band agent (`zts-agent`, sidecar) already mints the token. |
 | **Athenz (ZTS round-trip)** | ✅ landed (`feature = "auth-athenz-zts"`, default off; built-in signer behind `crypto-aws-lc-rs` / `crypto-ring`) | The pluggable `zts::ZtsClient` trait is the HTTPS seam — `zts::HttpZtsClient` does the reqwest-backed `POST /zts/v1/oauth2/token` (or legacy `n-token`) exchange — while `AthenzProvider` owns the `parking_lot`-guarded expiry-aware cache + the sans-io `ensure_role_token(now)` / `needs_refresh(now)` state machine ([ADR-0011](../specs/adr/0011-clock-injection-sans-io.md) clock injection; `wall_clock` makes the JWT `iat`/`exp` deterministic). JWT signing has two paths: (a) `jwt_signer::AwsLcRsSigner` / `jwt_signer::RingSigner` ship in-tree via `AthenzProvider::with_default_signer(config)`, gated on the crypto-provider matrix per [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md); or (b) a caller-supplied `zts::JwtSigner` / `zts::ZtsClient` via `AthenzProvider::builder()`. Parsed PKCS#8 DER wrapped in `zeroize::Zeroizing<…>`; byte-identical deterministic RS256 (RFC 8017 §8.2), cross-backend equivalence pinned by `ring::tests::cross_backend_signature_byte_identity`. **Full four-layer cross-runtime coverage** ([ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md), [ADR-0041](../specs/adr/0041-athenz-provider-testability-seams.md)): tokio (`athenz_zts_round_trip.rs`, real wiremock), moonpool (`athenz_refresh_edge.rs`, scripted `ZtsClient` + injected `now`), differential (`athenz_auth_data_equivalence.rs`, byte-identical JWT + auth_data), plus the e2e fixture in [`crates/magnetar/tests/e2e_athenz_zts.rs`](../crates/magnetar/tests/e2e_athenz_zts.rs) (three wiremock-stub tests + a Docker reachability probe against `athenz/athenz-zts-server:1.12.41`). The production-style ZMS+ZTS+cert-bootstrap topology stays deferred scope (would need the Athenz `make deploy-dev` 4-container stack as a shared CI fixture). |
 | **PIP-460** — Scalable topics | 🟡 experimental (v0.2.0, scaffold) | Behind `feature = "scalable-topics"` (default off). **No released Pulsar broker ships PIP-460 today** — upstream PIP is `Draft`, targets Pulsar 5.0 LTS. magnetar ships the **client-side scaffold**: hand-encoded wire commands (`CommandScalableTopicLookup` / `CommandSegmentDagWatch` / `CommandSegmentDagUpdate` + responses behind the feature gate until the 5.0 RC vendor bump), the `DagWatchSession` sans-io state machine (monotonic `update_seq`, split / merge / removal), the additive default-`None` `MessageId::segment_id` field (v4 wire byte-identical), both-engine `ScalableTopicsApi` impls, the `magnetar::scalable::StreamConsumer` surface (StreamConsumer-only, **drops on DAG change** — no transparent failover), and the `magnetar topic-info` CLI subcommand. Four-layer test set per [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md): proto unit + tokio + moonpool 1:1 + differential equivalence (golden trace `scalable_topic_drop_on_split.json`). E2E (`crates/magnetar/tests/e2e_scalable_topic.rs`) is `#[ignore]`'d behind `feature = "e2e,scalable-topics"` and **does not block the v0.2.0 release-cut** — it can only run once upstream cuts a 5.0 RC. QueueConsumer / CheckpointConsumer / controller-election / in-place repartition are v0.3.0+. See [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md) + [`docs/scalable-topics.md`](scalable-topics.md). |
-| **PIP-466** — V5 client surface | 🟡 experimental (v0.2.0) | Behind `feature = "experimental-v5-client"` (default off). Scaffold landed: `magnetar::v5` module exposes `PulsarClientV5` (v4 escape hatch via `v4()` / `into_v4()`), `v5::Producer` (thin wrapper, `Option<MessageId>` send return), `v5::StreamConsumer` (Exclusive / Failover), `v5::QueueConsumer` (Shared / `KeyShared`), and the `v5::mapping` field-translation table (`Duration` / `Option<Duration>` / `Option<usize>` ↔ v4 millis-as-`u64` / `usize`). No wire change, no sans-io change. Java V5 still iterating upstream — magnetar's surface targets Pulsar 4.x compatibility. See [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md). |
+| **PIP-466** — V5 client surface | ✅ experimental (v0.2.0, engine-generic) | Behind `feature = "experimental-v5-client"` (default off). `magnetar::v5` exposes `PulsarClientV5<E: Engine = TokioEngine>` (v4 escape hatch via `v4()` / `into_v4()`), `v5::Producer<E>`, `v5::StreamConsumer<E>` (Exclusive / Failover), `v5::QueueConsumer<E>` (Shared / `KeyShared`), and the `v5::mapping` field-translation table (`Duration` / `Option<Duration>` / `Option<usize>` ↔ v4 millis-as-`u64` / `usize`). Moonpool callers name `PulsarClientV5<MoonpoolEngine<P>>` directly. No wire change, no sans-io change. Java V5 still iterating upstream — magnetar's surface targets Pulsar 4.x compatibility. See [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md). |
 | **PIP-180** — Shadow topic | ✅ landed | v0.2.0 ([ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md), [`docs/shadow-topic.md`](shadow-topic.md)). Three admin REST methods (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` + `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. No proto bump. Caveat: source `MessageId` is client-asserted (broker validates write auth but does not prove the id is from a real source entry — upstream behaviour). The **replicator-side** path is exercised end-to-end by [`crates/magnetar/tests/e2e_shadow_topic_replicator.rs`](../crates/magnetar/tests/e2e_shadow_topic_replicator.rs) against a self-hosting single-cluster fixture (token auth + `replicator` role grant + in-container shadow create): it pins the broker's two orthogonal gates — authorisation (producer attach) and topic-type (`send_with_source_message_id` rejected with `code 22` on a regular topic, accepted on a shadow). See [`docs/shadow-topic.md` §Replicator-role e2e setup](shadow-topic.md#replicator-role-e2e-setup). |
 | **PIP-33** — Replicated subscriptions | ✅ landed (v0.2.0) | `ConsumerBuilder::replicate_subscription_state(bool)` flips `CommandSubscribe` field 14; receive-path filter drops `REPLICATED_SUBSCRIPTION_*` markers and emits `ConnectionEvent::ReplicatedSubscriptionMarkerObserved`. Snapshot generation stays broker-side per [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md). Two-cluster e2e runs weekly via [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml). Docs: [`docs/replicated-subscriptions.md`](replicated-subscriptions.md). |
 
@@ -160,28 +157,28 @@ Pick a routine feature subset that pulls in every magnetar facet
 EXCEPT two opt-in cells:
 
 - `crypto-fips` — needs a FIPS native build toolchain;
-  `cargo xtask check-crypto-matrix` covers it exhaustively in CI.
+  `cargo run -p xtask -- check-crypto-matrix` covers it exhaustively in CI.
 - `auth-sasl-kerberos` — needs `libkrb5-dev` + `libclang-dev` for
   `libgssapi-sys`; covered by the `e2e_sasl_kerberos.rs` Docker e2e
   per [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md).
 
 ```
-FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,crypto-aws-lc-rs"
 
 cargo +nightly fmt --all
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
   cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked
-cargo xtask check-no-channels         # ADR-0003
-cargo xtask check-no-io-deps          # ADR-0004
-cargo xtask check-no-internal-clock   # ADR-0011
-cargo xtask codegen --check
-cargo xtask check-sim-coverage        # ADR-0024 patch coverage
-cargo xtask check-runtime-test-parity # ADR-0024 1:1 runtime parity
-cargo xtask check-crypto-matrix       # ADR-0035 per-provider build matrix incl. FIPS
+cargo run -p xtask -- check-no-channels         # ADR-0003
+cargo run -p xtask -- check-no-io-deps          # ADR-0004
+cargo run -p xtask -- check-no-internal-clock   # ADR-0011
+cargo run -p xtask -- codegen --check
+cargo run -p xtask -- check-sim-coverage        # ADR-0024 patch coverage
+cargo run -p xtask -- check-runtime-test-parity # ADR-0024 1:1 runtime parity
+cargo run -p xtask -- check-crypto-matrix       # ADR-0035 per-provider build matrix incl. FIPS
 ```
 
 Contributors with a FIPS toolchain locally can substitute
@@ -190,7 +187,7 @@ Per-package invocations (`-p magnetar-runtime-tokio --features X`)
 need an explicit crypto feature because dependency features don't
 transitively activate under `-p`. See
 [ADR-0035](../specs/adr/0035-pluggable-crypto-provider.md) for the
-provider matrix and `cargo xtask check-crypto-matrix` for the
+provider matrix and `cargo run -p xtask -- check-crypto-matrix` for the
 authoritative per-provider build sweep.
 
 Behind `--features e2e`, the suite spins `apachepulsar/pulsar:4.0.4`

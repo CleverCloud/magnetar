@@ -12,26 +12,26 @@
 Before opening a PR:
 
 Pick a routine feature subset that pulls in every magnetar facet
-EXCEPT `crypto-fips` (the FIPS provider needs a native build
-toolchain that not every contributor has installed):
+EXCEPT `crypto-fips` and `auth-sasl-kerberos` (those need native FIPS /
+Kerberos toolchains that not every contributor has installed):
 
 ```
-FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,encryption,crypto-aws-lc-rs"
+FEATURES="tokio,moonpool,admin,auth-oauth2,auth-sasl,auth-athenz,auth-athenz-zts,encryption,experimental-v5-client,scalable-topics,crypto-aws-lc-rs"
 
 cargo +nightly fmt --check
 cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targets -- -D warnings
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
   cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked
-cargo xtask check-no-channels         # banned-channel grep (ADR-0003)
-cargo xtask check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
-cargo xtask check-no-internal-clock   # no host-clock reads in proto (ADR-0011)
-cargo xtask codegen --check           # proto codegen drift
-cargo xtask check-sim-coverage        # 100% moonpool patch coverage (ADR-0024)
-cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
-cargo xtask check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
+cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
+cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
+cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011)
+cargo run -p xtask -- codegen --check           # proto codegen drift
+cargo run -p xtask -- check-sim-coverage        # 100% moonpool patch coverage (ADR-0024)
+cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
+cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix incl. FIPS (ADR-0035)
 ```
 
 `check-crypto-matrix` exhaustively covers ALL providers — including
@@ -88,11 +88,11 @@ Edits on `main` are blocked by the global pre-edit hook.
 ## Updating the vendored Pulsar proto
 
 ```
-cargo xtask vendor-proto --rev <apache/pulsar commit SHA>
-cargo xtask codegen
+cargo run -p xtask -- vendor-proto --rev <apache/pulsar commit SHA>
+cargo run -p xtask -- codegen
 ```
 
-Then commit `crates/magnetar-proto/proto/PulsarApi.proto`, `PulsarMarkers.proto`, `SOURCE`, and the regenerated `crates/magnetar-proto/src/pb/*.rs`. CI's `codegen-drift` job runs `cargo xtask codegen --check` and fails if the generated files diverge from what is committed.
+Then commit `crates/magnetar-proto/proto/PulsarApi.proto`, `PulsarMarkers.proto`, `SOURCE`, and the regenerated `crates/magnetar-proto/src/pb/*.rs`. CI's `codegen-drift` job runs `cargo run -p xtask -- codegen --check` and fails if the generated files diverge from what is committed.
 
 ## Adding a dependency
 
