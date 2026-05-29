@@ -155,7 +155,7 @@ for seed in $(seq 1 32); do
     || { echo "seed $seed FAILED"; exit 1; }
 done
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable" \
+RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
   cargo doc --workspace --all-features --no-deps --locked
 cargo xtask check-no-channels         # banned-channel grep
 cargo xtask check-no-io-deps          # magnetar-proto = zero I/O deps
@@ -174,6 +174,15 @@ cargo test --workspace --features e2e -- --include-ignored
 
 The auto-format hook handles `cargo fmt` / `gofmt` / `ruff format` on
 edited files; lints and tests stay manual.
+
+The three heavy / diff-shaped xtask gates (`check-sim-coverage`,
+`check-runtime-test-parity`, `check-crypto-matrix`) are local-first but
+also run in CI via the scheduled
+[`.github/workflows/xtask-gates.yml`](.github/workflows/xtask-gates.yml)
+(daily cron + `workflow_dispatch`), which keeps per-PR
+[`ci.yml`](.github/workflows/ci.yml) fast. `check-sim-coverage` is a diff
+gate, so its scheduled `main` run short-circuits ("nothing to verify");
+dispatch it from a feature branch for real patch-coverage gating.
 
 ## Common slash workflows
 

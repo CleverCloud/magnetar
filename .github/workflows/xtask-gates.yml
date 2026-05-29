@@ -1,0 +1,120 @@
+name: xtask gates (scheduled)
+
+# The three xtask validation-chain gates that are too heavy or too
+# diff-shaped to gate every PR / push, but that CLAUDE.md / GUIDELINES.md
+# (ADR-0024, ADR-0035) require to be CI-enforced:
+#
+#   - check-runtime-test-parity : tokio <-> moonpool 1:1 test count (ADR-0024)
+#   - check-crypto-matrix       : per-provider build matrix incl. FIPS (ADR-0035)
+#   - check-sim-coverage        : 100% moonpool patch coverage on the diff (ADR-0024)
+#
+# They run daily on a cron (like the moonpool seed sweep, ADR-0036) and on
+# manual dispatch, keeping per-PR `ci.yml` fast.
+#
+# NOTE on check-sim-coverage: it is a *diff* gate (lines added relative to
+# `git merge-base origin/main HEAD`). On the scheduled run against `main`
+# that diff is empty, so it short-circuits with "nothing to verify" and
+# never builds the instrumented binaries. It only does real work on a
+# `workflow_dispatch` from a feature branch that touches the moonpool sim
+# surface. Per-PR / pre-merge patch-coverage gating remains the developer's
+# local validation chain (CLAUDE.md). The job is wired here so the gate has
+# a CI home and is dispatchable against any branch.
+#
+# Security note: no `github.event.*` inputs are interpolated anywhere in
+# this workflow.
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off-the-hour, and offset from the 03:17 seed sweep to
+    # avoid contention.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings --cfg tokio_unstable --cfg tracing_unstable"
+  RUSTDOCFLAGS: "-D warnings --cfg tokio_unstable --cfg tracing_unstable"
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 5
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  runtime-test-parity:
+    name: runtime-test-parity
+    # Greps the tokio + moonpool test-attribute counts; no build, no apt
+    # deps. Compiling the xtask binary itself does not need protoc (only
+    # `xtask codegen` does — see ci.yml's codegen-check job).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-runtime-test-parity
+
+  crypto-matrix:
+    name: crypto-matrix (per-provider incl. FIPS)
+    # 16 `cargo build` cells: facade x {aws-lc-rs,ring,openssl,fips} x
+    # {tokio, tokio+moonpool} plus the magnetar-auth-athenz signer matrix.
+    # The FIPS cells build aws-lc-fips-sys's C library, so reclaim runner
+    # disk like the test / e2e jobs do.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-crypto-matrix
+
+  sim-coverage:
+    name: sim-coverage (moonpool patch coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # fetch-depth: 0 + an explicit fetch of origin/main so the xtask's
+      # `git merge-base origin/main HEAD` resolves. On the scheduled `main`
+      # run the merge-base is HEAD, so the check short-circuits.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
+      # check-sim-coverage runs `cargo llvm-cov --all-features` over the
+      # moonpool + differential crates, which builds aws-lc-fips-sys under
+      # coverage instrumentation; reclaim disk like the heavy build jobs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          tool-cache: false
+          swap-storage: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # --all-features can transitively pull libgssapi (auth-sasl-kerberos);
+      # install the MIT KRB5 / libclang headers like the other --all-features
+      # jobs. Harmless if the coverage build does not reach it.
+      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-sim-coverage

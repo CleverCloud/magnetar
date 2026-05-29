@@ -18,3 +18,13 @@
 
 [build]
 rustflags = ["--cfg", "tokio_unstable", "--cfg", "tracing_unstable"]
+
+# `cargo xtask <cmd>` shorthand used throughout CLAUDE.md / GUIDELINES.md /
+# docs (check-no-channels, check-no-io-deps, check-no-internal-clock,
+# codegen, check-sim-coverage, check-runtime-test-parity,
+# check-crypto-matrix). Without this alias the commands fail with
+# "no such subcommand: xtask" (there is no `cargo-xtask` binary). CI uses
+# the explicit `cargo run --manifest-path xtask/Cargo.toml --` form, so it
+# does not depend on this alias.
+[alias]
+xtask = "run --package xtask --"
