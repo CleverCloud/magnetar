@@ -11,7 +11,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -19,8 +19,8 @@ use magnetar_proto::types::CompressionKind;
 use magnetar_proto::{CreateProducerRequest, MessageId, pb};
 use magnetar_runtime_tokio::Producer;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
+use crate::auto_update_task::{AutoUpdateTask, spawn_auto_update_task};
 use crate::client::{OutgoingMessage, PulsarError};
 use crate::{Engine, PulsarClient, TokioEngine};
 
@@ -289,125 +289,6 @@ pub struct PartitionedProducer<P: crate::ProducerApi = Producer> {
     /// [`Self::refresh_partitions`]. Dropping the [`PartitionedProducer`] aborts the
     /// task.
     auto_update: Option<Arc<AutoUpdateTask>>,
-}
-
-/// Background partition-watcher (Java parity:
-/// `ProducerBuilder#autoUpdatePartitionsInterval`).
-///
-/// Spawned by [`PartitionedProducerBuilder::create`] when the builder records a
-/// non-zero interval via
-/// [`PartitionedProducerBuilder::auto_update_partitions_interval`]. The spawned task
-/// is a pure timer that signals [`Self::changed`] every `interval`; the actual
-/// `PulsarClient::partitions_for_topic` call is driven by user code via
-/// [`PartitionedProducer::refresh_partitions`] (the crate-wide
-/// `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into a
-/// `'static` spawn).
-///
-/// Lifetime is bounded by the [`PartitionedProducer`]: dropping the producer drops
-/// the `Arc<AutoUpdateTask>`, which aborts the spawned tokio task in [`Drop`]. No
-/// channels — coordination is `Arc<Mutex<...>>` + [`tokio::sync::Notify`] +
-/// [`tokio::time::interval`] (per the project's "no channels in Rust async code"
-/// policy).
-#[derive(Debug)]
-struct AutoUpdateTask {
-    /// Base topic the producer was created against. Reused by
-    /// [`PartitionedProducer::refresh_partitions`] so callers don't have to remember
-    /// it.
-    topic: String,
-    /// Last partition count observed by the watcher. Seeded with the count discovered
-    /// at create time. Updated by [`PartitionedProducer::refresh_partitions`] when
-    /// called.
-    observed_partitions: Arc<AtomicU32>,
-    /// Monotonic counter of "partition count changed" events. Useful for tests and
-    /// "did anything change since I last looked?" probes. Bumped by
-    /// [`PartitionedProducer::refresh_partitions`] when a different count is observed.
-    change_count: Arc<AtomicU64>,
-    /// Signalled every time the internal timer fires, and every time
-    /// [`PartitionedProducer::refresh_partitions`] detects a real partition-count
-    /// change.
-    changed: Arc<Notify>,
-    /// Signalled on drop to cooperatively wake the loop sleeping on [`Notify`] so it
-    /// can notice it has been aborted promptly. The `handle.abort()` is the source of
-    /// truth; the notify is only there to short-circuit a long `tick().await`.
-    shutdown: Arc<Notify>,
-    /// The spawned task. Held in a [`tokio::sync::Mutex`] so [`Drop`] can take it on
-    /// the best-effort path without blocking.
-    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for AutoUpdateTask {
-    fn drop(&mut self) {
-        // Best-effort wake of the loop, then abort. If the lock is contended the abort
-        // still happens once `Mutex<Option<JoinHandle>>` is dropped via the inner Option,
-        // but the JoinHandle's own `Drop` does not abort by itself — only the explicit
-        // `abort()` here does — so this `try_lock` matters for prompt teardown.
-        self.shutdown.notify_waiters();
-        if let Ok(mut g) = self.handle.try_lock()
-            && let Some(h) = g.take()
-        {
-            h.abort();
-        }
-    }
-}
-
-/// Spawn the partition-watcher *timer* task.
-///
-/// The task is intentionally minimal: it ticks every `interval` and signals the
-/// `Notify` returned via [`PartitionedProducer::partitions_changed_notify`]. It does
-/// **not** itself call into the [`PulsarClient`] — that requires a `'static` clone of
-/// the client which the current `PulsarClient` API does not yet expose, and going via
-/// `unsafe` would break the crate-wide `#![forbid(unsafe_code)]` invariant.
-///
-/// Callers wire the timer to an actual partition refresh by spawning a small loop:
-///
-/// ```ignore
-/// let tick = producer.partitions_changed_notify().unwrap();
-/// loop {
-///     tick.notified().await;
-///     producer.refresh_partitions(&client).await?;
-/// }
-/// ```
-///
-/// or by calling [`PartitionedProducer::refresh_partitions`] directly on every tick.
-///
-/// The `Arc<AutoUpdateTask>` returned wraps a [`Drop`] that aborts the spawned task,
-/// so the timer is bounded by the [`PartitionedProducer`]'s lifetime.
-fn spawn_auto_update_task(
-    topic: String,
-    interval: Duration,
-    initial_partitions: u32,
-) -> Arc<AutoUpdateTask> {
-    let observed_partitions = Arc::new(AtomicU32::new(initial_partitions));
-    let change_count = Arc::new(AtomicU64::new(0));
-    let changed = Arc::new(Notify::new());
-    let shutdown = Arc::new(Notify::new());
-
-    let changed_task = changed.clone();
-    let shutdown_task = shutdown.clone();
-
-    let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume the immediate tick so the first real signal happens after one interval.
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown_task.notified() => break,
-                _ = ticker.tick() => {}
-            }
-            changed_task.notify_waiters();
-        }
-    });
-
-    Arc::new(AutoUpdateTask {
-        topic,
-        observed_partitions,
-        change_count,
-        changed,
-        shutdown,
-        handle: tokio::sync::Mutex::new(Some(handle)),
-    })
 }
 
 impl<P: crate::ProducerApi> PartitionedProducer<P> {

@@ -70,11 +70,15 @@ pub use engine::{
 pub use engine::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 
 #[cfg(feature = "tokio")]
+mod auto_update_task;
+#[cfg(feature = "tokio")]
 mod builders;
 #[cfg(feature = "tokio")]
 mod client;
 #[cfg(feature = "tokio")]
 mod client_builder;
+#[cfg(feature = "tokio")]
+mod consumer_template;
 #[cfg(feature = "moonpool")]
 mod moonpool_client;
 #[cfg(feature = "tokio")]

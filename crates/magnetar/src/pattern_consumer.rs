@@ -40,6 +40,7 @@ use magnetar_proto::{IncomingMessage, MessageId};
 use parking_lot::Mutex;
 
 use crate::client::PulsarError;
+use crate::consumer_template::ConsumerTemplate;
 use crate::{BrokerMetadataApi, ConsumerApi, Engine, PulsarClient, SubscribeApi};
 
 /// Regex-pattern consumer. Holds one consumer per matching topic and reconciles the set
@@ -68,80 +69,6 @@ struct Inner<C: ConsumerApi> {
     /// [`crate::ConsumerBuilder`] knob the user set on the original
     /// [`PatternConsumerBuilder`].
     template: ConsumerTemplate,
-}
-
-/// Frozen [`crate::ConsumerBuilder`] template propagated to every per-topic child. Stored
-/// inside [`Inner`] so [`PatternConsumer::update`] can subscribe newly-discovered topics
-/// with the same configuration as the initial snapshot.
-#[derive(Debug, Clone)]
-struct ConsumerTemplate {
-    subscription: String,
-    sub_type: magnetar_proto::pb::command_subscribe::SubType,
-    receiver_queue_size: usize,
-    initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
-    durable: bool,
-    properties: Vec<(String, String)>,
-    negative_ack_redelivery_delay: Option<std::time::Duration>,
-    ack_timeout: Option<std::time::Duration>,
-    ack_group_time: Option<std::time::Duration>,
-    dlq_policy: Option<(u32, Option<String>)>,
-    read_compacted: bool,
-    priority_level: Option<i32>,
-    subscription_properties: Vec<(String, String)>,
-    key_shared: Option<magnetar_proto::KeySharedConfig>,
-    replicate_subscription_state: Option<bool>,
-    force_topic_creation: Option<bool>,
-    start_message_rollback_duration_sec: Option<u64>,
-}
-
-impl ConsumerTemplate {
-    /// Apply the template to a [`crate::ConsumerBuilder`] for the given topic.
-    fn apply<'a, E: Engine>(
-        &self,
-        mut builder: crate::ConsumerBuilder<'a, E>,
-    ) -> crate::ConsumerBuilder<'a, E> {
-        builder = builder
-            .subscription(self.subscription.clone())
-            .subscription_type(self.sub_type)
-            .durable(self.durable)
-            .initial_position(self.initial_position)
-            .receiver_queue_size(self.receiver_queue_size)
-            .read_compacted(self.read_compacted);
-        for (k, v) in &self.properties {
-            builder = builder.property(k.clone(), v.clone());
-        }
-        if let Some(d) = self.negative_ack_redelivery_delay {
-            builder = builder.negative_ack_redelivery_delay(d);
-        }
-        if let Some(t) = self.ack_timeout {
-            builder = builder.ack_timeout(t);
-        }
-        if let Some(w) = self.ack_group_time {
-            builder = builder.ack_group_time(w);
-        }
-        if let Some((max, topic_opt)) = &self.dlq_policy {
-            builder = builder.dead_letter_policy(*max, topic_opt.clone());
-        }
-        if let Some(level) = self.priority_level {
-            builder = builder.priority_level(level);
-        }
-        for (k, v) in &self.subscription_properties {
-            builder = builder.subscription_property(k.clone(), v.clone());
-        }
-        if let Some(cfg) = self.key_shared.clone() {
-            builder = builder.key_shared_policy(cfg);
-        }
-        if let Some(on) = self.replicate_subscription_state {
-            builder = builder.replicate_subscription_state(on);
-        }
-        if let Some(on) = self.force_topic_creation {
-            builder = builder.force_topic_creation(on);
-        }
-        if let Some(s) = self.start_message_rollback_duration_sec {
-            builder = builder.start_message_rollback_duration(s);
-        }
-        builder
-    }
 }
 
 #[derive(Debug, Clone)]

@@ -506,12 +506,8 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
     /// Mirrors Java `ConsumerBuilder#cryptoFailureAction`. Controls what the consumer does
     /// when payload decryption fails (PIP-4): `Fail` (default) propagates the error,
     /// `Discard` silently drops the message, `Consume` returns the encrypted ciphertext
-    /// as-is.
-    ///
-    /// **Note**: the [`magnetar_runtime_tokio::Consumer`] receive path currently honors
-    /// only `Fail`; `Discard` and `Consume` plumb through the protocol layer but are
-    /// applied opportunistically. Decryption error semantics in the runtime layer will be
-    /// fully wired in a follow-up.
+    /// as-is. All three arms are honored by the
+    /// [`magnetar_runtime_tokio::Consumer`] receive path.
     #[must_use]
     pub fn crypto_failure_action(
         mut self,

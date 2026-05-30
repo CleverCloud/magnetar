@@ -137,7 +137,8 @@ impl<P: Providers> Client<P> {
     /// run the plaintext handshake.
     ///
     /// `addr` is a moonpool `host:port` string (NOT a `pulsar://` URL — strip
-    /// the scheme before calling). TLS lives in a follow-up milestone.
+    /// the scheme before calling). For TLS, use [`Self::connect_tls`] (backed
+    /// by `RustlsByteAdapter` over the moonpool byte pipe).
     ///
     /// Returns once the broker has responded with `CommandConnected`.
     ///
@@ -277,9 +278,11 @@ impl<P: Providers> Client<P> {
                 proxy_through_service_url,
             } => {
                 if proxy_through_service_url {
-                    // The moonpool engine is plain-text only today (TLS lands via the
-                    // `RustlsByteAdapter` byte pipe — see `connect_tls`), so we always pick
-                    // the plain `broker_service_url` when both are advertised.
+                    // Lookup-driven reconnects on the moonpool engine ride the plaintext
+                    // bootstrap pipe even when both URLs are advertised — TLS routing on the
+                    // pinned per-broker pool is wired through the engine's `connect_tls`
+                    // entry, not through `lookup_topic_target`. Prefer the plain
+                    // `broker_service_url` here for that reason.
                     let broker_url = broker_service_url.or(broker_service_url_tls).ok_or_else(
                         || {
                             ClientError::Other(format!(

@@ -103,9 +103,10 @@ impl ClientBuilder {
     /// reservation is released on `SendFut` completion (success or
     /// error) and on cancellation (via `Drop`).
     ///
-    /// **Note**: `MemoryLimitPolicy::ProducerBlock` (Java's alternate
-    /// semantics that blocks the send future until budget frees up via a
-    /// `Notify`-based wait) is the planned follow-up.
+    /// Under `MemoryLimitPolicy::ProducerBlock`, the send future parks
+    /// on a `Notify`-based wait until the budget frees up — both engines
+    /// (`TokioEngine`, `MoonpoolEngine<P>`) implement this policy; see
+    /// [`docs/memory-limit.md`](https://github.com/FlorentinDUBOIS/magnetar/blob/main/docs/memory-limit.md).
     #[must_use]
     pub fn memory_limit(mut self, bytes: usize, policy: MemoryLimitPolicy) -> Self {
         self.memory_limit = Some(MemoryLimit { bytes, policy });
@@ -302,9 +303,9 @@ impl ClientBuilder {
         }
         // Java `ClientBuilder#memoryLimit` — wire the configured budget into the runtime so
         // `Producer::send` reserves payload bytes against `ConnectionShared::memory_limit_bytes`
-        // before queueing. Only `FailImmediately` is enforced today; `ProducerBlock` is
-        // planned follow-up (it would park the send future until the budget frees up via
-        // `tokio::sync::Notify`).
+        // before queueing. Both `FailImmediately` and `ProducerBlock` are honored by the
+        // tokio and moonpool engines (the latter parks the send future on a `Notify` wait
+        // until the budget frees up).
         if let Some(limit) = self.memory_limit {
             // Cast saturates rather than truncates so a 64-bit limit on a 32-bit usize host
             // (effectively impossible — magnetar requires 64-bit pointers — but cheap to

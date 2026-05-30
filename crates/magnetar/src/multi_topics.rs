@@ -34,16 +34,17 @@
 //! [`crate::PatternConsumer`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
+use crate::auto_update_task::{AutoUpdateTask, spawn_auto_update_task};
 use crate::client::{PulsarError, SeekTarget};
+use crate::consumer_template::ConsumerTemplate;
 use crate::{ConsumerApi, Engine, PulsarClient, SubscribeApi};
 
 /// Multi-topics consumer. Each contained consumer subscribes to one topic; `receive()`
@@ -87,172 +88,6 @@ struct Inner<C: ConsumerApi> {
     /// onto tokio under the hood (see `Engine::TaskHandle = tokio::task::JoinHandle`
     /// in `engine.rs`), so this scaffolding is engine-invariant.
     auto_update: Option<Arc<AutoUpdateTask>>,
-}
-
-/// Background partition-watcher (Java parity:
-/// `ConsumerBuilder#autoUpdatePartitionsInterval`).
-///
-/// Spawned by [`MultiTopicsConsumerBuilder::subscribe`] /
-/// [`crate::PartitionedConsumerBuilder::subscribe`] when the builder records a
-/// non-zero interval via
-/// [`MultiTopicsConsumerBuilder::auto_update_partitions_interval`]. The spawned task
-/// is a pure timer that signals [`Self::changed`] every `interval`; the actual
-/// `PulsarClient::partitions_for_topic` call is driven by user code via
-/// [`MultiTopicsConsumer::refresh_partitions`] (the crate-wide
-/// `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into a
-/// `'static` spawn).
-///
-/// Lifetime is bounded by the [`MultiTopicsConsumer`]: dropping every clone of the
-/// consumer drops the `Arc<Inner>`, which drops the `Arc<AutoUpdateTask>`, which
-/// aborts the spawned tokio task in [`Drop`]. No channels — coordination is
-/// `Arc<Mutex<...>>` + [`tokio::sync::Notify`] + [`tokio::time::interval`] (per the
-/// project's "no channels in Rust async code" policy).
-#[derive(Debug)]
-struct AutoUpdateTask {
-    /// Topic the watcher polls — typically the base topic the
-    /// [`crate::PartitionedConsumer`] was built against (without the
-    /// `-partition-N` suffix).
-    topic: String,
-    /// Last partition count observed by the watcher.
-    observed_partitions: Arc<AtomicU32>,
-    /// Monotonic counter of "partition count changed" events. Useful for tests and
-    /// "did anything change since I last looked?" probes.
-    change_count: Arc<AtomicU64>,
-    /// Signalled every time the internal timer fires, and every time
-    /// [`MultiTopicsConsumer::refresh_partitions`] detects a real partition-count
-    /// change.
-    changed: Arc<Notify>,
-    /// Signalled on drop to cooperatively wake the loop sleeping on [`Notify`] so it
-    /// can notice it has been aborted promptly.
-    shutdown: Arc<Notify>,
-    /// The spawned task. Held in a [`tokio::sync::Mutex`] so [`Drop`] can take it on
-    /// the best-effort path without blocking.
-    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for AutoUpdateTask {
-    fn drop(&mut self) {
-        self.shutdown.notify_waiters();
-        if let Ok(mut g) = self.handle.try_lock()
-            && let Some(h) = g.take()
-        {
-            h.abort();
-        }
-    }
-}
-
-/// Spawn the partition-watcher *timer* task. See the doc on
-/// [`crate::partitioned_producer::spawn_auto_update_task`] for the shape — same
-/// pattern.
-fn spawn_auto_update_task(
-    topic: String,
-    interval: Duration,
-    initial_partitions: u32,
-) -> Arc<AutoUpdateTask> {
-    let observed_partitions = Arc::new(AtomicU32::new(initial_partitions));
-    let change_count = Arc::new(AtomicU64::new(0));
-    let changed = Arc::new(Notify::new());
-    let shutdown = Arc::new(Notify::new());
-
-    let changed_task = changed.clone();
-    let shutdown_task = shutdown.clone();
-
-    let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown_task.notified() => break,
-                _ = ticker.tick() => {}
-            }
-            changed_task.notify_waiters();
-        }
-    });
-
-    Arc::new(AutoUpdateTask {
-        topic,
-        observed_partitions,
-        change_count,
-        changed,
-        shutdown,
-        handle: tokio::sync::Mutex::new(Some(handle)),
-    })
-}
-
-/// Frozen [`crate::ConsumerBuilder`] template propagated to every per-topic child. Stored
-/// inside [`Inner`] so [`MultiTopicsConsumer::add_topic`] can subscribe newly-added topics
-/// with the same configuration as the initial set.
-#[derive(Debug, Clone)]
-struct ConsumerTemplate {
-    subscription: String,
-    sub_type: magnetar_proto::pb::command_subscribe::SubType,
-    receiver_queue_size: usize,
-    initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
-    durable: bool,
-    properties: Vec<(String, String)>,
-    negative_ack_redelivery_delay: Option<std::time::Duration>,
-    ack_timeout: Option<std::time::Duration>,
-    ack_group_time: Option<std::time::Duration>,
-    dlq_policy: Option<(u32, Option<String>)>,
-    read_compacted: bool,
-    priority_level: Option<i32>,
-    subscription_properties: Vec<(String, String)>,
-    key_shared: Option<magnetar_proto::KeySharedConfig>,
-    replicate_subscription_state: Option<bool>,
-    force_topic_creation: Option<bool>,
-    start_message_rollback_duration_sec: Option<u64>,
-}
-
-impl ConsumerTemplate {
-    /// Apply the template to a [`crate::ConsumerBuilder`] for the given topic.
-    fn apply<'a, E: Engine>(
-        &self,
-        mut builder: crate::ConsumerBuilder<'a, E>,
-    ) -> crate::ConsumerBuilder<'a, E> {
-        builder = builder
-            .subscription(self.subscription.clone())
-            .subscription_type(self.sub_type)
-            .durable(self.durable)
-            .initial_position(self.initial_position)
-            .receiver_queue_size(self.receiver_queue_size)
-            .read_compacted(self.read_compacted);
-        for (k, v) in &self.properties {
-            builder = builder.property(k.clone(), v.clone());
-        }
-        if let Some(d) = self.negative_ack_redelivery_delay {
-            builder = builder.negative_ack_redelivery_delay(d);
-        }
-        if let Some(t) = self.ack_timeout {
-            builder = builder.ack_timeout(t);
-        }
-        if let Some(w) = self.ack_group_time {
-            builder = builder.ack_group_time(w);
-        }
-        if let Some((max, topic_opt)) = &self.dlq_policy {
-            builder = builder.dead_letter_policy(*max, topic_opt.clone());
-        }
-        if let Some(level) = self.priority_level {
-            builder = builder.priority_level(level);
-        }
-        for (k, v) in &self.subscription_properties {
-            builder = builder.subscription_property(k.clone(), v.clone());
-        }
-        if let Some(cfg) = self.key_shared.clone() {
-            builder = builder.key_shared_policy(cfg);
-        }
-        if let Some(on) = self.replicate_subscription_state {
-            builder = builder.replicate_subscription_state(on);
-        }
-        if let Some(on) = self.force_topic_creation {
-            builder = builder.force_topic_creation(on);
-        }
-        if let Some(s) = self.start_message_rollback_duration_sec {
-            builder = builder.start_message_rollback_duration(s);
-        }
-        builder
-    }
 }
 
 #[derive(Debug, Clone)]
