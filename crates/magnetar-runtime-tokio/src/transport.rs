@@ -34,33 +34,18 @@ pub(crate) enum Transport {
 }
 
 impl Transport {
-    /// Connect to `url`, optionally upgrading to TLS using `tls_config` for `pulsar+ssl://`.
-    ///
-    /// `tls_config` is required when `url.scheme == Scheme::Tls`. For plaintext connections it is
-    /// ignored. DNS resolution falls back to tokio's built-in [`tokio::net::lookup_host`] —
-    /// see [`Self::connect_with_resolver`] for the resolver-aware flavour.
-    ///
-    /// Kept as a thin wrapper over [`Self::connect_with_resolver`] for callers that don't need
-    /// the pluggable DNS resolver hook (tests, future generic-socket flavours).
-    #[allow(dead_code)]
-    pub(crate) async fn connect(
-        url: &ParsedUrl,
-        tls_config: Option<Arc<rustls::ClientConfig>>,
-    ) -> Result<Self, ClientError> {
-        Self::connect_with_resolver(url, tls_config, None).await
-    }
-
     /// Connect to `url`, routing DNS resolution through `resolver` when `Some`.
     ///
     /// When `resolver = Some`, the resolver returns one or more [`std::net::SocketAddr`]
     /// candidates and we dial each in order, returning the first that connects. If every
     /// candidate fails, the last [`std::io::Error`] is surfaced. When `resolver = None`
     /// we fall back to tokio's built-in [`tokio::net::TcpStream::connect`] over the
-    /// `(host, port)` tuple — identical to [`Self::connect`].
+    /// `(host, port)` tuple.
     ///
-    /// `tls_config` semantics match [`Self::connect`]. The TLS server-name still comes
-    /// from `url.host`, not from the resolved address, so SNI / hostname verification
-    /// stay correct even when the resolver pins a specific IP.
+    /// `tls_config` is required when `url.scheme == Scheme::Tls`; for plaintext connections
+    /// it is ignored. The TLS server-name still comes from `url.host`, not from the resolved
+    /// address, so SNI / hostname verification stay correct even when the resolver pins a
+    /// specific IP.
     pub(crate) async fn connect_with_resolver(
         url: &ParsedUrl,
         tls_config: Option<Arc<rustls::ClientConfig>>,

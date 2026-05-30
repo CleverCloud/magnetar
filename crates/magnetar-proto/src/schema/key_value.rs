@@ -330,6 +330,9 @@ fn schema_type_name(ty: pb::schema::Type) -> String {
 
 /// Standard base64 encoder (RFC 4648 alphabet, with `=` padding). Inlined to avoid pulling
 /// `base64` into the magnetar-proto dep graph — schema canonicalisation is the only consumer.
+// reason: kept alongside the test-only `base64_decode` below for KeyValue canonical-form work
+// that has not yet wired through this helper; the schemars-driven path doesn't need it today.
+#[allow(dead_code)]
 fn base64_encode(out: &mut String, input: &[u8]) {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut i = 0;
@@ -439,6 +442,9 @@ mod tests {
     }
 
     /// Minimal base64 decoder (standard alphabet, no padding tolerance) for tests only.
+    // reason: unused today; kept for the KeyValue canonical-form follow-up alongside
+    // `base64_encode`.
+    #[allow(dead_code)]
     fn base64_decode(input: &str) -> Option<Vec<u8>> {
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

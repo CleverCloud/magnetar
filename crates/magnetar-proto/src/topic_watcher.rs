@@ -23,8 +23,13 @@ use crate::types::RequestId;
 #[derive(Debug, Clone)]
 pub(crate) struct TopicWatcher {
     /// Pattern requested by the user (re-resolved server-side; the state machine just echoes it).
+    // reason: carried for the derived `Debug` trace context and read by unit tests; future
+    // re-subscribe paths re-issue with the original pattern.
+    #[allow(dead_code)]
     pub(crate) pattern: String,
     /// Namespace the pattern applies to.
+    // reason: same as `pattern` — kept for Debug + future re-subscribe payload.
+    #[allow(dead_code)]
     pub(crate) namespace: String,
     /// Topics-hash from the last broker response (used to skip no-op updates).
     pub(crate) topics_hash: Option<String>,
@@ -45,6 +50,10 @@ impl TopicWatcherRegistry {
         self.by_request.insert(request_id, watcher_id);
     }
 
+    // reason: called only from unit tests today; the engine hooks the close path through
+    // `Connection`'s pending-request dispatch instead, but the registry helper stays as the
+    // single ownership-clearing surface for the upcoming `CommandWatchTopicListClose` wiring.
+    #[allow(dead_code)]
     pub(crate) fn close(&mut self, watcher_id: u64) {
         self.by_watcher.remove(&watcher_id);
         self.by_request.retain(|_, v| *v != watcher_id);

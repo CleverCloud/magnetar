@@ -197,12 +197,19 @@ impl TransactionMetadata {
 
 /// Per-request bookkeeping so we can correlate inbound responses with the originating call and
 /// figure out which transaction metadata to mutate.
+// reason: `request_id` is carried for the derived `Debug` trace context; the dispatch keys
+// off the surrounding registry HashMap entry, not the struct field. The crate-wide blanket
+// allow was removed; scope it here so future drift in *other* modules still trips.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PendingNewTxn {
     request_id: RequestId,
     waker_key: usize,
 }
 
+// reason: see `PendingNewTxn` — `request_id` is Debug payload, the registry HashMap is the
+// dispatch key.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PendingAddPartition {
     request_id: RequestId,
@@ -211,6 +218,8 @@ struct PendingAddPartition {
     waker_key: usize,
 }
 
+// reason: see `PendingNewTxn`.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PendingAddSubscription {
     request_id: RequestId,
@@ -220,6 +229,8 @@ struct PendingAddSubscription {
     waker_key: usize,
 }
 
+// reason: see `PendingNewTxn`.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PendingEndTxn {
     request_id: RequestId,

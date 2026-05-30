@@ -222,6 +222,11 @@ fn is_transient_open_error(code: i32) -> bool {
     )
 }
 
+// reason: variant payloads (handle, watcher_id, watch_session_id) are carried for the derived
+// `Debug` trace context and may be read by future dispatch paths; the compiler ignores derived
+// traits for dead-code analysis so we scope a single allow here rather than reverting to a
+// crate-wide blanket.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 enum PendingRequestKind {
     Lookup,

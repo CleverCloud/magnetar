@@ -69,47 +69,26 @@ fn stamp(metadata: &mut pb::MessageMetadata) {
     metadata.encryption_param = Some(Bytes::from_static(b"iv"));
 }
 
-impl magnetar_runtime_tokio::MessageEncryptor for StampOnlyEncryptor {
+// Both runtime crates re-export the same canonical `magnetar_proto::crypto` traits, so a single
+// impl per (type, trait) satisfies tokio and moonpool simultaneously.
+impl magnetar_proto::MessageEncryptor for StampOnlyEncryptor {
     fn encrypt(
         &self,
         plaintext: &[u8],
         metadata: &mut pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_tokio::EncryptError> {
+    ) -> Result<Bytes, magnetar_proto::EncryptError> {
         stamp(metadata);
         Ok(Bytes::copy_from_slice(plaintext))
     }
 }
 
-impl magnetar_runtime_moonpool::MessageEncryptor for StampOnlyEncryptor {
-    fn encrypt(
-        &self,
-        plaintext: &[u8],
-        metadata: &mut pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
-        stamp(metadata);
-        Ok(Bytes::copy_from_slice(plaintext))
-    }
-}
-
-impl magnetar_runtime_tokio::MessageDecryptor for AlwaysFailDecryptor {
+impl magnetar_proto::MessageDecryptor for AlwaysFailDecryptor {
     fn decrypt(
         &self,
         _ciphertext: &[u8],
         _metadata: &pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_tokio::EncryptError> {
-        Err(magnetar_runtime_tokio::EncryptError::new(
-            "decryptor rejects corrupt ciphertext",
-        ))
-    }
-}
-
-impl magnetar_runtime_moonpool::MessageDecryptor for AlwaysFailDecryptor {
-    fn decrypt(
-        &self,
-        _ciphertext: &[u8],
-        _metadata: &pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
-        Err(magnetar_runtime_moonpool::EncryptError::new(
+    ) -> Result<Bytes, magnetar_proto::EncryptError> {
+        Err(magnetar_proto::EncryptError::new(
             "decryptor rejects corrupt ciphertext",
         ))
     }

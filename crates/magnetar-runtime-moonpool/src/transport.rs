@@ -258,31 +258,6 @@ impl<P: Providers> Transport<P> {
         Ok(())
     }
 
-    /// Read up to `buf.len()` bytes from the wire. Returns `0` on a clean EOF.
-    ///
-    /// Provided for symmetry with the documented transport surface and for
-    /// the TLS adapter path, which reads into a fixed-size buffer before
-    /// handing bytes to [`RustlsByteAdapter`]. The plain driver uses
-    /// [`Self::read_buf`] instead.
-    ///
-    /// # Errors
-    /// Propagates the underlying `AsyncRead::poll_read` error.
-    #[allow(dead_code)]
-    pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Plain { stream, .. } => stream.read(buf).await,
-            Self::Tls { .. } => {
-                // The TLS path goes through `read_buf` — wrap the slice in a
-                // BytesMut for symmetry.
-                let mut tmp = BytesMut::with_capacity(buf.len());
-                let n = self.read_buf(&mut tmp).await?;
-                let to_copy = n.min(buf.len());
-                buf[..to_copy].copy_from_slice(&tmp[..to_copy]);
-                Ok(to_copy)
-            }
-        }
-    }
-
     /// Read into a [`bytes::BytesMut`]. For plaintext transports this is a
     /// direct passthrough; for TLS transports it pulls ciphertext from the
     /// wire, decrypts via [`RustlsByteAdapter::step`], and lands the

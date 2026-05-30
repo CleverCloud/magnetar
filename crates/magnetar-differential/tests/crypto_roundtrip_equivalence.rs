@@ -50,44 +50,25 @@ fn xor(bytes: &[u8]) -> Bytes {
     Bytes::from(bytes.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>())
 }
 
-impl magnetar_runtime_tokio::MessageEncryptor for XorCrypto {
+// Both runtime crates re-export the same canonical `magnetar_proto::crypto` traits, so a single
+// impl per (type, trait) satisfies tokio and moonpool simultaneously.
+impl magnetar_proto::MessageEncryptor for XorCrypto {
     fn encrypt(
         &self,
         plaintext: &[u8],
         metadata: &mut pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_tokio::EncryptError> {
+    ) -> Result<Bytes, magnetar_proto::EncryptError> {
         stamp(metadata);
         Ok(xor(plaintext))
     }
 }
 
-impl magnetar_runtime_tokio::MessageDecryptor for XorCrypto {
+impl magnetar_proto::MessageDecryptor for XorCrypto {
     fn decrypt(
         &self,
         ciphertext: &[u8],
         _metadata: &pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_tokio::EncryptError> {
-        Ok(xor(ciphertext))
-    }
-}
-
-impl magnetar_runtime_moonpool::MessageEncryptor for XorCrypto {
-    fn encrypt(
-        &self,
-        plaintext: &[u8],
-        metadata: &mut pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
-        stamp(metadata);
-        Ok(xor(plaintext))
-    }
-}
-
-impl magnetar_runtime_moonpool::MessageDecryptor for XorCrypto {
-    fn decrypt(
-        &self,
-        ciphertext: &[u8],
-        _metadata: &pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
+    ) -> Result<Bytes, magnetar_proto::EncryptError> {
         Ok(xor(ciphertext))
     }
 }

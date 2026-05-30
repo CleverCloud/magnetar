@@ -6,7 +6,7 @@
 //! [`moonpool_core::Providers`] so the same façade runs on production Tokio
 //! sockets and on a `moonpool-sim` deterministic substrate.
 //!
-//! ## M3 surface
+//! ## Public surface
 //!
 //! - [`Client::open_producer`] — `CommandProducer` round-trip.
 //! - [`Producer::send`] / [`Producer::flush`] / [`Producer::close`].
@@ -27,12 +27,11 @@
 //!
 //! The user-facing [`Producer`] stores the [`CompressionKind`] it was opened
 //! with so the broker sees the same compression metadata the state machine
-//! stamps. The moonpool engine does **not** ship a built-in codec stack in
-//! M3 — calling [`Producer::send`] with anything other than
-//! [`CompressionKind::None`] yields [`ClientError::Other`] until a follow-up
-//! milestone wires the codecs in. Mirrors the tokio engine's
-//! ordering (compression → encryption → state machine) so the swap will be a
-//! drop-in once codecs land.
+//! stamps. Compression is not yet wired on the moonpool engine; calling
+//! [`Producer::send`] with anything other than [`CompressionKind::None`]
+//! refuses synchronously with [`ClientError::Other`]. The tokio engine's
+//! ordering (compression → encryption → state machine) is mirrored so the
+//! codec swap will be a drop-in once it lands.
 //!
 //! [`Connection`]: magnetar_proto::Connection
 //! [`Connection::register_waker`]: magnetar_proto::Connection::register_waker
@@ -245,7 +244,7 @@ impl<P: Providers> Producer<P> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
 
-        // The moonpool engine does not ship a compression codec stack in M3.
+        // The moonpool engine does not yet ship a compression codec stack.
         // The state machine still stamps `metadata.compression` based on the
         // configured `CompressionKind`; until the runtime codec lands, we
         // refuse non-`None` codecs so the broker never sees mis-labelled
@@ -257,7 +256,7 @@ impl<P: Providers> Producer<P> {
                 handle: self.handle,
                 state: SendState::Failed {
                     error: Some(ClientError::Other(format!(
-                        "moonpool engine: compression {:?} not yet wired (M3); \
+                        "moonpool engine: compression {:?} not yet wired; \
                          use CompressionKind::None for now",
                         self.compression
                     ))),

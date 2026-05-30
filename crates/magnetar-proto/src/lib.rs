@@ -26,9 +26,10 @@
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
-// M2 scaffolding: connection / producer / consumer dispatch loops are long by nature; we'll
-// refactor and tighten as M3/M5/M7 wire up. Until then, keep the cosmetic lints quiet so the
-// real bugs surface.
+// Connection / producer / consumer dispatch loops are long by nature; the cosmetic lints below
+// are silenced so real bugs surface instead. `dead_code` is intentionally NOT allowed
+// crate-wide — scope any unavoidable dead surface to the offending item with
+// `#[allow(dead_code)] // reason:` so future drift gets caught by the workspace lint.
 #![allow(
     clippy::too_many_lines,
     clippy::match_same_arms,
@@ -58,8 +59,7 @@
     clippy::missing_const_for_fn,
     clippy::field_reassign_with_default,
     clippy::assigning_clones,
-    clippy::match_wildcard_for_single_variants,
-    dead_code
+    clippy::match_wildcard_for_single_variants
 )]
 
 /// Pulsar wire-protocol version this driver advertises in
@@ -93,6 +93,7 @@ pub mod cluster_failover;
 pub mod conn;
 pub(crate) mod conn_types;
 pub mod consumer;
+pub mod crypto;
 /// PIP-460 segment-DAG-watch session state machine (experimental, ADR-0031).
 #[cfg(feature = "scalable-topics")]
 pub mod dag_watch;
@@ -164,6 +165,7 @@ pub use crate::conn::{
     SubscribeRequest,
 };
 pub use crate::consumer::{ConsumerIdentity, ConsumerSlot, ConsumerStats, ShadowTopicMetadata};
+pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 #[cfg(feature = "scalable-topics")]
 pub use crate::dag_watch::{
     DagChangeReason, DagDelta, DagError, DagWatchSession, MergeEvent, SplitEvent,

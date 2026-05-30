@@ -32,6 +32,9 @@ pub(crate) struct LookupRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionedMetadataRequest {
     /// The topic being queried.
+    // reason: carried for the derived `Debug` trace context and identity in registry lookups;
+    // not read on the response path (the topic is echoed by the broker).
+    #[allow(dead_code)]
     pub(crate) topic: String,
 }
 

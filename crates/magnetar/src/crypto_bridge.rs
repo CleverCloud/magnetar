@@ -5,7 +5,11 @@
 //!
 //! Only compiled when the `encryption` feature is enabled. The runtime crate stays
 //! crypto-agnostic; the bridge lives here in the façade where both `magnetar-messagecrypto`
-//! and `magnetar-runtime-tokio` are visible. Uses a newtype to satisfy the orphan rule.
+//! and the runtime engines are visible. Uses a newtype to satisfy the orphan rule.
+//!
+//! Since both runtime crates re-export the same canonical [`magnetar_proto::crypto`] traits,
+//! the single impl below satisfies the tokio and moonpool engines simultaneously — no
+//! duplicate per-runtime impls.
 //!
 //! ```no_run
 //! # use std::sync::Arc;
@@ -23,15 +27,17 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use magnetar_messagecrypto::MessageCrypto;
+use magnetar_proto::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 use magnetar_proto::pb;
-use magnetar_runtime_tokio::{EncryptError, MessageDecryptor, MessageEncryptor};
 
 /// Newtype wrapper that exposes a [`magnetar_messagecrypto::MessageCrypto`] as both
-/// [`MessageEncryptor`] and [`MessageDecryptor`] for the tokio runtime engine.
+/// [`MessageEncryptor`] and [`MessageDecryptor`] for any runtime engine.
 ///
 /// Satisfies the Rust orphan rule (the runtime traits and `MessageCrypto` both live in
 /// different crates; magnetar — being downstream of both — is the only place we can implement
-/// them on a wrapper type).
+/// them on a wrapper type). Both `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`
+/// re-export the same canonical [`magnetar_proto::crypto`] traits, so this single pair of
+/// impls is consumed by every engine.
 #[derive(Debug)]
 pub struct MessageCryptoBridge {
     inner: Arc<MessageCrypto>,
@@ -72,36 +78,5 @@ impl MessageDecryptor for MessageCryptoBridge {
         self.inner
             .decrypt(ciphertext, metadata)
             .map_err(EncryptError::new)
-    }
-}
-
-// The same bridge also drives the moonpool runtime's identically-shaped PIP-4
-// hooks. The moonpool `MessageEncryptor` / `MessageDecryptor` / `EncryptError`
-// are distinct types from the tokio ones (each runtime defines its own), so we
-// implement both pairs on the one wrapper. This lets a single
-// `Arc<MessageCryptoBridge>` be handed to either engine's builder.
-#[cfg(feature = "moonpool")]
-impl magnetar_runtime_moonpool::MessageEncryptor for MessageCryptoBridge {
-    fn encrypt(
-        &self,
-        plaintext: &[u8],
-        metadata: &mut pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
-        self.inner
-            .encrypt(plaintext, metadata)
-            .map_err(magnetar_runtime_moonpool::EncryptError::new)
-    }
-}
-
-#[cfg(feature = "moonpool")]
-impl magnetar_runtime_moonpool::MessageDecryptor for MessageCryptoBridge {
-    fn decrypt(
-        &self,
-        ciphertext: &[u8],
-        metadata: &pb::MessageMetadata,
-    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
-        self.inner
-            .decrypt(ciphertext, metadata)
-            .map_err(magnetar_runtime_moonpool::EncryptError::new)
     }
 }
