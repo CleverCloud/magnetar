@@ -190,10 +190,23 @@ impl ClientBuilder {
     /// Use the supplied auth provider to populate the initial CONNECT auth data,
     /// and keep the provider for in-band `CommandAuthChallenge` refresh
     /// (PIP-30 / PIP-292).
+    ///
+    /// **BREAKING CHANGE**: the provider's [`magnetar_proto::AuthProvider::initial`]
+    /// is now invoked inside [`Self::build`] and any error it returns
+    /// surfaces through [`PulsarError::Config`] — the previous behaviour
+    /// silently dropped the error via `.ok()`, which would have let an
+    /// uncached `OAuth2` flow / a missing token file / an expired credential
+    /// open an *anonymous* connection (CWE-287). Callers using a provider
+    /// whose `initial()` returns `Err(AuthError::Invalid)` until an
+    /// out-of-band warm-up runs (e.g. `OAuth2Provider::ensure_fresh`) MUST
+    /// warm the provider before calling [`Self::build`].
     #[must_use]
     pub fn auth(mut self, provider: std::sync::Arc<dyn magnetar_proto::AuthProvider>) -> Self {
         self.auth_method_name = Some(provider.method().to_owned());
-        self.auth_data = provider.initial().ok();
+        // NOTE: we deliberately do NOT call `provider.initial()` here. The
+        // previous `.ok()` swallowed errors and let an unwarmed provider
+        // produce an anonymous connection. The fetch + error propagation
+        // now lives in `build()`.
         self.auth_provider = Some(provider);
         self
     }
@@ -301,8 +314,21 @@ impl ClientBuilder {
         if let Some(name) = self.auth_method_name {
             config.auth_method_name = name;
         }
+        // BREAKING CHANGE: surface the provider's `initial()` failure here
+        // rather than silently dropping it via `.ok()` in `auth(...)`. A
+        // missing token file or an unwarmed OAuth2 cache used to slip
+        // through and produce an anonymous CONNECT (CWE-287). The
+        // direct-bytes `self.auth_data` set via internal call sites still
+        // wins when present (matches the prior precedence).
         if let Some(data) = self.auth_data {
             config.auth_data = Some(data);
+        } else if let Some(provider) = self.auth_provider.as_ref() {
+            let bytes = provider.initial().map_err(|err| {
+                PulsarError::Config(format!(
+                    "auth provider initial() failed; cannot open authenticated connection: {err}"
+                ))
+            })?;
+            config.auth_data = Some(bytes);
         }
         // Java `ClientBuilder#dnsResolver` — when configured, every reconnect (including the
         // initial dial) routes through `provider.resolve(host, port)` via
@@ -376,5 +402,71 @@ impl ClientBuilder {
             inner,
             memory_limit: self.memory_limit,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use magnetar_proto::{AuthError, AuthProvider};
+
+    use super::ClientBuilder;
+    use crate::PulsarError;
+
+    /// Stub provider whose `initial()` returns `Err(AuthError::Invalid)`.
+    /// Models an unwarmed `OAuth2` cache, a missing token file, or any other
+    /// provider whose credential-fetch failed.
+    #[derive(Debug)]
+    struct FailingProvider;
+
+    impl AuthProvider for FailingProvider {
+        fn method(&self) -> &str {
+            "token"
+        }
+        fn initial(&self) -> Result<Bytes, AuthError> {
+            Err(AuthError::Invalid("forced failure (test)".to_owned()))
+        }
+    }
+
+    /// BREAKING CHANGE regression (F6, CWE-287): `ClientBuilder::auth(...)`
+    /// used to call `provider.initial().ok()`, silently dropping the error
+    /// and leaving `auth_data = None`. The resulting CONNECT carried no
+    /// credentials and the broker happily opened an *anonymous* session
+    /// when its auth plugin allowed it — a textbook authentication-bypass
+    /// vector when the provider is the only thing standing between the
+    /// caller and an anonymous connection.
+    ///
+    /// The fix defers `provider.initial()` to `build()` and surfaces the
+    /// failure through `PulsarError::Config`. This test pins that contract:
+    /// no anonymous fallback, no broker dial, just an early `Err`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_propagates_auth_provider_initial_error() {
+        let provider = std::sync::Arc::new(FailingProvider);
+        let result = ClientBuilder::default()
+            // Localhost target is fine — `build()` must surface the auth
+            // error BEFORE the dial, so no listener is required.
+            .service_url("pulsar://127.0.0.1:1")
+            .auth(provider)
+            .build()
+            .await;
+        let err = result.expect_err(
+            "build() must surface auth provider initial() error, not silently \
+             fall back to an anonymous CONNECT (CWE-287)",
+        );
+        match err {
+            PulsarError::Config(msg) => {
+                assert!(
+                    msg.contains("auth provider initial()"),
+                    "error must point at the auth path: {msg}"
+                );
+                assert!(
+                    msg.contains("forced failure (test)"),
+                    "error must propagate the provider's message: {msg}"
+                );
+            }
+            other => {
+                panic!("expected PulsarError::Config carrying the auth failure, got: {other:?}")
+            }
+        }
     }
 }

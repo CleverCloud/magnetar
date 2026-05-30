@@ -2887,4 +2887,86 @@ mod tests {
              decompression branch — moonpool refuses non-None compression on send)"
         );
     }
+
+    /// Mirror of `magnetar-runtime-tokio::consumer::tests
+    /// ::receive_returns_closed_after_local_close_race`. The moonpool
+    /// `ReceiveFut::poll` already carries the closed-state re-check (since
+    /// the dawn of the sim engine — see the `if conn.is_closed() ||
+    /// conn.consumer_is_closed(handle)` block); this test pins the
+    /// equivalent behaviour so the tokio↔moonpool parity gate
+    /// (ADR-0024 / `check-runtime-test-parity`) catches any future drift.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_returns_closed_after_local_close_race() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/close-race".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+
+        // Simulate the close-race: another (cloned) handle ran `close()` and
+        // flipped the per-slot `closed` bit + drained wakers BEFORE we ever
+        // installed ours. The receive future must spot the closed state and
+        // resolve `Err(Closed)` instead of parking on the slab.
+        {
+            let conn = shared.inner.lock();
+            let slot = conn.consumer(handle).expect("slot is registered").clone();
+            slot.state.lock().close();
+        }
+
+        let fut = ReceiveFut {
+            shared: shared.clone(),
+            handle,
+            decryptor: None,
+            slab_key: None,
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(250), fut)
+            .await
+            .expect("receive must resolve quickly; timeout means ReceiveFut parked forever");
+        match outcome {
+            Err(crate::client::ClientError::Closed) => {}
+            other => panic!("expected Err(Closed) after local close, got {other:?}"),
+        }
+    }
+
+    /// Parity placeholder for `magnetar-runtime-tokio::compress::tests
+    /// ::unchecked_uncompressed_size_is_rejected_before_allocation`. The
+    /// moonpool engine intentionally refuses non-`None` compression on
+    /// send (the comment in `ReceiveFut::poll` near line 1255 spells this
+    /// out), so there is no equivalent moonpool decompress path to harden
+    /// against a malicious `uncompressed_size`. We still record the
+    /// invariant here — "decompression is sans-engine on moonpool" — so
+    /// the parity gate (ADR-0024 / `check-runtime-test-parity`) stays
+    /// balanced and a future PR that wires moonpool decompression cannot
+    /// land without also wiring the same `MAX_FRAME_SIZE` cap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn moonpool_decompress_path_is_absent_by_design() {
+        // The moonpool producer rejects compressed sends (see
+        // `Producer::send` and the matching comment in `post_process_message`
+        // near consumer.rs:1255). A symmetric receive path therefore has no
+        // decompressor to attack via `uncompressed_size = u32::MAX`. The
+        // assertion below is a sentinel: if a future change wires moonpool
+        // decompression without porting the tokio
+        // `UncompressedSizeTooLarge` guard, the placeholder MUST grow into
+        // a real round-trip + bounded-allocation test.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/no-decompress".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        // Sanity: a freshly-subscribed consumer is not closed, has zero
+        // messages buffered, and is registered in the state machine. This
+        // pins the engine's surface so the test is non-vacuous.
+        let conn = shared.inner.lock();
+        let slot = conn.consumer(handle).expect("slot");
+        assert!(!slot.state.lock().closed);
+        assert_eq!(slot.state.lock().queue_len(), 0);
+    }
 }

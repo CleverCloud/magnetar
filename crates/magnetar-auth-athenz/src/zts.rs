@@ -167,16 +167,58 @@ impl ZtsClient for HttpZtsClient {
             .await
             .map_err(|e| AthenzError::Transport(format!("zts body: {e}")))?;
         if !status.is_success() {
-            return Err(AthenzError::ZtsRejected(format!(
-                "zts returned {status}: {body}"
+            // Redact the body from the error string (CWE-532, F7). ZTS
+            // error payloads can echo the signed JWT back, leak tenant
+            // session material, or surface internal stack traces; operators
+            // routinely log error variants verbatim, so the surfaced
+            // `Display` MUST NOT carry the raw bytes. The raw body is still
+            // emitted via `tracing::debug!` for operators who opt in to the
+            // `magnetar::auth::athenz` target at `DEBUG` level.
+            tracing::debug!(
+                target: "magnetar::auth::athenz",
+                %status,
+                body_len = body.len(),
+                "ZTS rejected the role-token request (body available at this span)",
+            );
+            return Err(AthenzError::ZtsRejected(redacted_rejected_message(
+                status.as_u16(),
+                &body,
             )));
         }
         serde_json::from_str(&body).map_err(|e| {
-            AthenzError::Config(format!(
-                "zts response not JSON-decodable (body={body}): {e}"
-            ))
+            tracing::debug!(
+                target: "magnetar::auth::athenz",
+                body_len = body.len(),
+                "ZTS response not JSON-decodable (body available at this span): {e}",
+            );
+            AthenzError::Config(redacted_decode_message(&body, &e.to_string()))
         })
     }
+}
+
+/// Build the `Display` string for a ZTS rejection without leaking the
+/// response body. CWE-532 (F7): ZTS error payloads can echo the signed JWT
+/// back, leak tenant session material, or surface internal stack traces.
+/// Operators routinely log error variants verbatim, so the surfaced
+/// `Display` MUST NOT carry the raw bytes. The body length is preserved so
+/// operators can still tell "empty body" from "huge body" at a glance.
+fn redacted_rejected_message(status: u16, body: &str) -> String {
+    format!(
+        "zts returned {status} [body redacted, {} bytes; see DEBUG-level \
+         magnetar::auth::athenz target]",
+        body.len()
+    )
+}
+
+/// Build the `Display` string for a ZTS JSON-decode failure without leaking
+/// the response body. Same CWE-532 reasoning as
+/// [`redacted_rejected_message`].
+fn redacted_decode_message(body: &str, decode_error: &str) -> String {
+    format!(
+        "zts response not JSON-decodable [body redacted, {} bytes; see \
+         DEBUG-level magnetar::auth::athenz target]: {decode_error}",
+        body.len()
+    )
 }
 
 #[cfg(test)]
@@ -202,5 +244,64 @@ mod tests {
     #[test]
     fn zts_grant_default_is_client_credentials() {
         assert!(matches!(ZtsGrant::default(), ZtsGrant::ClientCredentials));
+    }
+
+    /// F7 regression (CWE-532): the ZTS response body MUST NOT bleed into
+    /// the `Display` output of [`AthenzError::ZtsRejected`] or
+    /// [`AthenzError::Config`] when the body comes from the JSON decode
+    /// path. ZTS error payloads can echo the signed JWT back; operators
+    /// routinely log error variants verbatim. The raw body stays
+    /// retrievable via the `magnetar::auth::athenz` tracing target at
+    /// DEBUG.
+    #[test]
+    fn zts_error_messages_redact_response_body() {
+        let body = "{\"error\":\"unauthorized\",\"jwt\":\"eyJhbGciOiJSUzI1NiJ9.client_secret=hunter2.shh\"}";
+
+        let rejected = super::redacted_rejected_message(401, body);
+        assert!(
+            !rejected.contains("hunter2"),
+            "client_secret-style material must NOT leak: {rejected}"
+        );
+        assert!(
+            !rejected.contains("eyJhbGciOiJSUzI1NiJ9"),
+            "JWT material must NOT leak: {rejected}"
+        );
+        assert!(
+            rejected.contains("redacted"),
+            "redaction marker: {rejected}"
+        );
+        assert!(rejected.contains("401"), "status code is safe: {rejected}");
+        // Length preserved so "empty" vs "huge" is visible at a glance.
+        assert!(
+            rejected.contains(&body.len().to_string()),
+            "body length preserved: {rejected}"
+        );
+
+        let decode = super::redacted_decode_message(body, "expected value at line 1 column 1");
+        assert!(
+            !decode.contains("hunter2"),
+            "client_secret material must NOT leak: {decode}"
+        );
+        assert!(
+            !decode.contains("eyJhbGciOiJSUzI1NiJ9"),
+            "JWT material must NOT leak: {decode}"
+        );
+        assert!(decode.contains("redacted"), "redaction marker: {decode}");
+        // Decode error message itself is safe (no user data, just serde context).
+        assert!(
+            decode.contains("expected value"),
+            "decode error must surface: {decode}"
+        );
+
+        // End-to-end through the AthenzError Display surface — a paranoid
+        // operator might also call `format!("{err:?}")`, so make sure the
+        // Debug derive on `AthenzError(String)` doesn't sneak the body
+        // back in (it can't — we never embedded it in the String — but
+        // pin the surface for future-proofing).
+        let err = AthenzError::ZtsRejected(rejected.clone());
+        let displayed = format!("{err}");
+        let debugged = format!("{err:?}");
+        assert!(!displayed.contains("hunter2"), "Display: {displayed}");
+        assert!(!debugged.contains("hunter2"), "Debug: {debugged}");
     }
 }

@@ -43,6 +43,19 @@ pub enum CompressionError {
     /// Decompressed size deviates from the broker-stamped `uncompressed_size`.
     #[error("decompressed size mismatch: got {got}, expected {expected}")]
     SizeMismatch { got: usize, expected: usize },
+    /// Broker-supplied `uncompressed_size` exceeds the per-frame ceiling. A peer
+    /// can otherwise drive an arbitrarily large `Vec::with_capacity` through
+    /// the `expires_in`-style allocation hint and exhaust the process heap
+    /// without ever producing a real frame. Capped at
+    /// [`magnetar_proto::MAX_FRAME_SIZE`] (5 MiB), matching the wire ceiling
+    /// the frame codec already enforces on the outer length.
+    #[error("uncompressed_size {got} exceeds frame ceiling {ceiling}")]
+    UncompressedSizeTooLarge {
+        /// Broker-advertised uncompressed size.
+        got: usize,
+        /// Per-frame ceiling — currently [`magnetar_proto::MAX_FRAME_SIZE`].
+        ceiling: usize,
+    },
 }
 
 /// Map the protobuf-generated enum to our Rust-flavoured one.
@@ -108,6 +121,19 @@ pub fn decompress(
     ciphertext: &[u8],
     uncompressed_size: usize,
 ) -> Result<Bytes, CompressionError> {
+    // Cap the broker-controlled `uncompressed_size` BEFORE allocating. Without
+    // this guard a peer can advertise e.g. `uncompressed_size = u32::MAX` (4
+    // GiB) and drive `Vec::with_capacity(uncompressed_size)` in the Zlib path
+    // (or the `lz4_flex::decompress` output-buffer pre-allocation) to exhaust
+    // the process heap, never producing a real frame. The outer wire codec
+    // already rejects frames larger than `MAX_FRAME_SIZE`; cap the inflated
+    // payload at the same ceiling.
+    if uncompressed_size > magnetar_proto::MAX_FRAME_SIZE {
+        return Err(CompressionError::UncompressedSizeTooLarge {
+            got: uncompressed_size,
+            ceiling: magnetar_proto::MAX_FRAME_SIZE,
+        });
+    }
     let bound = uncompressed_size.saturating_mul(MAX_INFLATE_RATIO).max(64);
     match kind {
         CompressionKind::None => Ok(Bytes::copy_from_slice(ciphertext)),
@@ -206,5 +232,62 @@ mod tests {
         // Lie about the uncompressed size — bound is satisfied but verify_size rejects.
         let err = decompress(CompressionKind::Zstd, &compressed, 999).expect_err("mismatch");
         assert!(matches!(err, super::CompressionError::SizeMismatch { .. }));
+    }
+
+    /// A broker (or a tampered MITM) advertising an outlandish
+    /// `uncompressed_size` must be rejected BEFORE the codec allocates a
+    /// multi-GiB output buffer. The Zlib path used `Vec::with_capacity(
+    /// uncompressed_size)` directly, so without the cap a peer could drive
+    /// the process to OOM with a tiny payload that claims `u32::MAX` bytes
+    /// of plaintext. The ceiling matches `magnetar_proto::MAX_FRAME_SIZE`,
+    /// which the frame codec already enforces on the outer wire length.
+    #[test]
+    fn unchecked_uncompressed_size_is_rejected_before_allocation() {
+        // A vanishingly small Zlib body — its actual plaintext is empty, but
+        // we lie about `uncompressed_size` so the allocator-arming pre-cap is
+        // the only thing standing between the test and an OOM.
+        let tiny = compress(CompressionKind::Zlib, b"").expect("zlib empty compress");
+        let huge = u32::MAX as usize;
+        let err = decompress(CompressionKind::Zlib, &tiny, huge)
+            .expect_err("u32::MAX uncompressed_size must be rejected before allocation");
+        match err {
+            super::CompressionError::UncompressedSizeTooLarge { got, ceiling } => {
+                assert_eq!(got, huge);
+                assert_eq!(ceiling, magnetar_proto::MAX_FRAME_SIZE);
+            }
+            other => panic!("expected UncompressedSizeTooLarge, got {other:?}"),
+        }
+
+        // The cap applies uniformly across codecs — Zstd / LZ4 / Snappy must
+        // not be a bypass route. `uncompressed_size = MAX_FRAME_SIZE + 1` is
+        // the smallest over-cap value; using it locks the boundary check.
+        let over = magnetar_proto::MAX_FRAME_SIZE + 1;
+        for kind in [
+            CompressionKind::Zlib,
+            CompressionKind::Zstd,
+            CompressionKind::Lz4,
+            CompressionKind::Snappy,
+        ] {
+            // The body content does not matter — the cap rejects before any
+            // codec call. Passing an empty slice keeps the test cheap.
+            let err = decompress(kind, &[], over).expect_err("over-cap rejected");
+            assert!(
+                matches!(
+                    err,
+                    super::CompressionError::UncompressedSizeTooLarge { .. }
+                ),
+                "kind={kind:?} expected UncompressedSizeTooLarge, got {err:?}"
+            );
+        }
+
+        // Right at the cap, the pre-allocation gate must NOT fire — the
+        // codec's own decode path then takes over. A real payload of exactly
+        // 64 bytes round-trips successfully through Zstd; this lets us
+        // distinguish "guard rejected" from "guard accepted, codec verified".
+        let payload = vec![0xABu8; 64];
+        let compressed = compress(CompressionKind::Zstd, &payload).expect("zstd compress");
+        let out = decompress(CompressionKind::Zstd, &compressed, payload.len())
+            .expect("under-cap legit payload round-trips");
+        assert_eq!(&out[..], &payload[..]);
     }
 }

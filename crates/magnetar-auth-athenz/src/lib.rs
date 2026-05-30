@@ -319,8 +319,7 @@ impl AthenzProvider {
         let claims = self.build_claims()?;
         let jwt = signer.sign(&claims)?;
         let response = zts.exchange(&jwt).await?;
-        let ttl = std::time::Duration::from_secs(response.expires_in);
-        let refresh_at = now + ttl.checked_sub(self.refresh_margin).unwrap_or(ttl);
+        let refresh_at = refresh_at_from_expires_in(now, response.expires_in, self.refresh_margin);
         *self.cache.lock() = Some(CachedRoleToken {
             token: Bytes::from(response.access_token.into_bytes()),
             refresh_at: Some(refresh_at),
@@ -349,6 +348,33 @@ impl AthenzProvider {
             exp: now + self.jwt_ttl.as_secs(),
         })
     }
+}
+
+/// Compute the cached role-token refresh deadline from the ZTS-advertised
+/// `expires_in` seconds and a refresh margin, without ever panicking on
+/// overflow.
+///
+/// A ZTS endpoint advertising e.g. `expires_in = u64::MAX` would otherwise
+/// panic inside `Instant::add` on the naive `now + ttl - margin` path.
+/// `checked_add` clamps to a 1-hour safe default so the cache still gets a
+/// non-`None` `refresh_at` and the next [`AthenzProvider::needs_refresh`]
+/// call re-fetches well before any plausible real expiry.
+#[cfg(feature = "zts")]
+fn refresh_at_from_expires_in(
+    now: std::time::Instant,
+    expires_in: u64,
+    refresh_margin: std::time::Duration,
+) -> std::time::Instant {
+    let ttl = std::time::Duration::from_secs(expires_in);
+    let effective = ttl.checked_sub(refresh_margin).unwrap_or(ttl);
+    now.checked_add(effective).unwrap_or_else(|| {
+        tracing::warn!(
+            target: "magnetar::auth::athenz",
+            expires_in,
+            "ZTS-advertised expires_in overflows Instant; falling back to 1h safe default",
+        );
+        now + std::time::Duration::from_secs(3600)
+    })
 }
 
 /// Builder for [`AthenzProvider`] (behind `feature = "zts"`).
@@ -553,6 +579,34 @@ mod tests {
         assert_eq!(claims.aud, "https://zts.example.invalid:4443/zts/v1/");
         assert_eq!(claims.iat, 1_700_000_000);
         assert_eq!(claims.exp, 1_700_000_000 + super::DEFAULT_JWT_TTL.as_secs());
+    }
+
+    /// F5 regression: a ZTS endpoint advertising `expires_in = u64::MAX`
+    /// must not panic inside `Instant::add`. The helper falls back to a
+    /// 1-hour safe default so the cached entry still gets a usable
+    /// `refresh_at` and the next `needs_refresh` call re-fetches well
+    /// before any plausible real expiry.
+    #[cfg(feature = "zts")]
+    #[test]
+    fn refresh_at_from_expires_in_clamps_u64_max() {
+        let now = std::time::Instant::now();
+        let margin = std::time::Duration::from_secs(300);
+        let refresh_at = super::refresh_at_from_expires_in(now, u64::MAX, margin);
+        let expected = now + std::time::Duration::from_secs(3600);
+        assert_eq!(
+            refresh_at, expected,
+            "u64::MAX expires_in must clamp to the 1h fallback"
+        );
+
+        // Sanity: a normal in-range value still yields the obvious window.
+        let refresh_at_normal = super::refresh_at_from_expires_in(now, 600, margin);
+        let expected_normal = now + std::time::Duration::from_secs(600 - 300);
+        assert_eq!(refresh_at_normal, expected_normal);
+
+        // Margin >= ttl: helper falls back to `now + ttl` (no negative window).
+        let refresh_at_short =
+            super::refresh_at_from_expires_in(now, 60, std::time::Duration::from_secs(120));
+        assert_eq!(refresh_at_short, now + std::time::Duration::from_secs(60));
     }
 
     #[test]

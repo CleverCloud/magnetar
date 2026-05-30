@@ -1125,23 +1125,42 @@ impl Future for ReceiveFut {
         loop {
             let mut conn = shared.inner.lock();
             let Some(mut msg) = conn.pop_message(handle) else {
-                // No message ready. Install (or refresh) our per-consumer waker
-                // slab slot so the state machine wakes us when a new
-                // `CommandMessage` arrives. If the consumer has been closed
-                // since we last polled, register_consumer_receive_waker returns
-                // `None` and we surface the terminal state immediately.
+                // No message ready. First, check whether the connection or
+                // the consumer has already been closed — `close()` on a cloned
+                // handle flips `consumer_is_closed` synchronously and drains
+                // every parked waker BEFORE we install ours. Without this
+                // pre-check the freshly-installed slab slot would never be
+                // woken, parking the receive future forever. Mirrors the
+                // moonpool `ReceiveFut::poll` close-race guard.
+                if conn.is_closed() || conn.consumer_is_closed(handle) {
+                    if let Some(old_key) = this.slab_key.take() {
+                        conn.cancel_consumer_receive_waker(handle, old_key);
+                    }
+                    return Poll::Ready(Err(ClientError::Closed));
+                }
+                // Install (or refresh) our per-consumer waker slab slot so the
+                // state machine wakes us when a new `CommandMessage` arrives.
+                // If the consumer has been closed since we last polled,
+                // register_consumer_receive_waker returns `None` and we
+                // surface the terminal state immediately.
                 if let Some(old_key) = this.slab_key.take() {
                     conn.cancel_consumer_receive_waker(handle, old_key);
                 }
                 if let Some(key) = conn.register_consumer_receive_waker(handle, cx.waker().clone())
                 {
-                    // Re-check the queue under the lock so an arrival that
-                    // landed between the pop_message above and the slab
-                    // insert doesn't wake a (now-evicted) earlier slot.
+                    // Re-check the queue + closed state under the lock so an
+                    // arrival OR a close() that landed between the pre-check
+                    // above and the slab insert doesn't wake a (now-evicted)
+                    // earlier slot — or strand us on a slot that close() has
+                    // already drained.
                     if conn.peek_message_payload_size(handle).is_some() {
                         // Cancel our just-installed slot and loop to pop.
                         conn.cancel_consumer_receive_waker(handle, key);
                         continue;
+                    }
+                    if conn.is_closed() || conn.consumer_is_closed(handle) {
+                        conn.cancel_consumer_receive_waker(handle, key);
+                        return Poll::Ready(Err(ClientError::Closed));
                     }
                     this.slab_key = Some(key);
                     drop(conn);
@@ -2928,5 +2947,62 @@ mod tests {
             consumer.drain_dead_letter().is_empty(),
             "no messages have been flagged for DLQ yet",
         );
+    }
+
+    /// Close-race regression: a [`Consumer::receive`] in progress on one
+    /// cloned handle must NOT park forever when [`Consumer::close`] runs on
+    /// another cloned handle. The narrow window is:
+    ///
+    /// 1. Thread B calls `close()`, which (synchronously, under the global lock) flips
+    ///    `consumer_is_closed` and drains every parked waker — but Thread A's waker isn't parked
+    ///    yet.
+    /// 2. Thread A's `ReceiveFut::poll` enters its critical section, sees `pop_message == None`,
+    ///    registers its waker, and parks.
+    /// 3. No future close fires → Thread A waits forever.
+    ///
+    /// The fix in `ReceiveFut::poll` re-checks `is_closed() ||
+    /// consumer_is_closed()` BEFORE handing back `Poll::Pending` so the
+    /// already-closed state is surfaced as `Err(Closed)`. To reproduce the
+    /// race deterministically we don't drive the async close path (which
+    /// would deadlock the test on its own broker-ack RequestFut); we mark
+    /// the consumer locally via the proto API — the same observable effect
+    /// `close()` produces under the global lock — and then await the
+    /// `receive()` future with a tokio timeout. If the fix regressed, the
+    /// test would hang and the timeout would fire instead of `Err(Closed)`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_returns_closed_after_local_close_race() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/close-race".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer {
+            shared: shared.clone(),
+            handle,
+            slot: slot.clone(),
+            decryptor: None,
+        };
+
+        // Simulate the close-race: another (cloned) handle ran `close()` and
+        // flipped the per-slot `closed` bit + drained wakers BEFORE we ever
+        // installed ours. The receive future must spot the closed state and
+        // resolve `Err(Closed)` — without the fix it would register a waker
+        // that no later wake_one() will service and `tokio::time::timeout`
+        // would elapse.
+        slot.state.lock().close();
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(250), consumer.receive())
+                .await
+                .expect("receive must resolve quickly; timeout means ReceiveFut parked forever");
+        match outcome {
+            Err(ClientError::Closed) => {}
+            other => panic!("expected Err(Closed) after local close, got {other:?}"),
+        }
     }
 }

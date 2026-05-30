@@ -63,17 +63,40 @@ pub enum OAuth2Error {
     Transport(#[source] reqwest::Error),
 
     /// The IDP returned a non-2xx response.
-    #[error("OAuth2 token endpoint returned HTTP {status}: {body}")]
+    ///
+    /// The `Display` implementation REDACTS the body to defuse CWE-532
+    /// (sensitive-data exposure in logs): IDP error payloads frequently echo
+    /// the original POST form back — `client_secret=...`, refresh tokens,
+    /// session JWTs — and operators routinely log error variants verbatim.
+    /// Use [`Self::body`] (or a `tracing::trace!` span gated behind an
+    /// opt-in flag) to get the raw bytes when debugging.
+    #[error("OAuth2 token endpoint returned HTTP {status} [body redacted, {} bytes; use OAuth2Error::body() to inspect]", body.len())]
     Idp {
         /// HTTP status code from the IDP.
         status: u16,
         /// Response body — usually a JSON `{"error": "...", "error_description": "..."}`.
+        /// Available via [`Self::body`]; redacted from the `Display` output.
         body: String,
     },
 
     /// The IDP response was not parseable as a [`TokenResponse`].
     #[error("OAuth2 token endpoint returned malformed JSON: {0}")]
     Decode(#[source] serde_json::Error),
+}
+
+impl OAuth2Error {
+    /// Inspect the raw IDP response body for an [`OAuth2Error::Idp`] variant.
+    /// Returns `None` for every other variant. The body is deliberately NOT
+    /// included in `Display` / `to_string` output (CWE-532, F7) — IDP error
+    /// payloads frequently echo the original POST form back and operators
+    /// routinely log error variants verbatim.
+    #[must_use]
+    pub fn body(&self) -> Option<&str> {
+        match self {
+            OAuth2Error::Idp { body, .. } => Some(body),
+            _ => None,
+        }
+    }
 }
 
 impl From<OAuth2Error> for AuthError {
@@ -429,7 +452,7 @@ impl ClientCredentialsFlow {
             });
         }
         let parsed: TokenResponse = serde_json::from_str(&body).map_err(OAuth2Error::Decode)?;
-        let deadline = self.clock.now() + Duration::from_secs(parsed.expires_in);
+        let deadline = deadline_from_expires_in(self.clock.now(), parsed.expires_in);
         let cached = CachedToken {
             access_token: Bytes::from(parsed.access_token.clone().into_bytes()),
             deadline,
@@ -462,6 +485,29 @@ impl ClientCredentialsFlow {
     pub fn cached_access_token(&self) -> Option<Bytes> {
         self.cache.lock().as_ref().map(|c| c.access_token.clone())
     }
+}
+
+/// Compute the cached-token deadline from the IDP-advertised `expires_in`
+/// seconds without ever panicking on overflow.
+///
+/// IDPs occasionally advertise wildly large `expires_in` values — Auth0 has
+/// been observed returning `u32::MAX` for "never expires" client-credentials
+/// grants, and a misconfigured Keycloak realm can stamp seconds-since-epoch
+/// rather than a duration. Naive `Instant::now() + Duration::from_secs(...)`
+/// then panics inside `Instant::add`. Clamp via `checked_add`; on overflow,
+/// fall back to a 1-hour safe default with a warning so the cache still gets
+/// a non-`None` deadline and `needs_refresh` re-fetches well before any
+/// plausible real expiry.
+fn deadline_from_expires_in(now: Instant, expires_in: u64) -> Instant {
+    now.checked_add(Duration::from_secs(expires_in))
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                target: "magnetar::auth::oauth2",
+                expires_in,
+                "IDP-advertised expires_in overflows Instant; falling back to 1h safe default",
+            );
+            now + Duration::from_secs(3600)
+        })
 }
 
 impl AuthProvider for ClientCredentialsFlow {
@@ -673,5 +719,67 @@ mod tests {
         let clock = VirtualClock::new();
         let flow = build_flow(clock);
         assert_eq!(flow.method(), "token");
+    }
+
+    /// F7 regression (CWE-532): the IDP response body MUST NOT bleed into
+    /// the `Display` output of [`OAuth2Error::Idp`]. IDP error payloads
+    /// frequently echo the original POST form back — `client_secret=...`,
+    /// refresh tokens, session JWTs — and operators routinely log error
+    /// variants verbatim. The raw body stays available via
+    /// [`OAuth2Error::body`] for opt-in inspection.
+    #[test]
+    fn idp_error_display_redacts_response_body() {
+        let body = "{\"error\":\"invalid_grant\",\"posted_form\":\"client_secret=hunter2&refresh_token=eyJ.shh\"}";
+        let err = super::OAuth2Error::Idp {
+            status: 401,
+            body: body.to_owned(),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "client_secret must NOT leak through Display: {rendered}"
+        );
+        assert!(
+            !rendered.contains("refresh_token"),
+            "refresh_token must NOT leak through Display: {rendered}"
+        );
+        assert!(
+            !rendered.contains("eyJ.shh"),
+            "JWT material must NOT leak through Display: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "redaction marker must be present: {rendered}"
+        );
+        assert!(
+            rendered.contains("401"),
+            "status code is safe to surface: {rendered}"
+        );
+        // The body must still be retrievable via the opt-in getter.
+        assert_eq!(err.body(), Some(body));
+        // Other variants do not have a body.
+        let cfg = super::OAuth2Error::Config("missing field".to_owned());
+        assert_eq!(cfg.body(), None);
+    }
+
+    /// F4 regression: an IDP advertising `expires_in = u64::MAX` (Auth0's
+    /// observed "never expires" sentinel, or a misconfigured realm
+    /// stamping seconds-since-epoch instead of a duration) must not panic
+    /// inside `Instant::add`. The deadline helper falls back to a 1-hour
+    /// safe default so the cache still gets a usable refresh-by deadline.
+    #[test]
+    fn deadline_from_expires_in_clamps_u64_max() {
+        let now = Instant::now();
+        // u64::MAX seconds is well past the Instant range on every
+        // platform we support; before the fix this would have panicked on
+        // overflow inside `Instant::add`.
+        let deadline = super::deadline_from_expires_in(now, u64::MAX);
+        // Fallback is `now + 3600s`, which is always representable.
+        let expected = now + Duration::from_secs(3600);
+        assert_eq!(deadline, expected, "u64::MAX must clamp to 1h default");
+
+        // Sanity: a normal in-range value still produces the obvious deadline.
+        let normal = super::deadline_from_expires_in(now, 60);
+        assert_eq!(normal, now + Duration::from_secs(60));
     }
 }
