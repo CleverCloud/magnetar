@@ -52,6 +52,12 @@ pub(crate) enum Transport<P: Providers> {
     Plain {
         /// The underlying byte pipe.
         stream: <P::Network as NetworkProvider>::TcpStream,
+        /// Reusable heap-backed read scratch — `read_into` lands wire bytes
+        /// here once per transport (not once per call) before copying into
+        /// the caller's `BytesMut`. Owned on the `Transport` so the returned
+        /// read future stays small (a `[u8; TLS_WIRE_BUFFER]` on the stack
+        /// trips clippy's `large_futures`); see [`Self::read_into`].
+        read_scratch: Box<[u8]>,
     },
     /// TLS `pulsar+ssl://` connection — same byte pipe wrapped in a
     /// [`RustlsByteAdapter`]. The plaintext driver loop sees only decrypted
@@ -67,6 +73,12 @@ pub(crate) enum Transport<P: Providers> {
         /// caller's buffer fills up — we may decrypt more bytes than the
         /// caller asked for in a single `read_buf` call.
         plaintext_overflow: BytesMut,
+        /// Reusable heap-backed wire scratch — ciphertext pulled off the
+        /// wire lands here before being handed to [`RustlsByteAdapter`],
+        /// reused across reads and across the handshake. See the rationale
+        /// on [`Self::read_into`] for why it lives here rather than on the
+        /// stack.
+        read_scratch: Box<[u8]>,
     },
 }
 
@@ -76,17 +88,21 @@ impl<P: Providers> Transport<P> {
     /// not provide). One read, `0` == EOF, matching the single-`poll_read`
     /// semantics the old `stream.read_buf(&mut buf)` calls relied on.
     ///
-    /// The scratch is heap-allocated (not a `[u8; TLS_WIRE_BUFFER]` on the
-    /// stack) so the returned future doesn't carry a 16 KiB frame across
-    /// its `.await` — that tripped clippy's `large_futures` once this
-    /// helper got inlined into the handshake / read futures.
+    /// The scratch is owned by the caller (a reusable `Box<[u8]>` field on
+    /// the `Transport`) rather than allocated per call: the old in-place
+    /// `read_buf` read into the buffer's spare capacity with no extra alloc,
+    /// and this restores that. The scratch is *not* a `[u8; TLS_WIRE_BUFFER]`
+    /// on the stack — that would carry a 16 KiB frame across the `.await` and
+    /// trip clippy's `large_futures` once this helper got inlined into the
+    /// handshake / read futures. Passing a `&mut [u8]` keeps the returned
+    /// future pointer-sized.
     async fn read_into<S: futures::io::AsyncRead + Unpin>(
         stream: &mut S,
+        scratch: &mut [u8],
         buf: &mut BytesMut,
     ) -> io::Result<usize> {
-        let mut tmp = vec![0u8; TLS_WIRE_BUFFER];
-        let n = stream.read(&mut tmp).await?;
-        buf.extend_from_slice(&tmp[..n]);
+        let n = stream.read(scratch).await?;
+        buf.extend_from_slice(&scratch[..n]);
         Ok(n)
     }
 
@@ -98,7 +114,10 @@ impl<P: Providers> Transport<P> {
     /// [`EngineError::Io`].
     pub(crate) async fn connect(network: &P::Network, addr: &str) -> Result<Self, EngineError> {
         let stream = network.connect(addr).await.map_err(EngineError::Io)?;
-        Ok(Self::Plain { stream })
+        Ok(Self::Plain {
+            stream,
+            read_scratch: new_read_scratch(),
+        })
     }
 
     /// Establish a plaintext connection, routing host resolution through
@@ -134,7 +153,12 @@ impl<P: Providers> Transport<P> {
         for sa in addrs {
             let formatted = sa.to_string();
             match network.connect(&formatted).await {
-                Ok(stream) => return Ok(Self::Plain { stream }),
+                Ok(stream) => {
+                    return Ok(Self::Plain {
+                        stream,
+                        read_scratch: new_read_scratch(),
+                    });
+                }
                 Err(e) => last_err = Some(e),
             }
         }
@@ -168,7 +192,7 @@ impl<P: Providers> Transport<P> {
     ) -> Result<Self, EngineError> {
         let plain = Self::connect_with_resolver(network, addr, resolver).await?;
         let stream = match plain {
-            Self::Plain { stream } => stream,
+            Self::Plain { stream, .. } => stream,
             Self::Tls { .. } => unreachable!("connect_with_resolver only yields Plain"),
         };
         let server_name = ServerName::try_from(host.to_owned()).map_err(|err| {
@@ -179,6 +203,7 @@ impl<P: Providers> Transport<P> {
             stream,
             adapter: Box::new(RustlsByteAdapter::new(session)),
             plaintext_overflow: BytesMut::with_capacity(TLS_WIRE_BUFFER),
+            read_scratch: new_read_scratch(),
         };
         // Drive the handshake to completion. The adapter is stateful: pump
         // outbound ciphertext, pull inbound, repeat until rustls reports
@@ -194,14 +219,16 @@ impl<P: Providers> Transport<P> {
     /// payload to traverse the encrypted channel.
     async fn tls_handshake(&mut self) -> Result<(), EngineError> {
         let Self::Tls {
-            stream, adapter, ..
+            stream,
+            adapter,
+            read_scratch,
+            ..
         } = self
         else {
             return Ok(());
         };
         // Kick the adapter once to queue the ClientHello.
         adapter.step().map_err(EngineError::Tls)?;
-        let mut wire_buf = BytesMut::with_capacity(TLS_WIRE_BUFFER);
         while adapter.is_handshaking() {
             // Push any ciphertext rustls has buffered for the wire.
             let out = adapter.take_encrypted_outbound();
@@ -212,15 +239,14 @@ impl<P: Providers> Transport<P> {
             if !adapter.is_handshaking() {
                 break;
             }
-            // Pull more ciphertext off the wire.
-            wire_buf.clear();
-            let n = Self::read_into(stream, &mut wire_buf)
-                .await
-                .map_err(EngineError::Io)?;
+            // Pull more ciphertext off the wire directly into the reusable
+            // scratch — no intermediate `BytesMut` copy. Mirrors the TLS
+            // arm in `read_buf`.
+            let n = stream.read(read_scratch).await.map_err(EngineError::Io)?;
             if n == 0 {
                 return Err(EngineError::PeerClosed);
             }
-            adapter.push_encrypted(&wire_buf);
+            adapter.push_encrypted(&read_scratch[..n]);
             adapter.step().map_err(EngineError::Tls)?;
         }
         // One final pump to drain any post-handshake bytes (e.g. NewSessionTicket).
@@ -244,7 +270,7 @@ impl<P: Providers> Transport<P> {
     #[allow(dead_code)]
     pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Plain { stream } => stream.read(buf).await,
+            Self::Plain { stream, .. } => stream.read(buf).await,
             Self::Tls { .. } => {
                 // The TLS path goes through `read_buf` — wrap the slice in a
                 // BytesMut for symmetry.
@@ -267,11 +293,15 @@ impl<P: Providers> Transport<P> {
     /// decrypt failures (translated to [`io::ErrorKind::InvalidData`]).
     pub(crate) async fn read_buf(&mut self, buf: &mut bytes::BytesMut) -> io::Result<usize> {
         match self {
-            Self::Plain { stream } => Self::read_into(stream, buf).await,
+            Self::Plain {
+                stream,
+                read_scratch,
+            } => Self::read_into(stream, read_scratch, buf).await,
             Self::Tls {
                 stream,
                 adapter,
                 plaintext_overflow,
+                read_scratch,
             } => {
                 // 1. Drain any plaintext we previously decoded but couldn't fit.
                 if !plaintext_overflow.is_empty() {
@@ -288,12 +318,14 @@ impl<P: Providers> Transport<P> {
                 //    we re-issue the wire read until we either have plaintext or the peer actually
                 //    drops.
                 loop {
-                    let mut wire = BytesMut::with_capacity(TLS_WIRE_BUFFER);
-                    let read_n = Self::read_into(stream, &mut wire).await?;
+                    // Land ciphertext directly into the reusable scratch and
+                    // hand the filled prefix to the adapter — no per-iteration
+                    // heap allocation.
+                    let read_n = stream.read(read_scratch).await?;
                     if read_n == 0 {
                         return Ok(0);
                     }
-                    adapter.push_encrypted(&wire);
+                    adapter.push_encrypted(&read_scratch[..read_n]);
                     adapter
                         .step()
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -323,7 +355,7 @@ impl<P: Providers> Transport<P> {
     /// encryption failures (translated to [`io::ErrorKind::InvalidData`]).
     pub(crate) async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match self {
-            Self::Plain { stream } => stream.write_all(buf).await,
+            Self::Plain { stream, .. } => stream.write_all(buf).await,
             Self::Tls {
                 stream, adapter, ..
             } => {
@@ -353,7 +385,7 @@ impl<P: Providers> Transport<P> {
     /// as [`io::ErrorKind::WriteZero`] so the driver doesn't spin.
     pub(crate) async fn write_all_vectored(&mut self, segs: &[bytes::Bytes]) -> io::Result<()> {
         match self {
-            Self::Plain { stream } => {
+            Self::Plain { stream, .. } => {
                 // Real segment-granular writev: moonpool's `SimTcpStream`
                 // records each `IoSlice` as its own ordered delivery event,
                 // so the chaos pack can drop / reorder at segment boundaries.
@@ -431,7 +463,7 @@ impl<P: Providers> Transport<P> {
     /// Propagates the underlying `AsyncWrite::poll_flush` error.
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
         match self {
-            Self::Plain { stream } => stream.flush().await,
+            Self::Plain { stream, .. } => stream.flush().await,
             Self::Tls {
                 stream, adapter, ..
             } => {
@@ -459,10 +491,19 @@ impl<P: Providers> Transport<P> {
         // `TcpStream` vs the `rustls`-wrapped stream) — clippy can't see that.
         #[allow(clippy::match_same_arms)]
         match self {
-            Self::Plain { stream } => stream.close().await,
+            Self::Plain { stream, .. } => stream.close().await,
             Self::Tls { stream, .. } => stream.close().await,
         }
     }
+}
+
+/// Allocate the reusable per-transport read scratch. A heap-backed
+/// `Box<[u8]>` of [`TLS_WIRE_BUFFER`] bytes, reused across every wire read
+/// for the life of the transport so `read_into` no longer allocates per
+/// call. Lives on the heap (not the stack) so the returned read future
+/// stays small — see [`Transport::read_into`].
+fn new_read_scratch() -> Box<[u8]> {
+    vec![0u8; TLS_WIRE_BUFFER].into_boxed_slice()
 }
 
 /// Split a `host:port` literal into its components. Mirrors the trivial
@@ -594,6 +635,7 @@ mod tests {
 
             let mut transport: Transport<SimProviders> = Transport::Plain {
                 stream: client_stream,
+                read_scratch: super::new_read_scratch(),
             };
 
             let segs = vec![
@@ -713,14 +755,17 @@ mod tests {
         stream: <<SimProviders as moonpool_core::Providers>::Network as NetworkProvider>::TcpStream,
         segs: Vec<Bytes>,
     ) {
-        let mut transport: Transport<SimProviders> = Transport::Plain { stream };
+        let mut transport: Transport<SimProviders> = Transport::Plain {
+            stream,
+            read_scratch: super::new_read_scratch(),
+        };
         transport
             .write_all_vectored(&segs)
             .await
             .expect("vectored write (partial-accept)");
         // Close so the server sees a clean EOF after the last byte.
         let _ = AsyncWriteExt::close(&mut match transport {
-            Transport::Plain { stream } => stream,
+            Transport::Plain { stream, .. } => stream,
             Transport::Tls { .. } => unreachable!("constructed Plain"),
         })
         .await;
