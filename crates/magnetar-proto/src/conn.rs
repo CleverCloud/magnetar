@@ -1969,10 +1969,14 @@ impl Connection {
 
     /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
     /// per-consumer tracker deadline (negative-ack delay + unacked-message timeout).
+    ///
+    /// All `Instant + Duration` sites route through
+    /// [`crate::time::deadline_with_clamp`] so a near-`Duration::MAX`
+    /// keepalive interval cannot panic (invariant #6).
     pub fn poll_timeout(&self) -> Option<Instant> {
         let mut next = self
             .last_activity
-            .map(|t| t + self.config.keepalive_interval);
+            .map(|t| crate::time::deadline_with_clamp(t, self.config.keepalive_interval));
         let mut consider = |deadline: Instant| {
             next = Some(match next {
                 Some(current) => current.min(deadline),
@@ -2012,9 +2016,15 @@ impl Connection {
     /// Tick the state machine — fires keepalive pings + any per-consumer tracker actions
     /// whose deadlines have elapsed.
     pub fn handle_timeout(&mut self, now: Instant) {
-        // Keepalive.
+        // Keepalive. `deadline_with_clamp` keeps near-`Duration::MAX`
+        // keepalive intervals panic-free per invariant #6.
         let due = match self.last_activity {
-            Some(last) if now >= last + self.config.keepalive_interval => true,
+            Some(last)
+                if now
+                    >= crate::time::deadline_with_clamp(last, self.config.keepalive_interval) =>
+            {
+                true
+            }
             None => false,
             _ => false,
         };

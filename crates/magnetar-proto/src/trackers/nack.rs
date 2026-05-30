@@ -48,8 +48,12 @@ impl NegativeAcksTracker {
     }
 
     /// Nack a message. Returns no immediate actions; the redelivery will fire on a later tick.
+    ///
+    /// `now + redelivery_delay` routes through
+    /// [`crate::time::deadline_with_clamp`] so a `Duration::MAX`-shaped
+    /// delay cannot panic (invariant #6).
     pub fn add(&mut self, message_id: MessageId, now: Instant) {
-        let deadline = now + self.redelivery_delay;
+        let deadline = crate::time::deadline_with_clamp(now, self.redelivery_delay);
         self.pending.insert(message_id, deadline);
     }
 
@@ -57,8 +61,11 @@ impl NegativeAcksTracker {
     /// `redelivery_delay`. Mirrors Java's PIP-37 `NegativeAckRedeliveryBackoff` flow where
     /// the per-message delay is computed from the broker-reported redelivery count via
     /// [`MultiplierRedeliveryBackoff::delay_for`].
+    ///
+    /// Uses the same panic-free clamp as [`Self::add`].
     pub fn add_with_delay(&mut self, message_id: MessageId, delay: Duration, now: Instant) {
-        self.pending.insert(message_id, now + delay);
+        self.pending
+            .insert(message_id, crate::time::deadline_with_clamp(now, delay));
     }
 
     /// Drop tracking for a message (e.g. positive ack arrived after the nack).

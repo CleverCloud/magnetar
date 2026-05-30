@@ -123,7 +123,7 @@ impl UnackedMessageTracker {
         {
             return;
         }
-        let deadline = now + backoff.delay_for(redelivery_count);
+        let deadline = crate::time::deadline_with_clamp(now, backoff.delay_for(redelivery_count));
         self.backoff_pending.insert(message_id, deadline);
     }
 
@@ -214,7 +214,7 @@ impl UnackedMessageTracker {
             }
         }
         let bucket = Bucket {
-            deadline: now + self.ack_timeout,
+            deadline: crate::time::deadline_with_clamp(now, self.ack_timeout),
             ids: HashSet::new(),
         };
         self.buckets.push(bucket);

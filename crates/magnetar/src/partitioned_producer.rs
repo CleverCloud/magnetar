@@ -8,8 +8,6 @@
 //! and routes user sends to the appropriate child via a configurable routing strategy.
 //! Otherwise it falls back to a single producer on the original topic.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -27,8 +25,11 @@ use crate::{Engine, PulsarClient, TokioEngine};
 /// How a [`PartitionedProducer`] picks the partition for an outgoing message.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MessageRoutingMode {
-    /// Hash the message's partition key. Falls back to round-robin when no key is set.
-    /// Mirrors Java `MessageRoutingMode.CustomPartition` with the default `JavaStringHash`.
+    /// Hash the message's partition key via Java's `String.hashCode()` (the
+    /// `HashingScheme.JavaStringHash` default), then `% partitions`. Falls back
+    /// to round-robin when no key is set or the key is empty. Wire-compatible
+    /// with Java's default routing: the same key on a Rust producer and a
+    /// Java producer lands on the same partition.
     #[default]
     KeyHashOrRoundRobin,
     /// Always round-robin, ignoring any partition key.
@@ -356,11 +357,16 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
                 (prev as usize) % n
             }
             MessageRoutingMode::KeyHashOrRoundRobin => match key {
-                Some(k) if !k.is_empty() => {
-                    let mut h = DefaultHasher::new();
-                    k.hash(&mut h);
-                    (h.finish() as usize) % n
-                }
+                // Java parity: `HashingScheme.JavaStringHash` —
+                // `String.hashCode() & Integer.MAX_VALUE`, masked into a
+                // non-negative i32. The earlier implementation used Rust's
+                // `DefaultHasher` (SipHash with a process-randomised seed),
+                // which broke cross-language key affinity: the same key
+                // routed to a different partition from a Java producer,
+                // defeating the whole point of keyed partitioning. See R2/F3
+                // for the regression. The `java_string_hash` helper is the
+                // same one wired into [`JavaStringHashHasher`].
+                Some(k) if !k.is_empty() => (java_string_hash(k) as usize) % n,
                 _ => {
                     let prev = self.cursor.fetch_add(1, Ordering::Relaxed);
                     (prev as usize) % n
@@ -996,19 +1002,74 @@ mod tests {
             cursor: AtomicU64::new(0),
             auto_update: None,
         };
-        // We can't actually run pick_partition with 0 partitions; emulate by injecting a
-        // fake stub: route fn is pure given the routing mode + cursor state.
-        // Confirm that the same key yields the same partition for a given total.
-        let pick_a = key_hash("alpha", 4);
-        let pick_b = key_hash("alpha", 4);
+        // We can't actually run pick_partition with 0 partitions; emulate by mirroring
+        // the same `java_string_hash` math the production path uses. Confirms that
+        // the same key yields the same partition for a given total — both sides
+        // call into `java_string_hash`.
+        let pick_a = (java_string_hash("alpha") as usize) % 4;
+        let pick_b = (java_string_hash("alpha") as usize) % 4;
         assert_eq!(pick_a, pick_b);
         let _ = pp; // suppress unused
     }
 
-    fn key_hash(k: &str, n: usize) -> usize {
-        let mut h = DefaultHasher::new();
-        k.hash(&mut h);
-        (h.finish() as usize) % n
+    /// F3 — `MessageRoutingMode::KeyHashOrRoundRobin` must use Java's
+    /// `String.hashCode()` (a.k.a. `HashingScheme.JavaStringHash`), not
+    /// Rust's `DefaultHasher`. Otherwise a Rust-side keyed producer
+    /// routes the same key to a different partition than a Java
+    /// producer (or even than a different process — Rust's
+    /// `DefaultHasher` carries a per-process random seed). This test
+    /// pins the routing math to the same `java_string_hash` invariants
+    /// that the existing `HashTest` vectors lock in.
+    ///
+    /// Java `"alpha".hashCode()` is `92909918` — we mirror the
+    /// `& Integer.MAX_VALUE` mask, then `% partitions`. `"abc"` is the
+    /// textbook value `96354`. Empty key drops to round-robin (and so
+    /// doesn't enter this branch).
+    #[test]
+    fn default_routing_uses_java_string_hash_not_default_hasher() {
+        // Sanity: the helper still matches the well-known Java values.
+        assert_eq!(java_string_hash("alpha"), 92_909_918);
+        assert_eq!(java_string_hash("abc"), 96_354);
+
+        // The router branch the production code takes for non-empty
+        // keys: `(java_string_hash(k) as usize) % n`. We mirror the
+        // computation directly because constructing a `PartitionedProducer`
+        // with N>0 partitions requires real per-partition producers
+        // (which require a broker). The point is parity — same key,
+        // same partition, regardless of how many times we call it,
+        // and across processes.
+        for &(key, partitions, expected_alpha) in &[
+            ("alpha", 4_usize, (92_909_918_usize) % 4),
+            ("alpha", 16_usize, (92_909_918_usize) % 16),
+            ("abc", 8_usize, (96_354_usize) % 8),
+            ("keykeykeykeykey1", 8_usize, (434_058_482_usize) % 8),
+            ("keykeykey2", 32_usize, (42_978_643_usize) % 32),
+        ] {
+            let pick = (java_string_hash(key) as usize) % partitions;
+            assert_eq!(
+                pick, expected_alpha,
+                "key={key:?} partitions={partitions} must match Java's \
+                 String.hashCode() & Integer.MAX_VALUE then % partitions"
+            );
+        }
+
+        // Determinism across calls — the previous DefaultHasher path
+        // failed this within a single process whenever RandomState
+        // rotated; across processes it failed every restart.
+        let snapshot_a = (java_string_hash("user-42") as usize) % 16;
+        let snapshot_b = (java_string_hash("user-42") as usize) % 16;
+        assert_eq!(snapshot_a, snapshot_b);
+
+        // Multi-byte / non-ASCII key — UTF-16 path. Java treats
+        // non-BMP code points as surrogate pairs, which
+        // `java_string_hash` mirrors via `encode_utf16`. Use a BMP
+        // multibyte character so the test is portable.
+        let multi = "éclair"; // 'é' = U+00E9, 1 UTF-16 unit
+        let _ = (java_string_hash(multi) as usize) % 8;
+        // Determinism on multi-byte input.
+        let a = (java_string_hash(multi) as usize) % 8;
+        let b = (java_string_hash(multi) as usize) % 8;
+        assert_eq!(a, b);
     }
 
     #[derive(Debug)]

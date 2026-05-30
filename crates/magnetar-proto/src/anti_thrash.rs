@@ -359,7 +359,7 @@ impl AntiThrashState {
             return;
         }
 
-        self.cooldown_until = Some(now + self.cooldown);
+        self.cooldown_until = Some(crate::time::deadline_with_clamp(now, self.cooldown));
     }
 }
 

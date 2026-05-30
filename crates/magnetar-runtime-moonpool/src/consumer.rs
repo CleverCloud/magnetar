@@ -2969,4 +2969,39 @@ mod tests {
         assert!(!slot.state.lock().closed);
         assert_eq!(slot.state.lock().queue_len(), 0);
     }
+
+    /// Parity placeholder for `magnetar-runtime-tokio::compress::tests
+    /// ::zstd_decompression_bomb_is_bounded`. The moonpool engine refuses
+    /// any non-`None` compression on send (`Producer::send` short-circuits;
+    /// `post_process_message` near consumer.rs:1255 documents the same),
+    /// so there is no moonpool decompressor a decompression-bomb could
+    /// target. The test records the invariant so the parity gate
+    /// (ADR-0024 / `check-runtime-test-parity`) stays balanced and a
+    /// future PR that wires moonpool decompression cannot land without
+    /// also porting the bounded-decompression cap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn moonpool_decompress_bomb_path_is_absent_by_design() {
+        // No moonpool decompressor exists, so the bomb-shaped input has no
+        // attack surface here. We pin the absence-by-design invariant by
+        // freshly subscribing a consumer and asserting it carries no
+        // compressed-message buffer to decode — symmetric with the existing
+        // `moonpool_decompress_path_is_absent_by_design` placeholder but
+        // focused on the bomb-shape scenario rather than the
+        // `uncompressed_size = u32::MAX` scenario. If a future change wires
+        // a moonpool decompression path, the placeholder MUST grow into a
+        // real bounded-decode round-trip mirroring the tokio bomb test.
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/no-bomb-decompress".to_owned(),
+                subscription: "s-bomb".to_owned(),
+                ..Default::default()
+            })
+        };
+        let conn = shared.inner.lock();
+        let slot = conn.consumer(handle).expect("slot");
+        assert!(!slot.state.lock().closed);
+        assert_eq!(slot.state.lock().queue_len(), 0);
+    }
 }

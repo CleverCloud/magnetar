@@ -107,6 +107,7 @@ pub mod producer;
 pub mod schema;
 pub mod service_url;
 pub mod supervisor;
+pub mod time;
 pub mod topic_watcher;
 pub mod trackers;
 pub mod transmit;

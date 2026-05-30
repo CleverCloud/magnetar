@@ -533,10 +533,16 @@ impl ProducerState {
 
     /// Deadline of the earliest pending send (`enqueued_at + send_timeout`), or `None` if
     /// the producer has no send-timeout configured or no in-flight sends.
+    ///
+    /// Uses [`crate::time::deadline_with_clamp`] so a pathological
+    /// `Duration::MAX` (or near-`MAX`) timeout cannot panic via
+    /// `Instant::add` overflow (invariant #6 — no panics in proto).
     #[must_use]
     pub fn next_send_deadline(&self) -> Option<std::time::Instant> {
         let timeout = self.send_timeout?;
-        self.pending.front().map(|op| op.enqueued_at + timeout)
+        self.pending
+            .front()
+            .map(|op| crate::time::deadline_with_clamp(op.enqueued_at, timeout))
     }
 
     /// Drain every in-flight `OpSend` whose `enqueued_at + send_timeout` has passed.
@@ -555,7 +561,7 @@ impl ProducerState {
         // force a separate `.front()` peek + `.pop_front().expect(...)` (invariant #6 — no
         // panics in production code).
         while let Some(op) = self.pending.front() {
-            if now < op.enqueued_at + timeout {
+            if now < crate::time::deadline_with_clamp(op.enqueued_at, timeout) {
                 break;
             }
             // Front matched the deadline test; the very next `pop_front` returns the same
@@ -972,11 +978,15 @@ impl ProducerState {
 
     /// Wall-clock deadline at which the batch should be force-flushed. Returns `None`
     /// when batching has no max-publish-delay, or the batch is currently empty.
+    ///
+    /// Uses [`crate::time::deadline_with_clamp`] so a pathological
+    /// `Duration::MAX` cannot panic via `Instant::add` overflow
+    /// (invariant #6 — no panics in proto).
     #[must_use]
     pub fn next_batch_deadline(&self) -> Option<std::time::Instant> {
         let max_delay = self.batching_max_publish_delay?;
         let first = self.batch.first_added_at?;
-        Some(first + max_delay)
+        Some(crate::time::deadline_with_clamp(first, max_delay))
     }
 
     /// `true` if the batch should be force-flushed at `now` because
@@ -2577,5 +2587,65 @@ mod tests {
         // No panic: the encoder must accept a zero-length payload without
         // tripping the (now-removed) debug_assert on the encode Result.
         let _ = p.flush_batch(1_700_000_000, std::time::Instant::now());
+    }
+
+    /// `Instant + Duration::MAX` panics in stock std. The state machine
+    /// must accept pathological timeouts without panicking (invariant #6).
+    /// Mirrors the F2 fix in R2: `next_send_deadline` and
+    /// `drain_timed_out_sends` route through
+    /// [`crate::time::deadline_with_clamp`] so a near-`Duration::MAX`
+    /// `send_timeout` clamps to a 1-hour fallback rather than panicking.
+    #[test]
+    fn next_send_deadline_does_not_panic_on_duration_max() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        // Worst-case send_timeout — Java's `Long.MAX_VALUE` equivalent.
+        p.send_timeout = Some(std::time::Duration::MAX);
+        let now = std::time::Instant::now();
+        let _ = p.queue_send(small_message(b"p"), 100, now).unwrap();
+        let deadline = p.next_send_deadline().expect("a deadline must be returned");
+        // The clamp returns `now + OVERFLOW_FALLBACK` (1 hour) rather than
+        // panicking. The exact horizon is an implementation detail; we
+        // assert "in the future, but nowhere near `Instant` overflow".
+        assert!(deadline > now);
+        // 1 day from now is comfortably past the 1-hour horizon and
+        // comfortably under any conceivable `Instant` boundary.
+        assert!(deadline < now + std::time::Duration::from_secs(86_400));
+
+        // The drain side must also accept `Duration::MAX` without panic.
+        let drained = p.drain_timed_out_sends(now);
+        assert!(
+            drained.is_empty(),
+            "the deadline is far in the future; drain should yield nothing"
+        );
+    }
+
+    /// `Instant + Duration::MAX` panics for `next_batch_deadline` too —
+    /// pin the same clamp behaviour for `batching_max_publish_delay`
+    /// (the batch-flush deadline computation).
+    #[test]
+    fn next_batch_deadline_does_not_panic_on_duration_max() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        p.batching_enabled = true;
+        p.max_messages_in_batch = 100;
+        p.batching_max_publish_delay = Some(std::time::Duration::MAX);
+        let now = std::time::Instant::now();
+        let _ = p.queue_send(small_message(b"b"), 100, now).unwrap();
+        let deadline = p
+            .next_batch_deadline()
+            .expect("batch deadline must be returned");
+        assert!(deadline > now);
+        // The clamp protects against `Instant + Duration::MAX` panics.
+        // `batch_deadline_elapsed` must not panic either.
+        assert!(!p.batch_deadline_elapsed(now));
     }
 }

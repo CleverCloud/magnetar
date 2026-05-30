@@ -136,9 +136,12 @@ impl AckGroupingTracker {
     }
 
     /// Returns when the next tick is due, or `None` if there's nothing pending.
+    ///
+    /// Uses [`crate::time::deadline_with_clamp`] so a `Duration::MAX`
+    /// `ack_group_time` cannot panic (invariant #6).
     pub fn next_deadline(&self) -> Option<Instant> {
         let first = self.last_flush?;
-        Some(first + self.ack_group_time)
+        Some(crate::time::deadline_with_clamp(first, self.ack_group_time))
     }
 }
 
