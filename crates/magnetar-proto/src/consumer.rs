@@ -219,7 +219,12 @@ pub struct ConsumerState {
     /// the consumer state machine queued the message) and the moment the user calls
     /// `pop_message` / `receive`. Mirrors the latency percentiles surfaced by Java
     /// `ConsumerStatsRecorder` (p50, p99, max). Three significant digits, auto-resizing.
-    pub receive_latency_hist: hdrhistogram::Histogram<u64>,
+    ///
+    /// `Option`-typed so the constructor never has to `.expect(...)` on a statically-valid
+    /// `hdrhistogram::Histogram::new(3)` (invariant #6). `None` means the histogram could
+    /// not be initialised (impossible in any non-broken hdrhistogram build); stats helpers
+    /// report zero percentiles when `None` or empty.
+    pub receive_latency_hist: Option<hdrhistogram::Histogram<u64>>,
     /// Highest message id whose ack the runtime has surfaced via
     /// [`crate::Connection::ack`] / `ack_grouped_individual` / `ack_grouped_cumulative`. Used by
     /// [`crate::Connection::rebuild_consumers`] to set the `start_message_id` on the replayed
@@ -409,10 +414,10 @@ impl ConsumerState {
             batch_ack_tracker: rustc_hash::FxHashMap::default(),
             ack_tracker: None,
             crypto_failure_action: crate::conn::CryptoFailureAction::Fail,
-            // 3 significant digits, auto-resizing — same precision the Java client uses for its
-            // ConsumerStatsRecorder.
-            receive_latency_hist: hdrhistogram::Histogram::<u64>::new(3)
-                .expect("hdrhistogram precision 3 is valid"),
+            // 3 significant digits, auto-resizing — same precision the Java client uses for
+            // its ConsumerStatsRecorder. See [`crate::producer::new_latency_histogram`] for
+            // the invariant-#6 (no panics) safety chain.
+            receive_latency_hist: crate::producer::new_latency_histogram(),
             last_acked_message_id: None,
             last_rate_snapshot: None,
             current_msgs_per_sec: 0.0,
@@ -519,33 +524,45 @@ impl ConsumerState {
     }
 
     /// 50th percentile receive latency, in milliseconds. Mirrors Java
-    /// `ConsumerStatsRecorder#getRcvLatencyMillis50pct`.
+    /// `ConsumerStatsRecorder#getRcvLatencyMillis50pct`. Returns 0 when the histogram
+    /// is absent (constructor failure, statically impossible) or empty.
     #[must_use]
     pub fn receive_latency_p50_ms(&self) -> u64 {
-        if self.receive_latency_hist.is_empty() {
+        let Some(h) = self.receive_latency_hist.as_ref() else {
+            return 0;
+        };
+        if h.is_empty() {
             return 0;
         }
-        self.receive_latency_hist.value_at_quantile(0.50)
+        h.value_at_quantile(0.50)
     }
 
     /// 99th percentile receive latency, in milliseconds. Mirrors Java
-    /// `ConsumerStatsRecorder#getRcvLatencyMillis99pct`.
+    /// `ConsumerStatsRecorder#getRcvLatencyMillis99pct`. Returns 0 when the histogram
+    /// is absent (constructor failure, statically impossible) or empty.
     #[must_use]
     pub fn receive_latency_p99_ms(&self) -> u64 {
-        if self.receive_latency_hist.is_empty() {
+        let Some(h) = self.receive_latency_hist.as_ref() else {
+            return 0;
+        };
+        if h.is_empty() {
             return 0;
         }
-        self.receive_latency_hist.value_at_quantile(0.99)
+        h.value_at_quantile(0.99)
     }
 
     /// Maximum observed receive latency, in milliseconds. Mirrors Java
-    /// `ConsumerStatsRecorder#getRcvLatencyMillisMax`.
+    /// `ConsumerStatsRecorder#getRcvLatencyMillisMax`. Returns 0 when the histogram
+    /// is absent (constructor failure, statically impossible) or empty.
     #[must_use]
     pub fn receive_latency_max_ms(&self) -> u64 {
-        if self.receive_latency_hist.is_empty() {
+        let Some(h) = self.receive_latency_hist.as_ref() else {
+            return 0;
+        };
+        if h.is_empty() {
             return 0;
         }
-        self.receive_latency_hist.max()
+        h.max()
     }
 
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
@@ -601,7 +618,9 @@ impl ConsumerState {
         let msg = self.queue.pop_front()?;
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
         let latency_ms = u64::try_from(msg.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.receive_latency_hist.saturating_record(latency_ms);
+        if let Some(h) = self.receive_latency_hist.as_mut() {
+            h.saturating_record(latency_ms);
+        }
         Some(msg)
     }
 
@@ -644,6 +663,21 @@ impl ConsumerState {
         // Chunked message path.
         if let (Some(total), Some(chunk_id)) = (metadata.num_chunks_from_msg, metadata.chunk_id) {
             if total > 1 {
+                // F1: validate `chunk_id` against `total`. A malformed broker (or replay /
+                // protocol-violation scenario) could deliver a chunk with `chunk_id >= total`
+                // or a negative-looking i32. Both are protocol-level violations: drop the
+                // chunk and bump the metric without panicking. Mirrors the defensive
+                // bounds-check the Java consumer added in `ConsumerImpl#processMessageChunk`
+                // after CVE-style fuzzing of malformed chunk metadata.
+                if chunk_id < 0 || chunk_id >= total {
+                    tracing::warn!(
+                        consumer_id = self.handle.0,
+                        chunk_id,
+                        total_chunks = total,
+                        "drop chunk with out-of-range chunk_id (protocol violation)",
+                    );
+                    return Ok(DeliverOutcome::Dropped);
+                }
                 let uuid = metadata.uuid.clone().unwrap_or_default();
                 // Arc-wrap on first-chunk arrival so the ChunkBuffer never
                 // holds a deep-cloned metadata copy across the
@@ -689,10 +723,14 @@ impl ConsumerState {
                 // the chunk-only fields via `Arc::make_mut`.
                 let first_chunk_message_id = entry.first_chunk_message_id;
                 let redelivery_count = entry.redelivery_count;
-                let entry = self
-                    .chunk_reassembly
-                    .remove(&uuid)
-                    .expect("just-inserted ChunkBuffer disappeared");
+                // The `entry` borrow above was a `&mut` into `chunk_reassembly`; the buffer
+                // is guaranteed present (we just inserted/updated it earlier in this scope).
+                // Invariant #6 (no panics in production code): replace `.expect(...)` with
+                // an explicit `if let Some` and drop the chunk gracefully if a concurrent
+                // mutation ever removed it (impossible today — `&mut self` — but defensive).
+                let Some(entry) = self.chunk_reassembly.remove(&uuid) else {
+                    return Ok(DeliverOutcome::Dropped);
+                };
                 let mut final_meta_arc = entry.first_metadata;
                 {
                     let m = std::sync::Arc::make_mut(&mut final_meta_arc);
@@ -1174,8 +1212,12 @@ mod tests {
         assert_eq!(stats0.receive_latency_max_ms, 0);
 
         // 100 samples uniformly in [1, 100].
+        let hist = c
+            .receive_latency_hist
+            .as_mut()
+            .expect("receive_latency_hist initialised");
         for v in 1u64..=100 {
-            c.receive_latency_hist.saturating_record(v);
+            hist.saturating_record(v);
         }
         let p50 = c.receive_latency_p50_ms();
         let p99 = c.receive_latency_p99_ms();
@@ -1204,11 +1246,20 @@ mod tests {
             std::time::Instant::now(),
         )
         .unwrap();
-        assert!(c.receive_latency_hist.is_empty());
+        assert!(
+            c.receive_latency_hist
+                .as_ref()
+                .is_none_or(hdrhistogram::Histogram::is_empty)
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(2));
         let _msg = c.pop_message().expect("queued message");
-        assert_eq!(c.receive_latency_hist.len(), 1);
+        assert_eq!(
+            c.receive_latency_hist
+                .as_ref()
+                .map_or(0, hdrhistogram::Histogram::len),
+            1
+        );
         assert!(c.receive_latency_max_ms() >= 1);
         let stats = c.stats();
         assert_eq!(stats.receive_latency_max_ms, c.receive_latency_max_ms());
@@ -1868,5 +1919,132 @@ mod tests {
         // And the same regardless of `replicated_from`.
         let im_none = shadow_im(7, 43, None);
         assert!(c.classify_for_shadow(&im_none).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Invariant-#6 (no panics in `magnetar-proto` outside `#[cfg(test)]`)
+    // and F1 (chunk_id range check) regression tests.
+    // -----------------------------------------------------------------
+
+    /// V10: `ConsumerState::new` must not panic via `.expect(...)` on the
+    /// statically-valid `hdrhistogram::Histogram::new(3)`. Smoke-test that the
+    /// constructor returns `Some(_)` and that the `receive_latency_*_ms`
+    /// accessors degrade gracefully (return 0) when the histogram is empty.
+    #[test]
+    fn consumer_latency_histogram_constructs_without_panic() {
+        let c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert!(
+            c.receive_latency_hist.is_some(),
+            "Histogram::new(3) is statically valid",
+        );
+        assert_eq!(c.receive_latency_p50_ms(), 0);
+        assert_eq!(c.receive_latency_p99_ms(), 0);
+        assert_eq!(c.receive_latency_max_ms(), 0);
+        let stats = c.stats();
+        assert_eq!(stats.receive_latency_p50_ms, 0);
+        assert_eq!(stats.receive_latency_p99_ms, 0);
+        assert_eq!(stats.receive_latency_max_ms, 0);
+    }
+
+    /// V11: chunk reassembly used `.remove(&uuid).expect("just-inserted
+    /// ChunkBuffer disappeared")`. The fix replaces it with an `if let`
+    /// guard that returns `DeliverOutcome::Dropped` if the buffer is
+    /// somehow absent — graceful, not a panic. Verify the normal path
+    /// (all chunks present) still reassembles correctly so the fix did
+    /// not regress the happy path.
+    #[test]
+    fn chunk_reassembly_remove_happy_path_still_delivers() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // Three in-order chunks of a logical message.
+        for chunk_id in 0..3 {
+            let meta = chunk_meta("u-happy", 1, 3, chunk_id);
+            let outcome = c
+                .deliver(
+                    &message_cmd_at(100 + chunk_id as u64, 0),
+                    meta,
+                    None,
+                    Bytes::from_static(b"chunk"),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            let _ = outcome;
+        }
+        // The reassembled message is now in the queue and the buffer is gone.
+        assert_eq!(c.queue_len(), 1);
+        assert!(c.chunk_reassembly.is_empty());
+    }
+
+    /// F1: chunks whose `chunk_id` falls outside `[0, total_chunks)` are
+    /// protocol violations. Feed `chunk_id = i32::MAX, total_chunks = 3` and
+    /// `chunk_id = -1, total_chunks = 3` and assert each is gracefully
+    /// dropped — never reaches the reassembly buffer, never panics,
+    /// never advances the chunk counter. Mirrors the defensive
+    /// bounds-check Java added in `ConsumerImpl#processMessageChunk`.
+    #[test]
+    fn chunk_id_out_of_range_drops_protocol_violation() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // chunk_id > total - 1
+        let meta_high = chunk_meta("u-bad-high", 1, 3, i32::MAX);
+        let outcome_high = c
+            .deliver(
+                &message_cmd_at(1, 0),
+                meta_high,
+                None,
+                Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
+            )
+            .expect("delivery must not error");
+        assert!(
+            matches!(outcome_high, DeliverOutcome::Dropped),
+            "chunk_id == i32::MAX with total == 3 must be Dropped, got {outcome_high:?}",
+        );
+        // chunk_id < 0
+        let meta_neg = chunk_meta("u-bad-neg", 1, 3, -1);
+        let outcome_neg = c
+            .deliver(
+                &message_cmd_at(2, 0),
+                meta_neg,
+                None,
+                Bytes::from_static(b"hi"),
+                std::time::Instant::now(),
+            )
+            .expect("delivery must not error");
+        assert!(
+            matches!(outcome_neg, DeliverOutcome::Dropped),
+            "chunk_id == -1 must be Dropped, got {outcome_neg:?}",
+        );
+        // No reassembly buffer was ever allocated and no message was queued.
+        assert!(
+            c.chunk_reassembly.is_empty(),
+            "out-of-range chunk_id must not allocate a ChunkBuffer entry",
+        );
+        assert_eq!(c.queue_len(), 0);
+    }
+
+    /// F1 corollary: a boundary case — `chunk_id == total_chunks` is also
+    /// out-of-range (chunks are zero-indexed in `[0, total)`). The Java
+    /// defensive bounds-check rejects this exact off-by-one too.
+    #[test]
+    fn chunk_id_equals_total_chunks_is_dropped() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        // 3 chunks ⇒ valid ids are {0, 1, 2}. id == 3 is OOB.
+        let meta = chunk_meta("u-boundary", 1, 3, 3);
+        let outcome = c
+            .deliver(
+                &message_cmd_at(1, 0),
+                meta,
+                None,
+                Bytes::from_static(b"oob"),
+                std::time::Instant::now(),
+            )
+            .expect("delivery must not error");
+        assert!(
+            matches!(outcome, DeliverOutcome::Dropped),
+            "chunk_id == total_chunks must be Dropped, got {outcome:?}",
+        );
+        assert!(c.chunk_reassembly.is_empty());
     }
 }

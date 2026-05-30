@@ -282,11 +282,11 @@ impl MessageId {
     /// [`Self::from_bytes`] later.
     pub fn to_bytes(self) -> Vec<u8> {
         use prost::Message as _;
-        let pb = self.to_pb();
-        let mut buf = Vec::with_capacity(pb.encoded_len());
-        pb.encode(&mut buf)
-            .expect("encoding MessageIdData into a fresh Vec cannot fail");
-        buf
+        // `encode_to_vec` is the idiomatic prost infallible encode: it sizes the `Vec`
+        // via `encoded_len()` (so `BufMut::remaining_mut() == usize::MAX` on a `Vec`
+        // never trips the EncodeError-on-short-buffer path). Invariant #6: no panics
+        // in magnetar-proto outside `#[cfg(test)]`.
+        self.to_pb().encode_to_vec()
     }
 
     /// Reconstruct a message id from the byte string produced by [`Self::to_bytes`].
@@ -472,6 +472,44 @@ mod tests {
     fn message_id_from_bytes_rejects_garbage() {
         let garbage = &[0xFF, 0xFE, 0xFD][..];
         assert!(MessageId::from_bytes(garbage).is_none());
+    }
+
+    /// V6: `MessageId::to_bytes` previously used `.expect("encoding MessageIdData into
+    /// a fresh Vec cannot fail")` — a panic-shaped invariant-#6 violation. The fix
+    /// switches to `prost::Message::encode_to_vec`, which is infallible by contract
+    /// (writes to an internally-sized `Vec` via `BufMut::remaining_mut() == usize::MAX`).
+    /// Smoke-test every documented edge case: `EARLIEST` / `LATEST` sentinels, batched
+    /// ids with negative `batch_index`, ids with `partition == -1`, and round-trip
+    /// each through `from_bytes` so we know the encoder didn't silently truncate.
+    #[test]
+    fn to_bytes_never_panics_on_edge_cases() {
+        for id in [
+            MessageId::EARLIEST,
+            MessageId::LATEST,
+            MessageId {
+                ledger_id: 0,
+                entry_id: 0,
+                partition: -1,
+                batch_index: -1,
+                batch_size: 0,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            },
+            MessageId {
+                ledger_id: u64::MAX,
+                entry_id: u64::MAX,
+                partition: i32::MAX,
+                batch_index: i32::MIN,
+                batch_size: i32::MIN,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            },
+        ] {
+            // No panic on encode + round-trip — the previous `.expect(...)` path is gone.
+            let bytes = id.to_bytes();
+            let back = MessageId::from_bytes(&bytes).expect("round-trip decode");
+            assert_eq!(back, id);
+        }
     }
 
     /// Ported from Java `MessageIdCompareToTest#testEqual` (non-batched + batched variants).

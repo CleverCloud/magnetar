@@ -358,7 +358,18 @@ fn base64_encode(out: &mut String, input: &[u8]) {
             out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
             out.push('=');
         }
-        _ => unreachable!(),
+        // Invariant #6: no `panic!`/`unreachable!()` in `magnetar-proto` production code.
+        // The above `while i + 3 <= input.len()` loop advances `i` by 3 each iteration,
+        // so on exit `input.len() - i ∈ {0, 1, 2}` is provably exhaustive. `debug_assert!`
+        // traps a refactor that ever broke that invariant; the wildcard arm leaves the
+        // partial group unencoded so output stays a valid (albeit empty-tail) base64
+        // string — a no-op fallback, not a panic.
+        _ => {
+            debug_assert!(
+                false,
+                "base64_encode tail must be 0/1/2 bytes after the per-3 main loop",
+            );
+        }
     }
 }
 
@@ -545,5 +556,32 @@ mod tests {
         buf.clear();
         base64_encode(&mut buf, b"foobar");
         assert_eq!(buf, "Zm9vYmFy");
+    }
+
+    /// V12: `base64_encode`'s tail match `match input.len() - i { 0 | 1 | 2 | _ =>
+    /// unreachable!() }` was an invariant-#6 violation: `unreachable!()` panics on
+    /// reach. The fix replaced it with a `debug_assert!(false, …)` plus a fall-
+    /// through no-op (output stays a valid base64 prefix). Sweep every input
+    /// length from 0 to 9 inclusive — covers all three tail residues (0, 1, 2 mod
+    /// 3) without exercising the panic-pattern wildcard. No assertion of the
+    /// exact output: we just need to make sure no length panics.
+    #[test]
+    fn base64_encode_does_not_panic_on_any_tail_residue() {
+        let mut buf = String::new();
+        for len in 0..=9 {
+            buf.clear();
+            let input: Vec<u8> = (0..len as u8).collect();
+            base64_encode(&mut buf, &input);
+            // Output length must be ⌈4 * len / 3⌉ rounded up to nearest 4 (with
+            // `=` padding). For len=0 it is empty.
+            if len == 0 {
+                assert!(buf.is_empty(), "zero-length input produces empty output");
+            } else {
+                assert!(
+                    buf.len().is_multiple_of(4),
+                    "len={len} ⇒ output {buf:?} not 4-aligned"
+                );
+            }
+        }
     }
 }
