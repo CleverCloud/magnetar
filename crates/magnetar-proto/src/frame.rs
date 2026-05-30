@@ -296,8 +296,8 @@ pub fn encode_payload_head(
 ///
 /// This is the cheap front-of-stream check that lets
 /// [`crate::Connection::handle_bytes`] avoid `Bytes::copy_from_slice`
-/// on every decode iteration; see the receive-path zero-copy entry
-/// in `docs/follow-ups.md` under the 2026-05-27 audit section.
+/// on every decode iteration (receive-path zero-copy, 2026-05-27
+/// audit).
 pub fn peek_full_frame_len(inbound: &BytesMut) -> Result<Option<usize>, FrameError> {
     if inbound.len() < TOTAL_SIZE_LEN {
         return Ok(None);

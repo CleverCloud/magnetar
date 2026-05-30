@@ -124,8 +124,7 @@ impl OutgoingMessage {
     /// (caller-supplied `now_ms`) or [`Self::deliver_at_ms`] (absolute
     /// timestamp) instead — the broker compares `deliver_at_ms` to its
     /// own clock, so what matters for replay parity is that the *client*
-    /// stamp is deterministic. Tracked in `docs/follow-ups.md` under
-    /// the 2026-05-27 audit section.
+    /// stamp is deterministic (2026-05-27 determinism audit).
     #[must_use]
     pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
         let now = std::time::SystemTime::now()
@@ -139,10 +138,8 @@ impl OutgoingMessage {
     /// message with `now_ms + delay_ms` as the absolute UNIX-epoch
     /// millisecond deadline. The caller supplies `now_ms` — under
     /// `MoonpoolEngine` this should come from the engine's virtual wall
-    /// clock so the resulting wire bytes are deterministic across seeds.
-    ///
-    /// Tracked in `docs/follow-ups.md` under the 2026-05-27 audit
-    /// section ("Determinism warning" entry).
+    /// clock so the resulting wire bytes are deterministic across seeds
+    /// (2026-05-27 determinism audit, "Determinism warning" entry).
     #[must_use]
     pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
         self.deliver_at_ms = Some(now_ms.saturating_add(delay_ms));
@@ -429,8 +426,7 @@ pub async fn ack_cumulative_with_interceptors(
 /// `impl MessageBuilder<'_>` against the foreign `Producer` without
 /// the trait indirection.
 ///
-/// Two alternatives were considered and rejected (see
-/// `docs/follow-ups.md` §11):
+/// Two alternatives were considered and rejected:
 ///
 /// - **Move `MessageBuilder` + `OutgoingMessage` to a new shared crate** that both `magnetar` and
 ///   `magnetar-runtime-tokio` depend on. Cleanest layering but adds a crate to publish.
@@ -1042,7 +1038,7 @@ impl<E: crate::Engine> PulsarClient<E> {
     /// The builder queries the broker for the partition count and opens
     /// one child producer per partition. Mirrors Java's
     /// `PulsarClient#newProducer()` against a partitioned topic.
-    /// Engine-generic per docs/follow-ups.md §2 WAVE 2 — both runtimes'
+    /// Engine-generic — both runtimes'
     /// `Client` types implement [`crate::BrokerMetadataApi`] +
     /// [`crate::CreateProducerApi`] so the same builder shape works
     /// against tokio or moonpool.
@@ -1058,9 +1054,8 @@ impl<E: crate::Engine> PulsarClient<E> {
     /// [`crate::TableView`] is a key/value snapshot built from a
     /// compacted topic — useful for config snapshots and similar
     /// "latest value wins per key" patterns. Mirrors
-    /// `PulsarClient#newTableViewBuilder`. Engine-generic per
-    /// docs/follow-ups.md §2 WAVE 2 — dispatches through
-    /// [`crate::SubscribeApi`] under the hood.
+    /// `PulsarClient#newTableViewBuilder`. Engine-generic — dispatches
+    /// through [`crate::SubscribeApi`] under the hood.
     #[must_use]
     pub fn table_view(&self, topic: impl Into<String>) -> crate::TableViewBuilder<'_, E> {
         crate::TableViewBuilder::new(self, topic.into())
@@ -1068,8 +1063,7 @@ impl<E: crate::Engine> PulsarClient<E> {
 
     /// Schema-aware [`crate::TypedTableView`] builder. Mirrors Java
     /// `pulsar.tableViewBuilder(Schema)` — the view decodes payloads on
-    /// read so getters return `S::Owned` directly. Engine-generic per
-    /// docs/follow-ups.md §2 WAVE 2.
+    /// read so getters return `S::Owned` directly. Engine-generic.
     #[must_use]
     pub fn typed_table_view<S: magnetar_proto::schema::Schema>(
         &self,

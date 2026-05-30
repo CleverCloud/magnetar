@@ -14,10 +14,9 @@
 //! already in `mapping.rs::tests`.
 //!
 //! This file is the first of five planned V5 mapping wire-byte tests
-//! enumerated under "PIP-466 — V5 client surface" in
-//! `docs/follow-ups.md`. The other four (stream-consumer mapping,
-//! queue-consumer mapping, v4 escape hatch, builder defaults) follow
-//! the same shape and can ride this scaffolding.
+//! for the PIP-466 V5 client surface. The other four (stream-consumer
+//! mapping, queue-consumer mapping, v4 escape hatch, builder defaults)
+//! follow the same shape and can ride this scaffolding.
 
 use std::sync::Arc;
 use std::time::SystemTime;

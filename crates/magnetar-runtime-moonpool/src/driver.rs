@@ -687,7 +687,6 @@ where
         //    wall-clock closure installed by `ConnectionShared::with_auth` reads this atomic, so
         //    `Connection::handle_timeout` batch-publish stamping flows from the moonpool
         //    `TimeProvider` (host clock under `TokioProviders`, virtual time under `SimProviders`).
-        //    See the moonpool wall-clock bridge entry in `docs/follow-ups.md`.
         {
             let elapsed_ms = time.now().as_millis();
             let now_ms = shared

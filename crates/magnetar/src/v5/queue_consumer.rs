@@ -19,7 +19,7 @@ use crate::{ConsumerApi, Engine, IncomingMessage, SubscribeApi, TokioEngine};
 /// [`super::StreamConsumer`] for Exclusive / Failover ordered
 /// delivery.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+/// Engine-generic.
 pub struct QueueConsumer<E: Engine = TokioEngine>
 where
     E::ClientState: SubscribeApi,
@@ -94,7 +94,7 @@ where
 /// via [`Self::key_shared`]. Same V5-typed knob set as
 /// [`super::stream_consumer::StreamConsumerBuilder`].
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+/// Engine-generic.
 pub struct QueueConsumerBuilder<'a, E: Engine = TokioEngine> {
     inner: crate::ConsumerBuilder<'a, E>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,

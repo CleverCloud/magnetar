@@ -12,8 +12,8 @@
 //!   container over `pulsar+ssl://`.
 //!
 //! That leaves the moonpool-side TLS hunk in `transport.rs` as the
-//! biggest single uncovered region in the workspace (`docs/follow-ups.md`
-//! §7). The moonpool fixture lifts the in-process rustls broker
+//! biggest single uncovered region in the workspace. The moonpool
+//! fixture lifts the in-process rustls broker
 //! (self-signed cert + `tokio_rustls::TlsAcceptor`) and pins the
 //! engine's `connect_tls` end-to-end; this file keeps the
 //! `xtask check-runtime-test-parity` gate balanced (ADR-0024 §3) by

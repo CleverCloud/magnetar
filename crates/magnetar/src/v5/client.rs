@@ -17,10 +17,10 @@ use crate::{Engine, PulsarClient, TokioEngine};
 /// [`Self::v4`] escape hatch to fall back to the v4 surface on the
 /// same connection without re-handshaking.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3: `E: Engine`
-/// defaults to [`crate::TokioEngine`] so call sites that write
-/// `PulsarClientV5` keep resolving to the tokio specialisation;
-/// moonpool callers name `PulsarClientV5<MoonpoolEngine<P>>` directly.
+/// Engine-generic: `E: Engine` defaults to [`crate::TokioEngine`] so
+/// call sites that write `PulsarClientV5` keep resolving to the tokio
+/// specialisation; moonpool callers name
+/// `PulsarClientV5<MoonpoolEngine<P>>` directly.
 pub struct PulsarClientV5<E: Engine = TokioEngine> {
     inner: PulsarClient<E>,
 }

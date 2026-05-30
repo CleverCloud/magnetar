@@ -331,11 +331,10 @@ impl<C: crate::ConsumerApi + Clone> TableView<C> {
 
 /// Builder for a [`TableView`]. Mirrors `org.apache.pulsar.client.api.TableViewBuilder`.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 2: the type parameter
-/// `E: Engine` (defaults to [`crate::TokioEngine`]) selects the
-/// per-engine consumer type via the engine-side [`crate::SubscribeApi`]
-/// extension trait. The decryptor slot is engine-typed via
-/// [`crate::MessageDecryptorApi`].
+/// Engine-generic: the type parameter `E: Engine` (defaults to
+/// [`crate::TokioEngine`]) selects the per-engine consumer type via the
+/// engine-side [`crate::SubscribeApi`] extension trait. The decryptor
+/// slot is engine-typed via [`crate::MessageDecryptorApi`].
 pub struct TableViewBuilder<'a, E: Engine = TokioEngine> {
     client: &'a PulsarClient<E>,
     topic: String,
@@ -736,10 +735,9 @@ fn spawn_auto_update_task(topic: String, interval: Duration) -> Arc<AutoUpdateTa
 /// typed accessors that decode the payload on demand. Mirrors Java's
 /// `pulsar.tableView(Schema)` shape.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 2. Defaults `C =
-/// magnetar_runtime_tokio::Consumer` so existing call sites
-/// (`TypedTableView<MySchema>` without a second type argument) keep
-/// resolving to the tokio specialisation.
+/// Engine-generic. Defaults `C = magnetar_runtime_tokio::Consumer` so
+/// existing call sites (`TypedTableView<MySchema>` without a second
+/// type argument) keep resolving to the tokio specialisation.
 pub struct TypedTableView<
     S: magnetar_proto::schema::Schema,
     C: crate::ConsumerApi + Clone = magnetar_runtime_tokio::Consumer,
@@ -839,8 +837,8 @@ impl<S: magnetar_proto::schema::Schema + 'static, C: crate::ConsumerApi + Clone>
 /// Builder for a [`TypedTableView`]. Mirrors Java's schema-aware
 /// `pulsar.tableViewBuilder(Schema)` shape.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 2. Same shape as
-/// [`TableViewBuilder<E>`]; the `S` schema parameter is decoder-only.
+/// Engine-generic. Same shape as [`TableViewBuilder<E>`]; the `S`
+/// schema parameter is decoder-only.
 pub struct TypedTableViewBuilder<'a, S: magnetar_proto::schema::Schema, E: Engine = TokioEngine> {
     client: &'a PulsarClient<E>,
     topic: String,

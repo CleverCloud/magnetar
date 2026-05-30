@@ -322,8 +322,9 @@ impl AdminClient {
     /// under the hood (create-with-props, then set-shadow). magnetar keeps
     /// the two steps explicit. A previous version of this method sent a
     /// `{ "shadowTopics": [...], "properties": {...} }` envelope that
-    /// Pulsar 4.0.4 rejects with HTTP 400 (caught by the §5 replicator
-    /// e2e fixture; see docs/follow-ups.md §5).
+    /// Pulsar 4.0.4 rejects with HTTP 400 (caught by the PIP-180
+    /// replicator e2e fixture in
+    /// `crates/magnetar/tests/e2e_shadow_topic_replicator.rs`).
     ///
     /// Errors mirror the existing `AdminError` taxonomy: 404 → `Status { code:
     /// 404, .. }` (the source topic does not exist), 409 → `Status { code:

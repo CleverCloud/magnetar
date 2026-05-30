@@ -71,8 +71,7 @@ impl Engine for TokioEngine {
 // PIP-4 encryption hookup for the tokio engine. The associated types
 // plug the existing `magnetar_runtime_tokio::MessageEncryptor` /
 // `MessageDecryptor` trait objects (already `Send + Sync + Debug`) into
-// the engine-generic builder storage via the API extension traits added
-// in WAVE 1 of docs/follow-ups.md §2.
+// the engine-generic builder storage via the API extension traits.
 impl MessageEncryptorApi for TokioEngine {
     type Encryptor = Arc<dyn magnetar_runtime_tokio::MessageEncryptor>;
 }

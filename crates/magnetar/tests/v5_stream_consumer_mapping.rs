@@ -16,8 +16,7 @@
 //! `failover()` constructor that flips to `SubType::Failover`.
 //!
 //! Companion to `v5_producer_mapping.rs`. Same `FrameRecorder`
-//! scaffolding. Part of the 5-test PIP-466 mapping suite enumerated
-//! in `docs/follow-ups.md`.
+//! scaffolding. Part of the 5-test PIP-466 mapping suite.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

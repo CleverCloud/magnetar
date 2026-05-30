@@ -27,7 +27,8 @@ async fn create_shadow_topic_puts_correct_url_and_bare_array_body() {
     // the source topic. The broker's `setShadowTopics(List<String>)` handler
     // deserialises the body directly into a `List<String>` — the body MUST be
     // a bare JSON array, NOT a `{ "shadowTopics": [...] }` envelope (Pulsar
-    // 4.0.4 rejects the envelope with HTTP 400; see docs/follow-ups.md §5).
+    // 4.0.4 rejects the envelope with HTTP 400; see the PIP-180 replicator
+    // e2e fixture in `crates/magnetar/tests/e2e_shadow_topic_replicator.rs`).
     Mock::given(method("PUT"))
         .and(path(
             "/admin/v2/persistent/public/default/source-t/shadowTopics",

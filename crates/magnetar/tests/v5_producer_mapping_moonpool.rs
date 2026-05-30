@@ -7,8 +7,8 @@
 //! that the V5 → v4 mapping table outputs are byte-correct on the
 //! sans-io wire AND pins the type-level contract that the
 //! [`magnetar::v5::ProducerBuilder<MoonpoolEngine<TokioProviders>>`]
-//! shape resolves cleanly — proving WAVE 3 of docs/follow-ups.md §2
-//! (V5 engine-genericity for PIP-466 promotion).
+//! shape resolves cleanly — proving the V5 engine-genericity contract
+//! required for PIP-466 promotion.
 //!
 //! The mapping invariants under test are identical to the tokio
 //! mirror — the V5 defaults map to the same v4 wire values regardless

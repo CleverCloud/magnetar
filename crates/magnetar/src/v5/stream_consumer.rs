@@ -19,7 +19,7 @@ use crate::{ConsumerApi, Engine, IncomingMessage, SubscribeApi, TokioEngine};
 /// consumer per partition, ordered delivery. Use [`super::QueueConsumer`]
 /// for Shared / `KeyShared` work-distribution patterns.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+/// Engine-generic.
 pub struct StreamConsumer<E: Engine = TokioEngine>
 where
     E::ClientState: SubscribeApi,
@@ -94,7 +94,7 @@ where
 /// via [`Self::failover`]. Accepts `Duration`-typed timeouts and the
 /// V5 [`super::mapping::V5SubscriptionInitialPosition`] wrapper.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+/// Engine-generic.
 pub struct StreamConsumerBuilder<'a, E: Engine = TokioEngine> {
     inner: crate::ConsumerBuilder<'a, E>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,

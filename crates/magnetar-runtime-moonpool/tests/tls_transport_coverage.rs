@@ -9,7 +9,7 @@
 //! `read_buf` / `write_all` / `flush` / `shutdown`). Until this file
 //! landed, only the `Plain` arm was exercised through the engine —
 //! per-file coverage on `transport.rs` sat at 30.3% with the 124-line
-//! TLS hunk uncovered (`docs/follow-ups.md` §7, ADR-0024 patch coverage).
+//! TLS hunk uncovered (ADR-0024 patch coverage).
 //!
 //! Strategy. Stand up an in-process rustls server (one self-signed cert
 //! per test, minted with `rcgen` at fixture build time so no PEM file
@@ -25,10 +25,8 @@
 //! same either way: the moonpool client's `RustlsByteAdapter` drives
 //! `rustls::ClientConnection` sans-io, regardless of which provider
 //! supplies the wire bytes. Once moonpool-sim grows a hook to inject
-//! pre-driven cipher bytes (currently tracked at
-//! [`docs/follow-ups.md` §1](https://github.com/CleverCloud/magnetar/blob/main/docs/follow-ups.md)),
-//! the same tests can flip over to `SimProviders` without changing
-//! their assertions.
+//! pre-driven cipher bytes, the same tests can flip over to
+//! `SimProviders` without changing their assertions.
 //!
 //! Each test pairs 1:1 with a same-named test in the tokio crate's
 //! `tls_transport_coverage.rs` to keep the

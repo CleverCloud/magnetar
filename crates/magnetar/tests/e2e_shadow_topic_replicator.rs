@@ -12,9 +12,8 @@
 //!
 //! # Fixture shape — single-cluster (scope adjustment vs the original /goal)
 //!
-//! The original `/goal` in `docs/follow-ups.md` §5 called for a **two-
-//! cluster** standalone topology on separate Docker networks. After
-//! surveying PIP-180:
+//! The original `/goal` called for a **two-cluster** standalone topology
+//! on separate Docker networks. After surveying PIP-180:
 //!
 //! - **PIP-180 shadow topics are intra-cluster**. The shadow + source live in the **same** broker
 //!   and share the same `BookKeeper` ledgers. The "replicator-role" check the broker applies on

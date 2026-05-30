@@ -22,10 +22,10 @@ use crate::{CreateProducerApi, Engine, OutgoingMessage, ProducerApi, TokioEngine
 /// **Experimental** — PIP-466 V5 producer (ADR-0032). Behaviour and
 /// signatures may change before V5 is promoted to default.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3: `E: Engine`
-/// defaults to [`crate::TokioEngine`] so the existing alias `Producer`
-/// (no second type argument) keeps resolving to the tokio
-/// specialisation. Moonpool callers name `Producer<MoonpoolEngine<P>>`.
+/// Engine-generic: `E: Engine` defaults to [`crate::TokioEngine`] so
+/// the existing alias `Producer` (no second type argument) keeps
+/// resolving to the tokio specialisation. Moonpool callers name
+/// `Producer<MoonpoolEngine<P>>`.
 pub struct Producer<E: Engine = TokioEngine>
 where
     E::ClientState: CreateProducerApi,
@@ -93,7 +93,7 @@ where
 /// wire equivalents are computed via [`super::mapping`] at
 /// [`Self::create`] time.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 3.
+/// Engine-generic.
 pub struct ProducerBuilder<'a, E: Engine = TokioEngine> {
     inner: crate::ProducerBuilder<'a, E>,
     send_timeout: std::time::Duration,

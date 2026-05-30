@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end coverage for the Athenz ZTS round-trip
-//! ([`magnetar_auth_athenz::zts`], ADR-0030 +
-//! [`docs/follow-ups.md` §4](../../../docs/follow-ups.md)).
+//! ([`magnetar_auth_athenz::zts`], ADR-0030).
 //!
 //! Gated behind `e2e` + `auth-athenz-zts`. Run with:
 //!

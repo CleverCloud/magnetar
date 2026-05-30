@@ -515,8 +515,7 @@ helpers (`crates/magnetar/tests/helpers/`).
    `crypto-{aws-lc-rs,ring,openssl,fips}` per
    [ADR-0035](../adr/0035-pluggable-crypto-provider.md). `cargo xtask
    check-crypto-matrix` already covers the crypto axis; the new
-   feature multiplies the build matrix by 2 (on/off). Tracked under
-   `docs/follow-ups.md` "PIP-460 feature matrix expansion".
+   feature multiplies the build matrix by 2 (on/off).
 
 ### Rollback
 
