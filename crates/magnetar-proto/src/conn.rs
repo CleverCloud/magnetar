@@ -54,6 +54,14 @@ pub struct Connection {
     broker_max_message_size: Option<usize>,
     broker_protocol_version: i32,
     feature_flags: pb::FeatureFlags,
+    /// Last broker `CommandError` observed while the handshake was in
+    /// `ConnectSent` or `AuthChallenging` state. Captured so a
+    /// transport-drop-driven flip to [`HandshakeState::Failed`] can
+    /// surface the broker's explanation instead of an opaque "handshake
+    /// failed" error. Cleared by [`Self::reset`]. Mirrors what Java's
+    /// `ClientCnx#handleError` logs when the broker tears the connection
+    /// down mid-handshake.
+    handshake_failure_reason: Option<String>,
     /// Outbound bytes buffer drained by [`Self::poll_transmit`].
     outbound: BytesMut,
     /// Wave-1.1 staging slot for [`Self::poll_transmit_vectored`].
@@ -291,6 +299,7 @@ impl Connection {
             broker_max_message_size: None,
             broker_protocol_version: 0,
             feature_flags: pb::FeatureFlags::default(),
+            handshake_failure_reason: None,
             outbound: BytesMut::with_capacity(4 * 1024),
             pending_vectored_drain: None,
             outbound_segments: Vec::new(),
@@ -631,7 +640,21 @@ impl Connection {
         self.broker_max_message_size = None;
         self.broker_protocol_version = 0;
         self.feature_flags = pb::FeatureFlags::default();
+        self.handshake_failure_reason = None;
         self.last_activity = None;
+    }
+
+    /// Reason the last handshake attempt failed, if the broker sent a
+    /// `CommandError` while in `ConnectSent` / `AuthChallenging` state.
+    /// Engines surface this in the user-facing connect error so
+    /// operators see broker-side reasons (auth rejection, permission
+    /// denied, namespace-not-found, etc.) instead of an opaque
+    /// "handshake failed" string. `None` if the handshake never started,
+    /// is in progress, or failed for a non-protocol reason (raw transport
+    /// drop, TLS error).
+    #[must_use]
+    pub fn handshake_failure_reason(&self) -> Option<&str> {
+        self.handshake_failure_reason.as_deref()
     }
 
     /// Re-emit a `CommandProducer` for every still-open producer that was created before the
@@ -1301,6 +1324,37 @@ impl Connection {
                 let err = command
                     .error
                     .ok_or(ProtocolError::InvariantViolation("missing CommandError"))?;
+                // Mid-handshake `CommandError` (proxy auth rejection, namespace not
+                // found via proxy_to_broker_url, etc.) carries the broker's
+                // explanation but does NOT correlate with a `request_id` the
+                // outcomes map will route. Capture it so the engine's
+                // handshake future surfaces a useful error instead of opaque
+                // "handshake failed" once the peer drops the socket. Mirrors
+                // Java `ClientCnx#handleError` which logs the server error
+                // + message and tears the connection down.
+                if matches!(
+                    self.state,
+                    HandshakeState::ConnectSent | HandshakeState::AuthChallenging
+                ) {
+                    // Resolve the i32 ServerError into the human-readable
+                    // variant name when possible — the integer code by
+                    // itself is opaque to operators reading the log.
+                    let server_error_name = pb::ServerError::try_from(err.error)
+                        .map(|v| format!("{v:?}"))
+                        .unwrap_or_else(|_| format!("Unknown({})", err.error));
+                    let reason = format!(
+                        "broker rejected handshake (server_error={server_error_name}): {}",
+                        err.message
+                    );
+                    tracing::warn!(
+                        target: "magnetar_proto::conn",
+                        state = ?self.state,
+                        server_error = %server_error_name,
+                        message = %err.message,
+                        "captured CommandError during handshake — surfacing as handshake_failure_reason",
+                    );
+                    self.handshake_failure_reason = Some(reason);
+                }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
                 self.outcomes.insert(
@@ -6156,5 +6210,124 @@ mod scalable_conn_tests {
         // Post-split DAG: parent gone, two children present.
         let snap = conn.dag_snapshot(sid).expect("session still open");
         assert_eq!(snap.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod handshake_failure_reason_tests {
+    use super::*;
+
+    fn fresh_conn() -> Connection {
+        Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(SystemTime::now),
+        )
+    }
+
+    fn handshake_response_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "test-broker/1.0".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandConnected");
+        buf
+    }
+
+    /// A broker `CommandError` arriving while the connection is still in
+    /// `ConnectSent` (or `AuthChallenging`) must be captured as the
+    /// connection's `handshake_failure_reason`, so the engine can surface
+    /// it instead of the opaque "handshake failed" / "peer closed" message
+    /// when the supervisor flips the state to `Failed` after the socket
+    /// drops.
+    #[test]
+    fn command_error_during_handshake_is_captured_as_failure_reason() {
+        let mut conn = fresh_conn();
+        conn.begin_handshake().expect("begin");
+        assert_eq!(conn.state(), HandshakeState::ConnectSent);
+        assert!(conn.handshake_failure_reason().is_none());
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: 0,
+                error: pb::ServerError::AuthenticationError as i32,
+                message: "token expired".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        let reason = conn
+            .handshake_failure_reason()
+            .expect("handshake CommandError must populate failure reason");
+        assert!(
+            reason.contains("AuthenticationError"),
+            "reason should carry the ServerError variant: {reason}",
+        );
+        assert!(
+            reason.contains("token expired"),
+            "reason should carry the broker message verbatim: {reason}",
+        );
+
+        // Simulate the supervisor noticing the peer close and flipping
+        // state. The reason persists across the flip so the engine can
+        // surface it on the user-facing future.
+        conn.mark_disconnected();
+        assert_eq!(conn.state(), HandshakeState::Failed);
+        assert!(
+            conn.handshake_failure_reason().is_some(),
+            "reason must survive the Failed transition until reset()",
+        );
+
+        // `reset()` clears it so a redial doesn't replay the previous failure.
+        conn.reset();
+        assert_eq!(conn.state(), HandshakeState::Uninitialized);
+        assert!(
+            conn.handshake_failure_reason().is_none(),
+            "reset() must clear the reason for the next handshake attempt",
+        );
+    }
+
+    /// `CommandError` arriving on an already-`Connected` connection (e.g.
+    /// a stale producer-open error) MUST NOT pollute the handshake reason
+    /// — the failure-reason field is exclusively for ConnectSent /
+    /// AuthChallenging state.
+    #[test]
+    fn command_error_post_handshake_does_not_populate_failure_reason() {
+        let mut conn = fresh_conn();
+        let handshake = handshake_response_bytes();
+        conn.begin_handshake().expect("begin");
+        conn.handle_bytes(Instant::now(), &handshake)
+            .expect("handle CONNECTED");
+        assert_eq!(conn.state(), HandshakeState::Connected);
+
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: 99,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "namespace bundle not served".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        assert!(
+            conn.handshake_failure_reason().is_none(),
+            "post-handshake CommandError must not leak into handshake_failure_reason",
+        );
     }
 }

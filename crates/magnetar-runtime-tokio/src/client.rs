@@ -1080,7 +1080,16 @@ impl Future for ConnectedFut {
         match conn.state() {
             HandshakeState::Connected => Poll::Ready(Ok(())),
             HandshakeState::Failed => {
-                Poll::Ready(Err(ClientError::Other("handshake failed".to_owned())))
+                // Prefer the broker-supplied reason if the peer sent a
+                // `CommandError` mid-handshake (proxy auth rejection,
+                // namespace not found via proxy_to_broker_url, etc.). Falls
+                // back to the opaque message for raw transport drops where no
+                // protocol frame ever arrived (TLS error, ECONNREFUSED).
+                let msg = conn.handshake_failure_reason().map_or_else(
+                    || "handshake failed".to_owned(),
+                    |reason| format!("handshake failed: {reason}"),
+                );
+                Poll::Ready(Err(ClientError::Other(msg)))
             }
             HandshakeState::Closed => Poll::Ready(Err(ClientError::Closed)),
             _ => {

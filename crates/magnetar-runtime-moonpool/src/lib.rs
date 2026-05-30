@@ -722,6 +722,13 @@ pub enum EngineError {
     /// Peer closed the connection cleanly mid-handshake.
     #[error("peer closed connection")]
     PeerClosed,
+    /// Broker sent a `CommandError` during the handshake (proxy auth
+    /// rejection, namespace not found via `proxy_to_broker_url`, etc.).
+    /// The string carries the broker's `ServerError` + message verbatim.
+    /// Mirrors the tokio engine's enriched `ClientError::Other` for the
+    /// same failure class.
+    #[error("handshake failed: {0}")]
+    HandshakeFailed(String),
     /// Configuration error (e.g. URL parsing).
     #[error("config error: {0}")]
     Config(String),
@@ -996,6 +1003,14 @@ pub(crate) async fn handshake_plain<P: Providers>(
                 conn.state(),
                 magnetar_proto::HandshakeState::Failed | magnetar_proto::HandshakeState::Closed
             ) {
+                // Prefer the broker-supplied reason if the peer sent a
+                // `CommandError` mid-handshake; mirrors the tokio engine
+                // enrichment so a malformed proxy_to_broker_url, auth
+                // rejection, or namespace miss surfaces a useful message
+                // instead of an opaque "peer closed connection".
+                if let Some(reason) = conn.handshake_failure_reason() {
+                    return Err(EngineError::HandshakeFailed(reason.to_owned()));
+                }
                 return Err(EngineError::PeerClosed);
             }
         }
@@ -1003,6 +1018,18 @@ pub(crate) async fn handshake_plain<P: Providers>(
         // 3. Read more bytes from the wire.
         let n = transport.read_buf(&mut read_buf).await?;
         if n == 0 {
+            // Peer closed. Flip the proto state to `Failed` so the
+            // handshake-failure-reason check below (and any subsequent
+            // observer) sees the correct terminal state. Mirrors the
+            // tokio driver loop's `mark_disconnected()` on EOF, and is
+            // required for the broker-CommandError-then-drop enrichment
+            // to surface as `EngineError::HandshakeFailed` instead of
+            // the opaque `PeerClosed`.
+            let mut conn = shared.inner.lock();
+            conn.mark_disconnected();
+            if let Some(reason) = conn.handshake_failure_reason() {
+                return Err(EngineError::HandshakeFailed(reason.to_owned()));
+            }
             return Err(EngineError::PeerClosed);
         }
         let bytes = read_buf.split().freeze();
