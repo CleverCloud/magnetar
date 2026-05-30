@@ -59,6 +59,7 @@ new ADR that supersedes the old one and update the old one's status header.
 | [0041](adr/0041-athenz-provider-testability-seams.md) | Athenz provider testability seams (`ensure_role_token(now)`, injected `wall_clock`, pluggable `ZtsClient` trait + `HttpZtsClient`) on the aws-lc-rs/ring RS256 JWT exchange — lands the ADR-0024 tokio/moonpool/differential layers; supersedes ADR-0030 (drops the RUSTSEC-flagged `rsa`-crate N-Token path) | Accepted |
 | [0042](adr/0042-msrv-bump-1-88.md) | Bump MSRV to Rust 1.88 (`let_chains`); supersedes ADR-0007 | Accepted |
 | [0043](adr/0043-temporary-floating-moonpool-git-dep.md) | Temporarily float `moonpool-core` / `moonpool-sim` on git `branch = "main"` to pick up the futures-io `TcpStream` + segment-granular `write_vectored` ahead of a crates.io release (ADR-0040 wave 2); documented, time-boxed exception to ADR-0036 exact-pin; re-pin when PR #113 ships | Accepted |
+| [0044](adr/0044-moonpool-message-crypto-bridge.md) | Port the PIP-4 message-crypto bridge to the moonpool engine — engine `MessageEncryptor` / `MessageDecryptor` mirroring tokio; `MessageCryptoBridge` implements both engines' trait pairs; engine crypto API non-stub for both engines (`NoEncryption` retained only as the documented opt-out); equivalence asserted via the differential harness per ADR-0024 | Accepted |
 
 ## How to add an ADR
 

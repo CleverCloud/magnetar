@@ -86,7 +86,7 @@ re-pins to an exact `=x.y.z` once that release ships) exposes a
 | --- | --- | --- |
 | `TimeProvider` | wall clock | virtual clock advanced by the simulator |
 | `NetworkProvider` | real TCP via `tokio::net` | in-process byte pipe with controlled drops / delays |
-| `TaskProvider` | `tokio::task::spawn_local` | deterministic ready-queue |
+| `TaskProvider` | `tokio::task::Builder::new().spawn` (`Send`-bound) | deterministic ready-queue |
 | `RandomProvider` | OS RNG | `ChaCha8Rng` seeded by `MOONPOOL_SEED` |
 | `StorageProvider` | host filesystem | in-memory virtual filesystem |
 

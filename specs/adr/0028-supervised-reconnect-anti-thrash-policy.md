@@ -8,7 +8,7 @@
 ## Context
 
 E2E investigation of follow-up #74 (post-restart disconnect cascade,
-[`docs/follow-ups.md`](../../docs/follow-ups.md#74--post-restart-disconnect-cascade-broker-driven))
+[`docs/follow-ups.md`](../../docs/follow-ups.md))
 established that the magnetar-side supervised reconnect path is now
 correct: transient `CommandError` retains state, `lookup_then(topic)`
 re-acquires bundle ownership before `retry_producer_open` /
@@ -269,7 +269,7 @@ check-sim-coverage`) and the tokio↔moonpool 1:1 count must hold
 
 ## References
 
-- [`docs/follow-ups.md` §#74](../../docs/follow-ups.md#74--post-restart-disconnect-cascade-broker-driven)
+- [`docs/follow-ups.md`](../../docs/follow-ups.md)
   — failure description + unblock plan.
 - [`ADR-0010 v0.1.0 full Java parity`](0010-v0-1-full-java-parity.md)
   — connection-level backoff is part of the parity contract.

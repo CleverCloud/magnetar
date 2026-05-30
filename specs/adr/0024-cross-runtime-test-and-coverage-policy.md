@@ -129,8 +129,7 @@ Concretely, the binding rules are:
    hard-failing **from the moment this ADR lands**. Closing existing
    coverage gaps and bringing tokio↔moonpool test counts into 1:1
    alignment is tracked in
-   [`docs/follow-ups.md`](../../docs/follow-ups.md) §"Cross-runtime
-   test + coverage closure (ADR-0024)"; the executable plan lives in
+   [`docs/follow-ups.md`](../../docs/follow-ups.md); the executable plan lives in
    the local (gitignored) `tasks/coverage-closure-prompt.md`. Until
    those gaps close, merges to `main` will fail the validation chain
    by design — no exceptions.
@@ -208,8 +207,7 @@ Concretely, the binding rules are:
   Rejected by Florentin in favour of strict retroactive — gap closure
   to be tackled in a focused follow-up session before more behavioral
   work lands. Tracked in
-  [`docs/follow-ups.md`](../../docs/follow-ups.md) §"Cross-runtime
-  test + coverage closure (ADR-0024)".
+  [`docs/follow-ups.md`](../../docs/follow-ups.md).
 - **Tarpaulin instead of `cargo-llvm-cov`.** Rejected: tarpaulin is
   Linux-only and its JSON output is less stable across versions.
 - **CI-only enforcement (no local xtask).** Rejected: pre-commit
@@ -229,10 +227,9 @@ Concretely, the binding rules are:
   parity snapshot.
 - [`xtask/src/main.rs`](../../xtask/src/main.rs) — `check-sim-coverage`
   and `check-runtime-test-parity` subcommands.
-- [`docs/follow-ups.md`](../../docs/follow-ups.md) §"Cross-runtime
-  test + coverage closure (ADR-0024)" — the tracked follow-up; the
-  executable prompt lives locally in `tasks/coverage-closure-prompt.md`
-  (gitignored).
+- [`docs/follow-ups.md`](../../docs/follow-ups.md) — the tracked
+  follow-up; the executable prompt lives locally in
+  `tasks/coverage-closure-prompt.md` (gitignored).
 - [`CLAUDE.md`](../../CLAUDE.md) §"Non-negotiable invariants" #9 —
   references this ADR.
 - [`GUIDELINES.md`](../../GUIDELINES.md) §"Cross-runtime test +

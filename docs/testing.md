@@ -107,7 +107,13 @@ Lives in
 [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/).
 Targets the supervised reconnect path, the PIP-121 +
 PIP-188 reconnection flows, virtual-clock timers, and OAuth2 token
-refresh edges. See
+refresh edges. The supervised reconnect body (anti-thrash cooldown +
+multi-attempt redial) is exercised by
+[`supervised_redial.rs`](../crates/magnetar-runtime-moonpool/tests/supervised_redial.rs)
+— a `SimProviders` drop → accept → drop → accept fixture paired 1:1 with
+the real-loopback tokio mirror
+[`crates/magnetar-runtime-tokio/tests/supervised_redial.rs`](../crates/magnetar-runtime-tokio/tests/supervised_redial.rs).
+See
 [`moonpool-engine.md#deterministic-chaos-pack`](moonpool-engine.md#deterministic-chaos-pack)
 for the per-scenario breakdown.
 
@@ -119,6 +125,12 @@ Runs a `Trace` against both `magnetar-runtime-tokio` and
 `magnetar-runtime-moonpool` and asserts user-visible `EventStream`
 equivalence. See
 [`moonpool-engine.md#differential-equivalence-harness`](moonpool-engine.md#differential-equivalence-harness).
+Notable equivalence suites:
+
+| File | Coverage |
+| --- | --- |
+| [`crypto_roundtrip_equivalence.rs`](../crates/magnetar-differential/tests/crypto_roundtrip_equivalence.rs) | PIP-4 encrypted round-trip parity across both engines ([ADR-0044](../specs/adr/0044-moonpool-message-crypto-bridge.md)). |
+| [`crypto_failure_action_equivalence.rs`](../crates/magnetar-differential/tests/crypto_failure_action_equivalence.rs) | The 3-arm `cryptoFailureAction` matrix (Fail / Discard / Consume), pinned by golden trace [`golden/crypto_failure_action.json`](../crates/magnetar-differential/tests/golden/crypto_failure_action.json). |
 
 ## End-to-end (Docker)
 

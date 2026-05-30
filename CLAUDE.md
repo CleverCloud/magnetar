@@ -40,7 +40,7 @@ crates/
   magnetar-messagecrypto/         — PIP-4 AES-GCM
   magnetar-proto/                 — sans-io state machine + codec + trackers
   magnetar-runtime-tokio/         — production engine (default)
-  magnetar-runtime-moonpool/      — deterministic-simulation engine
+  magnetar-runtime-moonpool/      — deterministic-simulation engine (carries the PIP-4 crypto bridge, ADR-0044)
 xtask/                            — workspace automation
 ```
 

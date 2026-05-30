@@ -19,7 +19,8 @@ follow-up train; the gap is tracked below.
 | Client (lookup + partitioned-metadata + topic-watch) | ✅ | ✅ |
 | Producer façade (send / flush / close) | ✅ | ✅ |
 | Consumer façade (subscribe / receive / ack) | ✅ | ✅ |
-| Supervised reconnect (Stage 2 + Stage 3 rebuild) | ✅ | ✅ |
+| PIP-4 message encryption + decryption (AES-GCM) with `CryptoFailureAction` ([ADR-0044](../specs/adr/0044-moonpool-message-crypto-bridge.md)) | ✅ | ✅ (encrypt-on-send / decrypt-on-receive bridge; Fail / Discard / Consume arms; equivalence in `magnetar-differential`) |
+| Supervised reconnect (Stage 2 + Stage 3 rebuild) | ✅ | ✅ (multi-cycle redial coverage via `supervised_redial.rs`) |
 | DNS resolver injection ([ADR-0015](../specs/adr/0015-dns-resolver-injection.md)) | ✅ | ✅ |
 | Driver-level TLS (rustls byte-pipe — [ADR-0006](../specs/adr/0006-moonpool-tls-byte-pipe.md)) | ✅ | ✅ |
 | `memory_limit` atomic-CAS reservation ([ADR-0017](../specs/adr/0017-memory-limit-atomic-reservation.md)) | ✅ | ✅ |

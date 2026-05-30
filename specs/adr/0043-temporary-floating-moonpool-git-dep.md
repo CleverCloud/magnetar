@@ -10,7 +10,7 @@
 [ADR-0040](0040-vectored-io-transmit-enum.md) wave 2 needs the moonpool
 simulator to model vectored writes at segment granularity so the chaos
 pack can drop / re-order individual `IoSlice`s. The matching follow-up
-([`docs/follow-ups.md` §1](../../docs/follow-ups.md#1-moonpool-vectored-io),
+([ADR-0040](0040-vectored-io-transmit-enum.md),
 [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111))
 was blocked until upstream grew that surface.
 
@@ -94,7 +94,7 @@ exact-pin discipline in full.
 - Unblocks [ADR-0040](0040-vectored-io-transmit-enum.md) wave 2: the
   moonpool engine can dispatch real segment-granular vectored writes
   under `SimProviders` instead of the placeholder coalesce.
-- Closes [`docs/follow-ups.md` §1](../../docs/follow-ups.md#1-moonpool-vectored-io) /
+- Closes [ADR-0040](0040-vectored-io-transmit-enum.md) /
   [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111)
   — the chaos pack now sees per-`IoSlice` delivery events.
 
@@ -146,7 +146,7 @@ exact-pin discipline in full.
   `moonpool-sim` git entries (the floating constraint this ADR records).
 - `Cargo.lock` — the concrete resolved moonpool rev (the reproducibility
   anchor while the constraint floats).
-- [`docs/follow-ups.md` §1](../../docs/follow-ups.md#1-moonpool-vectored-io) /
+- [ADR-0040](0040-vectored-io-transmit-enum.md) /
   [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111),
   [PR #113](https://github.com/PierreZ/moonpool/pull/113) — the upstream
   work and the re-pin trigger.

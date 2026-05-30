@@ -36,11 +36,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | # | Item | Status |
 | - | --- | --- |
 | 1 | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold landed; e2e blocked on a Pulsar 5.0 RC shipping PIP-460 |
-| 2 | [Moonpool supervised-loop coverage](#2-moonpool-supervised-loop-coverage) | ⚡ (TLS hunk landed; supervised reconnect lines remain) |
-| 3 | [Golden trace: cryptoFailureAction matrix](#3-golden-trace-cryptofailureaction-matrix) | 🔗 blocked on porting the PIP-4 crypto bridge to moonpool |
-| 4 | [Differential runner: Send-bound spawn restructure](#4-differential-runner-send-bound-spawn-restructure) | 🔗 blocked on upstream moonpool `TaskProvider` |
-| 5 | [Re-pin moonpool off git `branch = "main"`](#5-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
-| 6 | [Moonpool transport `read_into` scratch allocation](#6-moonpool-transport-read_into-scratch-allocation) | 🟡 deferred (not load-bearing) |
+| 2 | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
 
 ---
 
@@ -68,83 +64,7 @@ Does **not** block the v0.2.0 release-cut.
 
 ---
 
-## 2. Moonpool supervised-loop coverage
-
-**Gap.** The moonpool transport TLS hunk and four end-to-end TLS tests
-landed (`crates/magnetar-runtime-moonpool/tests/tls_transport_coverage.rs`,
-1:1 tokio mirrors). The supervised reconnect loop in
-`crates/magnetar-runtime-moonpool/src/driver.rs::supervised_driver_loop`
-(anti-thrash cooldown, multi-attempt redial) still carries uncovered
-lines.
-
-**Why it stays open.** Closing them needs a multi-cycle peer-drop fixture
-(drop, accept, drop, …) — mechanically straightforward but descoped from
-the TLS-coverage PR. Pick it up if the `check-sim-coverage` diff gate
-flags those lines on a future change.
-
-**`/goal`.**
-
-```text
-/goal close the moonpool supervised-loop coverage gap per docs/follow-ups.md §2. Add a multi-cycle peer-drop fixture to crates/magnetar-runtime-moonpool/tests/ (drop → accept → drop → accept) that exercises supervised_driver_loop's anti-thrash cooldown + multi-attempt redial paths, with a paired tokio mirror to keep `xtask check-runtime-test-parity` balanced. Validation chain per CLAUDE.md, including `cargo run -p xtask -- check-sim-coverage` on the diff.
-```
-
----
-
-## 3. Golden trace: cryptoFailureAction matrix
-
-**Gap.** The differential golden-trace catalog covers round-trip, batch,
-nack-redelivery, seek variants, many-publishes, lookup-before-open, and
-the full transactional lifecycle (new/commit, new/abort, send-ack/commit,
-send-ack/abort). Missing: the **`cryptoFailureAction` matrix** (~240 LOC)
-— assert each `CryptoFailureAction` arm (Fail / Discard / Consume) at the
-consumer surface when a payload carries intentionally-corrupt ciphertext.
-
-**Why it stays open.** Blocked on porting the PIP-4 message-crypto bridge
-(currently `magnetar-messagecrypto` + `magnetar-runtime-tokio`) to the
-moonpool runtime — the differential equivalence claim needs both engines
-to drive decryption.
-
-**`/goal` (post crypto-bridge port).**
-
-```text
-/goal add the cryptoFailureAction matrix golden trace per docs/follow-ups.md §3 — DEPENDS on porting the PIP-4 message crypto bridge to the moonpool runtime first (moonpool MessageEncryptor/Decryptor). Once those are in place, extend the scripted broker to deliver a payload with intentionally-corrupt ciphertext and assert each `CryptoFailureAction` arm (Fail / Discard / Consume) at the consumer surface. Golden trace at crates/magnetar-differential/tests/golden/crypto_failure_action.json. Validation chain per CLAUDE.md.
-```
-
----
-
-## 4. Differential runner: Send-bound spawn restructure
-
-**Gap.** The differential moonpool runner's driver task is `spawn_local`'d
-into a [`tokio::task::LocalSet`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html)
-because [`moonpool_core::TokioProviders`]'s `TaskProvider` spawns via
-`tokio::task::Builder::new().spawn_local(...)`. While the outer test task
-is parked on `consumer.receive()`, the `spawn_local`'d driver only runs
-when the LocalSet's `run_until` is polled, so
-[`crates/magnetar-differential/src/runner_moonpool.rs`](../crates/magnetar-differential/src/runner_moonpool.rs)
-keeps a 25 ms `Kicker` pulsing `driver_waker.notify_one()` to bridge the
-pump gap. Correct, just ugly.
-
-**Why it stays open.** Investigated and structurally blocked in-tree: the
-driver task is spawned **inside**
-`magnetar_runtime_moonpool::Client::connect_plain` via the engine's
-`TaskProvider`, which hardcodes `spawn_local`. `tokio::spawn` requires
-`Send`; moonpool's `TaskProvider` is not `Send`-bound, so a drop-in
-`tokio::spawn` provider is impossible without an upstream change. Two real
-paths: (1) upstream moonpool adds a `Send`-bound spawn entry point (could
-ride the same window as the now-merged
-[PR #113](https://github.com/PierreZ/moonpool/pull/113)); or (2) duplicate
-the engine's driver-spawn wiring in the runner (brittle). Until then the
-`Kicker` workaround stays.
-
-**`/goal` (post-upstream).**
-
-```text
-/goal restructure the differential moonpool runner per docs/follow-ups.md §4 ONCE the upstream moonpool TaskProvider gains a Send-bound spawn entry point. When it lands: (1) construct a custom Providers type in crates/magnetar-differential/src/runner_moonpool.rs that uses the Send-bound provider for Task and reuses TokioNetworkProvider / TokioTimeProvider / TokioRandomProvider / TokioStorageProvider for the rest; (2) drop the LocalSet wrapper in `pub async fn run(...)` — `local.run_until(run_inner(...))` becomes `run_inner(...).await`; (3) delete the Kicker struct + 25 ms pulse loop; (4) update the module doc comment to document the trade-off; (5) run golden_traces, verify no regression. Validation chain per CLAUDE.md.
-```
-
----
-
-## 5. Re-pin moonpool off git `branch = "main"`
+## 2. Re-pin moonpool off git `branch = "main"`
 
 **Gap.** `Cargo.toml`'s `[workspace.dependencies]` tracks `moonpool-core`
 / `moonpool-sim` on `{ version = "0.6.0", git = "…", branch = "main" }` to
@@ -165,26 +85,8 @@ migration and the vectored entry.
 **`/goal` (post-release).**
 
 ```text
-/goal re-pin moonpool off the git `branch = "main"` floating dependency per docs/follow-ups.md §5, once a moonpool crates.io release ships PR #113 (futures-io `NetworkProvider::TcpStream` + `SimTcpStream::poll_write_vectored`). In Cargo.toml `[workspace.dependencies]`, replace the two `{ version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }` entries for `moonpool-core` / `moonpool-sim` with exact `=x.y.z` version pins matching the release that carries PR #113. Run `cargo update -p moonpool-core -p moonpool-sim` to refresh Cargo.lock to the released artefact. Confirm the transport still compiles against the `futures::io` ext traits (the release keeps the same surface). Remove the `[sources].allow-git` entry in deny.toml. Flip specs/adr/0043-temporary-floating-moonpool-git-dep.md Status to `Superseded by ADR-NNNN` and write the re-pin ADR (restores ADR-0036 exact-pin in full); flip the ADR-0036 amendment pointer + index status accordingly; update specs/README.md index. Update docs/simulation-patterns.md and any other version statement. Validation chain per CLAUDE.md (incl. `cargo deny check` — the release re-enables the version/advisory gates the git dep bypassed).
+/goal re-pin moonpool off the git `branch = "main"` floating dependency per docs/follow-ups.md §2, once a moonpool crates.io release ships PR #113 (futures-io `NetworkProvider::TcpStream` + `SimTcpStream::poll_write_vectored`). In Cargo.toml `[workspace.dependencies]`, replace the two `{ version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }` entries for `moonpool-core` / `moonpool-sim` with exact `=x.y.z` version pins matching the release that carries PR #113. Run `cargo update -p moonpool-core -p moonpool-sim` to refresh Cargo.lock to the released artefact. Confirm the transport still compiles against the `futures::io` ext traits (the release keeps the same surface). Remove the `[sources].allow-git` entry in deny.toml. Flip specs/adr/0043-temporary-floating-moonpool-git-dep.md Status to `Superseded by ADR-NNNN` and write the re-pin ADR (restores ADR-0036 exact-pin in full); flip the ADR-0036 amendment pointer + index status accordingly; update specs/README.md index. Update docs/simulation-patterns.md and any other version statement. Validation chain per CLAUDE.md (incl. `cargo deny check` — the release re-enables the version/advisory gates the git dep bypassed).
 ```
-
----
-
-## 6. Moonpool transport `read_into` scratch allocation
-
-**Gap.** `crates/magnetar-runtime-moonpool/src/transport.rs::read_into`
-(the `futures::io` replacement for the vanished tokio `read_buf`)
-heap-allocates a fresh `TLS_WIRE_BUFFER` (16 KiB) scratch on every read,
-then copies into the caller's `BytesMut`. The old tokio `read_buf` read
-in-place into the buffer's spare capacity (no extra alloc + copy).
-
-**Why it stays open / deferred.** Not load-bearing: the moonpool engine is
-the deterministic-simulation path, not the production hot path (the tokio
-engine is). The heap scratch was a deliberate choice to keep the returned
-future small (a 16 KiB stack array tripped clippy's `large_futures`). A
-future optimization could carry a reusable scratch buffer on the
-`Transport` and read into spare capacity, but it is pure throughput polish
-with no correctness or behavioural impact.
 
 ---
 
@@ -200,9 +102,9 @@ expected churn:
    post-implementation reference); partially-landed items are trimmed to
    their remaining residual.
 
-All remaining items carry either a `/goal …` block ready to dispatch, an
-explicit external blocker (upstream moonpool / Pulsar release), or are
-explicitly deferred as non-load-bearing. The only fully-external blockers
-are the PIP-460 e2e ([§1](#1-pip-460-scalable-topics-e2e)) and the moonpool
-re-pin ([§5](#5-re-pin-moonpool-off-git-branch-main)), both pending an
-upstream release.
+All remaining items carry either a `/goal …` block ready to dispatch or an
+explicit external blocker (upstream moonpool / Pulsar release). The only
+fully-external blockers are the PIP-460 e2e
+([§1](#1-pip-460-scalable-topics-e2e)) and the moonpool re-pin
+([§2](#2-re-pin-moonpool-off-git-branch-main)), both pending an upstream
+release.

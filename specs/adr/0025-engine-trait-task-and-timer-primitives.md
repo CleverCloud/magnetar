@@ -20,7 +20,7 @@ schemas — currently lives in an `impl PulsarClient<TokioEngine>`
 block because the implementations call `tokio::spawn`,
 `tokio::time::interval`, `tokio::task::JoinHandle::abort`, etc.
 
-`docs/follow-ups.md` §D1 sketched three trait-extension shapes:
+`docs/follow-ups.md` sketched three trait-extension shapes:
 
 1. **Minimal** — `TaskHandle` + `Interval` + `spawn` + `abort_task` +
    `new_interval` + `interval_tick`. Six methods. Lets background-task
@@ -168,7 +168,7 @@ practice.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   Cross-runtime test parity; the new primitives ship with mirrored
   tests on both engines.
-- [`docs/follow-ups.md`](../../docs/follow-ups.md) §D1 — three trait-
+- [`docs/follow-ups.md`](../../docs/follow-ups.md) — three trait-
   extension shapes considered; this ADR selects option 1.
 - [`crates/magnetar/src/engine.rs`](../../crates/magnetar/src/engine.rs) —
   trait definition.
