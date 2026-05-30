@@ -32,6 +32,11 @@ scalable-topics  = []
 bytes        = { workspace = true }
 crc32c       = { workspace = true }
 prost        = { workspace = true }
+# Well-known `google.protobuf` descriptor types used by `ProtobufSchema`
+# to advertise a canonical `FileDescriptorProto` as `schema_data` (broker
+# parity with the Java client's PROTOBUF_NATIVE descriptor wrapping).
+# Pure Rust, zero I/O — verified via `cargo xtask check-no-io-deps`.
+prost-types  = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 slab         = { workspace = true }

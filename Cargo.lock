@@ -1807,6 +1807,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "prost",
+ "prost-types",
  "rstest",
  "rustc-hash",
  "schemars 1.2.1",

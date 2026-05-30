@@ -20,10 +20,19 @@
 //!
 //! Per Codex cross-check on `SchemaRegistryServiceImpl.java:405-438`:
 //!
-//! - **AVRO / JSON / PROTOBUF** schemas are re-parsed broker-side via Avro `Schema.Parser` before
-//!   the version lookup. Magnetar emits the Avro parsing canonical form for `AvroSchema` so two
+//! - **AVRO / JSON** schemas are re-parsed broker-side via Avro `Schema.Parser` before the version
+//!   lookup. Magnetar emits the Avro parsing canonical form for `AvroSchema` so two
 //!   logically-identical schemas hash to the same version regardless of whitespace, field order, or
 //!   property ordering.
+//! - **PROTOBUF** schemas are stored as opaque blobs and compared by raw-byte equality. The Java
+//!   client emits an Avro-schema-derived-from-protobuf JSON document
+//!   (`org.apache.avro.protobuf.ProtobufData.getSchema(pojo)`); magnetar instead emits a serialised
+//!   `FileDescriptorProto` via [`ProtobufSchema::with_file_descriptor`] /
+//!   [`ProtobufSchema::with_file_descriptor_proto`]. Both forms satisfy the broker's byte-equality
+//!   contract, but they are **not** byte-identical to each other — a topic produced-to by both
+//!   clients will register two distinct schema versions until an Avro-from-protobuf bridge lands.
+//!   [`ProtobufSchema::new`] (fully-qualified name only) is retained for back-compat but is not
+//!   parity-compatible.
 //! - **PROTOBUF_NATIVE** and **KeyValue** are stored as opaque blobs and compared by **raw-byte
 //!   equality**. The Java client emits a `FileDescriptorSet` for `PROTOBUF_NATIVE` and a stable
 //!   JSON shape (`{"key": ..., "value": ..., "keyValueEncodingType": ...}`) for `KeyValue`.
