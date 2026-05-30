@@ -470,14 +470,27 @@ where
     /// [`crate::CreateProducerApi`] trait. The configured schema is
     /// advertised on `CommandProducer.schema`.
     ///
-    /// The encryptor (PIP-4) is **not** consulted on this path —
-    /// tokio-engine callers that need encryption use
-    /// [`Self::create_with_encryption`] on the
-    /// tokio specialisation.
+    /// **PIP-4 encryption guardrail (BREAKING since the encryptor-storage lift).**
+    /// If [`Self::encryption`] was called on the tokio specialisation,
+    /// `.create()` returns [`PulsarError::Other`] instead of silently opening
+    /// a plaintext producer. Use [`Self::create_with_encryption`] to honor
+    /// the PIP-4 encryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] if an encryptor was configured via [`Self::encryption`] — call
+    ///   `create_with_encryption()` instead.
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
     pub async fn create(
         self,
     ) -> Result<TypedProducer<S, <E::ClientState as crate::CreateProducerApi>::Producer>, PulsarError>
     {
+        if self.encryptor.is_some() {
+            return Err(PulsarError::Other(
+                "TypedProducerBuilder::create() refuses a configured encryptor — \
+                 use create_with_encryption() to honor the PIP-4 encryptor"
+                    .to_owned(),
+            ));
+        }
         let schema_pb = pb::Schema {
             name: self.topic.clone(),
             schema_data: self.schema.schema_data(),

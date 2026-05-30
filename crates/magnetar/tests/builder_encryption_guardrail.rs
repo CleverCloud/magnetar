@@ -13,7 +13,17 @@
 //! populated, with a message pointing at the per-engine
 //! `*_with_encryption()` / `*_with_decryption()` specialisations.
 //!
-//! Two engines, two tests apiece (producer + consumer = 4 tests total).
+//! Two engines, two tests apiece for the engine-generic
+//! `ProducerBuilder` / `ConsumerBuilder` (4 tests), plus four
+//! companion guardrails on the remaining engine-generic builders that
+//! still expose a per-engine `encryption()` setter:
+//! `PartitionedProducerBuilder::create`, `TableViewBuilder::create`,
+//! `TypedTableViewBuilder::create`, and the tokio-only
+//! `TypedProducerBuilder::create`. The latter four only have a tokio
+//! `encryption()` setter today, so only the tokio guardrail path is
+//! exercised — the moonpool side of those builders can't even
+//! populate the encryptor/decryptor slot via the public API.
+//!
 //! ADR-0024 four-layer policy: this file lives at the façade tier; the
 //! runtime tiers stay unchanged (the guardrail is a façade-only
 //! short-circuit), the proto tier is unaffected (no wire change), and the
@@ -315,4 +325,142 @@ async fn moonpool_consumer_subscribe_refuses_configured_decryptor() {
             client.close().await;
         })
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// Companion guardrails on the remaining engine-generic builders.
+// These four builders only expose a tokio `encryption()` setter today;
+// the moonpool side cannot populate the encryptor/decryptor slot via the
+// public API, so the moonpool guardrail path is unreachable and not
+// exercised here (the check itself is still correct on both engines).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_partitioned_producer_create_refuses_configured_encryptor() {
+    let addr = spawn_fake_broker().await;
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        PulsarClient::builder()
+            .service_url(format!("pulsar://{addr}"))
+            .build(),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    let bridge = build_bridge();
+    let err = client
+        .partitioned_producer("persistent://public/default/guardrail-tokio-pprod")
+        .encryption(bridge.clone() as Arc<dyn magnetar::runtime_tokio::MessageEncryptor>)
+        .create()
+        .await
+        .expect_err("create() must refuse a configured encryptor");
+    let msg = match err {
+        PulsarError::Other(s) => s,
+        other => panic!("expected PulsarError::Other, got {other:?}"),
+    };
+    assert!(
+        msg.contains("create_with_encryption"),
+        "guardrail error must point at the per-engine specialisation, got {msg:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_table_view_create_refuses_configured_decryptor() {
+    let addr = spawn_fake_broker().await;
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        PulsarClient::builder()
+            .service_url(format!("pulsar://{addr}"))
+            .build(),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    let bridge = build_bridge();
+    let err = client
+        .table_view("persistent://public/default/guardrail-tokio-tv")
+        .encryption(bridge.clone() as Arc<dyn magnetar::runtime_tokio::MessageDecryptor>)
+        .create()
+        .await
+        .expect_err("create() must refuse a configured decryptor");
+    let msg = match err {
+        PulsarError::Other(s) => s,
+        other => panic!("expected PulsarError::Other, got {other:?}"),
+    };
+    assert!(
+        msg.contains("create_with_decryption"),
+        "guardrail error must point at the per-engine specialisation, got {msg:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_typed_table_view_create_refuses_configured_decryptor() {
+    use magnetar_proto::schema::StringSchema;
+
+    let addr = spawn_fake_broker().await;
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        PulsarClient::builder()
+            .service_url(format!("pulsar://{addr}"))
+            .build(),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    let bridge = build_bridge();
+    let err = client
+        .typed_table_view(
+            "persistent://public/default/guardrail-tokio-ttv",
+            Arc::new(StringSchema::new()),
+        )
+        .encryption(bridge.clone() as Arc<dyn magnetar::runtime_tokio::MessageDecryptor>)
+        .create()
+        .await
+        .expect_err("create() must refuse a configured decryptor");
+    let msg = match err {
+        PulsarError::Other(s) => s,
+        other => panic!("expected PulsarError::Other, got {other:?}"),
+    };
+    assert!(
+        msg.contains("create_with_decryption"),
+        "guardrail error must point at the per-engine specialisation, got {msg:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_typed_producer_create_refuses_configured_encryptor() {
+    use magnetar_proto::schema::StringSchema;
+
+    let addr = spawn_fake_broker().await;
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        PulsarClient::builder()
+            .service_url(format!("pulsar://{addr}"))
+            .build(),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    let bridge = build_bridge();
+    let err = client
+        .typed_producer(
+            "persistent://public/default/guardrail-tokio-tprod",
+            Arc::new(StringSchema::new()),
+        )
+        .encryption(bridge.clone() as Arc<dyn magnetar::runtime_tokio::MessageEncryptor>)
+        .create()
+        .await
+        .expect_err("create() must refuse a configured encryptor");
+    let msg = match err {
+        PulsarError::Other(s) => s,
+        other => panic!("expected PulsarError::Other, got {other:?}"),
+    };
+    assert!(
+        msg.contains("create_with_encryption"),
+        "guardrail error must point at the per-engine specialisation, got {msg:?}"
+    );
 }

@@ -908,12 +908,21 @@ impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
     /// [`crate::BrokerMetadataApi`] (partition count lookup) and
     /// [`crate::CreateProducerApi`] (per-partition producer creation)
     /// extension traits, so the same builder shape works for both the
-    /// tokio and moonpool engines. The configured PIP-4 encryptor is
-    /// ignored on this engine-generic path — tokio-engine callers that
-    /// need encryption use [`PartitionedProducerBuilder::create_with_encryption`].
+    /// tokio and moonpool engines.
+    ///
+    /// **PIP-4 encryption guardrail (BREAKING since the encryptor-storage lift).**
+    /// If [`Self::encryption`] was called on the per-engine specialisation,
+    /// `.create()` returns [`PulsarError::Other`] instead of silently opening
+    /// plaintext per-partition producers. The engine-generic dispatch does not
+    /// know how to thread an engine-typed encryptor through `open_producer`,
+    /// so the previous "silently drop the encryptor" behaviour was a footgun.
+    /// Use [`Self::create_with_encryption`] on the tokio specialisation
+    /// instead.
     ///
     /// # Errors
     ///
+    /// - [`PulsarError::Other`] if an encryptor was configured via [`Self::encryption`] — call
+    ///   `create_with_encryption()` instead.
     /// - [`PulsarError::Other`] (stringified) on the broker metadata lookup or on a per-partition
     ///   producer open failure.
     pub async fn create(
@@ -925,6 +934,15 @@ impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
     where
         E::ClientState: crate::BrokerMetadataApi + crate::CreateProducerApi,
     {
+        if self.encryptor.is_some() {
+            return Err(PulsarError::Other(
+                "PartitionedProducerBuilder::create() refuses a configured encryptor — \
+                 use create_with_encryption() on the engine-specific builder \
+                 (PIP-4 encryptors are engine-typed and cannot dispatch \
+                 through the engine-generic CreateProducerApi)"
+                    .to_owned(),
+            ));
+        }
         let partitions_count =
             crate::BrokerMetadataApi::partitioned_topic_metadata(&self.client.inner, &self.topic)
                 .await

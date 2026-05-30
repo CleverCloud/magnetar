@@ -494,11 +494,19 @@ impl<'a, E: Engine> TableViewBuilder<'a, E> {
     ///
     /// Dispatches through the engine-generic [`crate::SubscribeApi`]
     /// extension trait — works against any engine whose `ClientState`
-    /// implements it. The configured PIP-4 decryptor is ignored on
-    /// this engine-generic path; tokio-engine callers that need
-    /// decryption use [`TableViewBuilder::create_with_decryption`].
+    /// implements it.
+    ///
+    /// **PIP-4 decryption guardrail (BREAKING since the decryptor-storage lift).**
+    /// If [`Self::encryption`] was called on the per-engine specialisation,
+    /// `.create()` returns [`PulsarError::Other`] instead of silently opening
+    /// a plaintext consumer. The engine-generic dispatch cannot thread an
+    /// engine-typed decryptor through `subscribe`, so the previous "silently
+    /// drop the decryptor" behaviour was a footgun. Use
+    /// [`Self::create_with_decryption`] on the tokio specialisation instead.
     ///
     /// # Errors
+    /// - [`PulsarError::Other`] if a decryptor was configured via [`Self::encryption`] — call
+    ///   `create_with_decryption()` instead.
     /// - [`PulsarError::Other`] on broker rejection or wire failure (stringified).
     pub async fn create(
         self,
@@ -507,6 +515,15 @@ impl<'a, E: Engine> TableViewBuilder<'a, E> {
         E::ClientState: crate::SubscribeApi,
         <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
     {
+        if self.decryptor.is_some() {
+            return Err(PulsarError::Other(
+                "TableViewBuilder::create() refuses a configured decryptor — \
+                 use create_with_decryption() on the engine-specific builder \
+                 (PIP-4 decryptors are engine-typed and cannot dispatch \
+                 through the engine-generic SubscribeApi)"
+                    .to_owned(),
+            ));
+        }
         let subscription = self
             .subscription
             .unwrap_or_else(|| format!("table-view-{}", E::random_subscription_suffix()));
@@ -921,11 +938,19 @@ impl<'a, S: magnetar_proto::schema::Schema, E: Engine> TypedTableViewBuilder<'a,
     }
 
     /// Subscribe and return the schema-aware view via the engine-generic
-    /// [`TableViewBuilder::create`] path. The configured PIP-4 decryptor
-    /// is ignored on this path; tokio-engine callers that need
-    /// decryption use [`TypedTableViewBuilder::create_with_decryption`].
+    /// [`TableViewBuilder::create`] path.
+    ///
+    /// **PIP-4 decryption guardrail (BREAKING since the decryptor-storage lift).**
+    /// If [`Self::encryption`] was called on the per-engine specialisation,
+    /// `.create()` returns [`PulsarError::Other`] instead of silently opening
+    /// a plaintext consumer. The engine-generic dispatch cannot thread an
+    /// engine-typed decryptor through `subscribe`, so the previous "silently
+    /// drop the decryptor" behaviour was a footgun. Use
+    /// [`Self::create_with_decryption`] on the tokio specialisation instead.
     ///
     /// # Errors
+    /// - [`PulsarError::Other`] if a decryptor was configured via [`Self::encryption`] — call
+    ///   `create_with_decryption()` instead.
     /// - [`PulsarError::Other`] on broker rejection or wire failure (stringified).
     pub async fn create(
         self,
@@ -934,6 +959,15 @@ impl<'a, S: magnetar_proto::schema::Schema, E: Engine> TypedTableViewBuilder<'a,
         E::ClientState: crate::SubscribeApi,
         <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
     {
+        if self.decryptor.is_some() {
+            return Err(PulsarError::Other(
+                "TypedTableViewBuilder::create() refuses a configured decryptor — \
+                 use create_with_decryption() on the engine-specific builder \
+                 (PIP-4 decryptors are engine-typed and cannot dispatch \
+                 through the engine-generic SubscribeApi)"
+                    .to_owned(),
+            ));
+        }
         let mut builder = self
             .client
             .table_view(self.topic)
