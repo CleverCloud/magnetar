@@ -10,15 +10,18 @@
 //! `consumer(...)` / `reader(...)` dispatch through the
 //! engine-generic factory traits.
 //!
-//! **Engine-genericity (docs/follow-ups.md §2 WAVE 2).** The encryptor
+//! **Engine-genericity.** The encryptor
 //! / decryptor storage is engine-typed via the per-engine
 //! [`crate::MessageEncryptorApi`] / [`crate::MessageDecryptorApi`]
 //! extension traits: tokio plugs in
 //! `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>` and moonpool
-//! plugs in [`crate::NoEncryption`] (no-op stub). The chainable
+//! plugs in `Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>`
+//! (both engines now ship the PIP-4 bridge). The chainable
 //! surface stays engine-agnostic — the `E: Engine` parameter only
 //! surfaces in the terminal `.create()` / `.subscribe()` dispatch
-//! through [`crate::CreateProducerApi`] / [`crate::SubscribeApi`].
+//! through [`crate::CreateProducerApi`] / [`crate::SubscribeApi`], and
+//! in the per-engine `.create_with_encryption()` /
+//! `.subscribe_with_decryption()` specialisations.
 //!
 //! All three builders are re-exported from `magnetar::*` via the
 //! façade `lib.rs` so existing call sites keep working unchanged.
@@ -48,9 +51,10 @@ pub struct ProducerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     /// Engine-typed encryptor slot. Tokio resolves
     /// `<TokioEngine as MessageEncryptorApi>::Encryptor` to
     /// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool
-    /// resolves it to [`crate::NoEncryption`] (no-op stub). The generic
-    /// `.create()` path ignores this field — only the tokio-specialised
-    /// `.create_with_encryption()` consults it.
+    /// resolves it to `Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>`.
+    /// The generic `.create()` path **rejects** a configured encryptor — only
+    /// the per-engine `.create_with_encryption()` specialisations actually
+    /// open a PIP-4-encrypting producer.
     ///
     /// `MessageEncryptorApi` is a supertrait of [`crate::Engine`], so the
     /// resolution is automatic — no extra bound needed at the use site.
@@ -165,15 +169,22 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
         self
     }
 
-    /// Configure PIP-4 end-to-end encryption. The encryptor is consulted on every
     /// Open the producer via the engine-generic
     /// [`crate::CreateProducerApi`] trait. Returns the engine's
-    /// concrete `Producer` type. The encryptor (PIP-4) is **not**
-    /// consulted on this path — tokio-engine callers that need
-    /// encryption use [`Self::create_with_encryption`] on the tokio
-    /// specialisation.
+    /// concrete `Producer` type.
+    ///
+    /// **PIP-4 encryption guardrail (BREAKING since the encryptor-storage lift).**
+    /// If [`Self::encryption`] was called on the per-engine specialisation,
+    /// `.create()` returns [`PulsarError::Other`] instead of silently opening
+    /// a plaintext producer. The engine-generic dispatch does not know how to
+    /// thread an engine-typed encryptor through `open_producer`, so the
+    /// previous "silently drop the encryptor" behaviour was a footgun.
+    /// Use [`Self::create_with_encryption`] on the tokio /
+    /// moonpool specialisation instead.
     ///
     /// # Errors
+    /// - [`PulsarError::Other`] if an encryptor was configured via [`Self::encryption`] — call
+    ///   `create_with_encryption()` instead.
     /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
     pub async fn create(
         self,
@@ -181,6 +192,15 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
     where
         E::ClientState: crate::CreateProducerApi,
     {
+        if self.encryptor.is_some() {
+            return Err(PulsarError::Other(
+                "ProducerBuilder::create() refuses a configured encryptor — \
+                 use create_with_encryption() on the engine-specific builder \
+                 (PIP-4 encryptors are engine-typed and cannot dispatch \
+                 through the engine-generic CreateProducerApi)"
+                    .to_owned(),
+            ));
+        }
         crate::CreateProducerApi::open_producer(&self.client.inner, self.req)
             .await
             .map_err(|err| PulsarError::Other(format!("open_producer: {err}")))
@@ -188,7 +208,8 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
 }
 
 /// Tokio-engine-specific `ProducerBuilder` methods that depend on the
-/// tokio `MessageEncryptor` extension (PIP-4 not yet wired on moonpool).
+/// tokio `MessageEncryptor` extension. The moonpool equivalent lives in
+/// the `#[cfg(feature = "moonpool")]` block below (ADR-0044).
 impl ProducerBuilder<'_, crate::TokioEngine> {
     /// Set the PIP-4 encryptor. The encryptor is consulted on every
     /// `send()` to wrap the (post-compression) payload.
@@ -219,13 +240,52 @@ impl ProducerBuilder<'_, crate::TokioEngine> {
     }
 }
 
+/// Moonpool-engine-specific `ProducerBuilder` methods that depend on the
+/// moonpool `MessageEncryptor` extension (PIP-4). 1:1 mirror of the tokio
+/// specialisation above — the moonpool runtime now ships the same encryption
+/// hook surface, so the façade exposes the same `.encryption()` +
+/// `.create_with_encryption()` chain for the moonpool engine.
+#[cfg(feature = "moonpool")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static>
+    ProducerBuilder<'_, crate::MoonpoolEngine<P>>
+{
+    /// Set the PIP-4 encryptor. The encryptor is consulted on every
+    /// `send()` to wrap the (post-compression) payload.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        encryptor: std::sync::Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>,
+    ) -> Self {
+        // `<MoonpoolEngine<P> as MessageEncryptorApi>::Encryptor` resolves
+        // exactly to `Arc<dyn MessageEncryptor>` so we store the arg
+        // directly into the engine-typed slot.
+        self.encryptor = Some(encryptor);
+        self
+    }
+
+    /// Open the producer honoring the configured encryptor (PIP-4).
+    /// Moonpool-engine-only — use [`Self::create`] for the engine-generic
+    /// path that ignores the encryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn create_with_encryption(self) -> Result<magnetar_runtime_moonpool::Producer<P>> {
+        self.client
+            .inner
+            .open_producer_with(self.req, self.encryptor)
+            .await
+            .map_err(|err| PulsarError::Other(format!("open_producer: {err}")))
+    }
+}
+
 /// Builder for a consumer.
 ///
 /// Engine-generic over `E: Engine` per ADR-0026 §D1 (default
 /// [`crate::TokioEngine`]). The base `subscribe()` dispatches through
 /// the [`crate::SubscribeApi`] extension trait implemented by both
-/// runtimes' `Client`; tokio-only knobs (PIP-4 decryption) live on
-/// the `impl ConsumerBuilder<TokioEngine>` specialised block.
+/// runtimes' `Client`; the per-engine PIP-4 decryption knobs live on the
+/// engine-specialised `impl ConsumerBuilder<TokioEngine>` /
+/// `#[cfg(feature = "moonpool")]` blocks (ADR-0044).
 pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     client: &'a PulsarClient<E>,
     req: SubscribeRequest,
@@ -234,6 +294,10 @@ pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     /// moonpool split; same per-engine
     /// [`crate::MessageDecryptorApi`] resolution (supertrait of
     /// [`crate::Engine`], so no extra bound needed at the use site).
+    ///
+    /// The generic `.subscribe()` path **rejects** a configured decryptor —
+    /// only the per-engine `.subscribe_with_decryption()` specialisations
+    /// actually open a PIP-4-decrypting consumer.
     decryptor: Option<<E as crate::MessageDecryptorApi>::Decryptor>,
 }
 
@@ -476,12 +540,20 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
     }
 
     /// Subscribe via the engine-generic [`crate::SubscribeApi`] trait.
-    /// Returns the engine's concrete `Consumer` type. The decryptor
-    /// (PIP-4) is **not** consulted on this path — for tokio-engine
-    /// callers that need decryption, use the tokio-specialised
-    /// `subscribe_with_decryption` method (`impl ConsumerBuilder<TokioEngine>`).
+    /// Returns the engine's concrete `Consumer` type.
+    ///
+    /// **PIP-4 decryption guardrail (BREAKING since the decryptor-storage lift).**
+    /// If [`Self::encryption`] was called on the per-engine specialisation,
+    /// `.subscribe()` returns [`PulsarError::Other`] instead of silently opening
+    /// a plaintext consumer. The engine-generic dispatch cannot thread an
+    /// engine-typed decryptor through `subscribe`, so the previous "silently
+    /// drop the decryptor" behaviour was a footgun. Use
+    /// [`Self::subscribe_with_decryption`] on the tokio / moonpool
+    /// specialisation instead.
     ///
     /// # Errors
+    /// - [`PulsarError::Other`] if a decryptor was configured via [`Self::encryption`] — call
+    ///   `subscribe_with_decryption()` instead.
     /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
     pub async fn subscribe(
         self,
@@ -489,6 +561,15 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
     where
         E::ClientState: crate::SubscribeApi,
     {
+        if self.decryptor.is_some() {
+            return Err(PulsarError::Other(
+                "ConsumerBuilder::subscribe() refuses a configured decryptor — \
+                 use subscribe_with_decryption() on the engine-specific builder \
+                 (PIP-4 decryptors are engine-typed and cannot dispatch \
+                 through the engine-generic SubscribeApi)"
+                    .to_owned(),
+            ));
+        }
         crate::SubscribeApi::subscribe(&self.client.inner, self.req)
             .await
             .map_err(|err| PulsarError::Other(format!("subscribe: {err}")))
@@ -496,7 +577,8 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
 }
 
 /// Tokio-engine-specific `ConsumerBuilder` methods that depend on the
-/// tokio `MessageDecryptor` extension (PIP-4 not yet wired on moonpool).
+/// tokio `MessageDecryptor` extension. The moonpool equivalent lives in
+/// the `#[cfg(feature = "moonpool")]` block below (ADR-0044).
 impl ConsumerBuilder<'_, crate::TokioEngine> {
     /// Configure PIP-4 end-to-end decryption. The decryptor is consulted on every received
     /// message whose `MessageMetadata.encryption_keys` is non-empty.
@@ -524,6 +606,42 @@ impl ConsumerBuilder<'_, crate::TokioEngine> {
             .inner
             .subscribe_with(self.req, self.decryptor)
             .await?)
+    }
+}
+
+/// Moonpool-engine-specific `ConsumerBuilder` methods that depend on the
+/// moonpool `MessageDecryptor` extension (PIP-4). 1:1 mirror of the tokio
+/// specialisation above.
+#[cfg(feature = "moonpool")]
+impl<P: moonpool_core::Providers + Send + Sync + 'static>
+    ConsumerBuilder<'_, crate::MoonpoolEngine<P>>
+{
+    /// Configure PIP-4 end-to-end decryption. The decryptor is consulted on every received
+    /// message whose `MessageMetadata.encryption_keys` is non-empty.
+    #[must_use]
+    pub fn encryption(
+        mut self,
+        decryptor: std::sync::Arc<dyn magnetar_runtime_moonpool::MessageDecryptor>,
+    ) -> Self {
+        // `<MoonpoolEngine<P> as MessageDecryptorApi>::Decryptor` resolves
+        // exactly to `Arc<dyn MessageDecryptor>` so we store the arg
+        // directly into the engine-typed slot.
+        self.decryptor = Some(decryptor);
+        self
+    }
+
+    /// Subscribe with the configured decryptor (PIP-4). Moonpool-engine-only.
+    /// Use [`Self::subscribe`] for the engine-generic path that ignores
+    /// the decryptor.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn subscribe_with_decryption(self) -> Result<magnetar_runtime_moonpool::Consumer<P>> {
+        self.client
+            .inner
+            .subscribe_with(self.req, self.decryptor)
+            .await
+            .map_err(|err| PulsarError::Other(format!("subscribe: {err}")))
     }
 }
 

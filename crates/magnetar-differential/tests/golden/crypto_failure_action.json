@@ -1,0 +1,5 @@
+[
+  "fail:RecvDecryptError",
+  "discard:RecvTimeout",
+  "consume:Received(corrupt=true)"
+]

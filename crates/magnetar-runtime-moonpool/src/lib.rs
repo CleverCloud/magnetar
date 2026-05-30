@@ -64,6 +64,7 @@
 pub mod auto_cluster_failover;
 mod client;
 mod consumer;
+pub mod crypto;
 pub mod dns;
 mod driver;
 mod pool;
@@ -103,6 +104,7 @@ use tokio::sync::Notify;
 
 pub use crate::client::{Client, ClientError, LookupTopicResult};
 pub use crate::consumer::Consumer;
+pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};
 pub use crate::dns::{DnsResolveFuture, DnsResolver, StaticDnsResolver, arc_dns_resolver};
 pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
@@ -116,8 +118,7 @@ use crate::transport::Transport;
 /// is that every test using `DETERMINISTIC_SIM_EPOCH_MS` reads the same
 /// wall clock, so wire bytes (and the `publish_time` field on outbound
 /// `CommandSend` frames in particular) are reproducible across runs of
-/// the same seed. Pairs with the moonpool wall-clock bridge tracked in
-/// `docs/follow-ups.md`.
+/// the same seed. Pairs with the moonpool wall-clock bridge.
 pub const DETERMINISTIC_SIM_EPOCH_MS: u64 = 1_704_067_200_000;
 
 /// Capture the host's current `SystemTime` as millis-since-`UNIX_EPOCH`.

@@ -714,14 +714,15 @@ impl PartitionedProducer<Producer> {
 /// Builder for [`PartitionedProducer`]. Mirrors Java's `ProducerBuilder` at the partitioned
 /// layer.
 ///
-/// Engine-generic per docs/follow-ups.md §2 WAVE 2: the type parameter
-/// `E: Engine` (defaults to [`crate::TokioEngine`]) selects the
-/// per-partition child producer type via the engine-side
-/// [`crate::CreateProducerApi`] + [`crate::BrokerMetadataApi`]
-/// extension traits. The encryptor slot is engine-typed via
+/// Engine-generic: the type parameter `E: Engine` (defaults to
+/// [`crate::TokioEngine`]) selects the per-partition child producer type
+/// via the engine-side [`crate::CreateProducerApi`] +
+/// [`crate::BrokerMetadataApi`] extension traits. The encryptor slot is
+/// engine-typed via
 /// [`crate::MessageEncryptorApi`] (tokio plugs in
 /// `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs in
-/// [`crate::NoEncryption`] no-op stub).
+/// `Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>` now that the
+/// moonpool engine ships the PIP-4 bridge).
 pub struct PartitionedProducerBuilder<'a, E: Engine = TokioEngine> {
     client: &'a PulsarClient<E>,
     topic: String,

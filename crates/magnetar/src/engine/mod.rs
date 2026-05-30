@@ -812,7 +812,7 @@ pub type OpenProducerFut<'a, P> = Pin<
 >;
 
 // ---------------------------------------------------------------------------
-// PIP-4 per-engine encryption extension traits (docs/follow-ups.md §2 WAVE 1).
+// PIP-4 per-engine encryption extension traits.
 //
 // Tokio defines `magnetar_runtime_tokio::MessageEncryptor` and
 // `magnetar_runtime_tokio::MessageDecryptor` for its own producer / consumer
@@ -821,9 +821,11 @@ pub type OpenProducerFut<'a, P> = Pin<
 // hard-locking them to the tokio engine. The two extension traits below
 // lift that storage off tokio: each engine declares its own concrete
 // encryptor / decryptor type, the façade stores
-// `Option<<E as MessageEncryptorApi>::Encryptor>` instead, and engines
-// that don't support encryption can supply a zero-sized stub
-// (e.g. moonpool's `NoEncryption`).
+// `Option<<E as MessageEncryptorApi>::Encryptor>` instead. Both runtime
+// engines now ship the PIP-4 bridge, so each resolves the associated type
+// to its own `Arc<dyn …MessageEncryptor>` / `…MessageDecryptor`. The
+// zero-sized [`NoEncryption`] stub remains for any future engine that
+// genuinely cannot drive on-the-wire encryption.
 //
 // The traits live on the engine marker (not on `Client`) because the
 // encryptor identity is engine-global config rather than per-connection
@@ -833,7 +835,7 @@ pub type OpenProducerFut<'a, P> = Pin<
 //
 // Sans-io: the traits define types only. Real encryption happens in the
 // runtime crates that supply the concrete types (`magnetar-runtime-tokio`
-// today; moonpool ships a no-op stub).
+// and `magnetar-runtime-moonpool`).
 // ---------------------------------------------------------------------------
 
 /// Engine-side message-encryptor selection. Each engine declares its own
@@ -843,10 +845,9 @@ pub type OpenProducerFut<'a, P> = Pin<
 ///
 /// Implemented on the engine marker ([`TokioEngine`] / [`MoonpoolEngine<P>`]).
 /// Tokio plugs in `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`;
-/// moonpool plugs in [`NoEncryption`] (a zero-sized stub) until real
-/// moonpool-side encryption lands. The choice of `Encryptor: Clone` lets
-/// the façade fan out the encryptor across child producers in
-/// `PartitionedProducer`.
+/// moonpool plugs in `Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>`.
+/// The choice of `Encryptor: Clone` lets the façade fan out the encryptor
+/// across child producers in `PartitionedProducer`.
 pub trait MessageEncryptorApi {
     /// Concrete per-engine encryptor type. `Clone + Send + Sync + 'static`
     /// so it survives spawn boundaries and fan-out into child producers.
@@ -963,14 +964,15 @@ pub enum ScalableEvent {
     },
 }
 
-/// Zero-sized stub for engines that don't yet wire real encryption.
-/// Used by [`MoonpoolEngine`] as both `MessageEncryptorApi::Encryptor`
-/// and `MessageDecryptorApi::Decryptor`. Constructing one is meaningless
-/// — engines that hand a `NoEncryption` to the façade signal "encryption
-/// not supported on this engine"; the builders' generic `.create()` /
-/// `.subscribe()` paths ignore the field. Tokio-specialised builder
-/// methods (`.create_with_encryption` / `.subscribe_with_decryption`)
-/// remain available on the tokio engine for real encryption.
+/// Zero-sized stub for any future engine that genuinely cannot wire real
+/// encryption. Both shipped engines ([`TokioEngine`] and
+/// [`MoonpoolEngine`]) now resolve their `MessageEncryptorApi::Encryptor`
+/// / `MessageDecryptorApi::Decryptor` to their own runtime's
+/// `Arc<dyn …MessageEncryptor>` / `…MessageDecryptor`, so `NoEncryption`
+/// is no longer used by either. It is retained as the documented opt-out
+/// type an engine can hand to the façade to signal "encryption not
+/// supported on this engine" — the builders' generic `.create()` /
+/// `.subscribe()` paths ignore the encryptor field regardless.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoEncryption;
 

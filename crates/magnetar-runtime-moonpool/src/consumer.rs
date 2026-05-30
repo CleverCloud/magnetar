@@ -52,6 +52,7 @@ use magnetar_proto::{
 use moonpool_core::Providers;
 
 use crate::client::{Client, ClientError};
+use crate::crypto::MessageDecryptor;
 use crate::{ConnectionShared, TopicListChange};
 
 /// User-facing consumer handle for the moonpool engine.
@@ -73,6 +74,11 @@ pub struct Consumer<P: Providers> {
     handle: ConsumerHandle,
     /// Direct handle to this consumer's per-slot state.
     slot: Arc<magnetar_proto::ConsumerSlot>,
+    /// Optional PIP-4 decryption hook. When the broker delivers a message with
+    /// `MessageMetadata.encryption_keys` set, the consumer hands the ciphertext
+    /// through this hook before yielding it to the user. 1:1 mirror of
+    /// `magnetar_runtime_tokio::Consumer::decryptor`.
+    decryptor: Option<Arc<dyn MessageDecryptor>>,
     /// Held only so `Consumer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers — the consumer just talks to the shared state.
@@ -85,6 +91,7 @@ impl<P: Providers> Clone for Consumer<P> {
             shared: self.shared.clone(),
             handle: self.handle,
             slot: self.slot.clone(),
+            decryptor: self.decryptor.clone(),
             _providers: std::marker::PhantomData,
         }
     }
@@ -490,6 +497,7 @@ impl<P: Providers> Consumer<P> {
         ReceiveFut {
             shared: self.shared.clone(),
             handle: self.handle,
+            decryptor: self.decryptor.clone(),
             slab_key: None,
         }
         .await
@@ -584,9 +592,40 @@ impl<P: Providers> Consumer<P> {
                 let mut conn = self.shared.inner.lock();
                 conn.pop_message(self.handle)
             };
-            let Some(msg) = msg else { break };
-            acc_bytes = acc_bytes.saturating_add(msg.payload.len());
-            out.push(msg);
+            let Some(mut msg) = msg else { break };
+            // PIP-4: honor the per-consumer crypto failure action for every encrypted message
+            // popped here (the first message went through `receive()` which already does this).
+            // Without this, messages 2..N of a batch would leak ciphertext to the caller and
+            // ignore the Fail/Discard/Consume policy. 1:1 with the tokio batch path.
+            let action = self
+                .shared
+                .inner
+                .lock()
+                .consumer_crypto_failure_action(self.handle);
+            match post_process_message(&mut msg, self.decryptor.as_ref(), action) {
+                PostProcessOutcome::Deliver => {
+                    acc_bytes = acc_bytes.saturating_add(msg.payload.len());
+                    out.push(msg);
+                }
+                PostProcessOutcome::Discard => {
+                    // Ack and continue — the caller should never see this message.
+                    let mut conn = self.shared.inner.lock();
+                    let _ = conn.ack(
+                        self.handle,
+                        magnetar_proto::AckRequest {
+                            message_ids: vec![msg.message_id],
+                            ack_type: magnetar_proto::pb::command_ack::AckType::Individual,
+                            properties: Vec::new(),
+                            txn_id: None,
+                        },
+                    );
+                    // Drop the connection lock before notifying the driver (lock-ordering:
+                    // global → per-slot, and `notify_one` must never run under the conn lock).
+                    drop(conn);
+                    self.shared.driver_waker.notify_one();
+                }
+                PostProcessOutcome::Fail(err) => return Err(err),
+            }
         }
         // pop_message may have queued FLOW frames; wake the driver.
         if out.len() > 1 {
@@ -1023,6 +1062,20 @@ impl<P: Providers> Client<P> {
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
     /// - [`ClientError::Other`] on connection close before the subscribe acked.
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer<P>, ClientError> {
+        self.subscribe_with(req, None).await
+    }
+
+    /// Same as [`Self::subscribe`] but with an optional PIP-4 decryption hook.
+    /// 1:1 mirror of `magnetar_runtime_tokio::Client::subscribe_with`.
+    ///
+    /// # Errors
+    /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
+    /// - [`ClientError::Other`] on connection close before the subscribe acked.
+    pub async fn subscribe_with(
+        &self,
+        req: SubscribeRequest,
+        decryptor: Option<Arc<dyn MessageDecryptor>>,
+    ) -> Result<Consumer<P>, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
         // See `Client::open_producer`: subscribe also needs lookup-driven bundle
         // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`. See the
@@ -1064,6 +1117,7 @@ impl<P: Providers> Client<P> {
             shared,
             handle,
             slot,
+            decryptor,
             _providers: std::marker::PhantomData,
         })
     }
@@ -1091,6 +1145,61 @@ impl Future for RequestFut {
     }
 }
 
+/// Outcome returned by [`post_process_message`].
+#[derive(Debug)]
+enum PostProcessOutcome {
+    /// The message is ready for the caller (plaintext, or — under `Consume` — ciphertext).
+    Deliver,
+    /// Decryption failed and the policy is [`magnetar_proto::CryptoFailureAction::Discard`].
+    /// The caller should ack the message and continue.
+    Discard,
+    /// Decryption failed and the policy is `Fail` (or no decryptor was configured for an
+    /// encrypted message). The caller should surface this error.
+    Fail(ClientError),
+}
+
+/// Apply the consumer-side PIP-4 decryption pipeline to a message popped straight from the
+/// sans-io state machine. Mirrors [`magnetar_runtime_tokio::consumer::post_process_message`]
+/// **minus the decompression step**: the moonpool producer refuses any non-`None`
+/// `CompressionKind` on send (see `Producer::send`), so there is never a consumer-side
+/// decompression branch to run here. `crypto_failure_action` governs what happens when the
+/// decryption step fails (see [`magnetar_proto::CryptoFailureAction`]).
+///
+/// The helper decrypts in place on `Deliver` (and leaves the ciphertext untouched under
+/// `Consume`); it NEVER acks and NEVER touches the connection — it only decides the outcome.
+/// The caller owns the ack-on-`Discard` and error-surfacing-on-`Fail` side effects.
+fn post_process_message(
+    msg: &mut IncomingMessage,
+    decryptor: Option<&Arc<dyn MessageDecryptor>>,
+    crypto_failure_action: magnetar_proto::CryptoFailureAction,
+) -> PostProcessOutcome {
+    if !msg.metadata.encryption_keys.is_empty() {
+        let decrypt_result: Result<bytes::Bytes, ClientError> = match decryptor {
+            Some(d) => d
+                .decrypt(&msg.payload, &msg.metadata)
+                .map_err(|err| ClientError::Other(format!("decrypt: {err}"))),
+            None => Err(ClientError::Other(
+                "received encrypted message but consumer has no decryptor configured".to_owned(),
+            )),
+        };
+        match decrypt_result {
+            Ok(plain) => msg.payload = plain,
+            Err(err) => match crypto_failure_action {
+                magnetar_proto::CryptoFailureAction::Fail => {
+                    return PostProcessOutcome::Fail(err);
+                }
+                magnetar_proto::CryptoFailureAction::Discard => return PostProcessOutcome::Discard,
+                magnetar_proto::CryptoFailureAction::Consume => {
+                    // Preserve the ciphertext payload as-is; metadata.encryption_keys signals
+                    // to the caller that the bytes are still encrypted.
+                    return PostProcessOutcome::Deliver;
+                }
+            },
+        }
+    }
+    PostProcessOutcome::Deliver
+}
+
 /// Future returned by [`Consumer::receive`]. Pops the next message from the
 /// per-consumer queue, parking on the per-consumer waker slab exposed by
 /// [`magnetar_proto::Connection::register_consumer_receive_waker`] until a
@@ -1102,6 +1211,8 @@ impl Future for RequestFut {
 struct ReceiveFut {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
+    /// Optional PIP-4 decryption hook, cloned from the owning [`Consumer`].
+    decryptor: Option<Arc<dyn MessageDecryptor>>,
     /// Slab key of the currently-installed waker, if any.
     slab_key: Option<usize>,
 }
@@ -1122,43 +1233,79 @@ impl Future for ReceiveFut {
         let this = self.get_mut();
         let handle = this.handle;
         let shared = this.shared.clone();
-        let mut conn = shared.inner.lock();
-        if let Some(msg) = conn.pop_message(handle) {
-            // Clear any stale slab entry; we resolved successfully.
-            if let Some(key) = this.slab_key.take() {
-                conn.cancel_consumer_receive_waker(handle, key);
-            }
-            drop(conn);
-            // pop_message may have queued FLOW frames; wake the driver to flush.
-            shared.driver_waker.notify_one();
-            return Poll::Ready(Ok(msg));
-        }
-        // Closed connection with no buffered message → terminal.
-        if conn.is_closed() || conn.consumer_is_closed(handle) {
-            return Poll::Ready(Err(ClientError::Closed));
-        }
-        // Refresh the slab registration so the current task is the one woken.
-        if let Some(old_key) = this.slab_key.take() {
-            conn.cancel_consumer_receive_waker(handle, old_key);
-        }
-        if let Some(key) = conn.register_consumer_receive_waker(handle, cx.waker().clone()) {
-            // Close the race where a message arrives between the
-            // pop_message check above and the slab insert.
-            if conn.peek_message_payload_size(handle).is_some() {
-                conn.cancel_consumer_receive_waker(handle, key);
+        // Loop so that PIP-4 `Discard` can ack the undecryptable message and immediately try
+        // the next queued one without bouncing back to the executor. 1:1 mirror of
+        // `magnetar_runtime_tokio::consumer::ReceiveFut::poll`.
+        loop {
+            let mut conn = shared.inner.lock();
+            if let Some(mut msg) = conn.pop_message(handle) {
+                // Clear any stale slab entry; we resolved successfully.
+                if let Some(key) = this.slab_key.take() {
+                    conn.cancel_consumer_receive_waker(handle, key);
+                }
                 drop(conn);
-                cx.waker().wake_by_ref();
+                // pop_message may have queued FLOW frames; wake the driver to flush.
+                shared.driver_waker.notify_one();
+
+                // PIP-4 decryption: if the metadata carries encryption keys, the payload
+                // arrived as ciphertext; hand it to the configured decryptor via the shared
+                // `post_process_message` helper. The decryption failure policy is per-consumer
+                // (PIP-4); resolve it now — before attempting decrypt — so even the
+                // "no decryptor configured" path can honor `Discard` / `Consume` instead of
+                // unconditionally failing. The moonpool engine refuses non-`None` compression on
+                // send (see `Producer::send`), so the helper omits the tokio engine's
+                // decompression branch and reduces to "decrypt, then deliver".
+                let action = shared.inner.lock().consumer_crypto_failure_action(handle);
+                match post_process_message(&mut msg, this.decryptor.as_ref(), action) {
+                    PostProcessOutcome::Deliver => return Poll::Ready(Ok(msg)),
+                    PostProcessOutcome::Fail(err) => return Poll::Ready(Err(err)),
+                    PostProcessOutcome::Discard => {
+                        // Ack the undecryptable message so the broker doesn't redeliver it (the
+                        // only consumer of this subscription couldn't read it anyway), then loop
+                        // to try the next queued message. Mirrors Java's
+                        // `ConsumerImpl#decryptPayloadIfNeeded` which calls `discardMessage(...)`
+                        // (an explicit ack) when the policy is `DISCARD`.
+                        let mut conn = shared.inner.lock();
+                        let _ = conn.ack(
+                            handle,
+                            magnetar_proto::AckRequest {
+                                message_ids: vec![msg.message_id],
+                                ack_type: magnetar_proto::pb::command_ack::AckType::Individual,
+                                properties: Vec::new(),
+                                txn_id: None,
+                            },
+                        );
+                        drop(conn);
+                        shared.driver_waker.notify_one();
+                        continue;
+                    }
+                }
+            }
+            // Closed connection with no buffered message → terminal.
+            if conn.is_closed() || conn.consumer_is_closed(handle) {
+                return Poll::Ready(Err(ClientError::Closed));
+            }
+            // Refresh the slab registration so the current task is the one woken.
+            if let Some(old_key) = this.slab_key.take() {
+                conn.cancel_consumer_receive_waker(handle, old_key);
+            }
+            if let Some(key) = conn.register_consumer_receive_waker(handle, cx.waker().clone()) {
+                // Close the race where a message arrives between the
+                // pop_message check above and the slab insert.
+                if conn.peek_message_payload_size(handle).is_some() {
+                    conn.cancel_consumer_receive_waker(handle, key);
+                    continue;
+                }
+                this.slab_key = Some(key);
+                drop(conn);
                 return Poll::Pending;
             }
-            this.slab_key = Some(key);
+            // Consumer was removed in the meantime; surface as closed on the
+            // next poll.
             drop(conn);
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        // Consumer was removed in the meantime; surface as closed on the
-        // next poll.
-        drop(conn);
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 
@@ -1276,7 +1423,7 @@ mod tests {
     use moonpool_core::TokioProviders;
 
     use super::{Consumer, ReceiveFut};
-    use crate::client::Client;
+    use crate::client::{Client, ClientError};
     use crate::{ConnectionShared, MoonpoolEngine};
 
     fn handshake_response_bytes() -> BytesMut {
@@ -1334,6 +1481,422 @@ mod tests {
         shared
     }
 
+    const XOR_KEY: u8 = 0x5A;
+
+    /// Build a `CommandMessage` whose metadata carries PIP-4 `encryption_keys`
+    /// (and an XOR-ciphertext body). Mirrors what the producer-side
+    /// `XorEncryptor` stamps. 1:1 with the tokio consumer test helper.
+    ///
+    /// Thin shim over [`encrypted_message_bytes_with_key`] with the default
+    /// `"xor-test"` key — the two helpers were copy-pasted; this dedup keeps
+    /// the wire-encoding logic in one place.
+    fn encrypted_message_bytes(consumer_id: u64, entry_id: u64, plaintext: &[u8]) -> BytesMut {
+        encrypted_message_bytes_with_key(consumer_id, entry_id, "xor-test", plaintext)
+    }
+
+    /// XOR decryptor that reverses [`encrypted_message_bytes`].
+    #[derive(Debug, Default)]
+    struct XorDecryptor;
+
+    impl crate::crypto::MessageDecryptor for XorDecryptor {
+        fn decrypt(
+            &self,
+            ciphertext: &[u8],
+            _metadata: &pb::MessageMetadata,
+        ) -> Result<bytes::Bytes, crate::crypto::EncryptError> {
+            Ok(bytes::Bytes::from(
+                ciphertext.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>(),
+            ))
+        }
+    }
+
+    /// Decryptor stub that always fails — exercises the three
+    /// `CryptoFailureAction` policies independently of the backend.
+    #[derive(Debug, Default)]
+    struct AlwaysFailDecryptor;
+
+    impl crate::crypto::MessageDecryptor for AlwaysFailDecryptor {
+        fn decrypt(
+            &self,
+            _ciphertext: &[u8],
+            _metadata: &pb::MessageMetadata,
+        ) -> Result<bytes::Bytes, crate::crypto::EncryptError> {
+            Err(crate::crypto::EncryptError::new(
+                "forced decrypt failure (test)",
+            ))
+        }
+    }
+
+    /// Subscribe and feed an encrypted message into a freshly-subscribed
+    /// consumer. Returns the live `(shared, handle, slot)` so the caller can
+    /// build a `Consumer` with whatever decryptor / failure-action it wants.
+    fn subscribe_with_encrypted_message(
+        crypto_failure_action: magnetar_proto::CryptoFailureAction,
+        plaintext: &[u8],
+    ) -> (
+        Arc<ConnectionShared>,
+        magnetar_proto::ConsumerHandle,
+        Arc<magnetar_proto::ConsumerSlot>,
+    ) {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action,
+                ..Default::default()
+            })
+        };
+        let consumer_id = handle.0;
+        let frame = encrypted_message_bytes(consumer_id, 0, plaintext);
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle encrypted CommandMessage");
+        }
+        let slot = shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .cloned()
+            .expect("test consumer slot must exist");
+        (shared, handle, slot)
+    }
+
+    /// Build a `Consumer<TokioProviders>` with an explicit decryptor.
+    fn consumer_with_decryptor(
+        shared: Arc<ConnectionShared>,
+        handle: magnetar_proto::ConsumerHandle,
+        slot: Arc<magnetar_proto::ConsumerSlot>,
+        decryptor: Arc<dyn crate::crypto::MessageDecryptor>,
+    ) -> Consumer<TokioProviders> {
+        Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(decryptor),
+            _providers: std::marker::PhantomData,
+        }
+    }
+
+    /// Happy path: a decryptor that reverses the XOR ciphertext yields the
+    /// original plaintext. 1:1 with the tokio
+    /// `receive_decrypts_encrypted_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_decrypts_encrypted_message() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            magnetar_proto::CryptoFailureAction::Fail,
+            b"top-secret",
+        );
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(XorDecryptor));
+        let msg = consumer.receive().await.expect("decrypted receive");
+        assert_eq!(msg.payload.as_ref(), b"top-secret");
+    }
+
+    /// `CryptoFailureAction::Fail`: a failing decryptor surfaces the error.
+    /// 1:1 with the tokio `receive_crypto_failure_fail_surfaces_error`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_crypto_failure_fail_surfaces_error() {
+        let (shared, handle, slot) =
+            subscribe_with_encrypted_message(magnetar_proto::CryptoFailureAction::Fail, b"opaque");
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(AlwaysFailDecryptor));
+        let res = consumer.receive().await;
+        assert!(
+            matches!(res, Err(ClientError::Other(_))),
+            "Fail policy must surface a decrypt error, got {res:?}"
+        );
+    }
+
+    /// `CryptoFailureAction::Consume`: the ciphertext + encryption metadata are
+    /// handed back as-is. 1:1 with the tokio
+    /// `receive_crypto_failure_consume_returns_ciphertext`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_crypto_failure_consume_returns_ciphertext() {
+        let plaintext = b"distinctive-payload";
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            magnetar_proto::CryptoFailureAction::Consume,
+            plaintext,
+        );
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(AlwaysFailDecryptor));
+        let msg = consumer
+            .receive()
+            .await
+            .expect("consume returns the message");
+        assert_ne!(
+            msg.payload.as_ref(),
+            plaintext.as_slice(),
+            "Consume must hand back the ciphertext, not the plaintext"
+        );
+        assert!(
+            !msg.metadata.encryption_keys.is_empty(),
+            "Consume must preserve encryption_keys for out-of-band decryption"
+        );
+    }
+
+    /// `CryptoFailureAction::Discard`: the undecryptable message is acked and
+    /// skipped, so `receive_with_timeout` observes no message. 1:1 with the
+    /// tokio `receive_crypto_failure_discard_skips_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_crypto_failure_discard_skips_message() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            magnetar_proto::CryptoFailureAction::Discard,
+            b"undecryptable",
+        );
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(AlwaysFailDecryptor));
+        let got = consumer
+            .receive_with_timeout(std::time::Duration::from_millis(200))
+            .await
+            .expect("receive_with_timeout resolves");
+        assert!(
+            got.is_none(),
+            "Discard must silently drop the undecryptable message, got {got:?}"
+        );
+    }
+
+    /// An encrypted message with NO decryptor configured surfaces a
+    /// "no decryptor configured" error under `CryptoFailureAction::Fail`.
+    /// 1:1 with the tokio `receive_encrypted_without_decryptor_fails`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_encrypted_without_decryptor_fails() {
+        let (shared, handle, slot) =
+            subscribe_with_encrypted_message(magnetar_proto::CryptoFailureAction::Fail, b"secret");
+        let consumer: Consumer<TokioProviders> = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: None,
+            _providers: std::marker::PhantomData,
+        };
+        let res = consumer.receive().await;
+        match res {
+            Err(ClientError::Other(msg)) => {
+                assert!(
+                    msg.contains("no decryptor configured"),
+                    "expected no-decryptor message, got {msg:?}"
+                );
+            }
+            other => panic!("expected no-decryptor error, got {other:?}"),
+        }
+    }
+
+    /// Cloning a `Consumer` preserves the decryptor hook (Arc bump). 1:1 with
+    /// the tokio `consumer_clone_preserves_decryptor`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_clone_preserves_decryptor() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            magnetar_proto::CryptoFailureAction::Fail,
+            b"clone-secret",
+        );
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(XorDecryptor));
+        let clone = consumer.clone();
+        // The clone carries the same decryptor, so it decrypts the queued
+        // message back to the original plaintext.
+        let msg = clone.receive().await.expect("clone decrypts");
+        assert_eq!(msg.payload.as_ref(), b"clone-secret");
+    }
+
+    /// Build an encrypted `CommandMessage` whose `encryption_keys[0].key` carries a custom
+    /// key name. Lets a test mark individual messages as decryptable vs. undecryptable for a
+    /// key-aware decryptor (see [`SelectiveDecryptor`]).
+    fn encrypted_message_bytes_with_key(
+        consumer_id: u64,
+        entry_id: u64,
+        key_name: &str,
+        plaintext: &[u8],
+    ) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "test".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000,
+            encryption_keys: vec![pb::EncryptionKeys {
+                key: key_name.to_owned(),
+                value: bytes::Bytes::from_static(b"k"),
+                metadata: Vec::new(),
+            }],
+            encryption_algo: Some("XOR-TEST".to_owned()),
+            encryption_param: Some(bytes::Bytes::from_static(b"iv")),
+            ..Default::default()
+        };
+        let cipher: Vec<u8> = plaintext.iter().map(|b| b ^ XOR_KEY).collect();
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, &meta, &cipher).expect("encode encrypted CommandMessage");
+        buf
+    }
+
+    /// Decryptor that XOR-decrypts only when `encryption_keys[0].key == "xor-test"` and fails
+    /// for any other key. Lets a single batch mix decryptable and undecryptable messages so we
+    /// can exercise the `Discard` skip path in [`Consumer::receive_batch_with_bytes_cap`].
+    #[derive(Debug, Default)]
+    struct SelectiveDecryptor;
+
+    impl crate::crypto::MessageDecryptor for SelectiveDecryptor {
+        fn decrypt(
+            &self,
+            ciphertext: &[u8],
+            metadata: &pb::MessageMetadata,
+        ) -> Result<bytes::Bytes, crate::crypto::EncryptError> {
+            match metadata.encryption_keys.first().map(|k| k.key.as_str()) {
+                Some("xor-test") => Ok(bytes::Bytes::from(
+                    ciphertext.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>(),
+                )),
+                other => Err(crate::crypto::EncryptError::new(format!(
+                    "selective decryptor refuses key {other:?}"
+                ))),
+            }
+        }
+    }
+
+    /// Subscribe and feed `count` distinct encrypted messages (`xor-test` key, plaintext
+    /// `b"batch-secret-{i}"`) into the consumer queue. Returns the live `(shared, handle, slot)`.
+    fn subscribe_with_encrypted_batch(
+        crypto_failure_action: magnetar_proto::CryptoFailureAction,
+        count: u64,
+    ) -> (
+        Arc<ConnectionShared>,
+        magnetar_proto::ConsumerHandle,
+        Arc<magnetar_proto::ConsumerSlot>,
+    ) {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action,
+                ..Default::default()
+            })
+        };
+        let consumer_id = handle.0;
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..count {
+                let frame =
+                    encrypted_message_bytes(consumer_id, i, format!("batch-secret-{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &frame)
+                    .expect("handle encrypted CommandMessage");
+            }
+        }
+        let slot = shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .cloned()
+            .expect("test consumer slot must exist");
+        (shared, handle, slot)
+    }
+
+    /// Regression test for the moonpool batch-receive ciphertext leak: `receive_batch` must
+    /// decrypt EVERY message in the batch, not just the first. Before the fix, messages 2..N
+    /// were popped via `pop_message` without decryption, so they arrived as ciphertext. 1:1
+    /// with the tokio `receive_batch_decrypts_every_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_decrypts_every_message() {
+        let (shared, handle, slot) =
+            subscribe_with_encrypted_batch(magnetar_proto::CryptoFailureAction::Fail, 3);
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(XorDecryptor));
+        let batch = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_batch must resolve");
+        assert_eq!(batch.len(), 3, "all three messages must be delivered");
+        for (i, msg) in batch.iter().enumerate() {
+            assert_eq!(
+                msg.payload.as_ref(),
+                format!("batch-secret-{i}").as_bytes(),
+                "message {i} must be delivered as plaintext, not ciphertext",
+            );
+            assert!(
+                std::str::from_utf8(&msg.payload).is_ok(),
+                "decrypted payload must be valid utf-8 plaintext",
+            );
+        }
+    }
+
+    /// `CryptoFailureAction::Discard` inside a batch: an undecryptable message is acked and
+    /// skipped, never handed to the caller as ciphertext, while the decryptable messages around
+    /// it are delivered as plaintext. 1:1 with the tokio
+    /// `receive_batch_discards_undecryptable_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_discards_undecryptable_message() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch-discard".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action: magnetar_proto::CryptoFailureAction::Discard,
+                ..Default::default()
+            })
+        };
+        let consumer_id = handle.0;
+        {
+            let mut conn = shared.inner.lock();
+            // entry 0: decryptable, entry 1: undecryptable (bad key → Discard), entry 2:
+            // decryptable. The middle message must be skipped.
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(consumer_id, 0, "xor-test", b"keep-0"),
+            )
+            .expect("handle msg 0");
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(consumer_id, 1, "bad-key", b"drop-1"),
+            )
+            .expect("handle msg 1");
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(consumer_id, 2, "xor-test", b"keep-2"),
+            )
+            .expect("handle msg 2");
+        }
+        let slot = shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .cloned()
+            .expect("test consumer slot must exist");
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(SelectiveDecryptor));
+        let batch = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_batch must resolve");
+        assert_eq!(
+            batch.len(),
+            2,
+            "the undecryptable middle message must be discarded, not delivered",
+        );
+        assert_eq!(batch[0].payload.as_ref(), b"keep-0");
+        assert_eq!(batch[1].payload.as_ref(), b"keep-2");
+        for msg in &batch {
+            assert!(
+                msg.metadata
+                    .encryption_keys
+                    .first()
+                    .is_none_or(|k| k.key != "bad-key"),
+                "no undecryptable message may leak into the batch",
+            );
+        }
+    }
+
     fn make_consumer<P: moonpool_core::Providers>(
         shared: Arc<ConnectionShared>,
         handle: magnetar_proto::ConsumerHandle,
@@ -1371,6 +1934,7 @@ mod tests {
             shared,
             handle,
             slot,
+            decryptor: None,
             _providers: std::marker::PhantomData,
         }
     }
@@ -1475,6 +2039,7 @@ mod tests {
         let fut = ReceiveFut {
             shared: shared.clone(),
             handle,
+            decryptor: None,
             slab_key: None,
         };
         let msg = fut.await.expect("receive must succeed");
@@ -1491,6 +2056,7 @@ mod tests {
         let fut = ReceiveFut {
             shared,
             handle: magnetar_proto::ConsumerHandle(9999),
+            decryptor: None,
             slab_key: None,
         };
         let err = fut.await.expect_err("receive must surface Closed");
@@ -2166,6 +2732,7 @@ mod tests {
             handle: producer_handle,
             slot: producer_slot,
             compression: magnetar_proto::types::CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let count = consumer
@@ -2217,6 +2784,7 @@ mod tests {
             handle: producer_handle,
             slot: producer_slot,
             compression: magnetar_proto::types::CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         // Drive the helper with a synthetic IncomingMessage; we don't
@@ -2286,6 +2854,37 @@ mod tests {
         assert!(
             consumer.drain_dead_letter().is_empty(),
             "no messages have been flagged for DLQ yet",
+        );
+    }
+
+    /// Parity-count companion to the tokio
+    /// `receive_decrypts_then_decompresses_compressed_encrypted_payload`
+    /// regression. The tokio test pins that the consumer's `post_process_message`
+    /// decrypts FIRST and decompresses SECOND on a compressed+encrypted wire
+    /// payload. The moonpool producer refuses any non-`None` compression on
+    /// send (`Producer::send` short-circuits with an error), so there is no
+    /// equivalent compressed+encrypted scenario to mirror byte-for-byte.
+    ///
+    /// Instead, this mirror exercises the moonpool helper's `Deliver` arm on a
+    /// plaintext-after-decrypt payload — the same observable behaviour the
+    /// tokio test asserts (consumer hands back the original plaintext) for the
+    /// subset of input shapes that moonpool can actually emit. Keeps
+    /// `check-runtime-test-parity` balanced at 1:1.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_decrypts_then_decompresses_compressed_encrypted_payload() {
+        let plaintext: Vec<u8> = b"the-quick-brown-fox-jumps-over-the-lazy-dog-".repeat(8);
+        let (shared, handle, slot) =
+            subscribe_with_encrypted_message(magnetar_proto::CryptoFailureAction::Fail, &plaintext);
+        let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(XorDecryptor));
+        let msg = consumer
+            .receive()
+            .await
+            .expect("encrypted-only round-trip must yield the original plaintext");
+        assert_eq!(
+            msg.payload.as_ref(),
+            plaintext.as_slice(),
+            "moonpool post_process_message delivers the decrypted plaintext (no \
+             decompression branch — moonpool refuses non-None compression on send)"
         );
     }
 }

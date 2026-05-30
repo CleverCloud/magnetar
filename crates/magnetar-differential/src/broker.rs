@@ -41,6 +41,15 @@ struct StoredMessage {
     ledger_id: u64,
     entry_id: u64,
     payload: Bytes,
+    /// PIP-4 producer-stamped encryption metadata, preserved so the broker
+    /// echoes `encryption_keys` / `encryption_algo` / `encryption_param` back
+    /// on the pushed `CommandMessage`. A real broker is opaque to PIP-4 (it is
+    /// a client-side concern) and round-trips the metadata verbatim; the
+    /// scripted broker mirrors that so the consumer-side decrypt path is
+    /// reachable in differential traces. `None` for plaintext sends.
+    encryption_keys: Vec<pb::EncryptionKeys>,
+    encryption_algo: Option<String>,
+    encryption_param: Option<Bytes>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -472,6 +481,11 @@ fn handle_frame(
                         ledger_id,
                         entry_id,
                         payload: payload.body.clone(),
+                        // Preserve the producer's PIP-4 encryption metadata so
+                        // the pushed `CommandMessage` round-trips it verbatim.
+                        encryption_keys: payload.metadata.encryption_keys.clone(),
+                        encryption_algo: payload.metadata.encryption_algo.clone(),
+                        encryption_param: payload.metadata.encryption_param.clone(),
                     };
                     let partition = partition_index_of(&topic);
                     {
@@ -720,7 +734,7 @@ fn push_pending(state: &Arc<Mutex<SessionState>>, out: &mut BytesMut) {
     }
     for (cid, batch) in to_push {
         for m in batch {
-            emit_message(out, cid, m.ledger_id, m.entry_id, &m.payload);
+            emit_message(out, cid, &m);
         }
     }
 }
@@ -921,20 +935,14 @@ fn emit_ack_response(out: &mut BytesMut, consumer_id: u64, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
-fn emit_message(
-    out: &mut BytesMut,
-    consumer_id: u64,
-    ledger_id: u64,
-    entry_id: u64,
-    payload: &Bytes,
-) {
+fn emit_message(out: &mut BytesMut, consumer_id: u64, stored: &StoredMessage) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::Message as i32,
         message: Some(pb::CommandMessage {
             consumer_id,
             message_id: pb::MessageIdData {
-                ledger_id,
-                entry_id,
+                ledger_id: stored.ledger_id,
+                entry_id: stored.entry_id,
                 partition: Some(-1),
                 batch_index: Some(-1),
                 ack_set: Vec::new(),
@@ -949,14 +957,19 @@ fn emit_message(
     };
     let meta = pb::MessageMetadata {
         producer_name: "diff-broker".to_owned(),
-        sequence_id: entry_id,
+        sequence_id: stored.entry_id,
         publish_time: 1_700_000_000,
+        // Round-trip the producer's PIP-4 encryption metadata so the consumer
+        // sees `encryption_keys` set and runs its decrypt path.
+        encryption_keys: stored.encryption_keys.clone(),
+        encryption_algo: stored.encryption_algo.clone(),
+        encryption_param: stored.encryption_param.clone(),
         ..Default::default()
     };
     // payload encoding will compute the CRC over [meta_size][meta][payload].
-    if encode_payload(out, &cmd, &meta, payload).is_err() {
+    if encode_payload(out, &cmd, &meta, &stored.payload).is_err() {
         // Encoding shouldn't fail under MAX_FRAME_SIZE; we sanity check
         // and drop on overflow.
-        debug_assert!(payload.len() < MAX_FRAME_SIZE);
+        debug_assert!(stored.payload.len() < MAX_FRAME_SIZE);
     }
 }

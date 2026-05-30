@@ -53,6 +53,7 @@ use moonpool_core::Providers;
 
 use crate::ConnectionShared;
 use crate::client::{Client, ClientError};
+use crate::crypto::MessageEncryptor;
 
 /// User-facing producer handle, moonpool engine flavour.
 ///
@@ -74,6 +75,10 @@ pub struct Producer<P: Providers> {
     /// Connection's registry at create time.
     pub(crate) slot: Arc<magnetar_proto::ProducerSlot>,
     pub(crate) compression: CompressionKind,
+    /// Optional PIP-4 encryption hook. When present, the producer encrypts every
+    /// outbound payload after compression but before handing it to the sans-io
+    /// layer. 1:1 mirror of `magnetar_runtime_tokio::Producer::encryptor`.
+    pub(crate) encryptor: Option<Arc<dyn MessageEncryptor>>,
     /// Held only so `Producer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -87,6 +92,7 @@ impl<P: Providers> Clone for Producer<P> {
             handle: self.handle,
             slot: self.slot.clone(),
             compression: self.compression,
+            encryptor: self.encryptor.clone(),
             _providers: std::marker::PhantomData,
         }
     }
@@ -234,7 +240,7 @@ impl<P: Providers> Producer<P> {
     /// - [`ClientError::Other`] wrapping a [`magnetar_proto::ProtocolError`] if the state machine
     ///   rejects the send (e.g. closed producer, unknown handle).
     /// - [`ClientError::Broker`] if the broker subsequently rejects the publish.
-    pub fn send(&self, msg: OutgoingMessage) -> SendFut {
+    pub fn send(&self, mut msg: OutgoingMessage) -> SendFut {
         let publish_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
@@ -258,6 +264,28 @@ impl<P: Providers> Producer<P> {
                 },
                 reserved_bytes: 0,
             };
+        }
+
+        // Encrypt the (post-compression) payload if a PIP-4 encryptor is wired. 1:1 mirror of
+        // the tokio engine's ordering (`magnetar_runtime_tokio::Producer::send`,
+        // `ProducerImpl.java:986-1003`): compression first (refused above on moonpool until
+        // codecs land), encryption second, so the broker sees ciphertext and the consumer
+        // reverses the order on receive. Encryption failure surfaces synchronously as a
+        // `SendFut` that resolves to `ClientError::Other` on the first poll.
+        if let Some(encryptor) = self.encryptor.as_ref() {
+            match encryptor.encrypt(&msg.payload, &mut msg.metadata) {
+                Ok(ciphertext) => msg.payload = ciphertext,
+                Err(err) => {
+                    return SendFut {
+                        shared: self.shared.clone(),
+                        handle: self.handle,
+                        state: SendState::Failed {
+                            error: Some(ClientError::Other(format!("encrypt: {err}"))),
+                        },
+                        reserved_bytes: 0,
+                    };
+                }
+            }
         }
 
         // Reserve memory against the configured global budget BEFORE
@@ -529,6 +557,21 @@ impl<P: Providers> Client<P> {
         &self,
         req: CreateProducerRequest,
     ) -> Result<Producer<P>, ClientError> {
+        self.open_producer_with(req, None).await
+    }
+
+    /// Same as [`Self::open_producer`] but with an optional PIP-4 encryption hook.
+    /// 1:1 mirror of `magnetar_runtime_tokio::Client::open_producer_with`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ClientError::Closed`] if the broker closes the producer before it becomes ready.
+    /// - [`ClientError::Other`] if the connection drops mid-open.
+    pub async fn open_producer_with(
+        &self,
+        req: CreateProducerRequest,
+        encryptor: Option<Arc<dyn MessageEncryptor>>,
+    ) -> Result<Producer<P>, ClientError> {
         let compression = req.compression;
         // Pulsar requires a `CommandLookupTopic` round-trip before opening a producer or
         // consumer: lookup is what triggers the broker to acquire ownership of the topic's
@@ -565,6 +608,7 @@ impl<P: Providers> Client<P> {
             handle,
             slot,
             compression,
+            encryptor,
             _providers: std::marker::PhantomData,
         })
     }
@@ -948,6 +992,143 @@ mod tests {
         )
     }
 
+    /// Deterministic, dependency-free PIP-4 encryptor stub: XORs every payload
+    /// byte with a fixed key and stamps the canonical encryption metadata
+    /// fields. Records the last plaintext it saw so tests can assert the
+    /// encrypt hook ran on the pre-encryption bytes. 1:1 mirror of the tokio
+    /// engine's stub (ADR-0024 cross-runtime parity).
+    #[derive(Debug, Default)]
+    struct XorEncryptor {
+        seen_plaintext: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    const XOR_KEY: u8 = 0x5A;
+
+    impl crate::crypto::MessageEncryptor for XorEncryptor {
+        fn encrypt(
+            &self,
+            plaintext: &[u8],
+            metadata: &mut pb::MessageMetadata,
+        ) -> Result<Bytes, crate::crypto::EncryptError> {
+            *self.seen_plaintext.lock().unwrap() = Some(plaintext.to_vec());
+            metadata.encryption_keys.push(pb::EncryptionKeys {
+                key: "xor-test".to_owned(),
+                value: Bytes::from_static(b"k"),
+                metadata: Vec::new(),
+            });
+            metadata.encryption_algo = Some("XOR-TEST".to_owned());
+            metadata.encryption_param = Some(Bytes::from_static(b"iv"));
+            Ok(Bytes::from(
+                plaintext.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>(),
+            ))
+        }
+    }
+
+    /// `send` with a PIP-4 encryptor wired stamps the encryption metadata and
+    /// hands the ciphertext (not the plaintext) to the sans-io layer. We observe
+    /// the encrypt hook fired against the original plaintext; the resulting send
+    /// enqueues a pending op (no driver running drains it). 1:1 with the tokio
+    /// `send_encrypts_payload_and_stamps_metadata`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_encrypts_payload_and_stamps_metadata() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/encrypt".to_owned(),
+                ..Default::default()
+            })
+        };
+        let encryptor = Arc::new(XorEncryptor::default());
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            slot: slot_for(&shared, handle),
+            compression: CompressionKind::None,
+            encryptor: Some(encryptor.clone()),
+            _providers: std::marker::PhantomData,
+        };
+        let _fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"plain-secret"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 12,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        });
+        assert_eq!(
+            encryptor.seen_plaintext.lock().unwrap().as_deref(),
+            Some(b"plain-secret".as_slice()),
+            "encrypt hook must see the pre-encryption payload",
+        );
+        assert!(
+            producer.pending_count() >= 1,
+            "expected pending encrypted send; got {}",
+            producer.pending_count()
+        );
+    }
+
+    /// Encryptor that always fails. Exercises the producer-side encrypt-error
+    /// branch (`send` surfaces `ClientError::Other("encrypt: …")`). 1:1 with the
+    /// tokio `send_encrypt_failure_surfaces_error`.
+    #[derive(Debug, Default)]
+    struct FailingEncryptor;
+
+    impl crate::crypto::MessageEncryptor for FailingEncryptor {
+        fn encrypt(
+            &self,
+            _plaintext: &[u8],
+            _metadata: &mut pb::MessageMetadata,
+        ) -> Result<Bytes, crate::crypto::EncryptError> {
+            Err(crate::crypto::EncryptError::new(
+                "forced encrypt failure (test)",
+            ))
+        }
+    }
+
+    /// A failing encryptor makes `send` resolve to `ClientError::Other` and the
+    /// payload never reaches the sans-io layer (no pending op). 1:1 with the
+    /// tokio `send_encrypt_failure_surfaces_error`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_encrypt_failure_surfaces_error() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/encrypt-fail".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer: Producer<TokioProviders> = Producer {
+            shared: shared.clone(),
+            handle,
+            slot: slot_for(&shared, handle),
+            compression: CompressionKind::None,
+            encryptor: Some(Arc::new(FailingEncryptor)),
+            _providers: std::marker::PhantomData,
+        };
+        let res = producer
+            .send(OutgoingMessage {
+                payload: Bytes::from_static(b"plain"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 5,
+                num_messages: 1,
+                txn_id: None,
+                source_message_id: None,
+            })
+            .await;
+        let err = res.expect_err("encrypt failure must surface");
+        assert!(
+            format!("{err}").contains("encrypt:"),
+            "expected encrypt-error message, got {err:?}"
+        );
+        assert_eq!(
+            producer.pending_count(),
+            0,
+            "a failed encrypt must not enqueue a send"
+        );
+    }
+
     /// Smoke test: a freshly-constructed producer reports defaults that
     /// match the sans-io layer (no sends pushed, none pending, no name).
     #[tokio::test(flavor = "current_thread")]
@@ -965,6 +1146,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         assert_eq!(producer.pending_count(), 0);
@@ -997,6 +1179,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let _fut = producer.send(OutgoingMessage {
@@ -1034,6 +1217,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::Zstd,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let res = producer
@@ -1072,6 +1256,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         assert_eq!(producer.pending_count(), 0);
@@ -1099,6 +1284,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let clone = producer.clone();
@@ -1161,6 +1347,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let fut = producer.send(OutgoingMessage {
@@ -1217,6 +1404,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let res = producer
@@ -1343,6 +1531,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let mut fut = producer.send(OutgoingMessage {
@@ -1415,6 +1604,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let mut fut = producer.send(OutgoingMessage {
@@ -1480,6 +1670,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let mut fut = producer.send(OutgoingMessage {
@@ -1552,6 +1743,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         // Budget has 1024 free bytes; the 4-byte payload reserves
@@ -1615,6 +1807,7 @@ mod tests {
             handle: bogus_handle,
             slot: stub_slot_for_test(bogus_handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let mut fut = producer.send(OutgoingMessage {
@@ -1692,6 +1885,7 @@ mod tests {
             handle,
             slot: slot_for(&shared, handle),
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         let mut fut = producer.send(OutgoingMessage {
@@ -1749,6 +1943,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         assert_eq!(
@@ -1776,6 +1971,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         assert_eq!(
@@ -1803,6 +1999,7 @@ mod tests {
             handle,
             slot,
             compression: CompressionKind::None,
+            encryptor: None,
             _providers: std::marker::PhantomData,
         };
         assert_eq!(

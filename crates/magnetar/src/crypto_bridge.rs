@@ -74,3 +74,34 @@ impl MessageDecryptor for MessageCryptoBridge {
             .map_err(EncryptError::new)
     }
 }
+
+// The same bridge also drives the moonpool runtime's identically-shaped PIP-4
+// hooks. The moonpool `MessageEncryptor` / `MessageDecryptor` / `EncryptError`
+// are distinct types from the tokio ones (each runtime defines its own), so we
+// implement both pairs on the one wrapper. This lets a single
+// `Arc<MessageCryptoBridge>` be handed to either engine's builder.
+#[cfg(feature = "moonpool")]
+impl magnetar_runtime_moonpool::MessageEncryptor for MessageCryptoBridge {
+    fn encrypt(
+        &self,
+        plaintext: &[u8],
+        metadata: &mut pb::MessageMetadata,
+    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
+        self.inner
+            .encrypt(plaintext, metadata)
+            .map_err(magnetar_runtime_moonpool::EncryptError::new)
+    }
+}
+
+#[cfg(feature = "moonpool")]
+impl magnetar_runtime_moonpool::MessageDecryptor for MessageCryptoBridge {
+    fn decrypt(
+        &self,
+        ciphertext: &[u8],
+        metadata: &pb::MessageMetadata,
+    ) -> Result<Bytes, magnetar_runtime_moonpool::EncryptError> {
+        self.inner
+            .decrypt(ciphertext, metadata)
+            .map_err(magnetar_runtime_moonpool::EncryptError::new)
+    }
+}

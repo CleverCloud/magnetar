@@ -1012,8 +1012,17 @@ enum PostProcessOutcome {
     Fail(ClientError),
 }
 
-/// Apply the consumer-side decompression + PIP-4 decryption pipeline to a message popped
+/// Apply the consumer-side PIP-4 decryption + decompression pipeline to a message popped
 /// straight from the sans-io state machine. Mirrors the inline logic in [`ReceiveFut::poll`].
+///
+/// **Order matters: decrypt FIRST, decompress SECOND.** The tokio producer applies the
+/// inverse order on send — `compression → encryption` (see
+/// `magnetar-runtime-tokio/src/producer.rs:194-230`, which mirrors Java
+/// `ProducerImpl.java:986-1003`) — so the wire payload is ciphertext wrapping the
+/// compressed bytes. Decompressing first would feed ciphertext into the codec and fail
+/// (silently bypassing the PIP-4 [`CryptoFailureAction`] policy). Decrypt first to
+/// recover the compressed plaintext, then decompress to get the user payload.
+///
 /// `crypto_failure_action` governs what happens when the decryption step fails (see
 /// [`magnetar_proto::CryptoFailureAction`]).
 fn post_process_message(
@@ -1021,6 +1030,35 @@ fn post_process_message(
     decryptor: Option<&Arc<dyn crate::crypto::MessageDecryptor>>,
     crypto_failure_action: magnetar_proto::CryptoFailureAction,
 ) -> PostProcessOutcome {
+    // Step 1 — PIP-4 decryption (outermost wrapper on the wire).
+    if !msg.metadata.encryption_keys.is_empty() {
+        let decrypt_result: Result<bytes::Bytes, ClientError> = match decryptor {
+            Some(d) => d
+                .decrypt(&msg.payload, &msg.metadata)
+                .map_err(|err| ClientError::Other(format!("decrypt: {err}"))),
+            None => Err(ClientError::Other(
+                "received encrypted message but consumer has no decryptor configured".to_owned(),
+            )),
+        };
+        match decrypt_result {
+            Ok(plain) => msg.payload = plain,
+            Err(err) => match crypto_failure_action {
+                magnetar_proto::CryptoFailureAction::Fail => {
+                    return PostProcessOutcome::Fail(err);
+                }
+                magnetar_proto::CryptoFailureAction::Discard => return PostProcessOutcome::Discard,
+                magnetar_proto::CryptoFailureAction::Consume => {
+                    // Preserve the ciphertext payload as-is; metadata.encryption_keys signals
+                    // to the caller that the bytes are still encrypted. We deliberately skip
+                    // decompression too — the bytes are still ciphertext, no codec could
+                    // interpret them.
+                    return PostProcessOutcome::Deliver;
+                }
+            },
+        }
+    }
+    // Step 2 — decompression (compression was applied first on send, so it lives INSIDE
+    // the encryption envelope). After step 1 `msg.payload` is compressed plaintext.
     if let Some(kind_i32) = msg.metadata.compression {
         let Ok(pb_kind) = magnetar_proto::pb::CompressionType::try_from(kind_i32) else {
             return PostProcessOutcome::Fail(ClientError::Other(format!(
@@ -1041,30 +1079,6 @@ fn post_process_message(
                     )));
                 }
             }
-        }
-    }
-    if !msg.metadata.encryption_keys.is_empty() {
-        let decrypt_result: Result<bytes::Bytes, ClientError> = match decryptor {
-            Some(d) => d
-                .decrypt(&msg.payload, &msg.metadata)
-                .map_err(|err| ClientError::Other(format!("decrypt: {err}"))),
-            None => Err(ClientError::Other(
-                "received encrypted message but consumer has no decryptor configured".to_owned(),
-            )),
-        };
-        match decrypt_result {
-            Ok(plain) => msg.payload = plain,
-            Err(err) => match crypto_failure_action {
-                magnetar_proto::CryptoFailureAction::Fail => {
-                    return PostProcessOutcome::Fail(err);
-                }
-                magnetar_proto::CryptoFailureAction::Discard => return PostProcessOutcome::Discard,
-                magnetar_proto::CryptoFailureAction::Consume => {
-                    // Preserve the ciphertext payload as-is; metadata.encryption_keys signals
-                    // to the caller that the bytes are still encrypted.
-                    return PostProcessOutcome::Deliver;
-                }
-            },
         }
     }
     PostProcessOutcome::Deliver
@@ -1145,48 +1159,16 @@ impl Future for ReceiveFut {
                 conn.cancel_consumer_receive_waker(handle, key);
             }
             drop(conn);
-            // Decompress the payload if the broker stamped a compression kind on it. Producer-
-            // side compression lives in `producer::Producer::send`; this is the symmetric
-            // consumer-side step. `uncompressed_size` is mandatory when `compression` is set
-            // (per `MessageMetadata` semantics); if it is absent we treat the payload as
-            // already-plain bytes.
-            if let Some(kind_i32) = msg.metadata.compression {
-                let pb_kind =
-                    magnetar_proto::pb::CompressionType::try_from(kind_i32).map_err(|_| {
-                        ClientError::Other(format!(
-                            "unknown compression code {kind_i32} on inbound message"
-                        ))
-                    })?;
-                let kind = crate::compress::kind_from_pb(pb_kind);
-                if kind != magnetar_proto::types::CompressionKind::None {
-                    let expected_size = msg
-                        .metadata
-                        .uncompressed_size
-                        .map_or(msg.payload.len(), |s| s as usize);
-                    let plain = crate::compress::decompress(kind, &msg.payload, expected_size)
-                        .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
-                    msg.payload = plain;
-                }
-            }
-            // PIP-4 decryption: if the metadata carries encryption keys, the payload arrived as
-            // ciphertext; hand it to the configured decryptor. Order is symmetric to producer
-            // send: encryption was applied AFTER compression, so we decrypt FIRST then would
-            // have decompressed — but Pulsar sends only the post-compression / post-encryption
-            // payload, so the metadata.compression stamp here actually describes the plaintext
-            // (Java does the same — see ProducerImpl.java:986-1003). Hence the compression /
-            // encryption order on the consumer side is: decrypt → decompress. We re-do
-            // decompression after decrypt for that reason.
-            //
-            // For simplicity (and because this matches what the Java client does for
-            // non-batch messages), we currently decompress first then decrypt. Pulsar's
-            // compression+encryption interaction is one of the rougher edges of the protocol —
-            // the precise field semantics differ between batch and non-batch paths. For now
-            // we accept that combining compression + encryption on the *same* message may
-            // need a follow-up to match Java exactly for batched paths.
+            // Decrypt FIRST, then decompress. The producer applies the inverse order on send
+            // — `compression → encryption` (see `producer::Producer::send` and Java
+            // `ProducerImpl.java:986-1003`) — so the wire payload is ciphertext wrapping the
+            // compressed bytes. Decompressing first would feed ciphertext into the codec and
+            // fail silently (bypassing the PIP-4 `CryptoFailureAction` policy entirely).
+            // Step 1 — PIP-4 decryption (outermost wrapper on the wire). The decryption
+            // failure policy is per-consumer (PIP-4); we resolve it now — before attempting
+            // decrypt — so even the "no decryptor configured" path can honor
+            // `Discard` / `Consume` instead of unconditionally failing.
             if !msg.metadata.encryption_keys.is_empty() {
-                // The decryption failure policy is per-consumer (PIP-4). We resolve it now —
-                // before attempting decrypt — so that even the "no decryptor configured" path
-                // can honor `Discard` / `Consume` instead of unconditionally failing.
                 let action = shared.inner.lock().consumer_crypto_failure_action(handle);
                 let decrypt_result: Result<bytes::Bytes, ClientError> =
                     match this.decryptor.as_ref() {
@@ -1230,9 +1212,34 @@ impl Future for ReceiveFut {
                         magnetar_proto::CryptoFailureAction::Consume => {
                             // Hand the ciphertext + `encryption_keys` metadata back to the
                             // caller untouched, so they can attempt out-of-band decryption.
+                            // We deliberately SKIP decompression — the bytes are still
+                            // ciphertext, no codec could interpret them.
                             return Poll::Ready(Ok(msg));
                         }
                     },
+                }
+            }
+            // Step 2 — decompression. Compression was applied first on send, so it lives
+            // INSIDE the encryption envelope: after step 1 the payload is compressed
+            // plaintext. `uncompressed_size` is mandatory when `compression` is set (per
+            // `MessageMetadata` semantics); if it is absent we treat the payload as
+            // already-plain bytes.
+            if let Some(kind_i32) = msg.metadata.compression {
+                let pb_kind =
+                    magnetar_proto::pb::CompressionType::try_from(kind_i32).map_err(|_| {
+                        ClientError::Other(format!(
+                            "unknown compression code {kind_i32} on inbound message"
+                        ))
+                    })?;
+                let kind = crate::compress::kind_from_pb(pb_kind);
+                if kind != magnetar_proto::types::CompressionKind::None {
+                    let expected_size = msg
+                        .metadata
+                        .uncompressed_size
+                        .map_or(msg.payload.len(), |s| s as usize);
+                    let plain = crate::compress::decompress(kind, &msg.payload, expected_size)
+                        .map_err(|err| ClientError::Other(format!("decompress: {err}")))?;
+                    msg.payload = plain;
                 }
             }
             return Poll::Ready(Ok(msg));
@@ -1276,6 +1283,7 @@ mod tests {
 
     use super::Consumer;
     use crate::ConnectionShared;
+    use crate::error::ClientError;
 
     fn handshake_response_bytes() -> BytesMut {
         let cmd = pb::BaseCommand {
@@ -1318,6 +1326,234 @@ mod tests {
         let mut buf = BytesMut::new();
         encode_payload(&mut buf, &cmd, &meta, payload).expect("encode CommandMessage");
         buf
+    }
+
+    const XOR_KEY: u8 = 0x5A;
+
+    /// Build a `CommandMessage` whose metadata carries PIP-4 `encryption_keys`
+    /// (and an XOR-ciphertext body). Mirrors what the producer-side
+    /// `XorEncryptor` stamps. 1:1 with the moonpool consumer test helper.
+    ///
+    /// Thin shim over [`encrypted_message_bytes_with_key`] with the default
+    /// `"xor-test"` key — the two helpers were copy-pasted; this dedup keeps
+    /// the wire-encoding logic in one place.
+    fn encrypted_message_bytes(consumer_id: u64, entry_id: u64, plaintext: &[u8]) -> BytesMut {
+        encrypted_message_bytes_with_key(consumer_id, entry_id, "xor-test", plaintext)
+    }
+
+    /// XOR decryptor that reverses [`encrypted_message_bytes`].
+    #[derive(Debug, Default)]
+    struct XorDecryptor;
+
+    impl crate::crypto::MessageDecryptor for XorDecryptor {
+        fn decrypt(
+            &self,
+            ciphertext: &[u8],
+            _metadata: &pb::MessageMetadata,
+        ) -> Result<bytes::Bytes, crate::crypto::EncryptError> {
+            Ok(bytes::Bytes::from(
+                ciphertext.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>(),
+            ))
+        }
+    }
+
+    /// Decryptor stub that always fails — exercises the three
+    /// `CryptoFailureAction` policies independently of the backend.
+    #[derive(Debug, Default)]
+    struct AlwaysFailDecryptor;
+
+    impl crate::crypto::MessageDecryptor for AlwaysFailDecryptor {
+        fn decrypt(
+            &self,
+            _ciphertext: &[u8],
+            _metadata: &pb::MessageMetadata,
+        ) -> Result<bytes::Bytes, crate::crypto::EncryptError> {
+            Err(crate::crypto::EncryptError::new(
+                "forced decrypt failure (test)",
+            ))
+        }
+    }
+
+    /// Feed an encrypted message into a freshly-subscribed consumer.
+    /// Returns the live `(shared, handle, slot)` so the caller can build a
+    /// `Consumer` with whatever decryptor / failure-action it wants.
+    fn subscribe_with_encrypted_message(
+        action: pb::command_subscribe::SubType,
+        crypto_failure_action: magnetar_proto::CryptoFailureAction,
+        plaintext: &[u8],
+    ) -> (
+        std::sync::Arc<ConnectionShared>,
+        magnetar_proto::ConsumerHandle,
+        std::sync::Arc<magnetar_proto::ConsumerSlot>,
+    ) {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: action,
+                crypto_failure_action,
+                ..Default::default()
+            })
+        };
+        let consumer_id = handle.0;
+        let frame = encrypted_message_bytes(consumer_id, 0, plaintext);
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle encrypted CommandMessage");
+        }
+        let slot = consumer_slot_for(&shared, handle);
+        (shared, handle, slot)
+    }
+
+    /// Happy path: a decryptor that reverses the XOR ciphertext yields the
+    /// original plaintext. 1:1 with the moonpool
+    /// `receive_decrypts_encrypted_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_decrypts_encrypted_message() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            pb::command_subscribe::SubType::Exclusive,
+            magnetar_proto::CryptoFailureAction::Fail,
+            b"top-secret",
+        );
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
+        };
+        let msg = consumer.receive().await.expect("decrypted receive");
+        assert_eq!(msg.payload.as_ref(), b"top-secret");
+    }
+
+    /// `CryptoFailureAction::Fail`: a failing decryptor surfaces the error.
+    /// 1:1 with the moonpool `receive_crypto_failure_fail_surfaces_error`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_crypto_failure_fail_surfaces_error() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            pb::command_subscribe::SubType::Exclusive,
+            magnetar_proto::CryptoFailureAction::Fail,
+            b"opaque",
+        );
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(AlwaysFailDecryptor)),
+        };
+        let res = consumer.receive().await;
+        assert!(
+            matches!(res, Err(ClientError::Other(_))),
+            "Fail policy must surface a decrypt error, got {res:?}"
+        );
+    }
+
+    /// `CryptoFailureAction::Consume`: the ciphertext + encryption metadata are
+    /// handed back as-is. 1:1 with the moonpool
+    /// `receive_crypto_failure_consume_returns_ciphertext`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_crypto_failure_consume_returns_ciphertext() {
+        let plaintext = b"distinctive-payload";
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            pb::command_subscribe::SubType::Exclusive,
+            magnetar_proto::CryptoFailureAction::Consume,
+            plaintext,
+        );
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(AlwaysFailDecryptor)),
+        };
+        let msg = consumer
+            .receive()
+            .await
+            .expect("consume returns the message");
+        assert_ne!(
+            msg.payload.as_ref(),
+            plaintext.as_slice(),
+            "Consume must hand back the ciphertext, not the plaintext"
+        );
+        assert!(
+            !msg.metadata.encryption_keys.is_empty(),
+            "Consume must preserve encryption_keys for out-of-band decryption"
+        );
+    }
+
+    /// `CryptoFailureAction::Discard`: the undecryptable message is acked and
+    /// skipped, so `receive_with_timeout` observes no message. 1:1 with the
+    /// moonpool `receive_crypto_failure_discard_skips_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_crypto_failure_discard_skips_message() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            pb::command_subscribe::SubType::Exclusive,
+            magnetar_proto::CryptoFailureAction::Discard,
+            b"undecryptable",
+        );
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(AlwaysFailDecryptor)),
+        };
+        let got = consumer
+            .receive_with_timeout(std::time::Duration::from_millis(200))
+            .await
+            .expect("receive_with_timeout resolves");
+        assert!(
+            got.is_none(),
+            "Discard must silently drop the undecryptable message, got {got:?}"
+        );
+    }
+
+    /// An encrypted message with NO decryptor configured surfaces a
+    /// "no decryptor configured" error under `CryptoFailureAction::Fail`.
+    /// 1:1 with the moonpool `receive_encrypted_without_decryptor_fails`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_encrypted_without_decryptor_fails() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            pb::command_subscribe::SubType::Exclusive,
+            magnetar_proto::CryptoFailureAction::Fail,
+            b"secret",
+        );
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: None,
+        };
+        let res = consumer.receive().await;
+        match res {
+            Err(ClientError::Other(msg)) => {
+                assert!(
+                    msg.contains("no decryptor configured"),
+                    "expected no-decryptor message, got {msg:?}"
+                );
+            }
+            other => panic!("expected no-decryptor error, got {other:?}"),
+        }
+    }
+
+    /// Cloning a `Consumer` preserves the decryptor hook (Arc bump). 1:1 with
+    /// the moonpool `consumer_clone_preserves_decryptor`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_clone_preserves_decryptor() {
+        let (shared, handle, slot) = subscribe_with_encrypted_message(
+            pb::command_subscribe::SubType::Exclusive,
+            magnetar_proto::CryptoFailureAction::Fail,
+            b"clone-secret",
+        );
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
+        };
+        let clone = consumer.clone();
+        let msg = clone.receive().await.expect("clone decrypts");
+        assert_eq!(msg.payload.as_ref(), b"clone-secret");
     }
 
     fn handshake_complete_shared() -> std::sync::Arc<ConnectionShared> {
@@ -2160,6 +2396,189 @@ mod tests {
         );
     }
 
+    /// Build an encrypted `CommandMessage` whose `encryption_keys[0].key` carries a custom
+    /// key name. Lets a test mark individual messages as decryptable vs. undecryptable for a
+    /// key-aware decryptor (see [`SelectiveDecryptor`]). 1:1 with the moonpool helper.
+    fn encrypted_message_bytes_with_key(
+        consumer_id: u64,
+        entry_id: u64,
+        key_name: &str,
+        plaintext: &[u8],
+    ) -> BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "test".to_owned(),
+            sequence_id: entry_id,
+            publish_time: 1_700_000_000,
+            encryption_keys: vec![pb::EncryptionKeys {
+                key: key_name.to_owned(),
+                value: bytes::Bytes::from_static(b"k"),
+                metadata: Vec::new(),
+            }],
+            encryption_algo: Some("XOR-TEST".to_owned()),
+            encryption_param: Some(bytes::Bytes::from_static(b"iv")),
+            ..Default::default()
+        };
+        let cipher: Vec<u8> = plaintext.iter().map(|b| b ^ XOR_KEY).collect();
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, &meta, &cipher).expect("encode encrypted CommandMessage");
+        buf
+    }
+
+    /// Decryptor that XOR-decrypts only when `encryption_keys[0].key == "xor-test"` and fails
+    /// for any other key. Lets a single batch mix decryptable and undecryptable messages so we
+    /// can exercise the `Discard` skip path in [`Consumer::receive_batch_with_bytes_cap`]. 1:1
+    /// with the moonpool helper.
+    #[derive(Debug, Default)]
+    struct SelectiveDecryptor;
+
+    impl crate::crypto::MessageDecryptor for SelectiveDecryptor {
+        fn decrypt(
+            &self,
+            ciphertext: &[u8],
+            metadata: &pb::MessageMetadata,
+        ) -> Result<bytes::Bytes, crate::crypto::EncryptError> {
+            match metadata.encryption_keys.first().map(|k| k.key.as_str()) {
+                Some("xor-test") => Ok(bytes::Bytes::from(
+                    ciphertext.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>(),
+                )),
+                other => Err(crate::crypto::EncryptError::new(format!(
+                    "selective decryptor refuses key {other:?}"
+                ))),
+            }
+        }
+    }
+
+    /// Regression mirror for the moonpool batch-receive ciphertext leak: `receive_batch` must
+    /// decrypt EVERY message in the batch, not just the first. 1:1 with the moonpool
+    /// `receive_batch_decrypts_every_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_decrypts_every_message() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action: magnetar_proto::CryptoFailureAction::Fail,
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            for i in 0..3_u64 {
+                let frame =
+                    encrypted_message_bytes(handle.0, i, format!("batch-secret-{i}").as_bytes());
+                conn.handle_bytes(Instant::now(), &frame)
+                    .expect("handle encrypted CommandMessage");
+            }
+        }
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
+        };
+        let batch = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_batch must resolve");
+        assert_eq!(batch.len(), 3, "all three messages must be delivered");
+        for (i, msg) in batch.iter().enumerate() {
+            assert_eq!(
+                msg.payload.as_ref(),
+                format!("batch-secret-{i}").as_bytes(),
+                "message {i} must be delivered as plaintext, not ciphertext",
+            );
+            assert!(
+                std::str::from_utf8(&msg.payload).is_ok(),
+                "decrypted payload must be valid utf-8 plaintext",
+            );
+        }
+    }
+
+    /// `CryptoFailureAction::Discard` inside a batch: an undecryptable message is acked and
+    /// skipped, never handed to the caller as ciphertext, while the decryptable messages around
+    /// it are delivered as plaintext. 1:1 with the moonpool
+    /// `receive_batch_discards_undecryptable_message`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_batch_discards_undecryptable_message() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-batch-discard".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action: magnetar_proto::CryptoFailureAction::Discard,
+                ..Default::default()
+            })
+        };
+        {
+            let mut conn = shared.inner.lock();
+            // entry 0: decryptable, entry 1: undecryptable (bad key → Discard), entry 2:
+            // decryptable. The middle message must be skipped.
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(handle.0, 0, "xor-test", b"keep-0"),
+            )
+            .expect("handle msg 0");
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(handle.0, 1, "bad-key", b"drop-1"),
+            )
+            .expect("handle msg 1");
+            conn.handle_bytes(
+                Instant::now(),
+                &encrypted_message_bytes_with_key(handle.0, 2, "xor-test", b"keep-2"),
+            )
+            .expect("handle msg 2");
+        }
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(SelectiveDecryptor)),
+        };
+        let batch = consumer
+            .receive_batch(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("receive_batch must resolve");
+        assert_eq!(
+            batch.len(),
+            2,
+            "the undecryptable middle message must be discarded, not delivered",
+        );
+        assert_eq!(batch[0].payload.as_ref(), b"keep-0");
+        assert_eq!(batch[1].payload.as_ref(), b"keep-2");
+        for msg in &batch {
+            assert!(
+                msg.metadata
+                    .encryption_keys
+                    .first()
+                    .is_none_or(|k| k.key != "bad-key"),
+                "no undecryptable message may leak into the batch",
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn receive_batch_with_bytes_cap_short_circuits_zero_caps() {
         let shared = handshake_complete_shared();
@@ -2387,6 +2806,103 @@ mod tests {
         assert!(
             pending_publish_bytes > 0,
             "reconsume_later must have queued the retry publish",
+        );
+    }
+
+    /// Regression for the decompress-vs-decrypt ordering bug: the producer
+    /// applies `compression → encryption` on send, so the wire payload is
+    /// ciphertext-of-compressed-data. The consumer MUST decrypt FIRST and
+    /// decompress SECOND. The legacy "decompress first" order would feed
+    /// ciphertext into the codec and silently bypass `CryptoFailureAction`.
+    ///
+    /// This test pins the corrected order by building a wire frame the same
+    /// way the producer would: zstd-compress the plaintext, then XOR-encrypt
+    /// the result; stamp both `metadata.compression` + `encryption_keys`.
+    /// A consumer with the matching XOR decryptor must deliver the original
+    /// plaintext.
+    ///
+    /// Has no 1:1 moonpool mirror: the moonpool producer refuses any non-`None`
+    /// compression on send, so the moonpool consumer's `post_process_message`
+    /// has no decompression branch and nothing to reorder. The parity-count
+    /// delta is compensated by `moonpool_helper_handles_encrypted_only_payload`
+    /// on the moonpool side.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_decrypts_then_decompresses_compressed_encrypted_payload() {
+        use magnetar_proto::types::CompressionKind;
+
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/crypto-compress-order".to_owned(),
+                subscription: "s".to_owned(),
+                sub_type: pb::command_subscribe::SubType::Exclusive,
+                crypto_failure_action: magnetar_proto::CryptoFailureAction::Fail,
+                ..Default::default()
+            })
+        };
+        let plaintext: Vec<u8> = b"the-quick-brown-fox-jumps-over-the-lazy-dog-".repeat(8);
+        // Mimic producer: compression → encryption.
+        let compressed =
+            crate::compress::compress(CompressionKind::Zstd, &plaintext).expect("zstd compress");
+        let ciphertext: Vec<u8> = compressed.iter().map(|b| b ^ XOR_KEY).collect();
+
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: 1,
+                    entry_id: 0,
+                    ..Default::default()
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let meta = pb::MessageMetadata {
+            producer_name: "test".to_owned(),
+            sequence_id: 0,
+            publish_time: 1_700_000_000,
+            compression: Some(pb::CompressionType::Zstd as i32),
+            uncompressed_size: Some(plaintext.len() as u32),
+            encryption_keys: vec![pb::EncryptionKeys {
+                key: "xor-test".to_owned(),
+                value: bytes::Bytes::from_static(b"k"),
+                metadata: Vec::new(),
+            }],
+            encryption_algo: Some("XOR-TEST".to_owned()),
+            encryption_param: Some(bytes::Bytes::from_static(b"iv")),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_payload(&mut buf, &cmd, &meta, &ciphertext)
+            .expect("encode compressed+encrypted CommandMessage");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle compressed+encrypted CommandMessage");
+        }
+
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer {
+            shared,
+            handle,
+            slot,
+            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
+        };
+        let msg = consumer
+            .receive()
+            .await
+            .expect("decrypt-then-decompress must yield the original plaintext");
+        assert_eq!(
+            msg.payload.as_ref(),
+            plaintext.as_slice(),
+            "consumer must decrypt first (ciphertext → compressed plaintext) THEN \
+             decompress (compressed plaintext → user plaintext); legacy reverse \
+             order would have failed at decompress on raw ciphertext"
         );
     }
 

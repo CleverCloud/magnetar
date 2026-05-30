@@ -775,6 +775,143 @@ mod tests {
         )
     }
 
+    /// Deterministic, dependency-free PIP-4 encryptor stub: XORs every payload
+    /// byte with a fixed key and stamps the canonical encryption metadata
+    /// fields. Records the last plaintext it saw so tests can assert the
+    /// encrypt hook ran on the pre-encryption bytes. 1:1 mirror of the moonpool
+    /// engine's stub (ADR-0024 cross-runtime parity).
+    #[derive(Debug, Default)]
+    struct XorEncryptor {
+        seen_plaintext: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    const XOR_KEY: u8 = 0x5A;
+
+    impl crate::crypto::MessageEncryptor for XorEncryptor {
+        fn encrypt(
+            &self,
+            plaintext: &[u8],
+            metadata: &mut pb::MessageMetadata,
+        ) -> Result<Bytes, crate::crypto::EncryptError> {
+            *self.seen_plaintext.lock().unwrap() = Some(plaintext.to_vec());
+            metadata.encryption_keys.push(pb::EncryptionKeys {
+                key: "xor-test".to_owned(),
+                value: Bytes::from_static(b"k"),
+                metadata: Vec::new(),
+            });
+            metadata.encryption_algo = Some("XOR-TEST".to_owned());
+            metadata.encryption_param = Some(Bytes::from_static(b"iv"));
+            Ok(Bytes::from(
+                plaintext.iter().map(|b| b ^ XOR_KEY).collect::<Vec<u8>>(),
+            ))
+        }
+    }
+
+    /// `send` with a PIP-4 encryptor wired stamps the encryption metadata and
+    /// hands the ciphertext (not the plaintext) to the sans-io layer. We observe
+    /// the encrypt hook fired against the original plaintext; the resulting send
+    /// enqueues a pending op (no driver running drains it). 1:1 with the moonpool
+    /// `send_encrypts_payload_and_stamps_metadata`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_encrypts_payload_and_stamps_metadata() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/encrypt".to_owned(),
+                ..Default::default()
+            })
+        };
+        let encryptor = std::sync::Arc::new(XorEncryptor::default());
+        let producer = Producer {
+            shared: shared.clone(),
+            handle,
+            slot: slot_for(&shared, handle),
+            compression: CompressionKind::None,
+            encryptor: Some(encryptor.clone()),
+        };
+        let _fut = producer.send(OutgoingMessage {
+            payload: Bytes::from_static(b"plain-secret"),
+            metadata: pb::MessageMetadata::default(),
+            uncompressed_size: 12,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        });
+        // The encryptor must have run against the original plaintext.
+        assert_eq!(
+            encryptor.seen_plaintext.lock().unwrap().as_deref(),
+            Some(b"plain-secret".as_slice()),
+            "encrypt hook must see the pre-encryption payload",
+        );
+        // The send enqueued a pending op against the per-slot queue.
+        assert!(
+            producer.pending_count() >= 1,
+            "expected pending encrypted send; got {}",
+            producer.pending_count()
+        );
+    }
+
+    /// Encryptor that always fails. Exercises the producer-side encrypt-error
+    /// branch (`send` surfaces `ClientError::Other("encrypt: …")`). 1:1 with the
+    /// moonpool `send_encrypt_failure_surfaces_error`.
+    #[derive(Debug, Default)]
+    struct FailingEncryptor;
+
+    impl crate::crypto::MessageEncryptor for FailingEncryptor {
+        fn encrypt(
+            &self,
+            _plaintext: &[u8],
+            _metadata: &mut pb::MessageMetadata,
+        ) -> Result<Bytes, crate::crypto::EncryptError> {
+            Err(crate::crypto::EncryptError::new(
+                "forced encrypt failure (test)",
+            ))
+        }
+    }
+
+    /// A failing encryptor makes `send` resolve to `ClientError::Other` and the
+    /// payload never reaches the sans-io layer (no pending op). 1:1 with the
+    /// moonpool `send_encrypt_failure_surfaces_error`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_encrypt_failure_surfaces_error() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/encrypt-fail".to_owned(),
+                ..Default::default()
+            })
+        };
+        let producer = Producer {
+            shared: shared.clone(),
+            handle,
+            slot: slot_for(&shared, handle),
+            compression: CompressionKind::None,
+            encryptor: Some(std::sync::Arc::new(FailingEncryptor)),
+        };
+        let res = producer
+            .send(OutgoingMessage {
+                payload: Bytes::from_static(b"plain"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 5,
+                num_messages: 1,
+                txn_id: None,
+                source_message_id: None,
+            })
+            .await;
+        let err = res.expect_err("encrypt failure must surface");
+        assert!(
+            format!("{err}").contains("encrypt:"),
+            "expected encrypt-error message, got {err:?}"
+        );
+        assert_eq!(
+            producer.pending_count(),
+            0,
+            "a failed encrypt must not enqueue a send"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn flush_with_timeout_returns_timeout_when_nothing_acks() {
         let shared = handshake_complete_shared();

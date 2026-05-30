@@ -23,7 +23,7 @@ use super::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
     SubscribeApi, TopicListChange, WatchTopicListFut,
 };
-use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
+use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, TransactionApi};
 
 /// Zero-sized marker for the moonpool deterministic-simulation engine,
 /// parametrised by the [`moonpool_core::Providers`] bundle the underlying
@@ -108,19 +108,20 @@ impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
     }
 }
 
-// PIP-4 encryption hookup for the moonpool engine. Moonpool doesn't yet
-// drive real on-the-wire encryption (the producer / consumer push paths
-// don't take an encryptor parameter), so both associated types resolve to
-// the engine-agnostic [`NoEncryption`] stub. Builders that flow through
-// the engine-generic `.create()` / `.subscribe()` paths simply ignore
-// the field; tokio-specialised `.create_with_encryption` /
-// `.subscribe_with_decryption` methods stay tokio-only.
+// PIP-4 encryption hookup for the moonpool engine. The moonpool runtime now
+// ships the same `MessageEncryptor` / `MessageDecryptor` trait surface as the
+// tokio engine (`magnetar_runtime_moonpool::{MessageEncryptor, MessageDecryptor}`),
+// so both associated types resolve to the runtime's `Arc<dyn …>` trait objects
+// rather than the `NoEncryption` stub. The engine-generic `.create()` /
+// `.subscribe()` paths still ignore the field; the moonpool-specialised
+// `.create_with_encryption` / `.subscribe_with_decryption` builder methods
+// consult it (mirroring the tokio specialisation).
 impl<P: moonpool_core::Providers> MessageEncryptorApi for MoonpoolEngine<P> {
-    type Encryptor = NoEncryption;
+    type Encryptor = std::sync::Arc<dyn magnetar_runtime_moonpool::MessageEncryptor>;
 }
 
 impl<P: moonpool_core::Providers> MessageDecryptorApi for MoonpoolEngine<P> {
-    type Decryptor = NoEncryption;
+    type Decryptor = std::sync::Arc<dyn magnetar_runtime_moonpool::MessageDecryptor>;
 }
 
 // PIP-460 scalable topics (ADR-0031, experimental). 1:1 with the tokio
