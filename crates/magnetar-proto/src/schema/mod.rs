@@ -26,11 +26,16 @@
 //!   property ordering.
 //! - **PROTOBUF** schemas are stored as opaque blobs and compared by raw-byte equality. The Java
 //!   client emits an Avro-schema-derived-from-protobuf JSON document
-//!   (`org.apache.avro.protobuf.ProtobufData.getSchema(pojo)`); magnetar instead emits a serialised
-//!   `FileDescriptorProto` via [`ProtobufSchema::with_file_descriptor`] /
-//!   [`ProtobufSchema::with_file_descriptor_proto`]. Both forms satisfy the broker's byte-equality
-//!   contract, but they are **not** byte-identical to each other — a topic produced-to by both
-//!   clients will register two distinct schema versions until an Avro-from-protobuf bridge lands.
+//!   (`org.apache.avro.protobuf.ProtobufData.getSchema(pojo)`); magnetar offers two parity
+//!   strategies:
+//!   * [`ProtobufSchema::with_avro_canonical_from_descriptor`] — best-effort port of the Java
+//!     mapping rules; aims at byte parity for the common protobuf-shape subset with documented gaps
+//!     (most notably the `avro.java.string` property);
+//!   * [`ProtobufSchema::with_file_descriptor`] / [`ProtobufSchema::with_file_descriptor_proto`] —
+//!     emit a serialised `FileDescriptorProto`; satisfy the broker's byte-equality contract but are
+//!     **not** byte-identical to Java's Avro-from-protobuf output.
+//!
+//!   See the [`ProtobufSchema`] docs for the full mapping rules and parity caveats.
 //!   [`ProtobufSchema::new`] (fully-qualified name only) is retained for back-compat but is not
 //!   parity-compatible.
 //! - **PROTOBUF_NATIVE** and **KeyValue** are stored as opaque blobs and compared by **raw-byte
