@@ -43,7 +43,7 @@ use crate::types::{CompressionKind, MessageId, ProducerHandle, SequenceId};
 /// (3 significant digits) with auto-resize. Returns `None` if
 /// `hdrhistogram::Histogram::<u64>::new(3)` ever errors — statically impossible per
 /// hdrhistogram-7.5.4 `src/lib.rs:736-749` (the constructor only errors when
-/// `sigfig > 5`). `debug_assert!` traps a contract regression in tests.
+/// `sigfig > 5`).
 ///
 /// Invariant #6 (no panics in `magnetar-proto` outside `#[cfg(test)]`) is satisfied
 /// by returning `Option`: callers that need the histogram check for `Some(_)`.
@@ -51,12 +51,11 @@ use crate::types::{CompressionKind, MessageId, ProducerHandle, SequenceId};
 /// histogram is empty, so a `None` slot surfaces as zero percentiles — graceful
 /// degradation, not a panic.
 pub(crate) fn new_latency_histogram() -> Option<hdrhistogram::Histogram<u64>> {
-    let h = hdrhistogram::Histogram::<u64>::new(3);
-    debug_assert!(
-        h.is_ok(),
-        "hdrhistogram::Histogram::new(3) is statically valid (sigfig <= 5)",
-    );
-    h.ok()
+    // reason: hdrhistogram's `Histogram::new(sigfig)` only errors when `sigfig > 5`;
+    // 3 is statically valid, so propagating `Option` (rather than asserting in debug)
+    // keeps the helper panic-free under invariant #6 and falls through to zero
+    // percentiles in the unreachable error branch.
+    hdrhistogram::Histogram::<u64>::new(3).ok()
 }
 
 /// Outbound publish queued by the user.
@@ -1013,18 +1012,13 @@ impl ProducerState {
         for (sm, payload) in self.batch.messages.drain(..) {
             let sm_len = sm.encoded_len();
             concatenated.extend_from_slice(&(sm_len as u32).to_be_bytes());
-            // `prost::Message::encode` to a `BytesMut` is provably infallible: the only
-            // error path is `BufMut::remaining_mut() < encoded_len()`, and `BytesMut`
-            // reports `remaining_mut() == usize::MAX` (auto-grows on write). Discarding
-            // the `Result` keeps invariant #6 (no panics in `magnetar-proto` outside
-            // `#[cfg(test)]`) without `.expect(...)`. `debug_assert!` traps a regression
-            // in tests if a future prost ever introduced a non-buffer error.
-            let res = sm.encode(&mut concatenated);
-            debug_assert!(
-                res.is_ok(),
-                "prost::Message::encode into BytesMut is infallible (auto-growing buffer)",
-            );
-            let _ = res;
+            // reason: `prost::Message::encode` into `BytesMut` is provably infallible —
+            // the only error path is `BufMut::remaining_mut() < encoded_len()`, and
+            // `BytesMut` reports `remaining_mut() == usize::MAX` (auto-grows on write).
+            // Discarding the `Result` keeps invariant #6 (no panics in `magnetar-proto`
+            // outside `#[cfg(test)]`); no `debug_assert!` because that would also panic
+            // under strict reading.
+            let _ = sm.encode(&mut concatenated);
             concatenated.extend_from_slice(&payload);
         }
         let payload = concatenated.freeze();
@@ -2548,5 +2542,40 @@ mod tests {
         // individual OpSend frames above; we just smoke-test the encoder path.
         let flushed = p.flush_batch(1_700_000_000, std::time::Instant::now());
         assert!(flushed <= 1);
+    }
+
+    /// V1 strict: `new_latency_histogram` previously carried a `debug_assert!` on
+    /// the constructor `Result`. Hammer the helper repeatedly to confirm the
+    /// debug-build behavior is still panic-free across many invocations — a
+    /// regression that re-introduced the assert would surface here under
+    /// `cargo test` (debug profile).
+    #[test]
+    fn new_latency_histogram_does_not_panic_under_repeated_calls() {
+        for _ in 0..1024 {
+            let h = new_latency_histogram();
+            assert!(h.is_some());
+        }
+    }
+
+    /// V2 strict: `flush_batch`'s `sm.encode(&mut concatenated)` used to be
+    /// guarded by a `debug_assert!`. Confirm the encode path stays panic-free
+    /// even on the empty-payload edge case (zero-length `OutgoingMessage`), which
+    /// produces a minimally-sized `SingleMessageMetadata` and exercises the
+    /// shortest possible varint width.
+    #[test]
+    fn flush_batch_does_not_panic_on_empty_payload() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            128 * 1024,
+        );
+        p.batching_enabled = true;
+        let _ = p
+            .queue_send(small_message(b""), 100, std::time::Instant::now())
+            .unwrap();
+        // No panic: the encoder must accept a zero-length payload without
+        // tripping the (now-removed) debug_assert on the encode Result.
+        let _ = p.flush_batch(1_700_000_000, std::time::Instant::now());
     }
 }

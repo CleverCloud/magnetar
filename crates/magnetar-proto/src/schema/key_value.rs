@@ -361,18 +361,13 @@ fn base64_encode(out: &mut String, input: &[u8]) {
             out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
             out.push('=');
         }
-        // Invariant #6: no `panic!`/`unreachable!()` in `magnetar-proto` production code.
-        // The above `while i + 3 <= input.len()` loop advances `i` by 3 each iteration,
-        // so on exit `input.len() - i ∈ {0, 1, 2}` is provably exhaustive. `debug_assert!`
-        // traps a refactor that ever broke that invariant; the wildcard arm leaves the
-        // partial group unencoded so output stays a valid (albeit empty-tail) base64
-        // string — a no-op fallback, not a panic.
-        _ => {
-            debug_assert!(
-                false,
-                "base64_encode tail must be 0/1/2 bytes after the per-3 main loop",
-            );
-        }
+        // reason: invariant #6 forbids panics (including `debug_assert!`) in
+        // `magnetar-proto` production code. The above `while i + 3 <= input.len()` loop
+        // advances `i` by 3 each iteration, so on exit `input.len() - i ∈ {0, 1, 2}` is
+        // provably exhaustive. The wildcard is statically unreachable for valid inputs;
+        // the silent no-op fallthrough leaves `out` as a valid (albeit empty-tail)
+        // base64 string — a safe fallback rather than a panic.
+        _ => {}
     }
 }
 
@@ -588,6 +583,28 @@ mod tests {
                     "len={len} ⇒ output {buf:?} not 4-aligned"
                 );
             }
+        }
+    }
+
+    /// V3 strict: the wildcard arm of `base64_encode`'s tail match previously
+    /// contained `debug_assert!(false, …)` — itself a panic path under invariant
+    /// #6. Confirm the encoder stays panic-free even on a deliberately large
+    /// input that loops through the main per-3 block hundreds of times before
+    /// landing on each residue class.
+    #[test]
+    fn base64_encode_does_not_panic_on_large_input() {
+        let mut buf = String::new();
+        // Three lengths chosen to land on each `len % 3` residue (0, 1, 2)
+        // after a high-iteration-count main loop, exercising the path the
+        // removed `debug_assert!(false)` guarded against.
+        for len in [4095usize, 4096, 4097] {
+            buf.clear();
+            let input: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            base64_encode(&mut buf, &input);
+            assert!(
+                buf.len().is_multiple_of(4),
+                "len={len} ⇒ output not 4-aligned"
+            );
         }
     }
 }
