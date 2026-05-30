@@ -112,36 +112,16 @@ impl OutgoingMessage {
         self
     }
 
-    /// Mirrors `TypedMessageBuilder#deliverAfter`. Adds `delay_ms` to the
-    /// current wall-clock time and stamps the resulting absolute deadline
-    /// on the message.
-    ///
-    /// # Determinism warning
-    ///
-    /// This convenience reads the host's `SystemTime::now`. Code that runs
-    /// under `MoonpoolEngine` and depends on byte-identical wire output
-    /// across simulator seeds should use [`Self::deliver_after_ms_from`]
-    /// (caller-supplied `now_ms`) or [`Self::deliver_at_ms`] (absolute
-    /// timestamp) instead — the broker compares `deliver_at_ms` to its
-    /// own clock, so what matters for replay parity is that the *client*
-    /// stamp is deterministic (2026-05-27 determinism audit).
+    /// Mirrors `TypedMessageBuilder#deliverAfter`. Stamps the message with
+    /// `now_ms + delay_ms` as the absolute UNIX-epoch millisecond
+    /// deadline. The caller supplies `now_ms` so this stays
+    /// sans-io-pure (ADR-0011 invariant #3): the tokio engine convenience
+    /// methods snapshot the host clock at the call site; the moonpool
+    /// engine plugs in a virtual wall clock so the resulting wire bytes
+    /// are deterministic across seeds. Use [`Self::deliver_at_ms`] for
+    /// the absolute-deadline variant.
     #[must_use]
-    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64);
-        self.deliver_at_ms = Some(now.saturating_add(delay_ms));
-        self
-    }
-
-    /// Engine-agnostic variant of [`Self::deliver_after_ms`]. Stamps the
-    /// message with `now_ms + delay_ms` as the absolute UNIX-epoch
-    /// millisecond deadline. The caller supplies `now_ms` — under
-    /// `MoonpoolEngine` this should come from the engine's virtual wall
-    /// clock so the resulting wire bytes are deterministic across seeds
-    /// (2026-05-27 determinism audit, "Determinism warning" entry).
-    #[must_use]
-    pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
+    pub fn deliver_after_ms(mut self, now_ms: i64, delay_ms: i64) -> Self {
         self.deliver_at_ms = Some(now_ms.saturating_add(delay_ms));
         self
     }
@@ -500,20 +480,13 @@ impl MessageBuilder<'_> {
         self
     }
 
-    /// See [`OutgoingMessage::deliver_after_ms`].
+    /// See [`OutgoingMessage::deliver_after_ms`]. The caller supplies
+    /// `now_ms` (sans-io, ADR-0011 invariant #3); the engine convenience
+    /// methods snapshot the host wall clock on the tokio path and the
+    /// virtual wall clock on the moonpool path.
     #[must_use]
-    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
-        self.msg = self.msg.deliver_after_ms(delay_ms);
-        self
-    }
-
-    /// See [`OutgoingMessage::deliver_after_ms_from`]. Engine-agnostic
-    /// alternative to [`Self::deliver_after_ms`] for moonpool-deterministic
-    /// callers — see the determinism warning on
-    /// [`OutgoingMessage::deliver_after_ms`].
-    #[must_use]
-    pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
-        self.msg = self.msg.deliver_after_ms_from(now_ms, delay_ms);
+    pub fn deliver_after_ms(mut self, now_ms: i64, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms(now_ms, delay_ms);
         self
     }
 
@@ -1409,6 +1382,24 @@ mod outgoing_message_tests {
         assert_eq!(msg.key.as_deref(), Some("k"));
         assert_eq!(msg.event_time_ms, Some(42));
         assert_eq!(msg.properties.len(), 1);
+    }
+
+    // ADR-0011 — invariant #3 sans-io clock injection. `deliver_after_ms`
+    // used to read the host's `SystemTime::now`; the caller now supplies
+    // `now_ms` so the stamped `deliver_at_ms` flows through the engine
+    // boundary deterministically.
+    #[test]
+    fn deliver_after_ms_routes_through_caller_now() {
+        // Two distinct virtual "now"s — under the new signature they
+        // MUST produce two distinct `deliver_at_ms`.
+        let msg_a = OutgoingMessage::with_payload("p").deliver_after_ms(1_000, 250);
+        let msg_b = OutgoingMessage::with_payload("p").deliver_after_ms(5_000, 250);
+        assert_eq!(msg_a.deliver_at_ms, Some(1_250));
+        assert_eq!(msg_b.deliver_at_ms, Some(5_250));
+
+        // Saturating add — caller passing i64::MAX should not panic.
+        let msg_sat = OutgoingMessage::with_payload("p").deliver_after_ms(i64::MAX, 1);
+        assert_eq!(msg_sat.deliver_at_ms, Some(i64::MAX));
     }
 
     #[test]

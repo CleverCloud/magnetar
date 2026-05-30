@@ -82,10 +82,11 @@ impl<P: crate::ProducerApi> PartitionedMessageBuilder<'_, P> {
         self
     }
 
-    /// See [`OutgoingMessage::deliver_after_ms`].
+    /// See [`OutgoingMessage::deliver_after_ms`]. The caller supplies
+    /// `now_ms` (sans-io, ADR-0011 invariant #3).
     #[must_use]
-    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
-        self.msg = self.msg.deliver_after_ms(delay_ms);
+    pub fn deliver_after_ms(mut self, now_ms: i64, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms(now_ms, delay_ms);
         self
     }
 

@@ -101,7 +101,7 @@ use magnetar_proto::{Connection, ConnectionConfig};
 ///
 /// [`AutoClusterFailover`]: crate::auto_cluster_failover::AutoClusterFailover
 pub use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider, StaticServiceUrlProvider};
-use moonpool_core::Providers;
+use moonpool_core::{Providers, TimeProvider};
 use parking_lot::Mutex;
 use slab::Slab;
 use tokio::sync::Notify;
@@ -125,22 +125,24 @@ use crate::transport::Transport;
 /// the same seed. Pairs with the moonpool wall-clock bridge.
 pub const DETERMINISTIC_SIM_EPOCH_MS: u64 = 1_704_067_200_000;
 
-/// Capture the host's current `SystemTime` as millis-since-`UNIX_EPOCH`.
-/// Used by [`ConnectionShared::with_auth`] for the
-/// production / dev path; deterministic-sim tests should call
-/// [`ConnectionShared::with_auth_and_wall_clock_base`] with a fixed
-/// epoch (e.g. [`DETERMINISTIC_SIM_EPOCH_MS`]) instead.
+/// Return the default wall-clock base for the moonpool engine.
+///
+/// The moonpool engine is **deterministic by default** (ADR-0011 sans-io
+/// clock injection): when a caller constructs [`ConnectionShared::with_auth`]
+/// without pinning an explicit base, we anchor the wall clock at the
+/// documented [`DETERMINISTIC_SIM_EPOCH_MS`] anchor (`2024-01-01T00:00:00Z`)
+/// instead of the host `SystemTime`. This keeps every test that just calls
+/// [`ConnectionShared::new`] / [`ConnectionShared::with_auth`] free of
+/// host-clock contamination — bit-for-bit reproducible across
+/// `moonpool-sim` seeds without any per-call setup.
+///
+/// Callers that need a live wall-clock anchor (production / dev paths
+/// running on real Pulsar brokers) should use
+/// [`ConnectionShared::with_auth_and_wall_clock_base`] and snapshot the
+/// host `SystemTime` at the call site themselves. That mirrors the
+/// pattern the tokio engine already follows.
 fn current_wall_clock_base_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| {
-            let m = d.as_millis();
-            if m > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                m as u64
-            }
-        })
+    DETERMINISTIC_SIM_EPOCH_MS
 }
 
 /// Shared connection state for the moonpool engine. Mirrors the tokio
@@ -266,6 +268,17 @@ pub struct ConnectionShared {
     /// `SimProviders` (whose `SimTimeProvider` holds
     /// `Weak<RefCell<…>>` and is structurally `!Send + !Sync`).
     pub wall_clock_ms: Arc<AtomicU64>,
+    /// Pluggable monotonic-clock provider for callers that hand `Instant`
+    /// values into the sans-io state machine
+    /// (`Connection::send`/`flush_producer`/…). Returned by
+    /// [`Self::now_instant`]. The default closure reads `Instant::now()`;
+    /// the moonpool engine binds it to the same `providers.time()`
+    /// snapshot it uses for [`Self::wall_clock_ms`] so all clock reads
+    /// flow through the moonpool [`TimeProvider`] (ADR-0011 sans-io
+    /// clock injection).
+    ///
+    /// [`TimeProvider`]: moonpool_core::TimeProvider
+    pub now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync>,
     /// PIP-460 (ADR-0031) scalable-topic events the driver drained off the
     /// proto queue. Mirrors the tokio engine's identically-named buffer.
     /// Surface via [`Client::next_scalable_event`].
@@ -343,6 +356,15 @@ impl ConnectionShared {
                 std::time::UNIX_EPOCH
                     + std::time::Duration::from_millis(read_handle.load(Ordering::Relaxed))
             });
+        // ADR-0011 — invariant #3 sans-io clock injection. The default
+        // monotonic-clock provider reads the host `Instant::now`; the
+        // driver loop replaces it via [`Self::install_now_instant_provider`]
+        // with a closure that reads the moonpool [`TimeProvider`] so
+        // user-facing callers (Producer::send, flush, …) feed
+        // deterministic Instants into the proto state machine. Default
+        // is fine for callers that build `ConnectionShared` directly
+        // without an engine (e.g. unit tests).
+        let now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(Instant::now);
         let mut conn = Connection::new(config, wall_clock_provider);
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
         Arc::new(Self {
@@ -360,11 +382,72 @@ impl ConnectionShared {
             memory_wakers: Mutex::new(Slab::new()),
             wall_clock_base_ms,
             wall_clock_ms,
+            now_instant_provider,
             #[cfg(feature = "scalable-topics")]
             scalable_events: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "scalable-topics")]
             scalable_notify: Notify::new(),
         })
+    }
+
+    /// Snapshot the configured monotonic clock — defaults to host
+    /// [`Instant::now`], overridable by the moonpool engine via
+    /// [`Self::with_now_instant_provider`] so user-facing callers feed
+    /// deterministic Instants into the proto state machine
+    /// (ADR-0011 sans-io clock injection).
+    #[must_use]
+    pub fn now_instant(&self) -> Instant {
+        (self.now_instant_provider)()
+    }
+
+    /// Read the current wall-clock millis-since-`UNIX_EPOCH` snapshot,
+    /// driven by the moonpool [`TimeProvider`] under `moonpool-sim` or
+    /// by the host `SystemTime` under `TokioProviders`. Pairs with
+    /// [`Self::now_instant`]; both are read by user-facing futures
+    /// (e.g. [`Producer::send`]) before handing values to the proto
+    /// state machine so deterministic-simulation runs are bit-for-bit
+    /// reproducible across seeds (ADR-0011 sans-io clock injection).
+    ///
+    /// [`TimeProvider`]: moonpool_core::TimeProvider
+    #[must_use]
+    pub fn now_wall_clock_ms(&self) -> u64 {
+        self.wall_clock_ms.load(Ordering::Relaxed)
+    }
+
+    /// Construct with a custom monotonic-clock provider in addition to
+    /// the explicit wall-clock anchor. The moonpool engine calls this
+    /// from the connect entrypoints so user-facing futures
+    /// (`Producer::send`, `Producer::flush`, the DLQ delayed-redelivery
+    /// path, …) feed Instants pulled through
+    /// [`moonpool_core::TimeProvider`] into the proto state machine
+    /// instead of reading the host `Instant::now`. Pairs with
+    /// `wall_clock_ms` to give a complete sans-io clock surface
+    /// (ADR-0011).
+    #[must_use]
+    pub fn with_auth_wall_clock_and_instant(
+        config: ConnectionConfig,
+        auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
+        wall_clock_base_ms: u64,
+        now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Arc<Self> {
+        let mut shared =
+            Self::with_auth_and_wall_clock_base(config, auth_provider, wall_clock_base_ms);
+        // Safety: at this point `shared` has not been cloned yet — the
+        // returned Arc still has refcount 1, so `get_mut` succeeds. Any
+        // future code path that clones BEFORE installing the provider
+        // would silently fall back to host `Instant::now` (covered by
+        // the assertion below in debug builds).
+        let installed = if let Some(mu) = Arc::get_mut(&mut shared) {
+            mu.now_instant_provider = now_instant_provider;
+            true
+        } else {
+            false
+        };
+        debug_assert!(
+            installed,
+            "with_auth_wall_clock_and_instant must install before cloning"
+        );
+        shared
     }
 
     // PIP-460 (ADR-0031) types mirror the tokio engine's
@@ -683,6 +766,38 @@ impl<P: Providers> MoonpoolEngine<P> {
         &self.providers
     }
 
+    /// Build a [`ConnectionShared`] with the engine's `TimeProvider`
+    /// wired into the monotonic-clock provider so user-facing futures
+    /// (Producer::send, Producer::flush, the moonpool consumer DLQ
+    /// path, …) feed deterministic Instants into the proto state
+    /// machine instead of reading the host `Instant::now`. The
+    /// wall-clock anchor stays at the default
+    /// [`DETERMINISTIC_SIM_EPOCH_MS`] — the driver loop will overwrite
+    /// `wall_clock_ms` from `providers.time().now()` once it starts.
+    /// (ADR-0011 sans-io clock injection.)
+    fn make_shared(&self, config: ConnectionConfig) -> Arc<ConnectionShared> {
+        let time = self.providers.time().clone();
+        // Anchor the moonpool elapsed-Duration to a single host Instant
+        // snapshot. Under TokioProviders this is "now"; under
+        // SimProviders the elapsed Duration is driven by virtual time
+        // and the anchor is irrelevant to determinism (Instants are
+        // only compared for differences). Either way the closure
+        // returns `start + provider.time().now()` so two reads in the
+        // same virtual tick produce the same Instant.
+        let start = Instant::now();
+        let now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
+            start
+                .checked_add(time.now())
+                .unwrap_or_else(|| start + std::time::Duration::from_secs(0))
+        });
+        ConnectionShared::with_auth_wall_clock_and_instant(
+            config,
+            None,
+            current_wall_clock_base_ms(),
+            now_instant_provider,
+        )
+    }
+
     /// Connect to a Pulsar broker over the moonpool [`NetworkProvider`] and
     /// spawn the driver task that runs the protocol forward.
     ///
@@ -732,7 +847,7 @@ impl<P: Providers> MoonpoolEngine<P> {
     ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
         let mut transport =
             Transport::<P>::connect_with_resolver(self.providers.network(), addr, resolver).await?;
-        let shared = ConnectionShared::new(config);
+        let shared = self.make_shared(config);
 
         // Drive the handshake inline. Once `Connected` lands we hand the
         // transport over to the long-running driver task so user-facing
@@ -777,7 +892,7 @@ impl<P: Providers> MoonpoolEngine<P> {
         let mut transport =
             Transport::<P>::connect_tls(self.providers.network(), addr, host, tls_config, resolver)
                 .await?;
-        let shared = ConnectionShared::new(config);
+        let shared = self.make_shared(config);
         handshake_plain::<P>(&shared, &mut transport).await?;
         let driver = driver::spawn::<P>(
             shared.clone(),
@@ -817,7 +932,7 @@ impl<P: Providers> MoonpoolEngine<P> {
             dns_resolver.as_deref(),
         )
         .await?;
-        let shared = ConnectionShared::new(config);
+        let shared = self.make_shared(config);
 
         handshake_plain::<P>(&shared, &mut transport).await?;
         let ctx = driver::ReconnectContext {
@@ -921,20 +1036,18 @@ mod tests {
     }
 
     #[test]
-    fn shared_state_seeds_wall_clock_from_host_by_default() {
-        // `with_auth` (and `new` by extension) captures the host's current
-        // `SystemTime`. The atomic should be initialised to a non-zero
-        // value within a sane window of "now". Without a tighter window
-        // this test would have to construct twice and assert monotonicity,
-        // which is brittle on slow CI — so we settle for "looks like a
-        // 2020+ wall-clock millis-since-epoch".
+    fn shared_state_seeds_wall_clock_deterministically_by_default() {
+        // ADR-0011 — invariant #3. `ConnectionShared::with_auth` (and
+        // `new` by extension) anchors the wall clock at the documented
+        // deterministic epoch by default. The host clock is NOT read
+        // — that would couple every test to wall time and break
+        // bit-for-bit replay across `moonpool-sim` seeds. Callers that
+        // really need a host-clock anchor pin it explicitly via
+        // `with_auth_and_wall_clock_base`.
         let s = ConnectionShared::new(ConnectionConfig::default());
         let observed = s.wall_clock_ms.load(Ordering::Relaxed);
-        // Lower bound = 2020-01-01 (a value the audit-fix branch will only
-        // ever be built well after). Upper bound = year 9999.
-        assert!(observed >= 1_577_836_800_000, "got {observed}");
-        assert!(observed < 253_402_300_799_000, "got {observed}");
-        assert_eq!(s.wall_clock_base_ms, observed);
+        assert_eq!(observed, super::DETERMINISTIC_SIM_EPOCH_MS);
+        assert_eq!(s.wall_clock_base_ms, super::DETERMINISTIC_SIM_EPOCH_MS);
     }
 
     #[test]

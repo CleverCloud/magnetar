@@ -40,7 +40,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::types::CompressionKind;
@@ -240,9 +239,13 @@ impl<P: Providers> Producer<P> {
     ///   rejects the send (e.g. closed producer, unknown handle).
     /// - [`ClientError::Broker`] if the broker subsequently rejects the publish.
     pub fn send(&self, mut msg: OutgoingMessage) -> SendFut {
-        let publish_time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        // ADR-0011 — invariant #3. Read the engine-provided wall clock
+        // (moonpool TimeProvider-driven atomic) instead of the host
+        // SystemTime so deterministic-simulation runs reproduce
+        // bit-for-bit on the `publish_time` field. Mirrors the tokio
+        // engine's snapshot semantics — same callsite, different
+        // backing clock.
+        let publish_time_ms = self.shared.now_wall_clock_ms();
 
         // The moonpool engine does not yet ship a compression codec stack.
         // The state machine still stamps `metadata.compression` based on the
@@ -388,7 +391,12 @@ impl<P: Providers> Producer<P> {
         publish_time_ms: u64,
         reserved_bytes: u64,
     ) -> SendFut {
-        let now = std::time::Instant::now();
+        // ADR-0011 — invariant #3. The proto state machine's monotonic
+        // input flows through the engine-supplied clock provider: under
+        // production TokioProviders it tracks the host clock; under
+        // SimProviders it advances only as the simulator ticks. Mirrors
+        // the tokio engine which captures `Instant::now` directly.
+        let now = self.shared.now_instant();
         let result = self.slot.queue_send(msg, publish_time_ms, now);
 
         // Wake the driver so it can drain the freshly-queued frame.
@@ -433,11 +441,12 @@ impl<P: Providers> Producer<P> {
     /// future drop-detection / disconnect-detection can surface errors
     /// without a breaking change.
     pub async fn flush(&self) -> Result<(), ClientError> {
-        let publish_time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        // ADR-0011 — invariant #3. Both clocks routed through the
+        // engine's providers (host clock under TokioProviders, virtual
+        // clock under SimProviders).
+        let publish_time_ms = self.shared.now_wall_clock_ms();
         {
-            let now = std::time::Instant::now();
+            let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
             conn.flush_producer(self.handle, publish_time_ms, now);
         }
@@ -723,7 +732,11 @@ impl Future for SendFut {
                     }
                     let owned = *msg.take().expect("Reserving polled with no message");
                     let result = {
-                        let now = std::time::Instant::now();
+                        // ADR-0011 — invariant #3. Engine-provided
+                        // monotonic clock so `Reserving → Pending`
+                        // transitions stamp deterministic Instants
+                        // into the proto state machine.
+                        let now = shared.now_instant();
                         let mut conn = shared.inner.lock();
                         conn.send(handle, owned, publish_time_ms, now)
                     };

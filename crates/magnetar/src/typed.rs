@@ -280,20 +280,11 @@ impl<S: Schema> TypedMessageBuilder<'_, S> {
         self
     }
 
-    /// See [`crate::OutgoingMessage::deliver_after_ms`].
+    /// See [`crate::OutgoingMessage::deliver_after_ms`]. The caller
+    /// supplies `now_ms` (sans-io, ADR-0011 invariant #3).
     #[must_use]
-    pub fn deliver_after_ms(mut self, delay_ms: i64) -> Self {
-        self.msg = self.msg.deliver_after_ms(delay_ms);
-        self
-    }
-
-    /// See [`crate::OutgoingMessage::deliver_after_ms_from`]. Engine-agnostic
-    /// alternative to [`Self::deliver_after_ms`] for moonpool-deterministic
-    /// callers — see the `deliver_after_ms` determinism warning on
-    /// [`crate::OutgoingMessage`].
-    #[must_use]
-    pub fn deliver_after_ms_from(mut self, now_ms: i64, delay_ms: i64) -> Self {
-        self.msg = self.msg.deliver_after_ms_from(now_ms, delay_ms);
+    pub fn deliver_after_ms(mut self, now_ms: i64, delay_ms: i64) -> Self {
+        self.msg = self.msg.deliver_after_ms(now_ms, delay_ms);
         self
     }
 

@@ -95,6 +95,20 @@ struct DataKeyState {
     last_refresh: Instant,
 }
 
+/// Pluggable monotonic clock used for data-key TTL tracking. The default
+/// `MessageCrypto::new` / `with_ttl` wire in [`Instant::now`]; tests and the
+/// moonpool engine inject a virtual clock so determinism is preserved
+/// (ADR-0011, sans-io clock injection).
+pub type ClockFn = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Default clock — reads the host's `Instant::now`. Engine-agnostic callers
+/// (production tokio engine) want this; deterministic-simulation callers pass
+/// a virtual clock via [`MessageCrypto::with_ttl_and_clock`].
+#[must_use]
+pub fn host_instant_clock() -> ClockFn {
+    Arc::new(Instant::now)
+}
+
 /// PIP-4 encryption handle. One per producer; reuse across sends.
 pub struct MessageCrypto {
     reader: Arc<dyn CryptoKeyReader>,
@@ -102,6 +116,13 @@ pub struct MessageCrypto {
     state: Mutex<DataKeyState>,
     data_key_ttl: Duration,
     rng: SystemRandom,
+    /// Monotonic-clock provider — read on construction (data-key birth time)
+    /// and on every `encrypt` call (TTL check). Defaults to host
+    /// [`Instant::now`] under [`Self::new`] / [`Self::with_ttl`]; the
+    /// moonpool engine wires a virtual clock via
+    /// [`Self::with_ttl_and_clock`] so the rotation schedule is
+    /// reproducible across sim seeds. See ADR-0011.
+    clock: ClockFn,
 }
 
 impl std::fmt::Debug for MessageCrypto {
@@ -114,7 +135,10 @@ impl std::fmt::Debug for MessageCrypto {
 }
 
 impl MessageCrypto {
-    /// Construct a new encryption handle.
+    /// Construct a new encryption handle. Uses the host's
+    /// [`Instant::now`] for data-key TTL tracking — see
+    /// [`Self::with_ttl_and_clock`] for the deterministic-sim variant
+    /// (ADR-0011 sans-io clock injection).
     pub fn new(
         reader: Arc<dyn CryptoKeyReader>,
         encryption_keys: Vec<String>,
@@ -122,29 +146,51 @@ impl MessageCrypto {
         Self::with_ttl(reader, encryption_keys, DEFAULT_DATA_KEY_TTL)
     }
 
-    /// Construct with a custom TTL (useful in tests).
+    /// Construct with a custom TTL (useful in tests). Uses the host's
+    /// [`Instant::now`] for data-key TTL tracking — see
+    /// [`Self::with_ttl_and_clock`] for the deterministic-sim variant.
     pub fn with_ttl(
         reader: Arc<dyn CryptoKeyReader>,
         encryption_keys: Vec<String>,
         data_key_ttl: Duration,
     ) -> Result<Self, CryptoError> {
+        Self::with_ttl_and_clock(reader, encryption_keys, data_key_ttl, host_instant_clock())
+    }
+
+    /// Construct with a custom TTL and an explicit clock provider. The
+    /// `clock` closure is read at every `encrypt` call to decide whether
+    /// the data key has expired, and once at construction to stamp the
+    /// initial `last_refresh`. The moonpool runtime wires this to its
+    /// virtual `TimeProvider` so PIP-4 data-key rotation is
+    /// bit-for-bit reproducible across sim seeds (ADR-0011 sans-io
+    /// clock injection).
+    pub fn with_ttl_and_clock(
+        reader: Arc<dyn CryptoKeyReader>,
+        encryption_keys: Vec<String>,
+        data_key_ttl: Duration,
+        clock: ClockFn,
+    ) -> Result<Self, CryptoError> {
         if encryption_keys.is_empty() {
             return Err(CryptoError::NoKeys);
         }
         let rng = SystemRandom::new();
-        let state = generate_state(&rng, reader.as_ref(), &encryption_keys)?;
+        let now = (clock)();
+        let state = generate_state(&rng, reader.as_ref(), &encryption_keys, now)?;
         Ok(Self {
             reader,
             encryption_keys,
             state: Mutex::new(state),
             data_key_ttl,
             rng,
+            clock,
         })
     }
 
     /// Force a fresh data key.
     pub fn rotate_data_key(&self) -> Result<(), CryptoError> {
-        let new_state = generate_state(&self.rng, self.reader.as_ref(), &self.encryption_keys)?;
+        let now = (self.clock)();
+        let new_state =
+            generate_state(&self.rng, self.reader.as_ref(), &self.encryption_keys, now)?;
         *self.state.lock() = new_state;
         Ok(())
     }
@@ -250,9 +296,10 @@ impl MessageCrypto {
     }
 
     fn maybe_rotate(&self) -> Result<(), CryptoError> {
+        let now = (self.clock)();
         let needs = {
             let s = self.state.lock();
-            s.last_refresh.elapsed() >= self.data_key_ttl
+            now.saturating_duration_since(s.last_refresh) >= self.data_key_ttl
         };
         if needs {
             self.rotate_data_key()?;
@@ -265,6 +312,7 @@ fn generate_state(
     rng: &SystemRandom,
     reader: &dyn CryptoKeyReader,
     encryption_keys: &[String],
+    now: Instant,
 ) -> Result<DataKeyState, CryptoError> {
     let mut data_key = [0u8; 32];
     rng.fill(&mut data_key)
@@ -289,7 +337,7 @@ fn generate_state(
     Ok(DataKeyState {
         data_key,
         wrapped,
-        last_refresh: Instant::now(),
+        last_refresh: now,
     })
 }
 
@@ -459,5 +507,52 @@ mod tests {
         md.encryption_param = Some(vec![1, 2, 3].into());
         let err = crypto.decrypt(&ct, &md).expect_err("nonce length");
         assert!(matches!(err, CryptoError::MalformedNonce));
+    }
+
+    // ADR-0011 — invariant #3 sans-io clock injection. The PIP-4 data-key
+    // TTL was previously stamped from `Instant::now()`; the encryptor now
+    // accepts an injected clock so deterministic-simulation callers can
+    // pin a virtual time and observe rotation deterministically.
+    #[test]
+    fn clock_injection_drives_data_key_rotation() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        let r = make_reader_with_alice();
+        // Anchor a virtual "now" we can advance under test control. Note
+        // that the underlying `Instant` is opaque so we cannot fabricate
+        // arbitrary values; we anchor on a single real `Instant` and step
+        // forward via `+ Duration`.
+        let anchor = Instant::now();
+        let cell = Arc::new(Mutex::new(anchor));
+        let cell_for_clock = cell.clone();
+        let clock: super::ClockFn = Arc::new(move || *cell_for_clock.lock().unwrap());
+
+        let crypto = MessageCrypto::with_ttl_and_clock(
+            r,
+            vec!["alice".into()],
+            Duration::from_secs(60),
+            clock,
+        )
+        .expect("crypto");
+
+        let mut md = pb::MessageMetadata::default();
+        let _ct = crypto.encrypt(b"hello", &mut md).expect("encrypt");
+        let first_key = crypto.state.lock().wrapped[0].1.clone();
+
+        // Step within TTL — must NOT rotate.
+        *cell.lock().unwrap() = anchor + Duration::from_secs(30);
+        let _ = crypto.encrypt(b"hello", &mut md).expect("encrypt");
+        let still_first = crypto.state.lock().wrapped[0].1.clone();
+        assert_eq!(first_key, still_first, "should not rotate within TTL");
+
+        // Step past TTL — must rotate.
+        *cell.lock().unwrap() = anchor + Duration::from_secs(120);
+        let _ = crypto.encrypt(b"hello", &mut md).expect("encrypt");
+        let after_rotate = crypto.state.lock().wrapped[0].1.clone();
+        assert_ne!(
+            first_key, after_rotate,
+            "should rotate once virtual clock crosses TTL"
+        );
     }
 }

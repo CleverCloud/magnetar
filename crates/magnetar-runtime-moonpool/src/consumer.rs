@@ -441,10 +441,10 @@ impl<P: Providers> Consumer<P> {
             value: msg.message_id.to_string(),
         });
         // Set deliver_at_time so the broker queues the message for
-        // `delay` past now.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0i64, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        // `delay` past now. ADR-0011 — invariant #3: read the engine
+        // wall clock (moonpool-virtualised under SimProviders, host
+        // clock under TokioProviders) instead of `SystemTime::now`.
+        let now_ms = i64::try_from(self.shared.now_wall_clock_ms()).unwrap_or(i64::MAX);
         let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
         metadata.deliver_at_time = Some(now_ms.saturating_add(delay_ms));
         let payload_len = msg.payload.len();
