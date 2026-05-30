@@ -14,7 +14,12 @@ use bytes::Bytes;
 use magnetar_proto::{AuthError, AuthProvider};
 
 /// SASL `PLAIN` (RFC 4616) credentials.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually to redact the password (CWE-532) — a
+/// derived `Debug` would print the cleartext password whenever an
+/// `AuthProvider: Debug` is rendered into a tracing span, panic dump, or
+/// support bundle.
+#[derive(Clone)]
 pub struct SaslPlain {
     username: String,
     password: String,
@@ -22,6 +27,16 @@ pub struct SaslPlain {
     /// bytes. Defaults to `false` for safety — every constructor takes
     /// an explicit decision.
     transport_ok: bool,
+}
+
+impl std::fmt::Debug for SaslPlain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaslPlain")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("transport_ok", &self.transport_ok)
+            .finish()
+    }
 }
 
 impl SaslPlain {
@@ -133,5 +148,26 @@ mod tests {
         let p = SaslPlain::allow_plaintext("alice", "s3cret");
         let bytes = p.initial().expect("initial");
         assert_eq!(bytes.as_ref(), b"\0alice\0s3cret".as_slice());
+    }
+
+    /// CWE-532 regression: a derived `Debug` would print the cleartext
+    /// password. The manual impl must redact it.
+    #[test]
+    fn debug_redacts_password() {
+        let p = SaslPlain::over_tls("alice", "hunter2");
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "password leaked through Debug: {rendered}",
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug should mark redaction explicitly: {rendered}",
+        );
+        // username is non-sensitive identifier — keep visible for triage.
+        assert!(
+            rendered.contains("alice"),
+            "username should remain: {rendered}"
+        );
     }
 }

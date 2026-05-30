@@ -19,10 +19,26 @@ use bytes::Bytes;
 use super::{AuthError, AuthProvider};
 
 /// mTLS auth provider carrying PEM-encoded cert and key material.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually to redact `private_key_pem` (CWE-532).
+/// A derived `Debug` would print the PEM key body whenever an
+/// `AuthProvider: Debug` is rendered into a tracing span, panic dump,
+/// or support bundle — enabling full client impersonation from a leaked
+/// log line. The cert chain length is shown as a coarse identifier;
+/// callers needing a stable fingerprint should hash the cert themselves.
+#[derive(Clone)]
 pub struct TlsAuth {
     cert_chain_pem: Bytes,
     private_key_pem: Bytes,
+}
+
+impl std::fmt::Debug for TlsAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsAuth")
+            .field("cert_chain_pem_len", &self.cert_chain_pem.len())
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TlsAuth {
@@ -108,5 +124,32 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cert file"), "msg={msg}");
+    }
+
+    /// CWE-532 regression: a derived `Debug` would print the PEM private
+    /// key body (enabling full client impersonation from a leaked log
+    /// line). The manual impl must redact it.
+    #[test]
+    fn debug_redacts_private_key() {
+        let cert = Bytes::from_static(
+            b"-----BEGIN CERTIFICATE-----\npublic-cert-bytes\n-----END CERTIFICATE-----\n",
+        );
+        let key = Bytes::from_static(
+            b"-----BEGIN PRIVATE KEY-----\nSECRET-KEY-MATERIAL-1234\n-----END PRIVATE KEY-----\n",
+        );
+        let p = TlsAuth::from_pem_bytes(cert, key);
+        let rendered = format!("{p:?}");
+        assert!(
+            !rendered.contains("SECRET-KEY-MATERIAL"),
+            "private key leaked through Debug: {rendered}",
+        );
+        assert!(
+            !rendered.contains("BEGIN PRIVATE KEY"),
+            "PEM header for key leaked through Debug: {rendered}",
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug should mark redaction explicitly: {rendered}",
+        );
     }
 }
