@@ -47,8 +47,9 @@ use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
-    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, DispatchRate,
-    PersistencePolicies, PublishRate, RetentionPolicies, TenantInfo,
+    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
+    DispatchRate, PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
+    TenantInfo,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -205,6 +206,16 @@ pub(crate) enum AdminCmd {
         #[command(subcommand)]
         sub: BrokersCmd,
     },
+    /// Bookie metadata + rack-aware placement (`/admin/v2/bookies/...`).
+    Bookies {
+        #[command(subcommand)]
+        sub: BookiesCmd,
+    },
+    /// Schema-registry operations (`/admin/v2/schemas/...`).
+    Schemas {
+        #[command(subcommand)]
+        sub: SchemasCmd,
+    },
 }
 
 /// `admin clusters <verb>`.
@@ -246,6 +257,148 @@ pub(crate) enum BrokersCmd {
     /// Get the current cluster-level leader broker.
     /// `GET /admin/v2/brokers/leaderBroker`.
     Leader,
+    /// List the names of every dynamic broker configuration key.
+    /// `GET /admin/v2/brokers/configuration`.
+    DynamicConfigKeys,
+    /// Get every dynamic-config override the operator has set
+    /// (static / default values stay out of the map).
+    /// `GET /admin/v2/brokers/configuration/values`.
+    DynamicConfigOverrides,
+    /// Get the broker's runtime (static + dynamic) configuration.
+    /// `GET /admin/v2/brokers/configuration/runtime`.
+    RuntimeConfig,
+    /// Get the broker's internal-stack endpoints (metadata-store
+    /// URLs, BookKeeper service URI, ledger root paths).
+    /// `GET /admin/v2/brokers/internal-configuration`.
+    InternalConfig,
+    /// Probe broker health — produces and consumes one heartbeat on
+    /// an internal topic. Prints the broker's `"ok"` body on success.
+    /// `GET /admin/v2/brokers/health`.
+    HealthCheck,
+    /// List the namespaces a specific broker currently owns.
+    /// `GET /admin/v2/brokers/{cluster}/{broker}/ownedNamespaces`.
+    OwnedNamespaces {
+        /// Cluster name.
+        cluster: String,
+        /// Broker `host:port` (matches `brokers list` output).
+        broker: String,
+    },
+    /// Override a dynamic configuration value.
+    /// `POST /admin/v2/brokers/configuration/{name}/{value}`.
+    SetDynamicConfig {
+        /// Configuration key name.
+        name: String,
+        /// New value (sent in the URL path).
+        value: String,
+    },
+    /// Drop a dynamic configuration override and revert to the
+    /// static / default value.
+    /// `DELETE /admin/v2/brokers/configuration/{name}`.
+    DeleteDynamicConfig {
+        /// Configuration key name.
+        name: String,
+    },
+}
+
+/// `admin bookies <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum BookiesCmd {
+    /// List every bookie the broker knows about (writable +
+    /// read-only) as registered in BookKeeper metadata.
+    /// `GET /admin/v2/bookies/all`.
+    List,
+    /// Get every bookie's group + rack assignment.
+    /// `GET /admin/v2/bookies/racks-info`.
+    RacksInfo,
+    /// Set (or update) a bookie's rack assignment.
+    /// `POST /admin/v2/bookies/racks-info/{bookie}`.
+    SetRack {
+        /// Bookie `host:port` (matches BookKeeper metadata).
+        bookie: String,
+        /// Placement group.
+        #[arg(long, default_value = "default")]
+        group: String,
+        /// Rack identifier within the group.
+        #[arg(long)]
+        rack: String,
+        /// Resolved hostname for the bookie. The broker uses it for
+        /// log lines; defaults to the bookie address if unset.
+        #[arg(long)]
+        hostname: Option<String>,
+    },
+    /// Remove a bookie's rack assignment.
+    /// `DELETE /admin/v2/bookies/racks-info/{bookie}`.
+    DeleteRack {
+        /// Bookie `host:port`.
+        bookie: String,
+    },
+}
+
+/// `admin schemas <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum SchemasCmd {
+    /// Get the latest schema attached to a topic.
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema`.
+    GetLatest {
+        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
+        topic: String,
+    },
+    /// Get a specific schema version.
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema/{version}`.
+    GetVersion {
+        /// Fully qualified topic.
+        topic: String,
+        /// Schema version (broker-assigned integer).
+        #[arg(long)]
+        version: i64,
+    },
+    /// List every registered schema version.
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schemas`.
+    ListVersions {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Register a new schema version.
+    /// `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/schema`.
+    Post {
+        /// Fully qualified topic.
+        topic: String,
+        /// Schema type (`AVRO` / `JSON` / `PROTOBUF` /
+        /// `PROTOBUF_NATIVE` / `KEY_VALUE` / `STRING` / `BYTES` / ...).
+        #[arg(long = "type")]
+        schema_type: String,
+        /// Schema definition (canonical-form blob).
+        #[arg(long)]
+        schema: String,
+        /// User-defined property in `key=value` form. Repeatable.
+        #[arg(long = "property", value_parser = parse_property)]
+        properties: Vec<(String, String)>,
+    },
+    /// Delete a topic's schema.
+    /// `DELETE /admin/v2/schemas/{tenant}/{ns}/{topic}/schema?force={force}`.
+    Delete {
+        /// Fully qualified topic.
+        topic: String,
+        /// Skip the "is the schema in use" guard.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check whether a candidate schema is compatible with the
+    /// topic's current schema.
+    /// `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/compatibility`.
+    Compatibility {
+        /// Fully qualified topic.
+        topic: String,
+        /// Schema type.
+        #[arg(long = "type")]
+        schema_type: String,
+        /// Schema definition (canonical-form blob).
+        #[arg(long)]
+        schema: String,
+        /// User-defined property in `key=value` form. Repeatable.
+        #[arg(long = "property", value_parser = parse_property)]
+        properties: Vec<(String, String)>,
+    },
 }
 
 /// `admin tenants <verb>`.
@@ -882,6 +1035,8 @@ async fn run_admin(
         AdminCmd::Topics { sub } => run_admin_topics(&admin, sub).await,
         AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
         AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
+        AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
+        AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
     }
 }
 
@@ -978,6 +1133,103 @@ async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), C
     match cmd {
         BrokersCmd::List { cluster } => print_json(&admin.brokers_list(&cluster).await?),
         BrokersCmd::Leader => print_json(&admin.brokers_leader().await?),
+        BrokersCmd::DynamicConfigKeys => print_json(&admin.brokers_dynamic_config_keys().await?),
+        BrokersCmd::DynamicConfigOverrides => {
+            print_json(&admin.brokers_dynamic_config_overrides().await?)
+        }
+        BrokersCmd::RuntimeConfig => print_json(&admin.brokers_runtime_config().await?),
+        BrokersCmd::InternalConfig => print_json(&admin.brokers_internal_config().await?),
+        BrokersCmd::HealthCheck => {
+            // The `/health` endpoint returns plain text (`"ok"`), not
+            // JSON — print it verbatim rather than re-wrapping in a
+            // JSON string for a script-friendly exit.
+            let body = admin.brokers_health_check().await?;
+            println!("{body}");
+            Ok(())
+        }
+        BrokersCmd::OwnedNamespaces { cluster, broker } => {
+            print_json(&admin.brokers_owned_namespaces(&cluster, &broker).await?)
+        }
+        BrokersCmd::SetDynamicConfig { name, value } => {
+            admin.brokers_set_dynamic_config(&name, &value).await?;
+            Ok(())
+        }
+        BrokersCmd::DeleteDynamicConfig { name } => {
+            admin.brokers_delete_dynamic_config(&name).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_admin_bookies(admin: &AdminClient, cmd: BookiesCmd) -> Result<(), CliError> {
+    match cmd {
+        BookiesCmd::List => print_json(&admin.bookies_list_all().await?),
+        BookiesCmd::RacksInfo => print_json(&admin.bookies_racks_info().await?),
+        BookiesCmd::SetRack {
+            bookie,
+            group,
+            rack,
+            hostname,
+        } => {
+            let hostname = hostname.unwrap_or_else(|| bookie.clone());
+            admin
+                .bookies_set_rack(
+                    &bookie,
+                    BookieInfo {
+                        group,
+                        rack,
+                        hostname,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        BookiesCmd::DeleteRack { bookie } => {
+            admin.bookies_delete_rack(&bookie).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_admin_schemas(admin: &AdminClient, cmd: SchemasCmd) -> Result<(), CliError> {
+    match cmd {
+        SchemasCmd::GetLatest { topic } => print_json(&admin.schema_get_latest(&topic).await?),
+        SchemasCmd::GetVersion { topic, version } => {
+            print_json(&admin.schema_get_version(&topic, version).await?)
+        }
+        SchemasCmd::ListVersions { topic } => {
+            print_json(&admin.schema_list_versions(&topic).await?)
+        }
+        SchemasCmd::Post {
+            topic,
+            schema_type,
+            schema,
+            properties,
+        } => {
+            let payload = PostSchemaPayload {
+                schema_type,
+                schema,
+                properties: properties.into_iter().collect(),
+            };
+            print_json(&admin.schema_post(&topic, payload).await?)
+        }
+        SchemasCmd::Delete { topic, force } => {
+            admin.schema_delete(&topic, force).await?;
+            Ok(())
+        }
+        SchemasCmd::Compatibility {
+            topic,
+            schema_type,
+            schema,
+            properties,
+        } => {
+            let payload = PostSchemaPayload {
+                schema_type,
+                schema,
+                properties: properties.into_iter().collect(),
+            };
+            print_json(&admin.schema_compatibility_check(&topic, payload).await?)
+        }
     }
 }
 
