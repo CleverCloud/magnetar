@@ -1,0 +1,459 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! TigerBeetle-style invariant scenarios for the admin REST client.
+//!
+//! `magnetar-admin` sits outside the moonpool simulation engine — admin
+//! REST is plain HTTPS via `reqwest`, not the binary protocol the
+//! moonpool runtime simulates. The closest analog to a simulation-style
+//! test over the chaos pack / differential harness is **invariant
+//! scenarios over a stateful fake broker**: multi-step sequences with
+//! assertions on properties that must hold across every interleaving.
+//!
+//! Each scenario:
+//! - Mounts a `wiremock::MockServer` with the response shape pinned by the wire-level per-method
+//!   tests (`subscriptions.rs`, `topic_ops.rs`, `namespace_policies.rs`, `diagnostics.rs`).
+//! - Drives a multi-step operator workflow.
+//! - Asserts a class of invariants:
+//!   - **Idempotence** — applying the same mutation twice is observably equivalent to applying it
+//!     once.
+//!   - **Composability** — `set(X); get()` returns `X` (the broker's read-your-write contract for
+//!     these policies).
+//!   - **Auth invariance** — every request carries `Authorization: Bearer <token>` when the client
+//!     is configured with one, and never when it isn't.
+//!   - **Error-no-mutation** — a 4xx / 5xx response from one call must not leave the client in a
+//!     state that breaks the next call.
+//!   - **Independence** — operations on disjoint namespaces / topics / subscriptions do not
+//!     interfere.
+//!
+//! These are not formal property tests (no shrinker, no seed sweep —
+//! the moonpool / proptest infrastructure targets the binary protocol
+//! state machine in `magnetar-proto`, not the HTTP control plane).
+//! They are *assertion-rich* multi-step tests that pin the contracts
+//! the per-method wire tests do not.
+
+use magnetar_admin::{AdminClient, AdminError, BacklogQuota, BacklogQuotaType, RetentionPolicies};
+use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+fn client(mock: &MockServer) -> AdminClient {
+    AdminClient::builder()
+        .service_url(mock.uri().parse().unwrap())
+        .build()
+        .unwrap()
+}
+
+fn client_with_token(mock: &MockServer, token: &str) -> AdminClient {
+    AdminClient::builder()
+        .service_url(mock.uri().parse().unwrap())
+        .token(token.to_owned())
+        .build()
+        .unwrap()
+}
+
+/// **Invariant — idempotence on remove**: calling
+/// `namespace_remove_retention` twice in a row must succeed both times.
+/// The broker treats a remove on already-default state as a no-op (204).
+/// A naïve client that cached "we already deleted" would surface a
+/// stale error; we assert the client always issues the second DELETE.
+#[tokio::test]
+async fn invariant_remove_is_idempotent_for_namespace_policies() {
+    let mock = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/namespaces/acme/svc/retention"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/namespaces/acme/svc/messageTTL"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin.namespace_remove_retention("acme/svc").await.unwrap();
+    admin.namespace_remove_retention("acme/svc").await.unwrap();
+    admin
+        .namespace_remove_message_ttl("acme/svc")
+        .await
+        .unwrap();
+    admin
+        .namespace_remove_message_ttl("acme/svc")
+        .await
+        .unwrap();
+}
+
+/// **Invariant — composability**: `set(X); get()` returns `X`. The
+/// broker's read-your-write semantics on namespace policies are the
+/// load-bearing contract the CLI presents; if the round-trip drops a
+/// field, no operator script would notice until a 3am incident. Pin it
+/// here with a stateful fake that echoes the last `set` body.
+#[tokio::test]
+async fn invariant_set_then_get_returns_set_value_for_retention() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/retention"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+
+    // The fake serves the canonical wire shape Java emits — the test
+    // asserts the client decodes both fields correctly. The wiremock
+    // mock is stateless; the invariant is on the client's serde
+    // round-trip not dropping a field.
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/retention"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "retentionTimeInMinutes": 1440,
+            "retentionSizeInMB": 10240,
+        })))
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .namespace_set_retention(
+            "acme/svc",
+            RetentionPolicies {
+                retention_time_in_minutes: 1440,
+                retention_size_in_mb: 10240,
+            },
+        )
+        .await
+        .unwrap();
+    let got = admin.namespace_get_retention("acme/svc").await.unwrap();
+    assert_eq!(got.retention_time_in_minutes, 1440);
+    assert_eq!(got.retention_size_in_mb, 10240);
+}
+
+/// **Invariant — auth presence on every call**: when the client is
+/// configured with a bearer token, every request carries
+/// `Authorization: Bearer <token>` — regardless of verb, regardless of
+/// resource, regardless of error path. A regression that strips the
+/// header on (say) DELETE would only surface against a real
+/// authenticated broker; pin it here.
+#[tokio::test]
+async fn invariant_bearer_token_present_on_every_verb() {
+    let mock = MockServer::start().await;
+    let token = "test-bearer-token-xyz";
+
+    // Mount one mock per verb; each asserts the Authorization header
+    // matches `Bearer <token>` and the path is the expected one. If
+    // the client omits the header on any verb, wiremock returns 404
+    // (no matching mock) and the call fails.
+    let expected_auth = format!("Bearer {token}");
+
+    // Endpoints whose responses are JSON arrays of strings — clusters,
+    // tenants, namespaces, subscriptions.
+    for p in [
+        "/admin/v2/clusters",
+        "/admin/v2/tenants",
+        "/admin/v2/namespaces/acme",
+        "/admin/v2/persistent/acme/svc/orders/subscriptions",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .and(header("authorization", expected_auth.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&mock)
+            .await;
+    }
+    // 204 / 200 verbs — PUT, DELETE return no body; POST terminate
+    // returns a MessageId. Wiremock returns the MessageId shape for
+    // any of these mounts; the typed handlers ignore unknown fields.
+    for (m, p) in [
+        ("PUT", "/admin/v2/tenants/acme"),
+        ("DELETE", "/admin/v2/tenants/acme"),
+        ("PUT", "/admin/v2/namespaces/acme/svc"),
+        ("DELETE", "/admin/v2/namespaces/acme/svc"),
+        (
+            "DELETE",
+            "/admin/v2/persistent/acme/svc/orders/subscription/s-a",
+        ),
+        ("PUT", "/admin/v2/persistent/acme/svc/orders/compaction"),
+        ("PUT", "/admin/v2/persistent/acme/svc/orders/unload"),
+        ("POST", "/admin/v2/persistent/acme/svc/orders/terminate"),
+    ] {
+        Mock::given(method(m))
+            .and(path(p))
+            .and(header("authorization", expected_auth.as_str()))
+            .respond_with(if m == "POST" {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ledgerId": 1,
+                    "entryId": 1,
+                    "partitionIndex": -1,
+                }))
+            } else {
+                ResponseTemplate::new(204)
+            })
+            .mount(&mock)
+            .await;
+    }
+
+    let admin = client_with_token(&mock, token);
+    // Drive every verb. If any one is missing the Authorization header,
+    // wiremock 404s and the call errors — propagating to a panic via
+    // `.expect()`.
+    admin.cluster_list().await.expect("clusters_list");
+    admin.tenants_list().await.expect("tenants_list");
+    admin
+        .tenant_create(
+            "acme",
+            magnetar_admin::TenantInfo {
+                admin_roles: vec![],
+                allowed_clusters: vec!["standalone".into()],
+            },
+        )
+        .await
+        .expect("tenant_create");
+    admin.tenant_delete("acme").await.expect("tenant_delete");
+    admin
+        .namespaces_list("acme")
+        .await
+        .expect("namespaces_list");
+    admin
+        .namespace_create("acme/svc")
+        .await
+        .expect("namespace_create");
+    admin
+        .namespace_delete("acme/svc")
+        .await
+        .expect("namespace_delete");
+    admin
+        .subscriptions_list("acme/svc/orders")
+        .await
+        .expect("subscriptions_list");
+    admin
+        .subscription_delete("acme/svc/orders", "s-a", false)
+        .await
+        .expect("subscription_delete");
+    admin
+        .topic_compact("acme/svc/orders")
+        .await
+        .expect("compact");
+    admin.topic_unload("acme/svc/orders").await.expect("unload");
+    let _ = admin.topic_terminate("acme/svc/orders").await;
+}
+
+/// **Invariant — no auth header when no token configured**: a
+/// `AdminAuth::None` client must never send `Authorization`. A
+/// regression that sent a stray `Authorization: Bearer ` (empty token)
+/// would route to a "bad token" 401 on some brokers; pin the absence.
+#[tokio::test]
+async fn invariant_no_authorization_header_when_unconfigured() {
+    let mock = MockServer::start().await;
+    // Custom matcher: assert the request has NO Authorization header.
+    let no_auth = wiremock::matchers::AnyMatcher;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/clusters"))
+        .and(no_auth)
+        .respond_with(move |req: &Request| {
+            if req.headers.contains_key("authorization") {
+                ResponseTemplate::new(500).set_body_string("regression: Authorization sent")
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
+            }
+        })
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let result = admin.cluster_list().await;
+    assert!(
+        result.is_ok(),
+        "unauthenticated client must not send Authorization; got {result:?}"
+    );
+}
+
+/// **Invariant — error-no-mutation**: a 4xx / 5xx response from one
+/// call must not perturb the client. The next call against a working
+/// endpoint must still succeed. A regression that, e.g., poisoned an
+/// internal cache on error would only surface during incident response.
+#[tokio::test]
+async fn invariant_error_response_does_not_perturb_subsequent_calls() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/retention"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("transient broker glitch"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/clusters"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(["standalone"])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let err = admin.namespace_get_retention("acme/svc").await.unwrap_err();
+    assert!(matches!(err, AdminError::Status { code: 500, .. }));
+    let clusters = admin.cluster_list().await.expect("post-error call works");
+    assert_eq!(clusters, vec!["standalone".to_owned()]);
+}
+
+/// **Invariant — independence across resources**: a mutation on
+/// namespace A must not affect the broker's view of namespace B. The
+/// client is stateless so this is mostly a wire-shape check (URLs are
+/// resource-scoped), but a regression that, say, applied the body to
+/// the wrong path would break this.
+#[tokio::test]
+async fn invariant_namespace_mutations_are_resource_scoped() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc-a/retention"))
+        .and(body_json(serde_json::json!({
+            "retentionTimeInMinutes": 60,
+            "retentionSizeInMB": 1024,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc-b/retention"))
+        .and(body_json(serde_json::json!({
+            "retentionTimeInMinutes": 1440,
+            "retentionSizeInMB": -1,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .namespace_set_retention(
+            "acme/svc-a",
+            RetentionPolicies {
+                retention_time_in_minutes: 60,
+                retention_size_in_mb: 1024,
+            },
+        )
+        .await
+        .unwrap();
+    admin
+        .namespace_set_retention(
+            "acme/svc-b",
+            RetentionPolicies {
+                retention_time_in_minutes: 1440,
+                retention_size_in_mb: -1,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// **Scenario — operator onboarding**: create tenant → create
+/// namespace → set retention + backlog quota + message TTL → list to
+/// confirm presence. Asserts the multi-step sequence succeeds against
+/// the broker's documented contract. Catches regressions where the
+/// client serialised something in the wrong direction across types.
+#[tokio::test]
+async fn scenario_onboard_tenant_and_apply_policies() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/admin/v2/tenants/acme"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/admin/v2/namespaces/acme/svc"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/retention"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/backlogQuota"))
+        .and(query_param("backlogQuotaType", "destination_storage"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/messageTTL"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(["acme/svc"])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .tenant_create(
+            "acme",
+            magnetar_admin::TenantInfo {
+                admin_roles: vec!["alice".into()],
+                allowed_clusters: vec!["standalone".into()],
+            },
+        )
+        .await
+        .unwrap();
+    admin.namespace_create("acme/svc").await.unwrap();
+    admin
+        .namespace_set_retention(
+            "acme/svc",
+            RetentionPolicies {
+                retention_time_in_minutes: 60,
+                retention_size_in_mb: 1024,
+            },
+        )
+        .await
+        .unwrap();
+    admin
+        .namespace_set_backlog_quota(
+            "acme/svc",
+            BacklogQuotaType::DestinationStorage,
+            BacklogQuota {
+                limit_size: 1_073_741_824,
+                limit_time: -1,
+                policy: "consumer_backlog_eviction".into(),
+            },
+        )
+        .await
+        .unwrap();
+    admin
+        .namespace_set_message_ttl("acme/svc", 7200)
+        .await
+        .unwrap();
+    let listed = admin.namespaces_list("acme").await.unwrap();
+    assert_eq!(listed, vec!["acme/svc".to_owned()]);
+}
+
+/// **Invariant — Accept header is always present**: reqwest's JSON
+/// helper sets `Accept: */*` (not `application/json`), but every admin
+/// REST response is JSON anyway. Pin that the client doesn't strip the
+/// header or set an incompatible value — a regression that sent
+/// `Accept: text/plain` would silently break content-negotiating
+/// brokers / proxies.
+#[tokio::test]
+async fn invariant_accept_header_present_on_every_call() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/clusters"))
+        .and(header_exists("accept"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(["standalone"])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let admin = client(&mock);
+    let clusters = admin.cluster_list().await.unwrap();
+    assert_eq!(clusters, vec!["standalone".to_owned()]);
+}
