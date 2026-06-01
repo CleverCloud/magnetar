@@ -32,7 +32,7 @@ workspace = true
 crypto-aws-lc-rs = ["rustls/aws_lc_rs", "dep:aws-lc-rs", "dep:zeroize", "dep:base64", "dep:rustls-pki-types"]
 crypto-ring      = ["rustls/ring",      "dep:ring",      "dep:zeroize", "dep:base64", "dep:rustls-pki-types"]
 crypto-fips      = ["rustls/fips"]
-crypto-openssl   = []
+crypto-openssl   = ["dep:rustls-openssl"]
 # ZTS round-trip — opt-in HTTP exchange behind the pluggable
 # `zts::ZtsClient` trait. Off by default; callers without `zts` keep the
 # lightweight `with_role_token` path (the caller hands an already-minted
@@ -52,6 +52,7 @@ thiserror        = { workspace = true }
 tracing          = { workspace = true }
 async-trait      = { workspace = true, optional = true }
 reqwest          = { workspace = true, optional = true }
+rustls-openssl   = { workspace = true, optional = true }
 url              = { workspace = true, optional = true }
 # Concrete `JwtSigner` backends (ADR-0030 + ADR-0035). At most one is
 # active per build; under `--all-features` the cfg cascade in

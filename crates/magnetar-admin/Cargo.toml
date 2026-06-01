@@ -17,15 +17,20 @@ workspace = true
 
 [features]
 # Pluggable rustls crypto provider (issue #9, ADR-0035). reqwest 0.13's
-# `rustls` (renamed from `rustls-tls`) resolves to aws-lc-rs internally;
+# `rustls` (renamed from `rustls-tls`) ships a built-in aws-lc-rs provider;
 # `rustls-no-provider` (renamed from `rustls-tls-no-provider`) trusts the
-# caller to `install_default()` whichever provider is in use (the tokio
-# engine boot does that idempotently via the
-# `magnetar_runtime_tokio::tls_crypto::install_default_provider()` shim).
-crypto-aws-lc-rs = ["reqwest/rustls"]
-crypto-ring      = ["reqwest/rustls-no-provider"]
-crypto-openssl   = ["reqwest/rustls-no-provider"]
-crypto-fips      = ["reqwest/rustls-no-provider"]
+# caller to `install_default()` whichever provider is in use. When more
+# than one `crypto-*` feature is enabled (e.g. default `crypto-aws-lc-rs`
+# alongside an explicit `crypto-ring`), cargo's feature union resolves
+# reqwest to the `rustls-no-provider` flavor, so `AdminClientBuilder::build`
+# always calls `tls_crypto::install_default_provider` itself. The cfg
+# cascade in `src/tls_crypto.rs` mirrors `magnetar-runtime-tokio` (aws-lc-rs
+# wins, then FIPS, then openssl, then ring) so admin standalone matches the
+# façade's provider choice without depending on the tokio runtime crate.
+crypto-aws-lc-rs = ["reqwest/rustls", "rustls/aws_lc_rs"]
+crypto-ring      = ["reqwest/rustls-no-provider", "rustls/ring"]
+crypto-openssl   = ["reqwest/rustls-no-provider", "dep:rustls-openssl"]
+crypto-fips      = ["reqwest/rustls-no-provider", "rustls/fips"]
 # PIP-460 scalable topics (ADR-0031). Keeps admin's `MessageId` construction
 # in sync with the proto-layer `segment_id` field gate. Default OFF.
 scalable-topics  = ["magnetar-proto/scalable-topics"]
@@ -33,6 +38,8 @@ scalable-topics  = ["magnetar-proto/scalable-topics"]
 [dependencies]
 magnetar-proto = { workspace = true }
 reqwest        = { workspace = true }
+rustls         = { workspace = true }
+rustls-openssl = { workspace = true, optional = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 url            = { workspace = true }

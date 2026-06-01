@@ -36,15 +36,18 @@ use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
     long_about = None,
 )]
 pub(crate) struct Cli {
-    /// Increase logging verbosity (-v, -vv, -vvv).
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    /// Increase logging verbosity (-v, -vv, -vvv). Accepted at any level
+    /// (`magnetar admin -vv tenant-list` is the same as
+    /// `magnetar -vv admin tenant-list`).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub(crate) verbose: u8,
 
     /// Pulsar service URL for data-plane (`pulsar://` / `pulsar+ssl://`).
     #[arg(
         long,
         env = "MAGNETAR_SERVICE_URL",
-        default_value = "pulsar://localhost:6650"
+        default_value = "pulsar://localhost:6650",
+        global = true
     )]
     pub(crate) service_url: String,
 
@@ -52,16 +55,22 @@ pub(crate) struct Cli {
     #[arg(
         long,
         env = "MAGNETAR_ADMIN_URL",
-        default_value = "http://localhost:8080"
+        default_value = "http://localhost:8080",
+        global = true
     )]
     pub(crate) admin_url: String,
 
     /// Bearer token for admin auth. Reads from `MAGNETAR_TOKEN` if unset.
-    #[arg(long, env = "MAGNETAR_TOKEN")]
+    #[arg(long, env = "MAGNETAR_TOKEN", global = true)]
     pub(crate) token: Option<String>,
 
     /// Admin request timeout in seconds.
-    #[arg(long, env = "MAGNETAR_ADMIN_TIMEOUT_SECS", default_value_t = 60)]
+    #[arg(
+        long,
+        env = "MAGNETAR_ADMIN_TIMEOUT_SECS",
+        default_value_t = 60,
+        global = true
+    )]
     pub(crate) admin_timeout_secs: u64,
 
     #[command(subcommand)]
@@ -234,7 +243,11 @@ pub(crate) enum AdminCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Get topic stats.
+    /// Get topic stats. Auto-detects partitioned topics: a single
+    /// `GET .../partitions` probe routes the request to `partitioned-stats`
+    /// when the topic has `partitions > 0`, otherwise to plain `stats`. The
+    /// aggregated counters surface either way; for per-partition detail call
+    /// `topic-stats` against each `<topic>-partition-N`.
     TopicStats {
         /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
         topic: String,
@@ -446,11 +459,21 @@ async fn run_admin(
             Ok(())
         }
         AdminCmd::TopicStats { topic } => {
-            let stats = admin.topic_stats(&topic).await?;
+            // The broker has two endpoints — `stats` for non-partitioned topics
+            // and `partitioned-stats` for the partitioned parent name. Probe
+            // the partition count first and dispatch; a non-partitioned topic
+            // returns `partitions: 0` here.
+            let partitions = admin.topic_partitions_count(&topic).await?;
+            let stats = if partitions > 0 {
+                admin.topic_partitioned_stats(&topic).await?
+            } else {
+                admin.topic_stats(&topic).await?
+            };
             // `TopicStats` derives `Deserialize` but not `Serialize` (it is
             // permissive); re-emit it via a manual JSON object so the CLI
             // output is human-friendly.
             let json = serde_json::json!({
+                "partitions": partitions,
                 "msgInCounter": stats.msg_in_counter,
                 "bytesInCounter": stats.bytes_in_counter,
                 "publishers": stats.publishers,

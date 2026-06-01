@@ -18,19 +18,24 @@ workspace = true
 [features]
 # Pluggable rustls crypto provider (issue #9, ADR-0035). Same shape as
 # `magnetar-admin`: reqwest 0.13's `rustls` (renamed from `rustls-tls`)
-# resolves to aws-lc-rs; `rustls-no-provider` (renamed from
-# `rustls-tls-no-provider`) defers to whichever provider the engine boot
-# installed.
-crypto-aws-lc-rs = ["reqwest/rustls"]
-crypto-ring      = ["reqwest/rustls-no-provider"]
-crypto-openssl   = ["reqwest/rustls-no-provider"]
-crypto-fips      = ["reqwest/rustls-no-provider"]
+# ships a built-in aws-lc-rs provider; `rustls-no-provider` (renamed from
+# `rustls-tls-no-provider`) defers to whichever provider the caller
+# installs. When more than one `crypto-*` feature is unified (workspace
+# `cargo test`), reqwest ends up in `rustls-no-provider` mode, so the
+# OAuth2 client always installs a default itself via the cfg-cascaded
+# `tls_crypto` shim (mirror of `magnetar-runtime-tokio::tls_crypto`).
+crypto-aws-lc-rs = ["reqwest/rustls", "rustls/aws_lc_rs"]
+crypto-ring      = ["reqwest/rustls-no-provider", "rustls/ring"]
+crypto-openssl   = ["reqwest/rustls-no-provider", "dep:rustls-openssl"]
+crypto-fips      = ["reqwest/rustls-no-provider", "rustls/fips"]
 
 [dependencies]
 bytes          = { workspace = true }
 magnetar-proto = { workspace = true }
 parking_lot    = { workspace = true }
 reqwest        = { workspace = true }
+rustls         = { workspace = true }
+rustls-openssl = { workspace = true, optional = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 thiserror      = { workspace = true }

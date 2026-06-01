@@ -38,6 +38,8 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+mod tls_crypto;
+
 use std::time::Duration;
 
 use magnetar_proto::MessageId;
@@ -249,11 +251,58 @@ impl AdminClient {
     /// Java: `PersistentTopics.java#getStats`
     /// (`@GET @Path("/{tenant}/{namespace}/{topic}/stats")`,
     /// response shape `PersistentTopicStats`).
+    ///
+    /// For a **partitioned** topic, the broker returns 404 on this endpoint
+    /// because there is no ledger backing the parent name. Call
+    /// [`Self::topic_partitioned_stats`] instead, or look up the count via
+    /// [`Self::topic_partitions_count`] first.
     pub async fn topic_stats(&self, topic: &str) -> Result<TopicStats, AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "stats"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         json_ok(resp).await
+    }
+
+    /// Get aggregated stats for a partitioned topic.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitioned-stats?
+    /// perPartition=false`. Java: `PersistentTopics.java#getPartitionedStats`
+    /// (`@GET @Path("/{tenant}/{namespace}/{topic}/partitioned-stats")`,
+    /// response shape `PartitionedTopicStats` which extends
+    /// `PersistentTopicStats` with `partitions: Map<String, TopicStats>`
+    /// and `metadata: PartitionedTopicMetadata`).
+    ///
+    /// magnetar exposes only the aggregated top-level counters through the
+    /// same [`TopicStats`] shape — the broker populates `msgInCounter`,
+    /// `bytesInCounter`, `publishers`, `subscriptions` at the response root
+    /// summed across partitions. The `partitions` and `metadata` fields are
+    /// dropped on deserialisation; for per-partition detail call
+    /// [`Self::topic_stats`] on each `<topic>-partition-N` instead. We pass
+    /// `perPartition=false` to keep the wire response small.
+    pub async fn topic_partitioned_stats(&self, topic: &str) -> Result<TopicStats, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&["persistent", tenant, namespace, name, "partitioned-stats"])?;
+        url.query_pairs_mut().append_pair("perPartition", "false");
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Resolve the partition count of a topic.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions`.
+    /// Java: `PersistentTopics.java#getPartitionedMetadata`
+    /// (`@GET @Path("/{tenant}/{namespace}/{topic}/partitions")`,
+    /// response shape `PartitionedTopicMetadata{ partitions: int }`).
+    ///
+    /// Returns `0` for non-partitioned topics; lets a caller disambiguate
+    /// between [`Self::topic_stats`] and [`Self::topic_partitioned_stats`]
+    /// when the topology is not known in advance.
+    pub async fn topic_partitions_count(&self, topic: &str) -> Result<u32, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "partitions"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        let meta: PartitionedTopicMetadata = json_ok(resp).await?;
+        Ok(meta.partitions)
     }
 
     /// Resolve a broker-entry-metadata `index` to a [`MessageId`] (PIP-415).
@@ -556,6 +605,16 @@ pub struct TopicStats {
     pub subscriptions: serde_json::Value,
 }
 
+/// Partitioned-topic metadata, as returned by
+/// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions`.
+/// Java: `org.apache.pulsar.common.partition.PartitionedTopicMetadata`.
+/// Only the partition count is consumed; broker-side extensions are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct PartitionedTopicMetadata {
+    partitions: u32,
+}
+
 /// Builder for [`AdminClient`].
 #[derive(Debug, Default)]
 pub struct AdminClientBuilder {
@@ -600,6 +659,16 @@ impl AdminClientBuilder {
         // so callers pass plain `http://broker:8080` rather than baking the
         // prefix in.
         let base_url = base_url.join("admin/v2/")?;
+
+        // reqwest 0.13 panics in `Client::builder().build()` when the active
+        // `rustls` flavor is `rustls-no-provider` and no global
+        // `CryptoProvider` is installed. That happens whenever more than one
+        // `crypto-*` feature is unified (e.g. default `crypto-aws-lc-rs`
+        // plus an explicit `crypto-ring`), so install the default here —
+        // the shim is idempotent and a no-op once a provider is set, which
+        // covers parallel callers and processes that also boot the tokio
+        // engine.
+        tls_crypto::install_default_provider();
 
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let http = reqwest::Client::builder()

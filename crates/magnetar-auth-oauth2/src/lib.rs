@@ -31,6 +31,8 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+mod tls_crypto;
+
 use core::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -364,9 +366,15 @@ impl ClientCredentialsFlowBuilder {
             Some(url) => url,
             None => default_token_endpoint(&issuer_url)?,
         };
-        let http = match self.http {
-            Some(http) => http,
-            None => Client::builder().build().map_err(OAuth2Error::Transport)?,
+        let http = if let Some(http) = self.http {
+            http
+        } else {
+            // reqwest 0.13 panics in `Client::builder().build()` when the
+            // active `rustls` flavor is `rustls-no-provider` and no global
+            // `CryptoProvider` is installed. The shim is idempotent — see
+            // `tls_crypto.rs`.
+            tls_crypto::install_default_provider();
+            Client::builder().build().map_err(OAuth2Error::Transport)?
         };
         let clock: Arc<dyn Clock> = self.clock.unwrap_or_else(|| Arc::new(SystemClock));
         Ok(ClientCredentialsFlow {

@@ -49,8 +49,12 @@ The base service URL is whatever the broker exposes (`http://localhost:8080`, `h
 | `topic_create_partitioned` | `PUT    /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions` | `PersistentTopics.java#createPartitionedTopic` |
 | `topic_delete` | `DELETE /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions?force={bool}` | `PersistentTopics.java#deletePartitionedTopic` |
 | `topic_stats` | `GET    /admin/v2/persistent/{tenant}/{namespace}/{topic}/stats` | `PersistentTopics.java#getStats` |
+| `topic_partitioned_stats` | `GET    /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitioned-stats?perPartition=false` | `PersistentTopics.java#getPartitionedStats` |
+| `topic_partitions_count` | `GET    /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions` | `PersistentTopics.java#getPartitionedMetadata` |
 
 `TopicStats` exposes the high-signal counters (`msgInCounter`, `bytesInCounter`) and passes `publishers` / `subscriptions` through as raw JSON because the Java schema is large and version-dependent.
+
+`topic_partitioned_stats` reuses the same `TopicStats` shape (it carries the broker's aggregated top-level counters); the per-partition breakdown is intentionally dropped. Call `topic_partitions_count` to size a topic and then either dispatch to `topic_stats` (non-partitioned) or `topic_partitioned_stats` (partitioned). The `magnetar` CLI's `admin topic-stats` does this auto-dispatch.
 
 ## Auth
 

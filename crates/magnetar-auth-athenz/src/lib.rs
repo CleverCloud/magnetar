@@ -52,6 +52,8 @@ use serde::{Deserialize, Serialize};
 ))]
 pub mod jwt_signer;
 #[cfg(feature = "zts")]
+mod tls_crypto;
+#[cfg(feature = "zts")]
 pub mod zts;
 
 /// Default refresh margin: the cached role token is refreshed once `now`

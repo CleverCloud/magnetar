@@ -126,6 +126,11 @@ impl HttpZtsClient {
     pub fn new(zts_url: impl AsRef<str>, grant: ZtsGrant) -> Result<Self, AthenzError> {
         let zts_url = url::Url::parse(zts_url.as_ref())
             .map_err(|e| AthenzError::Config(format!("invalid zts_url: {e}")))?;
+        // reqwest 0.13 panics in `Client::builder().build()` when the
+        // active `rustls` flavor is `rustls-no-provider` and no global
+        // `CryptoProvider` is installed. The shim is idempotent — see
+        // `tls_crypto.rs`.
+        crate::tls_crypto::install_default_provider();
         let http = reqwest::Client::builder()
             .build()
             .map_err(|e| AthenzError::Transport(format!("build reqwest client: {e}")))?;

@@ -298,3 +298,45 @@ fn verbose_repetition() {
     let cli = parse(&["magnetar", "-vvv", "admin", "tenant-list"]);
     assert_eq!(cli.verbose, 3);
 }
+
+#[test]
+fn root_flags_accepted_after_subcommand() {
+    // clap `global = true` lets each root flag be parsed at any level —
+    // confirm `--admin-url` / `--token` / `--admin-timeout-secs` / `-v`
+    // all flow through when placed after the subcommand chain.
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "tenant-list",
+        "--admin-url",
+        "http://broker:8080",
+        "--token",
+        "secret",
+        "--admin-timeout-secs",
+        "5",
+        "-vv",
+    ]);
+    assert_eq!(cli.admin_url, "http://broker:8080");
+    assert_eq!(cli.token.as_deref(), Some("secret"));
+    assert_eq!(cli.admin_timeout_secs, 5);
+    assert_eq!(cli.verbose, 2);
+    assert!(matches!(
+        cli.cmd,
+        Cmd::Admin {
+            sub: AdminCmd::TenantList
+        }
+    ));
+}
+
+#[test]
+fn produce_accepts_global_service_url_after_topic() {
+    let cli = parse(&[
+        "magnetar",
+        "produce",
+        "persistent://public/default/x",
+        "--service-url",
+        "pulsar://broker:6650",
+    ]);
+    assert_eq!(cli.service_url, "pulsar://broker:6650");
+    assert!(matches!(cli.cmd, Cmd::Produce { .. }));
+}
