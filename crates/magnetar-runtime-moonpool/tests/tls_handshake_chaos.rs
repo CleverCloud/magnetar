@@ -32,9 +32,10 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore};
 /// `ClientConnection` still constructs and emits a `ClientHello`; we only
 /// drive the inbound side with corrupted bytes after that point. The
 /// rustls crypto provider is picked by the workspace's `crypto-*`
-/// feature (issue #9, ADR-0035).
+/// feature (issue #9, ADR-0035) via the `active_provider` cfg cascade —
+/// any single-provider build (`crypto-aws-lc-rs`, `crypto-ring`,
+/// `crypto-openssl`, `crypto-fips`) compiles and runs this test.
 fn make_session() -> ClientConnection {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Arc::new(
         ClientConfig::builder_with_provider(active_provider())
             .with_safe_default_protocol_versions()
