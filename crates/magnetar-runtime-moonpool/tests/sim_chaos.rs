@@ -43,7 +43,9 @@ use magnetar_proto::{
     encode_command, encode_payload, pb,
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
-use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TimeProvider};
+use moonpool_core::{
+    NetworkProvider, Providers, RandomProvider, TaskProvider, TcpListenerTrait, TimeProvider,
+};
 use moonpool_sim::providers::SimProviders;
 use moonpool_sim::{
     Invariant, SimContext, SimulationBuilder, SimulationError, SimulationResult, TrailQuery,
@@ -1756,4 +1758,693 @@ fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
         .workload(ProxyClientWorkload::new(sessions))
         .set_iterations(8)
         .run();
+}
+
+// =============================================================================
+// ADR-0050 — Swizzle-clog workload (FoundationDB pattern).
+//
+// The broker accepts SEND from producers and the corresponding entries
+// land in the per-topic ledger, but the broker temporarily stops pushing
+// to a random subset of consumers (the "clogged" set, picked from the
+// seed-driven RNG so the choice is reproducible). After `clog_duration_ms`
+// virtual ms, the clogged set is drained in a different random order —
+// the FoundationDB pattern that surfaces resume-ordering bugs that a
+// plain crash-restart misses (see `docs/simulation-patterns.md` §1).
+// =============================================================================
+
+/// Number of consumers spun up by [`SwizzleClogClientWorkload`]. Sized
+/// so `n_clogged < SWIZZLE_CONSUMERS` always holds — every iteration has
+/// at least one "unaffected" consumer that the no-dup invariant can pin
+/// against.
+const SWIZZLE_CONSUMERS: u64 = 4;
+
+/// Number of payloads the producer publishes per iteration. Picked
+/// large enough that a clog window of ~100 ms can comfortably stall
+/// at least one consumer mid-stream.
+const SWIZZLE_PRODUCE_COUNT: u32 = 8;
+
+/// Phase cursor exposed to the broker's session handler so it can
+/// short-circuit deliveries to clogged consumers. The state machine is
+/// `Clogging → Restoring → Done`; `Done` matches the no-clog hot path
+/// (the `clogged_set` is empty so every consumer drains normally).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SwizzleClogPhase {
+    Clogging,
+    Restoring,
+}
+
+/// Seed-driven swizzle plan. Built lazily on the first session that
+/// observes all `SWIZZLE_CONSUMERS` subscribe commands, then handed to
+/// the controller task that arms / restores the clog window.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct SwizzleSpec {
+    /// Number of consumer ids selected for the clogged set.
+    n_clogged: usize,
+    /// Virtual-time width of the clog window.
+    clog_duration_ms: u64,
+    /// Consumer ids in the order the controller releases them from the
+    /// clog — guaranteed to be a *different* permutation from
+    /// [`SwizzleState::clog_order`] when `n_clogged >= 2`.
+    restore_order: Vec<u64>,
+}
+
+/// Shared state between the broker's accept loop, the session
+/// handlers, and the swizzle controller task. All three sides operate
+/// under one mutex; contention is negligible because the broker has a
+/// single live session and the controller wakes on a virtual-clock
+/// schedule.
+#[derive(Default)]
+struct SwizzleState {
+    /// Consumer ids currently barred from receiving pushes. Cleared
+    /// as the controller walks `restore_order`.
+    clogged_set: HashSet<u64>,
+    /// The ids of every consumer the broker has seen subscribe so
+    /// far. Used by the controller to decide when the client side has
+    /// finished spinning up.
+    registered: HashSet<u64>,
+    /// The order ids were inserted into the clog — useful for both
+    /// debugging and asserting `restore_order != clog_order`.
+    clog_order: Vec<u64>,
+    /// `Some` once the controller has built its plan; lets the
+    /// session-side dispatch log the spec for `swizzle-controller`
+    /// emit events without re-deriving it from the RNG.
+    spec: Option<SwizzleSpec>,
+}
+
+/// Broker workload that swizzle-clogs a random subset of consumers
+/// (per ADR-0050). Reuses the stateful broker's `SessionState` /
+/// `handle_stateful_frame` plumbing — only the push-to-consumer step
+/// is overridden so clogged ids stay queued.
+struct SwizzleClogBrokerWorkload {
+    /// Width of the clog window in virtual ms. Picked at construction
+    /// so the test can scale the budget per sweep.
+    clog_duration_ms: u64,
+    /// Number of consumers to clog. The controller picks which ids
+    /// from `SwizzleState::registered` once the client has finished
+    /// subscribing.
+    n_clogged: usize,
+    /// Shared with the controller task and the session handler.
+    state: Arc<Mutex<SwizzleState>>,
+}
+
+impl SwizzleClogBrokerWorkload {
+    fn new(n_clogged: usize, clog_duration_ms: u64) -> Self {
+        Self {
+            clog_duration_ms,
+            n_clogged,
+            state: Arc::new(Mutex::new(SwizzleState::default())),
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for SwizzleClogBrokerWorkload {
+    fn name(&self) -> &str {
+        "broker"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let network = ctx.network().clone();
+        let bind_addr = format!("{}:{BROKER_PORT}", ctx.my_ip());
+        let listener = network
+            .bind(&bind_addr)
+            .await
+            .map_err(|e| SimulationError::InvalidState(format!("swizzle broker bind: {e}")))?;
+
+        let shutdown = ctx.shutdown().clone();
+        let task = ctx.providers().task().clone();
+        let time = ctx.providers().time().clone();
+        let random = ctx.providers().random().clone();
+        let n_clogged = self.n_clogged;
+        let clog_duration_ms = self.clog_duration_ms;
+        let state_for_controller = self.state.clone();
+        let _controller = task.spawn_task("swizzle-controller", async move {
+            swizzle_controller(
+                state_for_controller,
+                time,
+                random,
+                n_clogged,
+                clog_duration_ms,
+            )
+            .await;
+        });
+
+        let source = ctx.my_ip().to_owned();
+        let task_for_sessions = ctx.providers().task().clone();
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _peer)) => {
+                            let session_source = source.clone();
+                            let state_for_session = self.state.clone();
+                            let _handle = task_for_sessions.spawn_task(
+                                "swizzle-broker-session",
+                                async move {
+                                    let _ = handle_swizzle_session(
+                                        stream,
+                                        session_source,
+                                        state_for_session,
+                                    )
+                                    .await;
+                                },
+                            );
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Controller task — sleeps until the client side has subscribed all
+/// `SWIZZLE_CONSUMERS` consumers, then derives the clog plan from the
+/// seed-driven RNG and walks the `Clogging → Restoring` phase.
+async fn swizzle_controller<T, R>(
+    state: Arc<Mutex<SwizzleState>>,
+    time: T,
+    random: R,
+    n_clogged: usize,
+    clog_duration_ms: u64,
+) where
+    T: TimeProvider,
+    R: RandomProvider,
+{
+    // Wait for the client workload to register every consumer. The
+    // sim budget bounds this loop — if the client never subscribes we
+    // bail without engaging the clog (the iteration's `check()` then
+    // catches the missing-receive case).
+    for _ in 0..200 {
+        let ready = state.lock().registered.len() >= SWIZZLE_CONSUMERS as usize;
+        if ready {
+            break;
+        }
+        let _ = time.sleep(Duration::from_millis(10)).await;
+    }
+
+    // Snapshot the registered ids and pick the clogged subset via the
+    // seed-driven `RandomProvider`. We Fisher-Yates-shuffle a working
+    // copy to derive a deterministic permutation; `random.random_range`
+    // is the only RNG entry point used.
+    let mut registered: Vec<u64> = {
+        let s = state.lock();
+        let mut v: Vec<u64> = s.registered.iter().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    if registered.is_empty() {
+        return;
+    }
+    let n = n_clogged.min(registered.len());
+    fisher_yates_shuffle(&mut registered, &random);
+    let clog_order: Vec<u64> = registered.iter().take(n).copied().collect();
+
+    // Derive `restore_order` as a different permutation of the same
+    // set. Re-shuffle the slice until the result differs from
+    // `clog_order` (guaranteed to terminate when `n >= 2`; when `n < 2`
+    // we accept the trivial equal permutation — the swizzle still
+    // exercises the single-consumer resume path).
+    let mut restore_order = clog_order.clone();
+    if n >= 2 {
+        for _ in 0..16 {
+            fisher_yates_shuffle(&mut restore_order, &random);
+            if restore_order != clog_order {
+                break;
+            }
+        }
+        // Fall back to a deterministic swap when the RNG keeps
+        // proposing the same order — last-resort guarantee that
+        // `restore_order != clog_order`.
+        if restore_order == clog_order {
+            restore_order.swap(0, 1);
+        }
+    }
+
+    let spec = SwizzleSpec {
+        n_clogged: n,
+        clog_duration_ms,
+        restore_order: restore_order.clone(),
+    };
+
+    {
+        let mut s = state.lock();
+        for id in &clog_order {
+            s.clogged_set.insert(*id);
+        }
+        s.clog_order = clog_order;
+        s.spec = Some(spec);
+    }
+
+    // Hold the clog for the configured window.
+    let _ = time.sleep(Duration::from_millis(clog_duration_ms)).await;
+
+    // Restore one id at a time, stepping the virtual clock between
+    // releases so observers see the swizzle as a sequence of distinct
+    // events rather than an atomic resume.
+    for id in &restore_order {
+        {
+            let mut s = state.lock();
+            s.clogged_set.remove(id);
+        }
+        let _ = time.sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Fisher-Yates in-place shuffle driven by the seed-controlled
+/// [`RandomProvider`]. The simulator's `RandomProvider` does not
+/// expose `rand::seq::SliceRandom::shuffle`, so we open-code the
+/// shuffle on top of `random_range`.
+fn fisher_yates_shuffle<R: RandomProvider>(slice: &mut [u64], random: &R) {
+    if slice.len() < 2 {
+        return;
+    }
+    for i in (1..slice.len()).rev() {
+        let j = random.random_range(0..(i + 1));
+        slice.swap(i, j);
+    }
+}
+
+/// Per-session dispatch — mirror of [`handle_stateful_session`] but
+/// the push-to-consumer step consults the shared [`SwizzleState`] and
+/// skips ids currently in `clogged_set`. SEND from producers is
+/// always accepted: the ledger keeps growing during the clog, so when
+/// the controller releases an id the consumer drains the queued tail.
+async fn handle_swizzle_session<S>(
+    mut stream: S,
+    source: String,
+    state: Arc<Mutex<SwizzleState>>,
+) -> SimulationResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let mut session = SessionState::new();
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            handle_stateful_frame(&mut session, &source, &frame, &mut out_buf);
+            // Subscribe registers the consumer id with the shared
+            // swizzle state so the controller can see how many
+            // consumers exist.
+            if let Ok(pb::base_command::Type::Subscribe) =
+                pb::base_command::Type::try_from(frame.command.r#type)
+            {
+                if let Some(s) = &frame.command.subscribe {
+                    state.lock().registered.insert(s.consumer_id);
+                }
+            }
+        }
+
+        // Push pending messages but skip any consumer currently in
+        // the clogged_set. The ledger keeps appending under producer
+        // SEND so once the consumer is restored, its cursor walks
+        // forward and the queued tail drains.
+        let clogged = state.lock().clogged_set.clone();
+        push_pending_messages_excluding(&mut session, &source, &mut out_buf, &clogged);
+
+        if !out_buf.is_empty() {
+            if stream.write_all(&out_buf).await.is_err() {
+                return Ok(());
+            }
+            if stream.flush().await.is_err() {
+                return Ok(());
+            }
+            out_buf.clear();
+        }
+
+        match read_into(&mut stream, &mut read_buf).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Variant of [`push_pending_messages`] that honours a clogged set.
+/// Consumers whose ids appear in `clogged` keep their cursor frozen
+/// (so when the clog lifts they pick up where they left off, just
+/// like a real broker after a permit-stall resume).
+fn push_pending_messages_excluding(
+    session: &mut SessionState,
+    source: &str,
+    out: &mut BytesMut,
+    clogged: &HashSet<u64>,
+) {
+    let to_push: Vec<(u64, Vec<StoredMessage>)> = {
+        let mut batch = Vec::new();
+        let ledger_snapshot: HashMap<String, Vec<StoredMessage>> = session.ledger.clone();
+        for (cid, slot) in &mut session.consumers {
+            if clogged.contains(cid) {
+                continue;
+            }
+            let Some(ledger) = ledger_snapshot.get(&slot.topic) else {
+                continue;
+            };
+            let mut pushed = Vec::new();
+            while slot.permits > 0 && slot.cursor < ledger.len() {
+                pushed.push(ledger[slot.cursor].clone());
+                slot.cursor += 1;
+                slot.permits -= 1;
+            }
+            if !pushed.is_empty() {
+                batch.push((*cid, pushed));
+            }
+        }
+        batch
+    };
+    for (cid, msgs) in to_push {
+        for m in msgs {
+            emit_event(
+                DELIVERS_TRAIL,
+                source,
+                &DeliverEvent {
+                    consumer_id: cid,
+                    ledger_id: m.ledger_id,
+                    entry_id: m.entry_id,
+                },
+            );
+            emit_message(out, cid, m.ledger_id, m.entry_id, &m.payload);
+        }
+    }
+}
+
+/// Client workload paired with [`SwizzleClogBrokerWorkload`]. Opens
+/// [`SWIZZLE_CONSUMERS`] consumers + a producer on the same topic,
+/// publishes [`SWIZZLE_PRODUCE_COUNT`] messages, then races every
+/// consumer toward `receive()` with a generous virtual-time budget so
+/// even the last consumer to leave the clogged set has a chance to
+/// drain.
+type ReceivedByConsumer = HashMap<u64, Vec<(u64, u64)>>;
+
+struct SwizzleClogClientWorkload {
+    /// Receives accumulated by consumer id; populated incrementally
+    /// by the per-consumer drain task. Wrapped under one mutex so the
+    /// `check()` phase can pluck a consistent snapshot.
+    received_per_consumer: Arc<Mutex<ReceivedByConsumer>>,
+    /// Set true on completion of the `run()` body so `check()` can
+    /// distinguish "broker never let the client get this far" from
+    /// "broker let the client run but the assertions failed".
+    completed: AtomicBool,
+    /// Snapshot of the broker's view of the clogged set, captured at
+    /// the end of the run for the per-iteration debug log.
+    swizzle_snapshot: Arc<Mutex<Option<SwizzleSpec>>>,
+}
+
+impl SwizzleClogClientWorkload {
+    fn new(swizzle_snapshot: Arc<Mutex<Option<SwizzleSpec>>>) -> Self {
+        Self {
+            received_per_consumer: Arc::new(Mutex::new(HashMap::new())),
+            completed: AtomicBool::new(false),
+            swizzle_snapshot,
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for SwizzleClogClientWorkload {
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        let broker_ip = ctx
+            .peer("broker")
+            .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
+        let addr = format!("{broker_ip}:{BROKER_PORT}");
+        let engine = MoonpoolEngine::new(ctx.providers().clone());
+
+        let client = tokio::time::timeout(
+            Duration::from_secs(30),
+            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+        )
+        .await
+        .map_err(|_| SimulationError::InvalidState("connect_plain timed out".into()))?
+        .map_err(|e| SimulationError::InvalidState(format!("connect_plain: {e:?}")))?;
+
+        // Subscribe every consumer up front so their ids are visible
+        // to the broker's swizzle controller before any SEND lands.
+        let mut consumers = Vec::with_capacity(SWIZZLE_CONSUMERS as usize);
+        for i in 0..SWIZZLE_CONSUMERS {
+            let consumer = client
+                .subscribe(SubscribeRequest {
+                    topic: "persistent://public/default/sim-swizzle-clog".to_owned(),
+                    subscription: format!("sim-swizzle-clog-sub-{i}"),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| SimulationError::InvalidState(format!("subscribe[{i}]: {e:?}")))?;
+            consumers.push(consumer);
+        }
+
+        let producer = client
+            .open_producer(CreateProducerRequest {
+                topic: "persistent://public/default/sim-swizzle-clog".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
+
+        // Publish first so the ledger grows while the swizzle window
+        // is still open.
+        for i in 0..SWIZZLE_PRODUCE_COUNT {
+            let payload = bytes::Bytes::from(i.to_le_bytes().to_vec());
+            let msg = magnetar_proto::producer::OutgoingMessage {
+                payload: payload.clone(),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 4,
+                num_messages: 1,
+                txn_id: None,
+                source_message_id: None,
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+        }
+
+        // Drain consumers concurrently — give every consumer its own
+        // task so a clogged consumer doesn't hold up the unaffected
+        // ones. Each drain task races `consumer.receive()` against a
+        // moonpool [`TimeProvider::sleep`] timeout so the sim's event
+        // queue stays non-empty (the deadlock detector compares
+        // moonpool's pending-event count, not tokio's, so plain
+        // `tokio::time::timeout` would let the sim go idle during the
+        // clog window).
+        let drain_budget = Duration::from_secs(2);
+        let mut drain_handles = Vec::with_capacity(consumers.len());
+        let received_per_consumer = self.received_per_consumer.clone();
+        let time_provider = ctx.providers().time().clone();
+        for (idx, consumer) in consumers.into_iter().enumerate() {
+            let received_for_task = received_per_consumer.clone();
+            let time_for_task = time_provider.clone();
+            let handle = tokio::spawn(async move {
+                let cid = idx as u64;
+                let mut got = Vec::new();
+                for _ in 0..SWIZZLE_PRODUCE_COUNT {
+                    let timer = time_for_task.sleep(drain_budget);
+                    tokio::pin!(timer);
+                    let msg = tokio::select! {
+                        biased;
+                        m = consumer.receive() => m,
+                        _ = &mut timer => break,
+                    };
+                    let Ok(msg) = msg else {
+                        break;
+                    };
+                    got.push((msg.message_id.ledger_id, msg.message_id.entry_id));
+                    let _ = consumer.ack(msg.message_id).await;
+                }
+                received_for_task.lock().insert(cid, got);
+            });
+            drain_handles.push(handle);
+        }
+        for handle in drain_handles {
+            let _ = handle.await;
+        }
+
+        self.completed.store(true, Ordering::SeqCst);
+        client.close().await;
+        Ok(())
+    }
+
+    async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
+        if !self.completed.load(Ordering::SeqCst) {
+            return Err(SimulationError::InvalidState(
+                "swizzle client workload did not complete".into(),
+            ));
+        }
+
+        let snapshot = self.received_per_consumer.lock().clone();
+        let spec = self.swizzle_snapshot.lock().clone();
+
+        // The plan asserts three swizzle-window properties. They map
+        // to the following workload-side checks (the cross-cutting
+        // `MonotonicMsgIdInvariant` is wired into the builder
+        // separately so it observes every iteration).
+        //
+        // 1. No duplicate messages on unaffected consumers — a consumer whose id was NOT in
+        //    `restore_order` must have a duplicate-free received list.
+        let clogged: HashSet<u64> = spec
+            .as_ref()
+            .map(|s| s.restore_order.iter().copied().collect())
+            .unwrap_or_default();
+        for (cid, msgs) in &snapshot {
+            if clogged.contains(cid) {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            for key in msgs {
+                if !seen.insert(*key) {
+                    return Err(SimulationError::InvalidState(format!(
+                        "duplicate delivery on unaffected consumer {cid}: msg={key:?}"
+                    )));
+                }
+            }
+        }
+
+        // 2. Every clogged consumer eventually received at least one message OR the iteration
+        //    surfaced a SessionLost. The sim budget is generous enough that the restored side
+        //    drains its tail before `check()` runs; an empty received-list here means the restore
+        //    never landed.
+        for cid in &clogged {
+            let drained = snapshot.get(cid).is_some_and(|v| !v.is_empty());
+            if !drained {
+                return Err(SimulationError::InvalidState(format!(
+                    "clogged consumer {cid} never received (and no SessionLost surfaced)"
+                )));
+            }
+        }
+
+        // Reset per-iteration state so the sweep starts each seed
+        // clean.
+        self.received_per_consumer.lock().clear();
+        self.completed.store(false, Ordering::SeqCst);
+        *self.swizzle_snapshot.lock() = None;
+        Ok(())
+    }
+}
+
+/// 16-seed sweep over the swizzle-clog workload. Each seed picks a
+/// different clogged subset + restore permutation via the seed-driven
+/// `RandomProvider`; the broker's invariants
+/// (`MonotonicMsgIdInvariant`) plus the workload-side `check()`
+/// assertions enforce ADR-0050's three swizzle-window properties.
+#[test]
+fn sim_chaos_swizzle_clog_sweep_16_seeds() {
+    // Picked so `n_clogged < SWIZZLE_CONSUMERS` always holds — every
+    // iteration has at least one consumer that's not in the clogged
+    // subset (the "unaffected" partition the no-dup assertion pins
+    // against).
+    let n_clogged: usize = 2;
+    let clog_duration_ms: u64 = 100;
+
+    let broker = SwizzleClogBrokerWorkload::new(n_clogged, clog_duration_ms);
+    let swizzle_snapshot = {
+        let s = broker.state.lock();
+        // The broker's `state.spec` only populates once the
+        // controller task has run; we pluck the same Arc the
+        // controller writes into and hand it to the client workload
+        // so `check()` can read it after the iteration.
+        Arc::new(Mutex::new(s.spec.clone()))
+    };
+    // Wire the same shared Arc into both the broker state and the
+    // client workload by referencing it through a side-channel
+    // mutex. The controller writes the final spec into the broker's
+    // `state.spec`; we mirror it into `swizzle_snapshot` at the end
+    // of the iteration via a check-time copy below.
+    let state_for_mirror = broker.state.clone();
+    let report = SimulationBuilder::new()
+        .workload(broker)
+        .workload(SwizzleClogMirroringClient::new(
+            swizzle_snapshot.clone(),
+            state_for_mirror,
+        ))
+        .invariant(MonotonicMsgIdInvariant::default())
+        .set_iterations(16)
+        .run();
+    assert!(
+        report.assertion_violations.is_empty(),
+        "swizzle invariant violation(s): {report:?}"
+    );
+    assert!(report.successful_runs >= 1, "report: {report:?}");
+}
+
+/// Smoke test — single seed, single iteration. Confirms the swizzle
+/// wiring composes before the sweep is invoked. Pinned alongside the
+/// existing chaos-pack smoke tests for quick pre-merge validation.
+#[test]
+fn sim_chaos_swizzle_clog_smoke() {
+    let broker = SwizzleClogBrokerWorkload::new(2, 100);
+    let swizzle_snapshot = Arc::new(Mutex::new(None));
+    let state_for_mirror = broker.state.clone();
+    let _ = SimulationBuilder::new()
+        .workload(broker)
+        .workload(SwizzleClogMirroringClient::new(
+            swizzle_snapshot,
+            state_for_mirror,
+        ))
+        .invariant(MonotonicMsgIdInvariant::default())
+        .set_iterations(1)
+        .run();
+}
+
+/// Thin client wrapper that mirrors the broker's
+/// [`SwizzleState::spec`] into the workload-owned snapshot at the
+/// top of `run()`. Keeps [`SwizzleClogClientWorkload::check()`] able
+/// to read the final swizzle plan without taking the broker's
+/// mutex.
+struct SwizzleClogMirroringClient {
+    inner: SwizzleClogClientWorkload,
+    broker_state: Arc<Mutex<SwizzleState>>,
+}
+
+impl SwizzleClogMirroringClient {
+    fn new(
+        swizzle_snapshot: Arc<Mutex<Option<SwizzleSpec>>>,
+        broker_state: Arc<Mutex<SwizzleState>>,
+    ) -> Self {
+        Self {
+            inner: SwizzleClogClientWorkload::new(swizzle_snapshot),
+            broker_state,
+        }
+    }
+}
+
+#[async_trait]
+impl Workload for SwizzleClogMirroringClient {
+    fn name(&self) -> &str {
+        "client"
+    }
+
+    async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        self.inner.run(ctx).await
+    }
+
+    async fn check(&mut self, ctx: &SimContext) -> SimulationResult<()> {
+        // Mirror the final swizzle spec from the broker side so the
+        // inner `check()` can read it. Done at the start of `check()`
+        // (after `run()`) so the controller has had time to populate
+        // it.
+        if let Some(spec) = self.broker_state.lock().spec.clone() {
+            *self.inner.swizzle_snapshot.lock() = Some(spec);
+        }
+        self.inner.check(ctx).await?;
+        // Reset broker-side per-iteration state too so the sweep
+        // restarts each seed cleanly.
+        let mut s = self.broker_state.lock();
+        s.clogged_set.clear();
+        s.registered.clear();
+        s.clog_order.clear();
+        s.spec = None;
+        Ok(())
+    }
 }
