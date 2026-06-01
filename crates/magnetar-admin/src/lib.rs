@@ -974,6 +974,70 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's deduplication-snapshot interval (entries).
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/deduplicationSnapshotInterval`.
+    /// Returns a bare integer (the entry count between dedup cursor
+    /// snapshots), or `null` (decoded as `None`) when the broker default
+    /// applies.
+    /// Java: `NamespacesBase#getDeduplicationSnapshotInterval`.
+    pub async fn namespace_get_deduplication_snapshot_interval(
+        &self,
+        ns: &str,
+    ) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "deduplicationSnapshotInterval",
+        ])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's deduplication-snapshot interval (entries).
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/deduplicationSnapshotInterval`
+    /// with a bare JSON integer body.
+    /// Java: `NamespacesBase#setDeduplicationSnapshotInterval`.
+    pub async fn namespace_set_deduplication_snapshot_interval(
+        &self,
+        ns: &str,
+        interval_entries: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "deduplicationSnapshotInterval",
+        ])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&interval_entries))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's deduplication-snapshot interval override.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/deduplicationSnapshotInterval`.
+    /// Java: `NamespacesBase#deleteDeduplicationSnapshotInterval`.
+    pub async fn namespace_remove_deduplication_snapshot_interval(
+        &self,
+        ns: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "deduplicationSnapshotInterval",
+        ])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.

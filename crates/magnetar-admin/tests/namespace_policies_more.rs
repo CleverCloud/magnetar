@@ -78,3 +78,53 @@ async fn deduplication_get_set_remove_cycle() {
         .await
         .expect("remove deduplication");
 }
+
+#[tokio::test]
+async fn deduplication_snapshot_interval_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/deduplicationSnapshotInterval",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(1000)))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/deduplicationSnapshotInterval",
+        ))
+        .and(body_json(serde_json::json!(2500)))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/deduplicationSnapshotInterval",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    assert_eq!(
+        admin
+            .namespace_get_deduplication_snapshot_interval("acme/svc")
+            .await
+            .expect("get dedup snapshot interval"),
+        Some(1000)
+    );
+    admin
+        .namespace_set_deduplication_snapshot_interval("acme/svc", 2500)
+        .await
+        .expect("set dedup snapshot interval");
+    admin
+        .namespace_remove_deduplication_snapshot_interval("acme/svc")
+        .await
+        .expect("remove dedup snapshot interval");
+}

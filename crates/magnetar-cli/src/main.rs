@@ -686,6 +686,27 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's deduplication-snapshot interval (or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/deduplicationSnapshotInterval`.
+    GetDeduplicationSnapshotInterval {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's deduplication-snapshot interval (entry count).
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/deduplicationSnapshotInterval`.
+    SetDeduplicationSnapshotInterval {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Entry count between dedup cursor snapshots.
+        #[arg(long)]
+        interval_entries: i32,
+    },
+    /// Remove a namespace's deduplication-snapshot interval override.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/deduplicationSnapshotInterval`.
+    RemoveDeduplicationSnapshotInterval {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1777,6 +1798,26 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         }
         NamespacesCmd::RemoveDeduplication { namespace } => {
             admin.namespace_remove_deduplication(&namespace).await?;
+            Ok(())
+        }
+        NamespacesCmd::GetDeduplicationSnapshotInterval { namespace } => print_json(
+            &admin
+                .namespace_get_deduplication_snapshot_interval(&namespace)
+                .await?,
+        ),
+        NamespacesCmd::SetDeduplicationSnapshotInterval {
+            namespace,
+            interval_entries,
+        } => {
+            admin
+                .namespace_set_deduplication_snapshot_interval(&namespace, interval_entries)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveDeduplicationSnapshotInterval { namespace } => {
+            admin
+                .namespace_remove_deduplication_snapshot_interval(&namespace)
+                .await?;
             Ok(())
         }
     }
