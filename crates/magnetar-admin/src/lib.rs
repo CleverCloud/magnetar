@@ -1558,6 +1558,48 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a topic's max-producers cap (or `null` if no override).
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/maxProducers`. Returns
+    /// a bare integer when the override is set, `null` (decoded as
+    /// `Option::None`) when no topic-level cap is in place.
+    /// Java: `PersistentTopicsBase#getMaxProducers`.
+    pub async fn topic_get_max_producers(&self, topic: &str) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "maxProducers"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a topic's max-producers cap.
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/maxProducers` with
+    /// a bare integer body. `0` disables (broker treats as unlimited).
+    /// Java: `PersistentTopicsBase#setMaxProducers`.
+    pub async fn topic_set_max_producers(
+        &self,
+        topic: &str,
+        max_producers: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "maxProducers"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&max_producers))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a topic's max-producers cap (fall back to namespace / broker default).
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/maxProducers`.
+    /// Java: `PersistentTopicsBase#removeMaxProducers`.
+    pub async fn topic_remove_max_producers(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "maxProducers"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.

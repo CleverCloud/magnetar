@@ -973,6 +973,27 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
     },
+    /// Get a topic's max-producers cap (or `null` if no override).
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/maxProducers`.
+    GetMaxProducers {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's max-producers cap. `0` = unlimited.
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/maxProducers`.
+    SetMaxProducers {
+        /// Fully qualified topic.
+        topic: String,
+        /// Maximum number of concurrent producers on the topic.
+        #[arg(long)]
+        max_producers: i32,
+    },
+    /// Remove a topic's max-producers cap (fall back to namespace / broker default).
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/maxProducers`.
+    RemoveMaxProducers {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1972,6 +1993,20 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemovePublishRate { topic } => {
             admin.topic_remove_publish_rate(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::GetMaxProducers { topic } => {
+            print_json(&admin.topic_get_max_producers(&topic).await?)
+        }
+        TopicsCmd::SetMaxProducers {
+            topic,
+            max_producers,
+        } => {
+            admin.topic_set_max_producers(&topic, max_producers).await?;
+            Ok(())
+        }
+        TopicsCmd::RemoveMaxProducers { topic } => {
+            admin.topic_remove_max_producers(&topic).await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,
