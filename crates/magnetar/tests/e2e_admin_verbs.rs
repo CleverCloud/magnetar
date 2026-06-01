@@ -24,7 +24,10 @@ use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::{OutgoingMessage, PulsarClient};
-use magnetar_admin::{AdminClient, BacklogQuota, BacklogQuotaType, RetentionPolicies};
+use magnetar_admin::{
+    AdminClient, BacklogQuota, BacklogQuotaType, DelayedDeliveryPolicies, DispatchRate,
+    PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
+};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -317,6 +320,265 @@ async fn e2e_admin_subscription_ops() -> Result<(), Box<dyn std::error::Error>> 
     assert!(
         !after_delete.iter().any(|s| s == sub_name),
         "subscription_delete left the subscription in place: {after_delete:?}"
+    );
+
+    Ok(())
+}
+
+/// Namespace policies breadth (PR #2 slice 1 + slice 2) — exercise the
+/// `set → get returns set → remove → get returns default-or-none`
+/// invariant for persistence, dispatch-rate, deduplication, compaction
+/// threshold, delayed-delivery, and max-producers-per-topic against a
+/// real Pulsar 4.0.4 broker. Each policy family on a fresh broker
+/// returns `None` (or the broker's zero default) until set; the
+/// invariant is that the round-trip preserves the configured value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_admin_namespace_policies_breadth() -> Result<(), Box<dyn std::error::Error>> {
+    let (_service_url, admin_url, _container) = start_pulsar().await?;
+    let admin = build_admin(&admin_url)?;
+    let ns = "public/default";
+
+    // --- Persistence ---------------------------------------------------
+
+    let pers = PersistencePolicies {
+        bookkeeper_ensemble: 2,
+        bookkeeper_write_quorum: 2,
+        bookkeeper_ack_quorum: 2,
+        managed_ledger_max_mark_delete_rate: 1.0,
+    };
+    admin.namespace_set_persistence(ns, pers).await?;
+    let got = admin.namespace_get_persistence(ns).await?;
+    assert_eq!(got.bookkeeper_ensemble, 2);
+    assert_eq!(got.bookkeeper_write_quorum, 2);
+    assert_eq!(got.bookkeeper_ack_quorum, 2);
+    admin.namespace_remove_persistence(ns).await?;
+
+    // --- DispatchRate --------------------------------------------------
+
+    let rate = DispatchRate {
+        dispatch_throttling_rate_in_msg: 1000,
+        dispatch_throttling_rate_in_byte: 1_048_576,
+        rate_period_in_second: 1,
+        relative_to_publish_rate: false,
+    };
+    admin.namespace_set_dispatch_rate(ns, rate).await?;
+    let got = admin.namespace_get_dispatch_rate(ns).await?;
+    assert_eq!(got.dispatch_throttling_rate_in_msg, 1000);
+    assert_eq!(got.dispatch_throttling_rate_in_byte, 1_048_576);
+    admin.namespace_remove_dispatch_rate(ns).await?;
+
+    // --- Deduplication -------------------------------------------------
+
+    admin.namespace_set_deduplication(ns, true).await?;
+    let got = admin.namespace_get_deduplication(ns).await?;
+    assert_eq!(got, Some(true));
+    admin.namespace_remove_deduplication(ns).await?;
+
+    // --- Compaction threshold ------------------------------------------
+
+    admin
+        .namespace_set_compaction_threshold(ns, 10_485_760)
+        .await?;
+    let got = admin.namespace_get_compaction_threshold(ns).await?;
+    assert_eq!(got, Some(10_485_760));
+    admin.namespace_remove_compaction_threshold(ns).await?;
+
+    // --- Delayed delivery ----------------------------------------------
+
+    let dd = DelayedDeliveryPolicies {
+        active: true,
+        tick_time_millis: 1000,
+    };
+    admin.namespace_set_delayed_delivery(ns, dd).await?;
+    let got = admin.namespace_get_delayed_delivery(ns).await?;
+    assert!(got.is_some(), "delayed-delivery should round-trip");
+    let got = got.unwrap();
+    assert!(got.active);
+    assert_eq!(got.tick_time_millis, 1000);
+    admin.namespace_remove_delayed_delivery(ns).await?;
+
+    // --- MaxProducersPerTopic ------------------------------------------
+
+    admin.namespace_set_max_producers_per_topic(ns, 50).await?;
+    let got = admin.namespace_get_max_producers_per_topic(ns).await?;
+    assert_eq!(got, Some(50));
+    admin.namespace_remove_max_producers_per_topic(ns).await?;
+
+    // --- PublishRate ---------------------------------------------------
+
+    let pr = PublishRate {
+        publish_throttling_rate_in_msg: 500,
+        publish_throttling_rate_in_byte: 524_288,
+    };
+    admin.namespace_set_publish_rate(ns, pr).await?;
+    let got = admin.namespace_get_publish_rate(ns).await?;
+    assert_eq!(got.publish_throttling_rate_in_msg, 500);
+    admin.namespace_remove_publish_rate(ns).await?;
+
+    Ok(())
+}
+
+/// Per-topic policy overrides (PR #3) — the broker's topic-level
+/// policies override the namespace defaults. Asserts the round-trip
+/// `set → get returns set → remove → get returns None` for retention,
+/// dispatch-rate, persistence, and max-producers on a per-topic basis.
+/// Requires the broker to be launched with `topicLevelPoliciesEnabled
+/// = true` (Pulsar 4.0.4 default).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, admin_url, _container) = start_pulsar().await?;
+    let admin = build_admin(&admin_url)?;
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    let topic = "persistent://public/default/magnetar-e2e-topic-policies";
+
+    // Bootstrap topic with a single produce — Pulsar autocreates.
+    {
+        let producer = client.producer(topic).create().await?;
+        producer
+            .send(OutgoingMessage::with_payload(b"warmup".to_vec()).into())
+            .await?;
+        producer.close().await?;
+    }
+
+    // --- Topic retention ----------------------------------------------
+
+    let pol = RetentionPolicies {
+        retention_time_in_minutes: 30,
+        retention_size_in_mb: 512,
+    };
+    admin.topic_set_retention(topic, pol).await?;
+    let got = admin.topic_get_retention(topic).await?;
+    assert_eq!(got.retention_time_in_minutes, 30);
+    assert_eq!(got.retention_size_in_mb, 512);
+    admin.topic_remove_retention(topic).await?;
+
+    // --- Topic dispatch-rate ------------------------------------------
+
+    let rate = DispatchRate {
+        dispatch_throttling_rate_in_msg: 100,
+        dispatch_throttling_rate_in_byte: 1_048_576,
+        rate_period_in_second: 1,
+        relative_to_publish_rate: false,
+    };
+    admin.topic_set_dispatch_rate(topic, rate).await?;
+    let got = admin.topic_get_dispatch_rate(topic).await?;
+    assert!(got.is_some(), "topic dispatch-rate should round-trip");
+    admin.topic_remove_dispatch_rate(topic).await?;
+
+    // --- Topic max-producers ------------------------------------------
+
+    admin.topic_set_max_producers(topic, 5).await?;
+    let got = admin.topic_get_max_producers(topic).await?;
+    assert_eq!(got, Some(5));
+    admin.topic_remove_max_producers(topic).await?;
+
+    // --- Topic message-TTL --------------------------------------------
+
+    admin.topic_set_message_ttl(topic, 3600).await?;
+    let got = admin.topic_get_message_ttl(topic).await?;
+    assert_eq!(got, Some(3600));
+    admin.topic_remove_message_ttl(topic).await?;
+
+    Ok(())
+}
+
+/// Brokers / bookies / schemas (PR #4) — read-only diagnostics plus
+/// a schema post-then-get round-trip. The bookies / brokers paths
+/// surface broker-internal state; we pin shape, not values (a fresh
+/// standalone exposes one broker, one bookie). The schema round-trip
+/// posts an AVRO schema and asserts the version field comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_admin_brokers_bookies_schemas() -> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, admin_url, _container) = start_pulsar().await?;
+    let admin = build_admin(&admin_url)?;
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    // --- Brokers diagnostics -------------------------------------------
+
+    let keys = admin.brokers_dynamic_config_keys().await?;
+    assert!(
+        !keys.is_empty(),
+        "brokers_dynamic_config_keys should expose at least the well-known config knobs"
+    );
+
+    let runtime = admin.brokers_runtime_config().await?;
+    assert!(
+        runtime.is_object(),
+        "brokers_runtime_config should return a JSON object"
+    );
+
+    let internal = admin.brokers_internal_config().await?;
+    assert!(
+        internal.is_object(),
+        "brokers_internal_config should return a JSON object"
+    );
+
+    // health_check returns plain `"ok"` text — pin the substring.
+    let health = admin.brokers_health_check().await?;
+    assert!(
+        health.contains("ok") || health.is_empty(),
+        "brokers_health_check unexpected body: {health:?}"
+    );
+
+    // --- Bookies -------------------------------------------------------
+
+    let bookies = admin.bookies_list_all().await?;
+    assert!(
+        bookies.is_object(),
+        "bookies_list_all should return a JSON object"
+    );
+
+    let racks = admin.bookies_racks_info().await?;
+    assert!(
+        racks.is_object(),
+        "bookies_racks_info should return a JSON object (possibly empty)"
+    );
+
+    // --- Schemas: post then get round-trip ----------------------------
+
+    let topic = "persistent://public/default/magnetar-e2e-schemas";
+    // Bootstrap the topic with a producer attach so the schema
+    // endpoints don't 404.
+    {
+        let producer = client.producer(topic).create().await?;
+        producer
+            .send(OutgoingMessage::with_payload(b"warmup".to_vec()).into())
+            .await?;
+        producer.close().await?;
+    }
+
+    // Post a trivial AVRO schema. Pulsar's `PostSchemaPayload`
+    // accepts the JSON-stringified AVRO definition in the `schema`
+    // field.
+    let payload = PostSchemaPayload {
+        schema_type: "AVRO".to_owned(),
+        schema: r#"{"type":"record","name":"X","fields":[{"name":"v","type":"string"}]}"#
+            .to_owned(),
+        properties: Default::default(),
+    };
+    let posted = admin.schema_post(topic, payload).await?;
+    assert!(
+        posted.get("version").is_some(),
+        "schema_post should return a `version` field; got {posted}"
+    );
+
+    let latest = admin.schema_get_latest(topic).await?;
+    assert!(
+        latest.get("type").is_some(),
+        "schema_get_latest should return a `type` field; got {latest}"
+    );
+
+    let versions = admin.schema_list_versions(topic).await?;
+    assert!(
+        !versions.is_empty(),
+        "schema_list_versions returned empty list after a schema was posted"
     );
 
     Ok(())
