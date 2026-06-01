@@ -773,6 +773,27 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's max-consumers-per-topic limit (or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/maxConsumersPerTopic`.
+    GetMaxConsumersPerTopic {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's max-consumers-per-topic limit. `0` disables.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/maxConsumersPerTopic`.
+    SetMaxConsumersPerTopic {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Max concurrent consumers per topic. `0` disables.
+        #[arg(long)]
+        max_consumers: i32,
+    },
+    /// Remove a namespace's max-consumers-per-topic limit override.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/maxConsumersPerTopic`.
+    RemoveMaxConsumersPerTopic {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1946,6 +1967,26 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         NamespacesCmd::RemoveMaxProducersPerTopic { namespace } => {
             admin
                 .namespace_remove_max_producers_per_topic(&namespace)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetMaxConsumersPerTopic { namespace } => print_json(
+            &admin
+                .namespace_get_max_consumers_per_topic(&namespace)
+                .await?,
+        ),
+        NamespacesCmd::SetMaxConsumersPerTopic {
+            namespace,
+            max_consumers,
+        } => {
+            admin
+                .namespace_set_max_consumers_per_topic(&namespace, max_consumers)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveMaxConsumersPerTopic { namespace } => {
+            admin
+                .namespace_remove_max_consumers_per_topic(&namespace)
                 .await?;
             Ok(())
         }
