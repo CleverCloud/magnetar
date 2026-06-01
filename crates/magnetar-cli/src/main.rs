@@ -14,6 +14,28 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+// The user-facing `magnetar` binary always needs TLS — both the admin
+// REST client (reqwest + rustls) and the data-plane runtime
+// (`magnetar-runtime-tokio` + tokio-rustls) bind a crypto provider at
+// compile time. Mirror the ADR-0035 guard from
+// `magnetar-runtime-tokio::tls_crypto` so a build with no provider
+// selected fails fast at compile time instead of silently shipping a
+// half-broken binary (admin HTTPS dead, runtime TLS only working via
+// `magnetar-runtime-tokio`'s own default). The admin library crate
+// keeps its no-TLS stub for HTTP-only library callers — this gate is
+// the binary's responsibility.
+#[cfg(not(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+)))]
+compile_error!(
+    "magnetar-cli: enable at least one of crypto-{aws-lc-rs,ring,openssl,fips}. \
+     The default feature set covers this; only `--no-default-features` users \
+     need to pick one explicitly."
+);
+
 mod version;
 
 use std::process::ExitCode;
