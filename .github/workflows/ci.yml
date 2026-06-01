@@ -117,16 +117,20 @@ jobs:
       # folded the former weekly `e2e-replicated-subs.yml` into per-PR CI
       # (the multi-cluster e2e_replicated_subscriptions test now runs
       # under `cargo test` like the rest of the e2e suite). The fixture
-      # must be healthy *before* `cargo test` starts so the test can
-      # connect to both brokers on `localhost:8080` / `localhost:8081`.
+      # is mapped to host ports 16650/16651/18080/18081 (off the default
+      # Pulsar 6650/8080) so it doesn't collide with the
+      # `testcontainers`-spawned brokers other e2e tests start — those
+      # brokers advertise themselves as `localhost:8080` internally and
+      # the conflict otherwise routes their lookup responses to this
+      # fixture's broker-a instead.
       - name: Bring up two-cluster Pulsar fixture (PIP-33)
         working-directory: crates/magnetar/tests/fixtures
         run: |
           set -euo pipefail
           docker compose -f docker-compose.replicated-subs.yml up -d
           # Wait for both brokers' admin endpoints to report healthy.
-          for url in http://localhost:8080/admin/v2/brokers/health \
-                     http://localhost:8081/admin/v2/brokers/health; do
+          for url in http://localhost:18080/admin/v2/brokers/health \
+                     http://localhost:18081/admin/v2/brokers/health; do
             attempts=60
             until curl -sf "$url" >/dev/null; do
               attempts=$((attempts - 1))

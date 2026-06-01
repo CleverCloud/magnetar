@@ -34,8 +34,14 @@ use std::time::Duration;
 use magnetar::PulsarClient;
 use magnetar::proto::pb::command_subscribe::SubType;
 
-const CLUSTER_A_URL: &str = "pulsar://localhost:6650";
-const CLUSTER_B_URL: &str = "pulsar://localhost:6651";
+// Host-side ports — match `fixtures/docker-compose.replicated-subs.yml`.
+// They're off the default Pulsar 6650 to avoid colliding with the
+// `testcontainers`-spawned brokers that other e2e tests start (those
+// brokers advertise themselves as `localhost:8080` internally, so a
+// fixed `localhost:6650` mapping here would route their lookup
+// responses back to the wrong broker).
+const CLUSTER_A_URL: &str = "pulsar://localhost:16650";
+const CLUSTER_B_URL: &str = "pulsar://localhost:16651";
 
 async fn build_client(url: &str) -> Result<PulsarClient, Box<dyn std::error::Error>> {
     Ok(PulsarClient::builder().service_url(url).build().await?)

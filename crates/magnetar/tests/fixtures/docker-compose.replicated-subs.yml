@@ -108,9 +108,19 @@ services:
     command: >
       bash -c "bin/apply-config-from-env.py conf/broker.conf &&
                exec bin/pulsar broker"
+    # Host ports moved off the default Pulsar 6650 / 8080 so this
+    # fixture doesn't collide with `testcontainers`-spawned brokers
+    # in other e2e tests (`e2e_cluster_failover.rs` etc.), which
+    # internally advertise themselves as `localhost:8080` — any
+    # lookup response routing the client back to host:8080 hits
+    # this fixture's broker-a instead of the testcontainers broker,
+    # producing a "Namespace bundle not served by this instance"
+    # error. ADR-0046 surfaced the conflict by folding the per-PR
+    # `test` job and the (former weekly) PIP-33 fixture into the
+    # same workflow run.
     ports:
-      - "6650:6650"
-      - "8080:8080"
+      - "16650:6650"
+      - "18080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
       interval: 5s
@@ -137,8 +147,8 @@ services:
       bash -c "bin/apply-config-from-env.py conf/broker.conf &&
                exec bin/pulsar broker"
     ports:
-      - "6651:6650"
-      - "8081:8080"
+      - "16651:6650"
+      - "18081:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
       interval: 5s
