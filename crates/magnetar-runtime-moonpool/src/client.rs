@@ -283,14 +283,22 @@ impl<P: Providers> Client<P> {
                     // pinned per-broker pool is wired through the engine's `connect_tls`
                     // entry, not through `lookup_topic_target`. Prefer the plain
                     // `broker_service_url` here for that reason.
-                    let broker_url = broker_service_url.or(broker_service_url_tls).ok_or_else(
-                        || {
+                    //
+                    // The advertised value is normalised to `host:port` via
+                    // [`proxy_broker_authority`] before being captured in
+                    // [`LookupTarget::Proxy`] so the (currently follow-up) moonpool proxy path
+                    // produces the same `CommandConnect.proxy_to_broker_url` wire bytes as the
+                    // tokio engine (see `magnetar_runtime_tokio::client::preferred_broker_url`
+                    // and ADR-0039).
+                    let raw = broker_service_url
+                        .or(broker_service_url_tls)
+                        .ok_or_else(|| {
                             ClientError::Other(format!(
                                 "lookup of '{topic}' set proxy_through_service_url=true but did \
                              not advertise a broker_service_url"
                             ))
-                        },
-                    )?;
+                        })?;
+                    let broker_url = proxy_broker_authority(&raw);
                     Ok(LookupTarget::Proxy { broker_url })
                 } else {
                     Ok(LookupTarget::Direct)
@@ -766,6 +774,32 @@ impl Future for RequestFut {
     }
 }
 
+/// Normalise an advertised broker URL into the `host:port` form expected on
+/// `CommandConnect.proxy_to_broker_url`. The Apache Pulsar Proxy parses that field
+/// via `InetSocketAddress.createUnresolved`, so passing `pulsar://host:port` makes
+/// `validateBrokerTarget()` return `false` and the proxy rejects the handshake with
+/// `ServerError.ServiceNotReady "Target broker cannot be validated"` (ADR-0039,
+/// parity with Java client + pulsar-rs + the tokio engine).
+///
+/// Mirrors `magnetar_runtime_tokio::client::preferred_broker_url`. The two engines
+/// pick their preferred URL differently — moonpool prefers `broker_service_url` so
+/// it can keep riding the plaintext bootstrap pipe (see [`Client::lookup_topic_target`])
+/// — but the scheme-strip step is identical.
+fn proxy_broker_authority(input: &str) -> String {
+    let (rest, default_port) = if let Some(rest) = input.strip_prefix("pulsar+ssl://") {
+        (rest, Some(6651u16))
+    } else if let Some(rest) = input.strip_prefix("pulsar://") {
+        (rest, Some(6650u16))
+    } else {
+        (input, None)
+    };
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    match default_port {
+        Some(port) if !host_port.contains(':') => format!("{host_port}:{port}"),
+        _ => host_port.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -773,7 +807,7 @@ mod tests {
     use magnetar_proto::ConnectionConfig;
     use moonpool_core::TokioProviders;
 
-    use super::{Client, ClientError, LookupTopicResult};
+    use super::{Client, ClientError, LookupTopicResult, proxy_broker_authority};
     use crate::{ConnectionShared, MoonpoolEngine, TopicListChange};
 
     /// `Client::connect_plain` is generic over `P: Providers` — name it to
@@ -886,5 +920,51 @@ mod tests {
     #[test]
     fn duration_marker() {
         let _ = Duration::from_millis(1);
+    }
+
+    #[test]
+    fn proxy_broker_authority_strips_pulsar_ssl_scheme() {
+        assert_eq!(
+            proxy_broker_authority("pulsar+ssl://b-c3-n12:6651"),
+            "b-c3-n12:6651"
+        );
+    }
+
+    #[test]
+    fn proxy_broker_authority_strips_pulsar_scheme() {
+        assert_eq!(
+            proxy_broker_authority("pulsar://b-c3-n12:6650"),
+            "b-c3-n12:6650"
+        );
+    }
+
+    #[test]
+    fn proxy_broker_authority_appends_default_port_for_pulsar_scheme() {
+        assert_eq!(proxy_broker_authority("pulsar://b-c3-n12"), "b-c3-n12:6650");
+    }
+
+    #[test]
+    fn proxy_broker_authority_appends_default_port_for_pulsar_ssl_scheme() {
+        assert_eq!(
+            proxy_broker_authority("pulsar+ssl://b-c3-n12"),
+            "b-c3-n12:6651"
+        );
+    }
+
+    #[test]
+    fn proxy_broker_authority_passes_through_bare_host_port() {
+        // Defensive: a broker that advertised `host:port` directly (no scheme) is forwarded
+        // unchanged.
+        assert_eq!(proxy_broker_authority("b-c3-n12:6650"), "b-c3-n12:6650");
+    }
+
+    #[test]
+    fn proxy_broker_authority_trims_trailing_path_segments() {
+        // Real lookup responses don't carry paths, but the helper is the only thing standing
+        // between the broker's string and `CommandConnect`, so be defensive.
+        assert_eq!(
+            proxy_broker_authority("pulsar://b-c3-n12:6650/extra/path"),
+            "b-c3-n12:6650"
+        );
     }
 }

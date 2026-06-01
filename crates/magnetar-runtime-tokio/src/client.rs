@@ -1023,14 +1023,32 @@ impl Client {
 /// the TLS URL when the bootstrap connection is on `pulsar+ssl://`, otherwise picks the
 /// plain URL. Returns `None` if the broker declined to advertise any URL (which the
 /// proxy contract says shouldn't happen but the broker is the broker).
+///
+/// The advertised value (e.g. `pulsar://broker-c3-n12:6650`) is normalised to the
+/// `host:port` form Apache Pulsar Proxy expects on
+/// `CommandConnect.proxy_to_broker_url` — the Java reference client and pulsar-rs both
+/// send it scheme-less. The proxy parses the field via
+/// `InetSocketAddress.createUnresolved`; an unstripped `pulsar://...` makes
+/// `validateBrokerTarget()` return `false` and the proxy rejects the handshake with
+/// `ServerError.ServiceNotReady "Target broker cannot be validated"`.
 fn preferred_broker_url(
     broker_url: Option<String>,
     broker_url_tls: Option<String>,
     scheme: Scheme,
 ) -> Option<String> {
-    match scheme {
+    let raw = match scheme {
         Scheme::Tls => broker_url_tls.or(broker_url),
         Scheme::Plain => broker_url.or(broker_url_tls),
+    }?;
+    if let Ok(parsed) = ParsedUrl::parse(&raw) {
+        Some(format!("{}:{}", parsed.host, parsed.port))
+    } else {
+        tracing::warn!(
+            broker_url = %raw,
+            "lookup advertised broker URL with unparseable scheme; \
+             forwarding unchanged — proxy may reject handshake",
+        );
+        Some(raw)
     }
 }
 
@@ -1283,3 +1301,62 @@ impl Future for EventWaitFut {
 // Keep the unused-imports happy on builds that don't enable the consumer/producer suite.
 #[allow(dead_code)]
 fn _opoutcome_usage_marker(_o: OpOutcome, _k: PendingOpKey) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_broker_url_strips_scheme_on_tls_bootstrap() {
+        let got = preferred_broker_url(
+            Some("pulsar://b-c3-n12:6650".to_owned()),
+            Some("pulsar+ssl://b-c3-n12:6651".to_owned()),
+            Scheme::Tls,
+        );
+        assert_eq!(got.as_deref(), Some("b-c3-n12:6651"));
+    }
+
+    #[test]
+    fn preferred_broker_url_strips_scheme_on_plain_bootstrap() {
+        let got = preferred_broker_url(
+            Some("pulsar://b-c3-n12:6650".to_owned()),
+            Some("pulsar+ssl://b-c3-n12:6651".to_owned()),
+            Scheme::Plain,
+        );
+        assert_eq!(got.as_deref(), Some("b-c3-n12:6650"));
+    }
+
+    #[test]
+    fn preferred_broker_url_falls_back_when_preferred_missing() {
+        // TLS bootstrap, but the broker only advertised the plain URL — fall back to plain.
+        let got =
+            preferred_broker_url(Some("pulsar://b-c3-n12:6650".to_owned()), None, Scheme::Tls);
+        assert_eq!(got.as_deref(), Some("b-c3-n12:6650"));
+    }
+
+    #[test]
+    fn preferred_broker_url_default_port_when_url_has_none() {
+        // Broker advertised a URL without explicit port. Default port from the URL scheme
+        // (NOT the bootstrap scheme) — same convention as pulsar-rs.
+        let got = preferred_broker_url(Some("pulsar://b-c3-n12".to_owned()), None, Scheme::Plain);
+        assert_eq!(got.as_deref(), Some("b-c3-n12:6650"));
+
+        let got = preferred_broker_url(None, Some("pulsar+ssl://b-c3-n12".to_owned()), Scheme::Tls);
+        assert_eq!(got.as_deref(), Some("b-c3-n12:6651"));
+    }
+
+    #[test]
+    fn preferred_broker_url_returns_none_when_no_url_advertised() {
+        assert!(preferred_broker_url(None, None, Scheme::Tls).is_none());
+        assert!(preferred_broker_url(None, None, Scheme::Plain).is_none());
+    }
+
+    #[test]
+    fn preferred_broker_url_passes_through_unparseable_input() {
+        // Defensive fallback: if the broker advertised a value we can't parse as a
+        // Pulsar URL, forward it as-is (with a warning). Better than dropping the
+        // lookup result on the floor.
+        let got = preferred_broker_url(Some("not a url".to_owned()), None, Scheme::Plain);
+        assert_eq!(got.as_deref(), Some("not a url"));
+    }
+}

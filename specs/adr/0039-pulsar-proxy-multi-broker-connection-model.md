@@ -1,9 +1,19 @@
 # ADR-0039 — Per-broker connection pool for the Apache Pulsar Proxy
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion)
 - **Date**: 2026-05-27
 - **Decider**: Florentin Dubois
 - **Tags**: architecture, proxy, lookup, connection-pool, runtime
+
+> **Amendment (2026-06-01, [ADR-0045](0045-proxy-to-broker-url-host-port-format.md)).**
+> The "Incompatibilities → None on the wire" claim below was inaccurate:
+> the proxy requires `CommandConnect.proxy_to_broker_url` to be `host:port`
+> (no scheme), parsed via `InetSocketAddress.createUnresolved`. Magnetar
+> previously stuffed the broker's advertised `pulsar://host:port` value
+> verbatim, which made the proxy reject the handshake with
+> `ServerError.ServiceNotReady "Target broker cannot be validated"`.
+> See [ADR-0045](0045-proxy-to-broker-url-host-port-format.md) for the
+> scheme-strip helpers and their tests.
 
 ## Context
 

@@ -13,14 +13,17 @@
 //!    `CommandSubscribe` on that connection — sending a data frame there triggers a panic in the
 //!    broker stub.
 //! 2. The runtime is expected to then open a **second** TCP connection with
-//!    `CommandConnect.proxy_to_broker_url = Some(<the broker URL>)`. The fake broker accepts it and
-//!    answers `CommandProducer` / `CommandSubscribe`.
+//!    `CommandConnect.proxy_to_broker_url = Some(<host:port of the advertised broker>)`. The fake
+//!    broker accepts it and answers `CommandProducer` / `CommandSubscribe`. The runtime strips the
+//!    `pulsar://` scheme before stuffing the value into `CommandConnect`, matching the Apache
+//!    Pulsar Java reference client and pulsar-rs — the proxy parses the field via
+//!    `InetSocketAddress.createUnresolved` and rejects anything other than `host:port`.
 //!
 //! The test asserts:
 //! - Exactly **two** TCP sessions are accepted (bootstrap + per-broker entry).
 //! - The bootstrap session's `CommandConnect` carries no `proxy_to_broker_url`.
-//! - The per-broker session's `CommandConnect` carries the broker URL the proxy advertised in the
-//!   lookup response.
+//! - The per-broker session's `CommandConnect` carries the `host:port` of the broker URL the proxy
+//!   advertised in the lookup response — no `pulsar://` scheme prefix.
 //! - The producer / consumer round-trip completes end-to-end through the pinned pool entry.
 //!
 //! Sibling moonpool simulation coverage lives in
@@ -55,10 +58,14 @@ struct SessionRecord {
 }
 
 /// Synthetic broker URL the fake proxy advertises in lookup responses. The
-/// runtime sets `CommandConnect.proxy_to_broker_url` to this exact string on
-/// the second connection. The host portion is meaningless — the client never
-/// dials it; the dial target stays the proxy address.
+/// host portion is meaningless — the client never dials it; the dial target
+/// stays the proxy address.
 const ADVERTISED_BROKER_URL: &str = "pulsar://broker-a.proxy.internal:6650";
+
+/// `host:port` form of [`ADVERTISED_BROKER_URL`]. This is what the runtime
+/// must put in `CommandConnect.proxy_to_broker_url` after stripping the
+/// `pulsar://` scheme (parity with Java + pulsar-rs; ADR-0039).
+const ADVERTISED_BROKER_HOST_PORT: &str = "broker-a.proxy.internal:6650";
 
 /// Spawn a fake Apache Pulsar Proxy on `127.0.0.1:0`. Returns the bound
 /// address (as a `pulsar://...` URL) and the per-session record log.
@@ -272,8 +279,9 @@ async fn open_producer_through_proxy_opens_second_connection() {
 
     assert_eq!(
         pinned.connect_proxy_to_broker_url.as_deref(),
-        Some(ADVERTISED_BROKER_URL),
-        "pinned CONNECT must set proxy_to_broker_url to the advertised broker URL"
+        Some(ADVERTISED_BROKER_HOST_PORT),
+        "pinned CONNECT must set proxy_to_broker_url to the host:port form of the advertised \
+         broker URL (no scheme prefix)"
     );
 
     // The bootstrap session saw the lookup; the pinned session saw the producer create.
@@ -337,8 +345,8 @@ async fn subscribe_through_proxy_opens_second_connection() {
     let pinned = &snapshot[1];
     assert_eq!(
         pinned.connect_proxy_to_broker_url.as_deref(),
-        Some(ADVERTISED_BROKER_URL),
-        "pinned CONNECT must set proxy_to_broker_url"
+        Some(ADVERTISED_BROKER_HOST_PORT),
+        "pinned CONNECT must set proxy_to_broker_url to host:port (no scheme)"
     );
     let pinned_kinds: Vec<_> = pinned
         .frames
