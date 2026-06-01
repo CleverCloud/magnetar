@@ -313,6 +313,63 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Bookies ---------------------------------------------------------
+
+    /// List every bookie the broker knows about — both writable and
+    /// read-only — as registered in `BookKeeper` metadata.
+    ///
+    /// `GET /admin/v2/bookies/all`. Returns the broker's
+    /// `BookiesClusterInfo` envelope — a `bookies: [{ address: "host:port" }]`
+    /// array. Raw JSON for forward-compat.
+    /// Java: `BookiesBase#getAllAvailableBookies`.
+    pub async fn bookies_list_all(&self) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["bookies", "all"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get every bookie's group + rack assignment, as configured for the
+    /// rack-aware placement policy.
+    ///
+    /// `GET /admin/v2/bookies/racks-info`. Returns the nested
+    /// `Map<group, Map<bookieAddress, BookieInfo>>` shape Pulsar
+    /// persists in metadata. Raw JSON because the wire shape exposes
+    /// nested maps that change between releases (the `default` group
+    /// is implicit on older brokers).
+    /// Java: `BookiesBase#getBookieRackInfo`.
+    pub async fn bookies_racks_info(&self) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["bookies", "racks-info"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set (or update) a bookie's rack assignment.
+    ///
+    /// `POST /admin/v2/bookies/racks-info/{bookie}` with a JSON
+    /// [`BookieInfo`] body. `bookie` is the `host:port` registered in
+    /// `BookKeeper` metadata. The placement policy picks up the new
+    /// rack on its next reconciliation tick.
+    /// Java: `BookiesBase#updateBookieRackInfo`.
+    pub async fn bookies_set_rack(&self, bookie: &str, info: BookieInfo) -> Result<(), AdminError> {
+        let url = self.url(&["bookies", "racks-info", bookie])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&info))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a bookie's rack assignment.
+    ///
+    /// `DELETE /admin/v2/bookies/racks-info/{bookie}`. The bookie falls
+    /// back to the placement policy's default group / rack until
+    /// [`Self::bookies_set_rack`] is called again.
+    /// Java: `BookiesBase#deleteBookieRackInfo`.
+    pub async fn bookies_delete_rack(&self, bookie: &str) -> Result<(), AdminError> {
+        let url = self.url(&["bookies", "racks-info", bookie])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Tenants ---------------------------------------------------------
 
     /// List tenants.
@@ -1506,6 +1563,24 @@ pub struct BacklogQuota {
     pub limit_time: i32,
     /// Action when the quota is exceeded.
     pub policy: String,
+}
+
+/// Java `BookieInfo` — a single bookie's group + rack assignment, as
+/// stored in the `racks-info` metadata path and shipped on
+/// [`AdminClient::bookies_set_rack`]. Field names are camelCase on the
+/// wire (matching `org.apache.pulsar.common.policies.data.BookieInfo`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BookieInfo {
+    /// Rack-aware placement group. Defaults to `"default"` when unset
+    /// in older brokers; modern brokers expose every group explicitly.
+    pub group: String,
+    /// Rack identifier within the group — opaque to the broker, only
+    /// the placement policy cares about it.
+    pub rack: String,
+    /// Resolved hostname for the bookie. The broker uses it for
+    /// log lines; it does not have to match DNS.
+    pub hostname: String,
 }
 
 /// Java `BacklogQuotaType` — selects which dimension a `BacklogQuota`
