@@ -28,6 +28,49 @@ use magnetar_proto::{
 };
 use magnetar_runtime_moonpool::ConnectionShared;
 
+/// Derive `count` deterministic `u64` seeds from the outer `MOONPOOL_SEED`
+/// env var (default `0x4242_4242_4242_4242` when unset).
+///
+/// Uses splitmix64 — a stateless integer hash widely used for seed expansion
+/// (no dep, public-domain construction). Daily-sweep failures reported via
+/// `MOONPOOL_SEED=<X>` reproduce bit-for-bit under the same env value
+/// (ADR-0036 / ADR-0047). Accepts both `0x…` hex and bare decimal — the
+/// daily-sweep workflow echoes both forms.
+///
+/// Wire into a sweep test as:
+///
+/// ```ignore
+/// let report = SimulationBuilder::new()
+///     .workload(broker)
+///     .workload(client)
+///     .set_debug_seeds(sweep_seeds(16))
+///     .set_iterations(16)
+///     .run();
+/// ```
+pub fn sweep_seeds(count: usize) -> Vec<u64> {
+    let base = std::env::var("MOONPOOL_SEED")
+        .ok()
+        .and_then(|s| {
+            let s = s.trim();
+            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<u64>().ok()
+            }
+        })
+        .unwrap_or(0x4242_4242_4242_4242_u64);
+    let mut x = base;
+    (0..count)
+        .map(|_| {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        })
+        .collect()
+}
+
 /// Build a synthetic `CommandConnected` frame matching the production engine's
 /// expectations. Mirrors the helper used by the per-module tests so chaos
 /// tests stay in lockstep when the handshake shape changes.

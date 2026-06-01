@@ -55,6 +55,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use valuable::Valuable;
 
+mod common;
+use common::sweep_seeds;
+
 /// Trail names shared by the in-sim broker (emitter) and the invariants
 /// (consumers). moonpool main replaced the legacy `StateHandle` timeline
 /// with plain-`tracing` capture: the broker emits correctness facts via
@@ -402,6 +405,7 @@ fn sim_handshake_sweep_16_seeds() {
     let _ = SimulationBuilder::new()
         .workload(BrokerWorkload::new())
         .workload(ClientWorkload::new())
+        .set_debug_seeds(sweep_seeds(16))
         .set_iterations(16)
         .run();
 }
@@ -1330,6 +1334,7 @@ fn sim_chaos_produce_consume_sweep_16_seeds() {
         .invariant(AckAfterReceiveInvariant::default())
         .invariant(NoDupOnAckedInvariant::default())
         .invariant(HandleResolutionInvariant::default())
+        .set_debug_seeds(sweep_seeds(16))
         .set_iterations(16)
         .run();
     // Safety invariants must hold on *every* seed (no `assert_always!`
@@ -1643,6 +1648,7 @@ fn sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds() {
     let _ = SimulationBuilder::new()
         .workload(DropsTcpAfterCreate::new(5))
         .workload(AntiThrashClientWorkload::new())
+        .set_debug_seeds(sweep_seeds(16))
         .set_iterations(16)
         .run();
 }
@@ -1939,6 +1945,7 @@ fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
             sessions: sessions.clone(),
         })
         .workload(ProxyClientWorkload::new(sessions))
+        .set_debug_seeds(sweep_seeds(8))
         .set_iterations(8)
         .run();
 }
@@ -2577,6 +2584,7 @@ fn sim_chaos_swizzle_clog_sweep_16_seeds() {
         ))
         .invariant(MonotonicMsgIdInvariant::default())
         .invariant(HandleResolutionInvariant::default())
+        .set_debug_seeds(sweep_seeds(16))
         .set_iterations(16)
         .run();
     assert!(

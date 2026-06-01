@@ -404,6 +404,12 @@ fn supervised_loop_redials_under_drop_accept_cycle_sweep_8_seeds() {
     let broker = DropAcceptCycleBroker::new(5);
     let sessions_accepted = broker.sessions_accepted.clone();
     let drops_performed = broker.drops_performed.clone();
+    // Curated regression seeds — hand-picked so every iteration drives the
+    // supervisor's redial body to completion (the cross-iteration
+    // `accepts >= 2` / `drops >= 2` totals below are the authoritative
+    // assertion). Unlike the `sim_chaos.rs` discovery sweeps, this is a
+    // pinned-anchor test (`set_debug_seeds` semantics, not `MOONPOOL_SEED`-
+    // derived); the name carries `sweep_8_seeds` for historical reasons.
     let report = SimulationBuilder::new()
         .workload(broker)
         .workload(SupervisedRedialClientWorkload::new())

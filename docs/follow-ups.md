@@ -39,7 +39,6 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | 1 | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
 | 2 | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
 | 3 | [Moonpool `ProxyConnectionPool` parity (proxy ✓ / multi-broker DIRECT pending)](#3-moonpool-proxyconnectionpool-parity) | 🟡 partial — the proxy arm is closed (2026-06-01, [ADR-0039 amendment](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md#moonpool-engine-parity-2026-06-01)); the multi-broker DIRECT arm from F7 lands on tokio but the moonpool engine still falls back to the bootstrap for `Direct { broker_url: Some(_) }`. One-line wiring through `pool::get_or_open(_, broker_url)` once the pool surface admits the DIRECT case. |
-| 4 | [`sim_chaos_produce_consume_sweep_16_seeds` non-`MOONPOOL_SEED` randomness](#4-sim_chaos_produce_consume_sweep_16_seeds-non-moonpool_seed-randomness) | 🧠 design fix needed — sweep test's internal 16-seed pick is not derived from the outer `MOONPOOL_SEED`, so daily-sweep failures cannot be reproduced via the registered seed (ADR-0047 §4 case 3 default state) |
 
 ---
 
@@ -132,47 +131,6 @@ hand-off is resolved.
 
 ```text
 /goal land a moonpool flavour of magnetar_runtime_tokio::pool::ProxyConnectionPool per docs/follow-ups.md §3 / ADR-0039 (including the 2026-06-01 multi-broker DIRECT amendment). Read crates/magnetar-runtime-tokio/src/pool.rs as the reference implementation, then port the pin-per-broker pool to crates/magnetar-runtime-moonpool/src/pool.rs over moonpool_core::Providers (NetworkProvider + clock injection per ADR-0011), preserving the get_or_open `proxy_to_broker_url: Option<String>` parameterisation so both proxy AND direct multi-broker routing share the pool. Wire it into the moonpool client's lookup path so `proxy_through_service_url = true` responses route through the pool instead of returning ClientError::ProxyUnsupportedOnUnsupervisedClient, AND the `Direct { broker_url: Some(url) }` non-bootstrap arm routes through the pool with `proxy_to_broker_url = None` instead of falling back to the bootstrap (crates/magnetar-runtime-moonpool/src/client.rs:362-376, crates/magnetar-runtime-moonpool/src/producer.rs:595). Remove the `TODO(proxy)` at crates/magnetar-runtime-moonpool/src/lib.rs:70. Land the four-layer test parity per ADR-0024 (proto unit, tokio integration, moonpool 1:1 integration, differential equivalence) plus an e2e exercise that piggybacks the existing crates/magnetar/tests/e2e_pulsar_proxy.rs fixture. After this lands, flip docs/parity-status.md + README.md's parity-matrix proxy row to genuinely ✅ on moonpool and trim the multi-broker DIRECT caveat from the parity row. Validation chain per CLAUDE.md.
-```
-
----
-
-## 4. `sim_chaos_produce_consume_sweep_16_seeds` non-`MOONPOOL_SEED` randomness
-
-**Gap.** The
-[`sim_chaos_produce_consume_sweep_16_seeds`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)
-test rolls 16 internal seeds and runs the chaos suite against each.
-Those 16 picks are NOT derived from the outer `MOONPOOL_SEED` env var
-that ADR-0036 / ADR-0047 use as the discovery + replay axis. The
-consequence: when the daily
-[`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml)
-flags a seed via "`sim_chaos_produce_consume_sweep_16_seeds` failed
-under `MOONPOOL_SEED=<X>`", replaying that exact `MOONPOOL_SEED`
-locally is **not** guaranteed to reproduce the failure — the internal
-16-pick may roll a different set of seeds the next run.
-
-Validated empirically: five seeds reported failing in the
-2026-05-30 → 2026-06-01 daily sweeps
-(`0xcc2a910b6988dcde`, `0xafc471307ad05238`, `0xe9b47c5615260922`,
-`0x0bd3ae5e3538fae6`, `0xc77e139889216916`) all pass under
-`MOONPOOL_SEED=<value> cargo test -p magnetar-runtime-moonpool
---no-default-features --features crypto-aws-lc-rs --locked` against
-`main` — the exact command the daily sweep and the per-PR
-`seed-replay` job now use.
-
-**Why it stays open.** Closing this requires
-`sim_chaos_produce_consume_sweep_16_seeds` to derive its internal
-16-pick from the outer `MOONPOOL_SEED` (e.g. via a seeded
-`rand_chacha::ChaCha20Rng::from_seed(MOONPOOL_SEED.to_le_bytes())`
-extended to 32 bytes), so the entire (`MOONPOOL_SEED` → 16 internal
-seeds → assertions) chain is bit-for-bit reproducible. Once that
-lands, the ADR-0047 §4 case-3 default state ("dig in anyway when it
-doesn't repro") collapses to case 2 ("reproduces locally → fix the
-bug").
-
-**`/goal` (ready to dispatch).**
-
-```text
-/goal close docs/follow-ups.md §4 by making `sim_chaos_produce_consume_sweep_16_seeds` (`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`) derive its internal 16-seed pick from the outer `MOONPOOL_SEED` env var. Seed a `rand_chacha::ChaCha20Rng` (or equivalent reproducible PRNG already in the workspace) from `MOONPOOL_SEED` extended/expanded to the PRNG's required key size, then generate 16 u64 seeds from it. Audit any sibling `*_sweep_*_seeds` tests in the same file for the same pattern (`sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds`, `sim_handshake_sweep_16_seeds`, `sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds`) and apply the same fix. Validate: pick a seed, run twice, assert the same set of pass/fail outcomes. Validation chain per CLAUDE.md. After this lands, the historical seeds that did not repro pre-fix can be retried; any that DO now repro get added to `known-failing.toml` as `status = "open"` with the corresponding `/goal` to fix.
 ```
 
 ---
