@@ -121,6 +121,78 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    /// List failure-domains configured on a cluster.
+    ///
+    /// `GET /admin/v2/clusters/{cluster}/failureDomains`. The broker returns
+    /// a `Map<String, FailureDomain>` keyed by domain name; each value
+    /// carries a `brokers: Set<String>` member. The map is exposed as a
+    /// raw `serde_json::Value` for forward-compat — broker minor versions
+    /// add fields.
+    /// Java: `ClustersBase#getFailureDomains`.
+    pub async fn cluster_failure_domains_list(
+        &self,
+        cluster: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["clusters", cluster, "failureDomains"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get one failure-domain by name.
+    ///
+    /// `GET /admin/v2/clusters/{cluster}/failureDomains/{domain}`.
+    /// Java: `ClustersBase#getDomain`.
+    pub async fn cluster_failure_domain_get(
+        &self,
+        cluster: &str,
+        domain: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["clusters", cluster, "failureDomains", domain])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// List namespace-isolation policies configured on a cluster.
+    ///
+    /// `GET /admin/v2/clusters/{cluster}/namespaceIsolationPolicies`. The
+    /// broker returns a `Map<String, NamespaceIsolationData>` carrying
+    /// the namespace regex, primary/secondary broker lists, and the
+    /// auto-failover policy. Exposed as raw JSON for forward-compat.
+    /// Java: `ClustersBase#getNamespaceIsolationPolicies`.
+    pub async fn namespace_isolation_policies_list(
+        &self,
+        cluster: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["clusters", cluster, "namespaceIsolationPolicies"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    // --- Brokers ---------------------------------------------------------
+
+    /// List active brokers in a cluster.
+    ///
+    /// `GET /admin/v2/brokers/{cluster}`. Returns a list of `host:port`
+    /// strings — one entry per broker that's currently registered with
+    /// the cluster's metadata store. Java: `BrokersBase#getActiveBrokers`.
+    pub async fn brokers_list(&self, cluster: &str) -> Result<Vec<String>, AdminError> {
+        let url = self.url(&["brokers", cluster])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get the current leader broker for the cluster.
+    ///
+    /// `GET /admin/v2/brokers/leaderBroker`. Returns `{ serviceUrl,
+    /// brokerId }`. Exposed as raw JSON for forward-compat — newer
+    /// brokers add `clusterName` and similar fields.
+    /// Java: `BrokersBase#getLeaderBroker`.
+    pub async fn brokers_leader(&self) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["brokers", "leaderBroker"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
     // --- Tenants ---------------------------------------------------------
 
     /// List tenants.

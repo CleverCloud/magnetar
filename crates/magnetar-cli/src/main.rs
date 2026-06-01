@@ -197,6 +197,11 @@ pub(crate) enum AdminCmd {
         #[command(subcommand)]
         sub: SubscriptionsCmd,
     },
+    /// Broker diagnostics (`/admin/v2/brokers/...`).
+    Brokers {
+        #[command(subcommand)]
+        sub: BrokersCmd,
+    },
 }
 
 /// `admin clusters <verb>`.
@@ -204,6 +209,40 @@ pub(crate) enum AdminCmd {
 pub(crate) enum ClustersCmd {
     /// List clusters.
     List,
+    /// List failure-domains configured on a cluster.
+    /// `GET /admin/v2/clusters/{cluster}/failureDomains`.
+    ListFailureDomains {
+        /// Cluster name.
+        cluster: String,
+    },
+    /// Get one failure-domain by name.
+    /// `GET /admin/v2/clusters/{cluster}/failureDomains/{domain}`.
+    GetFailureDomain {
+        /// Cluster name.
+        cluster: String,
+        /// Failure-domain name.
+        domain: String,
+    },
+    /// List namespace-isolation policies on a cluster.
+    /// `GET /admin/v2/clusters/{cluster}/namespaceIsolationPolicies`.
+    ListNamespaceIsolationPolicies {
+        /// Cluster name.
+        cluster: String,
+    },
+}
+
+/// `admin brokers <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum BrokersCmd {
+    /// List active brokers in a cluster.
+    /// `GET /admin/v2/brokers/{cluster}`.
+    List {
+        /// Cluster name.
+        cluster: String,
+    },
+    /// Get the current cluster-level leader broker.
+    /// `GET /admin/v2/brokers/leaderBroker`.
+    Leader,
 }
 
 /// `admin tenants <verb>`.
@@ -616,6 +655,7 @@ async fn run_admin(
         AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, sub).await,
         AdminCmd::Topics { sub } => run_admin_topics(&admin, sub).await,
         AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
+        AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
     }
 }
 
@@ -696,6 +736,22 @@ async fn run_admin_subscriptions(
 async fn run_admin_clusters(admin: &AdminClient, cmd: ClustersCmd) -> Result<(), CliError> {
     match cmd {
         ClustersCmd::List => print_json(&admin.cluster_list().await?),
+        ClustersCmd::ListFailureDomains { cluster } => {
+            print_json(&admin.cluster_failure_domains_list(&cluster).await?)
+        }
+        ClustersCmd::GetFailureDomain { cluster, domain } => {
+            print_json(&admin.cluster_failure_domain_get(&cluster, &domain).await?)
+        }
+        ClustersCmd::ListNamespaceIsolationPolicies { cluster } => {
+            print_json(&admin.namespace_isolation_policies_list(&cluster).await?)
+        }
+    }
+}
+
+async fn run_admin_brokers(admin: &AdminClient, cmd: BrokersCmd) -> Result<(), CliError> {
+    match cmd {
+        BrokersCmd::List { cluster } => print_json(&admin.brokers_list(&cluster).await?),
+        BrokersCmd::Leader => print_json(&admin.brokers_leader().await?),
     }
 }
 
