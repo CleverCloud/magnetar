@@ -10,7 +10,7 @@
 //! `removeRetention`, …).
 
 use magnetar_admin::{
-    AdminClient, BacklogQuota, BacklogQuotaType, DispatchRate, PersistencePolicies,
+    AdminClient, BacklogQuota, BacklogQuotaType, DispatchRate, PersistencePolicies, PublishRate,
     RetentionPolicies,
 };
 use wiremock::matchers::{body_json, method, path, query_param};
@@ -448,4 +448,61 @@ async fn topic_replicator_dispatch_rate_get_set_remove_cycle() {
         .topic_remove_replicator_dispatch_rate("acme/svc/orders")
         .await
         .expect("remove topic replicator dispatch rate");
+}
+
+#[tokio::test]
+async fn topic_publish_rate_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/publishRate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "publishThrottlingRateInMsg": 5000,
+            "publishThrottlingRateInByte": 2097152_i64,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/publishRate"))
+        .and(body_json(serde_json::json!({
+            "publishThrottlingRateInMsg": -1,
+            "publishThrottlingRateInByte": -1,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/publishRate"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let rate = admin
+        .topic_get_publish_rate("acme/svc/orders")
+        .await
+        .expect("get topic publish rate")
+        .expect("non-null body");
+    assert_eq!(rate.publish_throttling_rate_in_msg, 5000);
+    assert_eq!(rate.publish_throttling_rate_in_byte, 2_097_152);
+
+    admin
+        .topic_set_publish_rate(
+            "acme/svc/orders",
+            PublishRate {
+                publish_throttling_rate_in_msg: -1,
+                publish_throttling_rate_in_byte: -1,
+            },
+        )
+        .await
+        .expect("set topic publish rate");
+    admin
+        .topic_remove_publish_rate("acme/svc/orders")
+        .await
+        .expect("remove topic publish rate");
 }

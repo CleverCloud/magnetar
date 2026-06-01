@@ -949,6 +949,30 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
     },
+    /// Get a topic's publish-rate policy (or `null` if no override).
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/publishRate`.
+    GetPublishRate {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's publish-rate policy (overrides namespace default).
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/publishRate`.
+    SetPublishRate {
+        /// Fully qualified topic.
+        topic: String,
+        /// Throttle in messages/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_msg: i32,
+        /// Throttle in bytes/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_byte: i64,
+    },
+    /// Remove a topic's publish-rate policy.
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/publishRate`.
+    RemovePublishRate {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1925,6 +1949,29 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemoveReplicatorDispatchRate { topic } => {
             admin.topic_remove_replicator_dispatch_rate(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::GetPublishRate { topic } => {
+            print_json(&admin.topic_get_publish_rate(&topic).await?)
+        }
+        TopicsCmd::SetPublishRate {
+            topic,
+            rate_msg,
+            rate_byte,
+        } => {
+            admin
+                .topic_set_publish_rate(
+                    &topic,
+                    PublishRate {
+                        publish_throttling_rate_in_msg: rate_msg,
+                        publish_throttling_rate_in_byte: rate_byte,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        TopicsCmd::RemovePublishRate { topic } => {
+            admin.topic_remove_publish_rate(&topic).await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,
