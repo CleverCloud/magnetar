@@ -27,7 +27,7 @@ ERROR magnetar: engine error: open_producer: other: handshake failed:
 Reference clients send the value scheme-less:
 
 - **Java** — `ClientCnx#channelActive` builds the target via `String.format("%s:%d", logicalAddress.getHostString(), logicalAddress.getPort())` before passing it to `Commands.newConnect(..., targetBroker)`.
-- **pulsar-rs** — `service_discovery.rs:135` builds `broker_url = format!("{}:{}", u.host_str().unwrap(), u.port().unwrap_or(broker_port))` with `broker_port = 6650` for `pulsar` and `6651` for `pulsar+ssl`; this is the value `connection_manager.rs:368` stuffs into `CommandConnect.proxy_to_broker_url`.
+- **pulsar-rs** — `service_discovery.rs:135` (pulsar-rs, external reference) builds `broker_url = format!("{}:{}", u.host_str().unwrap(), u.port().unwrap_or(broker_port))` with `broker_port = 6650` for `pulsar` and `6651` for `pulsar+ssl`; this is the value `connection_manager.rs:368` (pulsar-rs, external reference) stuffs into `CommandConnect.proxy_to_broker_url`.
 
 ## Decision
 

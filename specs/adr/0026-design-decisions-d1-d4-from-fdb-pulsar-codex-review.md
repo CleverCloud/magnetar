@@ -124,7 +124,7 @@ _Update (2026-05-26):_ SASL Kerberos / GSSAPI ✅ has now also landed via [ADR-0
   `sim_handshake_smoke` (1 iter) and `sim_handshake_sweep_16_seeds` (16 iter) run under `SimulationBuilder`.
   ADR-0024 carve-out recorded in xtask's `PARITY_EXEMPT_FILES` constant.
 - **D1 phase 1** — `magnetar::engine::TransactionApi` extension trait + tokio delegate impl (commit `1258b89`).
-- **D1 phase 2-4** — moonpool port + `MoonpoolClientState` impl + façade rewrite to `impl<E: Engine + TransactionApi> PulsarClient<E>` + 4+4 mirror tests + parity-status row flip (commit `ab9041b` + the intervening commits).
+- **D1 phase 2-4** — moonpool port + `MoonpoolClientState` impl + façade rewrite to `impl<E: Engine + TransactionApi> PulsarClient<E>` + 4+4 mirror tests + parity-matrix row flip in [`README.md`](../../README.md#java-client-parity-matrix) (commit `ab9041b` + the intervening commits).
   Sub-PR template for the remaining seven surface lifts (Producer/Consumer foundational lift first, then Reader → TypedSchemas → MultiTopics → PartitionedProducer → PartitionedConsumer → PatternConsumer → TableView) documented in `docs/follow-ups.md` under "Façade surface bound to PulsarClient<MoonpoolEngine<P>>".
 
 Each commit ships its own validation chain per ADR-0024.

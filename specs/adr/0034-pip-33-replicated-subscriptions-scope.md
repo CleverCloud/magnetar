@@ -22,8 +22,8 @@ The amendment lifting PIP-33 out of the original ADR-0010 core-parity scope foll
 ## Decision
 
 - **Wire-protocol delta vs. current vendored PulsarApi.proto: none.** All wire pieces are present:
-  - `CommandSubscribe.replicateSubscriptionState` ([`PulsarApi.proto:397-398`](../../crates/magnetar-proto/proto/PulsarApi.proto)).
-  - `MarkerType::REPLICATED_SUBSCRIPTION_*` enum + `ReplicatedSubscriptionsSnapshotRequest` / `ReplicatedSubscriptionsSnapshotResponse` / `ReplicatedSubscriptionsSnapshot` / `ReplicatedSubscriptionsUpdate` messages ([`PulsarMarkers.proto:28-33,40-82`](../../crates/magnetar-proto/proto/PulsarMarkers.proto)).
+  - `CommandSubscribe.replicateSubscriptionState` ([`crates/magnetar-proto/proto/PulsarApi.proto:397-401`](../../crates/magnetar-proto/proto/PulsarApi.proto)).
+  - `MarkerType::REPLICATED_SUBSCRIPTION_*` enum + `ReplicatedSubscriptionsSnapshotRequest` / `ReplicatedSubscriptionsSnapshotResponse` / `ReplicatedSubscriptionsSnapshot` / `ReplicatedSubscriptionsUpdate` messages ([`crates/magnetar-proto/proto/PulsarMarkers.proto:28-33,40-82`](../../crates/magnetar-proto/proto/PulsarMarkers.proto)).
     No proto bump required.
 
 - **`magnetar-proto` state-machine additions.**

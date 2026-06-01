@@ -217,7 +217,7 @@ The Pulsar 5.0 only `CommandScalableTopicLookup` path is **owned by [PIP-460](pi
 | v4 ↔ v5 delegation glue                                     | ~150      |
 | Tests (b) + (c) mirrored                                    | ~300      |
 | Doc-tests + module banner                                   | ~50       |
-| README / parity matrix / `docs/parity-status.md` update     | ~50       |
+| README parity-matrix row update                             | ~50       |
 | E2E mirror tests (×3)                                       | ~150      |
 | **Total**                                                   | **~1080** |
 
@@ -256,8 +256,7 @@ PIP-466 can land **in parallel** with PIP-460, PIP-180, and PIP-33.
 ## 8. Documentation deliverables (same wave)
 
 - [`docs/pip-features.md#v5-client-surface-pip-466`](../../docs/pip-features.md#v5-client-surface-pip-466) — V5 surface overview, experimental banner, mapping table, examples.
-- `docs/parity-status.md` — PIP-466 row, `🟡 experimental — Stream/Queue consumers + Producer; no Reader/TableView/Transaction/CheckpointConsumer in V5 module`.
-- `README.md` — parity-matrix row update.
+- [`README.md`](../../README.md#java-client-parity-matrix) — parity-matrix row update (canonical row); the PIP-466 entry lands marked `🟡 experimental — Stream/Queue consumers + Producer; no Reader/TableView/Transaction/CheckpointConsumer in V5 module`.
 - `specs/README.md` — flip ADR-0032 to `Accepted` on sign-off.
 - `docs/follow-ups.md` — follow-up list: V5 `Reader`, `TableView`, `Transaction`, `CheckpointConsumer`; V5-by-default decision.
 

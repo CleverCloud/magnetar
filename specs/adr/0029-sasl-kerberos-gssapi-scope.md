@@ -12,7 +12,7 @@
 The rationale recorded there was that GSSAPI is a large, multi-stakeholder external dependency (`libgssapi`, MIT/Heimdal KRB5 runtime, JAAS-style JAAS section semantics) whose scope was not proportional to the near-term demand from Clever Cloud's use cases.
 The parity matrix in `README.md` previously marked the mechanism `🟡 partial — PLAIN only, GSSAPI follow-up`.
 
-Today the scaffolding for the deferred mechanism is in place: `magnetar-auth-sasl` ships `SaslKerberos` (see [`crates/magnetar-auth-sasl/src/lib.rs:67-100`](../../crates/magnetar-auth-sasl/src/lib.rs)) whose `AuthProvider::initial` returns `AuthError::Unsupported("Kerberos/GSSAPI requires the kerberos feature flag")` unconditionally — even with the `kerberos` feature enabled the message just changes to "feature-gated but the implementation is not yet wired up".
+Today the scaffolding for the deferred mechanism is in place: `magnetar-auth-sasl` ships `SaslKerberos` (see [`crates/magnetar-auth-sasl/src/kerberos.rs`](../../crates/magnetar-auth-sasl/src/kerberos.rs), `pub struct SaslKerberos` + `impl AuthProvider for SaslKerberos`) whose `AuthProvider::initial` returns `AuthError::Unsupported("Kerberos/GSSAPI requires the kerberos feature flag")` unconditionally — even with the `kerberos` feature enabled the message just changes to "feature-gated but the implementation is not yet wired up".
 The protocol layer already understands the asynchronous auth challenge/response handshake: `CommandAuthChallenge` / `CommandAuthResponse` are present in the vendored proto ([`crates/magnetar-proto/proto/PulsarApi.proto:329-337,1300-1301`](../../crates/magnetar-proto/proto/PulsarApi.proto)), and protocol version V14 is already advertised on `CONNECT`.
 The wire is ready; the mechanism implementation is not.
 
@@ -104,5 +104,5 @@ Accepted — landed via `feat/sasl-kerberos` on 2026-05-26.
   <https://pulsar.apache.org/docs/security-kerberos/>
 - `libgssapi` (Rust binding) —
   <https://crates.io/crates/libgssapi>
-- `crates/magnetar-auth-sasl/src/lib.rs:67-100` — current `SaslKerberos` scaffold returning `AuthError::Unsupported`.
+- `crates/magnetar-auth-sasl/src/kerberos.rs` — `SaslKerberos` provider + `GssapiClient` sans-io seam + `ScriptedGssapiClient` test driver; `crates/magnetar-auth-sasl/src/gssapi.rs` carries the `LibGssapiClient` production binding under the `kerberos` cargo feature.
 - `crates/magnetar-proto/proto/PulsarApi.proto:329-337,1300-1301` — `CommandAuthChallenge` / `CommandAuthResponse` already vendored.

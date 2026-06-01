@@ -15,7 +15,7 @@ The pattern is described in:
 - [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#foundationdb-simulator-the-reference-implementation) — "FoundationDB simulator → Fault injection → Swizzle-clogging" — the research note this plan operationalises.
 - Simulation-deepening rollout (removed after landing) §P3 — the sequenced implementation plan that put this ADR in flight; consolidated into ADRs 0047–0050.
 
-The chaos broker can drop one connection today (see `DropsTcpAfterCreate` at `sim_chaos.rs:1200`), but stopping N random _consumers'_ permit issuance and then restoring them in a different order is not yet expressible.
+The chaos broker can drop one connection today (see `DropsTcpAfterCreate` at [`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs:1385`](../../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)), but stopping N random _consumers'_ permit issuance and then restoring them in a different order is not yet expressible.
 That's exactly the bug shape FDB calls out: a consumer that lost permits during a partition and gets resumed last (after every other peer has already drained their queue) is a different code path from a consumer that resumed first — and both are different from the no-partition path.
 
 ## Decision

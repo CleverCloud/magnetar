@@ -472,8 +472,7 @@ No revert PR needed; pre-PIP-460-compatible callers are unaffected.
 ## 8. Documentation deliverables (same wave)
 
 - [`docs/pip-features.md#scalable-topics-pip-460--experimental`](../../docs/pip-features.md#scalable-topics-pip-460--experimental) — surface overview, experimental banner, drop-on-change semantics, examples.
-- `docs/parity-status.md` — add PIP-460 row, `🟡 experimental`.
-- `README.md` — Java-client parity matrix row update.
+- [`README.md`](../../README.md#java-client-parity-matrix) — Java-client parity matrix row update (canonical row; the PIP-460 entry lands marked `🟡 experimental`).
 - `specs/README.md` ADR index — flip ADR-0031 status to `Accepted` the moment Florentin signs the proposal off.
 - `docs/follow-ups.md` — record follow-up items: QueueConsumer, CheckpointConsumer, controller election, transparent failover.
 

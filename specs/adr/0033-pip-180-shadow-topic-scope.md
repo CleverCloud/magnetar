@@ -27,7 +27,7 @@ This ADR locks the PIP-180 surface: producer-side `CommandSend` shadow `message_
 
 ## Decision
 
-- **Wire-protocol delta vs. current vendored PulsarApi.proto: none.** PIP-180's optional `message_id` on `CommandSend` is already present in the vendored proto ([`PulsarApi.proto:547`](../../crates/magnetar-proto/proto/PulsarApi.proto) comment).
+- **Wire-protocol delta vs. current vendored PulsarApi.proto: none.** PIP-180's optional `message_id` on `CommandSend` is already present in the vendored proto ([`crates/magnetar-proto/proto/PulsarApi.proto:547`](../../crates/magnetar-proto/proto/PulsarApi.proto) comment).
   No proto bump required.
   The producer encoder needs to start **emitting** the field on the shadow-replication path; today it never does.
 
