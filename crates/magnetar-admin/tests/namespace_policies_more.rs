@@ -369,3 +369,53 @@ async fn max_unacked_messages_per_consumer_get_set_remove_cycle() {
         .await
         .expect("remove max unacked per consumer");
 }
+
+#[tokio::test]
+async fn max_unacked_messages_per_subscription_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/maxUnackedMessagesPerSubscription",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(200_000)))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/maxUnackedMessagesPerSubscription",
+        ))
+        .and(body_json(serde_json::json!(400_000)))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/maxUnackedMessagesPerSubscription",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    assert_eq!(
+        admin
+            .namespace_get_max_unacked_messages_per_subscription("acme/svc")
+            .await
+            .expect("get max unacked per subscription"),
+        Some(200_000)
+    );
+    admin
+        .namespace_set_max_unacked_messages_per_subscription("acme/svc", 400_000)
+        .await
+        .expect("set max unacked per subscription");
+    admin
+        .namespace_remove_max_unacked_messages_per_subscription("acme/svc")
+        .await
+        .expect("remove max unacked per subscription");
+}

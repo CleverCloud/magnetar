@@ -1294,6 +1294,71 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's max-unacked-messages-per-subscription limit.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerSubscription`.
+    /// Returns a bare integer (the broker's per-subscription unacked
+    /// ceiling — once exceeded the broker stops dispatching to every
+    /// consumer on that subscription), or `null` (decoded as `None`)
+    /// when the broker default applies.
+    /// Java: `NamespacesBase#getMaxUnackedMessagesPerSubscription`.
+    pub async fn namespace_get_max_unacked_messages_per_subscription(
+        &self,
+        ns: &str,
+    ) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "maxUnackedMessagesPerSubscription",
+        ])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's max-unacked-messages-per-subscription limit.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerSubscription`
+    /// with a bare JSON integer body. `0` disables the limit.
+    /// Java: `NamespacesBase#setMaxUnackedMessagesPerSubscription`.
+    pub async fn namespace_set_max_unacked_messages_per_subscription(
+        &self,
+        ns: &str,
+        max_unacked: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "maxUnackedMessagesPerSubscription",
+        ])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&max_unacked))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's max-unacked-messages-per-subscription override.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerSubscription`.
+    /// Java: `NamespacesBase#removeMaxUnackedMessagesPerSubscription`.
+    pub async fn namespace_remove_max_unacked_messages_per_subscription(
+        &self,
+        ns: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "maxUnackedMessagesPerSubscription",
+        ])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
