@@ -265,6 +265,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(err) => {
             eprintln!("magnetar: failed to start tokio runtime: {err}");
+            print_source_chain(&err);
             return ExitCode::from(1);
         }
     };
@@ -273,17 +274,41 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("magnetar: {err}");
+            print_source_chain(&err);
             ExitCode::from(1)
         }
     }
 }
 
+/// Print the `Display` chain of `err.source()` recursively to stderr,
+/// indented under the caller's already-printed top-level message.
+///
+/// `reqwest::Error`'s `Display` only renders its own top-level message
+/// (e.g. "error sending request for url (https://…)"). The underlying
+/// cause — `hyper` connector error, `rustls` handshake failure, missing
+/// TLS backend, DNS — sits in `.source()`. Walking the chain surfaces
+/// it so operators don't have to bisect the binary's feature flags or
+/// re-run under tcpdump just to find out *why* a request died.
+fn print_source_chain(err: &dyn std::error::Error) {
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprintln!("  caused by: {cause}");
+        source = cause.source();
+    }
+}
+
 fn init_tracing(verbose: u8) {
+    // Step 4+ pulls in the transport stack (`hyper`, `rustls`, `h2`) —
+    // that is where TLS handshakes and connector errors actually log.
+    // Without these directives `-vvvvv` is silent on the layer where
+    // most admin REST failures happen.
     let default = match verbose {
         0 => "magnetar=info",
         1 => "magnetar=debug",
         2 => "magnetar=trace",
-        _ => "magnetar=trace,reqwest=debug",
+        3 => "magnetar=trace,reqwest=debug",
+        4 => "magnetar=trace,reqwest=debug,hyper=debug,rustls=debug,h2=debug",
+        _ => "magnetar=trace,reqwest=trace,hyper=trace,rustls=trace,h2=trace",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
@@ -511,7 +536,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
     /// Underlying admin client failure.
-    #[error("{0}")]
+    #[error(transparent)]
     Admin(#[from] AdminError),
     /// Bad CLI argument that clap could not catch.
     #[error("bad argument: {0}")]
@@ -520,10 +545,10 @@ pub(crate) enum CliError {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     /// Underlying magnetar (data-plane) façade failure.
-    #[error("{0}")]
+    #[error(transparent)]
     Pulsar(#[from] magnetar::PulsarError),
     /// Underlying tokio engine failure (producer/consumer ops).
-    #[error("{0}")]
+    #[error(transparent)]
     Client(#[from] ClientError),
     /// I/O error while reading stdin or writing stdout.
     #[error("io: {0}")]

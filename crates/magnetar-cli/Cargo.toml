@@ -26,13 +26,39 @@ doc  = false
 workspace = true
 
 [features]
+default = ["crypto-aws-lc-rs"]
+
 # PIP-460 scalable topics (ADR-0031). Default OFF. Adds the `topic-info`
 # subcommand (prints a scalable topic's segment DAG). Propagates the façade's
 # experimental scalable surface.
 scalable-topics = ["magnetar/scalable-topics", "magnetar-admin/scalable-topics"]
 
+# --- Crypto provider features (ADR-0035). Mirror the façade's pluggable
+# rustls crypto backend down into the binary crate. `magnetar-admin` is
+# imported directly here (not through the façade's `admin` feature), so
+# the cascade has to forward to it explicitly — otherwise reqwest in the
+# admin client is compiled without any TLS feature and every `https://`
+# admin URL fails at the connector layer. Single-provider builds use
+# `--no-default-features --features crypto-<x>`. ---
+crypto-aws-lc-rs = [
+    "magnetar/crypto-aws-lc-rs",
+    "magnetar-admin/crypto-aws-lc-rs",
+]
+crypto-ring = [
+    "magnetar/crypto-ring",
+    "magnetar-admin/crypto-ring",
+]
+crypto-openssl = [
+    "magnetar/crypto-openssl",
+    "magnetar-admin/crypto-openssl",
+]
+crypto-fips = [
+    "magnetar/crypto-fips",
+    "magnetar-admin/crypto-fips",
+]
+
 [dependencies]
-magnetar           = { workspace = true, features = ["tokio"] }
+magnetar           = { workspace = true, default-features = false, features = ["tokio"] }
 magnetar-admin     = { workspace = true }
 anstream           = "1"
 anstyle            = "1"

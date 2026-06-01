@@ -30,7 +30,12 @@ categories    = ["asynchronous", "network-programming"]
 
 [workspace.dependencies]
 # Internal crates
-magnetar                 = { version = "^0.1.0-dev.0", path = "crates/magnetar" }
+# `default-features = false` so the only consumer (magnetar-cli) can pick
+# its own `crypto-*` provider via `--no-default-features --features
+# crypto-ring|openssl|fips`. Without this, the façade's own defaults
+# (`tokio` + `crypto-aws-lc-rs`) leak in and produce a multi-provider
+# build for any single-provider override. ADR-0035 §1.
+magnetar                 = { version = "^0.1.0-dev.0", path = "crates/magnetar", default-features = false }
 magnetar-admin           = { version = "^0.1.0-dev.0", path = "crates/magnetar-admin" }
 magnetar-auth-athenz     = { version = "^0.1.0-dev.0", path = "crates/magnetar-auth-athenz" }
 magnetar-auth-oauth2     = { version = "^0.1.0-dev.0", path = "crates/magnetar-auth-oauth2" }

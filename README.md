@@ -175,6 +175,12 @@ cargo build -p magnetar --no-default-features --features tokio,crypto-aws-lc-rs
 cargo build -p magnetar --no-default-features --features tokio,crypto-ring
 cargo build -p magnetar --no-default-features --features tokio,crypto-openssl   # needs system OpenSSL
 cargo build -p magnetar --no-default-features --features tokio,crypto-fips      # needs cmake + C toolchain
+
+# The `magnetar` binary (magnetar-cli) mirrors the same cascade — the
+# admin REST client (reqwest + rustls) and the data-plane runtime both
+# bind to the selected provider. `cargo build -p magnetar-cli` alone
+# defaults to `crypto-aws-lc-rs`.
+cargo build -p magnetar-cli --no-default-features --features crypto-ring
 ```
 
 Under `cargo build --workspace --all-features` the compile-time cfg
