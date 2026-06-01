@@ -23,7 +23,7 @@
 //!
 //! # Sans-io contract
 //!
-//! `magnetar-proto` does NOT depend on the [`rand`] crate. The helper
+//! `magnetar-proto` does NOT depend on the `rand` crate. The helper
 //! abstracts the RNG via a closure so the engine owns the dependency.
 //! This preserves [ADR-0004](../specs/adr/0004-sans-io-protocol-core.md)
 //! (zero I/O deps in the proto crate) and aligns with
