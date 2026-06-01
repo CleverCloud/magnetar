@@ -193,6 +193,91 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    /// List the names of all dynamic-config keys the broker exposes.
+    ///
+    /// `GET /admin/v2/brokers/configuration`. Returns the bare list of
+    /// `ServiceConfiguration` fields tagged `@FieldContext(dynamic = true)`
+    /// — the set of keys that `brokers_set_dynamic_config` accepts. Use
+    /// [`Self::brokers_dynamic_config_overrides`] for the current values.
+    /// Java: `BrokersBase#getDynamicConfigurationName`.
+    pub async fn brokers_dynamic_config_keys(&self) -> Result<Vec<String>, AdminError> {
+        let url = self.url(&["brokers", "configuration"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get the currently-overridden dynamic configuration values.
+    ///
+    /// `GET /admin/v2/brokers/configuration/values`. Returns a
+    /// `Map<String, String>` of every dynamic key the operator has set
+    /// (the broker omits keys still on their static / default value).
+    /// Exposed as raw JSON because broker minor versions add keys.
+    /// Java: `BrokersBase#getAllDynamicConfigurations`.
+    pub async fn brokers_dynamic_config_overrides(&self) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["brokers", "configuration", "values"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get the broker's runtime (merged static + dynamic) configuration.
+    ///
+    /// `GET /admin/v2/brokers/configuration/runtime`. Returns the full
+    /// `Map<String, String>` of `ServiceConfiguration` values as they
+    /// currently apply on the broker process — static defaults
+    /// overlaid with any `brokers_set_dynamic_config` overrides. Raw
+    /// JSON for forward-compat. Java: `BrokersBase#getRuntimeConfiguration`.
+    pub async fn brokers_runtime_config(&self) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["brokers", "configuration", "runtime"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get the broker's internal-stack endpoints.
+    ///
+    /// `GET /admin/v2/brokers/internal-configuration`. Returns the
+    /// `InternalConfigurationData` envelope — metadata-store URLs
+    /// (`zookeeperServers`, `configurationMetadataStoreUrl`),
+    /// `BookKeeper` metadata service URI, ledger root paths. Raw JSON
+    /// for forward-compat; the shape rolls between releases as the
+    /// metadata layer evolves.
+    /// Java: `BrokersBase#getInternalConfigurationData`.
+    pub async fn brokers_internal_config(&self) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["brokers", "internal-configuration"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Probe broker health — produces and consumes one heartbeat message
+    /// on an internal topic.
+    ///
+    /// `GET /admin/v2/brokers/health`. The broker returns the plain-text
+    /// string `"ok"` on success; non-200 surfaces as `AdminError::Status`.
+    /// Java: `BrokersBase#healthCheck`.
+    pub async fn brokers_health_check(&self) -> Result<String, AdminError> {
+        let url = self.url(&["brokers", "health"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        let resp = ensure_status(resp).await?;
+        Ok(resp.text().await?)
+    }
+
+    /// List the namespaces a specific broker currently owns.
+    ///
+    /// `GET /admin/v2/brokers/{cluster}/{broker}/ownedNamespaces`. The
+    /// `broker` argument must be the broker's `host:port` (matching the
+    /// strings [`Self::brokers_list`] returns). Returns a
+    /// `Map<String, NamespaceOwnershipStatus>` keyed by namespace name —
+    /// raw JSON for forward-compat.
+    /// Java: `BrokersBase#getOwnedNamespaces`.
+    pub async fn brokers_owned_namespaces(
+        &self,
+        cluster: &str,
+        broker: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        let url = self.url(&["brokers", cluster, broker, "ownedNamespaces"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
     // --- Tenants ---------------------------------------------------------
 
     /// List tenants.
