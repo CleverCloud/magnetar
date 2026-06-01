@@ -68,8 +68,14 @@ fn image_tag() -> String {
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("magnetar=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Include the test crate (`e2e_cluster_failover`) so the
+                // pre-create / retry / failure tracing lands in CI logs
+                // for triage. magnetar=info covers the runtime path.
+                tracing_subscriber::EnvFilter::new(
+                    "magnetar=info,magnetar_runtime_tokio=info,e2e_cluster_failover=info",
+                )
+            }),
         )
         .with_test_writer()
         .try_init();
@@ -212,22 +218,31 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     let mut attempts = 0u32;
     let send_outcome = loop {
         attempts += 1;
+        tracing::info!(attempts, "producer.send attempt");
         match producer
             .send(OutgoingMessage::with_payload(payload.clone()).into())
             .await
         {
-            Ok(_message_id) => break Ok(()),
+            Ok(message_id) => {
+                tracing::info!(attempts, ?message_id, "producer.send succeeded");
+                break Ok(());
+            }
             Err(e) if attempts < 30 => {
                 tracing::info!(?e, attempts, "producer send retry during failover");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            Err(e) => break Err(e),
+            Err(e) => {
+                tracing::warn!(?e, attempts, "producer send giving up");
+                break Err(e);
+            }
         }
     };
     send_outcome?;
 
     // Consumer should also have been rebuilt against broker-B.
+    tracing::info!("awaiting post-failover consumer.receive (60s budget)");
     let post = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    tracing::info!("post-failover consumer.receive returned");
     assert_eq!(
         post.payload.as_ref(),
         payload.as_slice(),
