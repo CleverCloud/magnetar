@@ -278,6 +278,41 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    /// Override a dynamic broker configuration value.
+    ///
+    /// `POST /admin/v2/brokers/configuration/{name}/{value}`. Both the
+    /// key and the value travel in the URL path — there is no request
+    /// body — matching the broker's `updateDynamicConfiguration(@PathParam
+    /// String configName, @PathParam String configValue)` signature.
+    /// The key must be one of those returned by
+    /// [`Self::brokers_dynamic_config_keys`]; unknown keys yield 412.
+    /// Java: `BrokersBase#updateDynamicConfiguration`.
+    pub async fn brokers_set_dynamic_config(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(name)?;
+        validate_segment(value)?;
+        let url = self.url(&["brokers", "configuration", name, value])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Drop a dynamic configuration override, reverting to the static value.
+    ///
+    /// `DELETE /admin/v2/brokers/configuration/{name}`. After the call
+    /// the key disappears from [`Self::brokers_dynamic_config_overrides`]
+    /// and [`Self::brokers_runtime_config`] reflects the underlying
+    /// static / default value again.
+    /// Java: `BrokersBase#deleteDynamicConfiguration`.
+    pub async fn brokers_delete_dynamic_config(&self, name: &str) -> Result<(), AdminError> {
+        validate_segment(name)?;
+        let url = self.url(&["brokers", "configuration", name])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Tenants ---------------------------------------------------------
 
     /// List tenants.

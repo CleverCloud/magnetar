@@ -98,6 +98,46 @@ async fn brokers_runtime_config_returns_merged_map() {
 }
 
 #[tokio::test]
+async fn brokers_set_dynamic_config_uses_path_params_only() {
+    // `updateDynamicConfiguration` takes both name and value as path
+    // segments — there is no request body. The POST returns 204.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/admin/v2/brokers/configuration/brokerShutdownTimeoutMs/5000",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .brokers_set_dynamic_config("brokerShutdownTimeoutMs", "5000")
+        .await
+        .expect("set-dynamic-config returns 204");
+}
+
+#[tokio::test]
+async fn brokers_delete_dynamic_config_drops_override() {
+    let mock = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/admin/v2/brokers/configuration/brokerShutdownTimeoutMs",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .brokers_delete_dynamic_config("brokerShutdownTimeoutMs")
+        .await
+        .expect("delete-dynamic-config returns 204");
+}
+
+#[tokio::test]
 async fn brokers_internal_config_returns_metadata_endpoints() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
