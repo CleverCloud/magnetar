@@ -22,26 +22,14 @@ The parity matrix lives in [`README.md#java-client-parity-matrix`](README.md).
 
 ## Workspace layout
 
-```
-crates/
-  magnetar/                       — top-level façade + PulsarClient<E> + builders
-  magnetar-admin/                 — reqwest-backed REST admin client
-  magnetar-auth-athenz/           — Athenz auth scaffold
-  magnetar-auth-oauth2/           — OAuth2 ClientCredentialsFlow
-  magnetar-auth-sasl/             — SASL PLAIN + Kerberos/GSSAPI (libgssapi behind `kerberos` feature, ADR-0029)
-  magnetar-cli/                   — `magnetar` binary
-  magnetar-differential/          — tokio ↔ moonpool differential harness (test-only)
-  magnetar-fakes/                 — in-process broker stub for tests
-  magnetar-messagecrypto/         — PIP-4 AES-GCM
-  magnetar-proto/                 — sans-io state machine + codec + trackers
-  magnetar-runtime-tokio/         — production engine (default)
-  magnetar-runtime-moonpool/      — deterministic-simulation engine (carries the PIP-4 crypto bridge, ADR-0044)
-xtask/                            — workspace automation
-```
+The workspace ships 12 crates plus `xtask/`.
+See [`ARCHITECTURE.md#crate-topology`](ARCHITECTURE.md#crate-topology) for the full breakdown — the canonical listing of crate roles, layering constraints, and which crates depend on which.
+The two engines (`magnetar-runtime-tokio`, `magnetar-runtime-moonpool`) sit behind the `Engine` trait selected on `PulsarClient<E>`; sans-io state lives in `magnetar-proto` (zero I/O deps, ADR-0004).
 
 ## Non-negotiable invariants
 
-These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
+These are the **workspace-wide rules**.
+The protocol-correctness subset (CRC32C, no-panics-in-proto, schema parity, etc.) overlaps with [`GUIDELINES.md`](GUIDELINES.md), which is the binding spec for wire-format and code rules; the test-policy + lock-ordering items here are workspace-process additions enforced via xtask.
 
 1. **No channels.** `tokio::sync::{mpsc,broadcast,watch,oneshot}`, `std::sync::mpsc`, `crossbeam-channel`, `flume`, `async-channel`, `kanal`, `postage`, `tachyonix`, `thingbuf` — banned everywhere.
    Replace with `Arc<parking_lot::Mutex<...>>` + `tokio::sync::Notify` + `core::task::Waker` slabs inside the state machine.
@@ -160,7 +148,7 @@ cargo run -p xtask -- codegen --check           # proto codegen drift
 cargo run -p xtask -- check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR-0035)
-cargo run -p xtask -- check-known-failing-seeds # replay registry seeds (ADR-0047) — mirrors the per-PR `seed-replay` CI job
+# (known-failing seed replay runs in CI via the per-PR `seed-replay` job; ADR-0047)
 ```
 
 Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no separate command, no `--features e2e`, no `--include-ignored`).

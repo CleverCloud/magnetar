@@ -648,7 +648,7 @@ known-missing feature.
 | SASL `PLAIN` (RFC 4616) | ✅ | ✅ | `magnetar_auth_sasl::SaslPlain` — `\0<username>\0<password>` payload. |
 | SASL Kerberos / GSSAPI | ✅ | ✅ | `magnetar_auth_sasl::SaslKerberos` runs the GSSAPI initiate loop via `libgssapi` (façade feature `auth-sasl-kerberos`). The multi-round `AUTH_CHALLENGE` / `AUTH_RESPONSE` exchange threads through `AuthProvider::respond_to_challenge`; the four sans-io test layers per [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md) drive a `magnetar_auth_sasl::ScriptedGssapiClient` so they stay free of a libkrb5 build dep. End-to-end coverage uses a Dockerised KDC fixture. See [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | Athenz (pre-fetched role token) | ✅ | ✅ | `AthenzProvider::with_role_token` — bypass the ZTS round-trip when the caller already holds a valid role token. |
-| Athenz (ZTS round-trip) | ✅ | ✅ | `feature = "auth-athenz-zts"` (default off). The pluggable `zts::ZtsClient` trait (`zts::HttpZtsClient` does the reqwest-backed POST) exchanges a signed JWT for a role token; `AthenzProvider` owns the expiry-aware cache and `ensure_role_token(now)` / `needs_refresh(now)` (sans-io clock injection). Build via `AthenzProvider::with_default_signer(config)` (cfg-active in-tree signer) or `AthenzProvider::builder()` (custom signer / client / `wall_clock`). The concrete `zts::JwtSigner` ships in two flavours — `jwt_signer::AwsLcRsSigner` and `jwt_signer::RingSigner` — gated on the crypto-provider matrix per [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md); parsed PKCS#8 DER wrapped in `zeroize::Zeroizing<…>`, byte-identical deterministic RS256 (RFC 8017 §8.2). Full four-layer cross-runtime coverage (tokio/moonpool/differential + e2e) per [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md). See [`docs/athenz.md`](docs/athenz.md) and [ADR-0041](specs/adr/0041-athenz-provider-testability-seams.md). |
+| Athenz (ZTS round-trip) | ✅ | ✅ | `feature = "auth-athenz-zts"` (default off). The pluggable `zts::ZtsClient` trait (`zts::HttpZtsClient` does the reqwest-backed POST) exchanges a signed JWT for a role token; `AthenzProvider` owns the expiry-aware cache and `ensure_role_token(now)` / `needs_refresh(now)` (sans-io clock injection). Build via `AthenzProvider::with_default_signer(config)` (cfg-active in-tree signer) or `AthenzProvider::builder()` (custom signer / client / `wall_clock`). The concrete `zts::JwtSigner` ships in two flavours — `jwt_signer::AwsLcRsSigner` and `jwt_signer::RingSigner` — gated on the crypto-provider matrix per [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md); parsed PKCS#8 DER wrapped in `zeroize::Zeroizing<…>`, byte-identical deterministic RS256 (RFC 8017 §8.2). Full four-layer cross-runtime coverage (tokio/moonpool/differential + e2e) per [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md). See [ADR-0041](specs/adr/0041-athenz-provider-testability-seams.md). |
 | In-band `AUTH_CHALLENGE` refresh (PIP-30 / PIP-292) | ✅ | ✅ | Driver consults the configured `AuthProvider` and submits `CommandAuthResponse`. |
 | `pulsar+ssl://` URLs | ✅ | ✅ | Built-in. |
 | Binary proxy (`proxy_to_broker_url`) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. Both engines ship the full `ProxyConnectionPool` — tokio in [`magnetar-runtime-tokio::pool`](crates/magnetar-runtime-tokio/src/pool.rs), moonpool in [`magnetar-runtime-moonpool::pool`](crates/magnetar-runtime-moonpool/src/pool.rs) (see the [ADR-0039 2026-06-01 amendment](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md#moonpool-engine-parity-2026-06-01)). |
@@ -708,7 +708,8 @@ known-missing feature.
   producer/consumer, multi-topics, pattern consumers, TableView,
   transactions, and typed schema builders all dispatch through
   `impl<E: Engine> PulsarClient<E>` where the selected runtime implements
-  the matching `*Api` trait. See [`docs/parity-status.md`](docs/parity-status.md).
+  the matching `*Api` trait. Per-feature, per-engine status lives in the
+  [parity matrix above](#java-client-parity-matrix).
 - **PIP-460 scalable topics** ship as an experimental scaffold behind
   `feature = "scalable-topics"` (default off); the in-process four-layer
   test suite is the binding gate. e2e against a real broker waits for an
@@ -753,19 +754,20 @@ known-missing feature.
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
 | PIP-188 | `TOPIC_MIGRATED` | ✅ | Wire opcode decoded; tokio driver's event loop catches `ConnectionEvent::TopicMigrated`, logs the new-broker hint, and returns an error from `driver_loop_inner` so the supervisor triggers `Connection::reset` + reconnect. `rebuild_producers` / `rebuild_consumers` re-attach every still-open handle on the new socket. |
 | _local_ | Anti-thrash policy ([ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)) | ✅ (opt-in) | Per-handle ack-then-drop detector + connection-level cooldown. Mitigates broker-driven post-restart cascades (Pulsar PR #14467 / #13428 / #12846 — `ServerCnx#handleProducer` ↔ `AbstractTopic#addProducer` race). `SupervisorConfig::anti_thrash_threshold` default `None`. |
-| PIP-460 | Scalable topics | 🟡 | Experimental scaffold behind `feature = "scalable-topics"` (default off), ADR-0031. **No released Pulsar broker ships PIP-460** (upstream `Draft`, targets 5.0 LTS) — so this is scaffold-now / e2e-later. Ships the `topic://` URL scheme, hand-encoded wire commands (lookup + DAG-watch + DAG-update, behind the feature gate until the Pulsar 5.0 RC vendor bump per ADR-0026 §D4), the `DagWatchSession` sans-io state machine, the additive default-`None` `MessageId::segment_id` field (v4 wire byte-identical), both-engine `ScalableTopicsApi` impls, `magnetar::scalable::StreamConsumer` (StreamConsumer-only, **drops on DAG change**), and the `magnetar topic-info` CLI. Four-layer in-process tests are the binding gate; e2e is `#[ignore]`'d. QueueConsumer / CheckpointConsumer / controller-election / repartition stay out of the current scaffold and will land once an upstream release pins the wire commands. See [`docs/scalable-topics.md`](docs/scalable-topics.md) + [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md). |
+| PIP-460 | Scalable topics | 🟡 | Experimental scaffold behind `feature = "scalable-topics"` (default off), ADR-0031. **No released Pulsar broker ships PIP-460** (upstream `Draft`, targets 5.0 LTS) — so this is scaffold-now / e2e-later. Ships the `topic://` URL scheme, hand-encoded wire commands (lookup + DAG-watch + DAG-update, behind the feature gate until the Pulsar 5.0 RC vendor bump per ADR-0026 §D4), the `DagWatchSession` sans-io state machine, the additive default-`None` `MessageId::segment_id` field (v4 wire byte-identical), both-engine `ScalableTopicsApi` impls, `magnetar::scalable::StreamConsumer` (StreamConsumer-only, **drops on DAG change**), and the `magnetar topic-info` CLI. Four-layer in-process tests are the binding gate; e2e is `#[ignore]`'d. QueueConsumer / CheckpointConsumer / controller-election / repartition stay out of the current scaffold and will land once an upstream release pins the wire commands. See [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md). |
 | PIP-466 | V5 client API surface | ✅ | Behind `feature = "experimental-v5-client"` (default off). Engine-generic per ADR-0032. `magnetar::v5` exposes `PulsarClientV5<E: Engine = TokioEngine>` (with `v4()` escape hatch), `v5::Producer<E>`, `v5::StreamConsumer<E>` (Exclusive / Failover), `v5::QueueConsumer<E>` (Shared / `KeyShared`), and the `v5::mapping` field-translation table. Moonpool callers name `PulsarClientV5<MoonpoolEngine<P>>` directly. Wraps the v4 surface — no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md). |
-| PIP-180 | Shadow topic | ✅ | Admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
+| PIP-180 | Shadow topic | ✅ | Admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
 | PIP-415 | `getMessageIdByIndex` | ✅ | `magnetar-admin::AdminClient::topic_get_message_id_by_index` — REST-only per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) (binary-protocol section intentionally empty; canonical implementation [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin / broker / CLI only) |
-| PIP-33 | Replicated subscriptions | ✅ | `ConsumerBuilder::replicate_subscription_state(bool)` flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
+| PIP-33 | Replicated subscriptions | ✅ | `ConsumerBuilder::replicate_subscription_state(bool)` flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
 | PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime with `HealthProbe`). Active URL re-resolved on every supervised-reconnect attempt. |
 
 ---
 
-## Runtime engines
+## Engine-by-engine surface coverage
 
 Magnetar publishes two engines that drive the same sans-io state machine.
 Pick at compile time via feature flags.
+The [parity matrix above](#java-client-parity-matrix) is the per-feature, per-engine status snapshot; this section describes each engine's surface.
 
 ### `magnetar-runtime-tokio` — production (default)
 
@@ -818,11 +820,8 @@ same trajectory and the differential harness enforces tokio ↔ moonpool
 
 The bulk of the parity matrix above ships on `main`, including:
 
-- **PIP-180** shadow topic ([`docs/shadow-topic.md`](docs/shadow-topic.md),
-  [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
-- **PIP-33** replicated subscriptions
-  ([`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md),
-  [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md)).
+- **PIP-180** shadow topic ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
+- **PIP-33** replicated subscriptions ([ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md)).
 - **SASL Kerberos / GSSAPI** ([ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
 - **Pluggable rustls crypto provider** (aws-lc-rs / ring / openssl / fips —
   [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)).

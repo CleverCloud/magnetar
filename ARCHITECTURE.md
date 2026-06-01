@@ -633,7 +633,7 @@ Closed                      Failed   (handshake error / I/O error)
 ```
 
 `Connection::state()` reports the live state.
-Source: [`HandshakeState` enum at conn.rs:52`].
+Source: [`HandshakeState` enum at `crates/magnetar-proto/src/conn_types.rs:25`](crates/magnetar-proto/src/conn_types.rs).
 
 ### Pending-op machinery
 
@@ -718,7 +718,6 @@ Pulsar transactions use four opcodes (`NEW_TXN`, `ADD_PARTITION_TO_TXN`, `ADD_SU
 The producer attaches `txn_id` to its publish via `OutgoingMessage::txn`, and the consumer attaches it to acks via `ack_with_txn` / `ack_cumulative_with_txn` / `ack_batch_with_txn`.
 
 [`crates/magnetar-proto/src/conn.rs`]: crates/magnetar-proto/src/conn.rs
-[`HandshakeState` enum at conn.rs:52`]: crates/magnetar-proto/src/conn.rs
 
 ---
 
@@ -777,7 +776,7 @@ Source: [`crates/magnetar-proto/src/frame.rs:30-48`].
 
 ## Producer paths — batching vs chunking
 
-Pulsar enforces a critical invariant per `ProducerImpl.java:630-654`:
+Pulsar enforces a critical invariant per `ProducerImpl.java:630-654` (Apache Pulsar Java reference, external):
 
 > **Chunked messages can never be batched.** If a message is eligible for the batch container, `totalChunks` is forced to `1`.
 
@@ -861,7 +860,7 @@ Source: [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/prod
 
 ### Sequence-id discipline
 
-- Sequence ids are assigned inside the chunk loop (Java `ProducerImpl.java:696-704`, `:745-753` — both first-send and resend paths).
+- Sequence ids are assigned inside the chunk loop (Java `ProducerImpl.java:696-704`, `:745-753` — both first-send and resend paths; Apache Pulsar Java reference, external).
 - Resend reuses the original sequence id.
 - `last_sequence_id` and `last_sequence_id_published` are tracked separately so the runtime can drive resend-safe dedup.
 - Sequence id and request id are **monotonically non-decreasing** per connection per producer ([GUIDELINES.md §Protocol-correctness invariants point 4](GUIDELINES.md#protocol-correctness-invariants)).
@@ -1380,7 +1379,7 @@ pub trait Schema: Send + Sync + std::fmt::Debug {
 
 ### Canonicalisation (Codex Q4)
 
-Per the cross-check on `SchemaRegistryServiceImpl.java:405-438`:
+Per the cross-check on `SchemaRegistryServiceImpl.java:405-438` (Apache Pulsar Java reference, external):
 
 - **AVRO / JSON / PROTOBUF** schemas are re-parsed broker-side via the Avro `Schema.Parser` before the version lookup.
   Magnetar emits the Avro canonical parsing form (`AvroSchema`) so two logically-identical schemas hash to the same version regardless of whitespace, field order, or property ordering.

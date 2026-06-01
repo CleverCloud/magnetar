@@ -14,7 +14,7 @@ Stack additively with `~/.claude/CLAUDE.md`; when this file and the global file 
 4. **Request-id monotonicity.** Producer-side `request_id` and `sequence_id` are monotonically non-decreasing per connection, per producer.
    Resend reuses the original sequence id.
 5. **`canAddToBatch ⇒ totalChunks == 1`.** Enforced in `ProducerState::queue_send` and asserted via unit test.
-   Mirrors `ProducerImpl.java:630-654`.
+   Mirrors `ProducerImpl.java:630-654` (Apache Pulsar Java reference, external).
 6. **Schema bytes parity.** AVRO/JSON/PROTOBUF schemas are canonicalised broker-side; PROTOBUF_NATIVE + KeyValue use raw-byte equality.
    Magnetar serialisers must emit byte-identical Java output for the latter two.
 
@@ -86,31 +86,8 @@ The pre-edit hook blocks edits on `main`/`master`/`trunk`/`develop`.
 
 ## Validation
 
-Before declaring a task done:
-
-```
-cargo build --workspace --all-features
-cargo clippy --workspace --all-features -- -D warnings
-cargo +nightly fmt --check
-cargo test --workspace
-for seed in $(seq 1 32); do                              # local-only sweep (ADR-0024 §3 / ADR-0036)
-  MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
-    --all-features --locked -- --quiet \
-    || { echo "seed $seed FAILED"; exit 1; }
-done                                                     # CI: 128 random seeds daily, .github/workflows/moonpool-seed-sweep.yml
-cargo deny check
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo xtask check-sim-coverage        # ADR-0024: 100% moonpool coverage on diff
-cargo xtask check-runtime-test-parity # ADR-0024: tokio ↔ moonpool 1:1 test count
-```
-
-Plus when `magnetar-proto` changes:
-
-```
-cargo xtask check-no-channels
-cargo xtask codegen --check       # asserts no proto codegen drift
-cargo xtask check-no-io-deps      # asserts magnetar-proto has no I/O deps
-```
+**Validation chain.** Run before declaring a task done — see [CLAUDE.md § Validation chain](CLAUDE.md#validation-chain) for the authoritative full chain (xtask gates, FIPS clang env vars, e2e pre-reqs, etc.).
+The `GUIDELINES.md` scope is the binding code rules (no-channels, I/O isolation, TLS, protocol invariants); the build / test invocation order lives in `CLAUDE.md`.
 
 Mutation testing (optional, for deeper coverage on `magnetar-proto`):
 
