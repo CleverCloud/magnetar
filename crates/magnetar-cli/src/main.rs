@@ -276,6 +276,20 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
         topic: String,
     },
+    /// Resolve a broker-entry-metadata index to a `MessageId` (PIP-415).
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/getMessageIdByIndex?index={index}`.
+    /// Requires the broker to have `brokerEntryMetadataInterceptors`
+    /// configured with `AppendIndexMetadataInterceptor`; otherwise the
+    /// broker returns 404 / 400. The Java `MessageIdImpl` cannot represent
+    /// negative `ledgerId` values either, so a broker that returns one
+    /// surfaces as `AdminError::Protocol`.
+    GetMessageIdByIndex {
+        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
+        topic: String,
+        /// Broker-entry index to resolve.
+        #[arg(long)]
+        index: i64,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -566,6 +580,20 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
                 "bytesInCounter": stats.bytes_in_counter,
                 "publishers": stats.publishers,
                 "subscriptions": stats.subscriptions,
+            });
+            print_json(&json)
+        }
+        TopicsCmd::GetMessageIdByIndex { topic, index } => {
+            // `MessageId` doesn't derive `Serialize` (it's a pure proto
+            // type); build the JSON shape manually so the CLI output
+            // mirrors Java's `MessageIdImpl.toString()` field layout.
+            let id = admin.topic_get_message_id_by_index(&topic, index).await?;
+            let json = serde_json::json!({
+                "ledgerId": id.ledger_id,
+                "entryId": id.entry_id,
+                "partition": id.partition,
+                "batchIndex": id.batch_index,
+                "batchSize": id.batch_size,
             });
             print_json(&json)
         }
