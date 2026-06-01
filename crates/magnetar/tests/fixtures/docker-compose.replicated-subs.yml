@@ -14,7 +14,7 @@
 #   cargo test -p magnetar --test e2e_replicated_subscriptions
 #   docker compose -f docker-compose.replicated-subs.yml down -v
 #
-# Per ADR-0045 this fixture runs on every PR — the `test` job in
+# Per ADR-0046 this fixture runs on every PR — the `test` job in
 # .github/workflows/ci.yml brings it up automatically before `cargo test`.
 
 services:

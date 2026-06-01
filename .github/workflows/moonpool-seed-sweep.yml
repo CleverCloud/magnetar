@@ -1,21 +1,24 @@
 name: Moonpool seed sweep
 
-# Daily random-seed sweep of `magnetar-runtime-moonpool`. Replaces the
-# fixed 32-seed sweep that used to run on every PR / push (ADR-0036).
-# Rationale: fixed seeds always exercise the same scheduling, so
-# repeating them on every commit is wasted runner time; random seeds
-# accumulating over days cover the seed space much better.
+# Daily random-seed *discovery* sweep of `magnetar-runtime-moonpool`.
+# ADR-0036 set the cadence (daily random vs. fixed per-PR); ADR-0047 adds
+# the persistence + per-PR replay layer on top — once this workflow flags
+# a seed, the failure-report job opens a GitHub issue and the human/agent
+# triaging the issue appends the seed to
+# `crates/magnetar-runtime-moonpool/seeds/known-failing.toml`. From there
+# the `seed-replay` job in `.github/workflows/ci.yml` keeps replaying it
+# on every PR until the underlying bug is fixed and the entry removed.
 #
 # A freshly-rolled set of 16 random `u64` seeds runs in parallel each
-# day. Any failure leaves the matrix entry red so the failing seed is
-# visible in the run summary — re-run the test locally with
-# `MOONPOOL_SEED=<seed>` to reproduce bit-for-bit.
+# day. Local reproduction is `MOONPOOL_SEED=<seed> cargo test -p
+# magnetar-runtime-moonpool --features crypto-aws-lc-rs --locked`.
 #
 # Security note: no `github.event.*` inputs are interpolated anywhere
-# in this workflow. The only matrix expansion comes from
-# `steps.roll.outputs.seeds`, which is produced by this workflow's own
-# `generate-seeds` job using Python's `secrets` module — controlled
-# input, not user-supplied.
+# in this workflow's `run:` blocks. The only matrix expansion comes
+# from `steps.roll.outputs.seeds`, which is produced by this workflow's
+# own `generate-seeds` job using Python's `secrets` module — controlled
+# input, not user-supplied. The `report-failures` job uses `GITHUB_TOKEN`
+# strictly for `gh issue` calls.
 
 on:
   schedule:
@@ -27,6 +30,13 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
+
+# `report-failures` opens GitHub issues for newly-discovered failing
+# seeds (ADR-0047 §3). The matrix jobs themselves only need `contents:
+# read` (default).
+permissions:
+  contents: read
+  issues: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -77,3 +87,113 @@ jobs:
         env:
           MOONPOOL_SEED: ${{ matrix.seed }}
         run: cargo test -p magnetar-runtime-moonpool --all-features --locked
+      # Record the seed for the report-failures job. We write the value
+      # to `failed.txt` only if the previous step failed; the artifact
+      # is always uploaded so the downstream job's `download-artifact`
+      # never errors on a missing artifact.
+      - name: Record failing seed for downstream report
+        if: failure()
+        env:
+          MATRIX_SEED: ${{ matrix.seed }}
+        run: |
+          set -euo pipefail
+          echo "${MATRIX_SEED}" > failed.txt
+      - name: Upload failure marker
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          # Hex seeds are alphanumeric; safe inside an artifact name.
+          name: failing-seed-${{ matrix.seed }}
+          path: failed.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report-failures:
+    # Opens one GitHub issue per failing seed (ADR-0047 §3). Runs only
+    # when at least one matrix entry failed. Idempotent: an existing
+    # open issue whose title contains the seed value is left alone (a
+    # comment is appended pointing at the new run).
+    name: open issues for newly-failed seeds
+    needs: moonpool-sim
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download failure markers
+        uses: actions/download-artifact@v4
+        with:
+          path: failure-markers
+          pattern: failing-seed-*
+          merge-multiple: false
+      - name: Ensure issue labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Idempotent — create if missing, otherwise the `|| true` swallows
+          # the "label already exists" error.
+          gh label create seed-failure --repo "$REPO" \
+            --color FBCA04 \
+            --description "Failing moonpool sim seed (ADR-0047)" \
+            2>/dev/null || true
+          gh label create moonpool --repo "$REPO" \
+            --color C5DEF5 \
+            --description "magnetar-runtime-moonpool" \
+            2>/dev/null || true
+      - name: Open or update issues per failing seed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Each `failing-seed-<seed>/failed.txt` contains the seed.
+          shopt -s nullglob
+          markers=(failure-markers/failing-seed-*/failed.txt)
+          if [ "${#markers[@]}" -eq 0 ]; then
+            echo "No failure markers found; nothing to report."
+            exit 0
+          fi
+          for marker in "${markers[@]}"; do
+            seed="$(cat "$marker" | tr -d '[:space:]')"
+            [ -n "$seed" ] || continue
+            title="moonpool sim: seed=${seed} reproduces against ${COMMIT_SHA:0:7}"
+            # Search OPEN issues with this seed in the title; idempotent
+            # against the daily sweep re-flagging the same seed.
+            existing="$(gh issue list --repo "$REPO" --state open --search "in:title ${seed}" --json number --jq '.[0].number // empty')"
+            body=$(cat <<EOF
+          The daily moonpool-seed-sweep flagged \`MOONPOOL_SEED=${seed}\` as
+          failing against [\`${COMMIT_SHA}\`](${RUN_URL}).
+
+          Per [ADR-0047](../blob/main/specs/adr/0047-failing-seed-registry-per-pr-replay.md)
+          this seed must now be either fixed or added to
+          \`crates/magnetar-runtime-moonpool/seeds/known-failing.toml\`
+          with \`status = "open"\` so the per-PR \`seed-replay\` job in
+          \`.github/workflows/ci.yml\` catches any future regression.
+
+          ### Reproduce locally
+
+          \`\`\`
+          MOONPOOL_SEED=${seed} cargo test -p magnetar-runtime-moonpool \\
+              --features crypto-aws-lc-rs --locked
+          \`\`\`
+
+          ### Workflow run
+
+          ${RUN_URL}
+
+          If the seed fails to reproduce locally, the triage policy
+          (ADR-0047 §4 case 3) requires a deep-dive anyway — "I can't
+          repro" is not a close reason.
+          EOF
+          )
+            if [ -n "$existing" ]; then
+              echo "Issue #${existing} already tracks seed=${seed}; appending comment."
+              gh issue comment "$existing" --repo "$REPO" --body "$body"
+            else
+              echo "Opening new issue for seed=${seed}."
+              gh issue create --repo "$REPO" --title "$title" --body "$body" --label "seed-failure,moonpool"
+            fi
+          done

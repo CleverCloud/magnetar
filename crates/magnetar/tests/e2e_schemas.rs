@@ -8,7 +8,7 @@
 //! typed consumer reads them back, and we assert byte-for-byte (or value-for-value)
 //! parity for each of the headline schemas.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_schemas -- --nocapture

@@ -16,7 +16,7 @@
 //! strictly positive — i.e. the rolling delta math actually fires end-to-end
 //! against a live broker.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_rolling_stats -- --nocapture

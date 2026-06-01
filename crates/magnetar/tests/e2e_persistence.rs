@@ -16,7 +16,7 @@
 //! client never has to special-case them. These tests pin that contract end-to-end
 //! against the real broker rather than re-asserting it in unit tests.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_persistence -- --nocapture

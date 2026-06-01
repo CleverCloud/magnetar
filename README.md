@@ -122,7 +122,7 @@ The default feature set enables the tokio engine. The feature flags catalog:
 | `auth-athenz` | no | Pulls in `magnetar-auth-athenz`. |
 | `auth-athenz-zts` | no | Implies `auth-athenz` and turns on the reqwest-backed ZTS exchange plus in-tree JWT signer support. |
 | `encryption` | no | Pulls in `magnetar-messagecrypto` plus the PIP-4 bridge type. |
-<!-- `e2e` and `e2e-multi-cluster` features removed per ADR-0045: the
+<!-- `e2e` and `e2e-multi-cluster` features removed per ADR-0046: the
 end-to-end suite runs as a regular `cargo test` with no feature gate
 and no `#[ignore]`. Docker on the host is the only prerequisite. -->
 
@@ -863,7 +863,7 @@ RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
 ```
 
 End-to-end tests against a real broker run as part of
-`cargo test --workspace --all-features` (ADR-0045 — no `--features e2e`,
+`cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`,
 no `#[ignore]`). Docker is the only prerequisite; the suite spins
 `pulsar:4.0.4` via `testcontainers-rs`.
 

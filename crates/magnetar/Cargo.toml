@@ -37,7 +37,7 @@ auth-athenz = ["dep:magnetar-auth-athenz"]
 # into the athenz crate (see `magnetar-auth-athenz/zts`).
 auth-athenz-zts = ["auth-athenz", "magnetar-auth-athenz/zts"]
 encryption  = ["dep:magnetar-messagecrypto"]
-# Note (ADR-0045): the former `e2e` and `e2e-multi-cluster` Cargo features
+# Note (ADR-0046): the former `e2e` and `e2e-multi-cluster` Cargo features
 # are gone. End-to-end tests run as regular tests on every `cargo test`
 # and every CI push — gating moved from compile-time + `#[ignore]` to "the
 # host either has Docker or the test fails." `testcontainers`, `wiremock`,

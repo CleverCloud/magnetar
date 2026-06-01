@@ -5,7 +5,7 @@
 //! standalone broker via `testcontainers-rs`, runs producer/consumer
 //! traffic, and exercises one branch of the compaction story.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_compacted -- --nocapture

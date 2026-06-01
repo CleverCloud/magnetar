@@ -15,7 +15,7 @@
 //!   3. Call `consumer_a.unsubscribe(true)`.
 //!   4. Produce another message and verify consumer-B still receives it.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045).
+//! Runs as a regular test under `cargo test` (ADR-0046).
 
 use std::time::Duration;
 

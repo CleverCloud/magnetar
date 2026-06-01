@@ -192,6 +192,6 @@ transitively activate under `-p`. See
 provider matrix and `cargo run -p xtask -- check-crypto-matrix` for the
 authoritative per-provider build sweep.
 
-Per ADR-0045, the suite spins `apachepulsar/pulsar:4.0.4`
+Per ADR-0046, the suite spins `apachepulsar/pulsar:4.0.4`
 in Docker and exercises the public surface against a real broker — see
 [`testing.md`](testing.md).

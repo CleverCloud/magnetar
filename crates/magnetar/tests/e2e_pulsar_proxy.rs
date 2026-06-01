@@ -22,7 +22,7 @@
 //!
 //! ## Runtime
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045 — no feature
+//! Runs as a regular test under `cargo test` (ADR-0046 — no feature
 //! flag, no `#[ignore]`). Requires Docker on the host: two containers
 //! are started — a standalone broker (~30 s startup), and a proxy
 //! (~10 s startup once the broker is healthy). The proxy needs network

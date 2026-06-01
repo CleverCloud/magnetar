@@ -18,7 +18,7 @@
 //! producer exercises the driver merging several per-slot staged sends into
 //! one vectored transmit.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Requires
+//! Runs as a regular test under `cargo test` (ADR-0046). Requires
 //! Docker on the host.
 
 use std::time::Duration;

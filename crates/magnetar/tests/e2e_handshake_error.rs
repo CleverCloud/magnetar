@@ -18,7 +18,7 @@
 //! reaches the façade error verbatim instead of being swallowed by the
 //! generic `"handshake failed"` string), not the exact broker phrasing.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_handshake_error -- --nocapture
@@ -149,7 +149,7 @@ fn mint_internal_admin_token() -> String {
 /// broker-side auth marker instead of being swallowed by the legacy
 /// opaque `"handshake failed"` string).
 ///
-/// Runs as a regular test under `cargo test` (ADR-0045). Requires
+/// Runs as a regular test under `cargo test` (ADR-0046). Requires
 /// Docker on the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_invalid_token_surfaces_broker_handshake_reason()

@@ -3,7 +3,7 @@
 //! End-to-end tests against a real Apache Pulsar 4.x standalone broker
 //! spun up via `testcontainers-rs`.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_pulsar -- --nocapture

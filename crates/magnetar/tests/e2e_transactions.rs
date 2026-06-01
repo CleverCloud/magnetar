@@ -7,7 +7,7 @@
 //! commit publishes are visible, abort drops them, and consumer acks issued inside
 //! a transaction are rolled back on abort so a fresh subscription redelivers.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_transactions -- --nocapture

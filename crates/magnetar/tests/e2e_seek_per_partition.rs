@@ -15,7 +15,7 @@
 //!   5. Verify that partition 0 yields only the post-seek tail while the other three partitions
 //!      yield their full contents.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045).
+//! Runs as a regular test under `cargo test` (ADR-0046).
 
 use std::time::Duration;
 

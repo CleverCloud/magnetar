@@ -1,6 +1,6 @@
 # ADR-0036 — Moonpool seed sweep: daily random, not fixed per-PR
 
-- **Status**: Accepted (amended by [ADR-0043](0043-temporary-floating-moonpool-git-dep.md), exact-pin discipline scoped exception; **partially superseded by [ADR-0045](0045-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** for end-to-end tests, which now run per-PR rather than on a weekly cost-shifted cadence — the moonpool seed sweep + the diff-shaped xtask gates still follow this ADR)
+- **Status**: Accepted (amended by [ADR-0043](0043-temporary-floating-moonpool-git-dep.md), exact-pin discipline scoped exception; **partially superseded by [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** for end-to-end tests, which now run per-PR rather than on a weekly cost-shifted cadence — the moonpool seed sweep + the diff-shaped xtask gates still follow this ADR; **amended by [ADR-0047](0047-failing-seed-registry-per-pr-replay.md)** which adds the persistent failing-seed registry + per-PR replay layer on top of the daily discovery cadence this ADR established — the discovery rhythm is unchanged)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: testing, moonpool, ci, process

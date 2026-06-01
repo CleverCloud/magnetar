@@ -12,7 +12,7 @@
 //!   2. **Happy path** — limit = 64 KiB, send a 1 KiB message. Expect a normal `SendReceipt` (the
 //!      reservation succeeds and is released on completion).
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045).
+//! Runs as a regular test under `cargo test` (ADR-0046).
 
 use std::time::Duration;
 

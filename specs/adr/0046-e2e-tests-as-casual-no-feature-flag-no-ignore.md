@@ -1,4 +1,4 @@
-# ADR-0045 — e2e tests are casual: no feature flag, no `#[ignore]`
+# ADR-0046 — e2e tests are casual: no feature flag, no `#[ignore]`
 
 - **Status**: Accepted
 - **Date**: 2026-06-01

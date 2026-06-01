@@ -1,6 +1,6 @@
 # ADR-0021 — Tests are fixed, not silently ignored or removed
 
-- **Status**: Accepted, **amended by [ADR-0045](0045-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** (the env-dep `#[ignore]` carve-out in §1 is removed for end-to-end tests; the bug-hide ban §2 + surface-and-wait §4 remain in force)
+- **Status**: Accepted, **amended by [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** (the env-dep `#[ignore]` carve-out in §1 is removed for end-to-end tests; the bug-hide ban §2 + surface-and-wait §4 remain in force)
 - **Date**: 2026-05-22
 - **Decider**: Florentin Dubois
 - **Tags**: testing, quality, process, agents

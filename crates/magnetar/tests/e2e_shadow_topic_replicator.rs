@@ -61,7 +61,7 @@
 //!    error before the topic-type gate is even reached. The test asserts an authorisation-flavoured
 //!    error surfaces on the producer create / send path — pinning whatever the broker does today.
 //!
-//! Both tests run as regular tests under `cargo test` (ADR-0045).
+//! Both tests run as regular tests under `cargo test` (ADR-0046).
 //! Requires Docker on the host.
 //!
 //! # Token minting

@@ -11,7 +11,7 @@
 //! `crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml` and is
 //! brought up out-of-band by `configure_replicated_subs.sh`.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045 — the former
+//! Runs as a regular test under `cargo test` (ADR-0046 — the former
 //! `e2e` / `e2e-multi-cluster` Cargo features are gone). The two-cluster
 //! docker-compose fixture must be healthy before `cargo test` starts;
 //! per-PR CI brings it up automatically in the `test` job

@@ -1,0 +1,37 @@
+# Known failing seeds — moonpool deterministic-simulation registry.
+#
+# Discovered by `.github/workflows/moonpool-seed-sweep.yml` (daily,
+# 16 random seeds per run). Replayed on every per-PR CI run + every
+# push to `main` by the `seed-replay` job in
+# `.github/workflows/ci.yml`, and locally by
+# `cargo run -p xtask -- check-known-failing-seeds`. ADR-0047 binds
+# the policy; ADR-0036 stays in force for the daily discovery cadence.
+#
+# Local replay:
+#   MOONPOOL_SEED=<value> cargo test -p magnetar-runtime-moonpool \
+#       --features crypto-aws-lc-rs --locked
+#
+# Schema (one TOML array entry per failing seed):
+#
+#   [[seed]]
+#   value         = 12345                # the u64 to seed MOONPOOL_SEED with
+#   discovered    = "2026-06-01"         # YYYY-MM-DD UTC, day the daily sweep flagged it
+#   workflow_run  = "https://github.com/CleverCloud/magnetar/actions/runs/…"
+#   commit_sha    = "abcdef1234..."      # the main HEAD when the failure was observed
+#   test_name     = "sim_chaos_…"        # optional, the failing test if known
+#   status        = "open"               # "open" | "investigating" | "wontfix"
+#   issue         = "https://github.com/CleverCloud/magnetar/issues/…"   # optional
+#   note          = """
+#       Free-form. What's been ruled out, what the suspected cause is,
+#       what's required to clear it. For "investigating" entries this is
+#       the audit trail; for "wontfix" entries it's the binding ADR
+#       reference.
+#       """
+#
+# Removing an entry happens in the SAME PR that lands the bug fix
+# (the PR's CI replay proves the seed passes against the post-fix
+# code). Anyone editing this file without a paired fix PR is in
+# process violation — see ADR-0047 §6.
+#
+# The registry is currently empty. Per-PR `seed-replay` is a trivial
+# pass until the daily sweep finds (and a human triages) something.

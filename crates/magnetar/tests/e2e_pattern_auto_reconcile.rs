@@ -9,7 +9,7 @@
 //! topics that were created **after** the pattern consumer was built and
 //! subscribes to them.
 //!
-//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
 //! cargo test -p magnetar --test e2e_pattern_auto_reconcile -- --nocapture

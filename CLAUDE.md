@@ -86,12 +86,12 @@ These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
 8. **No silent `#[ignore]`.** Tests are fixed, not papered over.
    E2e tests carry **no `#[ignore]` and no compile-time feature gate** —
    they run on every `cargo test --all-features` and on every CI push
-   ([ADR-0045](specs/adr/0045-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
+   ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
    supersedes ADR-0021's env-dep carve-out for e2e). `#[ignore]` for the
    bug-hide cases ADR-0021 §2 covers is still forbidden; the
    surface-and-wait protocol (ADR-0021 §4) is unchanged.
    ([ADR-0021](specs/adr/0021-no-silent-test-ignore-or-remove.md),
-   [ADR-0045](specs/adr/0045-e2e-tests-as-casual-no-feature-flag-no-ignore.md))
+   [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md))
 9. **Cross-runtime test + coverage policy.** Every behavioral change
    (runtime behavior, public API, wire format) and every change inside
    `magnetar-proto` ships with **all four** test layers in the same
@@ -178,9 +178,10 @@ cargo xtask codegen --check           # proto codegen drift
 cargo xtask check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
 cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo xtask check-crypto-matrix       # per-provider build matrix (ADR-0035)
+cargo xtask check-known-failing-seeds # replay registry seeds (ADR-0047) — mirrors the per-PR `seed-replay` CI job
 ```
 
-Per [ADR-0045](specs/adr/0045-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
+Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
 the e2e suite is **already included** in `cargo test --workspace --all-features`
 above (no separate command, no `--features e2e`, no `--include-ignored`).
 The local run still needs Docker + `apachepulsar/pulsar:4.0.4` reachable.
