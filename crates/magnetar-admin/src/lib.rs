@@ -1338,6 +1338,50 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a topic's consumer dispatch-rate policy (or `null` if no override).
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/dispatchRate`. The
+    /// broker emits the per-topic [`DispatchRate`] override or `null` when
+    /// no override is set; callers fall back to the namespace policy in the
+    /// `None` case. Java: `PersistentTopicsBase#getDispatchRate`.
+    pub async fn topic_get_dispatch_rate(
+        &self,
+        topic: &str,
+    ) -> Result<Option<DispatchRate>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "dispatchRate"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a topic's consumer dispatch-rate policy (overrides namespace default).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/dispatchRate` with a
+    /// JSON `DispatchRate` body. Java: `PersistentTopicsBase#setDispatchRate`.
+    pub async fn topic_set_dispatch_rate(
+        &self,
+        topic: &str,
+        rate: DispatchRate,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "dispatchRate"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&rate))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a topic's consumer dispatch-rate policy.
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/dispatchRate`.
+    /// Java: `PersistentTopicsBase#removeDispatchRate`.
+    pub async fn topic_remove_dispatch_rate(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "dispatchRate"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.
