@@ -47,8 +47,8 @@ use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
-    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, RetentionPolicies,
-    TenantInfo,
+    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType,
+    PersistencePolicies, RetentionPolicies, TenantInfo,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -365,6 +365,36 @@ pub(crate) enum NamespacesCmd {
     /// Remove a namespace's message-TTL (fall back to broker default).
     /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/messageTTL`.
     RemoveMessageTtl {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Get a namespace's persistence policy.
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/persistence`.
+    GetPersistence {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's persistence policy.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/persistence`.
+    SetPersistence {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// BookKeeper ensemble size.
+        #[arg(long)]
+        ensemble: i32,
+        /// BookKeeper write quorum.
+        #[arg(long)]
+        write_quorum: i32,
+        /// BookKeeper ack quorum.
+        #[arg(long)]
+        ack_quorum: i32,
+        /// Managed-ledger mark-delete-rate cap (ops/sec). `0` disables.
+        #[arg(long, default_value_t = 0.0)]
+        mark_delete_rate: f64,
+    },
+    /// Remove a namespace's persistence policy (fall back to broker default).
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/persistence`.
+    RemovePersistence {
         /// Fully qualified namespace.
         namespace: String,
     },
@@ -943,6 +973,33 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         }
         NamespacesCmd::RemoveMessageTtl { namespace } => {
             admin.namespace_remove_message_ttl(&namespace).await?;
+            Ok(())
+        }
+        NamespacesCmd::GetPersistence { namespace } => {
+            print_json(&admin.namespace_get_persistence(&namespace).await?)
+        }
+        NamespacesCmd::SetPersistence {
+            namespace,
+            ensemble,
+            write_quorum,
+            ack_quorum,
+            mark_delete_rate,
+        } => {
+            admin
+                .namespace_set_persistence(
+                    &namespace,
+                    PersistencePolicies {
+                        bookkeeper_ensemble: ensemble,
+                        bookkeeper_write_quorum: write_quorum,
+                        bookkeeper_ack_quorum: ack_quorum,
+                        managed_ledger_max_mark_delete_rate: mark_delete_rate,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemovePersistence { namespace } => {
+            admin.namespace_remove_persistence(&namespace).await?;
             Ok(())
         }
     }

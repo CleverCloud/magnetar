@@ -408,6 +408,54 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Namespace policies — persistence + rates ----------------------
+
+    /// Get a namespace's persistence policy.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/persistence`. Returns the
+    /// BookKeeper ensemble / write-quorum / ack-quorum triple plus the
+    /// managed-ledger mark-delete rate cap. `null` body decodes to
+    /// `PersistencePolicies::default()` via `#[serde(default)]`.
+    /// Java: `NamespacesBase#getPersistence`.
+    pub async fn namespace_get_persistence(
+        &self,
+        ns: &str,
+    ) -> Result<PersistencePolicies, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "persistence"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's persistence policy.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/persistence` with a JSON
+    /// `PersistencePolicies` body.
+    /// Java: `NamespacesBase#setPersistence`.
+    pub async fn namespace_set_persistence(
+        &self,
+        ns: &str,
+        policy: PersistencePolicies,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "persistence"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&policy))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's persistence policy (fall back to broker default).
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/persistence`.
+    /// Java: `NamespacesBase#deletePersistence`.
+    pub async fn namespace_remove_persistence(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "persistence"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
@@ -1087,6 +1135,28 @@ pub struct RetentionPolicies {
     /// Maximum retention size in megabytes. `-1` = infinite, `0` = none.
     #[serde(rename = "retentionSizeInMB")]
     pub retention_size_in_mb: i64,
+}
+
+/// Java `PersistencePolicies` — namespace-level BookKeeper layout +
+/// managed-ledger write-shaping knobs. Maps to the broker's
+/// `org.apache.pulsar.common.policies.data.PersistencePolicies`. Use
+/// `Default` (`0/0/0/0.0`) only for "unset" semantics — the broker
+/// rejects ensemble values < 1 on `set`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PersistencePolicies {
+    /// BookKeeper ensemble size — the number of bookies the managed
+    /// ledger striping is spread across.
+    pub bookkeeper_ensemble: i32,
+    /// BookKeeper write quorum — the number of bookies each entry is
+    /// written to.
+    pub bookkeeper_write_quorum: i32,
+    /// BookKeeper ack quorum — the number of acks required before an
+    /// add is considered durable.
+    pub bookkeeper_ack_quorum: i32,
+    /// Managed-ledger mark-delete-rate cap (ops/sec). `0.0` disables
+    /// the throttle.
+    pub managed_ledger_max_mark_delete_rate: f64,
 }
 
 /// Java `BacklogQuota` — one entry in the namespace-level backlog quota
