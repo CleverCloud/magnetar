@@ -1132,6 +1132,55 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's max-producers-per-topic limit.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/maxProducersPerTopic`. Returns
+    /// a bare integer (the per-topic ceiling on concurrent producer
+    /// connections), or `null` (decoded as `None`) when the broker default
+    /// applies.
+    /// Java: `NamespacesBase#getMaxProducersPerTopic`.
+    pub async fn namespace_get_max_producers_per_topic(
+        &self,
+        ns: &str,
+    ) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "maxProducersPerTopic"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's max-producers-per-topic limit.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/maxProducersPerTopic` with
+    /// a bare JSON integer body. `0` disables the limit.
+    /// Java: `NamespacesBase#setMaxProducersPerTopic`.
+    pub async fn namespace_set_max_producers_per_topic(
+        &self,
+        ns: &str,
+        max_producers: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "maxProducersPerTopic"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&max_producers))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's max-producers-per-topic limit override.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/maxProducersPerTopic`.
+    /// Java: `NamespacesBase#removeMaxProducersPerTopic`.
+    pub async fn namespace_remove_max_producers_per_topic(
+        &self,
+        ns: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "maxProducersPerTopic"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.

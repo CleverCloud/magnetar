@@ -752,6 +752,27 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's max-producers-per-topic limit (or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/maxProducersPerTopic`.
+    GetMaxProducersPerTopic {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's max-producers-per-topic limit. `0` disables.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/maxProducersPerTopic`.
+    SetMaxProducersPerTopic {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Max concurrent producers per topic. `0` disables.
+        #[arg(long)]
+        max_producers: i32,
+    },
+    /// Remove a namespace's max-producers-per-topic limit override.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/maxProducersPerTopic`.
+    RemoveMaxProducersPerTopic {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1906,6 +1927,26 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         }
         NamespacesCmd::RemoveDelayedDelivery { namespace } => {
             admin.namespace_remove_delayed_delivery(&namespace).await?;
+            Ok(())
+        }
+        NamespacesCmd::GetMaxProducersPerTopic { namespace } => print_json(
+            &admin
+                .namespace_get_max_producers_per_topic(&namespace)
+                .await?,
+        ),
+        NamespacesCmd::SetMaxProducersPerTopic {
+            namespace,
+            max_producers,
+        } => {
+            admin
+                .namespace_set_max_producers_per_topic(&namespace, max_producers)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveMaxProducersPerTopic { namespace } => {
+            admin
+                .namespace_remove_max_producers_per_topic(&namespace)
+                .await?;
             Ok(())
         }
     }
