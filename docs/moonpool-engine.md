@@ -233,7 +233,7 @@ done
 ```
 
 In CI, the per-PR / per-push pipeline ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) exercises the moonpool suite under the default seed via the regular `test` job.
-A dedicated [`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml) workflow runs **daily** with **16 freshly-rolled random `u64` seeds in parallel** — see [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) for the rationale (fixed seeds in per-PR CI are wasted compute since each `(commit, seed)` pair is bit-for-bit reproducible; random seeds rolled daily cover the seed space far better over time).
+A dedicated [`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml) workflow runs **daily** with **128 freshly-rolled random `u64` seeds in parallel** — see [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) for the rationale (fixed seeds in per-PR CI are wasted compute since each `(commit, seed)` pair is bit-for-bit reproducible; random seeds rolled daily cover the seed space far better over time).
 Failing seeds are echoed in the run summary — reproduce locally with `MOONPOOL_SEED=<hex> cargo test -p magnetar-runtime-moonpool …`.
 
 ## Differential equivalence harness
@@ -272,7 +272,7 @@ The earlier `LocalSet` + 25 ms `Kicker` pump were tied to a stale `spawn_local` 
 - **Transparent in-flight publish replay** across reconnect: the sans-io machinery is there (`Connection::reset`, epoch bump, rebuild plumbing) but the engine surfaces `OpOutcome::SessionLost` rather than re-queueing the unconfirmed sends.
   Stage 3 follow-up.
 
-Tracked in [`follow-ups.md`](follow-ups.md).
+When one of these items moves from "known gap" to "ready to dispatch", it is added to [`follow-ups.md`](follow-ups.md) with the standard **Gap** / **Why it stays open** / `/goal` entry shape.
 
 ## Appendix — reference patterns: FoundationDB and TigerBeetle
 

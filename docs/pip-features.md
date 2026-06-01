@@ -164,7 +164,7 @@ What that acceptance covers:
   `MessageEncryptor` / `MessageDecryptor` types live behind the per-engine [`MessageEncryptorApi`] / [`MessageDecryptorApi`] extension traits (tokio plugs in `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs in a no-op stub).
   `MessageRouter` is a façade-level trait (pure routing math), engine-agnostic by construction.
 - **Test coverage.** The five mapping/wire test files have moonpool 1:1 mirrors at `crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape pinning + sans-io wire assertions against `MoonpoolEngine<TokioProviders>`); the V5 surface has full deterministic-simulation coverage symmetric with the v4 surface.
-  Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` + `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"` cover Pulsar 4.x compatibility.
+  Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` + `e2e_sub_types_v5.rs`) gated `feature = "experimental-v5-client"` (no `e2e` feature, no `#[ignore]` per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)) cover Pulsar 4.x compatibility.
   `check-crypto-matrix` × V5 axis is green.
 - **Per-surface builder lifts.** `PartitionedProducerBuilder<E>`, `TableViewBuilder<E>`, `TypedTableViewBuilder<S, E>` are engine-generic.
   The tokio-specialised `.create_with_encryption` / `.create_with_decryption` impls retain the PIP-4 carve-out.
@@ -402,11 +402,11 @@ Running the suite:
 
 ```sh
 cargo test -p magnetar \
-    --test e2e_shadow_topic_replicator -- --include-ignored --nocapture
+    --test e2e_shadow_topic_replicator -- --nocapture
 ```
 
-> **Admin-client wire-shape note.** The e2e creates the shadow topic via the broker's own `pulsar-admin` CLI, not `magnetar_admin::AdminClient::create_shadow_topic`, because Pulsar 4.0.4's `PUT .../{source}/shadowTopics` endpoint deserialises the body as a bare `List<String>` while the admin client sends a `{"shadowTopics":[…]}` object (HTTP 400).
-> That mismatch is tracked in [`follow-ups.md`](follow-ups.md).
+> **Admin-client wire-shape note.** Pulsar 4.0.4's `PUT .../{source}/shadowTopics` endpoint deserialises the body as a bare `List<String>` (not an envelope object); `magnetar_admin::AdminClient::create_shadow_topic` matches that contract today and is verified against the broker by the replicator e2e fixture.
+> The fixture still provisions the shadow link via `pulsar-admin` exec'd inside the container — it's a single-step bootstrap that piggybacks the existing container-side admin auth, not a workaround for an admin-client bug.
 
 ### Shadow topics references
 
@@ -776,12 +776,12 @@ This buys two properties:
 
 ### Athenz end-to-end testing against a real ZTS
 
-End-to-end coverage lives in [`crates/magnetar/tests/e2e_athenz_zts.rs`](../crates/magnetar/tests/e2e_athenz_zts.rs) behind `feature = "e2e,auth-athenz-zts"` and is `#[ignore]`'d by default (parity with every other `e2e_*.rs` test).
-Run with:
+End-to-end coverage lives in [`crates/magnetar/tests/e2e_athenz_zts.rs`](../crates/magnetar/tests/e2e_athenz_zts.rs) behind `feature = "auth-athenz-zts"`; per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the file carries no `e2e` feature and no `#[ignore]`, so it runs on every `cargo test --all-features`.
+Run the file in isolation with:
 
 ```sh
 cargo test --features auth-athenz-zts \
-  -p magnetar --test e2e_athenz_zts -- --nocapture --include-ignored
+  -p magnetar --test e2e_athenz_zts -- --nocapture
 ```
 
 #### Athenz hybrid fixture shape
@@ -803,7 +803,7 @@ The Docker probe wires the upstream image into the e2e surface so a downstream c
 #### Athenz full ZMS+ZTS topology
 
 Full ZMS+ZTS+cert-bootstrap testing requires running the Athenz `make deploy-dev` topology as a shared CI fixture (four containers, MySQL persistence, a CA hierarchy, ZMS-side `zms-cli add-public-key` seeding for the tenant).
-Adding it would replace the `#[ignore]`'d Docker probe with a full multi-container compose fixture similar to [`crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml`](../crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml).
+Adding it would replace the lightweight Docker reachability probe with a full multi-container compose fixture similar to [`crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml`](../crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml).
 That work is out of scope for the current Athenz surface.
 
 ### Athenz cross-runtime test coverage (ADR-0024)
