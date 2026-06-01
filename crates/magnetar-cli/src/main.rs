@@ -48,7 +48,7 @@ use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, DispatchRate,
-    PersistencePolicies, RetentionPolicies, TenantInfo,
+    PersistencePolicies, PublishRate, RetentionPolicies, TenantInfo,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -485,6 +485,30 @@ pub(crate) enum NamespacesCmd {
     /// Remove a namespace's cross-cluster replicator dispatch-rate policy.
     /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/replicatorDispatchRate`.
     RemoveReplicatorDispatchRate {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Get a namespace's publish-rate policy.
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/publishRate`.
+    GetPublishRate {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's publish-rate policy.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/publishRate`.
+    SetPublishRate {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Throttle in messages/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_msg: i32,
+        /// Throttle in bytes/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_byte: i64,
+    },
+    /// Remove a namespace's publish-rate policy.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/publishRate`.
+    RemovePublishRate {
         /// Fully qualified namespace.
         namespace: String,
     },
@@ -1179,6 +1203,29 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             admin
                 .namespace_remove_replicator_dispatch_rate(&namespace)
                 .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetPublishRate { namespace } => {
+            print_json(&admin.namespace_get_publish_rate(&namespace).await?)
+        }
+        NamespacesCmd::SetPublishRate {
+            namespace,
+            rate_msg,
+            rate_byte,
+        } => {
+            admin
+                .namespace_set_publish_rate(
+                    &namespace,
+                    PublishRate {
+                        publish_throttling_rate_in_msg: rate_msg,
+                        publish_throttling_rate_in_byte: rate_byte,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemovePublishRate { namespace } => {
+            admin.namespace_remove_publish_rate(&namespace).await?;
             Ok(())
         }
     }

@@ -14,7 +14,7 @@
 //! `removeReplicatorDispatchRate`, `getPublishRate`, `setPublishRate`,
 //! `removePublishRate`).
 
-use magnetar_admin::{AdminClient, DispatchRate, PersistencePolicies};
+use magnetar_admin::{AdminClient, DispatchRate, PersistencePolicies, PublishRate};
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -281,4 +281,60 @@ async fn replicator_dispatch_rate_get_set_remove_cycle() {
         .namespace_remove_replicator_dispatch_rate("acme/svc")
         .await
         .expect("remove replicator dispatch rate");
+}
+
+#[tokio::test]
+async fn publish_rate_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/publishRate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "publishThrottlingRateInMsg": 5000,
+            "publishThrottlingRateInByte": 2097152_i64,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/publishRate"))
+        .and(body_json(serde_json::json!({
+            "publishThrottlingRateInMsg": -1,
+            "publishThrottlingRateInByte": -1,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/namespaces/acme/svc/publishRate"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let rate = admin
+        .namespace_get_publish_rate("acme/svc")
+        .await
+        .expect("get publish rate");
+    assert_eq!(rate.publish_throttling_rate_in_msg, 5000);
+    assert_eq!(rate.publish_throttling_rate_in_byte, 2_097_152);
+
+    admin
+        .namespace_set_publish_rate(
+            "acme/svc",
+            PublishRate {
+                publish_throttling_rate_in_msg: -1,
+                publish_throttling_rate_in_byte: -1,
+            },
+        )
+        .await
+        .expect("set publish rate");
+    admin
+        .namespace_remove_publish_rate("acme/svc")
+        .await
+        .expect("remove publish rate");
 }

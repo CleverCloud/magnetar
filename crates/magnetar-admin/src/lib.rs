@@ -594,6 +594,48 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's publish-rate policy.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/publishRate`. Returns
+    /// the producer-side throttle (msg/sec + byte/sec). `-1` on either
+    /// dimension means unlimited.
+    /// Java: `NamespacesBase#getPublishRate`.
+    pub async fn namespace_get_publish_rate(&self, ns: &str) -> Result<PublishRate, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "publishRate"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's publish-rate policy.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/publishRate` with a JSON
+    /// `PublishRate` body.
+    /// Java: `NamespacesBase#setPublishRate`.
+    pub async fn namespace_set_publish_rate(
+        &self,
+        ns: &str,
+        rate: PublishRate,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "publishRate"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&rate))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's publish-rate policy.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/publishRate`.
+    /// Java: `NamespacesBase#removePublishRate`.
+    pub async fn namespace_remove_publish_rate(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "publishRate"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
@@ -1314,6 +1356,19 @@ pub struct DispatchRate {
     /// If `true`, dispatch rate is interpreted as an addend on top of
     /// the namespace publish rate rather than an absolute cap.
     pub relative_to_publish_rate: bool,
+}
+
+/// Java `PublishRate` — producer-side throttle (msg/sec + byte/sec).
+/// `-1` on either dimension disables that axis of the throttle. Unlike
+/// `DispatchRate`, there is no rate-period field — the broker uses a
+/// fixed 1-second window.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PublishRate {
+    /// Throttle in messages/sec. `-1` = unlimited.
+    pub publish_throttling_rate_in_msg: i32,
+    /// Throttle in bytes/sec. `-1` = unlimited.
+    pub publish_throttling_rate_in_byte: i64,
 }
 
 /// Java `BacklogQuota` — one entry in the namespace-level backlog quota
