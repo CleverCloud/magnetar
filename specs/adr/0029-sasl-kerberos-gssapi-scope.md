@@ -1,7 +1,6 @@
 # ADR-0029 — SASL Kerberos / GSSAPI binding
 
-- **Status**: Accepted — landed ahead of the v0.2.0 milestone
-  (2026-05-26)
+- **Status**: Accepted (landed 2026-05-26)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: auth, sasl, kerberos, gssapi, landed
@@ -9,15 +8,16 @@
 ## Context
 
 [ADR-0010](0010-v0-1-full-java-parity.md) commits magnetar to full
-Apache Pulsar Java client parity at v0.1.0 against a Pulsar 4.0+
-broker. [ADR-0026 §D3](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-carved out one explicit exception: SASL `PLAIN` (RFC 4616) ships in
-v0.1.0, but **SASL Kerberos / GSSAPI is deferred to v0.2.0**. The
+Apache Pulsar Java client parity against a Pulsar 4.0+ broker.
+[ADR-0026 §D3](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
+carved out one explicit exception: SASL `PLAIN` (RFC 4616) shipped
+first, with **SASL Kerberos / GSSAPI deferred** as follow-up work. The
 rationale recorded there was that GSSAPI is a large, multi-stakeholder
 external dependency (`libgssapi`, MIT/Heimdal KRB5 runtime, JAAS-style
-JAAS section semantics) whose scope is not proportional to the demand
-from Clever Cloud's v0.1.0 use cases. The parity matrix in `README.md`
-marks the mechanism `🟡 partial — PLAIN only, GSSAPI in v0.2.0`.
+JAAS section semantics) whose scope was not proportional to the
+near-term demand from Clever Cloud's use cases. The parity matrix in
+`README.md` previously marked the mechanism
+`🟡 partial — PLAIN only, GSSAPI follow-up`.
 
 Today the scaffolding for the deferred mechanism is in place:
 `magnetar-auth-sasl` ships `SaslKerberos` (see
@@ -41,8 +41,8 @@ GSSAPI exchange via JDK's `Sasl.createSaslClient(["GSSAPI"], …)`, and
 drives a multi-step CONNECT → AuthChallenge → AuthResponse →
 CONNECTED handshake until the SASL state machine reports complete.
 
-This ADR locks the scope of the deferred work so the v0.2.0 milestone
-plan has a concrete sizing and acceptance contract.
+This ADR locks the scope of the deferred work so the follow-up plan
+has a concrete sizing and acceptance contract.
 
 ## Decision
 
@@ -100,12 +100,11 @@ plan has a concrete sizing and acceptance contract.
   `openssl-sys`, preserving [ADR-0005](0005-rustls-only-tls.md).
 
 - **JAAS subset.** Java's `saslJaasClientSectionName` resolves to a
-  full JAAS section with `Krb5LoginModule` options. magnetar v0.2.0
-  reads a **scoped subset** from `SaslKerberosConfig` rather than a
-  JAAS file: `principal`, `keytab`, `ticket_cache`, `use_keytab`,
-  `use_ticket_cache`. A JAAS-file parser is **out of scope** for
-  v0.2.0; the equivalence table will land alongside the v0.3.0+
-  parser work.
+  full JAAS section with `Krb5LoginModule` options. magnetar reads a
+  **scoped subset** from `SaslKerberosConfig` rather than a JAAS file:
+  `principal`, `keytab`, `ticket_cache`, `use_keytab`,
+  `use_ticket_cache`. A JAAS-file parser is **out of scope** here; the
+  equivalence table will land alongside any future parser work.
 
 - **Service principal naming.** Pulsar's `serverType=broker` resolves
   to a service principal of the form `<serverType>/<broker-hostname>@<realm>`.
@@ -163,7 +162,7 @@ plan has a concrete sizing and acceptance contract.
   pulsar CONNECTED step, surfacing principal mismatch as a
   connection failure rather than a silent succeed.
 
-- **Confined deferral.** A v0.3.0 follow-up may add JAAS-file
+- **Confined deferral.** A later follow-up may add JAAS-file
   parsing if a downstream user requires drop-in compatibility with
   a Java application's JAAS config. Not in scope here.
 
@@ -216,8 +215,8 @@ Accepted — landed via `feat/sasl-kerberos` on 2026-05-26.
 ## References
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum.
-- [ADR-0010](0010-v0-1-full-java-parity.md) — v0.1.0 full Java
-  parity, SASL Kerberos deferral.
+- [ADR-0010](0010-v0-1-full-java-parity.md) — full Java parity,
+  earlier SASL Kerberos deferral now lifted.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   cross-runtime test policy; binding test plan for the four-layer
   set above.

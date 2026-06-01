@@ -94,8 +94,7 @@ abstraction in Rust (see the `Providers` model in
 `SimulationBuilder` + `MoonpoolEngine<SimProviders>` + an
 in-simulator broker stub. The differential harness is **not**
 restructured (option 2 from D2) and the broker is **not**
-virtualised (option 3); both are explicitly out of scope for
-v0.1.0.
+virtualised (option 3); both are explicitly out of scope.
 
 **Invariant-based assertions, not byte-identical replays.** Codex
 flagged this: "deterministic replay" doesn't mean "identical
@@ -109,14 +108,14 @@ by construction: a moonpool-only chaos test cannot have a tokio
 equivalent. The exemption goes in the commit message per ADR-0024
 §Exemptions.
 
-### D3 — SASL/Athenz: **defer full impl to v0.2.0; amend parity docs**
+### D3 — SASL/Athenz: **defer full impl; amend parity docs**
 
 Codex pushed back on "ship stubs and claim full parity": that
 violates ADR-0010's "full Java parity on tokio" literally. The
 right move is to **defer** (the user-facing position) and
 **amend** ADR-0010's parity matrix to mark SASL/Kerberos and
 Athenz/ZTS as `🟡 partial — PLAIN / pre-fetched token only,
-GSSAPI + ZTS in v0.2.0`. Honest parity beats stubs-as-✅.
+GSSAPI + ZTS as follow-up work`. Honest parity beats stubs-as-✅.
 
 `docs/parity-status.md` already marks both crates `🟡 pre-alpha`
 ([line 58–59](../../docs/parity-status.md)) but README's parity
@@ -193,9 +192,8 @@ All four decisions landed in commits between 2026-05-23 and
   the partial scope and rationale.
 
   *Update (2026-05-26):* SASL Kerberos / GSSAPI ✅ has now also
-  landed (ahead of the v0.2.0 milestone) via
-  [ADR-0029](0029-sasl-kerberos-gssapi-scope.md); the Athenz ZTS
-  round-trip remains deferred under D3.
+  landed via [ADR-0029](0029-sasl-kerberos-gssapi-scope.md); the
+  Athenz ZTS round-trip remains deferred under D3.
 - **D2** — `crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`
   (commit `c23f6fd`). `BrokerWorkload` binds a sim `TcpListener`
   at the workload's assigned IP and replies to the minimum Pulsar

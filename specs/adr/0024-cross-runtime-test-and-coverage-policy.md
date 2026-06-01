@@ -51,13 +51,13 @@ of the production surface drifts. Observed risks:
    `docs/testing.md` but not *enforced*, so seed-dependent regressions
    slip through.
 
-The v0.1.0 finish-line wave produced three near-misses fitting
+The parity finish-line wave produced three near-misses fitting
 patterns (1)-(3), each caught manually during ADR review rather than
 by CI.
 
-ADR-0019 already records that moonpool parity is a follow-up train
-(post-v0.1.0); ADR-0021 already records that tests are fixed, not
-silently ignored. This ADR closes the gap between those two by
+ADR-0019 already records that moonpool parity is a follow-up train;
+ADR-0021 already records that tests are fixed, not silently ignored.
+This ADR closes the gap between those two by
 specifying **what coverage and what test layers a "fix" or "feature"
 must touch**, and by adding two hard-failing xtask checks to enforce
 the rules in the local + CI validation chain.
@@ -217,7 +217,7 @@ Concretely, the binding rules are:
 
 - [ADR-0004 — sans-io `magnetar-proto` + swappable I/O engines](0004-sans-io-protocol-core.md)
 - [ADR-0006 — moonpool engine drives `rustls::ClientConnection`](0006-moonpool-tls-byte-pipe.md)
-- [ADR-0010 — v0.1.0 full Java parity](0010-v0-1-full-java-parity.md)
+- [ADR-0010 — full Java parity](0010-v0-1-full-java-parity.md)
 - [ADR-0019 — engine scope and moonpool parity follow-up](0019-engine-scope-and-moonpool-parity.md)
 - [ADR-0021 — tests are fixed, not silently ignored or removed](0021-no-silent-test-ignore-or-remove.md)
 - [`docs/testing.md`](../../docs/testing.md) — five test categories.

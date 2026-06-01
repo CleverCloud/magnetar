@@ -21,7 +21,7 @@
 //!
 //! Instead, moonpool callers that reach for a tokio-only method get a
 //! clean trait-bound error rather than a silent fallback — exactly the
-//! ADR-0019 §Decision contract for v0.1.0.
+//! ADR-0019 §Decision contract.
 //!
 //! See ADR-0019 gate (e) — "Option A: generic `PulsarClient<E: Engine>`
 //! with default `E = TokioEngine`" — for the rationale.

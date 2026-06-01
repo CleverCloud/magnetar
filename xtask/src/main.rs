@@ -1356,7 +1356,7 @@ fn check_crypto_matrix() -> Result<()> {
         "crypto-fips",
     ];
     // Athenz signer matrix: `none` exercises the trait-only surface
-    // (existing v0.1.0 behaviour). `both` validates the cfg cascade —
+    // (existing behaviour). `both` validates the cfg cascade —
     // aws-lc-rs wins per ADR-0035 priority.
     const ATHENZ_CELLS: &[&str] = &[
         "",

@@ -1,8 +1,7 @@
-# PIP-460 — Scalable topics / DAG-watch consumer (experimental, v0.2.0)
+# PIP-460 — Scalable topics / DAG-watch consumer (experimental)
 
 - **Status**: Accepted (scaffold landed 2026-05-28; ADR-0031 Accepted)
 - **ADR**: [ADR-0031](../adr/0031-pip-460-scalable-subscription-scope.md)
-- **Target**: v0.2.0
 - **Date**: 2026-05-26
 - **Owner**: Florentin Dubois
 - **Upstream**: [pip/pip-460.md](https://github.com/apache/pulsar/blob/master/pip/pip-460.md)
@@ -20,12 +19,12 @@
 PIP-460 introduces a new `topic://<...>` URL scheme, segment-DAG
 metadata, three new wire commands (`CommandScalableTopicLookup`,
 `CommandSegmentDagWatch`, `CommandSegmentDagUpdate`), and a
-controller-broker session model. magnetar v0.2.0 ships **only the
+controller-broker session model. magnetar ships **only the
 StreamConsumer happy path** behind a default-off feature flag, drops
 on DAG-change-mid-consume (no transparent failover), and gates e2e on
 upstream cutting a Pulsar 5.0 RC. The other two PIP-460 consumer types
 (`QueueConsumer`, `CheckpointConsumer`), controller election, and
-in-place repartition are explicit v0.3.0+ work.
+in-place repartition are explicit follow-up work.
 
 ## 1. Wire-protocol delta vs. vendored `PulsarApi.proto`
 
@@ -172,7 +171,7 @@ CLOSE_SEGMENT_DAG_WATCH        = 85;
 Adds `v22` (or whatever upstream assigns) to
 [`PulsarApi.proto:280`](../../crates/magnetar-proto/proto/PulsarApi.proto)
 `enum ProtocolVersion`. The client only advertises `v22+` when the
-`scalable-topics` feature is on; otherwise it caps at the v0.1.0
+`scalable-topics` feature is on; otherwise it caps at the pre-PIP-460
 ceiling. The `SUPPORTED_PROTOCOL_VERSION` typed constant in
 `magnetar-proto` ([`crates/magnetar-proto/src/lib.rs`](../../crates/magnetar-proto/src/lib.rs))
 gets a parallel `SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS` constant.
@@ -309,7 +308,7 @@ pub enum Event {
 pub enum DagChangeReason { Split, Merge, SegmentRemoved, Unknown }
 ```
 
-### 2.5 Out of scope for v0.2.0 (`magnetar-proto`)
+### 2.5 Out of scope (`magnetar-proto`)
 
 - Controller-election awareness: when the controller broker
   disconnects we surface `Event::DagWatchClosed { reason }` and let the
@@ -318,7 +317,7 @@ pub enum DagChangeReason { Split, Merge, SegmentRemoved, Unknown }
   and a `DagChangedDuringConsume` event is emitted.
 - In-place repartitioning under live consumers.
 - Segment-aware sticky-key dispatch (Key_Shared semantics across the
-  full DAG). v0.2.0 KeyRange is observation-only.
+  full DAG). KeyRange is observation-only.
 
 ## 3. Runtime surface ports
 
@@ -368,11 +367,11 @@ where
 ```
 
 Feature flag: `scalable-topics` on the `magnetar` crate, **default off**.
-Compiling without the flag leaves the v0.1.0 surface bit-for-bit
+Compiling without the flag leaves the pre-PIP-460 surface bit-for-bit
 unchanged. The `magnetar-cli` binary picks the feature up via
 `--features magnetar/scalable-topics` only.
 
-`#[doc = "**Experimental** (PIP-460 v0.2.0). StreamConsumer drops on DAG change."]`
+`#[doc = "**Experimental** (PIP-460). StreamConsumer drops on DAG change."]`
 banner on every public type in the module.
 
 ### 3.2 `magnetar-runtime-moonpool`
@@ -475,9 +474,9 @@ rule applies.
 | Coverage | (1) lookup-then-consume happy path; (2) `topic-info` CLI round-trip; (3) drop-on-DAG-change observed against a broker-driven split. |
 
 The 4-layer set above is the **binding acceptance gate**; e2e is
-best-effort and explicitly **does not block the v0.2.0 release-cut**
-on this surface. Once Pulsar 5.0 GA ships, e2e becomes blocking — at
-which point we cut a follow-up proposal flipping the gate.
+best-effort and explicitly **does not block release** on this surface.
+Once Pulsar 5.0 GA ships, e2e becomes blocking — at which point we cut
+a follow-up proposal flipping the gate.
 
 `docker-compose.scalable-topics.yml` under
 `crates/magnetar/tests/fixtures/` (NEW) — single-broker, but pre-config
@@ -504,8 +503,8 @@ helpers (`crates/magnetar/tests/helpers/`).
    tag, not on master; the proposal's §1 field numbers are explicitly
    provisional.
 2. **Controller-broker disconnect semantics under-specified upstream.**
-   Mitigation: v0.2.0 surfaces `DagWatchClosed { reason }` and lets the
-   caller decide. No silent retry. Documented in
+   Mitigation: the client surfaces `DagWatchClosed { reason }` and lets
+   the caller decide. No silent retry. Documented in
    `docs/scalable-topics.md` (NEW) alongside the experimental banner.
 3. **Test-count parity strain.** The 1:1 rule means moonpool needs a
    working scripted controller-broker before any tokio test lands.
@@ -521,7 +520,7 @@ helpers (`crates/magnetar/tests/helpers/`).
 
 PIP-460 is feature-flagged off by default. If a critical bug surfaces
 post-release, the rollback is `--no-default-features` or simply not
-enabling `scalable-topics`. No revert PR needed; v0.1.0-compatible
+enabling `scalable-topics`. No revert PR needed; pre-PIP-460-compatible
 callers are unaffected.
 
 ## 7. Dependencies + sequencing
@@ -549,7 +548,7 @@ callers are unaffected.
 - `README.md` — Java-client parity matrix row update.
 - `specs/README.md` ADR index — flip ADR-0031 status to `Accepted`
   the moment Florentin signs the proposal off.
-- `docs/follow-ups.md` — record v0.3.0+ items: QueueConsumer,
+- `docs/follow-ups.md` — record follow-up items: QueueConsumer,
   CheckpointConsumer, controller election, transparent failover.
 
 ## 9. References

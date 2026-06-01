@@ -90,7 +90,7 @@ impl std::fmt::Debug for ConnectionFactory {
 /// Composite key — the Java client uses an `InetSocketAddress`-typed
 /// `(logical, physical, randomKey)` triple
 /// ([`ConnectionPool.Key`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java#L99)).
-/// We collapse to `(logical, physical)` for v0.1 (`randomKey` multiplexing is
+/// We collapse to `(logical, physical)` (`randomKey` multiplexing is
 /// follow-up #—): magnetar's per-handle slot mutex (ADR-0038) already
 /// parallelises the hot path inside one connection, so the extra fan-out gain
 /// from running N parallel connections per broker is not worth the API

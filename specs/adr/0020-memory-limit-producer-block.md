@@ -21,7 +21,7 @@ The `ProducerBlock` half was tagged as a polish follow-up in
 `README.md#open-structural-gaps`.
 
 Today (gate (d) cleared by Florentin on 2026-05-21) `ProducerBlock` is
-in scope for v0.1.0 — full Java parity per
+in scope — full Java parity per
 [ADR-0010](0010-v0-1-full-java-parity.md).
 
 Constraints from prior ADRs:
@@ -182,7 +182,7 @@ producers.
 
 - [ADR-0003 — no-channels rule](0003-no-channels-rule.md).
 - [ADR-0004 — sans-io protocol core](0004-sans-io-protocol-core.md).
-- [ADR-0010 — v0.1.0 full Java parity](0010-v0-1-full-java-parity.md).
+- [ADR-0010 — full Java parity](0010-v0-1-full-java-parity.md).
 - [ADR-0011 — clock injection](0011-clock-injection-sans-io.md).
 - [ADR-0017 — memory_limit atomic CAS reservation](0017-memory-limit-atomic-reservation.md)
   (this ADR extends ADR-0017's mechanism rather than replacing it).

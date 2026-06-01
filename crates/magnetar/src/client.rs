@@ -781,7 +781,7 @@ impl From<magnetar_proto::event::IncomingMessage> for IncomingMessage {
 /// Every façade surface (`producer`, `consumer`, `reader`, `typed_producer`,
 /// `typed_consumer`, partitioned / multi-topics / pattern / table-view
 /// constructors, transactions, interceptor SPI, …) is implemented only on
-/// `PulsarClient<TokioEngine>` for v0.1.0. Moonpool-side callers that reach
+/// `PulsarClient<TokioEngine>`. Moonpool-side callers that reach
 /// for one of these get a clean trait-bound failure — matching ADR-0019
 /// §Decision "no silent fallbacks".
 #[derive(Debug)]

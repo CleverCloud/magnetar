@@ -160,7 +160,7 @@ Concretely:
 
 - The `ConsumerApi` trait now has 41 methods and one associated
   type. Adding a new runtime is more work than before. This is the
-  v0.1.0 target surface; the trait is additive so subsequent
+  current target surface; the trait is additive so subsequent
   extensions are non-breaking, but the up-front cost of a new
   runtime is now real.
 - The trait method `unsubscribe(force: bool)` changed signature

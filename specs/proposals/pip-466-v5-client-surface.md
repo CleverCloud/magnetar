@@ -1,8 +1,7 @@
-# PIP-466 — V5 client surface (experimental, v0.2.0)
+# PIP-466 — V5 client surface (experimental)
 
 - **Status**: Draft
 - **ADR**: [ADR-0032](../adr/0032-pip-466-v5-client-surface-scope.md)
-- **Target**: v0.2.0
 - **Date**: 2026-05-26
 - **Owner**: Florentin Dubois
 - **Upstream**: [pip/pip-466.md](https://github.com/apache/pulsar/blob/master/pip/pip-466.md)
@@ -22,12 +21,12 @@
 PIP-466 is a clean-slate redesign of the Pulsar **Java** client API,
 designed to live **alongside** the v4 API as a separate module set
 (no wire change beyond the one `CommandScalableTopicLookup` already
-covered by [PIP-460](pip-460-scalable-topics.md)). For magnetar v0.2.0
-we ship a **subset** that mirrors the V5 ergonomic shape — `Duration`
-types, `Option<T>` builder fields, `StreamConsumer`/`QueueConsumer`
-roles — as a **thin skin over the v4 surface** behind a default-off
-feature flag. We do not duplicate the v4 surface end-to-end and we do
-not introduce per-surface engine GATs.
+covered by [PIP-460](pip-460-scalable-topics.md)). magnetar ships a
+**subset** that mirrors the V5 ergonomic shape — `Duration` types,
+`Option<T>` builder fields, `StreamConsumer` / `QueueConsumer` roles —
+as a **thin skin over the v4 surface** behind a default-off feature
+flag. We do not duplicate the v4 surface end-to-end and we do not
+introduce per-surface engine GATs.
 
 ## 1. Wire-protocol delta vs. vendored `PulsarApi.proto`
 
@@ -38,7 +37,7 @@ introduces — `CommandScalableTopicLookup` — is shared with PIP-460
 and is vendored under [PIP-460 §1](pip-460-scalable-topics.md#1-wire-protocol-delta-vs-vendored-pulsarapiproto).
 This proposal does **not** drive a second proto bump.
 
-The v0.2.0 V5 surface that we ship runs **bit-for-bit on the v4 wire**:
+The V5 surface that we ship runs **bit-for-bit on the v4 wire**:
 
 | V5 surface | v4 wire delegate |
 | --- | --- |
@@ -147,7 +146,7 @@ because V5 types live on the façade and are `<E: Engine>`-generic.
 Every public V5 type carries:
 
 ```rust
-#[doc = "**Experimental** — PIP-466 V5 client surface (v0.2.0)."]
+#[doc = "**Experimental** — PIP-466 V5 client surface."]
 #[doc = "Behaviour and signatures may change before V5 is promoted to default."]
 ```
 
@@ -162,9 +161,9 @@ scripted scenario.
 
 ### 3.3 `magnetar-cli`
 
-No V5-specific subcommand in v0.2.0. The CLI continues to use the v4
-API internally; advertising the V5 module from the CLI is deferred to
-v0.3.0+.
+No V5-specific subcommand yet. The CLI continues to use the v4 API
+internally; advertising the V5 module from the CLI is deferred to a
+follow-up.
 
 ## 4. Four-layer test plan ([ADR-0024](../adr/0024-cross-runtime-test-and-coverage-policy.md))
 
@@ -265,8 +264,8 @@ The Pulsar 5.0 only `CommandScalableTopicLookup` path is **owned by
 1. **Upstream V5 churn.** PIP-466 is itself in active design upstream
    — V5 method names, default values, and even module layout may shift
    before Pulsar 5.0 GA. Mitigation: the experimental banner +
-   default-off feature flag mean breaking changes are
-   non-breaking to v0.1.0 users.
+   default-off feature flag mean breaking changes do not affect
+   callers who stay on the v4 surface.
 2. **API duplication tax.** Maintaining two surfaces means every v4
    bugfix needs a "does the V5 skin still translate?" review.
    Mitigation: the table-driven `v5_builder_defaults.rs` test catches
@@ -279,7 +278,7 @@ The Pulsar 5.0 only `CommandScalableTopicLookup` path is **owned by
    single source of truth.
 4. **CheckpointConsumer absence may surprise users.** Mitigation:
    parity-matrix banner explicitly lists which V5 surfaces are
-   present, and a `// TODO: PIP-466 CheckpointConsumer (v0.3.0+,
+   present, and a `// TODO: PIP-466 CheckpointConsumer (follow-up,
    blocked on PIP-460 controller-broker work)` marker lives at the
    bottom of `crates/magnetar/src/v5/mod.rs`.
 
@@ -290,8 +289,9 @@ trivially `cargo build --no-default-features`. No revert PR needed.
 
 ## 7. Dependencies + sequencing
 
-V5 has no wire or sans-io prereq beyond what already ships in v0.1.0.
-PIP-466 can land **in parallel** with PIP-460, PIP-180, and PIP-33.
+V5 has no wire or sans-io prereq beyond what already ships on the v4
+surface. PIP-466 can land **in parallel** with PIP-460, PIP-180, and
+PIP-33.
 
 1. **Wave 1**: `magnetar::v5` module skeleton (`mod.rs`, `mapping.rs`)
    + (b) `v5_builder_defaults.rs` table-driven test. No surface impl.
@@ -311,7 +311,7 @@ PIP-466 can land **in parallel** with PIP-460, PIP-180, and PIP-33.
   in V5 module`.
 - `README.md` — parity-matrix row update.
 - `specs/README.md` — flip ADR-0032 to `Accepted` on sign-off.
-- `docs/follow-ups.md` — v0.3.0+ list: V5 `Reader`, `TableView`,
+- `docs/follow-ups.md` — follow-up list: V5 `Reader`, `TableView`,
   `Transaction`, `CheckpointConsumer`; V5-by-default decision.
 
 ## 9. References

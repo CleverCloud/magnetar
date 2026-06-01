@@ -1,50 +1,48 @@
-# ADR-0031 — PIP-460 scalable-topic / subscription scope for v0.2.0
+# ADR-0031 — PIP-460 scalable-topic / subscription scope
 
 - **Status**: Accepted
 - **Date**: 2026-05-26 (accepted 2026-05-28)
 - **Decider**: Florentin Dubois
-- **Tags**: pip-460, scalable-topics, segments, v0.2.0, scope, experimental
+- **Tags**: pip-460, scalable-topics, segments, scope, experimental
 
 ## Context
 
 [ADR-0010](0010-v0-1-full-java-parity.md) listed PIP-460 / PIP-466
-(scalable topics) **with an "experimental tag"** in v0.1.0 scope.
-On closer reading of the upstream PIP-460 design — which spans
-multiple sub-PIPs, introduces a new `topic://` URL scheme, three new
-consumer types (StreamConsumer, QueueConsumer, CheckpointConsumer),
-an elected controller broker, segment-DAG management, and persistent
-bidirectional streams for DAG watch sessions — shipping any
-meaningful PIP-460 surface in v0.1.0 is not realistic. The upstream
-itself targets **Pulsar 5.0 LTS** for the phased rollout.
+(scalable topics) **with an "experimental tag"**. On closer reading of
+the upstream PIP-460 design — which spans multiple sub-PIPs, introduces
+a new `topic://` URL scheme, three new consumer types (StreamConsumer,
+QueueConsumer, CheckpointConsumer), an elected controller broker,
+segment-DAG management, and persistent bidirectional streams for DAG
+watch sessions — shipping any meaningful PIP-460 surface alongside the
+initial parity wave was not realistic. The upstream itself targets
+**Pulsar 5.0 LTS** for the phased rollout.
 
-magnetar's [ADR-0009](0009-pulsar-4-minimum.md) baselines the
-broker at 4.0+. PIP-460 wire features will not be present in the
-broker we target for v0.1.0. The honest decision is to **defer
-the PIP-460 client implementation to v0.2.0** as an experimental
-surface and **lift PIP-460 out of ADR-0010's v0.1.0 scope** in a
-follow-up amendment. ADR-0031 (this file) locks the v0.2.0 scope;
-the ADR-0010 amendment is tracked as a separate `docs(adr): amend
-ADR-0010 §scalable-topics` commit and follows once Florentin signs
-off here.
+magnetar's [ADR-0009](0009-pulsar-4-minimum.md) baselines the broker at
+4.0+. PIP-460 wire features are not present in the broker we target.
+The honest decision is to ship the PIP-460 client implementation **as
+an experimental surface** and lift PIP-460 out of the original ADR-0010
+core-parity scope. ADR-0031 (this file) locks the scope; the ADR-0010
+amendment is tracked as a separate `docs(adr): amend ADR-0010
+§scalable-topics` commit.
 
-Today there is no scalable-topic scaffolding in magnetar. The
-`magnetar::client::ClientBuilder` only knows persistent and
-non-persistent topic URLs (`persistent://` / `non-persistent://`);
-the `magnetar-proto` consumer state machine assumes a
-fixed-partition `CommandLookupTopic` flow
+Before this ADR, there was no scalable-topic scaffolding in magnetar.
+The `magnetar::client::ClientBuilder` only knew persistent and
+non-persistent topic URLs (`persistent://` / `non-persistent://`); the
+`magnetar-proto` consumer state machine assumed a fixed-partition
+`CommandLookupTopic` flow
 ([`crates/magnetar-proto/src/lookup.rs`](../../crates/magnetar-proto/src/lookup.rs))
 and a single-segment `MessageId`
 ([`crates/magnetar-proto/src/types.rs`](../../crates/magnetar-proto/src/types.rs)).
 None of the PIP-460 wire commands
-(`CommandScalableTopicLookup`, segment-DAG-watch session frames)
-are present in the vendored proto.
+(`CommandScalableTopicLookup`, segment-DAG-watch session frames) were
+present in the vendored proto.
 
-This ADR locks the **bounded experimental surface** magnetar will
-ship in v0.2.0: enough to consume from a scalable topic against a
-Pulsar 5.0+ broker on the **happy path**, plus the wire and proto
-groundwork. The full DAG-aware split/merge surface, checkpoint
-consumer, and controller-broker coordination are out of scope and
-will be revisited in a v0.3.0+ ADR.
+This ADR locks the **bounded experimental surface** magnetar ships:
+enough to consume from a scalable topic against a Pulsar 5.0+ broker
+on the **happy path**, plus the wire and proto groundwork. The full
+DAG-aware split/merge surface, checkpoint consumer, and
+controller-broker coordination are out of scope and will be revisited
+in a follow-up ADR.
 
 ## Decision
 
@@ -53,11 +51,12 @@ will be revisited in a v0.3.0+ ADR.
   + response for segment-aware lookup, (b) extended `MessageId`
   with a `segment_id` field, (c) `CommandSegmentDagWatch` +
   `CommandSegmentDagUpdate` bidirectional-stream frames for the
-  controller broker's DAG-change notifications. **In v0.2.0 we
-  vendor PIP-460's proto additions** by running
+  controller broker's DAG-change notifications. **We vendor PIP-460's
+  proto additions** by running
   `cargo run -p xtask -- vendor-proto --rev <pulsar-5.0-rc-sha>`
   once upstream tags a Pulsar 5.0 candidate including PIP-460.
-  Vendoring is a separate commit per [ADR-0026 §D4](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
+  Vendoring is a separate commit per
+  [ADR-0026 §D4](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
 
 - **`magnetar-proto` state-machine additions.**
   - New entry point on `Conn`: handle `CommandScalableTopicLookup`
@@ -75,12 +74,12 @@ will be revisited in a v0.3.0+ ADR.
     `CommandSegmentDagUpdate` frames into
     `Event::SegmentDagUpdated { added, removed, split_events,
     merge_events }`.
-  - **Out of scope for v0.2.0**: controller-election awareness
-    on the client side, transparent segment-failover during
-    consume, in-place key-range repartitioning under load. The
-    client opens a `DagWatchSession`, reads the current DAG,
-    consumes against the published segments, and drops the
-    subscription if the DAG changes underneath it (surfaces an
+  - **Out of scope**: controller-election awareness on the client
+    side, transparent segment-failover during consume, in-place
+    key-range repartitioning under load. The client opens a
+    `DagWatchSession`, reads the current DAG, consumes against the
+    published segments, and drops the subscription if the DAG
+    changes underneath it (surfaces an
     `Event::DagChangedDuringConsume` and lets the caller
     re-resolve). This is the "experimental tag" position.
 
@@ -92,13 +91,12 @@ will be revisited in a v0.3.0+ ADR.
     `magnetar::scalable::StreamConsumer<T, E: Engine>` that wraps
     the existing `Consumer<T, E>` machinery but binds it to a
     `DagWatchSession`. The MVP is StreamConsumer only;
-    `QueueConsumer` and `CheckpointConsumer` are not in v0.2.0
-    scope (call out via an
-    `// TODO: PIP-460 QueueConsumer (v0.3.0+)` marker in the
-    crate root).
+    `QueueConsumer` and `CheckpointConsumer` are not in scope (call
+    out via an `// TODO: PIP-460 QueueConsumer (follow-up)` marker
+    in the crate root).
   - New feature flag: `scalable-topics` on the `magnetar` crate,
     **default off**. Compiling without the flag preserves the
-    v0.1.0 surface bit-for-bit. The CLI parses `topic://` URLs
+    pre-PIP-460 surface bit-for-bit. The CLI parses `topic://` URLs
     behind the same feature flag.
   - New `ScalableTopicsBuilder` extension trait via the
     [ADR-0026 §D1](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
@@ -117,7 +115,7 @@ will be revisited in a v0.3.0+ ADR.
 
 - **Experimental tag, not silent.** The scalable-topics surface
   ships behind `feature = "scalable-topics"` and every public
-  type carries a `#[doc = "**Experimental** (PIP-460 v0.2.0)"]`
+  type carries a `#[doc = "**Experimental** (PIP-460)"]`
   banner. README's parity matrix marks PIP-460 as
   `🟡 experimental — StreamConsumer only, no Queue/Checkpoint`.
 
@@ -144,9 +142,9 @@ will be revisited in a v0.3.0+ ADR.
   configured with PIP-460 enabled (`scalableTopicsEnabled=true`).
   Until Pulsar 5.0 ships a tagged image, e2e is gated behind
   `#[ignore = "e2e: requires Pulsar 5.0 with PIP-460"]`. The
-  v0.2.0 release-cut decision states e2e is **best-effort** on
-  this surface — the 4-layer test set above is the binding
-  acceptance gate.
+  release-cut decision states e2e is **best-effort** on this
+  surface — the 4-layer test set above is the binding acceptance
+  gate.
   <!-- TODO: verify Pulsar 5.0 image tag once upstream cuts an RC. -->
 
 - **LOC estimate.** ~1500–2200 LOC total. Breakdown:
@@ -172,18 +170,18 @@ the Pulsar 5.0 RC vendor bump), the `DagWatchSession` state machine, the
 `magnetar::scalable::StreamConsumer` surface (drop-on-DAG-change), the CLI
 `topic-info` subcommand, and the four-layer test set (proto unit + tokio +
 moonpool 1:1 + differential equivalence with a golden trace). E2E is
-`#[ignore]`'d behind `feature = "e2e,scalable-topics"` and **does not block
-the v0.2.0 release-cut** — it can only run once upstream cuts a Pulsar 5.0 RC
-shipping PIP-460. See [`docs/scalable-topics.md`](../../docs/scalable-topics.md)
-and the implementation in `git log`.
+`#[ignore]`'d behind `feature = "e2e,scalable-topics"` and remains deferred
+until upstream cuts a Pulsar 5.0 RC shipping PIP-460. See
+[`docs/scalable-topics.md`](../../docs/scalable-topics.md) and the
+implementation in `git log`.
 
 ## References
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum;
-  PIP-460 requires 5.0+, hence experimental-only in v0.2.0.
-- [ADR-0010](0010-v0-1-full-java-parity.md) — v0.1.0 parity
-  scope; this ADR is the basis for an amendment lifting PIP-460
-  out of v0.1.0 scope.
+  PIP-460 requires 5.0+, hence experimental-only.
+- [ADR-0010](0010-v0-1-full-java-parity.md) — parity scope; this ADR
+  is the basis for an amendment lifting PIP-460 out of the core-parity
+  scope.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   four-layer test plan binding.
 - [ADR-0026 §D1](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)

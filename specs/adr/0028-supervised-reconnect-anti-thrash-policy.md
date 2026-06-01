@@ -271,7 +271,7 @@ check-sim-coverage`) and the tokio↔moonpool 1:1 count must hold
 
 - [`docs/follow-ups.md`](../../docs/follow-ups.md)
   — failure description + unblock plan.
-- [`ADR-0010 v0.1.0 full Java parity`](0010-v0-1-full-java-parity.md)
+- [`ADR-0010 full Java parity`](0010-v0-1-full-java-parity.md)
   — connection-level backoff is part of the parity contract.
 - [`ADR-0018 PIP-188 reconnect on migrate`](0018-pip-188-reconnect-on-migrate.md)
   — the supervised-reset primitive this builds on; explicit

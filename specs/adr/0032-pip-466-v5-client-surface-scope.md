@@ -1,9 +1,9 @@
-# ADR-0032 — PIP-466 V5 client surface scope for v0.2.0
+# ADR-0032 — PIP-466 V5 client surface scope
 
 - **Status**: Accepted
 - **Date**: 2026-05-26 (Proposed), 2026-05-28 (Accepted)
 - **Decider**: Florentin Dubois
-- **Tags**: pip-466, v5-client, api-surface, v0.2.0, scope, experimental
+- **Tags**: pip-466, v5-client, api-surface, scope, experimental
 
 ## Acceptance note (2026-05-28)
 
@@ -27,12 +27,11 @@ sans-io wire assertions), satisfying the acceptance gate.
 ## Context
 
 [ADR-0010](0010-v0-1-full-java-parity.md) listed PIP-466 alongside
-PIP-460 with an "experimental tag" in v0.1.0. PIP-466 is the
-**V5 Java Client API** — a clean-slate redesign that lives **beside**
-the existing v4 surface as a separate set of modules, introduces
-three distinct consumer types (StreamConsumer / QueueConsumer /
-CheckpointConsumer), and uses `Duration` / `Optional` semantics
-throughout. Per
+PIP-460 with an "experimental tag". PIP-466 is the **V5 Java Client
+API** — a clean-slate redesign that lives **beside** the existing v4
+surface as a separate set of modules, introduces three distinct
+consumer types (StreamConsumer / QueueConsumer / CheckpointConsumer),
+and uses `Duration` / `Optional` semantics throughout. Per
 [ADR-0026 §D1](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
 the Pulsar Java client agent surfaced that PIP-466 "is additive and
 does not introduce per-surface engine abstractions" — i.e. it does
@@ -42,34 +41,36 @@ PIP-466 is **explicitly client-side**. From upstream: "the V5 API
 exists as new modules alongside the current implementation … no
 changes are required to existing applications." The single
 exception is one new wire command, `CommandScalableTopicLookup`,
-which is shared with **PIP-460** ([ADR-0031](0031-pip-460-scalable-subscription-scope.md))
-and is vendored once for both PIPs.
+which is shared with **PIP-460**
+([ADR-0031](0031-pip-460-scalable-subscription-scope.md)) and is
+vendored once for both PIPs.
 
-Today there is no PIP-466 scaffolding in magnetar.
+Before this ADR, there was no PIP-466 scaffolding in magnetar.
 [`crates/magnetar/src/lib.rs`](../../crates/magnetar/src/lib.rs)
 exports the v4-equivalent `PulsarClient`, `Producer<T, E>`,
 `Consumer<T, E>`, `Reader<T, E>`, `MultiTopicsConsumer`,
 `PartitionedProducer`, `PartitionedConsumer`, `PatternConsumer`,
 `TableView`, `Transaction` — the eight surfaces lifted to
-`Surface<T, E>` per [ADR-0026 §D1](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
-There is no parallel V5 surface and no `magnetar::v5` module.
+`Surface<T, E>` per
+[ADR-0026 §D1](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md).
+There was no parallel V5 surface and no `magnetar::v5` module.
 
-This ADR locks the v0.2.0 V5 surface scope: a **subset** that
-mirrors Pulsar Java's PIP-466 V5 design at the API-shape level
-(ergonomics, type signatures, builder semantics) but does **not**
-duplicate the v4 surface end to end. The V5 surface ships as
-**experimental** behind a feature flag; v4 stays the documented
-default. A future v0.3.0+ ADR may promote V5 to default once the
-upstream V5 design stabilises.
+This ADR locks the V5 surface scope: a **subset** that mirrors Pulsar
+Java's PIP-466 V5 design at the API-shape level (ergonomics, type
+signatures, builder semantics) but does **not** duplicate the v4
+surface end to end. The V5 surface ships as **experimental** behind a
+feature flag; v4 stays the documented default. A future ADR may
+promote V5 to default once the upstream V5 design stabilises.
 
 ## Decision
 
 - **Wire-protocol delta vs. current vendored PulsarApi.proto: none.**
   PIP-466 is purely a client-side API redesign. The one wire command
   introduced — `CommandScalableTopicLookup` — is shared with PIP-460
-  and is vendored under [ADR-0031](0031-pip-460-scalable-subscription-scope.md);
-  this ADR does **not** drive a second proto bump. **None** is the
-  explicit answer here.
+  and is vendored under
+  [ADR-0031](0031-pip-460-scalable-subscription-scope.md); this ADR
+  does **not** drive a second proto bump. **None** is the explicit
+  answer here.
 
 - **`magnetar-proto` state-machine additions.** **None.** PIP-466
   reuses the existing v4 wire driver (`Conn`, `Producer`, `Consumer`
@@ -97,11 +98,11 @@ upstream V5 design stabilises.
     types — it is an API skin, not a re-implementation. Internally,
     `magnetar::v5::StreamConsumer<T, E>` holds a v4
     `Consumer<T, E>` and forwards calls.
-  - **Out of scope for v0.2.0**: `magnetar::v5::CheckpointConsumer`
-    (requires PIP-460 controller-broker coordination beyond our
-    PIP-460 minimum surface), `magnetar::v5::Reader` (v4 `Reader`
-    is sufficient for v0.2.0 use cases), `magnetar::v5::TableView`,
-    `magnetar::v5::Transaction`. Tracked as a v0.3.0+ ADR.
+  - **Out of scope**: `magnetar::v5::CheckpointConsumer` (requires
+    PIP-460 controller-broker coordination beyond our PIP-460
+    minimum surface), `magnetar::v5::Reader` (v4 `Reader` is
+    sufficient for current use cases), `magnetar::v5::TableView`,
+    `magnetar::v5::Transaction`. Tracked as a follow-up ADR.
 
 - **`magnetar-runtime-moonpool` port.** Because V5 is a thin skin
   over v4, **the moonpool engine inherits the V5 surface for free**
@@ -120,7 +121,7 @@ upstream V5 design stabilises.
 
 - **Experimental tag, not silent.** The `magnetar::v5` module is
   feature-gated and every public type carries a
-  `#[doc = "**Experimental** (PIP-466 V5 client surface, v0.2.0)"]`
+  `#[doc = "**Experimental** (PIP-466 V5 client surface)"]`
   banner. README's parity matrix marks PIP-466 as
   `🟡 experimental — Stream/Queue consumers + Producer; no
   Reader/TableView/Transaction/CheckpointConsumer in V5 module
@@ -164,14 +165,14 @@ upstream V5 design stabilises.
 
 ## Status
 
-Proposed (awaiting Florentin sign-off, 2026-05-26)
+Accepted (2026-05-28).
 
 ## References
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum
   (V5 surface still works on 4.x for the non-scalable subset).
-- [ADR-0010](0010-v0-1-full-java-parity.md) — v0.1.0 parity scope;
-  PIP-466 lifted to v0.2.0 experimental.
+- [ADR-0010](0010-v0-1-full-java-parity.md) — parity scope;
+  PIP-466 ships as experimental V5 surface alongside v4.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   four-layer test plan; this ADR claims partial exemptions
   justified by the no-wire-delta nature of the change.

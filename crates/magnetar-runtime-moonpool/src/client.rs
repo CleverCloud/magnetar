@@ -137,8 +137,8 @@ impl<P: Providers> Client<P> {
     /// run the plaintext handshake.
     ///
     /// `addr` is a moonpool `host:port` string (NOT a `pulsar://` URL — strip
-    /// the scheme before calling). For TLS, use [`Self::connect_tls`] (backed
-    /// by `RustlsByteAdapter` over the moonpool byte pipe).
+    /// the scheme before calling). For TLS, use [`MoonpoolEngine::connect_tls`]
+    /// (backed by `RustlsByteAdapter` over the moonpool byte pipe).
     ///
     /// Returns once the broker has responded with `CommandConnected`.
     ///

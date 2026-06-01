@@ -1,6 +1,7 @@
 # Shadow topics (PIP-180)
 
-Status: ✅ landed in v0.2.0 — ADR-0033.
+Status: ✅ supported — scope locked in
+[ADR-0033](../specs/adr/0033-pip-180-shadow-topic-scope.md).
 
 PIP-180 introduces a read-only topic ownership model that shares the
 underlying BookKeeper ledgers of a **source topic** — a lightweight
@@ -117,9 +118,9 @@ than `max_message_size`; in that case the same `source_msg_id` is
 stamped on every chunk (one logical message, multiple frames).
 
 The regular `Producer::send(...)` continues to emit `CommandSend.message_id =
-None` — byte-identical to v0.1.0 on the wire (no proto bump). The new
-field on `OutgoingMessage` defaults to `None` so v0.1.0 callers see no
-change.
+None` — byte-identical on the wire (no proto bump). The new field on
+`OutgoingMessage` defaults to `None` so callers that don't use the
+replicator entry see no change.
 
 ### Consumer — shadow-side classification
 

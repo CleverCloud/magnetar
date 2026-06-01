@@ -8,7 +8,7 @@
 //! 1. `builder_replicate_subscription_state_true_emits_field` — the recording broker sees
 //!    `CommandSubscribe.replicate_subscription_state = Some(true)`.
 //! 2. `builder_replicate_subscription_state_default_false` — default flow omits the field (matches
-//!    v0.1.0 wire bytes).
+//!    the baseline wire bytes).
 //! 3. `consumer_skips_replicated_marker_against_scripted_broker` — a scripted broker sends 5
 //!    regular messages → 1 SNAPSHOT marker → 5 regular → 1 UPDATE marker. The consumer must
 //!    `receive()` exactly 10 user messages.

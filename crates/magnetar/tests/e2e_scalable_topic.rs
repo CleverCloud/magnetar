@@ -10,7 +10,7 @@
 //! against a 4.x broker. Per ADR-0031 e2e is **best-effort** on this surface —
 //! the four-layer in-process tests (proto unit + tokio + moonpool +
 //! differential) are the binding acceptance gate, and this file **does NOT
-//! block the v0.2.0 release-cut**.
+//! block release**.
 //!
 //! When Pulsar 5.0 cuts an RC with `scalableTopicsEnabled=true` (broker config
 //! TBD by upstream), flesh these out against an

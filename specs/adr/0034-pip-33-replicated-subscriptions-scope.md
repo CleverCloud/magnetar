@@ -1,14 +1,14 @@
-# ADR-0034 — PIP-33 replicated subscriptions scope for v0.2.0
+# ADR-0034 — PIP-33 replicated subscriptions scope
 
 - **Status**: Accepted (2026-05-26)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
-- **Tags**: pip-33, replicated-subscriptions, geo-replication, v0.2.0, scope
+- **Tags**: pip-33, replicated-subscriptions, geo-replication, scope
 
 ## Context
 
 [ADR-0010](0010-v0-1-full-java-parity.md) listed PIP-33 (replicated
-subscriptions) in v0.1.0 scope. PIP-33 enables subscription state
+subscriptions) in core-parity scope. PIP-33 enables subscription state
 synchronisation across geo-replicated Pulsar clusters at sub-second
 granularity, so a consumer that fails over from cluster A to
 cluster B resumes near its previous cursor position (with up-to-
@@ -21,7 +21,7 @@ propagates cursor positions across clusters via geo-replication.
 The client side of PIP-33 is small: a single producer/consumer
 option, `replicateSubscriptionState(boolean)`, that flips a flag in
 the `CommandSubscribe` payload. The broker does the heavy lifting.
-Despite the small surface, magnetar's v0.1.0 finishing wave never
+Despite the small surface, magnetar's parity finishing wave never
 landed the client-side hook — `ConsumerBuilder` exposes no
 equivalent of `Consumer.Builder#replicateSubscriptionState` and
 the `CommandSubscribe` encoder does not set the flag. The vendored
@@ -30,12 +30,13 @@ proto **does** have the flag and the markers
 [`crates/magnetar-proto/proto/PulsarMarkers.proto:28-33,40-82`](../../crates/magnetar-proto/proto/PulsarMarkers.proto));
 they are simply unused on the client driver side.
 
-This ADR locks the v0.2.0 PIP-33 surface: a one-line builder option
+This ADR locks the PIP-33 surface: a one-line builder option
 on consumers, marker-aware decode on the receive path (so the
 markers are not surfaced as application messages), and an explicit
 **non-goal**: magnetar does not implement broker-side replication.
-The amendment lifting PIP-33 out of v0.1.0 scope follows in a
-separate `docs(adr): amend ADR-0010` commit.
+The amendment lifting PIP-33 out of the original ADR-0010
+core-parity scope follows in a separate `docs(adr): amend ADR-0010`
+commit.
 
 ## Decision
 
@@ -54,7 +55,7 @@ separate `docs(adr): amend ADR-0010` commit.
 - **`magnetar-proto` state-machine additions.**
   - `SubscribeOptions { replicate_subscription_state: bool, …existing
     fields… }` — extend the existing subscribe-options carrier with
-    one bool field. Default `false` to preserve v0.1.0 behaviour.
+    one bool field. Default `false` to preserve prior behaviour.
   - `CommandSubscribe` encoder emits the new field when set.
   - Consumer receive path: parse the optional `MessageMetadata.marker_type`
     (already vendored) and, for `REPLICATED_SUBSCRIPTION_*` marker
@@ -75,7 +76,7 @@ separate `docs(adr): amend ADR-0010` commit.
     `Consumer.Builder#replicateSubscriptionState`. Wires through to
     `SubscribeOptions.replicate_subscription_state`.
   - No new feature flag. PIP-33 has been in Pulsar since 2.4 and
-    is available on the v0.1.0 baseline
+    is available on the baseline Pulsar 4.0+ broker
     ([ADR-0009](0009-pulsar-4-minimum.md)).
   - No new method on `PulsarClient<E>`; the surface is
     builder-only.
@@ -135,7 +136,7 @@ separate `docs(adr): amend ADR-0010` commit.
   resumed cursor position is within the documented
   one-second tolerance. Gated by `#[ignore = "e2e: requires
   two-cluster Docker fixture"]`. This is the **most expensive**
-  e2e fixture in v0.2.0 — call out in `docs/testing.md`.
+  e2e fixture in the suite — call out in `docs/testing.md`.
 
 - **LOC estimate.** ~400–600 LOC total. Breakdown:
   ~150 LOC `magnetar-proto` (SubscribeOptions field, marker
@@ -180,8 +181,9 @@ weekly workflow files an automatic GitHub issue on failure.
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum;
   PIP-33 has been available since 2.4 so 4.x is safe.
-- [ADR-0010](0010-v0-1-full-java-parity.md) — v0.1.0 parity
-  scope; this ADR is the basis for lifting PIP-33 out of v0.1.0.
+- [ADR-0010](0010-v0-1-full-java-parity.md) — parity scope; this
+  ADR is the basis for lifting PIP-33 out of the original
+  core-parity scope.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   four-layer test plan binding.
 - PIP-33 (Replicated Subscriptions) —

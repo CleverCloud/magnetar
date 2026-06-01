@@ -244,7 +244,7 @@ pub struct ConsumerState {
     /// `ConsumerStats#getRateBytesReceived`.
     pub current_bytes_per_sec: f64,
     /// PIP-180 / ADR-0033 shadow-topic metadata. `None` for a regular consumer
-    /// (the default — byte-identical receive path to v0.1.0). `Some(meta)` is
+    /// (the default — wire byte-identical receive path). `Some(meta)` is
     /// injected by the runtime engine at subscribe time when the admin REST
     /// `getShadowTopics(source)` lookup resolves the consumer's topic as a
     /// shadow of another. The connection's receive dispatch (see

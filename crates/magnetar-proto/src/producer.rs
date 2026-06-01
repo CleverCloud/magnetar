@@ -78,7 +78,7 @@ pub struct OutgoingMessage {
     pub txn_id: Option<crate::txn::TxnId>,
     /// Optional source-topic `MessageId` to propagate on `CommandSend.message_id`
     /// (PIP-180 / ADR-0033). `None` for a regular publish — the encoder leaves the
-    /// optional field absent, byte-identical to v0.1.0. `Some(id)` is the
+    /// optional field absent, wire byte-identical. `Some(id)` is the
     /// replicator-style write used by shadow-topic producers to preserve the
     /// source-topic id chain.
     ///
@@ -857,7 +857,7 @@ impl ProducerState {
             marker: None,
             // PIP-180 / ADR-0033: shadow-topic replicator-style sends carry the
             // source-topic `MessageId` on the optional `message_id` field. `None`
-            // for a regular publish — byte-identical to v0.1.0 on the wire.
+            // for a regular publish — wire byte-identical.
             message_id: msg.source_message_id.map(MessageId::to_pb),
         };
         let cmd = pb::BaseCommand {
@@ -1093,7 +1093,7 @@ impl ProducerState {
             // `queue_send` (see `has_source_id` branch), so a batched
             // `CommandSend` never carries a source `message_id` by
             // construction. Left as `None` here to keep the wire bytes
-            // byte-identical to v0.1.0 on the batched path.
+            // byte-identical on the batched path.
             message_id: None,
         };
         let cmd = pb::BaseCommand {
@@ -1214,7 +1214,7 @@ impl ProducerState {
                 marker: None,
                 // PIP-180 / ADR-0033: stamp the source-topic `MessageId` on every
                 // chunk of a replicator-style chunked publish. `None` for a regular
-                // (non-replicator) chunked send — byte-identical to v0.1.0.
+                // (non-replicator) chunked send — wire byte-identical.
                 message_id: source_message_id.map(MessageId::to_pb),
             };
             let cmd = pb::BaseCommand {
@@ -2351,7 +2351,7 @@ mod tests {
 
     /// PIP-180 backward-compat guard: a regular send (without `source_message_id`)
     /// produces a `CommandSend` whose encoded bytes are byte-identical to the
-    /// v0.1.0 baseline — `message_id` MUST be absent from the wire, not present
+    /// pre-PIP-180 baseline — `message_id` MUST be absent from the wire, not present
     /// as a default-zeroed `MessageIdData`. This is the "no proto bump" promise.
     #[test]
     fn command_send_without_message_id_byte_identical_to_v01() {
@@ -2372,7 +2372,7 @@ mod tests {
             send.message_id.is_none(),
             "regular send must leave CommandSend.message_id absent"
         );
-        // Compare against an explicit v0.1.0-shape CommandSend (every PIP-180-added
+        // Compare against an explicit pre-PIP-180-shape CommandSend (every PIP-180-added
         // optional unset). Encoded bytes must match.
         let v01 = pb::CommandSend {
             producer_id: send.producer_id,

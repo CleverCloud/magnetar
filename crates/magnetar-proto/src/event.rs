@@ -403,9 +403,9 @@ pub enum ConnectionEvent {
 
     /// **Experimental** (PIP-460, ADR-0031). The segment DAG changed
     /// (split / merge / removal) while a `StreamConsumer` was actively
-    /// consuming. This is the v0.2.0 "drop-on-change" guarantee — the
+    /// consuming. This is the "drop-on-change" guarantee — the
     /// runtime closes all per-segment v4 consumers and the caller must
-    /// re-resolve + re-subscribe. No transparent failover in v0.2.0.
+    /// re-resolve + re-subscribe. No transparent failover.
     #[cfg(feature = "scalable-topics")]
     DagChangedDuringConsume {
         /// Watch session id whose DAG changed.
@@ -415,9 +415,9 @@ pub enum ConnectionEvent {
     },
 
     /// **Experimental** (PIP-460, ADR-0031). The controller-broker connection
-    /// backing a DAG-watch session closed. v0.2.0 surfaces this for the
+    /// backing a DAG-watch session closed. This surfaces it for the
     /// caller to decide (no automatic re-lookup — controller-election
-    /// awareness is v0.3.0+ per ADR-0031).
+    /// awareness is future work per ADR-0031).
     #[cfg(feature = "scalable-topics")]
     DagWatchClosed {
         /// Watch session id that closed.

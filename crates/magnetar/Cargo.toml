@@ -56,13 +56,13 @@ e2e-multi-cluster = ["e2e"]
 experimental-v5-client = ["tokio"]
 
 # PIP-460 scalable topics (ADR-0031) — experimental StreamConsumer surface.
-# Default OFF. Compiling without this flag leaves the v0.1.0 surface
+# Default OFF. Compiling without this flag leaves the baseline surface
 # bit-for-bit unchanged (proved by the `scalable_topics_feature_off_does_not_export`
 # compile-fail test). The `magnetar::scalable` module, the `ScalableTopicsApi`
 # extension trait, and the `topic://` URL parser branch only exist when the
 # flag is on. Propagates to the proto wire surface and to whichever engine(s)
 # are enabled. E2E against a Pulsar 5.0+ broker is gated on
-# `e2e,scalable-topics` and does NOT block the v0.2.0 release-cut (no broker
+# `e2e,scalable-topics` and does NOT block release (no broker
 # ships PIP-460 today).
 scalable-topics = [
     "magnetar-proto/scalable-topics",

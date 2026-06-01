@@ -10,7 +10,7 @@
 //! cargo test --features e2e -p magnetar --test e2e_shadow_topic -- --include-ignored --nocapture
 //! ```
 //!
-//! PIP-180 is available against the v0.1.0 baseline broker (Pulsar 4.0+,
+//! PIP-180 is available against the baseline broker (Pulsar 4.0+,
 //! ADR-0009). No new container, no docker-compose helper — uses the same
 //! single-broker fixture as `e2e_pulsar.rs`.
 

@@ -1,10 +1,10 @@
 # Magnetar — Proposals
 
 Detailed implementation plans for upcoming features. Where ADRs lock the
-**binding decision** ("we will ship X in v0.2.0, behind feature Y"),
-proposals lock the **implementation map** that turns the decision into a
-landed PR: wire-protocol delta, sans-io state-machine additions,
-per-runtime surface ports, four-layer test plan per
+**binding decision** ("we will ship X behind feature Y"), proposals lock
+the **implementation map** that turns the decision into a landed PR:
+wire-protocol delta, sans-io state-machine additions, per-runtime
+surface ports, four-layer test plan per
 [ADR-0024](../adr/0024-cross-runtime-test-and-coverage-policy.md), and
 e2e plan.
 
@@ -22,7 +22,7 @@ references.
 - `Implemented` — All four test layers + e2e green on main.
 - `Superseded by …` — Replaced by a later proposal.
 
-## Index — v0.2.0 wave
+## Index
 
 | # | Title | ADR | Proposal status | **Upstream readiness** |
 | --- | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ references.
 | [PIP-466](pip-466-v5-client-surface.md) | V5 client surface (experimental) | [ADR-0032](../adr/0032-pip-466-v5-client-surface-scope.md) | Draft | 🟠 **DESIGN-PHASE** — V5 Java client API still iterating upstream; no stable Pulsar release exposes the V5 modules as default. magnetar's V5 surface is a thin skin over v4 wire (which **is** live), so it works against Pulsar 4.x today. |
 
 > **PIP-180 (shadow topic)** and **PIP-33 (replicated subscriptions)**
-> landed in v0.2.0. Their proposals have been folded back into their
+> have already landed. Their proposals have been folded back into their
 > authorising ADRs as an "Implementation footprint" section —
 > [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md),
 > [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md).
@@ -50,7 +50,7 @@ references.
   ships the feature. magnetar work that depends on the wire surface
   must wait for an upstream RC; tests are gated.
 
-### v0.2.0 e2e implications
+### E2E implications
 
 | PIP | e2e against `apachepulsar/pulsar:4.0.4` | Notes |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ references.
    similar. Keep it stable: links from PRs and ADRs reference this name.
 2. Cite the authorising ADR(s) at the top.
 3. Use the section template below.
-4. Append a row to the [Index](#index--v020-wave) in the same commit.
+4. Append a row to the [Index](#index) in the same commit.
 5. Update the status header as work progresses.
 
 ## Section template
@@ -73,7 +73,6 @@ references.
 
 - **Status**: Draft / Accepted / In-flight / Implemented
 - **ADR**: [ADR-NNNN](../adr/NNNN-...md)
-- **Target**: v0.X.0
 - **Date**: YYYY-MM-DD
 - **Owner**: <name>
 

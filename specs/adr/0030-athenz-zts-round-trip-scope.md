@@ -1,21 +1,20 @@
-# ADR-0030 — Athenz ZTS round-trip scope for v0.2.0
+# ADR-0030 — Athenz ZTS round-trip scope
 
 - **Status**: Superseded by [ADR-0041](0041-athenz-provider-testability-seams.md)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
-- **Tags**: auth, athenz, zts, v0.2.0, scope
+- **Tags**: auth, athenz, zts, scope
 
 ## Context
 
 [ADR-0010](0010-v0-1-full-java-parity.md) ships full Java-client
-parity at v0.1.0, but explicitly defers the **Athenz ZTS round-trip**
-to v0.2.0. The deferral was locked in
+parity, and originally deferred the **Athenz ZTS round-trip** as
+follow-up work. The deferral was locked in
 [ADR-0026 §D3](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md):
 shipping a fake-token stub and calling Athenz "✅" would lie to the
-parity matrix. The honest position is "PLAIN + pre-fetched role
-token in v0.1.0; ZTS round-trip in v0.2.0", and that is what
-`docs/parity-status.md` and `README.md`'s parity matrix already
-record.
+parity matrix. The honest interim position was "PLAIN + pre-fetched
+role token now; ZTS round-trip as follow-up", and that is what
+`docs/parity-status.md` and `README.md`'s parity matrix recorded.
 
 Today the scaffolding lives in
 [`crates/magnetar-auth-athenz/src/lib.rs`](../../crates/magnetar-auth-athenz/src/lib.rs).
@@ -41,9 +40,8 @@ refresh margin, and presents the role token bytes as the Pulsar
 `com.yahoo.athenz:athenz-zts-java-client` Java library, which
 magnetar would have to reimplement in Rust.
 
-This ADR locks the scope of the v0.2.0 ZTS round-trip implementation
-so the milestone has a sizing contract and a concrete acceptance
-boundary.
+This ADR locks the scope of the ZTS round-trip implementation so the
+work has a sizing contract and a concrete acceptance boundary.
 
 ## Decision
 
@@ -112,11 +110,11 @@ boundary.
   (d) `serde_json` for parsing RoleToken JSON.
 
 - **N-Token vs. SVC-Token.** Athenz has two principal-token flavours.
-  v0.2.0 implements **N-Token only** (tenant private key path).
+  This ADR implements **N-Token only** (tenant private key path).
   SVC-Token (the Athenz-issued service-identity token) requires
   ZMS-side provisioning, an `instance_id` claim, and the
-  `Athenz-Service-Auth` header semantics — out of scope (deferred to
-  v0.3.0+).
+  `Athenz-Service-Auth` header semantics — out of scope (tracked as
+  a separate follow-up).
 
 ## Consequences
 
@@ -172,7 +170,7 @@ boundary.
   memory only — never written to disk; (d) ZTS HTTPS uses
   `rustls` with the system root CA set, not a private CA bundle,
   unless `AthenzConfig` is extended with a `zts_ca_bundle` field
-  (deferred to v0.2.x); (e) clock injection via
+  (deferred to a later follow-up); (e) clock injection via
   [ADR-0011](0011-clock-injection-sans-io.md) means N-Token
   `t` / `e` claims are deterministic in simulation but real
   `SystemTime` in production. **No `openssl`**: preserves
@@ -192,8 +190,8 @@ see ADR-0041 for the rationale (RUSTSEC-2023-0071 + ADR-0011 determinism).
 - [ADR-0005](0005-rustls-only-tls.md) — `rustls` only, no
   `openssl`.
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum.
-- [ADR-0010](0010-v0-1-full-java-parity.md) — v0.1.0 full Java
-  parity; Athenz deferral.
+- [ADR-0010](0010-v0-1-full-java-parity.md) — full Java parity;
+  earlier Athenz deferral now lifted via ADR-0041.
 - [ADR-0011](0011-clock-injection-sans-io.md) — clock injection
   for token timestamps + cache expiry.
 - [ADR-0014](0014-oauth2-client-credentials-caching.md) —

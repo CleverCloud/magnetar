@@ -3,7 +3,7 @@
 //! **Experimental** (PIP-460, ADR-0031) — scalable-topic `StreamConsumer`.
 //!
 //! PIP-460 introduces a `topic://<...>` URL scheme backed by a controller
-//! broker and a segment DAG. magnetar v0.2.0 ships **only** the
+//! broker and a segment DAG. magnetar currently ships **only** the
 //! `StreamConsumer` happy path, behind the default-off `scalable-topics`
 //! feature, with **drop-on-DAG-change** semantics (no transparent segment
 //! failover). See [ADR-0031](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0031-pip-460-scalable-subscription-scope.md)
@@ -18,14 +18,14 @@
 //! consumer surfaces use, so it composes with the engine-generic
 //! [`crate::PulsarClient<E>`] without GAT growth.
 //!
-//! # Drop-on-change (v0.2.0)
+//! # Drop-on-change
 //!
 //! When the controller broker pushes a segment split / merge / removal while
 //! the `StreamConsumer` is active, the runtime surfaces
 //! `ConsumerEvent::DagChanged`; the caller must re-resolve and re-subscribe.
 //! Transparent failover, in-place repartition, `QueueConsumer`,
 //! `CheckpointConsumer`, and controller-election awareness are explicit
-//! v0.3.0+ work (out of scope, ADR-0031).
+//! future work (out of scope, ADR-0031).
 
 // The PIP-460 surface doc-comments thread bare type names (`StreamConsumer`,
 // `DagWatch`, …) through prose where backticking every occurrence hurts
@@ -34,18 +34,18 @@
 
 use std::marker::PhantomData;
 
-/// **Experimental** (PIP-460 v0.2.0). Why the segment DAG changed under a live
+/// **Experimental** (PIP-460). Why the segment DAG changed under a live
 /// [`StreamConsumer`]. Re-exported from the proto layer so callers match on a
 /// single canonical type.
 pub use magnetar_proto::DagChangeReason;
-/// **Experimental** (PIP-460 v0.2.0). One node of a scalable topic's segment
+/// **Experimental** (PIP-460). One node of a scalable topic's segment
 /// DAG. Re-exported from the proto layer.
 pub use magnetar_proto::{KeyRange, SegmentDescriptor, SegmentId, SegmentState};
 
 use crate::Engine;
 pub use crate::engine::{ScalableEvent, ScalableLookup, ScalableTopicsApi};
 
-/// **Experimental** (PIP-460 v0.2.0). An event surfaced by [`StreamConsumer::next_event`].
+/// **Experimental** (PIP-460). An event surfaced by [`StreamConsumer::next_event`].
 ///
 /// `StreamConsumer` drops its per-segment consumers on a DAG change; the
 /// [`Self::DagChanged`] variant is the caller's signal to re-resolve and
@@ -62,7 +62,7 @@ pub enum ConsumerEvent {
     },
     /// The segment DAG changed while consuming (split / merge / removal). The
     /// `StreamConsumer` has closed its per-segment consumers; re-resolve and
-    /// re-subscribe to continue. This is the v0.2.0 "drop-on-change"
+    /// re-subscribe to continue. This is the "drop-on-change"
     /// guarantee.
     DagChanged {
         /// Watch session id whose DAG changed.
@@ -71,7 +71,7 @@ pub enum ConsumerEvent {
         reason: DagChangeReason,
     },
     /// The DAG-watch session closed (controller-broker disconnect or client
-    /// close). No automatic re-lookup in v0.2.0.
+    /// close). No automatic re-lookup.
     Closed {
         /// Watch session id that closed.
         watch_session_id: u64,
@@ -80,12 +80,12 @@ pub enum ConsumerEvent {
     },
 }
 
-/// **Experimental** (PIP-460 v0.2.0, ADR-0031). StreamConsumer over a scalable
+/// **Experimental** (PIP-460, ADR-0031). StreamConsumer over a scalable
 /// topic. Holds an open DAG-watch session against the controller broker and
 /// surfaces [`ConsumerEvent`]s. **Drops on DAG change** — no transparent
-/// segment failover in v0.2.0.
+/// segment failover.
 ///
-/// `T` is the (future) per-message payload type; in the v0.2.0 scaffold the
+/// `T` is the (future) per-message payload type; in the current scaffold the
 /// surface is DAG-watch-centric (the per-segment v4 consumer fan-out and typed
 /// receive land once a Pulsar 5.0 broker ships the wire surface — see ADR-0031
 /// §"Out of scope"). Construct via [`crate::PulsarClient::scalable_stream_consumer`].
@@ -214,7 +214,7 @@ impl<E: Engine> crate::PulsarClient<E>
 where
     E::ClientState: ScalableTopicsApi,
 {
-    /// **Experimental** (PIP-460 v0.2.0, ADR-0031). Open a scalable-topic
+    /// **Experimental** (PIP-460, ADR-0031). Open a scalable-topic
     /// [`StreamConsumer`] for a `topic://...` URL. Resolves the topic against
     /// the controller broker, opens a DAG-watch session seeded with the
     /// current segment DAG, and returns a consumer that surfaces
@@ -249,7 +249,7 @@ where
         })
     }
 
-    /// **Experimental** (PIP-460 v0.2.0, ADR-0031). Resolve a `topic://...`
+    /// **Experimental** (PIP-460, ADR-0031). Resolve a `topic://...`
     /// scalable topic without opening a consumer — returns the current segment
     /// DAG + controller broker. Powers the CLI `topic-info` subcommand.
     ///

@@ -358,7 +358,7 @@ impl ConnectionShared {
             });
         // ADR-0011 — invariant #3 sans-io clock injection. The default
         // monotonic-clock provider reads the host `Instant::now`; the
-        // driver loop replaces it via [`Self::install_now_instant_provider`]
+        // driver loop replaces it via `Self::with_auth_wall_clock_and_instant`
         // with a closure that reads the moonpool [`TimeProvider`] so
         // user-facing callers (Producer::send, flush, …) feed
         // deterministic Instants into the proto state machine. Default
@@ -392,8 +392,8 @@ impl ConnectionShared {
 
     /// Snapshot the configured monotonic clock — defaults to host
     /// [`Instant::now`], overridable by the moonpool engine via
-    /// [`Self::with_now_instant_provider`] so user-facing callers feed
-    /// deterministic Instants into the proto state machine
+    /// [`Self::with_auth_wall_clock_and_instant`] so user-facing callers
+    /// feed deterministic Instants into the proto state machine
     /// (ADR-0011 sans-io clock injection).
     #[must_use]
     pub fn now_instant(&self) -> Instant {

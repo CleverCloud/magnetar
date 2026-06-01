@@ -221,16 +221,15 @@ follow-up `/goal` enumerates. The Docker probe wires the upstream image
 into the e2e surface so a downstream consumer with a fully-bootstrapped
 ZMS+ZTS topology can layer their own pre-seed step on top.
 
-### Closing the deferred slice
+### Full ZMS+ZTS topology
 
-Full ZMS+ZTS+cert-bootstrap testing requires shipping the Athenz
+Full ZMS+ZTS+cert-bootstrap testing requires running the Athenz
 `make deploy-dev` topology as a shared CI fixture (four containers,
 MySQL persistence, a CA hierarchy, ZMS-side `zms-cli add-public-key`
-seeding for the tenant). That work was descoped from this PR per the
-goal's "honest scope check." Adding it would replace the
-`#[ignore]`'d Docker probe with a full multi-container compose fixture
-similar to
+seeding for the tenant). Adding it would replace the `#[ignore]`'d
+Docker probe with a full multi-container compose fixture similar to
 [`crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml`](../crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml).
+That work is out of scope for the current Athenz surface.
 
 ## Cross-runtime test coverage (ADR-0024)
 
@@ -258,7 +257,7 @@ RS256 JWT.
   itself only emit RS256. The shape is ready (the JWS header builder
   already takes the alg as a parameter) but no consumer requests ES256
   today.
-- **SVC-token flow.** Locked in
-  [ADR-0030](../specs/adr/0030-athenz-zts-round-trip-scope.md) as
-  v0.3.0+ scope. Requires ZMS-side provisioning and an `instance_id`
-  claim that the current `ZtsClaims` struct does not model.
+- **SVC-token flow.** Out of scope per
+  [ADR-0030](../specs/adr/0030-athenz-zts-round-trip-scope.md).
+  Requires ZMS-side provisioning and an `instance_id` claim that the
+  current `ZtsClaims` struct does not model.

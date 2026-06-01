@@ -7,7 +7,7 @@
 
 ## Context
 
-Multiple agent dispatches during the v0.1.0 finish-line wave hit
+Multiple agent dispatches during the parity finish-line wave hit
 their per-agent turn budget mid-debug and applied an `#[ignore]` to
 keep CI green rather than finishing the underlying fix (most recently
 `crates/magnetar-differential/tests/broker_smoke.rs`, where the
@@ -84,7 +84,7 @@ Concretely:
 
 6. **The `cargo xtask check-no-channels` /
    `check-no-io-deps` family** gets a sibling
-   `check-no-bug-hide-ignores` job (M9 / v0.1.1 follow-up): scans
+   `check-no-bug-hide-ignores` job (follow-up): scans
    `crates/**/*.rs` for `#[ignore]` annotations whose reason string
    does not match a workspace-approved gate dependency list (Docker,
    GSSAPI, ZTS, TLS-fronted broker). Anything outside that list
@@ -129,7 +129,7 @@ Concretely:
   legitimately gated, and forcing every contributor to install Docker
   before running `cargo test` would be hostile to onboarding.
 - **Allow `#[ignore]` freely; rely on code review**. Rejected: the
-  v0.1.0 finish-line wave proved that agents under budget pressure
+  parity finish-line wave proved that agents under budget pressure
   default to the easy out. Without an explicit policy, the pattern
   recurs.
 - **Quarantine ignored tests in a separate suite that is not part
@@ -140,7 +140,7 @@ Concretely:
 
 ## References
 
-- [ADR-0010 — v0.1.0 full Java parity](0010-v0-1-full-java-parity.md)
+- [ADR-0010 — full Java parity](0010-v0-1-full-java-parity.md)
   (parity gaps surface via failing tests; ignoring them defeats the
   ADR).
 - `~/.claude/CLAUDE.md` § "Build & Validation" — references this

@@ -39,7 +39,7 @@ use crate::kerberos::{GssapiClient, GssapiError, GssapiStep};
 /// the form `<server-type>/<broker-host>@<REALM>` (e.g.
 /// `pulsar/broker.example@EXAMPLE.COM`). The default initiator credentials
 /// from the local credential cache (or keytab via the system Kerberos
-/// config) are used; magnetar v0.2.0 does not (yet) take an explicit
+/// config) are used; magnetar does not (yet) take an explicit
 /// keytab path — that is delegated to the surrounding krb5.conf /
 /// `KRB5_CLIENT_KTNAME` environment setup, matching how the Java client's
 /// `useTicketCache=true` default behaves.

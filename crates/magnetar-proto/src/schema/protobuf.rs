@@ -115,7 +115,7 @@ use crate::pb;
 /// (descriptor-mode, via [`ProtobufSchema::with_file_descriptor_proto`] or
 /// [`ProtobufSchema::with_file_descriptor`]) or the UTF-8-encoded fully-qualified
 /// message name (legacy-mode, via [`ProtobufSchema::new`]). See the
-/// [module docs](crate::schema::protobuf) for the parity caveat.
+/// [module docs](crate::schema) for the parity caveat.
 pub struct ProtobufSchema<T> {
     schema_data: Bytes,
     _marker: PhantomData<fn() -> T>,
@@ -138,7 +138,7 @@ where
     /// The Java client emits an Avro-schema-derived-from-protobuf JSON document, not
     /// the fully-qualified name. Use [`ProtobufSchema::with_file_descriptor_proto`]
     /// or [`ProtobufSchema::with_file_descriptor`] for a more descriptive,
-    /// descriptor-shaped identifier. See the [module docs](crate::schema::protobuf).
+    /// descriptor-shaped identifier. See the [module docs](crate::schema).
     pub fn new(fully_qualified_name: impl Into<String>) -> Self {
         Self {
             schema_data: Bytes::from(fully_qualified_name.into().into_bytes()),

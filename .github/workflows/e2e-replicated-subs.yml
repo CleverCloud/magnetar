@@ -6,7 +6,7 @@ name: E2E PIP-33 replicated subscriptions
 # orchestration that is flake-prone against the GitHub Actions network.
 #
 # Following the ADR-0036 cost-shifting precedent — same shape as
-# moonpool-seed-sweep.yml. A failure here gates the v0.2.0 release-cut
+# moonpool-seed-sweep.yml. A failure here blocks release
 # (the release manager waits for a green run before tagging).
 #
 # Manual trigger via workflow_dispatch for ad-hoc runs (e.g. validating a

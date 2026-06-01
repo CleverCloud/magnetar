@@ -102,7 +102,7 @@ with a one-shot setup script at
 1. **Encoder**. With `replicate_subscription_state(true)`, the encoder sets
    `CommandSubscribe.replicate_subscription_state = true`
    ([wire field 14](../crates/magnetar-proto/proto/PulsarApi.proto)). The
-   default (`None`) emits byte-identical bytes to v0.1.0.
+   default (`None`) leaves the wire bytes unchanged.
 
 2. **Receive-path filter**. When a frame arrives with
    `MessageMetadata.marker_type ∈ {10, 11, 12, 13}` —
@@ -165,7 +165,7 @@ These are the two explicit non-goals locked in
 ## References
 
 - [ADR-0034](../specs/adr/0034-pip-33-replicated-subscriptions-scope.md) —
-  v0.2.0 scope and non-goals.
+  scope and non-goals.
 - [ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md) —
   cross-runtime test + coverage policy.
 - [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) —

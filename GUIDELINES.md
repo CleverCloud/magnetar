@@ -61,7 +61,7 @@ The per-cell matrix is enforced by `cargo xtask check-crypto-matrix`.
 
 ## Worktree workflow
 
-Per `~/.claude/CLAUDE.md`: after the initial M0 commit on `main`, every subsequent change goes through:
+Per `~/.claude/CLAUDE.md`: every change to the workspace goes through a worktree:
 
 ```
 wt switch --create feat/<scope> -y
@@ -81,7 +81,7 @@ The pre-edit hook blocks edits on `main`/`master`/`trunk`/`develop`.
 
 ## Validation
 
-Per milestone, before declaring done:
+Before declaring a task done:
 
 ```
 cargo build --workspace --all-features
@@ -107,7 +107,7 @@ cargo xtask codegen --check       # asserts no proto codegen drift
 cargo xtask check-no-io-deps      # asserts magnetar-proto has no I/O deps
 ```
 
-Mutation testing (M5/M6+):
+Mutation testing (optional, for deeper coverage on `magnetar-proto`):
 
 ```
 cargo mutants --package magnetar-proto --timeout 60 --shard 1/4
@@ -159,8 +159,8 @@ dependency bumps with no functional impact. Author justifies in the
 commit message; reviewer enforces.
 
 **Why**: the parity matrix in
-[`README.md`](README.md#java-client-parity-matrix) is the
-v0.1.0 contract. Without coverage + count parity, moonpool silently
+[`README.md`](README.md#java-client-parity-matrix) is the binding
+Java-parity contract. Without coverage + count parity, moonpool silently
 falls behind tokio and the differential harness loses its value as an
 equivalence oracle. See
 [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md).

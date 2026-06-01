@@ -312,8 +312,8 @@ that matches the inbound frame. Two features use this pattern:
   AND the inbound `MessageMetadata.replicated_from` is populated,
   the classifier emits `ConnectionEvent::MessageReceivedFromShadow`
   in place of `ConnectionEvent::Message`. Regular (non-shadow)
-  topics keep emitting `Message` — wire path is byte-identical to
-  v0.1.0. Full surface in [`shadow-topic.md`](shadow-topic.md).
+  topics keep emitting `Message` — the wire path stays byte-identical.
+  Full surface in [`shadow-topic.md`](shadow-topic.md).
 - **Replicated-subscription markers (PIP-33 / ADR-0034)** — markers
   carried in the payload of a `CommandMessage` with magic type
   `MarkerType::REPLICATED_SUBSCRIPTION_*` are intercepted by the

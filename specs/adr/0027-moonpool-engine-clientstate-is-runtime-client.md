@@ -25,7 +25,7 @@ extension trait that the façade builders dispatch through
 `MoonpoolClientState` had no such impls. The façade-side workaround
 documented in ADR-0019 was "drive the moonpool runtime directly via the
 `shared()` accessor". This was acceptable while the moonpool surface
-was a v0.1.0 follow-up (M5–M8), but the user has now decided the
+was a deferred follow-up (M5–M8), but the user has now decided the
 moonpool engine is a first-class peer of tokio in the project's
 production-grade scope.
 
@@ -73,10 +73,10 @@ Mechanics:
   (`moonpool_builder_dispatch_compiles`).
 - **ADR-0019 §gate (e) is partially superseded.** The "façade surface
   stays bound to `PulsarClient<TokioEngine>`" carve-out no longer
-  applies to the three engine-generic builder entry points. The
-  v0.1.0 Java parity matrix is still satisfied by the tokio engine —
-  this ADR is only about *which type implements the façade traits*,
-  not about *which engine carries production load*.
+  applies to the three engine-generic builder entry points. The Java
+  parity matrix is still satisfied by the tokio engine — this ADR is
+  only about *which type implements the façade traits*, not about
+  *which engine carries production load*.
 - **No new dependencies.** The trait impls already existed on
   `Client<P>`; only the engine's `type ClientState` pointer moved.
   `magnetar-proto`'s I/O-free guarantee is unchanged.

@@ -1,14 +1,14 @@
-# ADR-0033 — PIP-180 shadow topic scope for v0.2.0
+# ADR-0033 — PIP-180 shadow topic scope
 
 - **Status**: Accepted (2026-05-26)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
-- **Tags**: pip-180, shadow-topic, admin, v0.2.0, scope
+- **Tags**: pip-180, shadow-topic, admin, scope
 
 ## Context
 
 [ADR-0010](0010-v0-1-full-java-parity.md) listed PIP-180 (shadow
-topic) in v0.1.0 scope. PIP-180 introduces a read-only topic
+topic) in core-parity scope. PIP-180 introduces a read-only topic
 ownership model that shares underlying storage ledgers from a
 source topic — a lightweight alternative to geo-replication for
 broadcast-style fan-out (up to ~100K subscriptions on the shadow).
@@ -18,9 +18,10 @@ producer-side wire (an optional `message_id` field on `CommandSend`
 to carry the source-topic message ID through the shadow), the admin
 REST surface (three new endpoints + three new client methods), and
 introduces shadow-aware semantics on the consumer side
-(message-ID equality across source ⇄ shadow). Magnetar's v0.1.0
-finishing wave has no room for the consumer-side and admin-REST
-work without slipping the rest of the parity matrix.
+(message-ID equality across source ⇄ shadow). The parity finishing
+wave had no room for the consumer-side and admin-REST work without
+slipping the rest of the parity matrix, so PIP-180 ships as a
+focused follow-up locked by this ADR.
 
 Today there is no PIP-180 scaffolding. The
 `CommandSend` encoder
@@ -42,10 +43,11 @@ The vendored proto already carries the wire bit. From the
 indicating the optional `MessageIdData` is present on `CommandSend`
 since the proto bump that brought it in.
 
-This ADR locks the v0.2.0 PIP-180 surface: producer-side
-`CommandSend` shadow `message_id` propagation, the three admin
-methods, consumer-side equality semantics on `MessageId`, plus the
-parity-matrix amendment lifting PIP-180 out of v0.1.0 scope.
+This ADR locks the PIP-180 surface: producer-side `CommandSend`
+shadow `message_id` propagation, the three admin methods,
+consumer-side equality semantics on `MessageId`, plus the
+parity-matrix amendment lifting PIP-180 out of the original ADR-0010
+core-parity scope.
 
 ## Decision
 
@@ -92,7 +94,7 @@ parity-matrix amendment lifting PIP-180 out of v0.1.0 scope.
     admin REST `getShadowTopics(source)` hint on the topic
     metadata, or simply consumes shadow data transparently.
   - New feature flag: **none**. PIP-180 is a v4-line PIP and
-    works against the v0.1.0 baseline broker
+    works against the baseline Pulsar 4.0+ broker
     ([ADR-0009](0009-pulsar-4-minimum.md)) — no opt-in flag.
 
 - **`magnetar-runtime-moonpool` port.** The producer-side
@@ -164,8 +166,8 @@ plus the inverse `get_shadow_source`), `magnetar shadow {create,delete,
 list,source}` CLI subcommands, four-layer test set (proto unit, tokio
 integration, moonpool 1:1 mirror, differential equivalence) + e2e
 against `apachepulsar/pulsar:4.0.4`. No proto bump, no feature flag —
-regular sends remain byte-identical to v0.1.0. User-facing docs at
-[`docs/shadow-topic.md`](../../docs/shadow-topic.md).
+regular sends remain byte-identical to the pre-PIP-180 behaviour.
+User-facing docs at [`docs/shadow-topic.md`](../../docs/shadow-topic.md).
 
 ## Implementation footprint
 
@@ -196,9 +198,9 @@ on the `Consumer` at subscribe time.
 
 - [ADR-0009](0009-pulsar-4-minimum.md) — Pulsar 4.0+ minimum;
   PIP-180 is available on 4.x.
-- [ADR-0010](0010-v0-1-full-java-parity.md) — v0.1.0 parity
-  scope; this ADR is the basis for lifting PIP-180 out of v0.1.0
-  to v0.2.0.
+- [ADR-0010](0010-v0-1-full-java-parity.md) — parity scope; this
+  ADR is the basis for lifting PIP-180 out of the original
+  core-parity scope into a focused follow-up.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) —
   four-layer test plan binding.
 - PIP-180 (Shadow Topic) —

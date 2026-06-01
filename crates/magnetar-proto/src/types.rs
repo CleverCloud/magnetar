@@ -79,9 +79,9 @@ impl fmt::Display for SegmentId {
 
 /// PIP-460 hash key range `[start, end)` a segment is responsible for.
 ///
-/// **Experimental** (PIP-460, ADR-0031). v0.2.0 surfaces the key range for
+/// **Experimental** (PIP-460, ADR-0031). Surfaces the key range for
 /// observation only — segment-aware sticky-key dispatch (Key_Shared across
-/// the full DAG) is out of scope (v0.3.0+).
+/// the full DAG) is out of scope (future work).
 #[cfg(feature = "scalable-topics")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyRange {
@@ -444,11 +444,11 @@ mod tests {
             "None-segment wire encoding is byte-identical to v4"
         );
         // A `Some`-segment id encodes the same wire bytes (segment is dropped
-        // on the v0.2.0 wire) — documented scaffold behaviour.
+        // on the scaffold wire) — documented scaffold behaviour.
         assert_eq!(
             scaled.to_bytes(),
             v4.to_bytes(),
-            "segment is in-process only on the v0.2.0 scaffold wire"
+            "segment is in-process only on the scaffold wire"
         );
     }
 

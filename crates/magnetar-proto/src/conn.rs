@@ -1224,7 +1224,7 @@ impl Connection {
                             // classifier emits `MessageReceivedFromShadow` so callers see the
                             // source-topic context without an out-of-band lookup. Regular
                             // (non-shadow) topics keep emitting `Message` — receive-path
-                            // byte-identical to v0.1.0.
+                            // wire byte-identical.
                             let queue_len = consumer.queue.len();
                             let start = queue_len.saturating_sub(count);
                             for idx in start..queue_len {
@@ -3786,9 +3786,9 @@ impl Connection {
                             lookup_token: resp.lookup_token.unwrap_or(0),
                         });
                 }
-                // v0.2.0: redirect / failure surface as a closed lookup with a
+                // Redirect / failure surface as a closed lookup with a
                 // reason; the runtime re-resolves. (Controller-election-aware
-                // redirect handling is v0.3.0+ per ADR-0031.)
+                // redirect handling is future work per ADR-0031.)
                 LookupType::Redirect | LookupType::Failed => {
                     self.events.push_back(ConnectionEvent::DagWatchClosed {
                         watch_session_id: 0,
@@ -5828,7 +5828,7 @@ mod conn_state_tests {
 
     #[test]
     fn command_subscribe_with_replicate_state_false_byte_identical_to_v01() {
-        // Default subscribe (None) MUST omit field 14 entirely so the wire bytes match v0.1.0
+        // Default subscribe (None) MUST omit field 14 entirely so the wire bytes match the baseline
         // (preserves backward compat for callers that never touched the flag).
         let (mut conn_none, _) = handshake_subscribe(None);
         let _ = conn_none.poll_transmit();

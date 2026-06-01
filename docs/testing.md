@@ -75,8 +75,9 @@ behavioral cases include:
 - 6 batch-container cases from Java's `BatchMessageContainerImplTest`.
 - ~14 schema codec cases.
 - 8 PIP-180 shadow-topic cases (3 producer encode-site guards including
-  the v0.1.0 byte-identical regression test, 1 `MessageId` structural
-  equality pin, 4 consumer-side classification cases).
+  a wire-byte-identity regression test for the no-source-id default,
+  1 `MessageId` structural equality pin, 4 consumer-side classification
+  cases).
 - 11 PIP-33 marker-decoder + filter cases.
 
 ### Four-layer PIP coverage (ADR-0024)

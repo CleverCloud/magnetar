@@ -1,11 +1,10 @@
 # Magnetar V5 client surface (PIP-466)
 
 **Status**: experimental (gated `feature = "experimental-v5-client"`,
-default off). The surface ships in `magnetar v0.2.0` against Pulsar 4.x
-brokers. Upstream Java V5 is still iterating; magnetar's V5 surface is
-a thin wrapper around the v4 wire commands, with V5-shaped types
-(`Duration`, `Option<usize>`, `V5SubscriptionInitialPosition`) on the
-caller-facing builders.
+default off). The surface targets Pulsar 4.x brokers. Upstream Java V5
+is still iterating; magnetar's V5 surface is a thin wrapper around the
+v4 wire commands, with V5-shaped types (`Duration`, `Option<usize>`,
+`V5SubscriptionInitialPosition`) on the caller-facing builders.
 
 Locked by [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)
 (Accepted). See [`docs/parity-status.md`](parity-status.md) for the
@@ -15,8 +14,7 @@ parity-matrix row.
 
 - You want the Java V5 ergonomics today (`Duration`-typed timeouts,
   per-surface `StreamConsumer` vs `QueueConsumer` builders, named
-  initial-position enum) without waiting for the upstream V5 release
-  to ship.
+  initial-position enum) without waiting for the upstream V5 release.
 - You're building greenfield code on Pulsar 4.x — the V5 builders
   translate to the existing v4 wire commands, so there's no broker
   version gate.
@@ -31,15 +29,14 @@ parity-matrix row.
   transactions. Stay on the v4 surface; the V5 wrapper exposes
   `v4()` if you need a mixed setup.
 - You're shipping to production with strict surface-stability
-  requirements. V5 is still default-off behind
-  `experimental-v5-client` even though ADR-0032 is Accepted and the
-  parity-matrix row is ✅.
+  requirements. V5 stays default-off behind `experimental-v5-client`
+  even though ADR-0032 is Accepted and the parity-matrix row is ✅.
 
 ## Enable the feature
 
 ```toml
 [dependencies]
-magnetar = { version = "0.2", features = ["experimental-v5-client"] }
+magnetar = { features = ["experimental-v5-client"] }
 ```
 
 V5 is mutually composable with every other magnetar feature
@@ -168,39 +165,35 @@ to drain a sans-io `Connection` and decode the resulting frames; they
 assert that V5 builder calls translate to the expected v4
 `CommandProducer` / `CommandSubscribe` field values on the wire.
 
-## Roadmap
+## Status
 
-Status snapshot — the parity-matrix row flipped from 🟡 experimental
-to ✅ on 2026-05-28 when ADR-0032 was Accepted alongside the unified
-engine-generic refactor. The
-`experimental-v5-client` feature stays default-off; acceptance flips
-the matrix and unlocks moonpool-engine V5 usage, not the default-on
-flag.
+The parity-matrix row sits at ✅ since ADR-0032 was Accepted alongside
+the engine-generic refactor. The `experimental-v5-client` feature
+stays default-off; acceptance reflects the matrix state and unlocks
+moonpool-engine V5 usage, not the default-on flag. What that
+acceptance covers:
 
-1. **✅ Landed (2026-05-28).** The five mapping/wire test files now
-   have moonpool 1:1 mirrors at
-   `crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape pinning +
-   sans-io wire assertions against
-   `MoonpoolEngine<TokioProviders>`). The V5 surface has full
-   deterministic-simulation coverage symmetric with the v4 surface.
-2. Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
-   `e2e_sub_types_v5.rs`) gated
-   `feature = "e2e,experimental-v5-client"` against Pulsar 4.0.4.
-3. **✅ Landed (2026-05-28).** ADR-0032 promoted from Proposed →
-   Accepted; matrix sweep (`check-crypto-matrix` × V5 axis) green.
-4. **✅ Landed (2026-05-28).** Engine-genericity:
-   `PulsarClientV5<E: Engine = TokioEngine>` is parametric.
-   `MessageEncryptor` / `MessageDecryptor` types now live behind the
-   per-engine [`MessageEncryptorApi`] / [`MessageDecryptorApi`]
-   extension traits (tokio plugs in
-   `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs
-   in `NoEncryption` no-op stub). `MessageRouter` is a façade-level
-   trait (pure routing math), already engine-agnostic.
-5. **✅ Landed (2026-05-28).** Per-surface builder lifts —
-   `PartitionedProducerBuilder<E>`, `TableViewBuilder<E>`,
-   `TypedTableViewBuilder<S, E>` are now engine-generic. The
-   tokio-specialised `.create_with_encryption` /
-   `.create_with_decryption` impls retain the PIP-4 carve-out.
+- **Engine-generic surface.** `PulsarClientV5<E: Engine = TokioEngine>`
+  is parametric, with the same v4 escape hatch and per-surface builders
+  on either engine. `MessageEncryptor` / `MessageDecryptor` types live
+  behind the per-engine [`MessageEncryptorApi`] / [`MessageDecryptorApi`]
+  extension traits (tokio plugs in
+  `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs
+  in a no-op stub). `MessageRouter` is a façade-level trait (pure
+  routing math), engine-agnostic by construction.
+- **Test coverage.** The five mapping/wire test files have moonpool 1:1
+  mirrors at `crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape
+  pinning + sans-io wire assertions against
+  `MoonpoolEngine<TokioProviders>`); the V5 surface has full
+  deterministic-simulation coverage symmetric with the v4 surface.
+  Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
+  `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"`
+  cover Pulsar 4.x compatibility. `check-crypto-matrix` × V5 axis is
+  green.
+- **Per-surface builder lifts.** `PartitionedProducerBuilder<E>`,
+  `TableViewBuilder<E>`, `TypedTableViewBuilder<S, E>` are
+  engine-generic. The tokio-specialised `.create_with_encryption` /
+  `.create_with_decryption` impls retain the PIP-4 carve-out.
 
 [`MessageEncryptorApi`]: ../crates/magnetar/src/engine/mod.rs
 [`MessageDecryptorApi`]: ../crates/magnetar/src/engine/mod.rs

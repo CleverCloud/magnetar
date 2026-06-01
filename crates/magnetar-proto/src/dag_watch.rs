@@ -11,14 +11,14 @@
 //! connection lock and translate the returned [`DagDelta`] into
 //! [`ConnectionEvent`](crate::ConnectionEvent) variants.
 //!
-//! # Drop-on-change (v0.2.0 scope)
+//! # Drop-on-change
 //!
-//! Per ADR-0031 the v0.2.0 surface is **observation + drop-on-change**: the
+//! Per ADR-0031 the surface is **observation + drop-on-change**: the
 //! session records the DAG, applies updates, and reports what changed, but
 //! does not perform transparent segment failover. The runtime closes the
 //! per-segment consumers and surfaces a `DagChangedDuringConsume` event when
 //! a split / merge / removal lands while a `StreamConsumer` is active.
-//! Transparent failover and in-place repartition are explicit v0.3.0+ work.
+//! Transparent failover and in-place repartition are explicit future work.
 
 use std::collections::BTreeMap;
 
@@ -43,7 +43,7 @@ pub struct DagDelta {
 impl DagDelta {
     /// `true` when the delta would force a `StreamConsumer` to drop its
     /// per-segment v4 consumers (any split, merge, or removal). A delta that
-    /// only *adds* fresh segments is non-consume-affecting in v0.2.0 because
+    /// only *adds* fresh segments is non-consume-affecting because
     /// the StreamConsumer attaches the new segment lazily.
     #[must_use]
     pub fn is_consume_affecting(&self) -> bool {
@@ -88,10 +88,10 @@ pub struct MergeEvent {
     pub merge_at_entry: u64,
 }
 
-/// Why the segment DAG changed under a live consumer (v0.2.0 drop-on-change).
+/// Why the segment DAG changed under a live consumer (drop-on-change).
 ///
-/// `#[non_exhaustive]` so future causes (e.g. a controller-broker hand-off in
-/// v0.3.0+) can be added without breaking downstream `match`es.
+/// `#[non_exhaustive]` so future causes (e.g. a controller-broker hand-off)
+/// can be added without breaking downstream `match`es.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DagChangeReason {

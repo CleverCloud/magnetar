@@ -38,8 +38,8 @@ mechanism is `Arc<parking_lot::Mutex<State>>` plus `tokio::sync::Notify` plus
 [ARCHITECTURE.md](ARCHITECTURE.md) for the full rationale.
 
 Magnetar is independent of the existing `pulsar-rs` crate — it shares neither
-code nor dependencies. The goal is feature-complete parity with the Java
-client at v0.1.0.
+code nor dependencies. The goal is feature-complete parity with the Apache
+Pulsar Java client.
 
 [`magnetar-proto`]: crates/magnetar-proto
 [`magnetar-runtime-tokio`]: crates/magnetar-runtime-tokio
@@ -94,8 +94,9 @@ client at v0.1.0.
 - **Interceptors**: `ProducerInterceptor` + `ConsumerInterceptor` SPIs.
 - **Admin REST client**: a `reqwest`-backed admin client lives in
   `magnetar-admin`.
-- **CLI**: `magnetar` binary in `magnetar-cli` covers admin lookups and stats
-  today; data-plane subcommands ship in v0.2.0.
+- **CLI**: `magnetar` binary in `magnetar-cli` covers admin lookups and
+  stats today; data-plane subcommands (produce / consume / inspect) are
+  in progress.
 
 ---
 
@@ -698,30 +699,29 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Moonpool engine parity.** v0.1.0 Java parity is satisfied by
-  the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)),
-  but the façade's dependent surfaces are now engine-generic through
-  ADR-0026 §D1 extension traits. Producers, consumers, readers,
-  partitioned producer/consumer, multi-topics, pattern consumers,
-  TableView, transactions, and typed schema builders all dispatch through
+- **Moonpool engine parity.** Java parity is fully satisfied by the
+  tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md));
+  the façade's dependent surfaces are engine-generic through ADR-0026 §D1
+  extension traits. Producers, consumers, readers, partitioned
+  producer/consumer, multi-topics, pattern consumers, TableView,
+  transactions, and typed schema builders all dispatch through
   `impl<E: Engine> PulsarClient<E>` where the selected runtime implements
   the matching `*Api` trait. See [`docs/parity-status.md`](docs/parity-status.md).
-- **PIP-180 shadow topic** landed in v0.2.0 ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md),
-  [`docs/shadow-topic.md`](docs/shadow-topic.md)).
-- **PIP-33 replicated subscriptions** landed in v0.2.0
-  ([ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md),
-  [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md)).
 - **PIP-460 scalable topics** ship as an experimental scaffold behind
-  `scalable-topics`; e2e waits for a Pulsar 5.0 RC with PIP-460.
+  `feature = "scalable-topics"` (default off); the in-process four-layer
+  test suite is the binding gate. e2e against a real broker waits for an
+  upstream Pulsar release that ships PIP-460 (currently `Draft`, targeting
+  Pulsar 5.0 LTS).
 - **PIP-466 V5 surface** ships as an experimental, engine-generic wrapper
-  behind `experimental-v5-client`.
-- **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616)
-  under the default `auth-sasl` feature, and Kerberos/GSSAPI via
-  `libgssapi` under the `auth-sasl-kerberos` feature. The
-  multi-round `AUTH_CHALLENGE` exchange threads through
-  `AuthProvider::respond_to_challenge`. The four sans-io test
-  layers drive a deterministic `ScriptedGssapiClient`; the e2e
-  layer runs against a Dockerised KDC. See
+  behind `feature = "experimental-v5-client"` (default off). No wire
+  change — it wraps the v4 surface.
+- **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616) under
+  the default `auth-sasl` feature, and Kerberos/GSSAPI via `libgssapi`
+  under the `auth-sasl-kerberos` feature. The multi-round
+  `AUTH_CHALLENGE` exchange threads through
+  `AuthProvider::respond_to_challenge`. The four sans-io test layers
+  drive a deterministic `ScriptedGssapiClient`; the e2e layer runs
+  against a Dockerised KDC. See
   [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md).
 - **Athenz** ships both the pre-fetched role-token path and the opt-in
   ZTS round-trip (`auth-athenz-zts`). Production-style ZMS+ZTS+certificate
@@ -751,11 +751,11 @@ known-missing feature.
 | PIP-391 | Batch-index ACK polish | ✅ | Pairs with PIP-54 |
 | PIP-188 | `TOPIC_MIGRATED` | ✅ | Wire opcode decoded; tokio driver's event loop catches `ConnectionEvent::TopicMigrated`, logs the new-broker hint, and returns an error from `driver_loop_inner` so the supervisor triggers `Connection::reset` + reconnect. `rebuild_producers` / `rebuild_consumers` re-attach every still-open handle on the new socket. |
 | _local_ | Anti-thrash policy ([ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)) | ✅ (opt-in) | Per-handle ack-then-drop detector + connection-level cooldown. Mitigates broker-driven post-restart cascades (Pulsar PR #14467 / #13428 / #12846 — `ServerCnx#handleProducer` ↔ `AbstractTopic#addProducer` race). `SupervisorConfig::anti_thrash_threshold` default `None`. |
-| PIP-460 | Scalable topics | 🟡 | Experimental scaffold behind `feature = "scalable-topics"` (default off), ADR-0031 (Accepted 2026-05-28). **No released Pulsar broker ships PIP-460** (upstream `Draft`, targets 5.0 LTS) — so this is scaffold-now / e2e-later. Ships the `topic://` URL scheme, hand-encoded wire commands (lookup + DAG-watch + DAG-update, behind the feature gate until the 5.0 RC vendor bump per ADR-0026 §D4), the `DagWatchSession` sans-io state machine, the additive default-`None` `MessageId::segment_id` field (v4 wire byte-identical), both-engine `ScalableTopicsApi` impls, `magnetar::scalable::StreamConsumer` (StreamConsumer-only, **drops on DAG change**), and the `magnetar topic-info` CLI. Four-layer in-process tests are the binding gate; e2e is `#[ignore]`'d and does not block release. QueueConsumer / CheckpointConsumer / controller-election / repartition are v0.3.0+. See [`docs/scalable-topics.md`](docs/scalable-topics.md) + [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md). |
-| PIP-466 | V5 client API surface | ✅ | Behind `feature = "experimental-v5-client"` (default off). Engine-generic per ADR-0032 (Accepted 2026-05-28). `magnetar::v5` exposes `PulsarClientV5<E: Engine = TokioEngine>` (with `v4()` escape hatch), `v5::Producer<E>`, `v5::StreamConsumer<E>` (Exclusive / Failover), `v5::QueueConsumer<E>` (Shared / `KeyShared`), and the `v5::mapping` field-translation table. Moonpool callers name `PulsarClientV5<MoonpoolEngine<P>>` directly. Wraps the v4 surface — no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md). |
-| PIP-180 | Shadow topic | ✅ | v0.2.0 — admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
+| PIP-460 | Scalable topics | 🟡 | Experimental scaffold behind `feature = "scalable-topics"` (default off), ADR-0031. **No released Pulsar broker ships PIP-460** (upstream `Draft`, targets 5.0 LTS) — so this is scaffold-now / e2e-later. Ships the `topic://` URL scheme, hand-encoded wire commands (lookup + DAG-watch + DAG-update, behind the feature gate until the Pulsar 5.0 RC vendor bump per ADR-0026 §D4), the `DagWatchSession` sans-io state machine, the additive default-`None` `MessageId::segment_id` field (v4 wire byte-identical), both-engine `ScalableTopicsApi` impls, `magnetar::scalable::StreamConsumer` (StreamConsumer-only, **drops on DAG change**), and the `magnetar topic-info` CLI. Four-layer in-process tests are the binding gate; e2e is `#[ignore]`'d. QueueConsumer / CheckpointConsumer / controller-election / repartition stay out of the current scaffold and will land once an upstream release pins the wire commands. See [`docs/scalable-topics.md`](docs/scalable-topics.md) + [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md). |
+| PIP-466 | V5 client API surface | ✅ | Behind `feature = "experimental-v5-client"` (default off). Engine-generic per ADR-0032. `magnetar::v5` exposes `PulsarClientV5<E: Engine = TokioEngine>` (with `v4()` escape hatch), `v5::Producer<E>`, `v5::StreamConsumer<E>` (Exclusive / Failover), `v5::QueueConsumer<E>` (Shared / `KeyShared`), and the `v5::mapping` field-translation table. Moonpool callers name `PulsarClientV5<MoonpoolEngine<P>>` directly. Wraps the v4 surface — no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md). |
+| PIP-180 | Shadow topic | ✅ | Admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md). |
 | PIP-415 | `getMessageIdByIndex` | ✅ | `magnetar-admin::AdminClient::topic_get_message_id_by_index` — REST-only per [PIP-415](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) (binary-protocol section intentionally empty; canonical implementation [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin / broker / CLI only) |
-| PIP-33 | Replicated subscriptions | ✅ | `ConsumerBuilder::replicate_subscription_state(bool)` + receive-path filter that drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
+| PIP-33 | Replicated subscriptions | ✅ | `ConsumerBuilder::replicate_subscription_state(bool)` flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
 | PIP-121 | Cluster failover (Auto + Controlled) | ✅ | `ServiceUrlProvider` + `StaticServiceUrlProvider` + `ControlledClusterFailover` (proto) + `AutoClusterFailover` (runtime with `HealthProbe`). Active URL re-resolved on every supervised-reconnect attempt. |
 
 ---
@@ -803,15 +803,18 @@ Pick at compile time via feature flags.
 
 ---
 
-## Roadmap
+## Status
 
-v0.1.0 targets full Java client parity on the tokio engine
-([ADR-0010](specs/adr/0010-v0-1-full-java-parity.md),
-[ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)). The
-moonpool engine reaches feature parity with tokio on a follow-up train.
+Magnetar targets a feature-complete Apache Pulsar driver with full
+Java-client parity, driven by two interchangeable engines (production
+tokio + deterministic-simulation moonpool) over the same sans-io
+protocol state machine ([ADR-0010](specs/adr/0010-v0-1-full-java-parity.md),
+[ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)). Java
+parity is satisfied on the tokio engine; the moonpool engine is on the
+same trajectory and the differential harness enforces tokio ↔ moonpool
+`EventStream` equivalence.
 
-The current open-work tracker is [`docs/follow-ups.md`](docs/follow-ups.md).
-The v0.2.0 wave items already landed on `main`:
+The bulk of the parity matrix above ships on `main`, including:
 
 - **PIP-180** shadow topic ([`docs/shadow-topic.md`](docs/shadow-topic.md),
   [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
@@ -825,10 +828,14 @@ The v0.2.0 wave items already landed on `main`:
 - **Anti-thrash supervised reconnect policy** (opt-in,
   [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
-The current open v0.2.0 follow-ups are narrower: PIP-460 e2e waits for a
-Pulsar 5.0 RC, the moonpool git dependency waits for a release containing
-upstream PR #113, and a few simulation/test-harness gaps remain tracked in
-[`docs/follow-ups.md`](docs/follow-ups.md).
+Known open work is narrow and tracked in
+[`docs/follow-ups.md`](docs/follow-ups.md): PIP-460 e2e waits for a
+Pulsar 5.0 RC that pins the scalable-topic wire commands, the moonpool
+git dependency waits for a release containing upstream PR #113, and a
+few simulation / test-harness gaps remain.
+
+API is unstable until the first tagged release — do not depend on this
+in production yet.
 
 ---
 

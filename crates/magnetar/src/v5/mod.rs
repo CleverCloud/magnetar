@@ -20,12 +20,12 @@
 //!   fire-and-forget paths).
 //!
 //! Java V5 is still iterating upstream, so the magnetar surface ships
-//! behind `feature = "experimental-v5-client"` (default off). The full
-//! v0.2.0 scope per [ADR-0032](../../../specs/adr/0032-pip-466-v5-client-surface-scope.md):
+//! behind `feature = "experimental-v5-client"` (default off). Scope per
+//! [ADR-0032](../../../specs/adr/0032-pip-466-v5-client-surface-scope.md):
 //! `v5::Producer<T, E>`, `v5::StreamConsumer<T, E>`, `v5::QueueConsumer<T, E>`,
 //! and the `PulsarClientV5<E>` entry point. V5 `Reader`, `TableView`,
 //! `Transaction`, `CheckpointConsumer` are out of scope and explicitly
-//! deferred to v0.3.0+.
+//! deferred to future work.
 
 pub mod client;
 pub mod mapping;

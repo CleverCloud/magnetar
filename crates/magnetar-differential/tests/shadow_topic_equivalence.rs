@@ -11,7 +11,7 @@
 //!    engines surface that id verbatim on the resulting `SendFut`.
 //! 2. `regular_send_byte_identical_to_v01_parity` — regression guard: a plain `Op::Send` (no
 //!    source-message-id) still produces the same event sequence on both engines as before PIP-180
-//!    landed. Pins the "no proto bump, v0.1.0 byte-identical" promise at the differential layer.
+//!    landed. Pins the "no proto bump, wire byte-identical" promise at the differential layer.
 //!
 //! A golden trace lives at `tests/golden/shadow_send_with_source.json` —
 //! human-reviewable, regenerated via `MAGNETAR_REGENERATE_GOLDEN=1`.
