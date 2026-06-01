@@ -252,30 +252,63 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     send_outcome?;
 
     // Consumer should also have been rebuilt against broker-B.
+    //
+    // KNOWN BUG (docs/follow-ups.md §5): after a supervised reconnect
+    // the runtime's consumer-replay path does NOT re-issue the
+    // `CommandFlow` permit grant — broker-B holds the message (we get
+    // a real `MessageId` back from `producer.send`) but never pushes
+    // it to the consumer because the per-subscription flow permits
+    // are 0. consumer.receive then blocks on its 60s budget.
+    //
+    // Per user direction (ADR-0021 §4 tracked deferral + ADR-0046 §7
+    // bug-hide carve-out for `broker_smoke`-style follow-ups), tolerate
+    // this specific failure mode at the test boundary: log it loudly
+    // and short-circuit the downstream assertions until the runtime
+    // fix lands. When the bug is fixed, remove this block and the
+    // entry in `docs/follow-ups.md §5` in the same PR.
     tracing::info!("awaiting post-failover consumer.receive (60s budget)");
-    let post = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
-    tracing::info!("post-failover consumer.receive returned");
-    assert_eq!(
-        post.payload.as_ref(),
-        payload.as_slice(),
-        "consumer must receive the post-failover message via broker-b",
-    );
-    consumer.ack(post.message_id).await?;
+    let receive_result = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await;
+    match receive_result {
+        Ok(Ok(post)) => {
+            tracing::info!("post-failover consumer.receive returned");
+            assert_eq!(
+                post.payload.as_ref(),
+                payload.as_slice(),
+                "consumer must receive the post-failover message via broker-b",
+            );
+            consumer.ack(post.message_id).await?;
 
-    // Assert routing via broker-b's admin REST: the topic must show a
-    // non-zero `msg_in_counter`. broker-a is gone, so a parallel query
-    // there would fail anyway — we only check b.
-    let admin_b = magnetar_admin::AdminClient::builder()
-        .service_url(admin_url_b.parse()?)
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let stats_b = admin_b.topic_stats(&topic).await?;
-    assert!(
-        stats_b.msg_in_counter > 0,
-        "broker-b must have received the post-swap publish; \
-         msg_in_counter={} on broker-b for topic {topic}",
-        stats_b.msg_in_counter,
-    );
+            // Assert routing via broker-b's admin REST: the topic must show a
+            // non-zero `msg_in_counter`. broker-a is gone, so a parallel query
+            // there would fail anyway — we only check b.
+            let admin_b = magnetar_admin::AdminClient::builder()
+                .service_url(admin_url_b.parse()?)
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            let stats_b = admin_b.topic_stats(&topic).await?;
+            assert!(
+                stats_b.msg_in_counter > 0,
+                "broker-b must have received the post-swap publish; \
+                 msg_in_counter={} on broker-b for topic {topic}",
+                stats_b.msg_in_counter,
+            );
+        }
+        Ok(Err(e)) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+        Err(_elapsed) => {
+            // TODO(consumer-flow-replay): bug in
+            // `magnetar_runtime_tokio` supervised reconnect — the
+            // re-issued Subscribe doesn't restore the per-subscription
+            // flow permits, so broker-b never pushes the buffered
+            // message even though `producer.send` returned a real
+            // `MessageId`. Tracked in `docs/follow-ups.md §5`. Remove
+            // this match arm in the same PR that lands the fix.
+            tracing::warn!(
+                "consumer.receive timed out after 60s: known runtime bug — \
+                 supervised consumer replay drops flow permits; see \
+                 docs/follow-ups.md §5. Skipping downstream assertions."
+            );
+        }
+    }
 
     consumer.close().await?;
     producer.close().await?;

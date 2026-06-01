@@ -25,6 +25,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 2   | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main)                                                                   | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113)                                                                                                      |
 | 3   | [Moonpool `ProxyConnectionPool` parity](#3-moonpool-proxyconnectionpool-parity)                                                                       | ⚡ ready to dispatch — tokio ships the pool ([ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)); moonpool returns `ProxyUnsupportedOnUnsupervisedClient`                               |
 | 4   | [`sim_chaos_produce_consume_sweep_16_seeds` non-`MOONPOOL_SEED` randomness](#4-sim_chaos_produce_consume_sweep_16_seeds-non-moonpool_seed-randomness) | 🧠 design fix needed — sweep test's internal 16-seed pick is not derived from the outer `MOONPOOL_SEED`, so daily-sweep failures cannot be reproduced via the registered seed (ADR-0047 §4 case 3 default state) |
+| 5   | [Supervised consumer replay drops flow permits](#5-supervised-consumer-replay-drops-flow-permits)                                                     | ⚡ ready to dispatch — runtime bug in `magnetar-runtime-tokio` supervised reconnect path; surfaced by `e2e_controlled_cluster_failover_manual_swap` after ADR-0046                                               |
 
 ---
 
@@ -94,6 +95,51 @@ Once that lands, the ADR-0047 §4 case-3 default state ("dig in anyway when it d
 
 ```text
 /goal close docs/follow-ups.md §4 by making `sim_chaos_produce_consume_sweep_16_seeds` (`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`) derive its internal 16-seed pick from the outer `MOONPOOL_SEED` env var. Seed a `rand_chacha::ChaCha20Rng` (or equivalent reproducible PRNG already in the workspace) from `MOONPOOL_SEED` extended/expanded to the PRNG's required key size, then generate 16 u64 seeds from it. Audit any sibling `*_sweep_*_seeds` tests in the same file for the same pattern (`sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds`, `sim_handshake_sweep_16_seeds`, `sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds`) and apply the same fix. Validate: pick a seed, run twice, assert the same set of pass/fail outcomes. Validation chain per CLAUDE.md. After this lands, the historical seeds that did not repro pre-fix can be retried; any that DO now repro get added to `known-failing.toml` as `status = "open"` with the corresponding `/goal` to fix.
+```
+
+---
+
+## 5. Supervised consumer replay drops flow permits
+
+**Gap.** After the supervised reconnect path in
+`magnetar-runtime-tokio` re-establishes a connection (e.g. PIP-121
+cluster failover landing on a new broker), the
+`magnetar_runtime_tokio::driver` replays each open consumer slot's
+`CommandSubscribe` against the new broker. The replay re-issues
+`Subscribe` but **does NOT re-issue `CommandFlow`** — so the
+per-subscription flow permits stay at 0 on the new broker. The
+broker holds buffered messages but never pushes them to the
+consumer.
+
+**Symptom.**
+[`crates/magnetar/tests/e2e_cluster_failover.rs`](../crates/magnetar/tests/e2e_cluster_failover.rs)'s
+`e2e_controlled_cluster_failover_manual_swap` reproduces it
+deterministically post-ADR-0046:
+
+1. Producer + consumer attach to broker-A; round-trip succeeds.
+2. The failover provider's URL is swapped to broker-B; broker-A is
+   stopped.
+3. The supervisor reconnects to broker-B. `producer.send` succeeds —
+   broker-B returns a real `MessageId { ledger_id: 9, entry_id: 0 }`.
+4. `consumer.receive` blocks for the full 60s budget; broker-B never
+   pushes the message; the test's `tokio::time::timeout` fires.
+5. Confirmed across six consecutive CI runs (26751695168,
+   26754662640, 26754896484, 26756821267, 26760173342, 26763302599)
+   — same 60s-elapsed signature every time.
+
+**Why it stays open.** Runtime fix, not a test-shape issue. The test
+currently tolerates the bug pattern at the `consumer.receive`
+boundary (warns + skips the downstream assertions, per ADR-0021 §4
+user-authorised follow-up deferral —
+`TODO(consumer-flow-replay)` in the test source). When the runtime
+fix lands, the tolerance arm and this entry get removed in the same
+PR. The bug exists pre-ADR-0046; ADR-0046 only made it visible by
+folding the e2e suite into per-PR CI.
+
+**`/goal` (ready to dispatch).**
+
+```text
+/goal close docs/follow-ups.md §5 by fixing the consumer flow-permit re-grant in `magnetar-runtime-tokio`'s supervised reconnect path. Audit `crates/magnetar-runtime-tokio/src/driver.rs` (the supervisor's consumer replay) plus `crates/magnetar-runtime-tokio/src/consumer.rs` (Subscribe + Flow command emission). After the new connection is established and the consumer's Subscribe has been replayed, the runtime MUST re-issue the per-subscription `CommandFlow` carrying the consumer's outstanding receive-queue capacity. Audit the parallel path in `magnetar-runtime-moonpool` — the bug is engine-generic. Land the ADR-0024 four-layer test set: (a) `magnetar-proto` unit asserting Subscribe+Flow are replayed as a pair on supervised reconnect, (b) `magnetar-runtime-tokio` integration asserting flow permits survive a broker swap, (c) the same in `magnetar-runtime-moonpool` (use the in-process broker stub), (d) `magnetar-differential` parity. Then strip the `match receive_result { … Err(_elapsed) => { tracing::warn! … } }` self-skip arm in `crates/magnetar/tests/e2e_cluster_failover.rs` and remove this follow-up entry in the same commit.
 ```
 
 ---
