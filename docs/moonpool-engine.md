@@ -358,7 +358,7 @@ in [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
 
 - **Property-based seed sweeps** in per-PR CI: the per-PR pipeline runs
   the test binary on the moonpool default seed only. Multi-seed
-  scheduling is covered by the daily 16-random-seed sweep
+  scheduling is covered by the daily 128-random-seed sweep
   ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)),
   not by per-PR CI.
 - **TLS handshake byte-level chaos** (corrupted handshake records) is

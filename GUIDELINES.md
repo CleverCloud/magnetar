@@ -92,7 +92,7 @@ for seed in $(seq 1 32); do                              # local-only sweep (ADR
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
     --all-features --locked -- --quiet \
     || { echo "seed $seed FAILED"; exit 1; }
-done                                                     # CI: 16 random seeds daily, .github/workflows/moonpool-seed-sweep.yml
+done                                                     # CI: 128 random seeds daily, .github/workflows/moonpool-seed-sweep.yml
 cargo deny check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo xtask check-sim-coverage        # ADR-0024: 100% moonpool coverage on diff
@@ -146,7 +146,7 @@ requirement in local + CI.
 `seed ∈ 1..32` to catch seed-dependent flakiness in the
 deterministic-simulation suite. **CI cadence is different**: per
 [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md), the
-sweep runs **daily** with **16 freshly-rolled random seeds in
+sweep runs **daily** with **128 freshly-rolled random seeds in
 parallel** in
 [`.github/workflows/moonpool-seed-sweep.yml`](.github/workflows/moonpool-seed-sweep.yml),
 not on every PR / push. Reason: fixed `(commit, seed)` pairs are

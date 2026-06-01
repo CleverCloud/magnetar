@@ -5,6 +5,15 @@
 - **Decider**: Florentin Dubois
 - **Tags**: testing, moonpool, ci, process
 
+> **Amendment (2026-06-01, this commit).**
+> The daily random-seed count moves from **16 → 128**. Runtime evidence:
+> each moonpool test runs in ~50ms; a full per-runner build+test cycle
+> finishes in ~6 minutes on cache-warm `ubuntu-latest`. 128 × ~6 min ≈
+> 12.8 runner-hours/night, comfortable inside GH Actions' default
+> concurrency cap. Coverage grows from ~5,840 seeds/year to ~46,720
+> seeds/year. The rest of this ADR (cadence, failure handling, exempt
+> local validation, mitigation under ADR-0043 float) is unchanged.
+
 > **Amendment (2026-05-29, [ADR-0043](0043-temporary-floating-moonpool-git-dep.md)).**
 > The exact-pin reproducibility discipline this ADR relies on is
 > temporarily relaxed for **two named crates only** — `moonpool-core` and
@@ -55,7 +64,8 @@ nothing) and into a daily cron job that rolls fresh seeds each run.
 ## Decision
 
 The moonpool seed sweep moves from per-PR / per-push to a dedicated
-**daily** workflow with **16 random seeds in parallel**.
+**daily** workflow with **128 random seeds in parallel** (originally 16,
+bumped per the 2026-06-01 amendment above).
 
 Concretely:
 
@@ -69,10 +79,10 @@ Concretely:
    [`.github/workflows/moonpool-seed-sweep.yml`](../../.github/workflows/moonpool-seed-sweep.yml)**
    running on `schedule: '17 3 * * *'` (03:17 UTC daily) and
    `workflow_dispatch`. The workflow has two jobs:
-   - `generate-seeds` — rolls **16 hex-encoded random `u64` seeds**
-     via Python's `secrets.randbits(64)`, emits them as a JSON array in
-     `$GITHUB_OUTPUT`.
-   - `moonpool-sim` — matrix of 16 parallel runners, each setting
+   - `generate-seeds` — rolls **128 random seeds** as hex-encoded
+     `u64` values via Python's `secrets.randbits(64)`, emits them as a
+     JSON array in `$GITHUB_OUTPUT`.
+   - `moonpool-sim` — matrix of 128 parallel runners, each setting
      `MOONPOOL_SEED=<seed>` and running the
      `magnetar-runtime-moonpool` test suite. `fail-fast: false` so the
      full set of failing seeds is visible in one run summary.
@@ -103,8 +113,9 @@ Concretely:
 
 - Per-PR runner-minutes drop by ~150–300 minutes; the merge gate
   finishes faster.
-- Coverage of the moonpool seed space grows over time (~5,840 distinct
-  seeds/year vs. the fixed 32 forever).
+- Coverage of the moonpool seed space grows over time (~46,720 distinct
+  seeds/year under the 2026-06-01 amendment — originally ~5,840 at 16
+  seeds/day — vs. the fixed 32 forever).
 - Seed-dependent regressions surface within 24 hours of landing, with
   a reproducible `MOONPOOL_SEED=<hex>` value attached.
 - The daily cadence makes it visible *when* a regression landed
@@ -116,7 +127,7 @@ Concretely:
   to 24 hours before the next nightly run flags it. This is a
   deliberate trade against the wasted-compute cost of the per-PR fixed
   sweep — random per-PR sweeps could re-introduce the latency without
-  the determinism, and "all seeds 1..32 plus 16 random" is the worst
+  the determinism, and "all seeds 1..32 plus N random" is the worst
   of both.
 - Diagnosing a regression requires copying a hex seed from the run
   summary rather than picking from a known short list. Mitigated by
@@ -135,19 +146,26 @@ Concretely:
 - **Keep per-PR fixed sweep, add daily random sweep on top.**
   Rejected: doubles compute, doesn't fix the "fixed seeds are useless
   after the first green run" problem.
-- **Per-PR random sweep (16 random seeds rolled per PR).** Rejected:
-  loses determinism — a flake under one PR's roll can't be reproduced
-  on a rebase. The seed-sweep value is in the *reproducible failure*,
-  which only random-but-recorded provides.
+- **Per-PR random sweep (16 random seeds rolled per PR — the count
+  matches the original daily figure; under the 2026-06-01 amendment
+  the daily count is 128).** Rejected: loses determinism — a flake
+  under one PR's roll can't be reproduced on a rebase. The seed-sweep
+  value is in the *reproducible failure*, which only random-but-
+  recorded provides.
 - **Weekly cadence instead of daily.** Rejected: a regression can sit
   for a week before being noticed; that's too long given how often
   the moonpool surface changes.
-- **More seeds per day (32 or 64).** Rejected for now: 16 is enough
-  for one day's exploration and keeps runner cost bounded. Easy to
-  bump later if the failure rate suggests we're undersampling.
+- **More seeds per day (32 or 64).** **Accepted later — see 2026-06-01
+  amendment.** Original rationale: 16 is enough for one day's
+  exploration and keeps runner cost bounded; easy to bump later if the
+  failure rate suggests we're undersampling. Runtime evidence collected
+  after the workflow had run for some weeks showed the per-seed cost
+  (~50 ms test runtime, ~6 min build+test per matrix runner cache-warm)
+  was much lower than the original estimate, so the rejection no longer
+  holds and the count moved to **128 seeds/night**.
 - **Use `RUSTFLAGS=-C panic=abort` to short-circuit failing seeds and
   roll more.** Rejected: solves a problem we don't have (runner cost
-  is fine at 16); adds complexity.
+  is fine at 128); adds complexity.
 
 ## References
 

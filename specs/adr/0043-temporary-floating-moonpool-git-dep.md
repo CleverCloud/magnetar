@@ -115,7 +115,7 @@ exact-pin discipline in full.
 
 - `Cargo.lock` records a concrete rev (`--locked` everywhere in the
   validation chain — CLAUDE.md / docs/testing.md / parity-status.md).
-- The daily 16-random-seed moonpool sweep
+- The daily 128-random-seed moonpool sweep
   ([ADR-0036](0036-moonpool-seed-sweep-daily-random.md),
   [`.github/workflows/moonpool-seed-sweep.yml`](../../.github/workflows/moonpool-seed-sweep.yml))
   guards against a silent moonpool-side scheduling regression sneaking

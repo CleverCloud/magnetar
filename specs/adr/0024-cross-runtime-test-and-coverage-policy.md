@@ -102,7 +102,7 @@ Concretely, the binding rules are:
 3. **Seed sweep.** The local validation chain runs
    `MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool` for
    `seed ∈ 1..32` on every pass. Any seed failure fails the chain. In
-   CI, the cadence is **daily, 16 random seeds in parallel**, per
+   CI, the cadence is **daily, 128 random seeds in parallel**, per
    [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) — fixed seeds
    in the per-PR gate were wasted compute because each `(commit, seed)`
    pair is bit-for-bit reproducible.

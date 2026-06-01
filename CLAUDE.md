@@ -161,7 +161,7 @@ cargo test --workspace --all-features
 # Moonpool seed sweep — catches seed-dependent flakiness in the
 # deterministic-simulation suite. Local-only per ADR-0036 (fixed seeds
 # in per-PR CI were wasted compute since each (commit, seed) pair is
-# bit-for-bit reproducible). CI runs a 16-random-seed sweep daily in
+# bit-for-bit reproducible). CI runs a 128-random-seed sweep daily in
 # `.github/workflows/moonpool-seed-sweep.yml`.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \

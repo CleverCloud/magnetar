@@ -114,7 +114,7 @@ FoundationDB's "production code IS the test target" principle.
   the `EventStream`s are byte-compared.
 - **Seed sweep**: per
   [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)
-  a daily 16-random-seed CI job covers the moonpool suite; the
+  a daily 128-random-seed CI job covers the moonpool suite; the
   per-PR matrix was retired because each `(commit, seed)` pair is
   bit-for-bit reproducible.
 
@@ -132,7 +132,7 @@ FoundationDB's "production code IS the test target" principle.
    restoring them in a different random order is not yet
    expressible.
 3. **No long-running soak.** "Tens of thousands of nightly sims" is
-   beyond a 16-seed daily job. A longer-running soak (e.g. nightly
+   beyond a 128-seed daily job. A longer-running soak (e.g. nightly
    1 000-seed sweep on a beefier runner) would close this gap.
 
 ---
@@ -235,7 +235,7 @@ simulation surface, easily landed as separate ADRs + commits.
   questionable incremental win.
 - **VOPR-equivalent dedicated runner.** TigerBeetle runs VOPR on
   dedicated bare-metal because every seed costs hours; magnetar's
-  current sim runs in ~50 ms per seed. The 16-random-seed daily
+  current sim runs in ~50 ms per seed. The 128-random-seed daily
   job is the correct shape until a multi-minute-per-seed regression
   appears.
 
@@ -268,7 +268,7 @@ simulation surface, easily landed as separate ADRs + commits.
 - [`ADR-0026 §D2`](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md#d2--wire-moonpool-sim-option-1-pure-sim-chaos-suite--converged)
   — chaos pack scope.
 - [`ADR-0036`](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)
-  — daily 16-random-seed CI policy.
+  — daily 128-random-seed CI policy.
 - Commit `aaa0661` — stateful chaos broker + invariants.
 - [`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)
   — current chaos suite.

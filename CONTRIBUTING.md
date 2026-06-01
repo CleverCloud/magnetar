@@ -42,7 +42,7 @@ locally can substitute `--all-features` for `--no-default-features
 (`cargo test -p <crate>`) need an explicit crypto feature because
 dependency features don't transitively activate under `-p`.
 
-Moonpool seed sweep: CI runs a daily 16-random-seed job per
+Moonpool seed sweep: CI runs a daily 128-random-seed job per
 [ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md);
 locally you can reproduce a flaky run with:
 

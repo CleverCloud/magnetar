@@ -9,7 +9,7 @@ name: Moonpool seed sweep
 # the `seed-replay` job in `.github/workflows/ci.yml` keeps replaying it
 # on every PR until the underlying bug is fixed and the entry removed.
 #
-# A freshly-rolled set of 16 random `u64` seeds runs in parallel each
+# A freshly-rolled set of 128 random `u64` seeds runs in parallel each
 # day. Local reproduction is `MOONPOOL_SEED=<seed> cargo test -p
 # magnetar-runtime-moonpool --features crypto-aws-lc-rs --locked`.
 #
@@ -48,7 +48,7 @@ env:
 
 jobs:
   generate-seeds:
-    name: roll 16 random seeds
+    name: roll 128 random seeds
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -59,7 +59,7 @@ jobs:
           set -euo pipefail
           seeds=$(python3 - <<'PY'
           import json, secrets
-          print(json.dumps([f"0x{secrets.randbits(64):016x}" for _ in range(16)]))
+          print(json.dumps([f"0x{secrets.randbits(64):016x}" for _ in range(128)]))
           PY
           )
           {
