@@ -37,6 +37,13 @@ crypto-openssl   = ["dep:rustls-openssl"]
 # `magnetar-proto/scalable-topics` wire surface that the moonpool engine's
 # `ScalableTopicsApi` impl drives. Additive: no new dependency.
 scalable-topics  = ["magnetar-proto/scalable-topics"]
+# FoundationDB-style buggify fault-injection (ADR-0048). Default OFF.
+# Forwards to `magnetar-proto/buggify` so the proto-layer choice
+# points become buggify-aware in the moonpool sim test suite. The
+# moonpool engine still ships `Buggify::disabled` by default — tests
+# opt in by calling `Connection::set_buggify` with their own
+# seed-driven RNG handle. Additive: no new dependency.
+buggify          = ["magnetar-proto/buggify"]
 
 [dependencies]
 magnetar-proto = { workspace = true }

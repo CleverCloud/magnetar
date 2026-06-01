@@ -26,6 +26,18 @@ scalable-topics = [
     "magnetar-runtime-moonpool/scalable-topics",
 ]
 
+# FoundationDB-style buggify fault-injection (ADR-0048). Default OFF.
+# Forwards to proto + engines. The differential harness itself does
+# NOT enable buggify in any of its assertions: the equivalence
+# contract is tokio ↔ moonpool with `Buggify::disabled` on both
+# sides. Enabling the feature only ensures the type plumbing compiles
+# under `--all-features` workspace builds.
+buggify = [
+    "magnetar-proto/buggify",
+    "magnetar-runtime-tokio/buggify",
+    "magnetar-runtime-moonpool/buggify",
+]
+
 [dependencies]
 magnetar-proto            = { workspace = true }
 magnetar-runtime-tokio    = { workspace = true }

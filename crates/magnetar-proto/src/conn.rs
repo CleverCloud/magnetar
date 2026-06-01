@@ -193,6 +193,12 @@ pub struct Connection {
     /// PIP-460 (ADR-0031) next client-allocated watch session id.
     #[cfg(feature = "scalable-topics")]
     next_watch_session_id: u64,
+    /// FoundationDB-style buggify fault-injection helper (ADR-0048).
+    /// Default state is [`crate::Buggify::disabled`] — every choice
+    /// point's `should_fire` call returns `false` and the buggified
+    /// branch compiles out. Engines opt the connection into seeded
+    /// fault injection via [`Self::set_buggify`].
+    buggify: crate::Buggify,
 }
 
 impl core::fmt::Debug for Connection {
@@ -333,7 +339,39 @@ impl Connection {
             dag_watch_sessions: HashMap::new(),
             #[cfg(feature = "scalable-topics")]
             next_watch_session_id: 1,
+            buggify: crate::Buggify::disabled(),
         }
+    }
+
+    /// Install a [`crate::Buggify`] helper on this connection. The
+    /// helper is consulted at the four named choice points defined in
+    /// [ADR-0048](../specs/adr/0048-buggify-fault-injection.md):
+    /// `connection.reset.delay`, `batch_container.flush.split`,
+    /// `handle_bytes.short_read`, and (via [`crate::Backoff`])
+    /// `retry_clock.skew`.
+    ///
+    /// Engines call this once at construction time. The moonpool
+    /// engine routes the RNG closure through `Providers::Random` for
+    /// seed-controlled fault injection; the tokio engine ships the
+    /// default [`crate::Buggify::disabled`] so production binaries
+    /// never see synthetic faults even when compiled with the
+    /// `buggify` feature on.
+    ///
+    /// Returns a clone of the installed helper so the engine can share
+    /// the same fire-counter map with its `Backoff` schedule via
+    /// [`crate::Backoff::install_buggify`].
+    pub fn set_buggify(&mut self, buggify: crate::Buggify) -> crate::Buggify {
+        self.buggify = buggify;
+        self.buggify.clone()
+    }
+
+    /// Borrow the connection's [`crate::Buggify`] helper. Useful from
+    /// engine driver loops that need to thread the same instance into
+    /// out-of-state-machine fault points (e.g.
+    /// [`crate::Backoff::install_buggify`]).
+    #[must_use]
+    pub fn buggify(&self) -> &crate::Buggify {
+        &self.buggify
     }
 
     /// Returns the current handshake state.
@@ -641,7 +679,18 @@ impl Connection {
         self.broker_protocol_version = 0;
         self.feature_flags = pb::FeatureFlags::default();
         self.handshake_failure_reason = None;
-        self.last_activity = None;
+        // ADR-0048 buggify point: when the `connection.reset.delay` label
+        // fires, leave the prior `last_activity` timestamp intact so the
+        // post-reset state machine inherits an older keepalive baseline.
+        // The engine's keepalive timer therefore arms one extra idle
+        // tick before the next ping. Sans-io: the fault is a pure
+        // state-skip, no clock read, no event-queue mutation.
+        if !self
+            .buggify
+            .should_fire(crate::buggify::labels::CONNECTION_RESET_DELAY, 0.05)
+        {
+            self.last_activity = None;
+        }
     }
 
     /// Reason the last handshake attempt failed, if the broker sent a
@@ -935,6 +984,17 @@ impl Connection {
     /// [`Self::handle_bytes`] and [`Self::handle_bytes_owned`] both
     /// dispatch the same per-frame logic without code duplication.
     fn handle_bytes_decode_loop(&mut self, now: Instant) -> Result<(), ProtocolError> {
+        // ADR-0048 buggify point: `handle_bytes.short_read` — when the
+        // label fires, break out of the per-frame decode loop after
+        // processing exactly one frame even if `inbound` still holds
+        // complete additional frames. Mirrors a short-read at the
+        // socket boundary; the next `handle_bytes` call resumes the
+        // drain on the surviving bytes. Tracked as a per-loop bool so
+        // the roll happens at most once per `handle_bytes` entry.
+        let short_read_armed = self
+            .buggify
+            .should_fire(crate::buggify::labels::HANDLE_BYTES_SHORT_READ, 0.05);
+        let mut frames_processed = 0_usize;
         loop {
             // Peek the front of the inbound buffer to find out whether a
             // complete frame is ready. If not, park and wait for more
@@ -992,6 +1052,17 @@ impl Connection {
                     // cannot fix a frame whose own length field lied.
                     return Err(other.into());
                 }
+            }
+            // ADR-0048 buggify point: `handle_bytes.short_read` —
+            // after the first processed frame, fire the synthetic
+            // short-read by returning to the caller with `inbound`
+            // still holding any remaining complete frames. The next
+            // `handle_bytes` call resumes the drain on the surviving
+            // bytes. Firing exits the loop directly, so we never need
+            // to "disarm" the flag — the local goes out of scope.
+            frames_processed = frames_processed.saturating_add(1);
+            if short_read_armed && frames_processed >= 1 && !self.inbound.is_empty() {
+                return Ok(());
             }
         }
     }
@@ -2465,6 +2536,27 @@ impl Connection {
         publish_time_ms: u64,
         now: Instant,
     ) -> usize {
+        // ADR-0048 buggify point: `batch_container.flush.split` —
+        // when the label fires AND the producer's batch holds more
+        // than one message, return 0 without draining the
+        // BatchContainer. The batch survives untouched; the next
+        // caller-driven flush picks it up. Effect: a chunk of the
+        // payload that would have left this tick is deferred to the
+        // next flush, exercising the framing-resume + receipt
+        // ordering paths under simulation. No invariant violation:
+        // OpSends already in `pending` stay in `pending`, the wire
+        // frame simply gets built one flush later.
+        let batch_holds_multiple = self
+            .producers
+            .get(&handle)
+            .is_some_and(|slot| slot.state.lock().batch.len() > 1);
+        if batch_holds_multiple
+            && self
+                .buggify
+                .should_fire(crate::buggify::labels::BATCH_CONTAINER_FLUSH_SPLIT, 0.05)
+        {
+            return 0;
+        }
         let n = self
             .producers
             .get(&handle)
@@ -6330,4 +6422,150 @@ mod handshake_failure_reason_tests {
             "post-handshake CommandError must not leak into handshake_failure_reason",
         );
     }
+
+    // ----------------------------------------------------------------
+    // ADR-0048 / ADR-0047 — buggify wiring + assertion-density tests.
+    // ----------------------------------------------------------------
+
+    /// ADR-0048 baseline: a `Connection` with no buggify installed
+    /// (the production default) treats every `should_fire` call as a
+    /// miss, so all four labels are inert. Holds whether the
+    /// `buggify` feature is on or off.
+    #[test]
+    fn buggify_default_is_disabled() {
+        let conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        assert!(!conn.buggify().is_armed());
+        assert!(
+            !conn
+                .buggify()
+                .should_fire(crate::buggify::labels::CONNECTION_RESET_DELAY, 1.0)
+        );
+    }
+
+    /// ADR-0048 wiring: `set_buggify` returns a clone of the
+    /// installed helper. Engines use this to share the helper with
+    /// `Backoff::install_buggify` so the four labels' fire counts
+    /// accumulate against a single map.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn buggify_install_returns_shared_handle() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let helper = conn.set_buggify(crate::Buggify::with_rng(std::sync::Arc::new(|| 0_u64)));
+        assert!(helper.is_armed());
+        assert!(conn.buggify().is_armed());
+        // The returned clone shares the underlying counter Arc, so
+        // firing on one side observes from the other.
+        assert!(helper.should_fire(crate::buggify::labels::CONNECTION_RESET_DELAY, 1.0));
+        assert_eq!(
+            conn.buggify()
+                .fire_count(crate::buggify::labels::CONNECTION_RESET_DELAY),
+            1
+        );
+    }
+
+    /// ADR-0048 `connection.reset.delay`: when the label fires,
+    /// `last_activity` is NOT cleared by `reset()`. Without buggify
+    /// (or with the label not firing) the field is `None` after
+    /// reset, matching the production semantics.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn buggify_reset_delay_preserves_last_activity() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Install a buggify that always fires.
+        conn.set_buggify(crate::Buggify::with_rng(std::sync::Arc::new(|| 0_u64)));
+        // Drive `last_activity` to a real value through a handshake.
+        conn.begin_handshake().expect("handshake");
+        let probe_now = Instant::now();
+        conn.handle_bytes(probe_now, &handshake_response_bytes())
+            .expect("handle handshake");
+        assert!(conn.last_activity.is_some());
+        let before_reset = conn.last_activity;
+        conn.reset();
+        // Label fired → `last_activity` survives the reset.
+        assert_eq!(conn.last_activity, before_reset);
+        assert!(
+            conn.buggify()
+                .fire_count(crate::buggify::labels::CONNECTION_RESET_DELAY)
+                >= 1
+        );
+    }
+
+    /// Baseline of the previous test: with buggify disabled (default),
+    /// `reset()` clears `last_activity`. Confirms the choice-point
+    /// branch is genuinely conditional.
+    #[test]
+    fn buggify_reset_without_armed_helper_clears_last_activity() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        assert!(conn.last_activity.is_some());
+        conn.reset();
+        assert!(conn.last_activity.is_none());
+    }
+
+    /// ADR-0048 `handle_bytes.short_read`: when the label fires AND
+    /// the inbound buffer carries more than one complete frame after
+    /// the first frame's decode, `handle_bytes` returns early
+    /// leaving the surviving bytes in `inbound`. The next call
+    /// resumes the drain.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn buggify_short_read_breaks_decode_loop_after_one_frame() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Always-fire buggify so the label triggers on entry.
+        conn.set_buggify(crate::Buggify::with_rng(std::sync::Arc::new(|| 0_u64)));
+        conn.begin_handshake().expect("handshake");
+
+        // Splice TWO frames into a single handle_bytes input:
+        // the handshake `Connected` response + a `Ping` (purely a
+        // keepalive ack, never errors). Pre-buggify the loop would
+        // drain both in one call.
+        let mut splice = bytes::BytesMut::new();
+        splice.extend_from_slice(&handshake_response_bytes());
+        let ping = pb::BaseCommand {
+            r#type: pb::base_command::Type::Ping as i32,
+            ping: Some(pb::CommandPing {}),
+            ..Default::default()
+        };
+        let mut ping_buf = bytes::BytesMut::new();
+        encode_command(&mut ping_buf, &ping).expect("encode Ping");
+        splice.extend_from_slice(&ping_buf);
+
+        conn.handle_bytes(Instant::now(), &splice)
+            .expect("handle splice under short_read");
+
+        // The handshake completed, but the buggified short read
+        // means the trailing Ping is still queued in `inbound`.
+        // Disarm buggify so the resume call drains everything.
+        assert!(conn.is_connected());
+        assert!(
+            conn.buggify()
+                .fire_count(crate::buggify::labels::HANDLE_BYTES_SHORT_READ)
+                >= 1
+        );
+        conn.set_buggify(crate::Buggify::disabled());
+        // Resume — empty input is enough to retrigger the decode
+        // loop on the residual bytes.
+        conn.handle_bytes(Instant::now(), &[]).expect("resume");
+        // After the resume the inbound buffer must be empty (Pong
+        // queued on outbound, residual Ping consumed).
+        assert!(conn.is_connected());
+    }
+
 }

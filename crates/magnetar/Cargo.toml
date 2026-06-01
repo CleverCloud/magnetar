@@ -69,6 +69,19 @@ scalable-topics = [
     "magnetar-admin?/scalable-topics",
 ]
 
+# FoundationDB-style buggify fault-injection (ADR-0048). Default OFF.
+# Forwards through to both runtime engines and the proto core so
+# `--all-features` builds compile the choice-point branches and the
+# `Buggify` helper. Production binaries stay deterministic — the
+# tokio engine never wires an RNG handle even when the feature is
+# on; only the moonpool integration tests opt in via
+# `Connection::set_buggify`.
+buggify = [
+    "magnetar-proto/buggify",
+    "magnetar-runtime-tokio?/buggify",
+    "magnetar-runtime-moonpool?/buggify",
+]
+
 # --- Crypto provider features (issue #9, ADR-0035). Compile-time pluggable
 # rustls crypto backend. Under `--all-features` the cfg-priority cascade
 # resolves to aws-lc-rs (see `magnetar-runtime-{tokio,moonpool}/src/

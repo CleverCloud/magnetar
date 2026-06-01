@@ -89,6 +89,7 @@ pub const SUPPORTED_PROTOCOL_VERSION_SCALABLE_TOPICS: i32 =
 pub mod anti_thrash;
 pub mod auth;
 pub mod backoff;
+pub mod buggify;
 pub mod cluster_failover;
 pub mod conn;
 pub(crate) mod conn_types;
@@ -159,6 +160,9 @@ pub use crate::auth::{
     AuthChallengeState, AuthError, AuthProvider, TlsAuth, TokenAuth, TokenSupplier,
 };
 pub use crate::backoff::Backoff;
+pub use crate::buggify::Buggify;
+#[cfg(feature = "buggify")]
+pub use crate::buggify::BuggifyRng;
 pub use crate::cluster_failover::ControlledClusterFailover;
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, CryptoFailureAction,

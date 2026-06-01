@@ -27,6 +27,17 @@ workspace = true
 # in the dependency set.
 default          = []
 scalable-topics  = []
+# FoundationDB-style buggify fault-injection points (ADR-0048). Default
+# OFF — when the feature is disabled, every `Buggify::should_fire` call
+# collapses to `#[inline(always)] -> false`, so the four named choice
+# points in the connection state machine compile to their production
+# behaviour with zero runtime overhead. Enabling the feature turns each
+# label into a seed-controlled RNG roll routed through the engine's
+# `RandomProvider` (sans-io: the proto layer never reaches for the host
+# RNG; the engine plugs a closure in via `Connection::set_buggify_rng`
+# and `Backoff::install_buggify`). Tests opt in via the moonpool
+# integration suite.
+buggify          = []
 
 [dependencies]
 bytes        = { workspace = true }

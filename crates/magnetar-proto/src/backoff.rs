@@ -44,6 +44,12 @@ pub struct Backoff {
     /// PRNG state for jitter computation.
     rng_state: u64,
     first_call: bool,
+    /// FoundationDB-style buggify helper (ADR-0048). Default
+    /// [`crate::Buggify::disabled`] preserves the production
+    /// production-correct schedule; the moonpool engine wires an
+    /// armed helper via [`Self::install_buggify`] to inject
+    /// `retry_clock.skew` faults at the next-delay computation.
+    buggify: crate::Buggify,
 }
 
 impl Default for Backoff {
@@ -69,7 +75,19 @@ impl Backoff {
                 seed
             },
             first_call: true,
+            buggify: crate::Buggify::disabled(),
         }
+    }
+
+    /// Install a [`crate::Buggify`] helper on this schedule. The
+    /// `retry_clock.skew` label fires inside [`Self::next`] when
+    /// armed, multiplying the returned `Duration` by a seed-driven
+    /// factor in `[0.5, 2.0]`. Engines call this once after
+    /// constructing the Backoff; the moonpool engine threads the same
+    /// helper instance the [`crate::Connection`] is using so the four
+    /// labels share a single fire-counter map. ADR-0048.
+    pub fn install_buggify(&mut self, buggify: crate::Buggify) {
+        self.buggify = buggify;
     }
 
     /// Compute the next backoff delay.
@@ -109,9 +127,53 @@ impl Backoff {
             // ticking at the `max` cadence.
             self.total_elapsed = Duration::ZERO;
             self.next_delay = self.max;
-            return self.max;
+            return self.apply_buggify_skew(self.max);
         }
-        current
+        self.apply_buggify_skew(current)
+    }
+
+    /// ADR-0048 buggify point: `retry_clock.skew`. When the label
+    /// fires, scale `base` by a seed-driven factor in `[0.5, 2.0]`.
+    /// The factor is derived from the engine RNG handle so two runs
+    /// of the same seed produce the same schedule. With no RNG armed
+    /// (or under `not(feature = "buggify")`) the function returns
+    /// `base` unmodified — production builds compile to a NOP.
+    fn apply_buggify_skew(&self, base: Duration) -> Duration {
+        if !self
+            .buggify
+            .should_fire(crate::buggify::labels::RETRY_CLOCK_SKEW, 0.05)
+        {
+            return base;
+        }
+        // Pull an additional u64 to derive the [0.5, 2.0] scale.
+        // Buckets the roll into 10_000 steps over the range — same
+        // resolution Buggify uses for the fire probability. If the
+        // RNG is unavailable, fall through to the unmodified base
+        // (Buggify::roll_u64 should not return None here because
+        // should_fire already required an armed helper, but guarding
+        // keeps `magnetar-proto`'s no-panic invariant intact).
+        let Some(roll) = self.buggify.roll_u64() else {
+            return base;
+        };
+        // Bucket the roll over 10_000 steps; the result is `< 10_000`
+        // so the `as f64` cast is lossless by construction (well
+        // inside f64's 52-bit mantissa).
+        #[allow(clippy::cast_precision_loss)]
+        let bucket = (roll % 10_000) as f64 / 10_000.0; // [0.0, 1.0)
+        let factor = 0.5 + bucket * 1.5; // [0.5, 2.0)
+        // Convert via nanoseconds so we keep sub-millisecond fidelity
+        // while staying inside the saturating u128 → u64 range.
+        // `base.as_nanos()` for any practical `Duration` fits in
+        // f64's mantissa (a `Duration` of u64::MAX seconds is ~5e11
+        // years; we never schedule retries near that range).
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let scaled_nanos = (base.as_nanos() as f64 * factor) as u128;
+        let scaled_nanos_u64 = u64::try_from(scaled_nanos).unwrap_or(u64::MAX);
+        Duration::from_nanos(scaled_nanos_u64)
     }
 
     /// Reset the backoff to its initial state. Call after a successful operation.
@@ -196,6 +258,110 @@ mod tests {
         let d = b.next();
         assert!(d <= Duration::from_millis(100));
         assert!(d >= Duration::from_millis(80));
+    }
+
+    /// ADR-0048: when no buggify helper is installed (the default),
+    /// `Backoff::next` returns the same schedule it did before the
+    /// retry-clock-skew label was added. Equivalent to the production
+    /// path for all callers that don't opt in.
+    #[test]
+    fn next_without_buggify_matches_baseline_schedule() {
+        let mut b = Backoff::new(
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(60 * 30),
+            1,
+        );
+        let first = b.next();
+        let second = b.next();
+        // No buggify → no skew. The jitter is in [80%, 100%] of the
+        // pre-doubled `next_delay`, so we just confirm we're inside
+        // the pre-skew band.
+        assert!(first <= Duration::from_millis(100));
+        assert!(first >= Duration::from_millis(80));
+        assert!(second <= Duration::from_millis(200));
+        assert!(second >= Duration::from_millis(160));
+    }
+
+    /// ADR-0048 `retry_clock.skew`: with an armed buggify helper that
+    /// always fires AND a follow-up roll at the bottom of the bucket
+    /// range, the returned duration is rescaled by `×0.5`. The two
+    /// rolls happen in order: first for `should_fire`, then for the
+    /// skew factor.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn buggified_next_scales_by_half_at_rng_zero() {
+        let mut b = Backoff::new(
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60 * 30),
+            // Tip: the base-jitter PRNG (`rng_state`) is independent
+            // of the buggify RNG, so we still get a deterministic
+            // jitter on top — the skew applies to the post-jitter
+            // duration.
+            42,
+        );
+        // Always-zero RNG: should_fire (p=0.05) lands roll=0.0 → fires;
+        // skew roll lands bucket=0 → factor 0.5.
+        b.install_buggify(crate::Buggify::with_rng(std::sync::Arc::new(|| 0_u64)));
+        let scaled = b.next();
+        // Base ≈ 8-10s after jitter; ×0.5 → 4-5s.
+        assert!(scaled >= Duration::from_secs(4));
+        assert!(scaled <= Duration::from_secs(5));
+    }
+
+    /// At the high end of the bucket range, the factor approaches
+    /// `2.0`. To exercise both the should_fire (must land low) and
+    /// the skew factor (must land high), the RNG alternates: first
+    /// call returns 0 (fires), second returns `9_998` (×2 scale).
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn buggified_next_scales_by_two_at_rng_top() {
+        let mut b = Backoff::new(
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60 * 30),
+            7,
+        );
+        let counter = std::sync::Arc::new(parking_lot::Mutex::new(0_u64));
+        let counter_handle = counter.clone();
+        b.install_buggify(crate::Buggify::with_rng(std::sync::Arc::new(move || {
+            let mut g = counter_handle.lock();
+            let v = *g;
+            *g += 1;
+            // Roll #0 → 0 (fires); roll #1 → 9_998 (×2 scale); then
+            // wrap to 0 if anyone keeps rolling.
+            if v == 1 { 9_998 } else { 0 }
+        })));
+        let scaled = b.next();
+        // Base ≈ 8-10s after jitter; ×2 → 16-20s.
+        assert!(scaled >= Duration::from_secs(16));
+        assert!(scaled <= Duration::from_secs(20));
+    }
+
+    /// Negative-space assertion: even with `buggify` armed, a probability
+    /// of zero never fires. Default fire-probability in
+    /// `apply_buggify_skew` is 0.05; an RNG that always lands at the
+    /// top of the [0, 10_000) bucket never crosses that threshold, so
+    /// the schedule is unmodified.
+    #[cfg(feature = "buggify")]
+    #[test]
+    fn buggified_next_skips_skew_when_roll_above_threshold() {
+        let mut b = Backoff::new(
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(60 * 30),
+            7,
+        );
+        // 9_999 % 10_000 = 9_999 → roll = 0.9999, well above 0.05.
+        b.install_buggify(crate::Buggify::with_rng(std::sync::Arc::new(|| 9_999_u64)));
+        let baseline = {
+            let mut clone = b.clone();
+            clone.install_buggify(crate::Buggify::disabled());
+            clone.next()
+        };
+        let with_buggify = b.next();
+        assert_eq!(baseline, with_buggify);
     }
 
     #[test]

@@ -37,6 +37,13 @@ crypto-openssl   = ["dep:rustls-openssl"]
 # `magnetar-proto/scalable-topics` wire surface that the tokio engine's
 # `ScalableTopicsApi` impl drives. Additive: no new dependency.
 scalable-topics  = ["magnetar-proto/scalable-topics"]
+# FoundationDB-style buggify fault-injection (ADR-0048). Default OFF.
+# Forwards to `magnetar-proto/buggify`. The tokio engine itself does
+# NOT wire an RNG handle onto `Connection::set_buggify` even when the
+# feature is on — production binaries stay deterministic; the
+# `tests/buggify_off_is_nop.rs` integration pins the contract.
+# Additive: no new dependency.
+buggify          = ["magnetar-proto/buggify"]
 
 [dependencies]
 magnetar-proto      = { workspace = true }
