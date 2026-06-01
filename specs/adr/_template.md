@@ -7,18 +7,21 @@
 
 ## Context
 
-What is the problem? What were the alternatives? Cite source material with
-file:line where possible.
+What is the problem?
+What were the alternatives?
+Cite source material with file:line where possible.
 
 ## Decision
 
-The decision in one paragraph + bullet list. Be specific — "use X" beats "use
-something X-shaped".
+The decision in one paragraph + bullet list.
+Be specific — "use X" beats "use something X-shaped".
 
 ## Consequences
 
-What does this make easier? Harder? What does it cost? What is it incompatible
-with?
+What does this make easier?
+Harder?
+What does it cost?
+What is it incompatible with?
 
 ## References
 

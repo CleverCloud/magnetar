@@ -1,10 +1,8 @@
 # Memory Limit Accounting
 
-`ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` enforces a
-global publish-bytes budget across every producer on a connection. The
-budget mirrors Java's `org.apache.pulsar.client.api.MemoryLimitPolicy`.
-Two policies ship; the choice is sticky for the lifetime of the
-connection.
+`ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)` enforces a global publish-bytes budget across every producer on a connection.
+The budget mirrors Java's `org.apache.pulsar.client.api.MemoryLimitPolicy`.
+Two policies ship; the choice is sticky for the lifetime of the connection.
 
 ## Surface
 
@@ -21,13 +19,12 @@ let client = PulsarClient::builder()
 # Ok(()) }
 ```
 
-| Policy | Behavior |
-| --- | --- |
+| Policy            | Behavior                                                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `FailImmediately` | Overflow returns `ClientError::MemoryLimitExceeded { current, limit, requested }` synchronously from `Producer::send`. Java default. |
-| `ProducerBlock` | Overflow parks the `SendFut` until enough budget frees up. The future is woken when another in-flight publish completes. |
+| `ProducerBlock`   | Overflow parks the `SendFut` until enough budget frees up. The future is woken when another in-flight publish completes.             |
 
-A `memory_limit` of `0` means unlimited and bypasses both reservation
-paths entirely.
+A `memory_limit` of `0` means unlimited and bypasses both reservation paths entirely.
 
 ## FailImmediately — atomic CAS reservation
 
@@ -35,8 +32,7 @@ Source: [ADR-0017](../specs/adr/0017-memory-limit-atomic-reservation.md).
 
 `ConnectionShared` carries:
 
-- `memory_limit_bytes: u64` — copied from `ConnectionConfig` at
-  construction.
+- `memory_limit_bytes: u64` — copied from `ConnectionConfig` at construction.
 - `memory_used: AtomicU64` — currently reserved bytes.
 
 `Producer::send` reserves before queuing:
@@ -55,17 +51,16 @@ match result {
 ```
 
 `SendFut::poll` on `Ready` calls `release_memory(self.reserved_bytes)`.
-`SendFut::drop` also releases (the future was cancelled or dropped
-without polling). Double-release is guarded by zeroing
-`reserved_bytes` after the first release.
+`SendFut::drop` also releases (the future was cancelled or dropped without polling).
+Double-release is guarded by zeroing `reserved_bytes` after the first release.
 
 ## ProducerBlock — Waker slab
 
 Source: [ADR-0020](../specs/adr/0020-memory-limit-producer-block.md).
 
-`FailImmediately` returns an error on overflow. `ProducerBlock` parks
-the future on a Waker slab until budget frees up. The slab lives on
-`ConnectionShared`:
+`FailImmediately` returns an error on overflow.
+`ProducerBlock` parks the future on a Waker slab until budget frees up.
+The slab lives on `ConnectionShared`:
 
 ```rust
 // magnetar-runtime-tokio::ConnectionShared
@@ -78,11 +73,9 @@ pub struct ConnectionShared {
 }
 ```
 
-`try_reserve_memory_or_register(bytes, waker)` is the new entry. The
-CAS loop runs first; on overflow the waker is inserted into the slab
-and a `MemoryPending(slab_key)` token returned. `release_memory`
-performs the CAS release **and** drains the slab so every parked
-producer re-polls:
+`try_reserve_memory_or_register(bytes, waker)` is the new entry.
+The CAS loop runs first; on overflow the waker is inserted into the slab and a `MemoryPending(slab_key)` token returned.
+`release_memory` performs the CAS release **and** drains the slab so every parked producer re-polls:
 
 ```text
 release_memory(bytes):
@@ -93,10 +86,8 @@ release_memory(bytes):
     }
 ```
 
-Drain-all (not "wake one") is deliberate — multiple parked producers
-race for the freed budget; the first to win the CAS proceeds, the
-others re-park. Mirrors Java's `MemoryLimitController` fairness
-contract.
+Drain-all (not "wake one") is deliberate — multiple parked producers race for the freed budget; the first to win the CAS proceeds, the others re-park.
+Mirrors Java's `MemoryLimitController` fairness contract.
 
 `MemoryReserveFut::poll`:
 
@@ -112,46 +103,29 @@ loop {
 }
 ```
 
-`MemoryReserveFut::drop` calls `cancel_memory_waker(slab_key)` to
-evict the slot — without it, a cancelled producer would leave a stale
-waker behind that the next `release_memory` would needlessly wake.
+`MemoryReserveFut::drop` calls `cancel_memory_waker(slab_key)` to evict the slot — without it, a cancelled producer would leave a stale waker behind that the next `release_memory` would needlessly wake.
 
-The slab + waker fan-out is no-channels-clean. No `Notify`, no `mpsc`,
-no `oneshot` — every signal is a `core::task::Waker` registered in a
-`Slab` behind a `parking_lot::Mutex`.
+The slab + waker fan-out is no-channels-clean.
+No `Notify`, no `mpsc`, no `oneshot` — every signal is a `core::task::Waker` registered in a `Slab` behind a `parking_lot::Mutex`.
 
 ## Where the code lives
 
-| Type | File |
-| --- | --- |
-| `MemoryLimitPolicy` enum | [`crates/magnetar-proto/src/conn.rs`](../crates/magnetar-proto/src/conn.rs) |
-| `ConnectionConfig::{memory_limit_bytes, memory_limit_policy}` | [`crates/magnetar-proto/src/conn.rs`](../crates/magnetar-proto/src/conn.rs) |
-| `ConnectionShared` + atomic + slab (tokio engine) | [`crates/magnetar-runtime-tokio/src/lib.rs`](../crates/magnetar-runtime-tokio/src/lib.rs) |
-| `Producer::send` reservation path | [`crates/magnetar-runtime-tokio/src/producer.rs`](../crates/magnetar-runtime-tokio/src/producer.rs) |
-| `MemoryLimitExceeded` error variant | [`crates/magnetar-runtime-tokio/src/error.rs`](../crates/magnetar-runtime-tokio/src/error.rs) |
+| Type                                                          | File                                                                                                |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `MemoryLimitPolicy` enum                                      | [`crates/magnetar-proto/src/conn.rs`](../crates/magnetar-proto/src/conn.rs)                         |
+| `ConnectionConfig::{memory_limit_bytes, memory_limit_policy}` | [`crates/magnetar-proto/src/conn.rs`](../crates/magnetar-proto/src/conn.rs)                         |
+| `ConnectionShared` + atomic + slab (tokio engine)             | [`crates/magnetar-runtime-tokio/src/lib.rs`](../crates/magnetar-runtime-tokio/src/lib.rs)           |
+| `Producer::send` reservation path                             | [`crates/magnetar-runtime-tokio/src/producer.rs`](../crates/magnetar-runtime-tokio/src/producer.rs) |
+| `MemoryLimitExceeded` error variant                           | [`crates/magnetar-runtime-tokio/src/error.rs`](../crates/magnetar-runtime-tokio/src/error.rs)       |
 
 ## End-to-end test coverage
 
-[`crates/magnetar/tests/e2e_memory_limit.rs`](../crates/magnetar/tests/e2e_memory_limit.rs)
-exercises both policies against a live broker. Unit tests for the CAS
-loop and the slab drain order live next to the implementations.
+[`crates/magnetar/tests/e2e_memory_limit.rs`](../crates/magnetar/tests/e2e_memory_limit.rs) exercises both policies against a live broker.
+Unit tests for the CAS loop and the slab drain order live next to the implementations.
 
 ## Moonpool engine
 
-The moonpool engine implements both `FailImmediately` and
-`ProducerBlock` with the same `Slab<Waker>` machinery as the tokio
-engine. The fairness contract under `moonpool_core::Providers` is
-specified in
-[ADR-0022](../specs/adr/0022-memory-limit-producer-block-moonpool.md):
-the slab drains in insertion order, but `Waker::wake()` then hands
-off to the wrapping `Providers::task` runtime, so tests must depend
-on *eventual* progress (every parked send eventually observes either
-a successful reservation or its own cancellation) rather than a
-specific wake order across multiple producers.
+The moonpool engine implements both `FailImmediately` and `ProducerBlock` with the same `Slab<Waker>` machinery as the tokio engine.
+The fairness contract under `moonpool_core::Providers` is specified in [ADR-0022](../specs/adr/0022-memory-limit-producer-block-moonpool.md): the slab drains in insertion order, but `Waker::wake()` then hands off to the wrapping `Providers::task` runtime, so tests must depend on _eventual_ progress (every parked send eventually observes either a successful reservation or its own cancellation) rather than a specific wake order across multiple producers.
 
-The runtime fields live on
-[`crates/magnetar-runtime-moonpool/src/lib.rs`](../crates/magnetar-runtime-moonpool/src/lib.rs)
-(`ConnectionShared::memory_limit_policy`,
-`ConnectionShared::memory_wakers`); the `SendFut` retry path lives in
-[`crates/magnetar-runtime-moonpool/src/producer.rs`](../crates/magnetar-runtime-moonpool/src/producer.rs)
-(`SendState::Reserving`).
+The runtime fields live on [`crates/magnetar-runtime-moonpool/src/lib.rs`](../crates/magnetar-runtime-moonpool/src/lib.rs) (`ConnectionShared::memory_limit_policy`, `ConnectionShared::memory_wakers`); the `SendFut` retry path lives in [`crates/magnetar-runtime-moonpool/src/producer.rs`](../crates/magnetar-runtime-moonpool/src/producer.rs) (`SendState::Reserving`).

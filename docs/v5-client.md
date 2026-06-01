@@ -1,36 +1,24 @@
 # Magnetar V5 client surface (PIP-466)
 
-**Status**: experimental (gated `feature = "experimental-v5-client"`,
-default off). The surface targets Pulsar 4.x brokers. Upstream Java V5
-is still iterating; magnetar's V5 surface is a thin wrapper around the
-v4 wire commands, with V5-shaped types (`Duration`, `Option<usize>`,
-`V5SubscriptionInitialPosition`) on the caller-facing builders.
+**Status**: experimental (gated `feature = "experimental-v5-client"`, default off).
+The surface targets Pulsar 4.x brokers.
+Upstream Java V5 is still iterating; magnetar's V5 surface is a thin wrapper around the v4 wire commands, with V5-shaped types (`Duration`, `Option<usize>`, `V5SubscriptionInitialPosition`) on the caller-facing builders.
 
-Locked by [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)
-(Accepted). See [`docs/parity-status.md`](parity-status.md) for the
-parity-matrix row.
+Locked by [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md) (Accepted).
+See [`docs/parity-status.md`](parity-status.md) for the parity-matrix row.
 
 ## When to use V5
 
-- You want the Java V5 ergonomics today (`Duration`-typed timeouts,
-  per-surface `StreamConsumer` vs `QueueConsumer` builders, named
-  initial-position enum) without waiting for the upstream V5 release.
-- You're building greenfield code on Pulsar 4.x — the V5 builders
-  translate to the existing v4 wire commands, so there's no broker
-  version gate.
-- You're prototyping the V5 migration for an existing v4 codebase and
-  want to mix-and-match V5 + v4 surfaces against the same connection
-  (the [`PulsarClientV5::v4()`](#v4-escape-hatch) escape hatch returns
-  the inner v4 client, no double-init).
+- You want the Java V5 ergonomics today (`Duration`-typed timeouts, per-surface `StreamConsumer` vs `QueueConsumer` builders, named initial-position enum) without waiting for the upstream V5 release.
+- You're building greenfield code on Pulsar 4.x — the V5 builders translate to the existing v4 wire commands, so there's no broker version gate.
+- You're prototyping the V5 migration for an existing v4 codebase and want to mix-and-match V5 + v4 surfaces against the same connection (the [`PulsarClientV5::v4()`](#v4-escape-hatch) escape hatch returns the inner v4 client, no double-init).
 
 ## When NOT to use V5
 
-- You need a feature V5 hasn't lifted yet — `Reader`, `TableView`,
-  transactions. Stay on the v4 surface; the V5 wrapper exposes
-  `v4()` if you need a mixed setup.
-- You're shipping to production with strict surface-stability
-  requirements. V5 stays default-off behind `experimental-v5-client`
-  even though ADR-0032 is Accepted and the parity-matrix row is ✅.
+- You need a feature V5 hasn't lifted yet — `Reader`, `TableView`, transactions.
+  Stay on the v4 surface; the V5 wrapper exposes `v4()` if you need a mixed setup.
+- You're shipping to production with strict surface-stability requirements.
+  V5 stays default-off behind `experimental-v5-client` even though ADR-0032 is Accepted and the parity-matrix row is ✅.
 
 ## Enable the feature
 
@@ -39,9 +27,7 @@ parity-matrix row.
 magnetar = { features = ["experimental-v5-client"] }
 ```
 
-V5 is mutually composable with every other magnetar feature
-(`tokio`, `moonpool`, `auth-oauth2`, `encryption`, `crypto-aws-lc-rs`,
-…) — it's purely an additive surface.
+V5 is mutually composable with every other magnetar feature (`tokio`, `moonpool`, `auth-oauth2`, `encryption`, `crypto-aws-lc-rs`, …) — it's purely an additive surface.
 
 ## Quick start
 
@@ -87,47 +73,42 @@ let queue = client
 
 ## V5 → v4 mapping table
 
-The V5 builders accept `Duration` / `Option<usize>` /
-`Option<Duration>` / `V5SubscriptionInitialPosition`, then translate to
-the v4 wire fields via the centralised
-[`v5::mapping`](../crates/magnetar/src/v5/mapping.rs) module. The
-defaults match Java V5 (`org.apache.pulsar.client.api.v5`).
+The V5 builders accept `Duration` / `Option<usize>` / `Option<Duration>` / `V5SubscriptionInitialPosition`, then translate to the v4 wire fields via the centralised [`v5::mapping`](../crates/magnetar/src/v5/mapping.rs) module.
+The defaults match Java V5 (`org.apache.pulsar.client.api.v5`).
 
-| V5 builder field                  | V5 type                          | V5 default        | v4 wire field                                                                    | v4 type     | Translation function                                       |
-|-----------------------------------|----------------------------------|-------------------|-----------------------------------------------------------------------------------|-------------|------------------------------------------------------------|
-| `send_timeout`                    | `Duration`                       | `30 s`            | `send_timeout` (millis)                                                           | `u64`       | [`send_timeout_to_ms`](../crates/magnetar/src/v5/mapping.rs) |
-| `max_pending_messages`            | `Option<usize>`                  | `Some(1000)`      | `max_pending_messages` (`0` = unlimited)                                          | `usize`     | [`max_pending_messages_to_v4`](../crates/magnetar/src/v5/mapping.rs) |
-| `ack_timeout`                     | `Option<Duration>`               | `None`            | `ack_timeout_ms` (`0` = disabled)                                                 | `u64`       | [`ack_timeout_to_ms`](../crates/magnetar/src/v5/mapping.rs) |
-| `negative_ack_redelivery_delay`   | `Duration`                       | `60 s`            | `negative_ack_redelivery_delay_ms`                                                | `u64`       | [`negative_ack_redelivery_delay_to_ms`](../crates/magnetar/src/v5/mapping.rs) |
-| `receiver_queue_size`             | `usize`                          | `1000`            | `receiver_queue_size`                                                             | `usize`     | _(direct)_                                                  |
-| `subscription_initial_position`   | `V5SubscriptionInitialPosition`  | `Latest`          | `pb::command_subscribe::InitialPosition`                                          | enum        | [`V5SubscriptionInitialPosition::into_pb`](../crates/magnetar/src/v5/mapping.rs) |
+| V5 builder field                | V5 type                         | V5 default   | v4 wire field                            | v4 type | Translation function                                                             |
+| ------------------------------- | ------------------------------- | ------------ | ---------------------------------------- | ------- | -------------------------------------------------------------------------------- |
+| `send_timeout`                  | `Duration`                      | `30 s`       | `send_timeout` (millis)                  | `u64`   | [`send_timeout_to_ms`](../crates/magnetar/src/v5/mapping.rs)                     |
+| `max_pending_messages`          | `Option<usize>`                 | `Some(1000)` | `max_pending_messages` (`0` = unlimited) | `usize` | [`max_pending_messages_to_v4`](../crates/magnetar/src/v5/mapping.rs)             |
+| `ack_timeout`                   | `Option<Duration>`              | `None`       | `ack_timeout_ms` (`0` = disabled)        | `u64`   | [`ack_timeout_to_ms`](../crates/magnetar/src/v5/mapping.rs)                      |
+| `negative_ack_redelivery_delay` | `Duration`                      | `60 s`       | `negative_ack_redelivery_delay_ms`       | `u64`   | [`negative_ack_redelivery_delay_to_ms`](../crates/magnetar/src/v5/mapping.rs)    |
+| `receiver_queue_size`           | `usize`                         | `1000`       | `receiver_queue_size`                    | `usize` | _(direct)_                                                                       |
+| `subscription_initial_position` | `V5SubscriptionInitialPosition` | `Latest`     | `pb::command_subscribe::InitialPosition` | enum    | [`V5SubscriptionInitialPosition::into_pb`](../crates/magnetar/src/v5/mapping.rs) |
 
 ### Edge cases worth knowing
 
-- **`ack_timeout = None` vs `Some(Duration::ZERO)`** — both translate
-  to wire `0` (the v4 "disabled" sentinel). The V5 type
-  distinguishes them, but the v4 wire collapses both. Pinned by
-  `v5_builder_defaults::v5_translation_edge_cases`.
-- **`max_pending_messages = None` vs `Some(0)`** — both translate to
-  wire `0` (the v4 "unlimited" sentinel). Same pin.
-- **`send_timeout` saturation** — pathological `Duration` values
-  beyond `u64::MAX` millis clamp at `u64::MAX` rather than panic. The
-  most-permissive interpretation. Pinned by the same test.
+- **`ack_timeout = None` vs `Some(Duration::ZERO)`** — both translate to wire `0` (the v4 "disabled" sentinel).
+  The V5 type distinguishes them, but the v4 wire collapses both.
+  Pinned by `v5_builder_defaults::v5_translation_edge_cases`.
+- **`max_pending_messages = None` vs `Some(0)`** — both translate to wire `0` (the v4 "unlimited" sentinel).
+  Same pin.
+- **`send_timeout` saturation** — pathological `Duration` values beyond `u64::MAX` millis clamp at `u64::MAX` rather than panic.
+  The most-permissive interpretation.
+  Pinned by the same test.
 
 ## Subscription types
 
-| V5 builder                                | v4 `SubType` | Notes                                                                                      |
-|-------------------------------------------|--------------|--------------------------------------------------------------------------------------------|
-| `client.stream_consumer(topic)` (default) | `Exclusive`  | Single active consumer per partition; ordered delivery.                                    |
-| `client.stream_consumer(topic).failover()`| `Failover`   | One active consumer per partition with automatic failover to backups.                      |
-| `client.queue_consumer(topic)` (default)  | `Shared`     | Work-distribution across multiple active consumers per partition; no per-key ordering.     |
-| `client.queue_consumer(topic).key_shared()` | `KeyShared`| Per-key ordering across a set of active consumers. Attaches default `KeySharedMeta`.       |
+| V5 builder                                  | v4 `SubType` | Notes                                                                                  |
+| ------------------------------------------- | ------------ | -------------------------------------------------------------------------------------- |
+| `client.stream_consumer(topic)` (default)   | `Exclusive`  | Single active consumer per partition; ordered delivery.                                |
+| `client.stream_consumer(topic).failover()`  | `Failover`   | One active consumer per partition with automatic failover to backups.                  |
+| `client.queue_consumer(topic)` (default)    | `Shared`     | Work-distribution across multiple active consumers per partition; no per-key ordering. |
+| `client.queue_consumer(topic).key_shared()` | `KeyShared`  | Per-key ordering across a set of active consumers. Attaches default `KeySharedMeta`.   |
 
 ## v4 escape hatch
 
-`PulsarClientV5` holds no parallel state — it wraps the underlying v4
-`PulsarClient` directly. `v4()` borrows the inner client; `into_v4()`
-consumes the wrapper.
+`PulsarClientV5` holds no parallel state — it wraps the underlying v4 `PulsarClient` directly.
+`v4()` borrows the inner client; `into_v4()` consumes the wrapper.
 
 ```rust
 let v5 = PulsarClientV5::from_v4(v4_client);
@@ -140,60 +121,38 @@ let v5_producer = v5.producer(topic).create().await?;
 let back_to_v4: PulsarClient = v5.into_v4();
 ```
 
-ADR-0032 pins this contract via the
-`v5_client_v4_escape_hatch::v5_wrapper_is_zero_sized_over_v4_client`
-test — `mem::size_of::<PulsarClientV5>` must equal
-`mem::size_of::<PulsarClient>`. A future refactor that added parallel
-state would fail that assertion.
+ADR-0032 pins this contract via the `v5_client_v4_escape_hatch::v5_wrapper_is_zero_sized_over_v4_client` test — `mem::size_of::<PulsarClientV5>` must equal `mem::size_of::<PulsarClient>`.
+A future refactor that added parallel state would fail that assertion.
 
 ## Test layers
 
 The V5 mapping translations are covered by:
 
-| Layer        | File                                                                                                                     |
-|--------------|--------------------------------------------------------------------------------------------------------------------------|
-| Unit         | [`crates/magnetar/src/v5/mapping.rs::tests`](../crates/magnetar/src/v5/mapping.rs)                                       |
-| Producer wire | [`crates/magnetar/tests/v5_producer_mapping.rs`](../crates/magnetar/tests/v5_producer_mapping.rs)                      |
-| Stream wire  | [`crates/magnetar/tests/v5_stream_consumer_mapping.rs`](../crates/magnetar/tests/v5_stream_consumer_mapping.rs)         |
-| Queue wire   | [`crates/magnetar/tests/v5_queue_consumer_mapping.rs`](../crates/magnetar/tests/v5_queue_consumer_mapping.rs)           |
-| Escape hatch | [`crates/magnetar/tests/v5_client_v4_escape_hatch.rs`](../crates/magnetar/tests/v5_client_v4_escape_hatch.rs)           |
-| Defaults     | [`crates/magnetar/tests/v5_builder_defaults.rs`](../crates/magnetar/tests/v5_builder_defaults.rs)                       |
+| Layer         | File                                                                                                            |
+| ------------- | --------------------------------------------------------------------------------------------------------------- |
+| Unit          | [`crates/magnetar/src/v5/mapping.rs::tests`](../crates/magnetar/src/v5/mapping.rs)                              |
+| Producer wire | [`crates/magnetar/tests/v5_producer_mapping.rs`](../crates/magnetar/tests/v5_producer_mapping.rs)               |
+| Stream wire   | [`crates/magnetar/tests/v5_stream_consumer_mapping.rs`](../crates/magnetar/tests/v5_stream_consumer_mapping.rs) |
+| Queue wire    | [`crates/magnetar/tests/v5_queue_consumer_mapping.rs`](../crates/magnetar/tests/v5_queue_consumer_mapping.rs)   |
+| Escape hatch  | [`crates/magnetar/tests/v5_client_v4_escape_hatch.rs`](../crates/magnetar/tests/v5_client_v4_escape_hatch.rs)   |
+| Defaults      | [`crates/magnetar/tests/v5_builder_defaults.rs`](../crates/magnetar/tests/v5_builder_defaults.rs)               |
 
-The wire-byte tests use
-[`magnetar_fakes::FrameRecorder`](../crates/magnetar-fakes/src/lib.rs)
-to drain a sans-io `Connection` and decode the resulting frames; they
-assert that V5 builder calls translate to the expected v4
-`CommandProducer` / `CommandSubscribe` field values on the wire.
+The wire-byte tests use [`magnetar_fakes::FrameRecorder`](../crates/magnetar-fakes/src/lib.rs) to drain a sans-io `Connection` and decode the resulting frames; they assert that V5 builder calls translate to the expected v4 `CommandProducer` / `CommandSubscribe` field values on the wire.
 
 ## Status
 
-The parity-matrix row sits at ✅ since ADR-0032 was Accepted alongside
-the engine-generic refactor. The `experimental-v5-client` feature
-stays default-off; acceptance reflects the matrix state and unlocks
-moonpool-engine V5 usage, not the default-on flag. What that
-acceptance covers:
+The parity-matrix row sits at ✅ since ADR-0032 was Accepted alongside the engine-generic refactor.
+The `experimental-v5-client` feature stays default-off; acceptance reflects the matrix state and unlocks moonpool-engine V5 usage, not the default-on flag.
+What that acceptance covers:
 
-- **Engine-generic surface.** `PulsarClientV5<E: Engine = TokioEngine>`
-  is parametric, with the same v4 escape hatch and per-surface builders
-  on either engine. `MessageEncryptor` / `MessageDecryptor` types live
-  behind the per-engine [`MessageEncryptorApi`] / [`MessageDecryptorApi`]
-  extension traits (tokio plugs in
-  `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs
-  in a no-op stub). `MessageRouter` is a façade-level trait (pure
-  routing math), engine-agnostic by construction.
-- **Test coverage.** The five mapping/wire test files have moonpool 1:1
-  mirrors at `crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape
-  pinning + sans-io wire assertions against
-  `MoonpoolEngine<TokioProviders>`); the V5 surface has full
-  deterministic-simulation coverage symmetric with the v4 surface.
-  Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` +
-  `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"`
-  cover Pulsar 4.x compatibility. `check-crypto-matrix` × V5 axis is
-  green.
-- **Per-surface builder lifts.** `PartitionedProducerBuilder<E>`,
-  `TableViewBuilder<E>`, `TypedTableViewBuilder<S, E>` are
-  engine-generic. The tokio-specialised `.create_with_encryption` /
-  `.create_with_decryption` impls retain the PIP-4 carve-out.
+- **Engine-generic surface.** `PulsarClientV5<E: Engine = TokioEngine>` is parametric, with the same v4 escape hatch and per-surface builders on either engine.
+  `MessageEncryptor` / `MessageDecryptor` types live behind the per-engine [`MessageEncryptorApi`] / [`MessageDecryptorApi`] extension traits (tokio plugs in `Arc<dyn magnetar_runtime_tokio::MessageEncryptor>`; moonpool plugs in a no-op stub).
+  `MessageRouter` is a façade-level trait (pure routing math), engine-agnostic by construction.
+- **Test coverage.** The five mapping/wire test files have moonpool 1:1 mirrors at `crates/magnetar/tests/v5_*_moonpool.rs` (engine-shape pinning + sans-io wire assertions against `MoonpoolEngine<TokioProviders>`); the V5 surface has full deterministic-simulation coverage symmetric with the v4 surface.
+  Three e2e tests (`crates/magnetar/tests/e2e_pulsar_v5.rs` + `e2e_sub_types_v5.rs`) gated `feature = "e2e,experimental-v5-client"` cover Pulsar 4.x compatibility.
+  `check-crypto-matrix` × V5 axis is green.
+- **Per-surface builder lifts.** `PartitionedProducerBuilder<E>`, `TableViewBuilder<E>`, `TypedTableViewBuilder<S, E>` are engine-generic.
+  The tokio-specialised `.create_with_encryption` / `.create_with_decryption` impls retain the PIP-4 carve-out.
 
 [`MessageEncryptorApi`]: ../crates/magnetar/src/engine/mod.rs
 [`MessageDecryptorApi`]: ../crates/magnetar/src/engine/mod.rs

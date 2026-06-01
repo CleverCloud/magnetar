@@ -8,25 +8,19 @@
 ## Context
 
 Apache Pulsar's Java client supports `ClientBuilder.memoryLimit(long, MemoryLimitPolicy)`.
-The client tracks the sum of in-flight publish bytes across all
-producers on the `PulsarClient`. When a `send()` would push the total
-above the limit, the policy decides:
+The client tracks the sum of in-flight publish bytes across all producers on the `PulsarClient`.
+When a `send()` would push the total above the limit, the policy decides:
 
 - `MemoryLimitPolicy.WAIT` — block (async) until enough room frees.
 - `MemoryLimitPolicy.NONE` — fail-fast with `ProducerQueueIsFullError`.
 
-Magnetar previously surfaced the builder but had no runtime check, so
-the parity matrix correctly listed it as `🟡`.
+Magnetar previously surfaced the builder but had no runtime check, so the parity matrix correctly listed it as `🟡`.
 
 Constraints:
 
-- [ADR-0003 no-channels-rule](0003-no-channels-rule.md): no
-  `tokio::sync::Semaphore` (semaphores are sometimes argued to be
-  "not channels", but they share the same blocking-coordination shape
-  and the project bans channel-shaped coordination primitives entirely).
+- [ADR-0003 no-channels-rule](0003-no-channels-rule.md): no `tokio::sync::Semaphore` (semaphores are sometimes argued to be "not channels", but they share the same blocking-coordination shape and the project bans channel-shaped coordination primitives entirely).
 - Accounting must be lock-free on the hot path (every `send` touches it).
-- The reservation must be atomically released when the `SendFut` resolves
-  or is dropped — including on error / cancellation.
+- The reservation must be atomically released when the `SendFut` resolves or is dropped — including on error / cancellation.
 
 ## Decision
 
@@ -61,11 +55,9 @@ impl ConnectionShared {
 }
 ```
 
-`Producer::send` calls `try_reserve_memory(payload.len() as u64)` *before*
-queueing the send. If full and the policy is `WAIT`, it currently
-returns `MemoryFull` immediately (an opt-in async wait will follow). On
-return / drop, `SendFut::Drop` calls `release_memory` exactly once via
-a `released: bool` flag.
+`Producer::send` calls `try_reserve_memory(payload.len() as u64)` _before_ queueing the send.
+If full and the policy is `WAIT`, it currently returns `MemoryFull` immediately (an opt-in async wait will follow).
+On return / drop, `SendFut::Drop` calls `release_memory` exactly once via a `released: bool` flag.
 
 ```rust
 pub struct SendFut { /* … */
@@ -82,31 +74,22 @@ impl Drop for SendFut {
 }
 ```
 
-`ClientBuilder::memory_limit(bytes: u64, policy: MemoryLimitPolicy)`
-plumbs the configuration down to `ConnectionConfig::memory_limit_bytes`
-which seeds `ConnectionShared`.
+`ClientBuilder::memory_limit(bytes: u64, policy: MemoryLimitPolicy)` plumbs the configuration down to `ConnectionConfig::memory_limit_bytes` which seeds `ConnectionShared`.
 
 ## Consequences
 
 - Zero allocation, zero locking on the hot path — just a CAS loop.
-- The CAS loop is well-bounded under contention: each retry sees a
-  monotonically increasing `current`, so the loop terminates when
-  either a competing reservation pushes the total above the limit (we
-  reject) or our reservation wins.
-- `Drop`-based release survives panics and future cancellations — every
-  reserved byte is accounted for.
-- The `WAIT` policy is currently degraded to fail-fast (returns
-  `MemoryFull`). A future change can layer a `Notify`-based wait without
-  changing the reservation primitive.
-- `memory_limit_bytes = 0` is the "unlimited" sentinel (matches Java's
-  default).
+- The CAS loop is well-bounded under contention: each retry sees a monotonically increasing `current`, so the loop terminates when either a competing reservation pushes the total above the limit (we reject) or our reservation wins.
+- `Drop`-based release survives panics and future cancellations — every reserved byte is accounted for.
+- The `WAIT` policy is currently degraded to fail-fast (returns `MemoryFull`).
+  A future change can layer a `Notify`-based wait without changing the reservation primitive.
+- `memory_limit_bytes = 0` is the "unlimited" sentinel (matches Java's default).
 
 ## References
 
-- `crates/magnetar-runtime-tokio/src/lib.rs` — `ConnectionShared`
-  accounting fields + `try_reserve_memory` / `release_memory`
+- `crates/magnetar-runtime-tokio/src/lib.rs` — `ConnectionShared` accounting fields + `try_reserve_memory` / `release_memory`
 - `crates/magnetar-runtime-tokio/src/producer.rs` — `SendFut` reservation
-  + Drop
+  - Drop
 - `crates/magnetar-proto/src/conn.rs` — `ConnectionConfig::memory_limit_bytes`
 - `crates/magnetar/src/client.rs` — `ClientBuilder::memory_limit`
 - Commit `703744e` — "feat(client): memory_limit runtime enforcement via AtomicU64 CAS reservation"

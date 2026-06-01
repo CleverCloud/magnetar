@@ -7,16 +7,10 @@
 
 ## Context
 
-ADR-0007 pinned the workspace MSRV at Rust 1.85 (edition 2024 anchor) and
-incorrectly attributed the `let_chains` stabilisation to that release. In
-fact, the `let_chains` feature — `if let Some(x) = … && let Some(y) = …` —
-was stabilised in **Rust 1.88.0** (issue
-[`rust-lang/rust#53667`](https://github.com/rust-lang/rust/issues/53667)).
+ADR-0007 pinned the workspace MSRV at Rust 1.85 (edition 2024 anchor) and incorrectly attributed the `let_chains` stabilisation to that release.
+In fact, the `let_chains` feature — `if let Some(x) = … && let Some(y) = …` — was stabilised in **Rust 1.88.0** (issue [`rust-lang/rust#53667`](https://github.com/rust-lang/rust/issues/53667)).
 
-The runtime fixes for in-flight publish snapshots across reset cycles
-introduced let-chain patterns in `crates/magnetar-proto/src/conn.rs` (the
-chained `if let Some(snapshots) = … && let Some(producer) = …` block),
-which causes the workspace to fail compilation on 1.85:
+The runtime fixes for in-flight publish snapshots across reset cycles introduced let-chain patterns in `crates/magnetar-proto/src/conn.rs` (the chained `if let Some(snapshots) = … && let Some(producer) = …` block), which causes the workspace to fail compilation on 1.85:
 
 ```
 error[E0658]: `let` expressions in this position are unstable
@@ -26,28 +20,22 @@ error[E0658]: `let` expressions in this position are unstable
     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ```
 
-The MSRV detected by `cargo msrv find` against the post-`chore(deps)` workspace
-is **1.88.0**.
+The MSRV detected by `cargo msrv find` against the post-`chore(deps)` workspace is **1.88.0**.
 
 ## Decision
 
-- `rust-version = "1.88"` (declared in `[workspace.package]` and inherited by
-  every member crate via `rust-version.workspace = true`).
+- `rust-version = "1.88"` (declared in `[workspace.package]` and inherited by every member crate via `rust-version.workspace = true`).
 - The CI `msrv` job pins `dtolnay/rust-toolchain@1.88.0`.
-- `rust-toolchain.toml` continues to use the rolling `stable` channel; the
-  pin is a *minimum*, not the dev default.
+- `rust-toolchain.toml` continues to use the rolling `stable` channel; the pin is a _minimum_, not the dev default.
 - `clippy.toml`'s `msrv = "1.88"` matches.
-- ADR-0007 is **superseded by this ADR**; its rationale stands except for
-  the let-chains attribution.
+- ADR-0007 is **superseded by this ADR**; its rationale stands except for the let-chains attribution.
 
 ## Consequences
 
-- Contributors and CI runners must have Rust ≥ 1.88 (released
-  2025-06-26). Both already match.
-- Future MSRV bumps follow the same shape: declared in `Cargo.toml`,
-  mirrored into CI, captured in a new ADR superseding this one.
-- We now have a single canonical path for chained `if let` patterns; the
-  code base can rely on the feature without `cfg`-gates.
+- Contributors and CI runners must have Rust ≥ 1.88 (released 2025-06-26).
+  Both already match.
+- Future MSRV bumps follow the same shape: declared in `Cargo.toml`, mirrored into CI, captured in a new ADR superseding this one.
+- We now have a single canonical path for chained `if let` patterns; the code base can rely on the feature without `cfg`-gates.
 
 ## References
 

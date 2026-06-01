@@ -7,27 +7,21 @@
 
 ## Context
 
-[PIP-121](https://github.com/apache/pulsar/wiki/PIP-121:-Pulsar-cluster-level-auto-failover-on-client-side)
-introduces client-side cluster failover. Two policies in the Java client:
+[PIP-121](https://github.com/apache/pulsar/wiki/PIP-121:-Pulsar-cluster-level-auto-failover-on-client-side) introduces client-side cluster failover.
+Two policies in the Java client:
 
-- **ControlledClusterFailover** — caller manually swaps the service URL
-  (e.g. ops decide to drain a region).
-- **AutoClusterFailover** — a background health-prober flips between
-  primary and secondary URLs based on probe outcomes.
+- **ControlledClusterFailover** — caller manually swaps the service URL (e.g. ops decide to drain a region).
+- **AutoClusterFailover** — a background health-prober flips between primary and secondary URLs based on probe outcomes.
 
-Both flow through a `ServiceUrlProvider` interface on `ClientBuilder`
-that returns the current URL on each reconnect.
+Both flow through a `ServiceUrlProvider` interface on `ClientBuilder` that returns the current URL on each reconnect.
 
-The previous magnetar implementation had a hard-coded `String`
-`service_url` on `Client`. Reconnect always used the same URL, so the
-parity matrix correctly listed PIP-121 as `❌`.
+The previous magnetar implementation had a hard-coded `String` `service_url` on `Client`.
+Reconnect always used the same URL, so the parity matrix correctly listed PIP-121 as `❌`.
 
 Constraints from prior ADRs:
 
-- [ADR-0003 no-channels-rule](0003-no-channels-rule.md): no
-  `tokio::sync::watch` to broadcast "current URL".
-- [ADR-0004 sans-io-protocol-core](0004-sans-io-protocol-core.md): the
-  failover prober runs in the engine, not in `magnetar-proto`.
+- [ADR-0003 no-channels-rule](0003-no-channels-rule.md): no `tokio::sync::watch` to broadcast "current URL".
+- [ADR-0004 sans-io-protocol-core](0004-sans-io-protocol-core.md): the failover prober runs in the engine, not in `magnetar-proto`.
 
 ## Decision
 
@@ -54,10 +48,8 @@ impl ControlledClusterFailover {
 impl ServiceUrlProvider for ControlledClusterFailover { /* … */ }
 ```
 
-`std::sync::Mutex<String>` (not `parking_lot::Mutex`) — the
-`magnetar-proto` crate does not depend on `parking_lot` and never will
-(its dependency-allow-list is the tightest in the workspace). The
-mutex is held only across a `.clone()` on a `String`, so std is fine.
+`std::sync::Mutex<String>` (not `parking_lot::Mutex`) — the `magnetar-proto` crate does not depend on `parking_lot` and never will (its dependency-allow-list is the tightest in the workspace).
+The mutex is held only across a `.clone()` on a `String`, so std is fine.
 
 ### Engine surface (`magnetar-runtime-tokio`)
 
@@ -91,37 +83,28 @@ The background prober is a regular `tokio::spawn`ed task that:
 
 ### Driver plumbing
 
-`ReconnectContext` (the per-reconnect carrier struct on
-`crates/magnetar-runtime-tokio/src/driver.rs`) gains a
-`service_url_provider: Arc<dyn ServiceUrlProvider>` field. Each
-reconnect attempt calls `provider.current()` to get the URL — that's the
-sole behavioural change in the supervisor loop.
+`ReconnectContext` (the per-reconnect carrier struct on `crates/magnetar-runtime-tokio/src/driver.rs`) gains a `service_url_provider: Arc<dyn ServiceUrlProvider>` field.
+Each reconnect attempt calls `provider.current()` to get the URL — that's the sole behavioural change in the supervisor loop.
 
-`ClientBuilder::service_url_provider(provider: Arc<dyn ServiceUrlProvider>)`
-plumbs the override.
+`ClientBuilder::service_url_provider(provider: Arc<dyn ServiceUrlProvider>)` plumbs the override.
 
 ## Consequences
 
 - Manual failover is one method call: `failover.switch("pulsar+ssl://dr.cluster:6651")`.
 - Auto failover is a spawned task; no channels, no `watch`.
-- The supervisor loop has one indirection on the URL string; no new
-  state machine in `magnetar-proto`.
-- `magnetar-proto` gets *only* the `ServiceUrlProvider` trait and the
-  `ControlledClusterFailover` (which doesn't need any I/O). The
-  `AutoClusterFailover` lives in the engine.
+- The supervisor loop has one indirection on the URL string; no new state machine in `magnetar-proto`.
+- `magnetar-proto` gets _only_ the `ServiceUrlProvider` trait and the `ControlledClusterFailover` (which doesn't need any I/O).
+  The `AutoClusterFailover` lives in the engine.
 - Tests:
   - 4 unit tests on `ControlledClusterFailover` (manual swap semantics).
-  - 3 unit tests on `AutoClusterFailover` (failover, recovery, threshold)
-    using `tokio::test(start_paused = true)`.
+  - 3 unit tests on `AutoClusterFailover` (failover, recovery, threshold) using `tokio::test(start_paused = true)`.
 
 ## References
 
 - `crates/magnetar-proto/src/service_url.rs` — trait + `StaticServiceUrlProvider`
 - `crates/magnetar-proto/src/cluster_failover.rs` — `ControlledClusterFailover`
-- `crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs` —
-  `AutoClusterFailover` + `HealthProbe`
-- `crates/magnetar-runtime-tokio/src/driver.rs` — `ReconnectContext`
-  carries the provider
+- `crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs` — `AutoClusterFailover` + `HealthProbe`
+- `crates/magnetar-runtime-tokio/src/driver.rs` — `ReconnectContext` carries the provider
 - `crates/magnetar/src/client.rs` — `ClientBuilder::service_url_provider`
 - Commit `87f2080` — "feat(client): ServiceUrlProvider trait + StaticServiceUrlProvider"
 - Commit `7b8d3e6` — "feat(supervisor): plumb ServiceUrlProvider through the supervised reconnect path"

@@ -1,0 +1,14 @@
+{
+  "proseWrap": "preserve",
+  "printWidth": 100000,
+  "overrides": [
+    {
+      "files": ["*.md", "*.markdown"],
+      "options": {
+        "proseWrap": "preserve",
+        "printWidth": 100000,
+        "tabWidth": 2
+      }
+    }
+  ]
+}

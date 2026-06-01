@@ -7,25 +7,21 @@
 
 ## Context
 
-Java's `org.apache.pulsar.client.impl.auth.oauth2.AuthenticationOAuth2`
-implements the OAuth2 *client_credentials* grant against the broker's
-authentication plugin. The driver:
+Java's `org.apache.pulsar.client.impl.auth.oauth2.AuthenticationOAuth2` implements the OAuth2 _client_credentials_ grant against the broker's authentication plugin.
+The driver:
 
 - fetches a bearer token from a configurable `issuerUrl` / `audience`
 - caches the token until shortly before its `expires_in`
 - refreshes proactively (so a live `Connection` is never holding an expired bearer)
 
-Magnetar's `magnetar-auth-oauth2` crate previously only carried a config
-struct. There was no flow implementation, no token cache, no
-expiry-aware refresh — the parity matrix correctly listed it as `🟡`.
+Magnetar's `magnetar-auth-oauth2` crate previously only carried a config struct.
+There was no flow implementation, no token cache, no expiry-aware refresh — the parity matrix correctly listed it as `🟡`.
 
 Two additional concerns came up in design:
 
-- The token expiry window must be *testable* without sleeping. Using
-  `SystemTime::now()` directly would block hermetic unit tests.
-- The flow must avoid the [no-channels rule (ADR-0003)](0003-no-channels-rule.md):
-  no `tokio::sync::watch` for "current token", no `oneshot` for refresh
-  completion.
+- The token expiry window must be _testable_ without sleeping.
+  Using `SystemTime::now()` directly would block hermetic unit tests.
+- The flow must avoid the [no-channels rule (ADR-0003)](0003-no-channels-rule.md): no `tokio::sync::watch` for "current token", no `oneshot` for refresh completion.
 
 ## Decision
 
@@ -50,15 +46,12 @@ impl<C: Clock> ClientCredentialsFlow<C> {
 Cache semantics:
 
 - A `parking_lot::Mutex<Option<CachedToken>>` slot holds the latest token
-  + the absolute expiry `SystemTime`.
-- `fetch_token()` returns the cached token if `clock.now() + skew < expiry`
-  (default skew: 30 s).
-- Otherwise it does an HTTPS POST to `token_endpoint`, parses the
-  `TokenResponse`, computes the absolute expiry, stores it, and returns.
+  - the absolute expiry `SystemTime`.
+- `fetch_token()` returns the cached token if `clock.now() + skew < expiry` (default skew: 30 s).
+- Otherwise it does an HTTPS POST to `token_endpoint`, parses the `TokenResponse`, computes the absolute expiry, stores it, and returns.
 
-Concurrency: no channels. `Mutex` for the cache slot; concurrent waiters
-on a refresh use `tokio::sync::Notify` (planned addition) — for now, the
-race is benign (two parallel callers issue two POSTs, last-writer-wins).
+Concurrency: no channels.
+`Mutex` for the cache slot; concurrent waiters on a refresh use `tokio::sync::Notify` (planned addition) — for now, the race is benign (two parallel callers issue two POSTs, last-writer-wins).
 
 Tests (8 cases, all using a `TestClock`):
 
@@ -73,16 +66,11 @@ Tests (8 cases, all using a `TestClock`):
 
 ## Consequences
 
-- The bearer-token plumbing into `magnetar-runtime-tokio` becomes a thin
-  wrapper: snapshot `clock.now()`, call `fetch_token().await`, hand the
-  token to the next `AUTH_CHALLENGE`.
-- The `Clock` trait is a third clock provider in the workspace (after
-  the sans-io [ADR-0011](0011-clock-injection-sans-io.md) and moonpool's
-  `TimeProvider`). It only handles `SystemTime`; `Instant` is irrelevant
-  to OAuth2.
+- The bearer-token plumbing into `magnetar-runtime-tokio` becomes a thin wrapper: snapshot `clock.now()`, call `fetch_token().await`, hand the token to the next `AUTH_CHALLENGE`.
+- The `Clock` trait is a third clock provider in the workspace (after the sans-io [ADR-0011](0011-clock-injection-sans-io.md) and moonpool's `TimeProvider`).
+  It only handles `SystemTime`; `Instant` is irrelevant to OAuth2.
 - Channels remain banned; the cache slot is the entire shared state.
-- A future "refresh-while-still-valid background tick" can plug in
-  without changing the cache slot's shape.
+- A future "refresh-while-still-valid background tick" can plug in without changing the cache slot's shape.
 
 ## References
 

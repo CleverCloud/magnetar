@@ -1,0 +1,10 @@
+target/
+**/target/
+Cargo.lock
+node_modules/
+.git/
+*.svg
+*.lock
+
+# Symlink to CLAUDE.md — Prettier refuses to follow it.
+AGENTS.md

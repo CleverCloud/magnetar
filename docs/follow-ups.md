@@ -1,65 +1,41 @@
 # Open Follow-Ups
 
-Consolidated tracker for known open work. Each entry lists the gap,
-the reason it stays open, and (where actionable) a `/goal …` block
-ready to be copy-pasted verbatim into a fresh session for an agent
-team to pick up.
+Consolidated tracker for known open work.
+Each entry lists the gap, the reason it stays open, and (where actionable) a `/goal …` block ready to be copy-pasted verbatim into a fresh session for an agent team to pick up.
 
-For the public-facing parity status, see
-[`parity-status.md`](parity-status.md) and the
-[parity matrix in the README](../README.md#java-client-parity-matrix).
+For the public-facing parity status, see [`parity-status.md`](parity-status.md) and the [parity matrix in the README](../README.md#java-client-parity-matrix).
 
-This file is the **single source of truth** for what is intentionally
-deferred or blocked. Anything not listed below is either already
-shipped (check `git log` for the implementation reference) or
-explicitly out of scope
-([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md)
-§D-series, [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md),
-[ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
+This file is the **single source of truth** for what is intentionally deferred or blocked.
+Anything not listed below is either already shipped (check `git log` for the implementation reference) or explicitly out of scope ([ADR-0026](../specs/adr/0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D-series, [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md), [ADR-0032](../specs/adr/0032-pip-466-v5-client-surface-scope.md)).
 
-When a PR closes an item, the entry is **removed** (git log + the ADR /
-docs file carry the post-implementation reference); partially-closed
-items are trimmed to their remaining open residual.
+When a PR closes an item, the entry is **removed** (git log + the ADR / docs file carry the post-implementation reference); partially-closed items are trimmed to their remaining open residual.
 
-**API stability stance.** The crate is not yet published. Breaking
-API changes are acceptable when they improve correctness, ergonomics,
-or layering; flag them with `BREAKING CHANGE:` in the commit body so
-the eventual changelog picks them up.
+**API stability stance.** The crate is not yet published.
+Breaking API changes are acceptable when they improve correctness, ergonomics, or layering; flag them with `BREAKING CHANGE:` in the commit body so the eventual changelog picks them up.
 
 ---
 
 ## Index
 
-Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
-⏳ blocked on upstream PIP release · 🧠 needs design decision ·
-🟡 deferred (not load-bearing).
+Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| # | Item | Status |
-| - | --- | --- |
-| 1 | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2 | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
-| 3 | [Moonpool `ProxyConnectionPool` parity](#3-moonpool-proxyconnectionpool-parity) | ⚡ ready to dispatch — tokio ships the pool ([ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)); moonpool returns `ProxyUnsupportedOnUnsupervisedClient` |
-| 4 | [`sim_chaos_produce_consume_sweep_16_seeds` non-`MOONPOOL_SEED` randomness](#4-sim_chaos_produce_consume_sweep_16_seeds-non-moonpool_seed-randomness) | 🧠 design fix needed — sweep test's internal 16-seed pick is not derived from the outer `MOONPOOL_SEED`, so daily-sweep failures cannot be reproduced via the registered seed (ADR-0047 §4 case 3 default state) |
+| #   | Item                                                                                                                                                  | Status                                                                                                                                                                                                           |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                                         | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460                                                                                                                 |
+| 2   | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main)                                                                   | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113)                                                                                                      |
+| 3   | [Moonpool `ProxyConnectionPool` parity](#3-moonpool-proxyconnectionpool-parity)                                                                       | ⚡ ready to dispatch — tokio ships the pool ([ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)); moonpool returns `ProxyUnsupportedOnUnsupervisedClient`                               |
+| 4   | [`sim_chaos_produce_consume_sweep_16_seeds` non-`MOONPOOL_SEED` randomness](#4-sim_chaos_produce_consume_sweep_16_seeds-non-moonpool_seed-randomness) | 🧠 design fix needed — sweep test's internal 16-seed pick is not derived from the outer `MOONPOOL_SEED`, so daily-sweep failures cannot be reproduced via the registered seed (ADR-0047 §4 case 3 default state) |
 
 ---
 
 ## 1. PIP-460 scalable-topics e2e
 
-**Gap.** The PIP-460 scalable-topics surface scaffold is in place across
-proto / façade / both engines / CLI with the binding 4-layer in-process
-tests (proto unit + tokio + moonpool 1:1 + differential + golden trace),
-behind `feature = "scalable-topics"` (default off,
-[ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md)). The
-**e2e** tests in `crates/magnetar/tests/e2e_scalable_topic.rs` have
-stub bodies that touch a constant and return — per
-[ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
-they run on every `cargo test --features scalable-topics` and trivially
-pass. Three named tests are wired but un-fleshed; no released broker
-speaks PIP-460.
+**Gap.** The PIP-460 scalable-topics surface scaffold is in place across proto / façade / both engines / CLI with the binding 4-layer in-process tests (proto unit + tokio + moonpool 1:1 + differential + golden trace), behind `feature = "scalable-topics"` (default off, [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md)).
+The **e2e** tests in `crates/magnetar/tests/e2e_scalable_topic.rs` have stub bodies that touch a constant and return — per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) they run on every `cargo test --features scalable-topics` and trivially pass.
+Three named tests are wired but un-fleshed; no released broker speaks PIP-460.
 
-**Why it stays open.** Upstream PIP-460 is `Draft`, targeting Pulsar 5.0
-LTS with phased rollout. The wire surface is hand-encoded in
-`crates/magnetar-proto/src/pb/scalable_topics.rs` until a real RC ships.
+**Why it stays open.** Upstream PIP-460 is `Draft`, targeting Pulsar 5.0 LTS with phased rollout.
+The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topics.rs` until a real RC ships.
 
 **`/goal` (once a Pulsar 5.0 RC carries PIP-460).**
 
@@ -71,21 +47,12 @@ LTS with phased rollout. The wire surface is hand-encoded in
 
 ## 2. Re-pin moonpool off git `branch = "main"`
 
-**Gap.** `Cargo.toml`'s `[workspace.dependencies]` tracks `moonpool-core`
-/ `moonpool-sim` on `{ version = "0.6.0", git = "…", branch = "main" }` to
-consume the futures-io `TcpStream` + segment-granular `write_vectored`
-change ahead of a crates.io release. This is a **documented, time-boxed
-exception** to ADR-0036's exact-pin reproducibility discipline
-([ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
-While it stands, `cargo update -p moonpool-core` can advance the rev to an
-arbitrary later `main` commit; `Cargo.lock`'s concrete rev is the only
-reproducibility anchor. (The `version = "0.6.0"` constraint trips
-resolution if `main` crosses to 0.7, surfacing the trigger automatically.)
+**Gap.** `Cargo.toml`'s `[workspace.dependencies]` tracks `moonpool-core` / `moonpool-sim` on `{ version = "0.6.0", git = "…", branch = "main" }` to consume the futures-io `TcpStream` + segment-granular `write_vectored` change ahead of a crates.io release.
+This is a **documented, time-boxed exception** to ADR-0036's exact-pin reproducibility discipline ([ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
+While it stands, `cargo update -p moonpool-core` can advance the rev to an arbitrary later `main` commit; `Cargo.lock`'s concrete rev is the only reproducibility anchor.
+(The `version = "0.6.0"` constraint trips resolution if `main` crosses to 0.7, surfacing the trigger automatically.)
 
-**Why it stays open.** Blocked on upstream cutting a **moonpool crates.io
-release that contains [PR #113](https://github.com/PierreZ/moonpool/pull/113)**.
-The last published release is `0.6.0`, which predates both the futures-io
-migration and the vectored entry.
+**Why it stays open.** Blocked on upstream cutting a **moonpool crates.io release that contains [PR #113](https://github.com/PierreZ/moonpool/pull/113)**. The last published release is `0.6.0`, which predates both the futures-io migration and the vectored entry.
 
 **`/goal` (post-release).**
 
@@ -97,26 +64,12 @@ migration and the vectored entry.
 
 ## 3. Moonpool `ProxyConnectionPool` parity
 
-**Gap.** ADR-0039 (Pulsar Proxy multi-broker connection model) ships a
-`ProxyConnectionPool` on the tokio engine
-(`crates/magnetar-runtime-tokio/src/pool.rs`, ~337 LOC) that pins a
-per-broker connection on `proxy_through_service_url = true` lookups and
-avoids the ~90 ms reconnect storm from issue #15. The moonpool engine
-does **not** have a counterpart yet — the lookup path returns
-`ClientError::ProxyUnsupportedOnUnsupervisedClient`
-(`crates/magnetar-runtime-moonpool/src/client.rs:313-326`,
-`crates/magnetar-runtime-moonpool/src/producer.rs:595`) and the
-`crates/magnetar-runtime-moonpool/src/lib.rs:70` carries a `TODO(proxy)`
-flagging the work. Both [`docs/parity-status.md`](parity-status.md)
-and [the README parity
-matrix](../README.md#java-client-parity-matrix) currently mis-state
-moonpool's binary-proxy row as ✅ — fixed in the same changeset that
-adds this entry.
+**Gap.** ADR-0039 (Pulsar Proxy multi-broker connection model) ships a `ProxyConnectionPool` on the tokio engine (`crates/magnetar-runtime-tokio/src/pool.rs`, ~337 LOC) that pins a per-broker connection on `proxy_through_service_url = true` lookups and avoids the ~90 ms reconnect storm from issue #15.
+The moonpool engine does **not** have a counterpart yet — the lookup path returns `ClientError::ProxyUnsupportedOnUnsupervisedClient` (`crates/magnetar-runtime-moonpool/src/client.rs:313-326`, `crates/magnetar-runtime-moonpool/src/producer.rs:595`) and the `crates/magnetar-runtime-moonpool/src/lib.rs:70` carries a `TODO(proxy)` flagging the work.
+Both [`docs/parity-status.md`](parity-status.md) and [the README parity matrix](../README.md#java-client-parity-matrix) currently mis-state moonpool's binary-proxy row as ✅ — fixed in the same changeset that adds this entry.
 
-**Why it stays open.** Implementation work, not external blocker. The
-tokio pool is the reference; the moonpool variant needs to be ported
-on top of `moonpool_core::Providers` (network + clock) and wired into
-the supervised-redial path.
+**Why it stays open.** Implementation work, not external blocker.
+The tokio pool is the reference; the moonpool variant needs to be ported on top of `moonpool_core::Providers` (network + clock) and wired into the supervised-redial path.
 
 **`/goal` (ready to dispatch).**
 
@@ -128,36 +81,14 @@ the supervised-redial path.
 
 ## 4. `sim_chaos_produce_consume_sweep_16_seeds` non-`MOONPOOL_SEED` randomness
 
-**Gap.** The
-[`sim_chaos_produce_consume_sweep_16_seeds`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)
-test rolls 16 internal seeds and runs the chaos suite against each.
-Those 16 picks are NOT derived from the outer `MOONPOOL_SEED` env var
-that ADR-0036 / ADR-0047 use as the discovery + replay axis. The
-consequence: when the daily
-[`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml)
-flags a seed via "`sim_chaos_produce_consume_sweep_16_seeds` failed
-under `MOONPOOL_SEED=<X>`", replaying that exact `MOONPOOL_SEED`
-locally is **not** guaranteed to reproduce the failure — the internal
-16-pick may roll a different set of seeds the next run.
+**Gap.** The [`sim_chaos_produce_consume_sweep_16_seeds`](../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs) test rolls 16 internal seeds and runs the chaos suite against each.
+Those 16 picks are NOT derived from the outer `MOONPOOL_SEED` env var that ADR-0036 / ADR-0047 use as the discovery + replay axis.
+The consequence: when the daily [`moonpool-seed-sweep.yml`](../.github/workflows/moonpool-seed-sweep.yml) flags a seed via "`sim_chaos_produce_consume_sweep_16_seeds` failed under `MOONPOOL_SEED=<X>`", replaying that exact `MOONPOOL_SEED` locally is **not** guaranteed to reproduce the failure — the internal 16-pick may roll a different set of seeds the next run.
 
-Validated empirically: five seeds reported failing in the
-2026-05-30 → 2026-06-01 daily sweeps
-(`0xcc2a910b6988dcde`, `0xafc471307ad05238`, `0xe9b47c5615260922`,
-`0x0bd3ae5e3538fae6`, `0xc77e139889216916`) all pass under
-`MOONPOOL_SEED=<value> cargo test -p magnetar-runtime-moonpool
---no-default-features --features crypto-aws-lc-rs --locked` against
-`main` — the exact command the daily sweep and the per-PR
-`seed-replay` job now use.
+Validated empirically: five seeds reported failing in the 2026-05-30 → 2026-06-01 daily sweeps (`0xcc2a910b6988dcde`, `0xafc471307ad05238`, `0xe9b47c5615260922`, `0x0bd3ae5e3538fae6`, `0xc77e139889216916`) all pass under `MOONPOOL_SEED=<value> cargo test -p magnetar-runtime-moonpool --no-default-features --features crypto-aws-lc-rs --locked` against `main` — the exact command the daily sweep and the per-PR `seed-replay` job now use.
 
-**Why it stays open.** Closing this requires
-`sim_chaos_produce_consume_sweep_16_seeds` to derive its internal
-16-pick from the outer `MOONPOOL_SEED` (e.g. via a seeded
-`rand_chacha::ChaCha20Rng::from_seed(MOONPOOL_SEED.to_le_bytes())`
-extended to 32 bytes), so the entire (`MOONPOOL_SEED` → 16 internal
-seeds → assertions) chain is bit-for-bit reproducible. Once that
-lands, the ADR-0047 §4 case-3 default state ("dig in anyway when it
-doesn't repro") collapses to case 2 ("reproduces locally → fix the
-bug").
+**Why it stays open.** Closing this requires `sim_chaos_produce_consume_sweep_16_seeds` to derive its internal 16-pick from the outer `MOONPOOL_SEED` (e.g. via a seeded `rand_chacha::ChaCha20Rng::from_seed(MOONPOOL_SEED.to_le_bytes())` extended to 32 bytes), so the entire (`MOONPOOL_SEED` → 16 internal seeds → assertions) chain is bit-for-bit reproducible.
+Once that lands, the ADR-0047 §4 case-3 default state ("dig in anyway when it doesn't repro") collapses to case 2 ("reproduces locally → fix the bug").
 
 **`/goal` (ready to dispatch).**
 
@@ -169,20 +100,13 @@ bug").
 
 ## Notes on this file
 
-Items move from this file to `git log` when their commit ships. The
-expected churn:
+Items move from this file to `git log` when their commit ships.
+The expected churn:
 
-1. New gap surfaces → entry added with **Gap** + **Why it stays open** +
-   (where actionable) a `/goal …` block.
+1. New gap surfaces → entry added with **Gap** + **Why it stays open** + (where actionable) a `/goal …` block.
 2. Agent team picks up the `/goal …` block in a fresh session.
-3. PR merges → entry removed (the ADR / docs file carries the
-   post-implementation reference); partially-closed items are trimmed
-   to their remaining residual.
+3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-All remaining items carry either a `/goal …` block ready to dispatch or
-an explicit external blocker (upstream moonpool / Pulsar release). The
-only fully-external blockers are the PIP-460 e2e flesh-out
-([§1](#1-pip-460-scalable-topics-e2e)) and the moonpool re-pin
-([§2](#2-re-pin-moonpool-off-git-branch-main)). The moonpool
-`ProxyConnectionPool` parity ([§3](#3-moonpool-proxyconnectionpool-parity))
-is dispatchable today.
+All remaining items carry either a `/goal …` block ready to dispatch or an explicit external blocker (upstream moonpool / Pulsar release).
+The only fully-external blockers are the PIP-460 e2e flesh-out ([§1](#1-pip-460-scalable-topics-e2e)) and the moonpool re-pin ([§2](#2-re-pin-moonpool-off-git-branch-main)).
+The moonpool `ProxyConnectionPool` parity ([§3](#3-moonpool-proxyconnectionpool-parity)) is dispatchable today.
