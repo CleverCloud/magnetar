@@ -122,6 +122,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // single-shot e2e scenario; splitting would just scatter the failover narrative
 async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url_a, _admin_url_a, container_a) = start_pulsar().await?;
     let (service_url_b, admin_url_b, _container_b) = start_pulsar().await?;
