@@ -557,7 +557,14 @@ fn visit(root: &Path, callback: &mut dyn FnMut(&Path, &str)) -> Result<()> {
     let skip = |name: &str| {
         matches!(
             name,
-            "target" | ".git" | ".github" | "tasks" | ".direnv" | ".vscode" | ".idea"
+            "target"
+                | ".git"
+                | ".github"
+                | "tasks"
+                | ".direnv"
+                | ".vscode"
+                | ".idea"
+                | ".claude"
         )
     };
     for entry in fs::read_dir(root)? {
