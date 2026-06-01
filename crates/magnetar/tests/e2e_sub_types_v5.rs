@@ -9,11 +9,11 @@
 //! Gated `feature = "e2e,experimental-v5-client"`. Run with:
 //!
 //! ```sh
-//! cargo test --features e2e,experimental-v5-client \
-//!   -p magnetar --test e2e_sub_types_v5 -- --nocapture --include-ignored
+//! cargo test --features experimental-v5-client \
+//!   -p magnetar --test e2e_sub_types_v5 -- --nocapture
 //! ```
 
-#![cfg(all(feature = "e2e", feature = "experimental-v5-client"))]
+#![cfg(feature = "experimental-v5-client")]
 
 use std::time::Duration;
 
@@ -68,7 +68,6 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v5_stream_consumer_failover_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     // V5 stream_consumer().failover() → wire SubType::Failover. The
@@ -116,7 +115,6 @@ async fn e2e_v5_stream_consumer_failover_round_trip() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v5_queue_consumer_shared_distributes_messages()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -180,7 +178,6 @@ async fn e2e_v5_queue_consumer_shared_distributes_messages()
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v5_queue_consumer_key_shared_per_key_ordering()
 -> Result<(), Box<dyn std::error::Error>> {

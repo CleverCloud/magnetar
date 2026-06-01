@@ -3,11 +3,11 @@
 //! End-to-end coverage for the Athenz ZTS round-trip
 //! ([`magnetar_auth_athenz::zts`], ADR-0030).
 //!
-//! Gated behind `e2e` + `auth-athenz-zts`. Run with:
+//! Gated behind the `auth-athenz-zts` feature. Run with:
 //!
 //! ```sh
-//! cargo test --features e2e,auth-athenz-zts \
-//!   -p magnetar --test e2e_athenz_zts -- --nocapture --include-ignored
+//! cargo test --features auth-athenz-zts \
+//!   -p magnetar --test e2e_athenz_zts -- --nocapture
 //! ```
 //!
 //! # Fixture shape — wiremock stub + Docker reachability probe
@@ -26,9 +26,8 @@
 //!
 //! Per the goal's "honest scope check" we therefore split this file:
 //!
-//! - **Wiremock-stub tests** (gated `#[ignore = "e2e: requires Docker"]` for parity with the
-//!   sibling e2e suites, but actually run without Docker — wiremock binds an ephemeral HTTP port)
-//!   exercise the full `ZtsClient` HTTP path, the expiry-aware cache, and the
+//! - **Wiremock-stub tests** (run without Docker — wiremock binds an ephemeral HTTP port) exercise
+//!   the full `ZtsClient` HTTP path, the expiry-aware cache, and the
 //!   `AuthProvider::respond_to_challenge` round-trip. They prove every behaviour the goal lists
 //!   (cached `initial()` after `refresh_via_zts`, expiry-driven refresh, challenge response uses
 //!   cached token) end-to-end against a real `reqwest` client + real HTTP server, with
@@ -57,7 +56,7 @@
 //! production credential); the same key body is mirrored in the
 //! aws-lc-rs / ring signer's per-backend test fixtures.
 
-#![cfg(all(feature = "e2e", feature = "auth-athenz-zts"))]
+#![cfg(feature = "auth-athenz-zts")]
 #![cfg(any(feature = "crypto-aws-lc-rs", feature = "crypto-ring"))]
 
 use std::time::{Duration, Instant};
@@ -201,7 +200,6 @@ fn build_provider(zts_base_url: &str) -> AthenzProvider {
 /// First test in the goal's enumeration: `ZtsClient::refresh_via_zts`
 /// must populate the cache so the subsequent `AuthProvider::initial()`
 /// returns the cached role token without hitting ZTS again.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_athenz_zts_refresh_then_cached_initial() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -279,7 +277,6 @@ async fn e2e_athenz_zts_refresh_then_cached_initial() -> Result<(), Box<dyn std:
 /// `now + (expires_in - refresh_margin)`, so advancing the instant we
 /// pass into `ensure_role_token` past that deadline forces a fresh
 /// exchange — no real wall-clock wait, no `expires_in = 0` hack.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -342,7 +339,6 @@ async fn e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry()
 /// **cached** role token verbatim — proving the cache survives the
 /// challenge-response cycle and the bytes the broker sees are the same
 /// bytes ZTS handed us.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_athenz_zts_cached_token_used_on_auth_challenge()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -441,7 +437,6 @@ async fn e2e_athenz_zts_cached_token_used_on_auth_challenge()
 ///
 /// Either branch confirms the e2e gate is wired; the goal's full
 /// production-ZMS path stays an explicit follow-up (see module doc).
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_athenz_zts_image_pulls_and_serves_status() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();

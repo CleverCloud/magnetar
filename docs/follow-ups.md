@@ -36,8 +36,9 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 
 | # | Item | Status |
 | - | --- | --- |
-| 1 | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold in place; e2e blocked on a Pulsar 5.0 RC carrying PIP-460 |
+| 1 | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
 | 2 | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
+| 3 | [Moonpool `ProxyConnectionPool` parity](#3-moonpool-proxyconnectionpool-parity) | ⚡ ready to dispatch — tokio ships the pool ([ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)); moonpool returns `ProxyUnsupportedOnUnsupervisedClient` |
 
 ---
 
@@ -48,9 +49,12 @@ proto / façade / both engines / CLI with the binding 4-layer in-process
 tests (proto unit + tokio + moonpool 1:1 + differential + golden trace),
 behind `feature = "scalable-topics"` (default off,
 [ADR-0031](../specs/adr/0031-pip-460-scalable-subscription-scope.md)). The
-**e2e** test (`crates/magnetar/tests/e2e_scalable_topic.rs`) is
-`#[ignore]`'d behind `feature = "e2e,scalable-topics"` with three named
-tests that cannot run today — no released broker speaks PIP-460.
+**e2e** tests in `crates/magnetar/tests/e2e_scalable_topic.rs` have
+stub bodies that touch a constant and return — per
+[ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
+they run on every `cargo test --features scalable-topics` and trivially
+pass. Three named tests are wired but un-fleshed; no released broker
+speaks PIP-460.
 
 **Why it stays open.** Upstream PIP-460 is `Draft`, targeting Pulsar 5.0
 LTS with phased rollout. The wire surface is hand-encoded in
@@ -59,7 +63,7 @@ LTS with phased rollout. The wire surface is hand-encoded in
 **`/goal` (once a Pulsar 5.0 RC carries PIP-460).**
 
 ```text
-/goal flesh out the PIP-460 e2e per docs/follow-ups.md §1 once upstream cuts a Pulsar 5.0 RC carrying PIP-460. First, as a dedicated commit per ADR-0026 §D4, run `cargo run -p xtask -- vendor-proto --rev <pulsar-5.0-rc-sha>` to replace the hand-encoded crates/magnetar-proto/src/pb/scalable_topics.rs module and reconcile field numbers against the vendored proto. Then implement the bodies of the three `#[ignore]`'d tests in crates/magnetar/tests/e2e_scalable_topic.rs against a real broker spawned via testcontainers-rs (gated `feature = "e2e,scalable-topics"`). Validation chain per CLAUDE.md.
+/goal flesh out the PIP-460 e2e per docs/follow-ups.md §1 once upstream cuts a Pulsar 5.0 RC carrying PIP-460. First, as a dedicated commit per ADR-0026 §D4, run `cargo run -p xtask -- vendor-proto --rev <pulsar-5.0-rc-sha>` to replace the hand-encoded crates/magnetar-proto/src/pb/scalable_topics.rs module and reconcile field numbers against the vendored proto. Then implement the bodies of the three stub tests in crates/magnetar/tests/e2e_scalable_topic.rs against a real broker spawned via testcontainers-rs (file is gated `feature = "scalable-topics"` per ADR-0046; no `#[ignore]`, no `feature = "e2e"`). Validation chain per CLAUDE.md.
 ```
 
 ---
@@ -90,6 +94,37 @@ migration and the vectored entry.
 
 ---
 
+## 3. Moonpool `ProxyConnectionPool` parity
+
+**Gap.** ADR-0039 (Pulsar Proxy multi-broker connection model) ships a
+`ProxyConnectionPool` on the tokio engine
+(`crates/magnetar-runtime-tokio/src/pool.rs`, ~337 LOC) that pins a
+per-broker connection on `proxy_through_service_url = true` lookups and
+avoids the ~90 ms reconnect storm from issue #15. The moonpool engine
+does **not** have a counterpart yet — the lookup path returns
+`ClientError::ProxyUnsupportedOnUnsupervisedClient`
+(`crates/magnetar-runtime-moonpool/src/client.rs:313-326`,
+`crates/magnetar-runtime-moonpool/src/producer.rs:595`) and the
+`crates/magnetar-runtime-moonpool/src/lib.rs:70` carries a `TODO(proxy)`
+flagging the work. Both [`docs/parity-status.md`](parity-status.md)
+and [the README parity
+matrix](../README.md#java-client-parity-matrix) currently mis-state
+moonpool's binary-proxy row as ✅ — fixed in the same changeset that
+adds this entry.
+
+**Why it stays open.** Implementation work, not external blocker. The
+tokio pool is the reference; the moonpool variant needs to be ported
+on top of `moonpool_core::Providers` (network + clock) and wired into
+the supervised-redial path.
+
+**`/goal` (ready to dispatch).**
+
+```text
+/goal land a moonpool flavour of magnetar_runtime_tokio::pool::ProxyConnectionPool per docs/follow-ups.md §3 / ADR-0039. Read crates/magnetar-runtime-tokio/src/pool.rs as the reference implementation, then port the pin-per-broker pool to crates/magnetar-runtime-moonpool/src/pool.rs over moonpool_core::Providers (NetworkProvider + clock injection per ADR-0011). Wire it into the moonpool client's lookup path so `proxy_through_service_url = true` responses route through the pool instead of returning ClientError::ProxyUnsupportedOnUnsupervisedClient (crates/magnetar-runtime-moonpool/src/client.rs:313-326, crates/magnetar-runtime-moonpool/src/producer.rs:595). Remove the `TODO(proxy)` at crates/magnetar-runtime-moonpool/src/lib.rs:70. Land the four-layer test parity per ADR-0024 (proto unit, tokio integration, moonpool 1:1 integration, differential equivalence) plus an e2e exercise that piggybacks the existing crates/magnetar/tests/e2e_pulsar_proxy.rs fixture. After this lands, flip docs/parity-status.md + README.md's parity-matrix proxy row to genuinely ✅ on moonpool. Validation chain per CLAUDE.md.
+```
+
+---
+
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships. The
@@ -102,9 +137,10 @@ expected churn:
    post-implementation reference); partially-closed items are trimmed
    to their remaining residual.
 
-All remaining items carry either a `/goal …` block ready to dispatch or an
-explicit external blocker (upstream moonpool / Pulsar release). The only
-fully-external blockers are the PIP-460 e2e
+All remaining items carry either a `/goal …` block ready to dispatch or
+an explicit external blocker (upstream moonpool / Pulsar release). The
+only fully-external blockers are the PIP-460 e2e flesh-out
 ([§1](#1-pip-460-scalable-topics-e2e)) and the moonpool re-pin
-([§2](#2-re-pin-moonpool-off-git-branch-main)), both pending an upstream
-release.
+([§2](#2-re-pin-moonpool-off-git-branch-main)). The moonpool
+`ProxyConnectionPool` parity ([§3](#3-moonpool-proxyconnectionpool-parity))
+is dispatchable today.

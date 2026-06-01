@@ -18,15 +18,13 @@
 //! reaches the façade error verbatim instead of being swallowed by the
 //! generic `"handshake failed"` string), not the exact broker phrasing.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_handshake_error -- --nocapture
+//! cargo test -p magnetar --test e2e_handshake_error -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the `e2e` workflow
-//! (`workflow_dispatch` + `release/*` branches) so unrelated PRs don't
-//! pay the multi-minute container startup cost.
+//! Requires Docker on the host.
 //!
 //! ## Image
 //!
@@ -34,8 +32,6 @@
 //! broker version). Override with `MAGNETAR_PULSAR_IMAGE_REPO` /
 //! `MAGNETAR_PULSAR_IMAGE_TAG` env vars if you need a different tag
 //! locally.
-
-#![cfg(feature = "e2e")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,9 +149,8 @@ fn mint_internal_admin_token() -> String {
 /// broker-side auth marker instead of being swallowed by the legacy
 /// opaque `"handshake failed"` string).
 ///
-/// `#[ignore]`'d and gated behind `feature = "e2e"` per the workspace
-/// convention — these tests cost Docker and are run on demand.
-#[ignore = "e2e: requires Docker"]
+/// Runs as a regular test under `cargo test` (ADR-0046). Requires
+/// Docker on the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_invalid_token_surfaces_broker_handshake_reason()
 -> Result<(), Box<dyn std::error::Error>> {

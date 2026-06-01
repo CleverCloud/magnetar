@@ -3,18 +3,10 @@
 //! PIP-180 / ADR-0033 — end-to-end shadow topic tests against a real
 //! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:4.0.4`).
 //!
-//! Gated behind the `e2e` feature flag + `#[ignore = "e2e: requires
-//! Docker"]`. Run with:
-//!
-//! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_shadow_topic -- --include-ignored --nocapture
-//! ```
-//!
-//! PIP-180 is available against the baseline broker (Pulsar 4.0+,
-//! ADR-0009). No new container, no docker-compose helper — uses the same
-//! single-broker fixture as `e2e_pulsar.rs`.
-
-#![cfg(feature = "e2e")]
+//! Runs as a regular test under `cargo test` (ADR-0046). Requires
+//! Docker on the host. PIP-180 is available against the baseline broker
+//! (Pulsar 4.0+, ADR-0009). No new container, no docker-compose helper
+//! — uses the same single-broker fixture as `e2e_pulsar.rs`.
 
 use std::time::Duration;
 
@@ -79,7 +71,6 @@ async fn start_pulsar() -> Result<
 /// 5. Produce on the source, consume on the shadow — assert the payload crosses the source ⇄ shadow
 ///    boundary.
 /// 6. Delete the shadow topic.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_shadow_topic_full_cycle() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;

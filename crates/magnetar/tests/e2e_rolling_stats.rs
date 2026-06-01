@@ -16,16 +16,13 @@
 //! strictly positive — i.e. the rolling delta math actually fires end-to-end
 //! against a live broker.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_rolling_stats -- --nocapture
+//! cargo test -p magnetar --test e2e_rolling_stats -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the dedicated `e2e`
-//! workflow (`workflow_dispatch` + `release/*` branches).
-
-#![cfg(feature = "e2e")]
+//! Requires Docker on the host.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,7 +109,6 @@ async fn drive_rate_windows(
 /// End-to-end: produce + consume at a paced cadence over ~3s with periodic
 /// `record_rate_window` ticks, then assert both producer and consumer surface
 /// strictly positive `msgs_per_sec` and `bytes_per_sec`.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_rolling_per_second_stats_window() -> Result<(), Box<dyn std::error::Error>> {
     // Paced send loop: 100 messages over ~3s ≈ 33 msg/s.

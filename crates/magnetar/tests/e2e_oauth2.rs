@@ -14,14 +14,14 @@
 //!    a second `/token` POST on the next
 //!    [`magnetar_auth_oauth2::ClientCredentialsFlow::ensure_fresh`] call.
 //!
-//! Gated behind `e2e` + `auth-oauth2`. Run with:
+//! Gated behind the `auth-oauth2` feature. Run with:
 //!
 //! ```sh
-//! cargo test --features e2e,auth-oauth2 \
+//! cargo test --features auth-oauth2 \
 //!   -p magnetar --test e2e_oauth2 -- --nocapture
 //! ```
 
-#![cfg(all(feature = "e2e", feature = "auth-oauth2"))]
+#![cfg(feature = "auth-oauth2")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,7 +162,6 @@ fn build_flow(
 /// Happy path: the IDP is hit exactly once on the first
 /// `ensure_fresh`; a producer + consumer round-trip against the broker
 /// succeeds with the JWT carried in `CommandConnect.auth_data`.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_oauth2_happy_path_produces_and_consumes() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _container) = start_pulsar().await?;
@@ -218,7 +217,6 @@ async fn e2e_oauth2_happy_path_produces_and_consumes() -> Result<(), Box<dyn std
 /// Cache hit: two clients sharing the same `ClientCredentialsFlow` instance
 /// must consume the same cached token. The IDP records exactly one
 /// `/oauth/token` POST across the entire run.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_oauth2_token_cache_reuses_across_connections() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -274,7 +272,6 @@ async fn e2e_oauth2_token_cache_reuses_across_connections() -> Result<(), Box<dy
 /// `deadline - REFRESH_LEEWAY`, call `ensure_fresh` again, and verify a
 /// *second* `/token` POST occurs. Mirrors ADR-0014's "refresh within 30 s of
 /// deadline" guarantee.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_oauth2_refresh_on_expiry_reissues_token() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _container) = start_pulsar().await?;

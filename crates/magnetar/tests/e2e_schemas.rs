@@ -8,16 +8,13 @@
 //! typed consumer reads them back, and we assert byte-for-byte (or value-for-value)
 //! parity for each of the headline schemas.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_schemas -- --nocapture
+//! cargo test -p magnetar --test e2e_schemas -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the dedicated `e2e` workflow
-//! (`workflow_dispatch` + `release/*` branches).
-
-#![cfg(feature = "e2e")]
+//! Requires Docker on the host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +76,6 @@ async fn start_pulsar() -> Result<
 
 /// Untyped bytes producer/consumer pair. Mirrors Java `SimpleSchemaTest#testBytesSchema`,
 /// which produces and consumes raw `byte[]` payloads via the default `Schema.BYTES`.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_bytes_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -131,7 +127,6 @@ async fn e2e_schema_bytes_roundtrip() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_string_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -184,7 +179,6 @@ struct Person {
 }
 
 /// JSON schema parity with Java `JsonSchemaTest#testJsonSchemaCreate`.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_json_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -237,7 +231,6 @@ async fn e2e_schema_json_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Int32 schema parity with Java `SimpleSchemaTest` Int schemas. Verifies the broker
 /// preserves the big-endian 4-byte wire layout end-to-end.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_int32_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

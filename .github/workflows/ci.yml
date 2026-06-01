@@ -77,8 +77,14 @@ jobs:
 
   test:
     name: test
+    # Per ADR-0046 the e2e suite runs as part of the regular `test` job —
+    # no separate `e2e` job, no `--features e2e`, no `#[ignore]`. The
+    # `--all-features` build pulls in the e2e tests automatically because
+    # the `#![cfg(feature = "e2e")]` gates are gone. Docker setup, image
+    # pre-pulls, and the PIP-33 two-cluster docker-compose fixture all
+    # live below.
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
       # The `--all-features` build (aws-lc-fips-sys's C build + every
@@ -101,7 +107,112 @@ jobs:
       # headers. Runtime libs ship by default; the -dev package only.
       - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
-      - run: cargo test --workspace --all-features --locked
+      # Pre-pull Docker images so the e2e suite (now part of `cargo test`)
+      # doesn't pay the pull cost inside the test wall budget. ADR-0046.
+      - name: Pre-pull Pulsar broker image
+        run: docker pull apachepulsar/pulsar:4.0.4
+      - name: Pre-pull KDC image (for the SASL Kerberos e2e)
+        run: docker pull gcavalcante8808/krb5-server:latest || true
+      # Bring up the PIP-33 two-cluster docker-compose fixture. ADR-0046
+      # folded the former weekly `e2e-replicated-subs.yml` into per-PR CI
+      # (the multi-cluster e2e_replicated_subscriptions test now runs
+      # under `cargo test` like the rest of the e2e suite). The fixture
+      # must be healthy *before* `cargo test` starts so the test can
+      # connect to both brokers on `localhost:8080` / `localhost:8081`.
+      - name: Bring up two-cluster Pulsar fixture (PIP-33)
+        working-directory: crates/magnetar/tests/fixtures
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.replicated-subs.yml up -d
+          # Wait for both brokers' admin endpoints to report healthy.
+          for url in http://localhost:8080/admin/v2/brokers/health \
+                     http://localhost:8081/admin/v2/brokers/health; do
+            attempts=60
+            until curl -sf "$url" >/dev/null; do
+              attempts=$((attempts - 1))
+              if [ "$attempts" -le 0 ]; then
+                echo "broker @ $url did not become healthy in time"
+                docker compose -f docker-compose.replicated-subs.yml ps
+                docker compose -f docker-compose.replicated-subs.yml logs --tail=200
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+      - name: Configure peer clusters + replicated subscription status
+        working-directory: crates/magnetar/tests/fixtures
+        run: ./configure_replicated_subs.sh
+      - name: Run full test suite (incl. e2e)
+        run: cargo test --workspace --all-features --locked -- --nocapture
+      - name: Tear down two-cluster fixture
+        if: always()
+        working-directory: crates/magnetar/tests/fixtures
+        run: docker compose -f docker-compose.replicated-subs.yml down -v || true
+      - name: Dump two-cluster broker logs on failure
+        if: failure()
+        working-directory: crates/magnetar/tests/fixtures
+        run: docker compose -f docker-compose.replicated-subs.yml logs --tail=500 || true
+
+  seed-replay:
+    # Per ADR-0047: replay every `status = "open"` seed listed in
+    # `crates/magnetar-runtime-moonpool/seeds/known-failing.toml` on every
+    # push to `main` and every PR. The daily moonpool-seed-sweep workflow
+    # is still where new seeds get *discovered*; this job is where
+    # already-known regressions get caught before they can re-merge.
+    # No-op (trivially green) when the registry is empty.
+    name: seed-replay (regression guard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Replay every open failing seed
+        env:
+          REGISTRY: crates/magnetar-runtime-moonpool/seeds/known-failing.toml
+        run: |
+          set -euo pipefail
+          # Parse the TOML; emit `<value>` per `[[seed]]` with status="open".
+          # Python 3.11+ ships `tomllib` in the stdlib; the ubuntu-latest
+          # runner image carries 3.12.
+          mapfile -t seeds < <(python3 - <<'PY'
+          import tomllib, os, sys
+          path = os.environ["REGISTRY"]
+          try:
+              with open(path, "rb") as fh:
+                  data = tomllib.load(fh)
+          except FileNotFoundError:
+              sys.exit(0)
+          for entry in data.get("seed", []):
+              if entry.get("status", "open") == "open":
+                  print(entry["value"])
+          PY
+          )
+          if [ "${#seeds[@]}" -eq 0 ]; then
+            echo "Registry has no open seeds — replay trivially passes."
+            exit 0
+          fi
+          echo "Replaying ${#seeds[@]} open seed(s) from the registry:"
+          printf '  %s\n' "${seeds[@]}"
+          failed=()
+          for seed in "${seeds[@]}"; do
+            echo "::group::seed=${seed}"
+            if MOONPOOL_SEED="${seed}" cargo test \
+                -p magnetar-runtime-moonpool \
+                --features crypto-aws-lc-rs --locked; then
+              echo "::endgroup::"
+              echo "  seed=${seed}: PASS (consider removing from the registry in the same PR)"
+            else
+              echo "::endgroup::"
+              echo "::error title=Open seed reproduced::seed=${seed} reproduces; see ADR-0047."
+              failed+=("${seed}")
+            fi
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "Seeds that still reproduce: ${failed[*]}"
+            exit 1
+          fi
+          echo "All open seeds passed — registry entries are stale and should be cleaned up."
 
   doc:
     name: doc
@@ -209,43 +320,10 @@ jobs:
   # still exercises `magnetar-runtime-moonpool` under the default seed
   # on every PR / push.
 
-  e2e:
-    name: e2e (Pulsar 4.x standalone)
-    runs-on: ubuntu-latest
-    # Always runs on pushes to main and on PRs targeting main so the
-    # behavioural parity suite gates merges. workflow_dispatch lets
-    # maintainers retrigger after a docker-hub blip. Job-level timeout
-    # covers Pulsar startup (~60s) + the full e2e suite (10 files,
-    # including transactions and compacted topics) with headroom.
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-      # Same disk pressure as the `test` job; reclaim before the build +
-      # Docker pulls. `docker-images: false` so the Docker subsystem the
-      # e2e suite relies on is left intact.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false
-          tool-cache: false
-          swap-storage: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # ADR-0029: e2e_sasl_kerberos.rs links `libgssapi`; install MIT
-      # KRB5 headers.
-      - name: Install libkrb5-dev + libclang-dev (for libgssapi via bindgen)
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libclang-dev
-      - name: Pre-pull Pulsar image (caches the layer for faster container startup)
-        run: docker pull apachepulsar/pulsar:4.0.4
-      - name: Pre-pull KDC image (caches the layer for the SASL Kerberos e2e)
-        run: docker pull gcavalcante8808/krb5-server:latest || true
-      - name: Run e2e suite
-        run: cargo test --workspace --features e2e,auth-sasl-kerberos --locked -- --nocapture
-        timeout-minutes: 75
+  # The former standalone `e2e` job is gone per ADR-0046 — its work is
+  # folded into the `test` job above (Docker pre-pulls + two-cluster
+  # docker-compose fixture + `cargo test --workspace --all-features`).
+  # One job, one Cargo profile, one validation pass per PR.
 
   mutants-smoke:
     name: cargo-mutants smoke (magnetar-proto)

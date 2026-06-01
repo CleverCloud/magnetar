@@ -12,16 +12,13 @@
 //!
 //! Mirrors Java's `ClientBuilder#dnsResolver(...)` integration coverage.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_dns_resolver -- --nocapture
+//! cargo test -p magnetar --test e2e_dns_resolver -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs this only in the dedicated `e2e`
-//! workflow.
-
-#![cfg(feature = "e2e")]
+//! Requires Docker on the host.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -120,7 +117,6 @@ impl DnsResolver for RecordingResolver {
 /// Wire a custom recording resolver into the client, confirm it is invoked at
 /// least once with the broker host, and round-trip a single message through
 /// the resulting connection.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_custom_dns_resolver_invoked_and_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

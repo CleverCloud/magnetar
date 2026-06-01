@@ -35,13 +35,11 @@
 //!   `CommandTopicMigrated` emitter today; the supervised-reset path is unit-tested in
 //!   `magnetar-proto` instead.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_cluster_failover -- --nocapture --ignored
+//! cargo test -p magnetar --test e2e_cluster_failover -- --nocapture
 //! ```
-
-#![cfg(feature = "e2e")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,7 +115,6 @@ fn supervisor_for_e2e() -> SupervisorConfig {
     }
 }
 
-#[ignore = "e2e: requires Docker (two containers)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url_a, _admin_url_a, container_a) = start_pulsar().await?;

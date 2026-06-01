@@ -7,8 +7,6 @@
 //! `pulsar-broker/src/test/java/org/apache/pulsar/client/api/InterceptorsTest.java`
 //! and the ack-list tests under `ConsumerAckListTest.java`.
 
-#![cfg(feature = "e2e")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -140,7 +138,6 @@ fn fresh_topic(suffix: &str) -> String {
 }
 
 /// Producer interceptor chain observes every send + ack round-trip.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_producer_interceptor_observes_send_ack() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -179,7 +176,6 @@ async fn e2e_producer_interceptor_observes_send_ack() -> Result<(), Box<dyn std:
 }
 
 /// Consumer interceptor chain observes every receive + ack.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_consumer_interceptor_observes_receive_ack() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -233,7 +229,6 @@ async fn e2e_consumer_interceptor_observes_receive_ack() -> Result<(), Box<dyn s
 
 /// Batch ack of all received message ids terminates redelivery — restarting the
 /// subscription must NOT replay them.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_ack_batch_terminates_redelivery() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -288,7 +283,6 @@ async fn e2e_ack_batch_terminates_redelivery() -> Result<(), Box<dyn std::error:
 
 /// Cumulative ack of the last message id terminates redelivery for everything up
 /// to and including that id.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_ack_cumulative_terminates_prior() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

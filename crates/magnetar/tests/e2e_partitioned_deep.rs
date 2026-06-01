@@ -7,8 +7,6 @@
 //! and the partitioned-producer / partitioned-consumer parity bits scattered
 //! across `PartitionedProducerImplTest`.
 
-#![cfg(feature = "e2e")]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,7 +100,6 @@ async fn create_partitioned_topic(
 /// Round-robin routing visits every partition. We dedicate one Exclusive
 /// consumer per partition (subscribing to `<topic>-partition-<n>`) and assert
 /// that an 8-message blast lands two messages on each.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_partitioned_round_robin_visits_every_partition()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -169,7 +166,6 @@ async fn e2e_partitioned_round_robin_visits_every_partition()
 
 /// Pinning `MessageRouter` always returns partition 1 — partition 1 sees every
 /// message, partitions 0 / 2 / 3 see none.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_partitioned_custom_message_router() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;
@@ -234,7 +230,6 @@ async fn e2e_partitioned_custom_message_router() -> Result<(), Box<dyn std::erro
 /// `PartitionedConsumer` aggregates across partitions and preserves per-partition
 /// order. We assign each message a distinct payload + key and verify the
 /// partitioned consumer drains all of them.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_partitioned_consumer_aggregates_all() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;

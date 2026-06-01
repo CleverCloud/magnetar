@@ -12,7 +12,7 @@ and whether the target is gated behind a feature flag or `#[ignore]`.
 | **Integration** | `crates/<crate>/tests/*.rs` | none | nothing | yes |
 | **Deterministic chaos** | [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/) | `--features crypto-aws-lc-rs` (or any single `crypto-*` provider — per-package `--all-features` would pull `crypto-fips` and its native toolchain) | nothing (virtual everything) | yes |
 | **Differential equivalence** | [`crates/magnetar-differential/tests/`](../crates/magnetar-differential/tests/) | When run with `--workspace`, use the routine feature subset (see [Running each category](#running-each-category)); when run standalone (`-p magnetar-differential`), forward a crypto provider feature to the runtime deps | nothing | yes |
-| **End-to-end (e2e)** | [`crates/magnetar/tests/e2e_*.rs`](../crates/magnetar/tests/) | `--features e2e` + `#[ignore = "e2e: requires Docker"]` | Docker + `apachepulsar/pulsar:4.0.4` | no |
+| **End-to-end (e2e)** | [`crates/magnetar/tests/e2e_*.rs`](../crates/magnetar/tests/) | none (ADR-0046 — runs as a regular `cargo test`) | Docker + `apachepulsar/pulsar:4.0.4` (host or CI runner must have it) | yes |
 
 ## Running each category
 
@@ -50,7 +50,11 @@ cargo test -p magnetar-differential --locked --features \
   'magnetar-runtime-tokio/crypto-aws-lc-rs,magnetar-runtime-moonpool/crypto-aws-lc-rs'
 
 # End-to-end suite (Docker required, runs apachepulsar/pulsar:4.0.4).
-cargo test --workspace --features e2e -- --include-ignored
+# Per ADR-0046 the e2e suite is **already part of** the `--workspace`
+# invocations above when `--all-features` is on — no `--features e2e`,
+# no `--include-ignored`. The line below is the bare-minimum invocation
+# that exercises only the e2e tests:
+cargo test -p magnetar --tests
 ```
 
 Contributors with a FIPS toolchain installed locally can substitute
@@ -60,8 +64,8 @@ per-provider sweep regardless.
 
 The validation chain documented in
 [`parity-status.md#validation-chain-per-commit`](parity-status.md#validation-chain-per-commit)
-runs everything except the e2e suite (e2e is opt-in for both local
-runs and CI).
+runs everything **including the e2e suite** (ADR-0046 folded the
+former opt-in `e2e` job into the regular `test` job).
 
 ## Unit tests
 
@@ -139,15 +143,17 @@ Every `crates/magnetar/tests/e2e_*.rs` file is gated on
 `#[cfg(feature = "e2e")]` AND `#[ignore = "e2e: requires Docker"]`.
 Both gates have to be cleared for the test to run, by design:
 
-- The `e2e` feature pulls in `testcontainers` + the `apachepulsar/pulsar:4.0.4`
-  image + the auth crates as needed.
-- The `#[ignore]` prevents the suite from running in environments
-  without Docker (most contributor laptops + the no-Docker CI shards).
-
-To run the suite, both flags must be set:
+Per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)
+the e2e suite carries **no feature flag and no `#[ignore]`** — every
+`cargo test` invocation that activates the workspace runs the e2e
+tests. Contributors without Docker on the host should run unit /
+integration / moonpool tests crate-by-crate (`-p magnetar-proto`,
+`-p magnetar-runtime-tokio`, `-p magnetar-runtime-moonpool`,
+`-p magnetar-differential`) which never touch the network boundary.
 
 ```bash
-cargo test --workspace --features e2e -- --include-ignored
+# Full validation chain (runs e2e automatically when Docker is present).
+cargo test --workspace --all-features --locked
 ```
 
 Suites cover:
@@ -167,7 +173,7 @@ Suites cover:
 | [`e2e_persistence.rs`](../crates/magnetar/tests/e2e_persistence.rs) | Persistent + non-persistent semantics. |
 | [`e2e_crypto.rs`](../crates/magnetar/tests/e2e_crypto.rs) | PIP-4 + `cryptoFailureAction` (Fail / Discard / Consume). |
 | [`e2e_oauth2.rs`](../crates/magnetar/tests/e2e_oauth2.rs) | OAuth2 `ClientCredentialsFlow` + token cache + refresh-on-expiry. |
-| [`e2e_sasl_kerberos.rs`](../crates/magnetar/tests/e2e_sasl_kerberos.rs) | SASL Kerberos / GSSAPI via `libgssapi` against a Dockerised MIT KDC (`gcavalcante8808/krb5-server`). Gated on `--features e2e,auth-sasl-kerberos`; needs `libkrb5-dev` + `libclang-dev` on the build host. See [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
+| [`e2e_sasl_kerberos.rs`](../crates/magnetar/tests/e2e_sasl_kerberos.rs) | SASL Kerberos / GSSAPI via `libgssapi` against a Dockerised MIT KDC (`gcavalcante8808/krb5-server`). Gated on `--features auth-sasl-kerberos`; needs `libkrb5-dev` + `libclang-dev` on the build host. See [ADR-0029](../specs/adr/0029-sasl-kerberos-gssapi-scope.md). |
 | [`e2e_dns_resolver.rs`](../crates/magnetar/tests/e2e_dns_resolver.rs) | Custom `DnsResolver` plumbed end-to-end. |
 | [`e2e_force_unsubscribe.rs`](../crates/magnetar/tests/e2e_force_unsubscribe.rs) | PIP-313 force unsubscribe. |
 | [`e2e_memory_limit.rs`](../crates/magnetar/tests/e2e_memory_limit.rs) | `MemoryLimitPolicy::{FailImmediately, ProducerBlock}`. |
@@ -177,7 +183,7 @@ Suites cover:
 | [`e2e_seek_per_partition.rs`](../crates/magnetar/tests/e2e_seek_per_partition.rs) | Per-partition seek callbacks. |
 | [`e2e_cluster_failover.rs`](../crates/magnetar/tests/e2e_cluster_failover.rs) | PIP-121 manual cluster swap with two broker containers. |
 | [`e2e_shadow_topic.rs`](../crates/magnetar/tests/e2e_shadow_topic.rs) | PIP-180 — admin REST shadow-topic management, `send_with_source_message_id` propagation, `MessageReceivedFromShadow` consumer event. |
-| [`e2e_replicated_subscriptions.rs`](../crates/magnetar/tests/e2e_replicated_subscriptions.rs) | PIP-33 cursor-resume across two clusters. Opt-in via `--features e2e,e2e-multi-cluster`; not run on per-PR CI (the docker-compose fixture is ~60s + flake-prone). Weekly run via [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) per the [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) cost-shifting precedent. |
+| [`e2e_replicated_subscriptions.rs`](../crates/magnetar/tests/e2e_replicated_subscriptions.rs) | PIP-33 cursor-resume across two clusters. Runs on every PR per [ADR-0046](../specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md). The `test` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) brings up the two-cluster docker-compose fixture (`fixtures/docker-compose.replicated-subs.yml`) before `cargo test`. |
 
 ## The `#[ignore]` policy
 

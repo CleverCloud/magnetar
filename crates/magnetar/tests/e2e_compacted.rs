@@ -5,17 +5,15 @@
 //! standalone broker via `testcontainers-rs`, runs producer/consumer
 //! traffic, and exercises one branch of the compaction story.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_compacted -- --nocapture
+//! cargo test -p magnetar --test e2e_compacted -- --nocapture
 //! ```
 //!
 //! Mirrors the Java parity tests at
 //! `pulsar-broker/src/test/java/org/apache/pulsar/compaction/CompactionTest.java`
 //! and `pulsar-broker/src/test/java/org/apache/pulsar/client/impl/TableViewTest.java`.
-
-#![cfg(feature = "e2e")]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -124,7 +122,6 @@ async fn trigger_compaction(
 /// to compact the topic; a fresh subscription with `read_compacted(true)`
 /// must only see the latest value per key — i.e. v1 is dropped. Mirrors the
 /// Java assertion shape in `CompactionTest#testCompaction` (PIP-94).
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_compacted_reader_sees_latest_per_key() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;
@@ -151,7 +148,7 @@ async fn e2e_compacted_reader_sees_latest_per_key() -> Result<(), Box<dyn std::e
 
     // Trigger compaction via the admin REST endpoint. The broker compacts
     // asynchronously; we sleep a conservative amount rather than poll the
-    // status endpoint — this test is `#[ignore]` and the budget is generous.
+    // status endpoint — the e2e job's budget covers it.
     trigger_compaction(&admin_url, &topic).await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -236,7 +233,6 @@ async fn wait_for_size(
 /// the snapshot of a `TableView` is the compacted view of the topic, even
 /// when compaction has not been triggered (the table view reads the raw
 /// log and overwrites entries in memory).
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_tableview_compacted_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -305,7 +301,6 @@ async fn e2e_tableview_compacted_snapshot() -> Result<(), Box<dyn std::error::Er
 /// `TableViewTest#testTableViewTombstone` and the drain-task branch in
 /// `magnetar::table_view::TableViewBuilder::create` that calls
 /// `state.remove(&key)` on an empty payload.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_tableview_tombstone_removes_key() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -351,8 +346,8 @@ async fn e2e_tableview_tombstone_removes_key() -> Result<(), Box<dyn std::error:
     // simply `!tv.contains_key("k1")` once the drain has caught up.
     //
     // We give the drain a generous budget to consume both messages, then
-    // assert the final state. Sleeping is acceptable here because the test
-    // is `#[ignore]`-gated.
+    // assert the final state. Sleeping is acceptable here because the e2e
+    // job has time to spare.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let snapshot = tv.snapshot();

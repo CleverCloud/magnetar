@@ -293,7 +293,7 @@ therefore pins "the send is **accepted** on a shadow but **rejected** on
 a regular topic", not a receipt round-trip. Running the suite:
 
 ```sh
-cargo test --features e2e -p magnetar \
+cargo test -p magnetar \
     --test e2e_shadow_topic_replicator -- --include-ignored --nocapture
 ```
 

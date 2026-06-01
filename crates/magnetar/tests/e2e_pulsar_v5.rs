@@ -3,12 +3,12 @@
 //! End-to-end tests for the PIP-466 V5 client surface against a real
 //! Apache Pulsar 4.x standalone broker spun up via `testcontainers-rs`.
 //!
-//! Gated behind both the `e2e` and `experimental-v5-client` feature
+//! Gated behind the `experimental-v5-client` feature.
 //! flags. Run with:
 //!
 //! ```sh
-//! cargo test --features e2e,experimental-v5-client \
-//!   -p magnetar --test e2e_pulsar_v5 -- --nocapture --include-ignored
+//! cargo test --features experimental-v5-client \
+//!   -p magnetar --test e2e_pulsar_v5 -- --nocapture
 //! ```
 //!
 //! Requires Docker on the host.
@@ -18,7 +18,7 @@
 //! (`PulsarClientV5`, `v5::producer::ProducerBuilder`,
 //! `v5::stream_consumer::StreamConsumerBuilder`).
 
-#![cfg(all(feature = "e2e", feature = "experimental-v5-client"))]
+#![cfg(feature = "experimental-v5-client")]
 
 use std::time::Duration;
 
@@ -76,7 +76,6 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v5_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -125,7 +124,6 @@ async fn e2e_v5_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v5_v4_escape_hatch_shares_state() -> Result<(), Box<dyn std::error::Error>> {
     // Cross-surface invariant from ADR-0032: `PulsarClientV5::v4()`

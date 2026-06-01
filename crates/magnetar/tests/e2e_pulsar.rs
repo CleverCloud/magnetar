@@ -3,23 +3,19 @@
 //! End-to-end tests against a real Apache Pulsar 4.x standalone broker
 //! spun up via `testcontainers-rs`.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_pulsar -- --nocapture
+//! cargo test -p magnetar --test e2e_pulsar -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the `e2e` workflow
-//! (`workflow_dispatch` + `release/*` branches) so unrelated PRs don't pay
-//! the multi-minute container startup cost.
+//! Requires Docker on the host.
 //!
 //! ## Image
 //!
 //! Uses `apachepulsar/pulsar:4.0.4` (Pulsar 4.0 LTS, our minimum supported
 //! broker version per `ask-magnetar-decisions.md`). Override with
 //! `MAGNETAR_PULSAR_IMAGE` env var if you need a different tag locally.
-
-#![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
@@ -79,7 +75,6 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -123,7 +118,6 @@ async fn e2e_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;
@@ -175,7 +169,6 @@ async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_pattern_consumer_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -232,7 +225,6 @@ async fn e2e_pattern_consumer_snapshot() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_key_shared_dispatch() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

@@ -12,9 +12,7 @@
 //!   2. **Happy path** — limit = 64 KiB, send a 1 KiB message. Expect a normal `SendReceipt` (the
 //!      reservation succeeds and is released on completion).
 //!
-//! Gated behind the `e2e` feature flag.
-
-#![cfg(feature = "e2e")]
+//! Runs as a regular test under `cargo test` (ADR-0046).
 
 use std::time::Duration;
 
@@ -70,7 +68,6 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_memory_limit_rejects_oversize() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -116,7 +113,6 @@ async fn e2e_memory_limit_rejects_oversize() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_memory_limit_happy_path() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
