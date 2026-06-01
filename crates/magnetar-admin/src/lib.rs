@@ -1038,6 +1038,55 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's compaction threshold (bytes).
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`. Returns
+    /// a bare integer (bytes of accumulated topic backlog above which the
+    /// broker triggers automatic compaction), or `null` (decoded as `None`)
+    /// when the broker default applies.
+    /// Java: `NamespacesBase#getCompactionThreshold`.
+    pub async fn namespace_get_compaction_threshold(
+        &self,
+        ns: &str,
+    ) -> Result<Option<i64>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "compactionThreshold"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's compaction threshold (bytes).
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold` with
+    /// a bare JSON long body. `0` disables automatic compaction.
+    /// Java: `NamespacesBase#setCompactionThreshold`.
+    pub async fn namespace_set_compaction_threshold(
+        &self,
+        ns: &str,
+        threshold_bytes: i64,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "compactionThreshold"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&threshold_bytes))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's compaction threshold override.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`.
+    /// Java: `NamespacesBase#deleteCompactionThreshold`.
+    pub async fn namespace_remove_compaction_threshold(
+        &self,
+        ns: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "compactionThreshold"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.

@@ -707,6 +707,27 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's compaction threshold (bytes, or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`.
+    GetCompactionThreshold {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's compaction threshold (bytes). `0` disables.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`.
+    SetCompactionThreshold {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Threshold in bytes. `0` disables automatic compaction.
+        #[arg(long)]
+        threshold_bytes: i64,
+    },
+    /// Remove a namespace's compaction threshold override.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`.
+    RemoveCompactionThreshold {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1817,6 +1838,26 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         NamespacesCmd::RemoveDeduplicationSnapshotInterval { namespace } => {
             admin
                 .namespace_remove_deduplication_snapshot_interval(&namespace)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetCompactionThreshold { namespace } => print_json(
+            &admin
+                .namespace_get_compaction_threshold(&namespace)
+                .await?,
+        ),
+        NamespacesCmd::SetCompactionThreshold {
+            namespace,
+            threshold_bytes,
+        } => {
+            admin
+                .namespace_set_compaction_threshold(&namespace, threshold_bytes)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveCompactionThreshold { namespace } => {
+            admin
+                .namespace_remove_compaction_threshold(&namespace)
                 .await?;
             Ok(())
         }
