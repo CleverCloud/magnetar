@@ -1305,6 +1305,32 @@ fn run_git_in_capture(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Force clang for `crypto-fips` cells on Linux.
+///
+/// aws-lc's FIPS BCM is post-processed by the `delocate` tool, which
+/// rejects any `.data*` section in the module assembly. GCC 16+ emits
+/// `.data.rel.ro.local` for some `-fPIC` const-pointer patterns; clang
+/// places the equivalent in `.rodata`. `aws-lc-fips-sys` only
+/// auto-switches to clang for the `asan` feature, so a plain Linux
+/// FIPS build inherits whatever `cmake-rs` picks (`/usr/bin/cc` → gcc
+/// on Fedora) and trips the delocate guard intermittently — the trip
+/// depends on which aws-lc sources cargo's feature unification pulls
+/// into `bcm.c`. Setting the C/asm toolchain explicitly here keeps the
+/// matrix green regardless of host gcc version.
+fn apply_fips_toolchain(cmd: &mut StdCommand, features: &str) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    if !features.split(',').any(|f| f.trim() == "crypto-fips") {
+        return;
+    }
+    cmd.env("CC", "clang")
+        .env("CXX", "clang++")
+        .env("ASM", "clang")
+        .env("AR", "llvm-ar")
+        .env("RANLIB", "llvm-ranlib");
+}
+
 /// Build the four `crypto-*` provider features in isolation.
 ///
 /// Each cell is exercised with the `tokio` feature on (production
@@ -1351,20 +1377,19 @@ fn check_crypto_matrix() -> Result<()> {
             eprintln!(
                 "xtask check-crypto-matrix: cargo build -p magnetar --no-default-features --features {features}"
             );
-            let status = StdCommand::new(&cargo)
-                .current_dir(&workspace_root)
-                .args([
-                    "build",
-                    "-p",
-                    "magnetar",
-                    "--no-default-features",
-                    "--features",
-                    &features,
-                ])
-                .status()
-                .with_context(|| {
-                    format!("failed to invoke `cargo build` for features `{features}`")
-                })?;
+            let mut cmd = StdCommand::new(&cargo);
+            cmd.current_dir(&workspace_root).args([
+                "build",
+                "-p",
+                "magnetar",
+                "--no-default-features",
+                "--features",
+                &features,
+            ]);
+            apply_fips_toolchain(&mut cmd, &features);
+            let status = cmd.status().with_context(|| {
+                format!("failed to invoke `cargo build` for features `{features}`")
+            })?;
             total_cells += 1;
             if !status.success() {
                 failures.push(format!("magnetar:{features}"));
