@@ -696,6 +696,19 @@ impl Future for RequestFut {
     }
 }
 
+impl Drop for RequestFut {
+    /// Drop-time cleanup: clear our entry from the connection's waker slab so
+    /// a cancelled producer-side request future (close-producer, etc.) does
+    /// not leave a dangling [`std::task::Waker`] behind. For
+    /// [`PendingOpKey::Send`] keys [`magnetar_proto::Connection::unregister_waker`]
+    /// also clears the per-producer-slot waker. See the matching docstring on
+    /// [`crate::client::RequestFut::drop`] for the rationale and
+    /// the lookup multi-agent review MEDIUM-4 finding.
+    fn drop(&mut self) {
+        self.shared.inner.lock().unregister_waker(self.key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};

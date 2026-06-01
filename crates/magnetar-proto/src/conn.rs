@@ -38,9 +38,9 @@ use bytes::{Bytes, BytesMut};
 pub use crate::conn_types::*;
 use crate::consumer::ConsumerState;
 use crate::error::ProtocolError;
-use crate::event::{ConnectionEvent, IncomingMessage, TxnRoundTrip};
+use crate::event::{ConnectionEvent, IncomingMessage, LookupOutcome, TxnRoundTrip};
 use crate::frame::{Frame, decode_one, encode_command, encode_payload, encode_payload_head};
-use crate::lookup::{LookupRegistry, LookupRequest, PartitionedMetadataRequest};
+use crate::lookup::{LookupRegistry, LookupRequest, LookupSubmitError, is_partition_topic};
 use crate::pb;
 use crate::producer::{ProducerState, SendDecision};
 use crate::topic_watcher::{TopicWatcher, TopicWatcherRegistry};
@@ -299,6 +299,10 @@ impl Connection {
         config: ConnectionConfig,
         wall_clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
     ) -> Self {
+        let lookup = LookupRegistry {
+            max_pending: config.max_pending_lookups,
+            ..LookupRegistry::default()
+        };
         Self {
             config,
             state: HandshakeState::Uninitialized,
@@ -320,7 +324,7 @@ impl Connection {
             in_flight_publish_snapshots: HashMap::new(),
             consumers: HashMap::new(),
             consumer_subscribe_requests: HashMap::new(),
-            lookup: LookupRegistry::default(),
+            lookup,
             topic_watchers: TopicWatcherRegistry::default(),
             txn_client: TxnClient::new(0),
             next_request_id: 0,
@@ -749,7 +753,36 @@ impl Connection {
         // poll via the per-request waker slab we already drained above. Clearing the
         // registries avoids replaying stale `Connect`/`Redirect` traffic on the new
         // socket.
-        self.lookup = LookupRegistry::default();
+        //
+        // **Belt-and-suspenders drain** (lookup multi-agent review HIGH-3): every
+        // in-flight lookup / partitioned-metadata request is *also* keyed in
+        // `pending_requests` on the happy path, so the first loop above
+        // (lines ~649-661) has already published `OpOutcome::SessionLost` and
+        // woken the registered waker for each one. We re-iterate the lookup
+        // registry's own key set here as a defensive measure: any future
+        // refactor that desynchronises `pending_requests` from the lookup
+        // registry (e.g. an internal retry path that inserts into `lookup`
+        // before allocating its `pending_requests` slot) would silently
+        // re-introduce the "lookup parked until 30s operation_timeout" race
+        // without this guard. The publish path is idempotent — if the first
+        // loop already wrote a `SessionLost` outcome, the second write is a
+        // no-op overwrite of an identical value; if a waker was already
+        // consumed, the second `wake_for_request` call finds nothing to
+        // wake. Order strictly: write outcomes → wake → clear the registry.
+        // The waker invocation may race with the eventual registry clear,
+        // but the outcome is already published so the freshly-woken future
+        // observes `SessionLost` on its next `take_outcome` call regardless
+        // of the registry's state.
+        let stranded_lookup_ids = self.lookup.pending_request_ids();
+        for rid in stranded_lookup_ids {
+            let key = PendingOpKey::Request(rid);
+            self.outcomes.insert(key, OpOutcome::SessionLost { key });
+            self.wake_for_request(rid);
+        }
+        self.lookup = LookupRegistry {
+            max_pending: self.config.max_pending_lookups,
+            ..LookupRegistry::default()
+        };
         self.topic_watchers = TopicWatcherRegistry::default();
 
         // (5) Back to Uninitialized so begin_handshake on the freshly-handshaked socket
@@ -1649,24 +1682,79 @@ impl Connection {
                         ))?;
                 let rid = RequestId(resp.request_id);
                 if let Some(req) = self.lookup.take_lookup(rid) {
-                    let (outcome, retry) = crate::lookup::translate_lookup_response(&resp, &req);
-                    if let Some(retry) = retry {
-                        let new_id = self.alloc_request_id();
-                        let _ = self.send_lookup_internal(new_id, retry);
+                    let chain_origin = req.chain_origin;
+                    // The wire-level request-id is always done at this point
+                    // — the broker won't send another response for it. The
+                    // *chain*'s pending_requests entry stays keyed on
+                    // `chain_origin` until the terminal outcome lands; only
+                    // the per-hop wire-id is dropped from pending_requests
+                    // when it differs (the initial hop already shares the
+                    // anchor's id).
+                    if rid != chain_origin {
+                        self.pending_requests.remove(&rid);
                     }
-                    self.pending_requests.remove(&rid);
-                    self.outcomes.insert(
-                        PendingOpKey::Request(rid),
-                        OpOutcome::LookupResponse {
-                            request_id: rid,
-                            outcome: outcome.clone(),
-                        },
-                    );
-                    self.wake_for_request(rid);
-                    self.events.push_back(ConnectionEvent::LookupResponse {
-                        request_id: rid,
-                        result: outcome,
-                    });
+                    let (outcome, retry) = crate::lookup::translate_lookup_response(&resp, &req);
+                    match retry {
+                        Some(retry) => {
+                            // HIGH-4 (lookup multi-agent review): the
+                            // intermediate `Redirected` outcome is
+                            // diagnostic-only. We push it to the
+                            // `ConnectionEvent` queue for tracing /
+                            // observability (engines that drain the event
+                            // stream can log every redirect hop) but
+                            // **never** publish it to the `outcomes` slot
+                            // and **never** wake the user-facing future.
+                            // Only `Connect` / `Failed` reach the user.
+                            self.events.push_back(ConnectionEvent::LookupResponse {
+                                request_id: chain_origin,
+                                result: outcome,
+                            });
+                            // Issue the retry frame on a fresh wire-level
+                            // request-id. The retry's `chain_origin` field
+                            // (set by `translate_lookup_response`) keeps
+                            // the user-facing anchor stable.
+                            let new_id = self.alloc_request_id();
+                            if let Err(LookupSubmitError::Rejected) =
+                                self.send_lookup_internal(new_id, retry)
+                            {
+                                // Cap-hit on retry — the frame never goes
+                                // out. Deliver a synthetic Failed against
+                                // the chain anchor so the user's future
+                                // terminates cleanly instead of waiting
+                                // on a hop that will never happen.
+                                self.synthesize_lookup_failed(
+                                    chain_origin,
+                                    "lookup retry rejected: max pending \
+                                     (ConnectionConfig::max_pending_lookups)",
+                                );
+                            }
+                            // `LookupSubmitError::Encode` is the historic
+                            // silent-drop path — the registry slot is
+                            // reserved, the future stays parked until the
+                            // operation timeout fires. Behaviour matches
+                            // the pre-HIGH-4 fold path.
+                        }
+                        None => {
+                            // Terminal outcome (`Connect` or `Failed`). The
+                            // anchor's pending_requests entry is consumed
+                            // and the user-facing future is woken with the
+                            // final answer. This is the only path that
+                            // ever publishes a `LookupResponse` outcome.
+                            self.pending_requests.remove(&chain_origin);
+                            self.outcomes.insert(
+                                PendingOpKey::Request(chain_origin),
+                                OpOutcome::LookupResponse {
+                                    request_id: chain_origin,
+                                    outcome: outcome.clone(),
+                                },
+                            );
+                            self.wake_for_request(chain_origin);
+                            self.events.push_back(ConnectionEvent::LookupResponse {
+                                request_id: chain_origin,
+                                result: outcome,
+                            });
+                        }
+                    }
                 }
             }
             pb::base_command::Type::PartitionedMetadataResponse => {
@@ -1676,7 +1764,7 @@ impl Connection {
                     ),
                 )?;
                 let rid = RequestId(resp.request_id);
-                if self.lookup.take_partition(rid).is_some() {
+                if self.lookup.take_partition(rid) {
                     self.pending_requests.remove(&rid);
                     let error = resp
                         .error
@@ -1841,6 +1929,37 @@ impl Connection {
                 } else {
                     None
                 };
+                // Defence-in-depth (medium-1 in the lookup multi-agent
+                // review): when the user has configured a
+                // `redirect_url_allow_list`, validate every
+                // broker-advertised URL **before** letting the runtime
+                // act on it. A rejected URL surfaces
+                // `RedirectUrlRejected` instead of `TopicMigrated`, so
+                // the supervised-reconnect arm in the runtime drivers
+                // does not fire and the original
+                // `AuthProvider::initial()` credentials are not handed
+                // to the unverified host. The mechanism is opt-in
+                // (default `None` = permissive) — see
+                // `RedirectUrlAllowList` and ADR-0018 §"Redirect URL
+                // allow-list (2026-06-01)".
+                if let Some(allow_list) = self.config.redirect_url_allow_list.as_ref() {
+                    let plain_ok = migrated
+                        .broker_service_url
+                        .as_deref()
+                        .is_some_and(|u| allow_list.is_allowed(u));
+                    let tls_ok = migrated
+                        .broker_service_url_tls
+                        .as_deref()
+                        .is_some_and(|u| allow_list.is_allowed(u));
+                    if !plain_ok && !tls_ok {
+                        self.events.push_back(ConnectionEvent::RedirectUrlRejected {
+                            source: "CommandTopicMigrated",
+                            broker_service_url: migrated.broker_service_url,
+                            broker_service_url_tls: migrated.broker_service_url_tls,
+                        });
+                        return Ok(());
+                    }
+                }
                 self.events.push_back(ConnectionEvent::TopicMigrated {
                     producer,
                     consumer,
@@ -2380,9 +2499,53 @@ impl Connection {
         self.wakers.insert(key, waker);
     }
 
+    /// Unregister the waker for a pending op, if one is registered.
+    ///
+    /// Mirrors [`Self::register_waker`]'s dispatch: for [`PendingOpKey::Send`] the
+    /// waker may live on the matching [`crate::producer::ProducerSlot`] instead of
+    /// the connection-wide slab, so we clear both sites unconditionally. For
+    /// [`PendingOpKey::Request`] only the connection-wide slab is touched.
+    ///
+    /// Called from the [`Drop`] impls on the runtime-side request futures
+    /// (`magnetar_runtime_tokio` / `magnetar_runtime_moonpool`
+    /// `RequestFut`) so a future that is cancelled
+    /// before its outcome lands does not leave an orphaned [`Waker`] in the
+    /// `wakers` map. The leak is otherwise inert (the dispatcher would later
+    /// `remove(&key)` and wake a no-op waker when the outcome arrives, or
+    /// [`Self::reset`] would garbage-collect on the next reconnect) but
+    /// defense-in-depth keeps the slab bounded for long-running connections
+    /// that issue many short-lived lookups whose request ids never resolve
+    /// (e.g. callers that drop the future before broker round-trip). See the
+    /// lookup multi-agent review MEDIUM-4 finding and ADR-0024.
+    pub fn unregister_waker(&mut self, key: PendingOpKey) {
+        // Drop the connection-wide entry first.
+        let _ = self.wakers.remove(&key);
+        // For Send keys the waker may have been stashed on the producer slot
+        // instead — clear it there too so the dispatcher never wakes a stale
+        // task. The reverse-lookup is O(pending) on the matching producer's
+        // pending vector; this is only hit on future-drop so the cost is
+        // amortised against the user's drop.
+        if let PendingOpKey::Send(handle, seq) = key {
+            if let Some(slot) = self.producers.get(&handle) {
+                slot.state.lock().clear_waker(seq);
+            }
+        }
+    }
+
     /// Consume the outcome of a pending op, if one is ready.
     pub fn take_outcome(&mut self, key: PendingOpKey) -> Option<OpOutcome> {
         self.outcomes.remove(&key)
+    }
+
+    /// Test/diagnostic accessor: number of wakers currently parked in the
+    /// connection-wide [`Self::wakers`] slab. Used by the
+    /// `lookup_drop_unregister` integration tests on both runtime engines to
+    /// assert that dropping a [`PendingOpKey::Request`]-correlated future
+    /// drains its [`Waker`] off the connection. **Not** counted: per-producer
+    /// per-sequence wakers stashed on [`crate::producer::ProducerSlot`].
+    #[doc(hidden)]
+    pub fn pending_waker_count(&self) -> usize {
+        self.wakers.len()
     }
 
     /// Open a producer. The state machine emits a `CommandProducer` and assigns a
@@ -3348,15 +3511,43 @@ impl Connection {
         request_id
     }
 
-    /// Issue a topic lookup. The state machine handles redirects internally; the user receives
-    /// either a `Connect` or `Failed` outcome.
+    /// Issue a topic lookup. The state machine handles redirects internally;
+    /// the user receives **only the terminal outcome** — either
+    /// `LookupOutcome::Connect` or `LookupOutcome::Failed`.
+    ///
+    /// HIGH-4 (lookup multi-agent review): intermediate
+    /// `LookupOutcome::Redirected` outcomes are surfaced via the
+    /// [`crate::event::ConnectionEvent::LookupResponse`] events queue for
+    /// observability/tracing only — they **never** publish to the outcomes
+    /// slot and **never** wake the user-facing future. This is what makes
+    /// the redirect cap and the broker-URL passthrough end-to-end
+    /// user-observable.
+    ///
+    /// Redirects are capped at [`crate::lookup::MAX_LOOKUP_REDIRECTS`] hops
+    /// (Java parity). If [`ConnectionConfig::max_pending_lookups`] is set
+    /// and the in-flight registry is already at the cap, the call surfaces
+    /// synchronously as a synthetic `LookupOutcome::Failed { code: 0,
+    /// message: "lookup rejected: max pending" }` against the freshly
+    /// allocated request-id — the frame never touches the wire.
     pub fn lookup(&mut self, topic: &str, authoritative: bool) -> RequestId {
         let request_id = self.alloc_request_id();
         let req = LookupRequest {
             topic: topic.to_owned(),
             authoritative,
+            hops_remaining: crate::lookup::MAX_LOOKUP_REDIRECTS,
+            // The initial request-id IS the chain origin — every retry on
+            // this lookup chain delivers its terminal outcome here.
+            chain_origin: request_id,
         };
-        let _ = self.send_lookup_internal(request_id, req);
+        if matches!(
+            self.send_lookup_internal(request_id, req),
+            Err(LookupSubmitError::Rejected),
+        ) {
+            self.synthesize_lookup_failed(
+                request_id,
+                "lookup rejected: max pending (ConnectionConfig::max_pending_lookups)",
+            );
+        }
         request_id
     }
 
@@ -3364,7 +3555,10 @@ impl Connection {
         &mut self,
         request_id: RequestId,
         req: LookupRequest,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), LookupSubmitError> {
+        // Check the cap BEFORE building / encoding so a hostile broker cannot
+        // make us pay encode cost on rejected hops. The encode_command path
+        // already enforces the connection-wide outbound buffer cap.
         let cmd = pb::CommandLookupTopic {
             topic: req.topic.clone(),
             request_id: request_id.0,
@@ -3380,11 +3574,42 @@ impl Connection {
             lookup_topic: Some(cmd),
             ..Default::default()
         };
-        self.encode_command(&base)?;
-        self.lookup.insert_lookup(request_id, req);
+        // Reserve a slot in the registry first; on capacity exhaustion we
+        // refuse to encode the frame.
+        self.lookup
+            .insert_lookup(request_id, req)
+            .map_err(|_| LookupSubmitError::Rejected)?;
+        self.encode_command(&base)
+            .map_err(|_| LookupSubmitError::Encode)?;
         self.pending_requests
             .insert(request_id, PendingRequestKind::Lookup);
         Ok(())
+    }
+
+    /// Write a synthetic `LookupOutcome::Failed { code: 0, message }`
+    /// outcome on `request_id` and wake the registered waker, without ever
+    /// emitting a `CommandLookupTopic` frame. Used when the cap kicks in
+    /// (either at the public entry point or on a redirect retry) so the
+    /// engine sees a clean terminal outcome rather than an indefinite
+    /// pending lookup.
+    fn synthesize_lookup_failed(&mut self, request_id: RequestId, message: &str) {
+        let outcome = LookupOutcome::Failed {
+            code: 0,
+            message: message.to_owned(),
+        };
+        self.pending_requests.remove(&request_id);
+        self.outcomes.insert(
+            PendingOpKey::Request(request_id),
+            OpOutcome::LookupResponse {
+                request_id,
+                outcome: outcome.clone(),
+            },
+        );
+        self.wake_for_request(request_id);
+        self.events.push_back(ConnectionEvent::LookupResponse {
+            request_id,
+            result: outcome,
+        });
     }
 
     /// Issue a `CommandGetSchema` to look up the schema declared for `topic` in the broker's
@@ -3419,8 +3644,59 @@ impl Connection {
     }
 
     /// Request partitioned-topic metadata.
+    ///
+    /// # Fast-path for per-partition child names
+    ///
+    /// If `topic` already encodes a partition index per Java's
+    /// `TopicName#isPartitioned` (i.e. its tail matches `-partition-<N>`
+    /// where `<N>` is a non-negative `u32`), the call short-circuits to
+    /// a synthetic `OpOutcome::PartitionedMetadata { partitions: 0,
+    /// error: None }` without touching the wire. Mirrors Java's
+    /// `PulsarClientImpl#getPartitionsForTopic` early-return and the
+    /// streamnative-pulsar-rs #327 service-discovery fix. For a topic
+    /// with `N` partitions, this cuts the per-partition LOOKUP
+    /// amplification from `N+1` round-trips to `1` and reduces load on
+    /// the broker's metadata store (ZooKeeper / etcd). Complements the
+    /// F1 hardening pass (redirect cap + pending-lookup cap).
+    ///
+    /// The detection uses [`crate::lookup::is_partition_topic`] — strict
+    /// end-of-string `-partition-\d+` match, not the looser
+    /// `contains("-partition-")` from the streamnative patch which
+    /// false-positives on names like `my-partition-thing-3`.
+    ///
+    /// # Max-pending cap
+    ///
+    /// Subject to the same `max_pending_lookups` cap as [`Self::lookup`]:
+    /// if the registry is already full, the call surfaces synchronously as
+    /// a synthetic `PartitionedMetadata { error: Some((0, "max pending"))
+    /// }` outcome — the frame never touches the wire. The fast-path
+    /// above bypasses the cap because no registry slot is consumed.
     pub fn get_partitioned_topic_metadata(&mut self, topic: &str) -> RequestId {
         let request_id = self.alloc_request_id();
+        // Fast-path: the input is already a per-partition child name —
+        // synthesize partitions=0 immediately. No registry slot, no
+        // outbound frame, no broker round-trip. Mirrors Java's
+        // `TopicName#getPartitionedTopicName` early-return when the name
+        // is already partitioned.
+        if is_partition_topic(topic) {
+            self.synthesize_partitioned_metadata_outcome(request_id, 0, None);
+            return request_id;
+        }
+        // Reserve the slot before encoding so we can short-circuit the
+        // outbound frame when the cap is hit.
+        if self.lookup.insert_partition(request_id).is_err() {
+            self.synthesize_partitioned_metadata_outcome(
+                request_id,
+                0,
+                Some((
+                    0,
+                    "partitioned-metadata rejected: max pending \
+                     (ConnectionConfig::max_pending_lookups)"
+                        .to_owned(),
+                )),
+            );
+            return request_id;
+        }
         let cmd = pb::CommandPartitionedTopicMetadata {
             topic: topic.to_owned(),
             request_id: request_id.0,
@@ -3435,15 +3711,44 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        self.lookup.insert_partition(
-            request_id,
-            PartitionedMetadataRequest {
-                topic: topic.to_owned(),
-            },
-        );
         self.pending_requests
             .insert(request_id, PendingRequestKind::PartitionedMetadata);
         request_id
+    }
+
+    /// Write a synthetic `OpOutcome::PartitionedMetadata` on `request_id`
+    /// and wake the registered waker, without ever emitting a
+    /// `CommandPartitionedTopicMetadata` frame. Used by:
+    ///
+    /// * the partition-topic fast-path (success outcome, `partitions = 0`, `error = None`),
+    /// * the `max_pending_lookups` cap rejection (failure outcome, `error = Some((0, "max pending
+    ///   …"))`).
+    ///
+    /// Mirror of [`Self::synthesize_lookup_failed`] for the
+    /// partition-metadata path, generalised to handle both the success
+    /// and failure synthetic outcomes the public entry point needs.
+    fn synthesize_partitioned_metadata_outcome(
+        &mut self,
+        request_id: RequestId,
+        partitions: u32,
+        error: Option<(i32, String)>,
+    ) {
+        self.pending_requests.remove(&request_id);
+        self.outcomes.insert(
+            PendingOpKey::Request(request_id),
+            OpOutcome::PartitionedMetadata {
+                request_id,
+                partitions,
+                error: error.clone(),
+            },
+        );
+        self.wake_for_request(request_id);
+        self.events
+            .push_back(ConnectionEvent::PartitionedMetadataResponse {
+                request_id,
+                partitions,
+                error,
+            });
     }
 
     /// Start a topic-list watcher (PIP-145).
@@ -4900,11 +5205,158 @@ mod conn_state_tests {
         }
     }
 
+    /// F11 fast-path: when the topic name already encodes a partition
+    /// index (`<base>-partition-<N>` per Java `TopicName#isPartitioned`),
+    /// `get_partitioned_topic_metadata` must short-circuit to
+    /// `partitions = 0` synthetically — no `CommandPartitionedTopicMetadata`
+    /// frame is emitted, no broker round-trip is needed, no registry slot
+    /// is consumed. Mirrors streamnative-pulsar-rs #327 and cuts the
+    /// per-partition lookup amplification on partitioned consumers from
+    /// `N+1` to `1`.
+    #[test]
+    fn get_partitioned_topic_metadata_fast_path_on_partition_suffix() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        // Drain the `Connected` event so subsequent `poll_event` returns ours.
+        let _ = conn.poll_event();
+        // Drain the handshake's `CommandConnect` from the outbound buffer.
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.outbound_len(),
+            0,
+            "outbound must be empty after draining the handshake frames"
+        );
+
+        let request_id =
+            conn.get_partitioned_topic_metadata("persistent://public/default/foo-partition-0");
+
+        // No frame on the wire — the fast-path skipped the encode.
+        assert_eq!(
+            conn.outbound_len(),
+            0,
+            "fast-path must NOT emit a CommandPartitionedTopicMetadata frame"
+        );
+
+        // Outcome is immediately available, with partitions = 0 and no error.
+        let key = PendingOpKey::Request(request_id);
+        match conn.take_outcome(key) {
+            Some(OpOutcome::PartitionedMetadata {
+                request_id: rid,
+                partitions,
+                error,
+            }) => {
+                assert_eq!(rid, request_id);
+                assert_eq!(partitions, 0, "fast-path always reports 0 partitions");
+                assert!(error.is_none(), "fast-path is a success, not an error");
+            }
+            other => panic!("expected synthetic PartitionedMetadata outcome, got {other:?}"),
+        }
+
+        // The companion event surfaces for observers (metrics / tracing).
+        match conn.poll_event() {
+            Some(ConnectionEvent::PartitionedMetadataResponse {
+                request_id: rid,
+                partitions,
+                error,
+            }) => {
+                assert_eq!(rid, request_id);
+                assert_eq!(partitions, 0);
+                assert!(error.is_none());
+            }
+            other => panic!("expected PartitionedMetadataResponse event, got {other:?}"),
+        }
+    }
+
+    /// F11 negative path: non-partition topic names must NOT trip the
+    /// fast-path — the state machine still issues a
+    /// `CommandPartitionedTopicMetadata` frame and waits for the broker's
+    /// response. Guards against future regressions where the detection
+    /// rule accidentally widens.
+    #[test]
+    fn get_partitioned_topic_metadata_emits_frame_for_non_partition_topic() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        let _ = conn.poll_transmit();
+        assert_eq!(conn.outbound_len(), 0);
+
+        let request_id = conn.get_partitioned_topic_metadata("persistent://public/default/orders");
+
+        // Frame is on the wire — the state machine is waiting for the broker.
+        assert!(
+            conn.outbound_len() > 0,
+            "non-partition topic must emit a CommandPartitionedTopicMetadata frame"
+        );
+        // No outcome until the broker replies.
+        let key = PendingOpKey::Request(request_id);
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "outcome stays pending until broker reply on the slow path"
+        );
+    }
+
+    /// F11 false-positive trap: a topic name like `my-partition-thing-3`
+    /// contains the substring `-partition-` (as the streamnative
+    /// `contains` heuristic checked) but the tail segment `thing-3` is
+    /// not a partition index. Magnetar's stricter regex-equivalent rule
+    /// rejects it, so the state machine MUST issue a frame and wait for
+    /// the broker. This pins the divergence from streamnative's looser
+    /// rule.
+    #[test]
+    fn get_partitioned_topic_metadata_rejects_streamnative_false_positive() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        let _ = conn.poll_transmit();
+
+        // Trap names from the F11 spec — must NOT short-circuit.
+        for trap in [
+            "persistent://public/default/my-partition-thing-3",
+            "persistent://public/default/foo-partition-foo",
+            "persistent://public/default/foo-partition-",
+            "persistent://public/default/foo",
+        ] {
+            let outbound_before = conn.outbound_len();
+            let request_id = conn.get_partitioned_topic_metadata(trap);
+            assert!(
+                conn.outbound_len() > outbound_before,
+                "topic {trap:?} must NOT short-circuit (no frame emitted)"
+            );
+            let key = PendingOpKey::Request(request_id);
+            assert!(
+                conn.take_outcome(key).is_none(),
+                "topic {trap:?} must stay pending until broker reply"
+            );
+            // Drain the buffered frame so the next iteration starts clean.
+            let _ = conn.poll_transmit();
+        }
+    }
+
     /// Ported from Java `BinaryProtoLookupService` — a `CommandLookupTopicResponse` whose
     /// `response = Redirect` must trigger a *fresh* outbound `CommandLookupTopic` with a
     /// fresh request id. Verifies that the state machine itself drives the retry (no need
-    /// for the user to re-submit). The retry counter (Java `maxLookupRedirects`) lives at
-    /// the runtime layer; here we only pin that one redirect produces one retry frame.
+    /// for the user to re-submit). HIGH-4 (lookup multi-agent review): the intermediate
+    /// `Redirected` outcome must NOT publish to the outcomes slot — only the terminal
+    /// outcome at the end of the chain is delivered to the user-facing future. The
+    /// intermediate `Redirected` is pushed to the events queue for diagnostics only.
     #[test]
     fn lookup_redirect_response_triggers_authoritative_retry() {
         let mut conn = Connection::new(
@@ -4955,13 +5407,254 @@ mod conn_state_tests {
             conn.outbound_len()
         );
 
-        // The user-visible outcome is `LookupResponse::Redirected` for observability.
-        match conn.take_outcome(PendingOpKey::Request(request_id)) {
+        // HIGH-4: the intermediate `Redirected` must NOT publish to the outcomes slot —
+        // only the terminal outcome (Connect / Failed) at the end of the chain does. The
+        // chain anchor's pending_requests / outcomes / waker are still parked; the
+        // user-facing future is correctly NOT woken on the first hop.
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "intermediate Redirected must not publish to outcomes (HIGH-4)"
+        );
+
+        // The intermediate Redirected IS pushed to the events queue for diagnostics —
+        // tracing / observability code that drains the event stream sees every hop.
+        let mut saw_redirected = false;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::LookupResponse {
+                request_id: rid,
+                result: crate::event::LookupOutcome::Redirected { .. },
+            } = ev
+            {
+                assert_eq!(
+                    rid, request_id,
+                    "diagnostic Redirected event must be keyed on the user-facing anchor"
+                );
+                saw_redirected = true;
+            }
+        }
+        assert!(
+            saw_redirected,
+            "expected a diagnostic LookupResponse(Redirected) event on the chain anchor"
+        );
+    }
+
+    /// Decode every complete `CommandLookupTopic` frame currently in the
+    /// outbound buffer and return the list of wire request-ids in the
+    /// order they were emitted. Drains the buffer.
+    ///
+    /// Test helper for the chain tests below — the proto state machine
+    /// allocates a fresh wire request-id on every redirect hop, and we
+    /// need to know the latest one to encode the broker's reply against
+    /// the right correlator.
+    fn drain_outbound_lookup_ids(conn: &mut Connection) -> Vec<RequestId> {
+        let bytes = conn.poll_transmit();
+        let mut cursor: bytes::Bytes = bytes;
+        let mut ids = Vec::new();
+        while !cursor.is_empty() {
+            let frame =
+                crate::frame::decode_one(&mut cursor).expect("decode outbound lookup frame");
+            if let Ok(pb::base_command::Type::Lookup) =
+                pb::base_command::Type::try_from(frame.command.r#type)
+            {
+                if let Some(l) = frame.command.lookup_topic {
+                    ids.push(RequestId(l.request_id));
+                }
+            }
+        }
+        ids
+    }
+
+    /// HIGH-4 (lookup multi-agent review): a redirect chain that
+    /// terminates in `Connect` must deliver the **terminal** outcome
+    /// against the user-facing request-id (the `chain_origin`), not the
+    /// intermediate `Redirected` outcome from the first hop. This is the
+    /// behaviour that makes the broker-URL passthrough and the redirect
+    /// cap end-to-end user-observable.
+    #[test]
+    fn lookup_redirect_chain_delivers_terminal_connect_to_origin() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        // Issue the user-facing lookup. The returned id is the
+        // `chain_origin` — the only id the user's future will ever wake
+        // against.
+        let user_request_id = conn.lookup("persistent://public/default/foo", false);
+        let initial_ids = drain_outbound_lookup_ids(&mut conn);
+        assert_eq!(
+            initial_ids,
+            vec![user_request_id],
+            "initial lookup must be keyed on the user-facing request-id"
+        );
+
+        // Walk two redirects, then terminate in Connect on the THIRD wire id.
+        let mut current_wire_id = user_request_id;
+        for hop in 0..2 {
+            let redirect = pb::BaseCommand {
+                r#type: pb::base_command::Type::LookupResponse as i32,
+                lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                    broker_service_url: Some(format!("pulsar://hop-{hop}:6650")),
+                    broker_service_url_tls: None,
+                    response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+                    request_id: current_wire_id.0,
+                    authoritative: Some(true),
+                    error: None,
+                    message: None,
+                    proxy_through_service_url: None,
+                }),
+                ..Default::default()
+            };
+            let mut buf = bytes::BytesMut::new();
+            encode_command(&mut buf, &redirect).expect("encode redirect");
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle redirect");
+
+            // Each redirect must NOT publish a terminal outcome to the
+            // user-facing slot — the chain anchor must stay parked.
+            assert!(
+                conn.take_outcome(PendingOpKey::Request(user_request_id))
+                    .is_none(),
+                "hop {hop}: intermediate Redirected must not wake the user"
+            );
+
+            // The state machine must have emitted a retry frame with a NEW
+            // wire request-id. Capture it for the next hop's correlator.
+            let next_ids = drain_outbound_lookup_ids(&mut conn);
+            assert_eq!(
+                next_ids.len(),
+                1,
+                "hop {hop}: exactly one retry frame must be emitted"
+            );
+            assert_ne!(
+                next_ids[0], current_wire_id,
+                "hop {hop}: retry must allocate a fresh wire request-id"
+            );
+            assert_ne!(
+                next_ids[0], user_request_id,
+                "hop {hop}: retry id must differ from the chain anchor too"
+            );
+            current_wire_id = next_ids[0];
+        }
+
+        // Drain the diagnostic Redirected events so the queue is clean for
+        // the terminal assertion below.
+        while conn
+            .poll_event_if(|e| matches!(e, ConnectionEvent::LookupResponse { .. }))
+            .is_some()
+        {}
+
+        // Terminate the chain in Connect on the most recent wire id.
+        let terminal = pb::BaseCommand {
+            r#type: pb::base_command::Type::LookupResponse as i32,
+            lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                broker_service_url: Some("pulsar://terminal:6650".to_owned()),
+                broker_service_url_tls: None,
+                response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+                request_id: current_wire_id.0,
+                authoritative: Some(true),
+                error: None,
+                message: None,
+                proxy_through_service_url: Some(false),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &terminal).expect("encode terminal Connect");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle terminal Connect");
+
+        // The user-facing future receives the Connect outcome with the
+        // terminal broker URL — NOT the first-hop redirect URL.
+        match conn.take_outcome(PendingOpKey::Request(user_request_id)) {
             Some(OpOutcome::LookupResponse {
-                outcome: crate::event::LookupOutcome::Redirected { .. },
-                ..
-            }) => {}
-            other => panic!("expected Redirected outcome, got {other:?}"),
+                request_id,
+                outcome:
+                    crate::event::LookupOutcome::Connect {
+                        broker_service_url, ..
+                    },
+            }) => {
+                assert_eq!(request_id, user_request_id);
+                assert_eq!(
+                    broker_service_url.as_deref(),
+                    Some("pulsar://terminal:6650"),
+                    "user must see the TERMINAL broker URL, not the first-hop redirect"
+                );
+            }
+            other => panic!("expected terminal Connect outcome at the anchor, got {other:?}"),
+        }
+    }
+
+    /// HIGH-4 + HIGH-2: a hostile broker that drives MAX_LOOKUP_REDIRECTS
+    /// hops must surface a synthetic `Failed { code: 0, message: "lookup
+    /// redirect cap exceeded …" }` to the user-facing future. Without
+    /// the HIGH-4 fix the user would see the FIRST hop's Redirected
+    /// outcome instead and never observe the cap.
+    #[test]
+    fn lookup_redirect_chain_cap_exceeded_surfaces_failed_to_origin() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        let user_request_id = conn.lookup("persistent://public/default/foo", false);
+        let initial_ids = drain_outbound_lookup_ids(&mut conn);
+        let mut current_wire_id = initial_ids[0];
+
+        // Feed `MAX_LOOKUP_REDIRECTS + 1` redirects. The (cap+1)-th one
+        // triggers the cap. The proto-level test
+        // `redirect_chain_terminates_at_cap` already pins the cap
+        // behaviour at the translate layer; here we confirm the
+        // *connection* layer surfaces it against the user's anchor.
+        for hop in 0..=crate::lookup::MAX_LOOKUP_REDIRECTS {
+            let redirect = pb::BaseCommand {
+                r#type: pb::base_command::Type::LookupResponse as i32,
+                lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                    broker_service_url: Some(format!("pulsar://hop-{hop}:6650")),
+                    broker_service_url_tls: None,
+                    response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+                    request_id: current_wire_id.0,
+                    authoritative: Some(true),
+                    error: None,
+                    message: None,
+                    proxy_through_service_url: None,
+                }),
+                ..Default::default()
+            };
+            let mut buf = bytes::BytesMut::new();
+            encode_command(&mut buf, &redirect).expect("encode redirect");
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle redirect");
+            if let Some(next) = drain_outbound_lookup_ids(&mut conn).into_iter().next() {
+                current_wire_id = next;
+            }
+        }
+
+        // User-facing outcome: Failed with the cap diagnostic.
+        match conn.take_outcome(PendingOpKey::Request(user_request_id)) {
+            Some(OpOutcome::LookupResponse {
+                request_id,
+                outcome: crate::event::LookupOutcome::Failed { code, message },
+            }) => {
+                assert_eq!(request_id, user_request_id);
+                assert_eq!(code, 0);
+                assert!(
+                    message.contains("redirect cap exceeded"),
+                    "expected cap diagnostic, got: {message}"
+                );
+            }
+            other => panic!("expected cap-exceeded Failed at the anchor, got {other:?}"),
         }
     }
 
@@ -5638,6 +6331,159 @@ mod conn_state_tests {
         );
     }
 
+    /// `unregister_waker` removes the registered waker so a subsequent dispatch
+    /// (or `reset`) does not wake the now-discarded task. The companion waker
+    /// for an unrelated request must still fire. Covers the lookup multi-agent
+    /// review MEDIUM-4 finding: futures that register wakers must clear them
+    /// on drop or the slab leaks one entry per cancelled request.
+    #[test]
+    fn unregister_waker_drops_request_entry_without_disturbing_siblings() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn counting_waker() -> (Arc<CountingWake>, Waker) {
+            let inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+            let waker: Waker = Arc::clone(&inner).into();
+            (inner, waker)
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        // Register two request wakers (request ids 100 and 101 — neither will
+        // ever receive a broker response in this test).
+        let key_a = PendingOpKey::Request(RequestId(100));
+        let key_b = PendingOpKey::Request(RequestId(101));
+        let (counter_a, waker_a) = counting_waker();
+        let (counter_b, waker_b) = counting_waker();
+        conn.register_waker(key_a, waker_a);
+        conn.register_waker(key_b, waker_b);
+        assert_eq!(
+            conn.pending_waker_count(),
+            2,
+            "two distinct request wakers parked"
+        );
+
+        // Drop request A's waker via `unregister_waker` (the path the runtime's
+        // `RequestFut::drop` will take).
+        conn.unregister_waker(key_a);
+        assert_eq!(
+            conn.pending_waker_count(),
+            1,
+            "unregister_waker drains exactly one slot"
+        );
+
+        // Re-registering is idempotent — it inserts a fresh entry, so the slab
+        // grows back to two.
+        let (_counter_a_redo, waker_a_redo) = counting_waker();
+        conn.register_waker(key_a, waker_a_redo);
+        assert_eq!(conn.pending_waker_count(), 2);
+        conn.unregister_waker(key_a);
+
+        // Tear the connection down — `reset` must NOT fire the unregistered
+        // waker, but should fire request B's waker (siblings are untouched).
+        conn.reset();
+        assert_eq!(
+            counter_a.0.load(Ordering::SeqCst),
+            0,
+            "the un-unregistered waker must NOT fire on reset"
+        );
+        assert_eq!(
+            counter_b.0.load(Ordering::SeqCst),
+            1,
+            "the un-touched sibling waker fires exactly once on reset"
+        );
+    }
+
+    /// `unregister_waker` on a [`PendingOpKey::Send`] key clears the
+    /// producer-slot waker too (the dispatcher prefers the slot-stored
+    /// waker over the connection-wide slab, per `register_waker`'s split).
+    /// Otherwise dropping a `SendFut` could leave a stale waker on the
+    /// `ProducerState::pending` entry that fires when the receipt arrives.
+    #[test]
+    fn unregister_waker_clears_producer_slot_send_waker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/unregister-send".to_owned(),
+            ..Default::default()
+        });
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send");
+
+        let key = PendingOpKey::Send(producer, seq);
+        let inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&inner).into();
+        conn.register_waker(key, waker);
+
+        // Connection-wide slab is empty because `register_waker` stashed the
+        // waker on the matching `ProducerSlot` instead.
+        assert_eq!(
+            conn.pending_waker_count(),
+            0,
+            "Send waker lives on the producer slot, not the connection slab"
+        );
+
+        // Unregister — the producer-slot waker is dropped too.
+        conn.unregister_waker(key);
+
+        // Reset must NOT fire the (now-dropped) waker.
+        conn.reset();
+        assert_eq!(
+            inner.0.load(Ordering::SeqCst),
+            0,
+            "unregister_waker clears the producer-slot waker; reset must not fire it"
+        );
+    }
+
     /// (a) Rebuild re-populates pending: after `rebuild_producers`, the snapshot bucket is
     /// drained and the producer's `pending` queue contains the same OpSends in the same
     /// order. The replayed `CommandSend` frames hit the outbound buffer.
@@ -6214,6 +7060,165 @@ mod conn_state_tests {
         assert_eq!(
             message_event_count, 3,
             "expected one Message event per arrival, not O(n²) amplification",
+        );
+    }
+
+    /// Lookup multi-agent review HIGH-3: `Connection::reset()` MUST publish
+    /// `OpOutcome::SessionLost` for every in-flight lookup +
+    /// partitioned-metadata request **before** the registry is cleared. A
+    /// future polled after the reset must observe `SessionLost` on its
+    /// next `take_outcome` call — it must NOT park on a now-orphaned waker
+    /// until the runtime's 30-second `operation_timeout` fires.
+    ///
+    /// Ordering invariant exercised: outcomes written → wakers fired →
+    /// registry maps cleared. The first loop in `reset` (drains
+    /// `pending_requests`) handles the happy path; the
+    /// belt-and-suspenders re-drain right before `self.lookup = …`
+    /// catches any orphan entry whose `pending_requests` slot was
+    /// already removed (e.g. a future internal retry path that
+    /// decouples the two maps).
+    #[test]
+    fn reset_drains_in_flight_lookup_with_session_lost_before_clearing_registry() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn counting_waker() -> (Arc<CountingWake>, Waker) {
+            let inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+            let waker: Waker = Arc::clone(&inner).into();
+            (inner, waker)
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        // Issue two in-flight requests against the lookup registry — one
+        // bare `CommandLookupTopic` and one
+        // `CommandPartitionedTopicMetadata`. The runtime would normally
+        // create a `RequestFut` per request id and register a waker on
+        // it; we mimic that registration directly.
+        let lookup_rid = conn.lookup("persistent://public/default/foo", false);
+        let partition_rid = conn.get_partitioned_topic_metadata("persistent://public/default/bar");
+        let lookup_key = PendingOpKey::Request(lookup_rid);
+        let partition_key = PendingOpKey::Request(partition_rid);
+
+        let (lookup_counter, lookup_waker) = counting_waker();
+        let (partition_counter, partition_waker) = counting_waker();
+        conn.register_waker(lookup_key, lookup_waker);
+        conn.register_waker(partition_key, partition_waker);
+
+        // Pre-reset invariants: both rids live in the lookup registry
+        // (so a late broker response could still correlate against them),
+        // and the wakers are parked but unfired.
+        assert!(
+            conn.lookup.lookups.contains_key(&lookup_rid),
+            "lookup registry holds the in-flight lookup pre-reset"
+        );
+        assert!(
+            conn.lookup.partitions.contains(&partition_rid),
+            "lookup registry holds the in-flight partition request pre-reset"
+        );
+        assert_eq!(
+            lookup_counter.0.load(Ordering::SeqCst),
+            0,
+            "no waker fires pre-reset"
+        );
+        assert_eq!(
+            partition_counter.0.load(Ordering::SeqCst),
+            0,
+            "no waker fires pre-reset"
+        );
+
+        conn.reset();
+
+        // (1) Wakers fired exactly once each — the user's task is now
+        // schedulable on the runtime, and the next poll will inspect
+        // `take_outcome`.
+        assert_eq!(
+            lookup_counter.0.load(Ordering::SeqCst),
+            1,
+            "the lookup waker must fire exactly once on reset"
+        );
+        assert_eq!(
+            partition_counter.0.load(Ordering::SeqCst),
+            1,
+            "the partitioned-metadata waker must fire exactly once on reset"
+        );
+
+        // (2) `OpOutcome::SessionLost` is published for both rids — the
+        // user future observes the lost session immediately on its next
+        // poll, NOT after the 30-second operation_timeout.
+        match conn.take_outcome(lookup_key) {
+            Some(OpOutcome::SessionLost { key }) => assert_eq!(key, lookup_key),
+            other => panic!("expected SessionLost on lookup rid, got {other:?}"),
+        }
+        match conn.take_outcome(partition_key) {
+            Some(OpOutcome::SessionLost { key }) => assert_eq!(key, partition_key),
+            other => panic!("expected SessionLost on partition rid, got {other:?}"),
+        }
+
+        // (3) Registry is empty after reset — a stale broker response that
+        // arrives on the dying socket's recv buffer mid-reconnect cannot
+        // correlate against a still-pending entry (defensive cleanup).
+        assert!(
+            conn.lookup.lookups.is_empty(),
+            "lookup registry is cleared after reset"
+        );
+        assert!(
+            conn.lookup.partitions.is_empty(),
+            "partition registry is cleared after reset"
+        );
+    }
+
+    /// Companion to the test above: `reset` preserves the configured
+    /// `max_pending_lookups` cap on the fresh registry, so the
+    /// connection-wide DoS protection (lookup multi-agent review
+    /// MEDIUM-2 / F1's hardening pass) survives the reconnect cycle.
+    /// Pre-fix `self.lookup = LookupRegistry::default()` reset the cap to
+    /// `0` (unbounded), silently disabling the cap until the next process
+    /// restart.
+    #[test]
+    fn reset_preserves_max_pending_lookups_cap_across_reconnect() {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                max_pending_lookups: 4,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        assert_eq!(
+            conn.lookup.max_pending, 4,
+            "fresh connection inherits the configured cap"
+        );
+
+        // Drive a lookup, then reset. The cap must still be `4` on the
+        // freshly-allocated registry — otherwise a misbehaving broker
+        // could DoS the client by inducing a reconnect to clear the cap.
+        let _rid = conn.lookup("persistent://public/default/foo", false);
+        conn.reset();
+        assert_eq!(
+            conn.lookup.max_pending, 4,
+            "max_pending_lookups cap MUST be re-applied to the freshly-allocated lookup registry"
         );
     }
 }

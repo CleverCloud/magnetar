@@ -551,7 +551,7 @@ impl<P: Providers> Producer<P> {
     }
 }
 
-impl<P: Providers> Client<P> {
+impl<P: Providers + Send + Sync> Client<P> {
     /// Open a producer.
     ///
     /// Returns once the broker has sent `CommandProducerSuccess`.
@@ -590,16 +590,13 @@ impl<P: Providers> Client<P> {
         // `PulsarClientImpl#createProducerAsync`.
         //
         // ADR-0039 routing: detect `proxy_through_service_url = true` via
-        // [`Client::lookup_topic_target`], then dispatch via the synchronous
-        // [`Client::resolve_target`]. The moonpool engine currently surfaces
-        // `ClientError::ProxyUnsupportedOnUnsupervisedClient` for the proxy branch —
-        // fully wiring the per-broker pool here requires moving the pool's dial onto a
-        // separately-spawned task because `moonpool_core::NetworkProvider` is declared
-        // `#[async_trait(?Send)]` (single-core design); the facade's `CreateProducerApi`
-        // trait method returns `Pin<Box<dyn Future + Send>>` which would otherwise be
-        // unsatisfiable on a generic `P`. Tracked as follow-up in ADR-0039.
+        // [`Client::lookup_topic_target`], then dispatch via [`Client::resolve_target`].
+        // On a client built via `connect_plain_supervised`, the `Proxy` branch routes
+        // through the per-broker connection pool (`crate::pool`); on `connect_plain` /
+        // `from_parts` clients the pool is `None` and the branch surfaces
+        // `ProxyUnsupportedOnUnsupervisedClient`.
         let target = self.lookup_topic_target(&req.topic).await?;
-        let target_shared = self.resolve_target(&target, &req.topic)?;
+        let target_shared = self.resolve_target(&target, &req.topic).await?;
         let (handle, slot) = {
             let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);
@@ -828,6 +825,20 @@ impl Future for RequestFut {
         }
         conn.register_waker(self.key, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for RequestFut {
+    /// Drop-time cleanup: clear our entry from the connection's waker slab so
+    /// a cancelled producer-side request future (close-producer, etc.) does
+    /// not leak a [`std::task::Waker`] in the slab. For
+    /// [`PendingOpKey::Send`] keys the per-producer-slot waker is also
+    /// cleared by [`magnetar_proto::Connection::unregister_waker`]. Mirrors
+    /// the tokio engine's
+    /// [`magnetar_runtime_tokio::producer::RequestFut::drop`]. Lookup
+    /// multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
+    fn drop(&mut self) {
+        self.shared.inner.lock().unregister_waker(self.key);
     }
 }
 

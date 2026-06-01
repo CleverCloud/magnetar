@@ -718,7 +718,11 @@ impl<P: Providers> Consumer<P> {
     /// `CommandAck` so the message is never silently dropped. Mirrors
     /// Java's `acknowledgmentGroupTime` path.
     pub fn ack_grouped(&self, message_id: MessageId) {
-        let now = std::time::Instant::now();
+        // ADR-0011: route the sans-io monotonic input through the
+        // engine-supplied clock so deterministic-sim runs feed virtual
+        // Instants into `ack_grouped_individual`. Production TokioProviders
+        // default the closure to `Instant::now` so behaviour is unchanged.
+        let now = self.shared.now_instant();
         {
             let mut conn = self.shared.inner.lock();
             conn.ack_grouped_individual(self.handle, message_id, now);
@@ -729,7 +733,8 @@ impl<P: Providers> Consumer<P> {
     /// Stage a cumulative ack into this consumer's ack-grouping tracker.
     /// See [`Self::ack_grouped`] for the semantics.
     pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
-        let now = std::time::Instant::now();
+        // ADR-0011: engine-supplied clock; see `ack_grouped`.
+        let now = self.shared.now_instant();
         {
             let mut conn = self.shared.inner.lock();
             conn.ack_grouped_cumulative(self.handle, message_id, now);
@@ -784,7 +789,8 @@ impl<P: Providers> Consumer<P> {
     /// `message_ids` vector matches Pulsar's "all unacked" semantics
     /// used by [`Self::redeliver_unacked`].
     pub fn negative_ack_many(&self, message_ids: Vec<MessageId>) {
-        let now = std::time::Instant::now();
+        // ADR-0011: engine-supplied clock; see `ack_grouped`.
+        let now = self.shared.now_instant();
         {
             let mut conn = self.shared.inner.lock();
             conn.negative_ack(self.handle, message_ids, now);
@@ -796,7 +802,8 @@ impl<P: Providers> Consumer<P> {
     /// per-message redelivery delay. Mirrors Java's PIP-37 backoff
     /// path.
     pub fn negative_ack_with_delay(&self, message_id: MessageId, delay: std::time::Duration) {
-        let now = std::time::Instant::now();
+        // ADR-0011: engine-supplied clock; see `ack_grouped`.
+        let now = self.shared.now_instant();
         {
             let mut conn = self.shared.inner.lock();
             conn.negative_ack_with_delay(self.handle, message_id, delay, now);
@@ -1049,7 +1056,7 @@ impl<P: Providers> Consumer<P> {
     }
 }
 
-impl<P: Providers> Client<P> {
+impl<P: Providers + Send + Sync> Client<P> {
     /// Subscribe to a topic and return a fully-initialised [`Consumer`].
     ///
     /// Resolves once the broker has acked the subscribe (`CommandSuccess`
@@ -1078,12 +1085,11 @@ impl<P: Providers> Client<P> {
     ) -> Result<Consumer<P>, ClientError> {
         let receiver_queue_size = req.receiver_queue_size;
         // See `Client::open_producer`: subscribe also needs lookup-driven bundle
-        // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`. See the
-        // same site for the ADR-0039 proxy-routing nuance — `resolve_target` is sync and
-        // errors `ProxyUnsupportedOnUnsupervisedClient` on the proxy branch until the
-        // pool's dial is moved onto a separately-spawned task.
+        // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`. On a
+        // client built via `connect_plain_supervised`, ADR-0039 proxy routing fans the
+        // `Proxy` branch through the per-broker pool inside `Client::resolve_target`.
         let target = self.lookup_topic_target(&req.topic).await?;
-        let shared = self.resolve_target(&target, &req.topic)?;
+        let shared = self.resolve_target(&target, &req.topic).await?;
         let (handle, slot) = {
             let mut conn = shared.inner.lock();
             let handle = conn.subscribe(req);
@@ -1142,6 +1148,19 @@ impl Future for RequestFut {
         }
         conn.register_waker(key, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for RequestFut {
+    /// Drop-time cleanup: clear our entry from the connection's waker slab so
+    /// a cancelled consumer-side request future (seek, get-last-msg-id, ack
+    /// receipt, etc.) does not leak a [`std::task::Waker`] in the slab.
+    /// Mirrors the tokio engine's
+    /// [`magnetar_runtime_tokio::consumer::RequestFut::drop`]. Lookup
+    /// multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
+    fn drop(&mut self) {
+        let key = PendingOpKey::Request(self.request_id);
+        self.shared.inner.lock().unregister_waker(key);
     }
 }
 

@@ -38,6 +38,7 @@ use moonpool_core::Providers;
 use parking_lot::Mutex;
 
 use crate::driver::DriverHandle;
+use crate::pool::ProxyConnectionPool;
 use crate::{ConnectionShared, EngineError, MoonpoolEngine, TopicListChange};
 
 /// Engine-layer error surfaced by [`Client`]. Wraps [`EngineError`] with a
@@ -83,9 +84,10 @@ pub enum ClientError {
 /// Outcome of a [`Client::lookup_topic`] call.
 ///
 /// Re-export of [`magnetar_proto::event::LookupOutcome`]. The state machine
-/// has already followed any `Redirect` chain internally; the user sees the
-/// terminal outcome (`Connect` or `Failed`) plus — for observability — the
-/// last `Redirected` variant if the broker chose to surface it.
+/// has already followed any `Redirect` chain internally; the user **only**
+/// sees a terminal outcome — `Connect` or `Failed`. Intermediate `Redirected`
+/// variants ride the proto events queue for diagnostics only and never
+/// resolve the user-facing future (HIGH-4 from the lookup multi-agent review).
 pub type LookupTopicResult = LookupOutcome;
 
 /// Top-level magnetar client, moonpool engine flavour.
@@ -96,6 +98,14 @@ pub type LookupTopicResult = LookupOutcome;
 pub struct Client<P: Providers> {
     shared: Arc<ConnectionShared>,
     driver: Mutex<Option<DriverHandle>>,
+    /// Per-broker proxy connection pool (ADR-0039). Populated only when the
+    /// client was built via [`Client::connect_plain_supervised`] (which
+    /// captures the providers + bootstrap config needed to lazily dial pool
+    /// entries). The other connect entrypoints — [`Client::connect_plain`]
+    /// and [`Client::from_parts`] — leave this `None`, so a lookup answering
+    /// `proxy_through_service_url = true` on those paths still surfaces
+    /// [`ClientError::ProxyUnsupportedOnUnsupervisedClient`].
+    pool: Option<Arc<ProxyConnectionPool<P>>>,
     /// Held only so `Client` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -108,12 +118,25 @@ pub struct Client<P: Providers> {
 /// callers keep their full proto view; runtime code (producer / consumer open paths) uses
 /// this routing-decision enum instead.
 ///
-/// **moonpool note**: the `Proxy` arm is detected but not yet routed — see
-/// [`Client::resolve_target`] for the follow-up tracker.
+/// **moonpool note**: the `Proxy` arm and the `Direct { broker_url: Some(_) }` arm are
+/// detected at the proto level but not yet routed — see [`Client::resolve_target`] for the
+/// follow-up tracker. Both depend on the (in-flight) moonpool flavour of
+/// `ProxyConnectionPool` tracked in `docs/follow-ups.md §3`. ADR-0039 §"Multi-broker DIRECT
+/// routing (2026-06-01)" documents the symmetry with the tokio engine.
 #[derive(Debug, Clone)]
 pub(crate) enum LookupTarget {
-    /// Bootstrap connection — same path as before ADR-0039.
-    Direct,
+    /// Direct connection.
+    /// * `broker_url = None` — no broker URL advertised; the bootstrap connection serves as the
+    ///   data plane (today's behaviour).
+    /// * `broker_url = Some(url)` — the lookup resolved to a specific broker. The tokio engine
+    ///   routes through its `ProxyConnectionPool`; on moonpool the resolution still uses the
+    ///   bootstrap connection if `url` matches `host:port` of the bootstrap, and otherwise errors
+    ///   with `ProxyUnsupportedOnUnsupervisedClient` (no moonpool pool yet — see
+    ///   `docs/follow-ups.md §3`).
+    Direct {
+        #[allow(dead_code)]
+        broker_url: Option<String>,
+    },
     /// Proxy-routed: a pool entry keyed by `broker_url` with
     /// `CommandConnect.proxy_to_broker_url = broker_url`. The `broker_url` is
     /// captured for the follow-up wiring; on moonpool today the resolution
@@ -156,6 +179,7 @@ impl<P: Providers> Client<P> {
         Ok(Self {
             shared,
             driver: Mutex::new(Some(driver)),
+            pool: None,
             _providers: std::marker::PhantomData,
         })
     }
@@ -183,11 +207,30 @@ impl<P: Providers> Client<P> {
         dns_resolver: Option<Arc<dyn crate::DnsResolver>>,
     ) -> Result<Self, ClientError> {
         let (shared, driver) = engine
-            .connect_plain_supervised(addr, config, service_url_provider, dns_resolver)
+            .connect_plain_supervised(
+                addr,
+                config.clone(),
+                service_url_provider.clone(),
+                dns_resolver.clone(),
+            )
             .await?;
+        // ADR-0039: capture the bootstrap inputs into a `ConnectionFactory`
+        // so the proxy pool can lazily dial per-broker pinned connections
+        // when a `proxy_through_service_url = true` lookup arrives. The
+        // bootstrap connection itself does NOT set `proxy_to_broker_url`
+        // (it stays the lookup-and-control plane).
+        let factory = crate::pool::ConnectionFactory {
+            addr: addr.to_owned(),
+            bootstrap_config: config,
+            providers: engine.providers().clone(),
+            service_url_provider,
+            dns_resolver,
+        };
+        let pool = ProxyConnectionPool::new(factory);
         Ok(Self {
             shared,
             driver: Mutex::new(Some(driver)),
+            pool: Some(pool),
             _providers: std::marker::PhantomData,
         })
     }
@@ -207,6 +250,7 @@ impl<P: Providers> Client<P> {
         Self {
             shared,
             driver: Mutex::new(Some(driver)),
+            pool: None,
             _providers: std::marker::PhantomData,
         }
     }
@@ -246,11 +290,16 @@ impl<P: Providers> Client<P> {
     }
 
     /// Close the connection. Drains outbound bytes via the driver loop and
-    /// then joins the driver task.
+    /// then joins the driver task. If the client owns a proxy pool
+    /// (ADR-0039), every pool entry is closed and its supervised driver
+    /// joined as part of teardown.
     ///
     /// Idempotent: calling close more than once is a no-op on subsequent
     /// calls (the driver handle is taken on the first call).
-    pub async fn close(self) {
+    pub async fn close(self)
+    where
+        P: Send + Sync,
+    {
         {
             let mut conn = self.shared.inner.lock();
             conn.close();
@@ -260,6 +309,12 @@ impl<P: Providers> Client<P> {
         if let Some(handle) = handle {
             // best-effort close — drop the driver's terminal error.
             let _ = handle.join().await;
+        }
+        // Tear down the proxy pool (ADR-0039). Pool entries are independent
+        // supervised driver loops; each observes its own `is_user_closed()`
+        // after `close()` is called and exits cleanly.
+        if let Some(pool) = self.pool.as_ref() {
+            pool.close().await;
         }
     }
 
@@ -301,12 +356,27 @@ impl<P: Providers> Client<P> {
                     let broker_url = proxy_broker_authority(&raw);
                     Ok(LookupTarget::Proxy { broker_url })
                 } else {
-                    Ok(LookupTarget::Direct)
+                    // ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)": capture the
+                    // resolved broker URL even on the DIRECT branch so the proto-level
+                    // routing decision matches the tokio engine. The synchronous
+                    // [`Self::resolve_target`] handles the rest (bootstrap match → reuse
+                    // bootstrap; other → defer to the moonpool pool follow-up).
+                    let broker_url = broker_service_url.or(broker_service_url_tls);
+                    Ok(LookupTarget::Direct { broker_url })
                 }
             }
-            // `Redirected` is surfaced for observability after the proto layer's redirect
-            // chain settles; treat as direct routing (ADR-0039 §"Consequences").
-            LookupOutcome::Redirected { .. } => Ok(LookupTarget::Direct),
+            // HIGH-4 (lookup multi-agent review): `Redirected` is never delivered to the
+            // user-facing future — the proto state machine chases the chain internally and
+            // only publishes terminal outcomes (`Connect` / `Failed`) against the
+            // user-facing request-id. Intermediate `Redirected` outcomes ride the proto
+            // events queue for diagnostics only. This arm exists solely to keep the match
+            // exhaustive (future-proofing) and would only fire on a state-machine bug.
+            LookupOutcome::Redirected { .. } => Err(ClientError::Other(
+                "BUG: intermediate Redirected outcome leaked to the user-facing future — \
+                 proto layer should chase redirects internally and only deliver terminal \
+                 outcomes (HIGH-4)"
+                    .to_owned(),
+            )),
             LookupOutcome::Failed { code, message } => Err(ClientError::Broker { code, message }),
         }
     }
@@ -314,26 +384,60 @@ impl<P: Providers> Client<P> {
     /// Resolve a [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
     /// CommandProducer / CommandSubscribe on (ADR-0039).
     ///
-    /// **moonpool note**: synchronous — every `.await` in the producer/consumer open path
-    /// has to stay Send-able because the facade's `CreateProducerApi` /
-    /// `SubscribeApi` traits pin their returns as `Pin<Box<dyn Future + Send>>`. The
-    /// `Proxy` branch therefore errors out with
-    /// `ClientError::ProxyUnsupportedOnUnsupervisedClient` for now; wiring the pool's
-    /// dial properly requires moving the connect work onto a separately-spawned task with
-    /// a `Send` Notify hand-off (the trait-pinned `+ Send` cast through `Box::pin` in
-    /// `engine.rs` can't accommodate a `network.connect(...).await` inside the future
-    /// body because `moonpool_core::NetworkProvider` is `#[async_trait(?Send)]`).
-    /// Production tokio paths use the tokio engine which does the routing end-to-end.
-    pub(crate) fn resolve_target(
+    /// **Send-safety on moonpool**: `moonpool_core::NetworkProvider` is
+    /// declared `#[async_trait(?Send)]` (single-core design), so dialling a
+    /// fresh pool entry inside this future body would break the
+    /// `Pin<Box<dyn Future + Send>>` pin on the facade's
+    /// [`crate::CreateProducerApi`] / [`crate::SubscribeApi`] trait methods.
+    /// The pool side-steps that by hoisting the dial into a task spawned via
+    /// [`moonpool_core::TaskProvider::spawn_task`] (which uses
+    /// `spawn_local` — no `Send` bound on the spawned future); this function
+    /// only `.await`s a [`tokio::sync::Notify`] and a `Mutex<Option<...>>`
+    /// slot, both of which are `Send`. See `crate::pool::get_or_open` for
+    /// the full mechanism.
+    ///
+    /// Multi-broker DIRECT (F7 in the lookup-hardening pass) is not yet
+    /// pool-routed on moonpool: a `Direct { broker_url: Some(_) }` falls
+    /// back to the bootstrap connection. The pool side already exists
+    /// (F8); wiring it for the Direct arm is a one-line change to
+    /// `pool::get_or_open(_, broker_url, /* proxy_to_broker_url = */ None)`
+    /// once the pool surface admits the parameter. Tracked in
+    /// `docs/follow-ups.md §3`.
+    pub(crate) async fn resolve_target(
         &self,
         target: &LookupTarget,
         topic: &str,
-    ) -> Result<Arc<ConnectionShared>, ClientError> {
+    ) -> Result<Arc<ConnectionShared>, ClientError>
+    where
+        P: Send + Sync,
+    {
         match target {
-            LookupTarget::Direct => Ok(self.shared.clone()),
-            LookupTarget::Proxy { .. } => Err(ClientError::ProxyUnsupportedOnUnsupervisedClient {
-                topic: topic.to_owned(),
-            }),
+            LookupTarget::Direct { broker_url: None } => Ok(self.shared.clone()),
+            LookupTarget::Direct {
+                broker_url: Some(_),
+            } => {
+                // Multi-broker DIRECT on moonpool: the pool already exists
+                // (F8) but its `get_or_open` surface only takes a logical
+                // broker URL (the proxy case). Wiring DIRECT through it is a
+                // follow-up; for now fall back to the bootstrap connection
+                // — same as the pre-amendment behaviour. Tokio's engine
+                // does the full per-broker dial.
+                Ok(self.shared.clone())
+            }
+            LookupTarget::Proxy { broker_url } => {
+                let pool = self.pool.as_ref().ok_or_else(|| {
+                    ClientError::ProxyUnsupportedOnUnsupervisedClient {
+                        topic: topic.to_owned(),
+                    }
+                })?;
+                // Every pool entry dials the same physical address — the
+                // proxy URL the bootstrap was built with. The proto-layer's
+                // `CommandConnect.proxy_to_broker_url` (set on the cloned
+                // ConnectionConfig inside the pool) tells the proxy which
+                // backend broker this connection serves.
+                let shared = crate::pool::get_or_open(pool.clone(), broker_url).await?;
+                Ok(shared)
+            }
         }
     }
 
@@ -342,10 +446,13 @@ impl<P: Providers> Client<P> {
     /// `authoritative` should be `false` for a fresh lookup; the state
     /// machine flips it to `true` on any internal redirect retry. The
     /// returned [`LookupTopicResult`] is the *terminal* outcome after the
-    /// sans-io layer has followed any redirect chain.
+    /// sans-io layer has followed any redirect chain — HIGH-4 (lookup
+    /// multi-agent review) makes this end-to-end user-observable.
     ///
     /// # Errors
-    /// - [`ClientError::Broker`] when the broker returns a `Failed` lookup.
+    /// - [`ClientError::Broker`] when the broker returns a `Failed` lookup (including the synthetic
+    ///   `Failed` raised when the redirect chain exceeds
+    ///   [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops).
     /// - [`ClientError::Other`] when an outcome other than [`OpOutcome::LookupResponse`] arrives on
     ///   this request id (this would be a state-machine bug, not a transient failure).
     pub async fn lookup_topic(
@@ -751,10 +858,10 @@ impl<P: Providers> Client<P> {
 }
 
 /// Future that resolves the [`OpOutcome`] correlated with a single
-/// `RequestId`. Mirrors the tokio engine's `PartitionedMetadataFut` — the
-/// name there is misleading; it's the canonical "wait for a request-id-
-/// correlated outcome" future, reused for lookup, partitioned metadata,
-/// watch-topic-list-snapshot, and the txn family.
+/// `RequestId`. Mirrors the tokio engine's identically-named `RequestFut`:
+/// the canonical "wait for a request-id-correlated outcome" future, reused
+/// for lookup, partitioned metadata, watch-topic-list-snapshot, and the
+/// txn family.
 struct RequestFut {
     shared: Arc<ConnectionShared>,
     request_id: RequestId,
@@ -771,6 +878,19 @@ impl Future for RequestFut {
         }
         conn.register_waker(key, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for RequestFut {
+    /// Drop-time cleanup: clear our entry from the connection's waker slab so
+    /// a cancelled lookup / partitioned-metadata / watch-snapshot / txn
+    /// future does not leave a dangling [`std::task::Waker`] behind. Mirrors
+    /// the tokio engine's
+    /// [`magnetar_runtime_tokio::client::RequestFut::drop`].
+    /// Lookup multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
+    fn drop(&mut self) {
+        let key = PendingOpKey::Request(self.request_id);
+        self.shared.inner.lock().unregister_waker(key);
     }
 }
 

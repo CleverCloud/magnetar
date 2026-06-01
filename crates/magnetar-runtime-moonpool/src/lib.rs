@@ -67,11 +67,7 @@ mod consumer;
 pub mod crypto;
 pub mod dns;
 mod driver;
-// TODO(proxy): a moonpool flavour of `magnetar_runtime_tokio::pool::ProxyConnectionPool`
-// landed earlier as scaffolding but had no production callers — the live proxy path still
-// returns `EngineError::ProxyUnsupportedOnUnsupervisedClient`. The previous module shape is
-// preserved in git history; revive from there when wiring proxy supervised support over
-// `moonpool_core::Providers`.
+mod pool;
 mod producer;
 pub mod tls;
 pub mod tls_crypto;
@@ -143,6 +139,31 @@ pub const DETERMINISTIC_SIM_EPOCH_MS: u64 = 1_704_067_200_000;
 /// pattern the tokio engine already follows.
 fn current_wall_clock_base_ms() -> u64 {
     DETERMINISTIC_SIM_EPOCH_MS
+}
+
+/// Build a [`ConnectionShared`] with the supplied providers' `TimeProvider`
+/// wired into the monotonic-clock provider. Extracted from
+/// [`MoonpoolEngine::make_shared`] so the proxy connection pool
+/// (ADR-0039) can build pinned per-broker `ConnectionShared` instances with
+/// the same deterministic-clock plumbing as the bootstrap connection —
+/// the pool only holds the providers bundle, not the engine itself.
+pub(crate) fn make_shared_with_providers<P: Providers>(
+    providers: &P,
+    config: ConnectionConfig,
+) -> Arc<ConnectionShared> {
+    let time = providers.time().clone();
+    let start = Instant::now();
+    let now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
+        start
+            .checked_add(time.now())
+            .unwrap_or_else(|| start + std::time::Duration::from_secs(0))
+    });
+    ConnectionShared::with_auth_wall_clock_and_instant(
+        config,
+        None,
+        current_wall_clock_base_ms(),
+        now_instant_provider,
+    )
 }
 
 /// Shared connection state for the moonpool engine. Mirrors the tokio
@@ -783,26 +804,7 @@ impl<P: Providers> MoonpoolEngine<P> {
     /// `wall_clock_ms` from `providers.time().now()` once it starts.
     /// (ADR-0011 sans-io clock injection.)
     fn make_shared(&self, config: ConnectionConfig) -> Arc<ConnectionShared> {
-        let time = self.providers.time().clone();
-        // Anchor the moonpool elapsed-Duration to a single host Instant
-        // snapshot. Under TokioProviders this is "now"; under
-        // SimProviders the elapsed Duration is driven by virtual time
-        // and the anchor is irrelevant to determinism (Instants are
-        // only compared for differences). Either way the closure
-        // returns `start + provider.time().now()` so two reads in the
-        // same virtual tick produce the same Instant.
-        let start = Instant::now();
-        let now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
-            start
-                .checked_add(time.now())
-                .unwrap_or_else(|| start + std::time::Duration::from_secs(0))
-        });
-        ConnectionShared::with_auth_wall_clock_and_instant(
-            config,
-            None,
-            current_wall_clock_base_ms(),
-            now_instant_provider,
-        )
+        make_shared_with_providers(&self.providers, config)
     }
 
     /// Connect to a Pulsar broker over the moonpool [`NetworkProvider`] and
@@ -1033,7 +1035,12 @@ pub(crate) async fn handshake_plain<P: Providers>(
             return Err(EngineError::PeerClosed);
         }
         let bytes = read_buf.split().freeze();
-        shared.inner.lock().handle_bytes(Instant::now(), &bytes)?;
+        // ADR-0011: feed `Connection::handle_bytes` an Instant pulled
+        // through the engine-supplied clock (default: host `Instant::now`;
+        // moonpool `make_shared` rewires it to the `TimeProvider`-anchored
+        // closure so deterministic-sim runs stay reproducible).
+        let now = shared.now_instant();
+        shared.inner.lock().handle_bytes(now, &bytes)?;
     }
 }
 

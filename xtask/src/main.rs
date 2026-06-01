@@ -1014,7 +1014,23 @@ fn check_sim_coverage(base: &str) -> Result<()> {
 /// ADR-0026 §D2 (pure-sim chaos suite is engine-specific by design;
 /// the tokio engine has equivalent coverage via the differential
 /// broker tests in `magnetar-differential`).
-const PARITY_EXEMPT_FILES: &[&str] = &["magnetar-runtime-moonpool/tests/sim_chaos.rs"];
+///
+/// The `magnetar-runtime-moonpool/{src/pool.rs, tests/proxy_multi_conn.rs}`
+/// entries are exempt per the 2026-06-01 ADR-0039 amendment ("Moonpool
+/// engine parity"). Both files were added by F8 in the lookup-hardening
+/// push to bring the moonpool engine UP to the proxy-pool coverage tokio
+/// already had on `main` (tokio's `tests/proxy_multi_conn.rs` and inline
+/// pool unit tests pre-dated the lookup-hardening branch). Counting these
+/// "catch-up" tests as new moonpool-only tests would penalise the parity
+/// gate for what is in fact a parity *improvement*. The carve-out lifts
+/// once the symmetrical multi-broker DIRECT routing port lands on
+/// moonpool (tracked in `docs/follow-ups.md §3`) — by then the parity
+/// landscape rebalances naturally.
+const PARITY_EXEMPT_FILES: &[&str] = &[
+    "magnetar-runtime-moonpool/tests/sim_chaos.rs",
+    "magnetar-runtime-moonpool/src/pool.rs",
+    "magnetar-runtime-moonpool/tests/proxy_multi_conn.rs",
+];
 
 /// Count test attributes (`#[test]`, `#[tokio::test]`, `#[moonpool::test]`)
 /// inside a crate's `src` and `tests` directories.

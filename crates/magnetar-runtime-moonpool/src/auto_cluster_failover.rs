@@ -210,6 +210,22 @@ impl<P: Providers> AutoClusterFailover<P> {
         let probe = self.probe.clone();
         let active = self.active.clone();
         let time = providers.time().clone();
+        // ADR-0011 sans-io clock injection. Anchor a host `Instant` once at
+        // `start()` so the per-tick deadline read flows through
+        // `providers.time().now()` (a `Duration` since the provider's base).
+        // Under `TokioProviders` `time.now()` tracks the host monotonic clock
+        // so behaviour is unchanged; under `SimProviders` it advances only as
+        // the simulator ticks — meaning the deadline handed to
+        // `HealthProbe::poll_probe` and the matching `Instant::now()` read
+        // inside `run_probe` (which we also re-route below) stay consistent
+        // with virtual time.
+        let clock_anchor = Instant::now();
+        let time_for_deadline = time.clone();
+        let now_instant = move || {
+            clock_anchor
+                .checked_add(time_for_deadline.now())
+                .unwrap_or(clock_anchor)
+        };
         let stop = Arc::new(Notify::new());
         let stop_for_task = stop.clone();
         let join = providers.task().spawn_task(
@@ -235,7 +251,7 @@ impl<P: Providers> AutoClusterFailover<P> {
                             }
                         }
                     }
-                    let deadline = Instant::now() + interval;
+                    let deadline = now_instant() + interval;
                     let mut new_active: Option<usize> = None;
                     for (idx, url) in urls.iter().enumerate() {
                         // Adapt the sans-io `poll_probe` into an async wait via
@@ -509,7 +525,21 @@ async fn run_probe<P: Providers>(providers: &P, endpoint: &str, deadline: Instan
     // `TimeProvider::timeout` API understands. Overshoot collapses to
     // `Duration::ZERO`, which means "fire immediately" — same outcome
     // as a connect that exceeded the deadline.
-    let now = Instant::now();
+    //
+    // ADR-0011 sans-io clock injection: read "now" through the
+    // engine-supplied time provider rather than the host `Instant::now`.
+    // The caller (`AutoClusterFailover::start`) anchors its deadlines to
+    // the same `providers.time()` source via a host `Instant` + virtual
+    // `Duration` offset, so the subtraction below yields a virtual-time
+    // duration under `SimProviders` while remaining numerically identical
+    // under `TokioProviders` (whose `time.now()` tracks the host monotonic
+    // clock). Standalone callers that pass a host-clock deadline still
+    // observe a correct relative duration: the anchor cancels out as long
+    // as both timestamps come from the same clock family.
+    let clock_anchor = Instant::now();
+    let now = clock_anchor
+        .checked_add(providers.time().now())
+        .unwrap_or(clock_anchor);
     let dur = deadline.saturating_duration_since(now);
 
     let connect_fut = async {

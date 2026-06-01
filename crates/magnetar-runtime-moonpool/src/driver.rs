@@ -51,7 +51,7 @@
 //! [`Transport`]: crate::transport::Transport
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::ConnectionEvent;
@@ -97,6 +97,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                 ConnectionEvent::AuthChallenge { .. }
                     | ConnectionEvent::TopicListChanged { .. }
                     | ConnectionEvent::TopicMigrated { .. }
+                    | ConnectionEvent::RedirectUrlRejected { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
             )
         });
@@ -145,6 +146,27 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                 shared
                     .replicated_subscription_marker_notify
                     .notify_waiters();
+            }
+            ConnectionEvent::RedirectUrlRejected {
+                source,
+                broker_service_url,
+                broker_service_url_tls,
+            } => {
+                // Defence-in-depth mirror of the tokio runtime: the
+                // configured `redirect_url_allow_list` refused the
+                // broker-advertised URL, so the proto state machine
+                // swallowed the redirect / migration command. We surface
+                // a `warn!` for operator visibility and **do not**
+                // propagate an error — the supervised reconnect arm
+                // stays asleep, the original `AuthProvider::initial()`
+                // credentials are NOT handed to the unverified host.
+                tracing::warn!(
+                    source,
+                    rejected_url = broker_service_url.as_deref(),
+                    rejected_url_tls = broker_service_url_tls.as_deref(),
+                    "broker-advertised redirect URL rejected by redirect_url_allow_list; \
+                     ignoring the hint (auth provider NOT replayed against the unverified host)",
+                );
             }
             ConnectionEvent::TopicMigrated {
                 producer,
@@ -460,11 +482,14 @@ where
 
     // `socket_alive_since` lets us decide, once `driver_loop_inner` returns, whether the
     // previous socket lived long enough to count as a stable reconnect (-> `backoff.reset()`)
-    // or died inside `drop_grace` (-> keep growing). Uses host-clock `Instant::now()` to
-    // pair with the same clock the inner loop already stamps on `handle_bytes` /
-    // `ProducerReady`. Determinism for the schedule itself is preserved via `time.sleep()`
-    // on the redial path.
-    let mut socket_alive_since = Instant::now();
+    // or died inside `drop_grace` (-> keep growing). Routed through the engine-supplied
+    // monotonic clock (`shared.now_instant()`) so under `SimProviders` the elapsed-duration
+    // gate (`should_reset_backoff`) flows from virtual time — keeping the schedule
+    // bit-for-bit reproducible per ADR-0011 "Engines snapshot the host clock at the call
+    // boundary; moonpool plugs in virtual clocks". Elapsed durations below use the same
+    // provider via `now_instant().saturating_duration_since(...)` rather than the host
+    // `Instant::elapsed()`.
+    let mut socket_alive_since = shared.now_instant();
     let mut last_inner_result =
         driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
 
@@ -485,14 +510,14 @@ where
         // ADR-0028: feed a TCP-drop signal into the anti-thrash detector if
         // the socket closed within the supervisor's `drop_grace` of the
         // most-recent successful re-attach. Mirror of the tokio runtime
-        // (`crates/magnetar-runtime-tokio/src/driver.rs`). `Instant::now()` is
-        // used here for the per-host clock that pairs with the `Instant` the
-        // sans-io state machine already stamps on `ProducerReady` /
-        // `SubscribeAcked` (driver inner loop, ~`Instant::now()` on
-        // `handle_bytes`). The moonpool engine keeps deterministic sleep
-        // scheduling via `time.sleep(duration)` below.
+        // (`crates/magnetar-runtime-tokio/src/driver.rs`). Reads time through
+        // `shared.now_instant()` so under `SimProviders` the comparison flows
+        // from virtual time, satisfying ADR-0011 ("Engines snapshot the host
+        // clock at the call boundary; moonpool plugs in virtual clocks").
+        // Determinism of the sleep schedule is preserved via `time.sleep`
+        // below.
         if cfg.anti_thrash_threshold.is_some() {
-            let now = Instant::now();
+            let now = shared.now_instant();
             let should_record = {
                 let conn = shared.inner.lock();
                 conn.anti_thrash_state()
@@ -513,13 +538,13 @@ where
         // deterministic for the sleep itself) before the next redial.
         let cooldown_until = {
             let conn = shared.inner.lock();
-            match conn.anti_thrash_tick(Instant::now()) {
+            match conn.anti_thrash_tick(shared.now_instant()) {
                 magnetar_proto::AntiThrashDisposition::Cooldown { until } => Some(until),
                 magnetar_proto::AntiThrashDisposition::Normal => None,
             }
         };
         if let Some(until) = cooldown_until {
-            let now = Instant::now();
+            let now = shared.now_instant();
             if until > now {
                 let dur = until.saturating_duration_since(now);
                 tracing::warn!(
@@ -537,7 +562,14 @@ where
         // geometrically up to `max_backoff`. The attempt counter is per-cycle (it gates
         // `max_attempts` give-up, not the cadence). Mirror of the tokio runtime.
         let backoff = backoff.get_or_insert_with(|| cfg.build_backoff(seed));
-        if cfg.should_reset_backoff(socket_alive_since.elapsed()) {
+        // ADR-0011: route the elapsed-duration computation through the
+        // engine-supplied clock instead of `Instant::elapsed()` (which
+        // implicitly reads the host `Instant::now`). Under `SimProviders`
+        // this keeps the reset gate honoring virtual time.
+        let socket_lifetime = shared
+            .now_instant()
+            .saturating_duration_since(socket_alive_since);
+        if cfg.should_reset_backoff(socket_lifetime) {
             backoff.reset();
         }
         let mut attempt: u32 = 0;
@@ -620,7 +652,9 @@ where
         shared.driver_waker.notify_one();
 
         transport = new_transport;
-        socket_alive_since = Instant::now();
+        // ADR-0011: virtual-clock-anchored timestamp; pairs with the
+        // `should_reset_backoff` gate above.
+        socket_alive_since = shared.now_instant();
         last_inner_result = driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
     }
 }
@@ -757,8 +791,12 @@ where
         }
 
         // 3. Park until something interesting happens. The duration is relative because moonpool's
-        //    `TimeProvider::sleep` takes a `Duration`, not an `Instant`.
-        let sleep_dur = deadline.map(|t| t.saturating_duration_since(Instant::now()));
+        //    `TimeProvider::sleep` takes a `Duration`, not an `Instant`. The "now" baseline is
+        //    pulled through the engine-supplied clock (`shared.now_instant()`) so sim runs compute
+        //    the sleep window against virtual time — pairing with the `Instant` the state machine
+        //    itself was handed via `handle_bytes` / `handle_timeout` below (ADR-0011 sans-io clock
+        //    injection).
+        let sleep_dur = deadline.map(|t| t.saturating_duration_since(shared.now_instant()));
 
         tokio::select! {
             biased;
@@ -789,7 +827,13 @@ where
                 // into place with zero memcpy. Mid-frame fall-back
                 // re-uses the legacy `extend_from_slice` path.
                 let chunk = read_buf.split();
-                let now = Instant::now();
+                // ADR-0011: feed the sans-io state machine an Instant pulled
+                // through the engine-supplied clock so `SimProviders` runs
+                // are bit-for-bit reproducible. The default provider reads
+                // `Instant::now()`, so production TokioProviders behaviour
+                // is unchanged; SimProviders threads `time.now()` through
+                // the closure installed by `MoonpoolEngine::make_shared`.
+                let now = shared.now_instant();
                 if let Err(err) = shared.inner.lock().handle_bytes_owned(now, chunk) {
                     shared.inner.lock().mark_disconnected();
                     return Err(err.into());
@@ -843,7 +887,9 @@ where
             // elapses or the time provider shuts down; both are treated as
             // a tick.
             () = sleep_or_pending::<P>(&time, sleep_dur) => {
-                shared.inner.lock().handle_timeout(Instant::now());
+                // ADR-0011: route the tick-now through the engine clock so
+                // virtual-time sim runs see deterministic timeout firings.
+                shared.inner.lock().handle_timeout(shared.now_instant());
             }
         }
     }

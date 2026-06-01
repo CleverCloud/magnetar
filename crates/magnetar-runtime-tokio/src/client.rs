@@ -59,18 +59,22 @@ pub struct Client {
 ///
 /// Mirrors the upstream Java client's
 /// [`LookupTopicResult`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/LookupTopicResult.java)
-/// (`logicalAddress`, `physicalAddress`, `isUseProxy`) collapsed to the variants magnetar
-/// actually distinguishes today (ADR-0039).
+/// (`logicalAddress`, `physicalAddress`, `isUseProxy`).
 #[derive(Debug, Clone)]
 enum LookupTarget {
-    /// Direct connection — the bootstrap conn is the data plane (today's behaviour for
-    /// single-broker setups without a proxy). The lookup's `broker_service_url` may name a
-    /// different broker than the one currently connected; multi-broker direct routing is
-    /// follow-up work tracked in ADR-0039 §"Consequences".
-    Direct,
+    /// Direct connection — the broker is reachable directly (no proxy).
+    ///
+    /// * `broker_url = None` — the lookup did not advertise a broker URL (single-broker cluster or
+    ///   pre-2.4 broker behaviour). The bootstrap connection serves as the data plane.
+    /// * `broker_url = Some(url)` — the lookup resolved to a specific broker. If `url` matches the
+    ///   bootstrap's `host:port`, the bootstrap connection is reused; otherwise
+    ///   `Client::resolve_target` opens (or reuses) a pool entry that dials the resolved broker
+    ///   **directly** (`CommandConnect.proxy_to_broker_url = None`). Multi-broker DIRECT routing —
+    ///   ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)".
+    Direct { broker_url: Option<String> },
     /// Proxy connection — the broker is reachable only through the proxy. Routes through
     /// the [`ProxyConnectionPool`] keyed by `broker_url`; dial target is the bootstrap's
-    /// physical address (the proxy).
+    /// physical address (the proxy) and `CommandConnect.proxy_to_broker_url = Some(url)`.
     Proxy { broker_url: String },
 }
 
@@ -373,25 +377,32 @@ impl Client {
     /// Issue a `CommandLookupTopic` for `topic` and decide where the topic's data ops should
     /// ride. Returns one of the [`LookupTarget`] variants:
     ///
-    /// - [`LookupTarget::Direct`] — the bootstrap connection is the data plane. Either we are
-    ///   talking directly to the broker (no proxy) or the lookup resolved to the same broker we are
-    ///   already connected to. Producer / consumer rides on `self.shared`.
+    /// - [`LookupTarget::Direct { broker_url: None }`] — no broker URL was advertised on the
+    ///   lookup; the bootstrap connection serves as the data plane (single-broker behaviour).
+    /// - [`LookupTarget::Direct { broker_url: Some(url) }`] — the lookup resolved to a specific
+    ///   broker (`proxy_through_service_url = false`). [`Self::resolve_target`] either reuses the
+    ///   bootstrap (when `url` matches the bootstrap `host:port`) or opens a pinned pool entry that
+    ///   dials the resolved broker directly. ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)".
     /// - [`LookupTarget::Proxy { broker_url }`] — the lookup answered `proxy_through_service_url =
     ///   true`. The runtime opens (or reuses) a pool entry for `broker_url` with
     ///   `CommandConnect.proxy_to_broker_url = broker_url`; the data ops ride on that pool entry.
     ///   See ADR-0039.
     ///
-    /// `Redirected` outcomes are folded back into `Direct` after a `tracing::warn!` —
-    /// the proto layer's `lookup` state machine chases redirect chains internally, so by the
-    /// time we observe `Redirected` the chain has settled. Multi-broker DIRECT routing
-    /// (without proxy) is still single-connection today; see ADR-0039 §"Consequences".
+    /// **HIGH-4 (lookup multi-agent review)**: the proto-layer state machine chases
+    /// redirect chains internally and only ever delivers terminal outcomes
+    /// (`LookupOutcome::Connect` / `LookupOutcome::Failed`) to the user-facing future.
+    /// Intermediate `LookupOutcome::Redirected` outcomes never reach this function —
+    /// they're pushed to the proto events queue for diagnostics only — so the broker
+    /// URL we observe here is the resolved tail of the chain. The redirect cap from
+    /// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] surfaces as `LookupOutcome::Failed`
+    /// → [`ClientError::Broker`] when a hostile broker exhausts the budget.
     async fn lookup_topic(&self, topic: &str) -> Result<LookupTarget, ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.lookup(topic, false)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -428,25 +439,32 @@ impl Client {
                         )))?;
                             Ok(LookupTarget::Proxy { broker_url })
                         } else {
-                            Ok(LookupTarget::Direct)
+                            // ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)": capture
+                            // the resolved broker URL so `resolve_target` can route the data
+                            // ops to the right broker on multi-broker clusters. If the
+                            // broker declined to advertise a URL we keep `None`, preserving
+                            // the pre-amendment behaviour (route on the bootstrap connection)
+                            // for single-broker setups.
+                            let broker_url = direct_broker_url(
+                                broker_service_url,
+                                broker_service_url_tls,
+                                self.bootstrap_scheme(),
+                            );
+                            Ok(LookupTarget::Direct { broker_url })
                         }
                     }
-                    magnetar_proto::LookupOutcome::Redirected {
-                        broker_service_url,
-                        broker_service_url_tls,
-                    } => {
-                        // The proto layer already chases redirects internally and only surfaces
-                        // `Redirected` for observability after the redirect chain has settled.
-                        // Treat as a direct lookup — multi-broker direct routing (without proxy)
-                        // is follow-up work tracked in ADR-0039 §"Consequences".
-                        tracing::warn!(
-                            topic,
-                            broker_service_url = broker_service_url.as_deref(),
-                            broker_service_url_tls = broker_service_url_tls.as_deref(),
-                            "broker redirected lookup; multi-broker DIRECT redirect is follow-up work"
-                        );
-                        Ok(LookupTarget::Direct)
-                    }
+                    // HIGH-4: `Redirected` is no longer surfaced to the engine —
+                    // the proto state machine chases the chain internally and only
+                    // publishes terminal outcomes (`Connect` / `Failed`) against the
+                    // user-facing request-id. Intermediate `Redirected` outcomes ride
+                    // the proto events queue for diagnostics only. Keep the match
+                    // exhaustive so a future variant addition is a hard compile error.
+                    magnetar_proto::LookupOutcome::Redirected { .. } => Err(ClientError::Other(
+                        "BUG: intermediate Redirected outcome leaked to the user-facing \
+                         future — proto layer should chase redirects internally and only \
+                         deliver terminal outcomes (HIGH-4)"
+                            .to_owned(),
+                    )),
                     magnetar_proto::LookupOutcome::Failed { code, message } => {
                         Err(ClientError::Broker { code, message })
                     }
@@ -460,29 +478,88 @@ impl Client {
     }
 
     /// Resolve the [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
-    /// CommandProducer / CommandSubscribe on. [`LookupTarget::Direct`] returns the bootstrap
-    /// connection; [`LookupTarget::Proxy { broker_url }`] opens (or reuses) the pool entry
-    /// keyed by `(broker_url, bootstrap URL)`.
+    /// CommandProducer / CommandSubscribe on.
+    ///
+    /// * [`LookupTarget::Direct { broker_url: None }`] — bootstrap connection (no broker URL was
+    ///   advertised; single-broker behaviour).
+    /// * [`LookupTarget::Direct { broker_url: Some(url) }`] — multi-broker DIRECT routing. If
+    ///   `url`'s `host:port` matches the bootstrap, reuse the bootstrap. Otherwise open (or reuse)
+    ///   a pool entry keyed by `(url, url)` and dial the resolved broker directly
+    ///   (`CommandConnect.proxy_to_broker_url = None`). ADR-0039 §"Multi-broker DIRECT routing
+    ///   (2026-06-01)".
+    /// * [`LookupTarget::Proxy { broker_url }`] — opens (or reuses) the pool entry keyed by
+    ///   `(broker_url, bootstrap URL)` with `CommandConnect.proxy_to_broker_url =
+    ///   Some(broker_url)`.
     async fn resolve_target(
         &self,
         target: LookupTarget,
         topic: &str,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         match target {
-            LookupTarget::Direct => Ok(self.shared.clone()),
+            LookupTarget::Direct { broker_url: None } => Ok(self.shared.clone()),
+            LookupTarget::Direct {
+                broker_url: Some(broker_url),
+            } => self.resolve_direct_broker(&broker_url, topic).await,
             LookupTarget::Proxy { broker_url } => {
                 let pool = self.pool.as_ref().ok_or_else(|| {
                     ClientError::ProxyUnsupportedOnSocketClient {
                         topic: topic.to_owned(),
                     }
                 })?;
-                // Every pool entry dials the same physical address — the proxy URL the
+                // Every proxy pool entry dials the same physical address — the proxy URL the
                 // bootstrap was built with. The proto-layer's `CommandConnect.proxy_to_broker_url`
                 // is what tells the proxy which backend broker this connection serves.
                 let physical = pool.bootstrap_url();
-                pool.get_or_open(&broker_url, &physical).await
+                pool.get_or_open(&broker_url, &physical, Some(broker_url.clone()))
+                    .await
             }
         }
+    }
+
+    /// Resolve a multi-broker DIRECT routing target. If `broker_url` matches the bootstrap's
+    /// `host:port`, the bootstrap connection is reused (no extra dial). Otherwise the pool
+    /// opens (or reuses) a pinned connection that dials `broker_url` directly with
+    /// `CommandConnect.proxy_to_broker_url = None`. ADR-0039 §"Multi-broker DIRECT routing
+    /// (2026-06-01)".
+    ///
+    /// `broker_url` may be either a full Pulsar URL (e.g. `pulsar://broker-1:6650`) or a
+    /// bare `host:port` (the `host:port` form is what
+    /// [`crate::client::direct_broker_url`] / [`preferred_broker_url`] emit). Both forms
+    /// must round-trip to the same parsed `(host, port)` for the bootstrap-equality check
+    /// to bypass the pool dial.
+    async fn resolve_direct_broker(
+        &self,
+        broker_url: &str,
+        topic: &str,
+    ) -> Result<Arc<ConnectionShared>, ClientError> {
+        let Some(pool) = self.pool.as_ref() else {
+            // `from_socket` callers have no URL to dial — the bootstrap is the only
+            // connection available. Single-broker scenarios still work; multi-broker
+            // dial requests would have nowhere to land.
+            tracing::warn!(
+                topic,
+                broker_url,
+                "lookup resolved to a specific broker but client has no dial-able URL \
+                 (from_socket); falling back to bootstrap connection"
+            );
+            return Ok(self.shared.clone());
+        };
+        let parsed = parse_direct_broker_url(broker_url, pool.bootstrap_scheme())?;
+
+        // Bootstrap-equality fast path: same `host:port` as the connect-time URL → reuse the
+        // bootstrap connection. Saves one TCP/TLS handshake on every single-broker /
+        // bootstrap-broker lookup, and keeps existing single-broker tests on exactly one
+        // socket (no spurious pool entry).
+        let bootstrap = pool.bootstrap_url();
+        if parsed.host == bootstrap.host && parsed.port == bootstrap.port {
+            return Ok(self.shared.clone());
+        }
+
+        // Different broker → pin a dedicated pool entry. `logical == physical` here because
+        // we are dialling the broker directly (the proxy is not in the picture). The pool
+        // is keyed on `(logical, "host:port")` so two DIRECT lookups to the same broker URL
+        // share one entry, just like two PROXY lookups for the same backend share one.
+        pool.get_or_open(broker_url, &parsed, None).await
     }
 
     /// Scheme of the bootstrap connection — used by [`Self::lookup_topic`] to pick between
@@ -510,7 +587,7 @@ impl Client {
             conn.new_txn(timeout)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -564,7 +641,7 @@ impl Client {
             conn.tc_client_connect(0)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -596,7 +673,7 @@ impl Client {
             conn.add_partition_to_txn(txn, topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -624,7 +701,7 @@ impl Client {
             conn.add_subscription_to_txn(txn, subscription.into(), topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -651,7 +728,7 @@ impl Client {
             conn.end_txn(txn, action)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -680,7 +757,7 @@ impl Client {
             conn.watch_topic_list(namespace, pattern)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -770,7 +847,7 @@ impl Client {
             conn.get_partitioned_topic_metadata(topic)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = PartitionedMetadataFut {
+        let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
@@ -1052,6 +1129,61 @@ fn preferred_broker_url(
     }
 }
 
+/// Pick the broker URL the lookup advertised on the DIRECT
+/// (`proxy_through_service_url = false`) path. Mirrors
+/// [`preferred_broker_url`] in TLS-posture preference but **keeps the full Pulsar
+/// URL** (e.g. `pulsar://broker-1:6650`) instead of stripping the scheme: on the
+/// DIRECT path the URL is fed back into [`ParsedUrl::parse`] to recover the dial
+/// target and TLS choice (whereas the proxy path needs the scheme-less
+/// `host:port` form `CommandConnect.proxy_to_broker_url` expects per ADR-0045).
+///
+/// Returns `None` when the lookup omitted both `broker_service_url` and
+/// `broker_service_url_tls` (pre-2.4 brokers, single-broker setups). The caller
+/// folds `None` into `LookupTarget::Direct { broker_url: None }` so the
+/// bootstrap connection serves as the data plane unchanged.
+fn direct_broker_url(
+    broker_url: Option<String>,
+    broker_url_tls: Option<String>,
+    scheme: Scheme,
+) -> Option<String> {
+    match scheme {
+        Scheme::Tls => broker_url_tls.or(broker_url),
+        Scheme::Plain => broker_url.or(broker_url_tls),
+    }
+}
+
+/// Parse a broker URL captured on the DIRECT lookup path into a
+/// [`ParsedUrl`] usable by the pool's [`Transport::connect_with_resolver`]
+/// call. Accepts both the full `pulsar://host:port` form and the bare
+/// `host:port` form (the latter is what [`preferred_broker_url`] emits for the
+/// proxy path — when a DIRECT lookup ever hands us that form we still want to
+/// dial it). The scheme falls back to the bootstrap scheme when missing —
+/// brokers in a single cluster typically run the same TLS posture, and the
+/// bootstrap's `tls_config` is the only one the pool has on hand.
+fn parse_direct_broker_url(
+    broker_url: &str,
+    bootstrap_scheme: Scheme,
+) -> Result<ParsedUrl, ClientError> {
+    if let Ok(parsed) = ParsedUrl::parse(broker_url) {
+        return Ok(parsed);
+    }
+    // Try as bare `host:port`. We synthesise a `pulsar://`-prefixed URL using
+    // the bootstrap scheme so [`ParsedUrl::parse`] does the host/port split
+    // for us — this also catches subtle inputs like IPv6 literals consistently
+    // with the rest of the runtime.
+    let scheme_prefix = match bootstrap_scheme {
+        Scheme::Tls => "pulsar+ssl://",
+        Scheme::Plain => "pulsar://",
+    };
+    let synthetic = format!("{scheme_prefix}{broker_url}");
+    ParsedUrl::parse(&synthetic).map_err(|err| {
+        ClientError::Other(format!(
+            "lookup advertised broker URL '{broker_url}' that is neither a Pulsar URL nor a \
+             host:port pair the runtime can dial: {err}"
+        ))
+    })
+}
+
 pub(crate) async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), ClientError> {
     ConnectedFut {
         shared,
@@ -1131,12 +1263,18 @@ impl Future for ConnectedFut {
     }
 }
 
-struct PartitionedMetadataFut {
-    shared: Arc<ConnectionShared>,
-    request_id: magnetar_proto::RequestId,
+/// "Wait for the broker reply to a request-id-keyed command" future.
+///
+/// Reused for lookup, partitioned-metadata, watch-topic-list-snapshot, and
+/// the txn family — i.e. every command whose response is correlated by
+/// `request_id` rather than by `producer_id` / `consumer_id`. Mirrors the
+/// moonpool engine's identically-named `RequestFut`.
+pub(crate) struct RequestFut {
+    pub(crate) shared: Arc<ConnectionShared>,
+    pub(crate) request_id: magnetar_proto::RequestId,
 }
 
-impl Future for PartitionedMetadataFut {
+impl Future for RequestFut {
     type Output = magnetar_proto::OpOutcome;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1147,6 +1285,24 @@ impl Future for PartitionedMetadataFut {
         }
         conn.register_waker(key, cx.waker().clone());
         Poll::Pending
+    }
+}
+
+impl Drop for RequestFut {
+    /// Drop-time cleanup: clear our entry from the connection's waker slab so
+    /// a cancelled `partitioned_metadata` / `lookup` future does not leave a
+    /// dangling [`std::task::Waker`] behind. Without this hook the entry is
+    /// otherwise reclaimed lazily — either when the matching broker response
+    /// finally lands (the dispatcher `remove`s the waker and wakes a no-op
+    /// task) or on the next [`magnetar_proto::Connection::reset`] — but for
+    /// long-running connections that issue many short-lived lookups whose
+    /// callers cancel before the round-trip completes, those entries
+    /// accumulate. Defense-in-depth per the lookup multi-agent review
+    /// MEDIUM-4 finding. ADR-0024 four-layer coverage lives in
+    /// `tests/lookup_drop_unregister.rs`.
+    fn drop(&mut self) {
+        let key = magnetar_proto::PendingOpKey::Request(self.request_id);
+        self.shared.inner.lock().unregister_waker(key);
     }
 }
 

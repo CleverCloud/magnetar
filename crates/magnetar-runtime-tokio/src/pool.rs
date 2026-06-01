@@ -1,26 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-broker connection pool for the Apache Pulsar Proxy (ADR-0039).
+//! Per-broker connection pool for the Apache Pulsar Proxy and for
+//! multi-broker DIRECT routing (ADR-0039 — base proxy entry +
+//! 2026-06-01 amendment).
 //!
-//! When a `CommandLookupTopic` answer carries
-//! `proxy_through_service_url = true`, the proxy expects the client to open a
-//! **new** connection back to the proxy address (the "physical" target) with
-//! `CommandConnect.proxy_to_broker_url` set to the resolved broker URL (the
-//! "logical" target). The proxy then forwards every frame on that connection to
-//! the resolved broker.
+//! Two routing shapes share this pool, keyed on
+//! `(logical_broker_url, physical_dial_address)`:
 //!
-//! This module mirrors the upstream Java client's
-//! [`ConnectionPool`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java):
-//! a `HashMap<(logical_address, physical_address), Arc<ConnectionShared>>`
-//! keyed by the broker URL (logical) and proxy URL (physical). Each entry
-//! owns its own supervised driver loop (ADR-0028 anti-thrash + ADR-0024
-//! per-handle backoff still apply unchanged) and stays alive for the lifetime
-//! of the `Client`.
+//! 1. **Proxy-routed** (`proxy_through_service_url = true` on the lookup): every pool entry dials
+//!    the same `physical` (the proxy on `service_url`); `CommandConnect.proxy_to_broker_url` is set
+//!    to `logical` so the proxy forwards every frame on that connection to the resolved broker.
+//!    (The original ADR-0039 case.)
+//! 2. **Direct multi-broker** (`proxy_through_service_url = false` plus a `broker_service_url` that
+//!    names a broker *other than* the bootstrap): the pool dials the resolved broker directly
+//!    (`logical == physical`), `CommandConnect.proxy_to_broker_url` is **`None`** (we are talking
+//!    directly to the broker, no proxy in the middle). The 2026-06-01 amendment to ADR-0039 wires
+//!    this path so the second producer / consumer on a multi-broker cluster lands on the broker the
+//!    lookup actually resolved to, instead of bouncing on the bootstrap with
+//!    `ServerError::NotConnected "not served by this instance"`.
+//!
+//! Both shapes mirror the upstream Java client's
+//! [`ConnectionPool`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java)
+//! key `(logical_address, physical_address)`. Each entry owns its own
+//! supervised driver loop (ADR-0028 anti-thrash + ADR-0024 per-handle backoff
+//! still apply unchanged) and stays alive for the lifetime of the `Client`.
 //!
 //! The pool is opt-in by topology: when every lookup answer reports
-//! `proxy_through_service_url = false` (single-broker setups, no proxy), the
-//! pool stays empty and behaviour is byte-identical to the pre-ADR-0039
-//! single-connection client.
+//! `proxy_through_service_url = false` and either omits the broker URL or
+//! names the bootstrap broker, the pool stays empty and behaviour is
+//! byte-identical to the pre-ADR-0039 single-connection client.
 //!
 //! See [ADR-0039](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)
 //! for the design and [issue #15](https://github.com/CleverCloud/magnetar/issues/15)
@@ -146,10 +154,20 @@ impl ProxyConnectionPool {
     /// `CommandConnected` has fired, so the caller can immediately queue
     /// `CommandProducer` / `CommandSubscribe` on it.
     ///
-    /// `logical` is the broker URL the proxy resolved to (the value passed
-    /// into `CommandConnect.proxy_to_broker_url`). `physical` is the URL
-    /// magnetar dials — almost always the original `service_url` the client
-    /// was built with (i.e. the proxy address).
+    /// `logical` is the broker URL the lookup resolved to (used as the
+    /// `CommandConnect.proxy_to_broker_url` value on the proxy path).
+    /// `physical` is the URL magnetar dials.
+    ///
+    /// `proxy_to_broker_url` controls the `CommandConnect.proxy_to_broker_url`
+    /// field on the entry's CONNECT frame:
+    ///
+    /// * `Some(host_port)` — the proxy path (the value the Pulsar Proxy expects, `host:port` form,
+    ///   no scheme). The pool entry rides on `physical` (= the proxy address) and the proxy
+    ///   forwards each frame to the broker named in `proxy_to_broker_url`. Mirrors Java
+    ///   `Commands.newConnect(..., targetBroker)`.
+    /// * `None` — direct multi-broker routing. The pool entry dials `physical` (= the resolved
+    ///   broker) directly, no proxy in the middle. ADR-0039 §"Multi-broker DIRECT routing
+    ///   (2026-06-01)".
     ///
     /// Concurrency: if two callers race for the same key, only one connection
     /// is opened; the loser drops its half-built `Entry` and gets the
@@ -158,6 +176,7 @@ impl ProxyConnectionPool {
         &self,
         logical: &str,
         physical: &ParsedUrl,
+        proxy_to_broker_url: Option<String>,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         let key: PoolKey = (
             logical.to_owned(),
@@ -172,7 +191,7 @@ impl ProxyConnectionPool {
         // Slow path — dial, handshake, register. `Transport::connect_with_resolver`
         // and the supervisor's handshake-wait both `.await`, so we MUST NOT
         // hold the entries-lock across them.
-        let entry = self.build_entry(logical, physical).await?;
+        let entry = self.build_entry(physical, proxy_to_broker_url).await?;
 
         // Race resolution: another caller may have populated the key while we
         // were dialling. The winner stays; we drop ours.
@@ -200,15 +219,19 @@ impl ProxyConnectionPool {
 
     async fn build_entry(
         &self,
-        logical: &str,
         physical: &ParsedUrl,
+        proxy_to_broker_url: Option<String>,
     ) -> Result<Arc<Entry>, ClientError> {
-        // Per-entry ConnectionConfig: clone the bootstrap, override the
-        // `proxy_to_broker_url` so `CommandConnect` carries the logical
-        // broker URL on this connection. Everything else (auth, supervisor,
-        // memory limit, schema, etc.) tracks the bootstrap config 1:1.
+        // Per-entry ConnectionConfig: clone the bootstrap, override
+        // `proxy_to_broker_url` according to the routing shape:
+        //   * `Some(host_port)` — proxy path, CONNECT carries the logical broker URL so the proxy
+        //     can forward subsequent frames.
+        //   * `None` — direct multi-broker path, CONNECT carries no `proxy_to_broker_url` (we are
+        //     dialling the broker directly).
+        // Everything else (auth, supervisor, memory limit, schema, etc.)
+        // tracks the bootstrap config 1:1.
         let mut cfg = self.factory.bootstrap_config.clone();
-        cfg.proxy_to_broker_url = Some(logical.to_owned());
+        cfg.proxy_to_broker_url = proxy_to_broker_url;
 
         let socket = Transport::connect_with_resolver(
             physical,
@@ -280,8 +303,11 @@ impl ProxyConnectionPool {
         self.factory.url.scheme
     }
 
-    /// Clone the bootstrap [`ParsedUrl`] — used by the [`crate::Client`] to feed
-    /// [`Self::get_or_open`] (every pool entry dials the same physical address).
+    /// Clone the bootstrap [`ParsedUrl`] — used by the [`crate::Client`]:
+    /// * **proxy path** — fed verbatim into [`Self::get_or_open`] as the physical dial target
+    ///   (every proxy pool entry dials the same proxy address).
+    /// * **direct multi-broker path** — used by [`crate::Client::resolve_direct_broker`] to bypass
+    ///   the pool when the resolved broker URL matches the bootstrap `host:port`.
     #[must_use]
     pub(crate) fn bootstrap_url(&self) -> ParsedUrl {
         self.factory.url.clone()

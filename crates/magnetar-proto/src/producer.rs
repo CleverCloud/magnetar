@@ -1345,6 +1345,20 @@ impl ProducerState {
         }
     }
 
+    /// Clear the waker (if any) parked on the pending [`OpSend`] for the
+    /// given sequence id. Mirrors [`Self::register_waker`] but installs
+    /// `None` instead of a fresh [`Waker`]. Called from
+    /// [`crate::Connection::unregister_waker`] when a runtime-side
+    /// `SendFut`-style future is dropped before the receipt lands, so the
+    /// dispatcher does not later wake a no-longer-interested task.
+    pub fn clear_waker(&mut self, sequence_id: SequenceId) {
+        if let Some(idx) = self.pending_index.get(&sequence_id).copied() {
+            if let Some(op) = self.pending.get_mut(idx) {
+                op.waker = None;
+            }
+        }
+    }
+
     /// Drain every in-flight `OpSend` and return the `(sequence_id, waker)` pairs that
     /// were registered by user-facing send futures. The caller is responsible for
     /// installing a `SessionLost` outcome and waking each future. Also clears the batch

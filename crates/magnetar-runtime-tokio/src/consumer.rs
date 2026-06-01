@@ -1285,6 +1285,18 @@ impl Future for RequestFut {
     }
 }
 
+impl Drop for RequestFut {
+    /// Drop-time cleanup: clear our entry from the connection's waker slab so
+    /// a cancelled consumer-side request future (seek, get-last-msg-id, ack
+    /// receipt, etc.) does not leave a dangling [`std::task::Waker`] behind.
+    /// See the matching docstring on
+    /// [`crate::client::RequestFut::drop`] for the rationale and
+    /// the lookup multi-agent review MEDIUM-4 finding.
+    fn drop(&mut self) {
+        self.shared.inner.lock().unregister_waker(self.key);
+    }
+}
+
 /// Compare two message ids lexicographically by `(ledger_id, entry_id, partition, batch_index)`.
 /// Returns `true` iff `lhs` is strictly greater than `rhs` (i.e. is from a later position in the
 /// log). Matches Java's `MessageId#compareTo` semantics.

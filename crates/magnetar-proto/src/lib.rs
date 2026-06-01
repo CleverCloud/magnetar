@@ -166,8 +166,8 @@ pub use crate::buggify::BuggifyRng;
 pub use crate::cluster_failover::ControlledClusterFailover;
 pub use crate::conn::{
     AckRequest, Connection, ConnectionConfig, CreateProducerRequest, CryptoFailureAction,
-    HandshakeState, KeySharedConfig, MemoryLimitPolicy, OpOutcome, PendingOpKey, SeekTarget,
-    SubscribeRequest,
+    HandshakeState, KeySharedConfig, MemoryLimitPolicy, OpOutcome, PendingOpKey,
+    RedirectUrlAllowList, SeekTarget, SubscribeRequest,
 };
 pub use crate::consumer::{ConsumerIdentity, ConsumerSlot, ConsumerStats, ShadowTopicMetadata};
 pub use crate::crypto::{EncryptError, MessageDecryptor, MessageEncryptor};

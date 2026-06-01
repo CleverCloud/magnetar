@@ -296,6 +296,32 @@ pub enum ConnectionEvent {
         broker_service_url_tls: Option<String>,
     },
 
+    /// The broker advertised a redirect URL (PIP-188 `TopicMigrated`,
+    /// `CommandLookupTopicResponse` proxy URL, `CommandCloseProducer` /
+    /// `CommandCloseConsumer` reassignment URL, ...) that the configured
+    /// [`RedirectUrlAllowList`](crate::conn::RedirectUrlAllowList) rejected.
+    ///
+    /// The runtime engines surface this event **instead of** honouring the
+    /// URL — no `CommandConnect` is sent to the rejected host under the
+    /// original [`AuthProvider`](crate::auth::AuthProvider). Defence in
+    /// depth: a compromised broker (or a MITM downstream of TLS
+    /// termination) cannot harvest the reused credentials by advertising
+    /// an attacker-controlled URL.
+    ///
+    /// `urls` carries the rejected URL list (plain + TLS variants, in
+    /// that order, both `Option<String>`) so operators can audit the
+    /// trigger. The runtime keeps using its original URL.
+    RedirectUrlRejected {
+        /// Where the rejected URL came from on the wire (e.g.
+        /// `"CommandTopicMigrated"`,
+        /// `"CommandLookupTopicResponse"`).
+        source: &'static str,
+        /// The rejected plaintext URL (if the broker advertised one).
+        broker_service_url: Option<String>,
+        /// The rejected TLS URL (if the broker advertised one).
+        broker_service_url_tls: Option<String>,
+    },
+
     /// The broker asked us to close a producer (e.g. fenced).
     ProducerClosedByBroker {
         /// The producer that was closed.

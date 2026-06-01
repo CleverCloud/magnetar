@@ -88,6 +88,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 ConnectionEvent::AuthChallenge { .. }
                     | ConnectionEvent::TopicListChanged { .. }
                     | ConnectionEvent::TopicMigrated { .. }
+                    | ConnectionEvent::RedirectUrlRejected { .. }
                     | ConnectionEvent::ProducerOpenFailedTransient { .. }
                     | ConnectionEvent::SubscribeFailedTransient { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
@@ -141,6 +142,29 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 shared
                     .replicated_subscription_marker_notify
                     .notify_waiters();
+            }
+            ConnectionEvent::RedirectUrlRejected {
+                source,
+                broker_service_url,
+                broker_service_url_tls,
+            } => {
+                // Defence-in-depth: the configured `redirect_url_allow_list`
+                // refused this broker-advertised URL, so the proto state
+                // machine swallowed the redirect / migration command. We
+                // surface a `warn!` for the operator audit trail and
+                // **do not** propagate an error — the supervised reconnect
+                // arm stays asleep, the original `AuthProvider::initial()`
+                // credentials are NOT handed to the unverified host, and
+                // the existing connection keeps serving (the broker that
+                // sent the redirect may close the channel separately;
+                // that's a normal transport drop, not a credential leak).
+                tracing::warn!(
+                    source,
+                    rejected_url = broker_service_url.as_deref(),
+                    rejected_url_tls = broker_service_url_tls.as_deref(),
+                    "broker-advertised redirect URL rejected by redirect_url_allow_list; \
+                     ignoring the hint (auth provider NOT replayed against the unverified host)",
+                );
             }
             ConnectionEvent::TopicMigrated {
                 producer,
@@ -315,25 +339,19 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
 /// transient-error retry path (see #71 + #72) to force the broker to (re)acquire
 /// namespace bundle ownership before we re-attach the producer / consumer.
 async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
-    use std::future::poll_fn;
-    use std::task::Poll;
+    use magnetar_proto::OpOutcome;
 
-    use magnetar_proto::{OpOutcome, PendingOpKey};
+    use crate::client::RequestFut;
 
     let request_id = {
         let mut conn = shared.inner.lock();
         conn.lookup(topic, false)
     };
     shared.driver_waker.notify_one();
-    let key = PendingOpKey::Request(request_id);
-    let outcome = poll_fn(|cx| {
-        let mut conn = shared.inner.lock();
-        if let Some(outcome) = conn.take_outcome(key) {
-            return Poll::Ready(outcome);
-        }
-        conn.register_waker(key, cx.waker().clone());
-        Poll::Pending
-    })
+    let outcome = RequestFut {
+        shared: shared.clone(),
+        request_id,
+    }
     .await;
     if matches!(
         &outcome,

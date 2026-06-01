@@ -46,6 +46,57 @@ At the façade layer the engine is selected via the `Engine` marker trait, so `P
 The higher-level façade surfaces (partitioned, multi-topics, pattern, reader, table-view, transactions, typed schemas) were lifted to be engine-generic over `E: Engine`, so they build on both engines; only a few narrow tokio-only specialisations remain.
 See [`../README.md#engine-by-engine-surface-coverage`](../README.md#engine-by-engine-surface-coverage) for the authoritative per-feature, per-engine snapshot.
 
+## Apache Pulsar Proxy connection pool
+
+[ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)
+(amended 2026-06-01) lands the per-broker connection pool on the
+moonpool engine. The pool lives at
+[`crates/magnetar-runtime-moonpool/src/pool.rs`](../crates/magnetar-runtime-moonpool/src/pool.rs)
+and mirrors
+[`crates/magnetar-runtime-tokio/src/pool.rs`](../crates/magnetar-runtime-tokio/src/pool.rs)
+1:1.
+
+The pool is populated only when the client is built via
+[`Client::connect_plain_supervised`](../crates/magnetar-runtime-moonpool/src/client.rs)
+— that constructor wraps the bootstrap connect inputs (proxy address,
+`ConnectionConfig` template, `Providers` bundle, optional
+`ServiceUrlProvider` + `DnsResolver`) into a `ConnectionFactory<P>` and
+hands it to a fresh `ProxyConnectionPool<P>`. The
+[`Client::resolve_target`](../crates/magnetar-runtime-moonpool/src/client.rs)
+hook then routes any `LookupOutcome::Connect { proxy_through_service_url
+= true, .. }` to the pool via the
+`pool::get_or_open(Arc<Self>, logical_broker_url)` async free function,
+which:
+
+1. Probes the entries map; on a hit, returns the cached `Ready` entry.
+2. On a miss, installs a `Pending(PendingDial)` slot and spawns the dial
+   work via
+   [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task)
+   — necessary because `NetworkProvider::connect` can be `?Send` on some
+   moonpool-core releases and the producer / consumer open path needs to
+   stay `Send` for the facade's
+   `CreateProducerApi` / `SubscribeApi` traits.
+3. The spawned dial task runs `network.connect` →
+   `handshake_plain` → `spawn_supervised`, then publishes the
+   `Arc<Result<Arc<ConnectionShared>, EngineError>>` into the
+   `PendingDial::result` slot and fans the result out via
+   `Notify::notify_waiters`. Racing waiters all `Arc::clone` the same
+   outcome.
+4. The dial task promotes the entry from `Pending` to
+   `Ready { shared, driver }` on success, or evicts it on failure so the
+   next caller redials.
+
+`Client::close` drains every `Ready` pool entry's supervised driver in
+addition to the bootstrap. `Pending` entries are dropped without
+explicit abort — the close path tears down the bootstrap first, the
+proxy fails any in-flight handshake, and the dial task's error path
+evicts the slot.
+
+Per-broker `ConnectionConfig.proxy_to_broker_url` is set on the
+**cloned** config inside `build_entry_async`; the bootstrap config
+itself stays untouched, so the bootstrap connection's `CommandConnect`
+omits the field (matching the Java client + Pulsar Proxy contract).
+
 ## Producer + consumer façades
 
 [`magnetar-runtime-moonpool::Producer<P>`](../crates/magnetar-runtime-moonpool/src/producer.rs) and [`magnetar-runtime-moonpool::Consumer<P>`](../crates/magnetar-runtime-moonpool/src/consumer.rs) mirror their tokio counterparts.

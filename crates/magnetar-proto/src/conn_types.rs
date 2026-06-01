@@ -50,6 +50,123 @@ pub enum PendingOpKey {
     Send(ProducerHandle, SequenceId),
 }
 
+/// Allow-list policy for broker-advertised redirect URLs.
+///
+/// **Threat model.** The broker is the source of every URL that triggers a
+/// client-side re-dial under the *same* auth provider:
+///
+/// - `CommandTopicMigrated.broker_service_url{,_tls}` (PIP-188).
+/// - `CommandLookupTopicResponse.broker_service_url{,_tls}` (data-plane lookup; relevant in proxy
+///   mode where the URL becomes `CommandConnect.proxy_to_broker_url` on the next handshake).
+/// - `CommandCloseProducer.assigned_broker_service_url{,_tls}` /
+///   `CommandCloseConsumer.assigned_broker_service_url{,_tls}`.
+///
+/// The runtime's
+/// [`AuthProvider`](crate::auth::AuthProvider)::initial / `respond_to_challenge`
+/// implementations replay credential bytes (OAuth2 bearer, SASL PLAIN,
+/// Kerberos GSSAPI, Athenz N-token, ...) on every `CommandConnect`. A
+/// compromised broker (or a MITM downstream of TLS termination) that
+/// advertises an attacker-controlled URL would therefore harvest the
+/// reused credentials on the next handshake.
+///
+/// The runtime engines (`magnetar-runtime-tokio`, `magnetar-runtime-moonpool`)
+/// consult this allow-list **before** honouring any broker-advertised URL.
+/// Rejection surfaces a
+/// [`ConnectionEvent::RedirectUrlRejected`](crate::event::ConnectionEvent::RedirectUrlRejected) and
+/// short-circuits the re-dial so the original auth provider is not handed to the unverified host.
+///
+/// # Defaults
+///
+/// [`ConnectionConfig::redirect_url_allow_list`] is `None` by default —
+/// permissive, preserving the pre-allow-list behaviour. Operators opt in
+/// when they have a known set of brokers / hostnames; defence-in-depth.
+///
+/// # Variants
+///
+/// - [`RedirectUrlAllowList::Hosts`] — accept URLs whose host literal is in the set
+///   (case-insensitive). The most common shape: pin the redirect target to a known set of broker
+///   hostnames.
+/// - [`RedirectUrlAllowList::Exact`] — accept only URLs whose full URL string is in the set.
+///   Strict; useful when the broker fleet has a small, stable URL surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectUrlAllowList {
+    /// Accept URLs whose `host` component (lowercased) is a member of
+    /// this set. The host is parsed by the in-crate ASCII scanner —
+    /// [`magnetar-proto`](crate) keeps its zero-I/O dependency surface.
+    /// URLs that fail to parse (missing authority, non-Pulsar scheme)
+    /// are rejected; that's the safe default. Port is not constrained —
+    /// pin it via [`RedirectUrlAllowList::Exact`] if the deployment
+    /// surface justifies it.
+    Hosts(Vec<String>),
+    /// Accept URLs whose full URL string (verbatim) is in this set. Strict.
+    Exact(Vec<String>),
+}
+
+impl RedirectUrlAllowList {
+    /// `true` when `url` is admitted by this allow-list.
+    ///
+    /// - [`Self::Hosts`] extracts the host component of a `pulsar://` or `pulsar+ssl://` URL and
+    ///   matches case-insensitively against the set. URLs with no extractable host (malformed,
+    ///   unsupported scheme, missing authority) are rejected — the safe default.
+    /// - [`Self::Exact`] matches the full URL literal byte-for-byte.
+    ///
+    /// The host extractor is deliberately ASCII-only (no IDNA / punycode
+    /// fold). Pulsar broker URLs use ASCII hostnames or IP literals in
+    /// practice; an IDNA-flavoured URL would simply miss the literal
+    /// match in the allow-list and be rejected, which is the safe outcome
+    /// for an unverified host.
+    ///
+    /// Sans-io: parses with a small hand-rolled scanner so
+    /// [`magnetar-proto`](crate) keeps its zero-I/O dependency surface
+    /// (no `url` crate).
+    #[must_use]
+    pub fn is_allowed(&self, url: &str) -> bool {
+        match self {
+            Self::Hosts(hosts) => match extract_pulsar_host(url) {
+                Some(host) => hosts
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(host)),
+                None => false,
+            },
+            Self::Exact(urls) => urls.iter().any(|allowed| allowed == url),
+        }
+    }
+}
+
+/// Pull the host literal out of a `pulsar://host[:port][/path...]` or
+/// `pulsar+ssl://host[:port][/path...]` URL. Returns `None` for any other
+/// scheme, missing authority, or malformed input (e.g. empty host between
+/// `://` and `:`). Used by [`RedirectUrlAllowList::is_allowed`] and unit
+/// tested below — see also the IPv6-bracket carve-out.
+fn extract_pulsar_host(url: &str) -> Option<&str> {
+    // Strip the scheme. Only the two Pulsar schemes are accepted; anything
+    // else is rejected to keep the allow-list strict — a `http://` URL the
+    // broker invented to confuse us must miss the gate.
+    let rest = url
+        .strip_prefix("pulsar://")
+        .or_else(|| url.strip_prefix("pulsar+ssl://"))?;
+
+    // IPv6 literal: `[::1]:6650`. Honour the bracket form so a future
+    // dual-stack broker doesn't inadvertently fall into the "no host" path.
+    if let Some(after_lbrack) = rest.strip_prefix('[') {
+        let close = after_lbrack.find(']')?;
+        // Tail (after `]`) must start with `:` or `/` or be empty.
+        let tail = &after_lbrack[close + 1..];
+        if !tail.is_empty() && !tail.starts_with(':') && !tail.starts_with('/') {
+            return None;
+        }
+        let host = &after_lbrack[..close];
+        if host.is_empty() {
+            return None;
+        }
+        return Some(host);
+    }
+
+    let host_end = rest.find([':', '/']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() { None } else { Some(host) }
+}
+
 /// Connection configuration.
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
@@ -93,6 +210,38 @@ pub struct ConnectionConfig {
     /// budget frees up. Ignored when
     /// [`memory_limit_bytes`](Self::memory_limit_bytes) is `0`.
     pub memory_limit_policy: MemoryLimitPolicy,
+    /// Cap on the *total* number of in-flight broker LOOKUP +
+    /// partitioned-topic-metadata requests on this connection. `0` (the
+    /// default) preserves the historical unbounded behaviour and matches
+    /// Java.
+    ///
+    /// Set to a small positive value (e.g. `1024`) to harden the client
+    /// against pending-lookup memory amplification by a misbehaving or
+    /// hostile broker — closes the "pending-lookup memory amplification"
+    /// finding from the lookup multi-agent review. Requests that would
+    /// exceed the cap surface synchronously as `LookupOutcome::Failed
+    /// { code: 0, message: "lookup rejected: max pending" }` without ever
+    /// touching the wire.
+    pub max_pending_lookups: usize,
+    /// Allow-list for broker-advertised redirect URLs (PIP-188
+    /// `TopicMigrated`, `CommandLookupTopicResponse` proxy URLs,
+    /// `CommandCloseProducer` / `CommandCloseConsumer` reassignment URLs).
+    ///
+    /// `None` (the default) is permissive: the runtime trusts every
+    /// URL the broker advertises and honours it on the next handshake
+    /// under the same [`AuthProvider`](crate::auth::AuthProvider). This
+    /// preserves pre-allow-list behaviour.
+    ///
+    /// `Some(allow_list)` is defence-in-depth: the runtime validates every
+    /// broker-advertised URL through
+    /// [`RedirectUrlAllowList::is_allowed`] before re-dialling. A
+    /// rejected URL surfaces a
+    /// [`ConnectionEvent::RedirectUrlRejected`](crate::event::ConnectionEvent::RedirectUrlRejected)
+    /// and short-circuits the re-dial; the runtime keeps using the
+    /// original URL (no credentials are sent to the rejected host).
+    ///
+    /// See [`RedirectUrlAllowList`] for the threat-model rationale.
+    pub redirect_url_allow_list: Option<RedirectUrlAllowList>,
 }
 
 /// Policy applied when the configured global publish memory budget is
@@ -135,7 +284,105 @@ impl Default for ConnectionConfig {
             supervisor: None,
             memory_limit_bytes: 0,
             memory_limit_policy: MemoryLimitPolicy::FailImmediately,
+            max_pending_lookups: 0,
+            redirect_url_allow_list: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod redirect_url_allow_list_tests {
+    //! Unit tests for [`RedirectUrlAllowList`] — sans-io behaviour only.
+    //! The runtime-side wiring is exercised in
+    //! `magnetar-runtime-tokio/tests/topic_migrated_allow_list.rs` and the
+    //! mirrored moonpool / differential layers.
+
+    use super::{ConnectionConfig, RedirectUrlAllowList};
+
+    #[test]
+    fn default_redirect_allow_list_is_permissive() {
+        let cfg = ConnectionConfig::default();
+        assert!(
+            cfg.redirect_url_allow_list.is_none(),
+            "default must be permissive (None) to preserve pre-allow-list behaviour",
+        );
+    }
+
+    #[test]
+    fn hosts_variant_matches_on_host_case_insensitive() {
+        let list = RedirectUrlAllowList::Hosts(vec![
+            "broker-a.example.com".to_owned(),
+            "broker-b.example.com".to_owned(),
+        ]);
+        assert!(list.is_allowed("pulsar://broker-a.example.com:6650"));
+        assert!(list.is_allowed("pulsar+ssl://broker-b.example.com:6651"));
+        // Case-insensitive: the broker may advertise upper-case authority.
+        assert!(list.is_allowed("pulsar://BROKER-A.example.com:6650"));
+    }
+
+    #[test]
+    fn hosts_variant_rejects_unlisted_hosts() {
+        let list = RedirectUrlAllowList::Hosts(vec!["broker-a.example.com".to_owned()]);
+        assert!(!list.is_allowed("pulsar://attacker.example.com:6650"));
+        assert!(!list.is_allowed("pulsar://10.0.0.1:6650"));
+    }
+
+    #[test]
+    fn hosts_variant_rejects_unparseable_url() {
+        // Defensive default: parse-failure means "we cannot verify the
+        // host", so we reject. A misbehaving broker should not be able to
+        // bypass the gate by sending a malformed URL.
+        let list = RedirectUrlAllowList::Hosts(vec!["broker-a.example.com".to_owned()]);
+        assert!(!list.is_allowed("not-a-url"));
+        assert!(!list.is_allowed(""));
+    }
+
+    #[test]
+    fn exact_variant_requires_literal_match() {
+        let list = RedirectUrlAllowList::Exact(vec![
+            "pulsar://broker-a.example.com:6650".to_owned(),
+            "pulsar+ssl://broker-b.example.com:6651".to_owned(),
+        ]);
+        assert!(list.is_allowed("pulsar://broker-a.example.com:6650"));
+        assert!(list.is_allowed("pulsar+ssl://broker-b.example.com:6651"));
+        // Different port: rejected (the host alone is not enough under Exact).
+        assert!(!list.is_allowed("pulsar://broker-a.example.com:7000"));
+        // Different scheme: rejected.
+        assert!(!list.is_allowed("pulsar+ssl://broker-a.example.com:6650"));
+    }
+
+    #[test]
+    fn empty_list_rejects_every_url() {
+        let hosts = RedirectUrlAllowList::Hosts(Vec::new());
+        let exact = RedirectUrlAllowList::Exact(Vec::new());
+        assert!(!hosts.is_allowed("pulsar://broker.example.com:6650"));
+        assert!(!exact.is_allowed("pulsar://broker.example.com:6650"));
+    }
+
+    #[test]
+    fn hosts_variant_admits_ip_literal_authority() {
+        let list = RedirectUrlAllowList::Hosts(vec!["10.0.0.5".to_owned()]);
+        assert!(list.is_allowed("pulsar://10.0.0.5:6650"));
+        assert!(!list.is_allowed("pulsar://10.0.0.6:6650"));
+    }
+
+    #[test]
+    fn hosts_variant_admits_ipv6_bracketed_authority() {
+        let list = RedirectUrlAllowList::Hosts(vec!["::1".to_owned()]);
+        assert!(list.is_allowed("pulsar://[::1]:6650"));
+        assert!(list.is_allowed("pulsar+ssl://[::1]:6651"));
+        assert!(!list.is_allowed("pulsar://[::2]:6650"));
+    }
+
+    #[test]
+    fn hosts_variant_rejects_non_pulsar_scheme() {
+        let list = RedirectUrlAllowList::Hosts(vec!["broker.example.com".to_owned()]);
+        // A malicious broker that advertises `http://`, `tcp://` or any
+        // other scheme should fail the gate even when the host matches —
+        // we only ever re-dial Pulsar URLs.
+        assert!(!list.is_allowed("http://broker.example.com:6650"));
+        assert!(!list.is_allowed("tcp://broker.example.com:6650"));
+        assert!(!list.is_allowed("javascript:broker.example.com"));
     }
 }
 
