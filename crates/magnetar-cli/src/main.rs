@@ -47,7 +47,7 @@ use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
-    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType,
+    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, DispatchRate,
     PersistencePolicies, RetentionPolicies, TenantInfo,
 };
 
@@ -395,6 +395,36 @@ pub(crate) enum NamespacesCmd {
     /// Remove a namespace's persistence policy (fall back to broker default).
     /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/persistence`.
     RemovePersistence {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Get a namespace's consumer dispatch-rate policy.
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/dispatchRate`.
+    GetDispatchRate {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's consumer dispatch-rate policy.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/dispatchRate`.
+    SetDispatchRate {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Throttle in messages/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_msg: i32,
+        /// Throttle in bytes/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_byte: i64,
+        /// Averaging window in seconds.
+        #[arg(long, default_value_t = 1)]
+        period_seconds: i32,
+        /// Treat rate as additive on top of namespace publish rate.
+        #[arg(long, default_value_t = false)]
+        relative_to_publish: bool,
+    },
+    /// Remove a namespace's consumer dispatch-rate policy.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/dispatchRate`.
+    RemoveDispatchRate {
         /// Fully qualified namespace.
         namespace: String,
     },
@@ -1000,6 +1030,33 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         }
         NamespacesCmd::RemovePersistence { namespace } => {
             admin.namespace_remove_persistence(&namespace).await?;
+            Ok(())
+        }
+        NamespacesCmd::GetDispatchRate { namespace } => {
+            print_json(&admin.namespace_get_dispatch_rate(&namespace).await?)
+        }
+        NamespacesCmd::SetDispatchRate {
+            namespace,
+            rate_msg,
+            rate_byte,
+            period_seconds,
+            relative_to_publish,
+        } => {
+            admin
+                .namespace_set_dispatch_rate(
+                    &namespace,
+                    DispatchRate {
+                        dispatch_throttling_rate_in_msg: rate_msg,
+                        dispatch_throttling_rate_in_byte: rate_byte,
+                        rate_period_in_second: period_seconds,
+                        relative_to_publish_rate: relative_to_publish,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveDispatchRate { namespace } => {
+            admin.namespace_remove_dispatch_rate(&namespace).await?;
             Ok(())
         }
     }

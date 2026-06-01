@@ -456,6 +456,48 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's consumer dispatch-rate policy.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/dispatchRate`. Returns
+    /// the per-namespace consumer-dispatch throttle (msg/sec, byte/sec,
+    /// window in seconds). `-1` on either dimension means unlimited.
+    /// Java: `NamespacesBase#getDispatchRate`.
+    pub async fn namespace_get_dispatch_rate(&self, ns: &str) -> Result<DispatchRate, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "dispatchRate"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's consumer dispatch-rate policy.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/dispatchRate` with a
+    /// JSON `DispatchRate` body.
+    /// Java: `NamespacesBase#setDispatchRate`.
+    pub async fn namespace_set_dispatch_rate(
+        &self,
+        ns: &str,
+        rate: DispatchRate,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "dispatchRate"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&rate))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's consumer dispatch-rate policy.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/dispatchRate`.
+    /// Java: `NamespacesBase#deleteDispatchRate`.
+    pub async fn namespace_remove_dispatch_rate(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "dispatchRate"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
@@ -1157,6 +1199,25 @@ pub struct PersistencePolicies {
     /// Managed-ledger mark-delete-rate cap (ops/sec). `0.0` disables
     /// the throttle.
     pub managed_ledger_max_mark_delete_rate: f64,
+}
+
+/// Java `DispatchRate` — a sliding-window throttle (msg/sec + byte/sec
+/// over a `ratePeriodInSecond` window). Shared shape between the
+/// per-namespace consumer dispatch rate, the per-subscription dispatch
+/// rate, and the cross-cluster replicator dispatch rate. `-1` on either
+/// dimension disables that axis of the throttle.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DispatchRate {
+    /// Throttle in messages/sec. `-1` = unlimited.
+    pub dispatch_throttling_rate_in_msg: i32,
+    /// Throttle in bytes/sec. `-1` = unlimited.
+    pub dispatch_throttling_rate_in_byte: i64,
+    /// Window size in seconds the throttle averages over.
+    pub rate_period_in_second: i32,
+    /// If `true`, dispatch rate is interpreted as an addend on top of
+    /// the namespace publish rate rather than an absolute cap.
+    pub relative_to_publish_rate: bool,
 }
 
 /// Java `BacklogQuota` — one entry in the namespace-level backlog quota

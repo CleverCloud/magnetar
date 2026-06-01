@@ -14,7 +14,7 @@
 //! `removeReplicatorDispatchRate`, `getPublishRate`, `setPublishRate`,
 //! `removePublishRate`).
 
-use magnetar_admin::{AdminClient, PersistencePolicies};
+use magnetar_admin::{AdminClient, DispatchRate, PersistencePolicies};
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -87,4 +87,68 @@ async fn persistence_get_set_remove_cycle() {
         .namespace_remove_persistence("acme/svc")
         .await
         .expect("remove persistence");
+}
+
+#[tokio::test]
+async fn dispatch_rate_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/dispatchRate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dispatchThrottlingRateInMsg": 1000,
+            "dispatchThrottlingRateInByte": 1048576_i64,
+            "ratePeriodInSecond": 1,
+            "relativeToPublishRate": false,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/dispatchRate"))
+        .and(body_json(serde_json::json!({
+            "dispatchThrottlingRateInMsg": -1,
+            "dispatchThrottlingRateInByte": -1,
+            "ratePeriodInSecond": 1,
+            "relativeToPublishRate": true,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/namespaces/acme/svc/dispatchRate"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let rate = admin
+        .namespace_get_dispatch_rate("acme/svc")
+        .await
+        .expect("get dispatch rate");
+    assert_eq!(rate.dispatch_throttling_rate_in_msg, 1000);
+    assert_eq!(rate.dispatch_throttling_rate_in_byte, 1_048_576);
+    assert_eq!(rate.rate_period_in_second, 1);
+    assert!(!rate.relative_to_publish_rate);
+
+    admin
+        .namespace_set_dispatch_rate(
+            "acme/svc",
+            DispatchRate {
+                dispatch_throttling_rate_in_msg: -1,
+                dispatch_throttling_rate_in_byte: -1,
+                rate_period_in_second: 1,
+                relative_to_publish_rate: true,
+            },
+        )
+        .await
+        .expect("set dispatch rate");
+    admin
+        .namespace_remove_dispatch_rate("acme/svc")
+        .await
+        .expect("remove dispatch rate");
 }
