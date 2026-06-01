@@ -15,7 +15,7 @@ use clap::Parser;
 #[allow(dead_code, unused_imports)]
 mod cli;
 
-use cli::{AdminCmd, Cli, Cmd};
+use cli::{AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, TenantsCmd, TopicsCmd};
 
 fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(args).expect("parse")
@@ -92,33 +92,38 @@ fn consume_with_count() {
 }
 
 #[test]
-fn admin_cluster_list() {
-    let cli = parse(&["magnetar", "admin", "cluster-list"]);
+fn admin_clusters_list() {
+    let cli = parse(&["magnetar", "admin", "clusters", "list"]);
     assert!(matches!(
         cli.cmd,
         Cmd::Admin {
-            sub: AdminCmd::ClusterList
+            sub: AdminCmd::Clusters {
+                sub: ClustersCmd::List
+            }
         }
     ));
 }
 
 #[test]
-fn admin_tenant_list() {
-    let cli = parse(&["magnetar", "admin", "tenant-list"]);
+fn admin_tenants_list() {
+    let cli = parse(&["magnetar", "admin", "tenants", "list"]);
     assert!(matches!(
         cli.cmd,
         Cmd::Admin {
-            sub: AdminCmd::TenantList
+            sub: AdminCmd::Tenants {
+                sub: TenantsCmd::List
+            }
         }
     ));
 }
 
 #[test]
-fn admin_tenant_create_multi_role_multi_cluster() {
+fn admin_tenants_create_multi_role_multi_cluster() {
     let cli = parse(&[
         "magnetar",
         "admin",
-        "tenant-create",
+        "tenants",
+        "create",
         "acme",
         "--admin-role",
         "alice",
@@ -132,10 +137,13 @@ fn admin_tenant_create_multi_role_multi_cluster() {
     match cli.cmd {
         Cmd::Admin {
             sub:
-                AdminCmd::TenantCreate {
-                    name,
-                    admin_role,
-                    cluster,
+                AdminCmd::Tenants {
+                    sub:
+                        TenantsCmd::Create {
+                            name,
+                            admin_role,
+                            cluster,
+                        },
                 },
         } => {
             assert_eq!(name, "acme");
@@ -147,69 +155,87 @@ fn admin_tenant_create_multi_role_multi_cluster() {
 }
 
 #[test]
-fn admin_tenant_delete() {
-    let cli = parse(&["magnetar", "admin", "tenant-delete", "acme"]);
+fn admin_tenants_delete() {
+    let cli = parse(&["magnetar", "admin", "tenants", "delete", "acme"]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::TenantDelete { name },
+            sub: AdminCmd::Tenants {
+                sub: TenantsCmd::Delete { name },
+            },
         } => assert_eq!(name, "acme"),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
 
 #[test]
-fn admin_namespace_list() {
-    let cli = parse(&["magnetar", "admin", "namespace-list", "acme"]);
+fn admin_namespaces_list() {
+    let cli = parse(&["magnetar", "admin", "namespaces", "list", "acme"]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::NamespaceList { tenant },
+            sub:
+                AdminCmd::Namespaces {
+                    sub: NamespacesCmd::List { tenant },
+                },
         } => assert_eq!(tenant, "acme"),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
 
 #[test]
-fn admin_namespace_create_and_delete() {
-    let create = parse(&["magnetar", "admin", "namespace-create", "acme/svc"]);
+fn admin_namespaces_create_and_delete() {
+    let create = parse(&["magnetar", "admin", "namespaces", "create", "acme/svc"]);
     match create.cmd {
         Cmd::Admin {
-            sub: AdminCmd::NamespaceCreate { namespace },
+            sub:
+                AdminCmd::Namespaces {
+                    sub: NamespacesCmd::Create { namespace },
+                },
         } => assert_eq!(namespace, "acme/svc"),
         other => panic!("unexpected cmd: {other:?}"),
     }
-    let del = parse(&["magnetar", "admin", "namespace-delete", "acme/svc"]);
+    let del = parse(&["magnetar", "admin", "namespaces", "delete", "acme/svc"]);
     match del.cmd {
         Cmd::Admin {
-            sub: AdminCmd::NamespaceDelete { namespace },
+            sub:
+                AdminCmd::Namespaces {
+                    sub: NamespacesCmd::Delete { namespace },
+                },
         } => assert_eq!(namespace, "acme/svc"),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
 
 #[test]
-fn admin_topic_list() {
-    let cli = parse(&["magnetar", "admin", "topic-list", "acme/svc"]);
+fn admin_topics_list() {
+    let cli = parse(&["magnetar", "admin", "topics", "list", "acme/svc"]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::TopicList { namespace },
+            sub:
+                AdminCmd::Topics {
+                    sub: TopicsCmd::List { namespace },
+                },
         } => assert_eq!(namespace, "acme/svc"),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
 
 #[test]
-fn admin_topic_create_with_partitions() {
+fn admin_topics_create_with_partitions() {
     let cli = parse(&[
         "magnetar",
         "admin",
-        "topic-create",
+        "topics",
+        "create",
         "acme/svc/orders",
         "--partitions",
         "4",
     ]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::TopicCreate { topic, partitions },
+            sub:
+                AdminCmd::Topics {
+                    sub: TopicsCmd::Create { topic, partitions },
+                },
         } => {
             assert_eq!(topic, "acme/svc/orders");
             assert_eq!(partitions, 4);
@@ -219,11 +245,14 @@ fn admin_topic_create_with_partitions() {
 }
 
 #[test]
-fn admin_topic_delete_default_no_force() {
-    let cli = parse(&["magnetar", "admin", "topic-delete", "acme/svc/orders"]);
+fn admin_topics_delete_default_no_force() {
+    let cli = parse(&["magnetar", "admin", "topics", "delete", "acme/svc/orders"]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::TopicDelete { topic, force },
+            sub:
+                AdminCmd::Topics {
+                    sub: TopicsCmd::Delete { topic, force },
+                },
         } => {
             assert_eq!(topic, "acme/svc/orders");
             assert!(!force);
@@ -233,29 +262,87 @@ fn admin_topic_delete_default_no_force() {
 }
 
 #[test]
-fn admin_topic_delete_force() {
+fn admin_topics_delete_force() {
     let cli = parse(&[
         "magnetar",
         "admin",
-        "topic-delete",
+        "topics",
+        "delete",
         "acme/svc/orders",
         "--force",
     ]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::TopicDelete { force, .. },
+            sub:
+                AdminCmd::Topics {
+                    sub: TopicsCmd::Delete { force, .. },
+                },
         } => assert!(force),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
 
 #[test]
-fn admin_topic_stats() {
-    let cli = parse(&["magnetar", "admin", "topic-stats", "acme/svc/orders"]);
+fn admin_topics_stats() {
+    let cli = parse(&["magnetar", "admin", "topics", "stats", "acme/svc/orders"]);
     match cli.cmd {
         Cmd::Admin {
-            sub: AdminCmd::TopicStats { topic },
+            sub: AdminCmd::Topics {
+                sub: TopicsCmd::Stats { topic },
+            },
         } => assert_eq!(topic, "acme/svc/orders"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_topics_shadow_create() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "topics",
+        "shadow",
+        "create",
+        "acme/svc/source",
+        "persistent://acme/svc/shadow",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Topics {
+                    sub:
+                        TopicsCmd::Shadow {
+                            sub: ShadowCmd::Create { source, shadow },
+                        },
+                },
+        } => {
+            assert_eq!(source, "acme/svc/source");
+            assert_eq!(shadow, "persistent://acme/svc/shadow");
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_topics_shadow_list() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "topics",
+        "shadow",
+        "list",
+        "acme/svc/source",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Topics {
+                    sub:
+                        TopicsCmd::Shadow {
+                            sub: ShadowCmd::List { source },
+                        },
+                },
+        } => assert_eq!(source, "acme/svc/source"),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
@@ -269,7 +356,8 @@ fn admin_flags_are_globals() {
         "--token",
         "secret",
         "admin",
-        "tenant-list",
+        "tenants",
+        "list",
     ]);
     assert_eq!(cli.admin_url, "http://broker:8080");
     assert_eq!(cli.token.as_deref(), Some("secret"));
@@ -277,7 +365,7 @@ fn admin_flags_are_globals() {
 
 #[test]
 fn admin_timeout_default_is_60() {
-    let cli = parse(&["magnetar", "admin", "tenant-list"]);
+    let cli = parse(&["magnetar", "admin", "tenants", "list"]);
     assert_eq!(cli.admin_timeout_secs, 60);
 }
 
@@ -288,14 +376,15 @@ fn admin_timeout_override() {
         "--admin-timeout-secs",
         "5",
         "admin",
-        "tenant-list",
+        "tenants",
+        "list",
     ]);
     assert_eq!(cli.admin_timeout_secs, 5);
 }
 
 #[test]
 fn verbose_repetition() {
-    let cli = parse(&["magnetar", "-vvv", "admin", "tenant-list"]);
+    let cli = parse(&["magnetar", "-vvv", "admin", "tenants", "list"]);
     assert_eq!(cli.verbose, 3);
 }
 
@@ -307,7 +396,8 @@ fn root_flags_accepted_after_subcommand() {
     let cli = parse(&[
         "magnetar",
         "admin",
-        "tenant-list",
+        "tenants",
+        "list",
         "--admin-url",
         "http://broker:8080",
         "--token",
@@ -323,7 +413,9 @@ fn root_flags_accepted_after_subcommand() {
     assert!(matches!(
         cli.cmd,
         Cmd::Admin {
-            sub: AdminCmd::TenantList
+            sub: AdminCmd::Tenants {
+                sub: TenantsCmd::List
+            }
         }
     ));
 }

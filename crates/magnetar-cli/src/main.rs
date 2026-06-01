@@ -145,20 +145,13 @@ pub(crate) enum Cmd {
         #[arg(long, default_value_t = false)]
         replicate_subscription_state: bool,
     },
-    /// Admin commands (`/admin/v2/...`).
+    /// Admin commands (`/admin/v2/...`). Grouped by resource — clusters,
+    /// tenants, namespaces, topics — following pulsarctl / kubectl
+    /// conventions. Shadow-topic (PIP-180 / ADR-0033) management lives
+    /// under `admin topics shadow`.
     Admin {
         #[command(subcommand)]
         sub: AdminCmd,
-    },
-    /// Shadow-topic commands (PIP-180 / ADR-0033).
-    ///
-    /// Create, delete, or list shadow topics on the broker. A shadow topic
-    /// shares its ledger storage with a source topic and exposes a
-    /// read-only view of every entry to consumers — a lightweight fan-out
-    /// alternative to geo-replication. See `docs/shadow-topic.md`.
-    Shadow {
-        #[command(subcommand)]
-        sub: ShadowCmd,
     },
     /// **Experimental** (PIP-460 / ADR-0031). Print a scalable topic's current
     /// segment DAG. Resolves a `topic://...` URL against the controller broker
@@ -172,7 +165,128 @@ pub(crate) enum Cmd {
     },
 }
 
-/// `shadow` subcommands.
+/// `admin` subcommands — grouped by resource. The nested layout matches
+/// pulsarctl (`pulsarctl topics stats`) and kubectl (`kubectl pods get`)
+/// rather than the older flat shape (`admin topic-stats`).
+#[derive(Debug, Subcommand)]
+pub(crate) enum AdminCmd {
+    /// Cluster-level operations (`/admin/v2/clusters/...`).
+    Clusters {
+        #[command(subcommand)]
+        sub: ClustersCmd,
+    },
+    /// Tenant CRUD (`/admin/v2/tenants/...`).
+    Tenants {
+        #[command(subcommand)]
+        sub: TenantsCmd,
+    },
+    /// Namespace CRUD + policies (`/admin/v2/namespaces/...`).
+    Namespaces {
+        #[command(subcommand)]
+        sub: NamespacesCmd,
+    },
+    /// Topic CRUD + stats + ops (`/admin/v2/persistent/...`). Shadow-topic
+    /// (PIP-180) management lives under `admin topics shadow`.
+    Topics {
+        #[command(subcommand)]
+        sub: TopicsCmd,
+    },
+}
+
+/// `admin clusters <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClustersCmd {
+    /// List clusters.
+    List,
+}
+
+/// `admin tenants <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum TenantsCmd {
+    /// List tenants.
+    List,
+    /// Create a tenant.
+    Create {
+        /// Tenant name.
+        name: String,
+        /// Admin roles. Repeat the flag for multiple values.
+        #[arg(long = "admin-role")]
+        admin_role: Vec<String>,
+        /// Allowed clusters. Repeat the flag for multiple values.
+        #[arg(long = "cluster")]
+        cluster: Vec<String>,
+    },
+    /// Delete a tenant.
+    Delete {
+        /// Tenant name.
+        name: String,
+    },
+}
+
+/// `admin namespaces <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum NamespacesCmd {
+    /// List namespaces under a tenant.
+    List {
+        /// Tenant name.
+        tenant: String,
+    },
+    /// Create a namespace.
+    Create {
+        /// Fully qualified namespace (`tenant/namespace`).
+        namespace: String,
+    },
+    /// Delete a namespace.
+    Delete {
+        /// Fully qualified namespace (`tenant/namespace`).
+        namespace: String,
+    },
+}
+
+/// `admin topics <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum TopicsCmd {
+    /// List persistent topics in a namespace.
+    List {
+        /// Fully qualified namespace (`tenant/namespace`).
+        namespace: String,
+    },
+    /// Create a partitioned topic.
+    Create {
+        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
+        topic: String,
+        /// Number of partitions.
+        #[arg(long)]
+        partitions: u32,
+    },
+    /// Delete a partitioned topic.
+    Delete {
+        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
+        topic: String,
+        /// Force-delete (drops connected producers/consumers).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Get topic stats. Auto-detects partitioned topics: a single
+    /// `GET .../partitions` probe routes the request to `partitioned-stats`
+    /// when the topic has `partitions > 0`, otherwise to plain `stats`. The
+    /// aggregated counters surface either way; for per-partition detail call
+    /// `topics stats` against each `<topic>-partition-N`.
+    Stats {
+        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
+        topic: String,
+    },
+    /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
+    /// its ledger storage with a source topic and exposes a read-only view
+    /// of every entry to consumers — a lightweight fan-out alternative to
+    /// geo-replication. See `docs/shadow-topic.md`.
+    Shadow {
+        #[command(subcommand)]
+        sub: ShadowCmd,
+    },
+}
+
+/// `admin topics shadow <verb>`.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ShadowCmd {
     /// Create a shadow topic on top of a source topic.
@@ -203,76 +317,6 @@ pub(crate) enum ShadowCmd {
     Source {
         /// Shadow topic (`[persistent://]tenant/namespace/topic`).
         shadow: String,
-    },
-}
-
-/// `admin` subcommands.
-#[derive(Debug, Subcommand)]
-pub(crate) enum AdminCmd {
-    /// List clusters.
-    ClusterList,
-    /// List tenants.
-    TenantList,
-    /// Create a tenant.
-    TenantCreate {
-        /// Tenant name.
-        name: String,
-        /// Admin roles. Repeat the flag for multiple values.
-        #[arg(long = "admin-role")]
-        admin_role: Vec<String>,
-        /// Allowed clusters. Repeat the flag for multiple values.
-        #[arg(long = "cluster")]
-        cluster: Vec<String>,
-    },
-    /// Delete a tenant.
-    TenantDelete {
-        /// Tenant name.
-        name: String,
-    },
-    /// List namespaces under a tenant.
-    NamespaceList {
-        /// Tenant name.
-        tenant: String,
-    },
-    /// Create a namespace.
-    NamespaceCreate {
-        /// Fully qualified namespace (`tenant/namespace`).
-        namespace: String,
-    },
-    /// Delete a namespace.
-    NamespaceDelete {
-        /// Fully qualified namespace (`tenant/namespace`).
-        namespace: String,
-    },
-    /// List persistent topics in a namespace.
-    TopicList {
-        /// Fully qualified namespace (`tenant/namespace`).
-        namespace: String,
-    },
-    /// Create a partitioned topic.
-    TopicCreate {
-        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
-        topic: String,
-        /// Number of partitions.
-        #[arg(long)]
-        partitions: u32,
-    },
-    /// Delete a partitioned topic.
-    TopicDelete {
-        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
-        topic: String,
-        /// Force-delete (drops connected producers/consumers).
-        #[arg(long)]
-        force: bool,
-    },
-    /// Get topic stats. Auto-detects partitioned topics: a single
-    /// `GET .../partitions` probe routes the request to `partitioned-stats`
-    /// when the topic has `partitions > 0`, otherwise to plain `stats`. The
-    /// aggregated counters surface either way; for per-partition detail call
-    /// `topic-stats` against each `<topic>-partition-N`.
-    TopicStats {
-        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
-        topic: String,
     },
 }
 
@@ -385,9 +429,6 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Admin { sub } => {
             run_admin(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
         }
-        Cmd::Shadow { sub } => {
-            run_shadow(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
-        }
         #[cfg(feature = "scalable-topics")]
         Cmd::TopicInfo { topic } => run_topic_info(&service_url, token_for_data, &topic).await,
     }
@@ -433,30 +474,6 @@ async fn run_topic_info(
     Ok(())
 }
 
-/// PIP-180 / ADR-0033: dispatch shadow-topic subcommands over the admin
-/// REST client. Wraps `magnetar_admin::AdminClient::{create,delete,
-/// get_shadow_topics, get_shadow_source}`.
-async fn run_shadow(
-    admin_url: &str,
-    token: Option<String>,
-    timeout_secs: u64,
-    cmd: ShadowCmd,
-) -> Result<(), CliError> {
-    let admin = build_admin(admin_url, token, timeout_secs)?;
-    match cmd {
-        ShadowCmd::Create { source, shadow } => {
-            admin.create_shadow_topic(&source, &shadow).await?;
-            Ok(())
-        }
-        ShadowCmd::Delete { shadow, force } => {
-            admin.delete_shadow_topic(&shadow, force).await?;
-            Ok(())
-        }
-        ShadowCmd::List { source } => print_json(&admin.get_shadow_topics(&source).await?),
-        ShadowCmd::Source { shadow } => print_json(&admin.get_shadow_source(&shadow).await?),
-    }
-}
-
 async fn run_admin(
     admin_url: &str,
     token: Option<String>,
@@ -465,9 +482,23 @@ async fn run_admin(
 ) -> Result<(), CliError> {
     let admin = build_admin(admin_url, token, timeout_secs)?;
     match cmd {
-        AdminCmd::ClusterList => print_json(&admin.cluster_list().await?),
-        AdminCmd::TenantList => print_json(&admin.tenants_list().await?),
-        AdminCmd::TenantCreate {
+        AdminCmd::Clusters { sub } => run_admin_clusters(&admin, sub).await,
+        AdminCmd::Tenants { sub } => run_admin_tenants(&admin, sub).await,
+        AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, sub).await,
+        AdminCmd::Topics { sub } => run_admin_topics(&admin, sub).await,
+    }
+}
+
+async fn run_admin_clusters(admin: &AdminClient, cmd: ClustersCmd) -> Result<(), CliError> {
+    match cmd {
+        ClustersCmd::List => print_json(&admin.cluster_list().await?),
+    }
+}
+
+async fn run_admin_tenants(admin: &AdminClient, cmd: TenantsCmd) -> Result<(), CliError> {
+    match cmd {
+        TenantsCmd::List => print_json(&admin.tenants_list().await?),
+        TenantsCmd::Create {
             name,
             admin_role,
             cluster,
@@ -483,29 +514,39 @@ async fn run_admin(
                 .await?;
             Ok(())
         }
-        AdminCmd::TenantDelete { name } => {
+        TenantsCmd::Delete { name } => {
             admin.tenant_delete(&name).await?;
             Ok(())
         }
-        AdminCmd::NamespaceList { tenant } => print_json(&admin.namespaces_list(&tenant).await?),
-        AdminCmd::NamespaceCreate { namespace } => {
+    }
+}
+
+async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result<(), CliError> {
+    match cmd {
+        NamespacesCmd::List { tenant } => print_json(&admin.namespaces_list(&tenant).await?),
+        NamespacesCmd::Create { namespace } => {
             admin.namespace_create(&namespace).await?;
             Ok(())
         }
-        AdminCmd::NamespaceDelete { namespace } => {
+        NamespacesCmd::Delete { namespace } => {
             admin.namespace_delete(&namespace).await?;
             Ok(())
         }
-        AdminCmd::TopicList { namespace } => print_json(&admin.topics_list(&namespace).await?),
-        AdminCmd::TopicCreate { topic, partitions } => {
+    }
+}
+
+async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), CliError> {
+    match cmd {
+        TopicsCmd::List { namespace } => print_json(&admin.topics_list(&namespace).await?),
+        TopicsCmd::Create { topic, partitions } => {
             admin.topic_create_partitioned(&topic, partitions).await?;
             Ok(())
         }
-        AdminCmd::TopicDelete { topic, force } => {
+        TopicsCmd::Delete { topic, force } => {
             admin.topic_delete(&topic, force).await?;
             Ok(())
         }
-        AdminCmd::TopicStats { topic } => {
+        TopicsCmd::Stats { topic } => {
             // The broker has two endpoints — `stats` for non-partitioned topics
             // and `partitioned-stats` for the partitioned parent name. Probe
             // the partition count first and dispatch; a non-partitioned topic
@@ -528,6 +569,25 @@ async fn run_admin(
             });
             print_json(&json)
         }
+        TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,
+    }
+}
+
+/// PIP-180 / ADR-0033: dispatch shadow-topic subcommands over the admin
+/// REST client. Wraps `magnetar_admin::AdminClient::{create,delete,
+/// get_shadow_topics, get_shadow_source}`.
+async fn run_admin_topics_shadow(admin: &AdminClient, cmd: ShadowCmd) -> Result<(), CliError> {
+    match cmd {
+        ShadowCmd::Create { source, shadow } => {
+            admin.create_shadow_topic(&source, &shadow).await?;
+            Ok(())
+        }
+        ShadowCmd::Delete { shadow, force } => {
+            admin.delete_shadow_topic(&shadow, force).await?;
+            Ok(())
+        }
+        ShadowCmd::List { source } => print_json(&admin.get_shadow_topics(&source).await?),
+        ShadowCmd::Source { shadow } => print_json(&admin.get_shadow_source(&shadow).await?),
     }
 }
 

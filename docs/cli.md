@@ -33,10 +33,10 @@ docker run --rm -p 6650:6650 -p 8080:8080 \
   apachepulsar/pulsar:4.0.0 \
   bin/pulsar standalone
 
-magnetar admin tenant-list
-magnetar admin namespace-create public/scratch
-magnetar admin topic-create public/scratch/events --partitions 3
-magnetar admin topic-stats public/scratch/events | jq '.msgInCounter'
+magnetar admin tenants list
+magnetar admin namespaces create public/scratch
+magnetar admin topics create public/scratch/events --partitions 3
+magnetar admin topics stats public/scratch/events | jq '.msgInCounter'
 ```
 
 ## `--version` / `-V`
@@ -119,25 +119,25 @@ Wraps [`magnetar_admin::AdminClient`](../crates/magnetar-admin/src/lib.rs).
 Output is JSON to stdout; errors go to stderr with a non-zero exit code, so the output is pipeable into `jq`:
 
 ```sh
-magnetar admin tenant-list | jq '.[]'
+magnetar admin tenants list | jq '.[]'
 ```
 
 The full verb set:
 
 ```sh
-magnetar admin cluster-list
-magnetar admin tenant-list
-magnetar admin tenant-create acme --admin-role alice --admin-role bob --cluster standalone
-magnetar admin tenant-delete acme
+magnetar admin clusters list
+magnetar admin tenants list
+magnetar admin tenants create acme --admin-role alice --admin-role bob --cluster standalone
+magnetar admin tenants delete acme
 
-magnetar admin namespace-list acme
-magnetar admin namespace-create acme/svc
-magnetar admin namespace-delete acme/svc
+magnetar admin namespaces list acme
+magnetar admin namespaces create acme/svc
+magnetar admin namespaces delete acme/svc
 
-magnetar admin topic-list acme/svc
-magnetar admin topic-create acme/svc/orders --partitions 4
-magnetar admin topic-delete acme/svc/orders --force
-magnetar admin topic-stats acme/svc/orders
+magnetar admin topics list acme/svc
+magnetar admin topics create acme/svc/orders --partitions 4
+magnetar admin topics delete acme/svc/orders --force
+magnetar admin topics stats acme/svc/orders
 ```
 
 ### `produce` / `consume` (M9 stubs)
@@ -157,9 +157,9 @@ See [`pip-features.md#shadow-topics-pip-180`](pip-features.md#shadow-topics-pip-
 
 | Command                                                            | Effect                                                                                                                                           |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `magnetar shadow create <source> <shadow> [--property key=value]…` | `PUT /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics` — create a shadow topic on top of a source topic.                          |
-| `magnetar shadow delete <shadow> [--force]`                        | `DELETE /admin/v2/persistent/{tenant}/{namespace}/{shadow}` — remove a shadow topic. `--force` kicks off connected subscribers.                  |
-| `magnetar shadow list <source>`                                    | `GET /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics` — list the shadows of a source topic.                                      |
-| `magnetar shadow source <shadow>`                                  | `GET /admin/v2/persistent/{tenant}/{namespace}/{shadow}/shadowSource` — resolve a shadow's source topic (returns `null` for a non-shadow topic). |
+| `magnetar admin topics shadow create <source> <shadow> [--property key=value]…` | `PUT /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics` — create a shadow topic on top of a source topic.                          |
+| `magnetar admin topics shadow delete <shadow> [--force]`                        | `DELETE /admin/v2/persistent/{tenant}/{namespace}/{shadow}` — remove a shadow topic. `--force` kicks off connected subscribers.                  |
+| `magnetar admin topics shadow list <source>`                                    | `GET /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics` — list the shadows of a source topic.                                      |
+| `magnetar admin topics shadow source <shadow>`                                  | `GET /admin/v2/persistent/{tenant}/{namespace}/{shadow}/shadowSource` — resolve a shadow's source topic (returns `null` for a non-shadow topic). |
 
 All four commands share the global `--admin-url` / `--token` / `--admin-timeout-secs` flags with the `admin` subcommand and stream JSON output to stdout.

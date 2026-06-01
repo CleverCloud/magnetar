@@ -328,17 +328,17 @@ See the pinned unit test in [`crates/magnetar-proto/src/types.rs`](../crates/mag
 
 ```sh
 # Create a shadow topic
-magnetar shadow create persistent://public/default/source \
+magnetar admin topics shadow create persistent://public/default/source \
                        persistent://public/default/shadow
 
 # List the shadows of a source
-magnetar shadow list persistent://public/default/source
+magnetar admin topics shadow list persistent://public/default/source
 
 # Resolve a shadow's source
-magnetar shadow source persistent://public/default/shadow
+magnetar admin topics shadow source persistent://public/default/shadow
 
 # Delete a shadow
-magnetar shadow delete persistent://public/default/shadow --force
+magnetar admin topics shadow delete persistent://public/default/shadow --force
 ```
 
 ### Shadow topic caveats
@@ -358,7 +358,7 @@ The runtime engine resolves a consumer's shadow attachment at subscribe time via
 The result is cached on the per-consumer state for the lifetime of the consumer.
 If a new shadow is created on a topic after a consumer has subscribed to it (an unusual but legal flow), the consumer will not pick up the new shadow attachment until it is re-subscribed.
 
-The CLI's `magnetar shadow list <source>` makes the broker-side cache inspectable so operators can detect the race.
+The CLI's `magnetar admin topics shadow list <source>` makes the broker-side cache inspectable so operators can detect the race.
 
 #### Receive-path event variant
 
