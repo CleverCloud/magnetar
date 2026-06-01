@@ -490,6 +490,55 @@ impl Connection {
         handle: crate::anti_thrash::ReAttachHandle,
         kind: crate::anti_thrash::ReAttachOutcomeKind,
     ) {
+        // ADR-0049 pair-assertion (positive): when the anti-thrash
+        // detector is ARMED, a `TcpDropAfterReAttach` outcome must
+        // come from a connection that has previously observed at
+        // least one re-attach. Three valid signals of that
+        // observation:
+        //   1. The session has been reset at least once (`session_epoch > 0`) — live-driver path:
+        //      the supervisor calls `reset()` before each redial.
+        //   2. The anti-thrash detector itself recorded a prior `ReAttachOk`
+        //      (`last_reattach_at().is_some()`) — synthetic-test path used by the differential
+        //      anti-thrash equivalence harness.
+        //   3. The detector is DISABLED (no threshold). In that state `record_reattach_outcome` is
+        //      a no-op anyway (the detector's `record` exits early), so the call cannot misclassify
+        //      anything — tests exercising the "default-off" path drive the same surface and must
+        //      not panic.
+        // With the detector armed AND neither of (1) or (2)
+        // holding, the supervisor is misclassifying the very first
+        // socket as a re-attach — exactly what ADR-0028 must
+        // refuse.
+        debug_assert!(
+            !matches!(
+                kind,
+                crate::anti_thrash::ReAttachOutcomeKind::TcpDropAfterReAttach
+            ) || self.anti_thrash.threshold().is_none()
+                || self.session_epoch > 0
+                || self.anti_thrash.last_reattach_at().is_some(),
+            "TcpDropAfterReAttach recorded with session_epoch=0 AND no prior re-attach — \
+             supervisor misclassified first-connect as a re-attach"
+        );
+        // ADR-0049 pair-assertion (negative space): a `ReAttachOk`
+        // outcome must reference a producer or consumer that this
+        // Connection actually has open — i.e. the broker acked a
+        // CommandProducer/CommandSubscribe we hold the slot for. A
+        // stale `ReAttachHandle` surviving past `close_producer` /
+        // `close_consumer` would be a "ghost handle" bug that leaks
+        // cooldown weight into the anti-thrash detector against a
+        // slot we no longer own. `TcpDropAfterReAttach` is exempt:
+        // the engine driver records it with a placeholder
+        // `ProducerHandle(0)` because the close signal is
+        // connection-wide, not per-handle.
+        debug_assert!(
+            !matches!(kind, crate::anti_thrash::ReAttachOutcomeKind::ReAttachOk)
+                || match handle {
+                    crate::anti_thrash::ReAttachHandle::Producer(h) =>
+                        self.producers.contains_key(&h),
+                    crate::anti_thrash::ReAttachHandle::Consumer(h) =>
+                        self.consumers.contains_key(&h),
+                },
+            "record_reattach_outcome(ReAttachOk) with unknown handle (post-close ghost?)"
+        );
         let was_cooldown = self.anti_thrash.tick(now);
         self.anti_thrash.record(now, kind, handle);
         let is_cooldown = self.anti_thrash.tick(now);
@@ -517,6 +566,37 @@ impl Connection {
     /// stabilised. Clears any active cooldown and emits
     /// [`ConnectionEvent::AntiThrashCleared`] if the cooldown was active.
     pub fn record_first_op_success(&mut self, now: Instant) {
+        // ADR-0049 pair-assertion (positive): a first-op-success
+        // must come AFTER a user-driven `create_producer` /
+        // `subscribe`, so the connection must hold at least one
+        // producer or consumer slot. An empty slot map at this point
+        // means the engine driver fired the signal speculatively
+        // before the user opened any handle — there's no first op to
+        // succeed against. (The handshake state itself is
+        // INTENTIONALLY not checked here because the differential
+        // anti-thrash test sequences `record_first_op_success`
+        // against a `Failed` state to exercise the cooldown-clear
+        // path in isolation; live drivers always re-handshake before
+        // signalling first-op-success but the assertion would
+        // pessimise that test surface.)
+        debug_assert!(
+            !self.producers.is_empty() || !self.consumers.is_empty(),
+            "record_first_op_success with empty producer + consumer maps — \
+             nothing has been opened yet"
+        );
+        // ADR-0049 pair-assertion (negative space): the connection
+        // must NOT be in a user-closed terminal state. `Closing` /
+        // `Closed` means the user explicitly asked us to tear down;
+        // recording a first-op-success against that state would
+        // resurrect the anti-thrash detector against a connection
+        // that no longer matters and could even race the close path
+        // into a leaked cooldown. `Failed` is allowed because it is
+        // a transport-level drop the supervisor recovers from.
+        debug_assert!(
+            !matches!(self.state, HandshakeState::Closing | HandshakeState::Closed),
+            "record_first_op_success called on user-closed connection (state={:?})",
+            self.state
+        );
         let was_cooldown = matches!(
             self.anti_thrash.tick(now),
             crate::anti_thrash::AntiThrashDisposition::Cooldown { .. }
@@ -729,6 +809,30 @@ impl Connection {
     /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured. Any snapshot
     /// for a now-closed producer is discarded along with the rest of its state.
     pub fn rebuild_producers(&mut self) -> Vec<RequestId> {
+        // ADR-0049 negative-space assertion (the canonical one called
+        // out in `docs/simulation-patterns.md` §3 takeaway 2): a
+        // non-empty `in_flight_publish_snapshots` map is only legal
+        // when at least one `reset()` has fired — i.e.
+        // `session_epoch > 0`. The reverse direction (snapshots
+        // accumulating on a fresh, never-reset connection) would have
+        // caught the `0e47e14` regression in which a second `reset()`
+        // wiped the first reset's snapshots and silently dropped a
+        // user-queued send. The map being empty is always legal
+        // (some `reset()`s happen with nothing pending).
+        debug_assert!(
+            self.in_flight_publish_snapshots.is_empty() || self.session_epoch > 0,
+            "rebuild_producers entered with non-empty snapshot map and zero session_epoch"
+        );
+        // ADR-0049 positive assertion: every snapshot key must
+        // reference a producer this connection has open. A snapshot
+        // without a matching producer slot would be a memory leak
+        // (the snapshot never drains; nobody owns the resend).
+        debug_assert!(
+            self.in_flight_publish_snapshots
+                .keys()
+                .all(|h| self.producers.contains_key(h)),
+            "rebuild_producers entered with snapshot keys not in producers map"
+        );
         // Snapshot the (handle, request) pairs we want to replay so the borrow of
         // `producer_create_requests` doesn't conflict with `emit_command_producer`'s mutable
         // borrow of `self`.
@@ -6424,7 +6528,7 @@ mod handshake_failure_reason_tests {
     }
 
     // ----------------------------------------------------------------
-    // ADR-0048 / ADR-0047 — buggify wiring + assertion-density tests.
+    // ADR-0048 / ADR-0049 — buggify wiring + assertion-density tests.
     // ----------------------------------------------------------------
 
     /// ADR-0048 baseline: a `Connection` with no buggify installed
@@ -6568,4 +6672,97 @@ mod handshake_failure_reason_tests {
         assert!(conn.is_connected());
     }
 
+    /// ADR-0049 negative-space assertion at `rebuild_producers`
+    /// entry: when constructed under the buggy state (manually
+    /// stuffing the snapshot map while `session_epoch == 0`) the
+    /// `debug_assert!` panics. Confirms the assertion is wired and
+    /// can be triggered from a constructed bad state.
+    #[test]
+    #[should_panic(expected = "rebuild_producers entered with non-empty snapshot map")]
+    #[cfg(debug_assertions)]
+    fn rebuild_producers_panics_on_snapshots_with_zero_epoch() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Stuff one snapshot bucket without bumping `session_epoch`.
+        // Session epoch is `0` for a freshly-constructed Connection
+        // that has never been reset.
+        let phantom = ProducerHandle(424_242);
+        conn.in_flight_publish_snapshots.insert(phantom, Vec::new());
+        // Fire the assertion. We DO NOT care about the return value;
+        // the panic from `debug_assert!` is the test signal.
+        let _ = conn.rebuild_producers();
+    }
+
+    /// ADR-0049 positive assertion at `rebuild_producers` entry:
+    /// snapshot keys must reference producers we still own. A snapshot
+    /// for an unknown handle is a memory leak (the resend never
+    /// fires); the assertion forces tests / drivers to surface it.
+    #[test]
+    #[should_panic(expected = "rebuild_producers entered with snapshot keys not in producers map")]
+    #[cfg(debug_assertions)]
+    fn rebuild_producers_panics_on_orphan_snapshot_key() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Bump session_epoch via a reset() so the negative-space
+        // assert above doesn't fire first.
+        conn.reset();
+        assert!(conn.session_epoch > 0);
+        let phantom = ProducerHandle(424_242);
+        conn.in_flight_publish_snapshots.insert(phantom, Vec::new());
+        let _ = conn.rebuild_producers();
+    }
+
+    /// ADR-0049 positive assertion on `record_first_op_success`:
+    /// the call must happen with at least one open producer or
+    /// consumer. A fresh Connection with no opens is the canonical
+    /// "supervisor fired first-op-success before the user opened
+    /// anything" bug.
+    #[test]
+    #[should_panic(expected = "record_first_op_success with empty producer + consumer maps")]
+    #[cfg(debug_assertions)]
+    fn record_first_op_success_panics_with_no_opens() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.record_first_op_success(Instant::now());
+    }
+
+    /// ADR-0049 negative-space assertion on `record_reattach_outcome`
+    /// for `TcpDropAfterReAttach`: the kind requires either
+    /// `session_epoch > 0` (the live-driver path: supervisor reset
+    /// happened) or a prior re-attach already recorded in the
+    /// anti-thrash detector (the synthetic-test path used by the
+    /// differential harness). With BOTH absent — fresh Connection
+    /// that never reset and never observed a `ReAttachOk` — the
+    /// drop signal would be the driver misclassifying the first
+    /// connect as a re-attach.
+    #[test]
+    #[should_panic(expected = "TcpDropAfterReAttach recorded with session_epoch=0")]
+    #[cfg(debug_assertions)]
+    fn record_reattach_outcome_panics_tcp_drop_with_zero_epoch() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Arm the anti-thrash detector so the assertion fires. With
+        // the detector disabled (the default) the assertion's
+        // bypass clause #3 would mask the bug under test.
+        conn.set_anti_thrash(
+            Some(crate::anti_thrash::AntiThrashThreshold::recommended()),
+            std::time::Duration::from_secs(30),
+        );
+        // session_epoch == 0 (fresh Connection), no prior
+        // ReAttachOk recorded. Recording a TCP drop is illegal —
+        // we've never had a re-attach in this state.
+        conn.record_reattach_outcome(
+            Instant::now(),
+            crate::anti_thrash::ReAttachHandle::Producer(ProducerHandle(0)),
+            crate::anti_thrash::ReAttachOutcomeKind::TcpDropAfterReAttach,
+        );
+    }
 }
