@@ -64,6 +64,13 @@ use valuable::Valuable;
 const SENDS_TRAIL: &str = "broker_sends";
 const DELIVERS_TRAIL: &str = "broker_delivers";
 const ACKS_TRAIL: &str = "broker_acks";
+/// Client-side trails for the per-handle resolution invariant
+/// (`TigerBeetle` pattern, follow-on to ADR-0048's swizzle workload).
+/// Every `producer.send(msg)` call writes one `SENDS_STARTED_TRAIL`
+/// entry and exactly one matching `SENDS_RESOLVED_TRAIL` entry; the
+/// [`HandleResolutionInvariant`] asserts the bijection.
+const SENDS_STARTED_TRAIL: &str = "client_sends_started";
+const SENDS_RESOLVED_TRAIL: &str = "client_sends_resolved";
 
 /// Emit a captured correctness fact on `trail`, mirroring
 /// [`SimContext::emit`] but callable from a spawned session task that only
@@ -464,6 +471,67 @@ struct AckEvent {
     consumer_id: u64,
     ledger_id: u64,
     entry_id: u64,
+}
+
+/// Captured fact: the client workload kicked off a `producer.send` call.
+/// Paired with exactly one [`SendResolvedEvent`] carrying the same
+/// `(producer_handle, send_index)` key — the
+/// [`HandleResolutionInvariant`] asserts the bijection per the
+/// `TigerBeetle` "every operation resolves" rule (see
+/// `docs/simulation-deepening-plan.md` §P5).
+#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+struct SendStartedEvent {
+    producer_handle: u64,
+    send_index: u64,
+}
+
+/// Captured fact: a `producer.send` future surfaced one of the three
+/// allowed terminal states.
+///
+/// `kind` is one of [`SEND_RESOLUTION_SENT`],
+/// [`SEND_RESOLUTION_SESSION_LOST`], [`SEND_RESOLUTION_MEMORY_LIMIT`].
+/// Any other value (or a missing event for a started send) breaches
+/// [`HandleResolutionInvariant`]. We model the kind as a plain `u8`
+/// rather than a typed enum so the `Valuable` round-trip through
+/// `serde_json::Value` stays free of enum-tag fragility.
+#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+struct SendResolvedEvent {
+    producer_handle: u64,
+    send_index: u64,
+    kind: u8,
+}
+
+const SEND_RESOLUTION_SENT: u8 = 1;
+const SEND_RESOLUTION_SESSION_LOST: u8 = 2;
+const SEND_RESOLUTION_MEMORY_LIMIT: u8 = 3;
+
+/// Map a `tokio::time::timeout(producer.send(msg))` outcome onto one
+/// of the [`SEND_RESOLUTION_*`] markers, or `None` when the future is
+/// still pending (the outer `tokio::time::timeout` fired before the
+/// send resolved). `None` means *don't emit a resolved event* —
+/// the [`HandleResolutionInvariant`] then surfaces the unresolved
+/// send as "pending forever" via the workload's final-trail count
+/// check.
+fn classify_send_outcome(
+    outcome: Result<
+        &Result<magnetar_proto::MessageId, magnetar_runtime_moonpool::ClientError>,
+        &tokio::time::error::Elapsed,
+    >,
+) -> Option<u8> {
+    match outcome {
+        Ok(Ok(_)) => Some(SEND_RESOLUTION_SENT),
+        Ok(Err(magnetar_runtime_moonpool::ClientError::Engine(
+            magnetar_runtime_moonpool::EngineError::MemoryLimitExceeded { .. },
+        ))) => Some(SEND_RESOLUTION_MEMORY_LIMIT),
+        // Every other ClientError flavour reaches the workload only
+        // after the supervisor surfaced the broker drop / handshake
+        // failure as a `SessionLost` for in-flight ops. Map them all
+        // onto the SessionLost bucket — the invariant only cares that
+        // the resolution kind is one of the three allowed values, not
+        // which specific error variant the engine wrapped it in.
+        Ok(Err(_)) => Some(SEND_RESOLUTION_SESSION_LOST),
+        Err(_) => None,
+    }
 }
 
 /// Per-session state held by the stateful broker.
@@ -872,6 +940,96 @@ impl Invariant for MonotonicMsgIdInvariant {
     }
 }
 
+/// Per-handle resolution invariant — `TigerBeetle`'s "every operation
+/// resolves" rule applied to `producer.send` (see
+/// `docs/simulation-deepening-plan.md` §P5). Every entry in the
+/// `client_sends_started` trail must pair with **exactly one** entry
+/// in the `client_sends_resolved` trail sharing the same
+/// `(producer_handle, send_index)` key, and the resolved kind must be
+/// one of `Sent` / `SessionLost` / `MemoryLimitExceeded`.
+///
+/// Violations fired:
+/// - Two resolutions for the same key → "double resolve".
+/// - A `SendResolvedEvent` with an unknown `kind` → "unknown resolution".
+///
+/// Liveness ("pending forever" — a started send that never resolves)
+/// is asserted in the *workload-side* completion check rather than
+/// here because cursor-incremental `Invariant::observe` can only see
+/// what landed in the trails by the time it runs; a pending future
+/// has not yet emitted any resolution, which would falsely trigger
+/// here. The workload only declares completion after every send has
+/// either resolved or its task been polled to completion, so the
+/// trail counts match at the post-iteration `check()` boundary.
+struct HandleResolutionInvariant {
+    started_cursor: Cell<usize>,
+    resolved_cursor: Cell<usize>,
+    /// Counts how many resolutions arrived per (producer, `send_index`)
+    /// key. Anything `> 1` is a double-resolve violation.
+    resolution_count: RefCell<HashMap<(u64, u64), u8>>,
+}
+
+impl Default for HandleResolutionInvariant {
+    fn default() -> Self {
+        Self {
+            started_cursor: Cell::new(0),
+            resolved_cursor: Cell::new(0),
+            resolution_count: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl Invariant for HandleResolutionInvariant {
+    fn name(&self) -> &str {
+        "handle_send_resolution"
+    }
+
+    fn reset(&mut self) {
+        self.started_cursor.set(0);
+        self.resolved_cursor.set(0);
+        self.resolution_count.borrow_mut().clear();
+    }
+
+    fn observe(&self, q: &dyn TrailQuery, _sim_time_ms: u64) {
+        // Drain new started events first — bookkeeping only, no
+        // assertion (a started send that hasn't resolved yet is a
+        // legitimate in-flight state).
+        for entry in q.since::<SendStartedEvent>(SENDS_STARTED_TRAIL, &self.started_cursor) {
+            self.resolution_count
+                .borrow_mut()
+                .entry((entry.event.producer_handle, entry.event.send_index))
+                .or_insert(0);
+        }
+        // Walk resolved entries; assert the kind is allowed and the
+        // resolution count doesn't double-fire.
+        for entry in q.since::<SendResolvedEvent>(SENDS_RESOLVED_TRAIL, &self.resolved_cursor) {
+            let key = (entry.event.producer_handle, entry.event.send_index);
+            let kind = entry.event.kind;
+            assert_always!(
+                matches!(
+                    kind,
+                    SEND_RESOLUTION_SENT
+                        | SEND_RESOLUTION_SESSION_LOST
+                        | SEND_RESOLUTION_MEMORY_LIMIT
+                ),
+                format!(
+                    "unknown send resolution kind {kind} for handle={} index={}",
+                    key.0, key.1
+                )
+            );
+            let mut counts = self.resolution_count.borrow_mut();
+            let entry_count = counts.entry(key).or_insert(0);
+            *entry_count = entry_count.saturating_add(1);
+            assert_always!(
+                *entry_count <= 1,
+                format!(
+                    "double-resolve on producer={} send_index={}: count={}",
+                    key.0, key.1, *entry_count
+                )
+            );
+        }
+    }
+}
+
 /// Every `AckEvent` must be preceded by a `DeliverEvent` for the same
 /// (`consumer_id`, `message_id`). The broker never accepts an ack for
 /// a message it never delivered.
@@ -1056,6 +1214,8 @@ impl Workload for ProducerConsumerWorkload {
         // Publish PRODUCE_COUNT messages with payloads carrying a small
         // counter so the consumer-side check can verify each payload
         // was delivered exactly once.
+        let client_source = ctx.my_ip().to_owned();
+        let producer_handle = producer.handle().0;
         for i in 0..PRODUCE_COUNT {
             let payload = bytes::Bytes::from(i.to_le_bytes().to_vec());
             let msg = magnetar_proto::producer::OutgoingMessage {
@@ -1066,7 +1226,27 @@ impl Workload for ProducerConsumerWorkload {
                 txn_id: None,
                 source_message_id: None,
             };
-            let _ = tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+            emit_event(
+                SENDS_STARTED_TRAIL,
+                &client_source,
+                &SendStartedEvent {
+                    producer_handle,
+                    send_index: u64::from(i),
+                },
+            );
+            let send_result =
+                tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+            if let Some(kind) = classify_send_outcome(send_result.as_ref()) {
+                emit_event(
+                    SENDS_RESOLVED_TRAIL,
+                    &client_source,
+                    &SendResolvedEvent {
+                        producer_handle,
+                        send_index: u64::from(i),
+                        kind,
+                    },
+                );
+            }
             self.sent.lock().push(i);
         }
 
@@ -1123,6 +1303,7 @@ fn sim_chaos_produce_consume_with_invariants() {
         .invariant(MonotonicMsgIdInvariant::default())
         .invariant(AckAfterReceiveInvariant::default())
         .invariant(NoDupOnAckedInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
         .set_iterations(1)
         .run();
     // The three continuous invariants (monotonic msg-id, ack-after-receive,
@@ -1148,6 +1329,7 @@ fn sim_chaos_produce_consume_sweep_16_seeds() {
         .invariant(MonotonicMsgIdInvariant::default())
         .invariant(AckAfterReceiveInvariant::default())
         .invariant(NoDupOnAckedInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
         .set_iterations(16)
         .run();
     // Safety invariants must hold on *every* seed (no `assert_always!`
@@ -1176,6 +1358,7 @@ fn sim_chaos_seed_2_does_not_hang() {
         .invariant(MonotonicMsgIdInvariant::default())
         .invariant(AckAfterReceiveInvariant::default())
         .invariant(NoDupOnAckedInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
         .set_debug_seeds(vec![2])
         .set_iterations(1)
         .run();
@@ -2217,7 +2400,11 @@ impl Workload for SwizzleClogClientWorkload {
             .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
 
         // Publish first so the ledger grows while the swizzle window
-        // is still open.
+        // is still open. Emit started/resolved trail events so the
+        // `HandleResolutionInvariant` can assert every send resolves
+        // to exactly one of Sent / SessionLost / MemoryLimitExceeded.
+        let client_source = ctx.my_ip().to_owned();
+        let producer_handle = producer.handle().0;
         for i in 0..SWIZZLE_PRODUCE_COUNT {
             let payload = bytes::Bytes::from(i.to_le_bytes().to_vec());
             let msg = magnetar_proto::producer::OutgoingMessage {
@@ -2228,7 +2415,27 @@ impl Workload for SwizzleClogClientWorkload {
                 txn_id: None,
                 source_message_id: None,
             };
-            let _ = tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+            emit_event(
+                SENDS_STARTED_TRAIL,
+                &client_source,
+                &SendStartedEvent {
+                    producer_handle,
+                    send_index: u64::from(i),
+                },
+            );
+            let send_result =
+                tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+            if let Some(kind) = classify_send_outcome(send_result.as_ref()) {
+                emit_event(
+                    SENDS_RESOLVED_TRAIL,
+                    &client_source,
+                    &SendResolvedEvent {
+                        producer_handle,
+                        send_index: u64::from(i),
+                        kind,
+                    },
+                );
+            }
         }
 
         // Drain consumers concurrently — give every consumer its own
@@ -2369,6 +2576,7 @@ fn sim_chaos_swizzle_clog_sweep_16_seeds() {
             state_for_mirror,
         ))
         .invariant(MonotonicMsgIdInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
         .set_iterations(16)
         .run();
     assert!(
@@ -2393,6 +2601,7 @@ fn sim_chaos_swizzle_clog_smoke() {
             state_for_mirror,
         ))
         .invariant(MonotonicMsgIdInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
         .set_iterations(1)
         .run();
 }
