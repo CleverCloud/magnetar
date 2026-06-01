@@ -994,6 +994,27 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
     },
+    /// Get a topic's max-consumers cap (or `null` if no override).
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/maxConsumers`.
+    GetMaxConsumers {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's max-consumers cap. `0` = unlimited.
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/maxConsumers`.
+    SetMaxConsumers {
+        /// Fully qualified topic.
+        topic: String,
+        /// Maximum number of concurrent consumers on the topic.
+        #[arg(long)]
+        max_consumers: i32,
+    },
+    /// Remove a topic's max-consumers cap (fall back to namespace / broker default).
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/maxConsumers`.
+    RemoveMaxConsumers {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -2007,6 +2028,20 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemoveMaxProducers { topic } => {
             admin.topic_remove_max_producers(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::GetMaxConsumers { topic } => {
+            print_json(&admin.topic_get_max_consumers(&topic).await?)
+        }
+        TopicsCmd::SetMaxConsumers {
+            topic,
+            max_consumers,
+        } => {
+            admin.topic_set_max_consumers(&topic, max_consumers).await?;
+            Ok(())
+        }
+        TopicsCmd::RemoveMaxConsumers { topic } => {
+            admin.topic_remove_max_consumers(&topic).await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,

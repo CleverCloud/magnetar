@@ -548,3 +548,45 @@ async fn topic_max_producers_get_set_remove_with_bare_integer_body() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn topic_max_consumers_get_set_remove_with_bare_integer_body() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/maxConsumers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(32)))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/maxConsumers"))
+        .and(body_json(serde_json::json!(96)))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/maxConsumers"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    assert_eq!(
+        admin
+            .topic_get_max_consumers("acme/svc/orders")
+            .await
+            .unwrap(),
+        Some(32)
+    );
+    admin
+        .topic_set_max_consumers("acme/svc/orders", 96)
+        .await
+        .unwrap();
+    admin
+        .topic_remove_max_consumers("acme/svc/orders")
+        .await
+        .unwrap();
+}
