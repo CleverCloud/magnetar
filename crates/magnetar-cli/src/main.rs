@@ -46,7 +46,10 @@ use magnetar::proto::TokenAuth;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
-use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
+use magnetar_admin::{
+    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, RetentionPolicies,
+    TenantInfo,
+};
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
 #[derive(Debug, Parser)]
@@ -284,6 +287,85 @@ pub(crate) enum NamespacesCmd {
     /// Delete a namespace.
     Delete {
         /// Fully qualified namespace (`tenant/namespace`).
+        namespace: String,
+    },
+    /// Get a namespace's retention policy.
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/retention`.
+    GetRetention {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's retention policy.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/retention`.
+    SetRetention {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Retention time in minutes. `-1` = infinite, `0` = none.
+        #[arg(long)]
+        time_minutes: i32,
+        /// Retention size in MB. `-1` = infinite, `0` = none.
+        #[arg(long)]
+        size_mb: i64,
+    },
+    /// Remove a namespace's retention policy (fall back to broker default).
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/retention`.
+    RemoveRetention {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Get all backlog-quota policies on a namespace.
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/backlogQuotaMap`.
+    GetBacklogQuotas {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a backlog-quota policy on a namespace.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/backlogQuota?backlogQuotaType=...`.
+    SetBacklogQuota {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Quota dimension: `destination-storage` (bytes) or `message-age` (seconds).
+        #[arg(long = "type", value_parser = parse_backlog_quota_type)]
+        quota_type: BacklogQuotaType,
+        /// Maximum bytes for `destination-storage`. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        limit_size: i64,
+        /// Maximum age in seconds for `message-age`. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        limit_time: i32,
+        /// Action when the quota is exceeded — `producer_request_hold`,
+        /// `producer_exception`, or `consumer_backlog_eviction`.
+        #[arg(long)]
+        policy: String,
+    },
+    /// Remove a backlog-quota policy from a namespace.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/backlogQuota?backlogQuotaType=...`.
+    RemoveBacklogQuota {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Quota dimension: `destination-storage` or `message-age`.
+        #[arg(long = "type", value_parser = parse_backlog_quota_type)]
+        quota_type: BacklogQuotaType,
+    },
+    /// Get a namespace's message-TTL (seconds, or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/messageTTL`.
+    GetMessageTtl {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's message-TTL (seconds). `0` disables.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/messageTTL`.
+    SetMessageTtl {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// TTL in seconds.
+        #[arg(long)]
+        ttl_seconds: i32,
+    },
+    /// Remove a namespace's message-TTL (fall back to broker default).
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/messageTTL`.
+    RemoveMessageTtl {
+        /// Fully qualified namespace.
         namespace: String,
     },
 }
@@ -792,6 +874,77 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             admin.namespace_delete(&namespace).await?;
             Ok(())
         }
+        NamespacesCmd::GetRetention { namespace } => {
+            print_json(&admin.namespace_get_retention(&namespace).await?)
+        }
+        NamespacesCmd::SetRetention {
+            namespace,
+            time_minutes,
+            size_mb,
+        } => {
+            admin
+                .namespace_set_retention(
+                    &namespace,
+                    RetentionPolicies {
+                        retention_time_in_minutes: time_minutes,
+                        retention_size_in_mb: size_mb,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveRetention { namespace } => {
+            admin.namespace_remove_retention(&namespace).await?;
+            Ok(())
+        }
+        NamespacesCmd::GetBacklogQuotas { namespace } => {
+            print_json(&admin.namespace_get_backlog_quotas(&namespace).await?)
+        }
+        NamespacesCmd::SetBacklogQuota {
+            namespace,
+            quota_type,
+            limit_size,
+            limit_time,
+            policy,
+        } => {
+            admin
+                .namespace_set_backlog_quota(
+                    &namespace,
+                    quota_type,
+                    BacklogQuota {
+                        limit_size,
+                        limit_time,
+                        policy,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveBacklogQuota {
+            namespace,
+            quota_type,
+        } => {
+            admin
+                .namespace_remove_backlog_quota(&namespace, quota_type)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetMessageTtl { namespace } => {
+            print_json(&admin.namespace_get_message_ttl(&namespace).await?)
+        }
+        NamespacesCmd::SetMessageTtl {
+            namespace,
+            ttl_seconds,
+        } => {
+            admin
+                .namespace_set_message_ttl(&namespace, ttl_seconds)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveMessageTtl { namespace } => {
+            admin.namespace_remove_message_ttl(&namespace).await?;
+            Ok(())
+        }
     }
 }
 
@@ -976,6 +1129,20 @@ fn parse_message_id_position(s: &str) -> Result<MessageId, String> {
         #[cfg(feature = "scalable-topics")]
         segment_id: None,
     })
+}
+
+/// Parse a `BacklogQuotaType` from the CLI form. Accepts both
+/// kebab-case (operator-friendly) and the snake_case the broker REST
+/// surface emits, so a JSON-driven script that round-trips the value
+/// gets `--type destination_storage` for free.
+fn parse_backlog_quota_type(s: &str) -> Result<BacklogQuotaType, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "destination-storage" | "destination_storage" => Ok(BacklogQuotaType::DestinationStorage),
+        "message-age" | "message_age" => Ok(BacklogQuotaType::MessageAge),
+        other => Err(format!(
+            "unknown backlog quota type `{other}` (expected: destination-storage | message-age)"
+        )),
+    }
 }
 
 fn parse_property(spec: &str) -> Result<(String, String), String> {

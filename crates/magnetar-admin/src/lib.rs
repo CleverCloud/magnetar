@@ -269,6 +269,145 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's retention policy.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/retention`.
+    /// Returns `RetentionPolicies { retentionTimeInMinutes, retentionSizeInMB }`.
+    /// Java: `NamespacesBase#getRetention`.
+    pub async fn namespace_get_retention(&self, ns: &str) -> Result<RetentionPolicies, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "retention"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's retention policy.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/retention` with a JSON
+    /// `RetentionPolicies` body. `-1` means infinite (size or time).
+    /// Java: `NamespacesBase#setRetention`.
+    pub async fn namespace_set_retention(
+        &self,
+        ns: &str,
+        policy: RetentionPolicies,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "retention"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&policy))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's retention policy (fall back to broker default).
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/retention`.
+    /// Java: `NamespacesBase#removeRetention`.
+    pub async fn namespace_remove_retention(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "retention"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Get all backlog-quota policies on a namespace.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/backlogQuotaMap`. Returns
+    /// `Map<BacklogQuotaType, BacklogQuota>` — kept as raw JSON because
+    /// broker versions add quota types (`message_age` since 2.10).
+    /// Java: `NamespacesBase#getBacklogQuotaMap`.
+    pub async fn namespace_get_backlog_quotas(
+        &self,
+        ns: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "backlogQuotaMap"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a backlog-quota policy on a namespace.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/backlogQuota?backlogQuotaType={type}`
+    /// with a JSON `BacklogQuota` body. `backlog_quota_type` selects which
+    /// dimension to limit (`destination_storage` for byte size, `message_age`
+    /// for wall-clock TTL).
+    /// Java: `NamespacesBase#setBacklogQuota`.
+    pub async fn namespace_set_backlog_quota(
+        &self,
+        ns: &str,
+        backlog_quota_type: BacklogQuotaType,
+        quota: BacklogQuota,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let mut url = self.url(&["namespaces", tenant, namespace, "backlogQuota"])?;
+        url.query_pairs_mut()
+            .append_pair("backlogQuotaType", backlog_quota_type.as_query_value());
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&quota))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a backlog-quota policy from a namespace.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/backlogQuota?backlogQuotaType={type}`.
+    /// Java: `NamespacesBase#removeBacklogQuota`.
+    pub async fn namespace_remove_backlog_quota(
+        &self,
+        ns: &str,
+        backlog_quota_type: BacklogQuotaType,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let mut url = self.url(&["namespaces", tenant, namespace, "backlogQuota"])?;
+        url.query_pairs_mut()
+            .append_pair("backlogQuotaType", backlog_quota_type.as_query_value());
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Get a namespace's message-TTL (seconds).
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/messageTTL`. Returns a
+    /// bare integer (or `null` if no TTL is set — which decodes as
+    /// `Option::None`).
+    /// Java: `NamespacesBase#getNamespaceMessageTTL`.
+    pub async fn namespace_get_message_ttl(&self, ns: &str) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "messageTTL"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's message-TTL (seconds).
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/messageTTL` with a bare
+    /// integer body. `0` disables (broker treats as no TTL).
+    /// Java: `NamespacesBase#setNamespaceMessageTTL`.
+    pub async fn namespace_set_message_ttl(
+        &self,
+        ns: &str,
+        ttl_seconds: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "messageTTL"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&ttl_seconds))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's message-TTL (fall back to broker default).
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/messageTTL`.
+    /// Java: `NamespacesBase#removeNamespaceMessageTTL`.
+    pub async fn namespace_remove_message_ttl(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "messageTTL"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
@@ -935,6 +1074,58 @@ pub struct TopicStats {
 #[serde(default)]
 struct PartitionedTopicMetadata {
     partitions: u32,
+}
+
+/// Java `RetentionPolicies` — namespace-level retention policy. `-1` for
+/// either dimension means infinite. The broker applies whichever quota
+/// becomes binding first (time OR size).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RetentionPolicies {
+    /// Maximum retention time in minutes. `-1` = infinite, `0` = none.
+    pub retention_time_in_minutes: i32,
+    /// Maximum retention size in megabytes. `-1` = infinite, `0` = none.
+    #[serde(rename = "retentionSizeInMB")]
+    pub retention_size_in_mb: i64,
+}
+
+/// Java `BacklogQuota` — one entry in the namespace-level backlog quota
+/// map. `policy` is a string (`producer_request_hold`,
+/// `producer_exception`, `consumer_backlog_eviction`) rather than a
+/// closed Rust enum so new broker enum values forward-decode cleanly.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BacklogQuota {
+    /// Maximum allowed backlog in bytes (when type=`destination_storage`).
+    /// `-1` = unlimited.
+    pub limit_size: i64,
+    /// Maximum allowed backlog age in seconds (when type=`message_age`).
+    /// `-1` = unlimited.
+    pub limit_time: i32,
+    /// Action when the quota is exceeded.
+    pub policy: String,
+}
+
+/// Java `BacklogQuotaType` — selects which dimension a `BacklogQuota`
+/// entry limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogQuotaType {
+    /// Bytes-on-disk dimension. Uses `BacklogQuota::limit_size`.
+    DestinationStorage,
+    /// Message-age dimension. Uses `BacklogQuota::limit_time`.
+    MessageAge,
+}
+
+impl BacklogQuotaType {
+    /// Render as the lowercase snake_case value the broker REST surface
+    /// expects in the `backlogQuotaType` query parameter.
+    #[must_use]
+    pub fn as_query_value(self) -> &'static str {
+        match self {
+            Self::DestinationStorage => "destination_storage",
+            Self::MessageAge => "message_age",
+        }
+    }
 }
 
 /// Java `LongRunningProcessStatus` — the polling shape for triggered
