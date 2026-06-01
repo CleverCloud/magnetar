@@ -1087,6 +1087,51 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's delayed-delivery policy.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/delayedDelivery`. Returns
+    /// the active flag + tick time (the broker's index-tick granularity
+    /// for delivering delayed messages). `null` decodes as `None`.
+    /// Java: `NamespacesBase#getDelayedDeliveryPolicies`.
+    pub async fn namespace_get_delayed_delivery(
+        &self,
+        ns: &str,
+    ) -> Result<Option<DelayedDeliveryPolicies>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "delayedDelivery"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's delayed-delivery policy.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/delayedDelivery` with a
+    /// JSON `DelayedDeliveryPolicies` body.
+    /// Java: `NamespacesBase#setDelayedDeliveryPolicies`.
+    pub async fn namespace_set_delayed_delivery(
+        &self,
+        ns: &str,
+        policy: DelayedDeliveryPolicies,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "delayedDelivery"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&policy))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's delayed-delivery policy override.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/delayedDelivery`.
+    /// Java: `NamespacesBase#removeDelayedDeliveryPolicies`.
+    pub async fn namespace_remove_delayed_delivery(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "delayedDelivery"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
@@ -2315,6 +2360,21 @@ pub struct PublishRate {
     pub publish_throttling_rate_in_msg: i32,
     /// Throttle in bytes/sec. `-1` = unlimited.
     pub publish_throttling_rate_in_byte: i64,
+}
+
+/// Java `DelayedDeliveryPolicies` — namespace-level switch + index-tick
+/// granularity for the broker's delayed-message delivery tracker.
+/// Maps to `org.apache.pulsar.common.policies.data.DelayedDeliveryPolicies`.
+/// `tick_time_millis` controls how often the broker's delay-index buckets
+/// are re-evaluated; smaller values give tighter delivery accuracy at a
+/// higher tracker cost.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DelayedDeliveryPolicies {
+    /// Whether delayed delivery is enabled for the namespace.
+    pub active: bool,
+    /// Index-tick granularity in milliseconds.
+    pub tick_time_millis: i64,
 }
 
 /// Java `BacklogQuota` — one entry in the namespace-level backlog quota

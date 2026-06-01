@@ -48,8 +48,8 @@ use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
-    DispatchRate, PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
-    TenantInfo,
+    DelayedDeliveryPolicies, DispatchRate, PersistencePolicies, PostSchemaPayload, PublishRate,
+    RetentionPolicies, TenantInfo,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -725,6 +725,30 @@ pub(crate) enum NamespacesCmd {
     /// Remove a namespace's compaction threshold override.
     /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`.
     RemoveCompactionThreshold {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Get a namespace's delayed-delivery policy (or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/delayedDelivery`.
+    GetDelayedDelivery {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's delayed-delivery policy.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/delayedDelivery`.
+    SetDelayedDelivery {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Enable delayed delivery on the namespace.
+        #[arg(long)]
+        active: bool,
+        /// Index-tick granularity in milliseconds.
+        #[arg(long)]
+        tick_time_millis: i64,
+    },
+    /// Remove a namespace's delayed-delivery policy override.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/delayedDelivery`.
+    RemoveDelayedDelivery {
         /// Fully qualified namespace.
         namespace: String,
     },
@@ -1859,6 +1883,29 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
             admin
                 .namespace_remove_compaction_threshold(&namespace)
                 .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetDelayedDelivery { namespace } => {
+            print_json(&admin.namespace_get_delayed_delivery(&namespace).await?)
+        }
+        NamespacesCmd::SetDelayedDelivery {
+            namespace,
+            active,
+            tick_time_millis,
+        } => {
+            admin
+                .namespace_set_delayed_delivery(
+                    &namespace,
+                    DelayedDeliveryPolicies {
+                        active,
+                        tick_time_millis,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveDelayedDelivery { namespace } => {
+            admin.namespace_remove_delayed_delivery(&namespace).await?;
             Ok(())
         }
     }

@@ -24,7 +24,7 @@
 //! `setMaxUnackedMessagesPerSubscription`,
 //! `removeMaxUnackedMessagesPerSubscription`).
 
-use magnetar_admin::AdminClient;
+use magnetar_admin::{AdminClient, DelayedDeliveryPolicies};
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -173,4 +173,61 @@ async fn compaction_threshold_get_set_remove_cycle() {
         .namespace_remove_compaction_threshold("acme/svc")
         .await
         .expect("remove compaction threshold");
+}
+
+#[tokio::test]
+async fn delayed_delivery_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "active": true,
+            "tickTimeMillis": 1000,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
+        .and(body_json(serde_json::json!({
+            "active": false,
+            "tickTimeMillis": 5000,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let pol = admin
+        .namespace_get_delayed_delivery("acme/svc")
+        .await
+        .expect("get delayed delivery")
+        .expect("policy present");
+    assert!(pol.active);
+    assert_eq!(pol.tick_time_millis, 1000);
+
+    admin
+        .namespace_set_delayed_delivery(
+            "acme/svc",
+            DelayedDeliveryPolicies {
+                active: false,
+                tick_time_millis: 5000,
+            },
+        )
+        .await
+        .expect("set delayed delivery");
+    admin
+        .namespace_remove_delayed_delivery("acme/svc")
+        .await
+        .expect("remove delayed delivery");
 }
