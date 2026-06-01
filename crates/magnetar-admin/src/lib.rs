@@ -1250,6 +1250,48 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a topic's message-TTL (seconds, or `null` if unset).
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL`. Returns
+    /// a bare integer when the override is set, `null` (decoded as
+    /// `Option::None`) when no topic-level override is in place.
+    /// Java: `PersistentTopicsBase#getMessageTTL`.
+    pub async fn topic_get_message_ttl(&self, topic: &str) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "messageTTL"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a topic's message-TTL (seconds).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL` with
+    /// a bare integer body. `0` disables (broker treats as no TTL).
+    /// Java: `PersistentTopicsBase#setMessageTTL`.
+    pub async fn topic_set_message_ttl(
+        &self,
+        topic: &str,
+        ttl_seconds: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "messageTTL"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&ttl_seconds))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a topic's message-TTL (fall back to namespace default).
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL`.
+    /// Java: `PersistentTopicsBase#removeMessageTTL`.
+    pub async fn topic_remove_message_ttl(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "messageTTL"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.

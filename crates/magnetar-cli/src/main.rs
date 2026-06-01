@@ -808,6 +808,27 @@ pub(crate) enum TopicsCmd {
         #[arg(long = "type", value_parser = parse_backlog_quota_type)]
         quota_type: BacklogQuotaType,
     },
+    /// Get a topic's message-TTL (seconds, or `null` if unset).
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL`.
+    GetMessageTtl {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's message-TTL (seconds). `0` disables.
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL`.
+    SetMessageTtl {
+        /// Fully qualified topic.
+        topic: String,
+        /// TTL in seconds.
+        #[arg(long)]
+        ttl_seconds: i32,
+    },
+    /// Remove a topic's message-TTL (fall back to namespace default).
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL`.
+    RemoveMessageTtl {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1663,6 +1684,17 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemoveBacklogQuota { topic, quota_type } => {
             admin.topic_remove_backlog_quota(&topic, quota_type).await?;
+            Ok(())
+        }
+        TopicsCmd::GetMessageTtl { topic } => {
+            print_json(&admin.topic_get_message_ttl(&topic).await?)
+        }
+        TopicsCmd::SetMessageTtl { topic, ttl_seconds } => {
+            admin.topic_set_message_ttl(&topic, ttl_seconds).await?;
+            Ok(())
+        }
+        TopicsCmd::RemoveMessageTtl { topic } => {
+            admin.topic_remove_message_ttl(&topic).await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,

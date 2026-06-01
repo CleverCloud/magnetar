@@ -138,3 +138,45 @@ async fn topic_backlog_quota_get_set_remove_cycle() {
         .await
         .expect("remove topic backlog quota");
 }
+
+#[tokio::test]
+async fn topic_message_ttl_get_set_remove_with_bare_integer_body() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/messageTTL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(3600)))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/messageTTL"))
+        .and(body_json(serde_json::json!(7200)))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/messageTTL"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    assert_eq!(
+        admin
+            .topic_get_message_ttl("acme/svc/orders")
+            .await
+            .unwrap(),
+        Some(3600)
+    );
+    admin
+        .topic_set_message_ttl("acme/svc/orders", 7200)
+        .await
+        .unwrap();
+    admin
+        .topic_remove_message_ttl("acme/svc/orders")
+        .await
+        .unwrap();
+}
