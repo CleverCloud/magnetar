@@ -927,6 +927,53 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Namespace policies — limits + dedup + delayed delivery -----
+
+    /// Get a namespace's broker-side message deduplication flag.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/deduplication`. Returns a
+    /// bare JSON boolean, or `null` (decoded as `None`) when the policy
+    /// is unset and the broker default applies.
+    /// Java: `NamespacesBase#getDeduplication`.
+    pub async fn namespace_get_deduplication(
+        &self,
+        ns: &str,
+    ) -> Result<Option<bool>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "deduplication"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's broker-side message deduplication flag.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/deduplication` with a
+    /// bare JSON boolean body.
+    /// Java: `NamespacesBase#modifyDeduplication`.
+    pub async fn namespace_set_deduplication(
+        &self,
+        ns: &str,
+        enabled: bool,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "deduplication"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&enabled))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's deduplication flag (fall back to broker default).
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/deduplication`.
+    /// Java: `NamespacesBase#removeDeduplication`.
+    pub async fn namespace_remove_deduplication(&self, ns: &str) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "deduplication"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.

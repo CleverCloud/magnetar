@@ -665,6 +665,27 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's deduplication flag (or `null` if unset).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/deduplication`.
+    GetDeduplication {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's deduplication flag.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/deduplication`.
+    SetDeduplication {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Enable broker-side dedup on the namespace.
+        #[arg(long)]
+        enabled: bool,
+    },
+    /// Remove a namespace's deduplication flag (fall back to broker default).
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/deduplication`.
+    RemoveDeduplication {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1743,6 +1764,19 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         }
         NamespacesCmd::RemovePublishRate { namespace } => {
             admin.namespace_remove_publish_rate(&namespace).await?;
+            Ok(())
+        }
+        NamespacesCmd::GetDeduplication { namespace } => {
+            print_json(&admin.namespace_get_deduplication(&namespace).await?)
+        }
+        NamespacesCmd::SetDeduplication { namespace, enabled } => {
+            admin
+                .namespace_set_deduplication(&namespace, enabled)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveDeduplication { namespace } => {
+            admin.namespace_remove_deduplication(&namespace).await?;
             Ok(())
         }
     }
