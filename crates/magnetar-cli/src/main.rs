@@ -282,6 +282,42 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
         topic: String,
     },
+    /// Trigger ledger compaction. Asynchronous — poll
+    /// `topics compaction-status` to see progress.
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/compaction`.
+    Compact {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Get the current compaction status (`NOT_RUN` / `RUNNING` / `SUCCESS` / `ERROR`).
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/compaction`.
+    CompactionStatus {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Unload a topic from its current broker — forces rebalancing.
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/unload`.
+    Unload {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Terminate (seal) a topic. Returns the `MessageId` of the last
+    /// message that landed before the seal.
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/terminate`.
+    Terminate {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Grow a partitioned topic's partition count. Only forward growth is
+    /// supported; the broker returns 409 on shrink.
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions`.
+    UpdatePartitions {
+        /// Fully qualified topic.
+        topic: String,
+        /// New partition count (must be > current).
+        #[arg(long)]
+        partitions: u32,
+    },
     /// Resolve a broker-entry-metadata index to a `MessageId` (PIP-415).
     /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/getMessageIdByIndex?index={index}`.
     /// Requires the broker to have `brokerEntryMetadataInterceptors`
@@ -736,6 +772,34 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
                 "subscriptions": stats.subscriptions,
             });
             print_json(&json)
+        }
+        TopicsCmd::Compact { topic } => {
+            admin.topic_compact(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::CompactionStatus { topic } => {
+            print_json(&admin.topic_compaction_status(&topic).await?)
+        }
+        TopicsCmd::Unload { topic } => {
+            admin.topic_unload(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::Terminate { topic } => {
+            // `MessageId` doesn't derive `Serialize` — build the JSON manually
+            // (same shape as `topics get-message-id-by-index`).
+            let id = admin.topic_terminate(&topic).await?;
+            let json = serde_json::json!({
+                "ledgerId": id.ledger_id,
+                "entryId": id.entry_id,
+                "partition": id.partition,
+                "batchIndex": id.batch_index,
+                "batchSize": id.batch_size,
+            });
+            print_json(&json)
+        }
+        TopicsCmd::UpdatePartitions { topic, partitions } => {
+            admin.topic_update_partitions(&topic, partitions).await?;
+            Ok(())
         }
         TopicsCmd::GetMessageIdByIndex { topic, index } => {
             // `MessageId` doesn't derive `Serialize` (it's a pure proto

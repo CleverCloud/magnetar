@@ -344,6 +344,79 @@ impl AdminClient {
         dto.try_into_message_id()
     }
 
+    /// Trigger ledger compaction for a topic.
+    ///
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/compaction`.
+    /// Returns 204 on success; the broker queues the work asynchronously —
+    /// poll [`Self::topic_compaction_status`] to observe progress.
+    /// Java: `PersistentTopics#triggerCompaction`.
+    pub async fn topic_compact(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "compaction"])?;
+        let resp = self.send(self.http.request(Method::PUT, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Get the current compaction status for a topic.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/compaction`.
+    /// Returns Java's `LongRunningProcessStatus`: `status` ∈ {`NOT_RUN`,
+    /// `RUNNING`, `SUCCESS`, `ERROR`} plus an optional `lastError` string.
+    /// Java: `PersistentTopics#compactionStatus`.
+    pub async fn topic_compaction_status(
+        &self,
+        topic: &str,
+    ) -> Result<LongRunningProcessStatus, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "compaction"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Unload a topic from its current broker (forces rebalancing).
+    ///
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/unload`.
+    /// Operators use this to drain a hot broker or to re-elect ownership
+    /// after a configuration change. Java: `PersistentTopics#unloadTopic`.
+    pub async fn topic_unload(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "unload"])?;
+        let resp = self.send(self.http.request(Method::PUT, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Terminate (seal) a topic — no further produces succeed.
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/terminate`.
+    /// Returns the [`MessageId`] of the last message that landed before the
+    /// seal. Java: `PersistentTopics#terminate`.
+    pub async fn topic_terminate(&self, topic: &str) -> Result<MessageId, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "terminate"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        let dto: MessageIdResponse = json_ok(resp).await?;
+        dto.try_into_message_id()
+    }
+
+    /// Grow a partitioned topic's partition count.
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions`
+    /// with a bare JSON integer body. Only forward (grow) is supported by
+    /// the broker — shrinking returns 409. Java:
+    /// `PersistentTopics#updatePartitionedTopic`.
+    pub async fn topic_update_partitions(
+        &self,
+        topic: &str,
+        new_partitions: u32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "partitions"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&new_partitions))
+            .await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.
@@ -790,6 +863,19 @@ pub struct TopicStats {
 #[serde(default)]
 struct PartitionedTopicMetadata {
     partitions: u32,
+}
+
+/// Java `LongRunningProcessStatus` — the polling shape for triggered
+/// background jobs (compaction, offload). The broker returns one of four
+/// `status` values: `NOT_RUN` (never triggered), `RUNNING`, `SUCCESS`,
+/// `ERROR`. `last_error` is populated only on `ERROR`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LongRunningProcessStatus {
+    /// Job state — `NOT_RUN`, `RUNNING`, `SUCCESS`, or `ERROR`.
+    pub status: String,
+    /// Human-readable error message, present on `ERROR`.
+    pub last_error: String,
 }
 
 /// Request body for `POST .../subscription/{sub}/resetcursor` (Java
