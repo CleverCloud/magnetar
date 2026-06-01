@@ -4,10 +4,10 @@
 //! after Apache Pulsar's `BatchMessageTest`, `ConsumerBatchReceiveTest` and
 //! `MessageChunkingTest`.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_batch_chunk -- --nocapture
+//! cargo test -p magnetar --test e2e_batch_chunk -- --nocapture
 //! ```
 //!
 //! Requires Docker on the host. See `e2e_pulsar.rs` for the broker container
@@ -15,8 +15,6 @@
 //!
 //! PIP-37 (Large Message Size) requires producer chunking + batching disabled
 //! (chunks-never-batched). The chunked round-trip below mirrors that constraint.
-
-#![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
@@ -85,7 +83,6 @@ fn unique_topic(prefix: &str) -> String {
 /// (1 minute) so the batch can only flush on the message-count cap. Sends 5
 /// messages and verifies the consumer receives all 5 in order. Mirrors Java
 /// `BatchMessageTest` (`batchingMaxMessages` triggering a flush).
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_producer_batching_flushes_on_max_msgs() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -144,7 +141,6 @@ async fn e2e_producer_batching_flushes_on_max_msgs() -> Result<(), Box<dyn std::
 /// `BatchReceivePolicy`: the call returns at most 5 messages even when 10 are
 /// available, and a second call drains the remainder. Modelled after
 /// `ConsumerBatchReceiveTest`.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_consumer_batch_receive() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -204,7 +200,6 @@ async fn e2e_consumer_batch_receive() -> Result<(), Box<dyn std::error::Error>> 
 ///
 /// Only the length is asserted — per-byte comparison would dominate test wall
 /// time without adding signal.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_chunked_message_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

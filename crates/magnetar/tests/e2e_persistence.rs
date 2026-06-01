@@ -16,13 +16,11 @@
 //! client never has to special-case them. These tests pin that contract end-to-end
 //! against the real broker rather than re-asserting it in unit tests.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_persistence -- --nocapture --ignored
+//! cargo test -p magnetar --test e2e_persistence -- --nocapture
 //! ```
-
-#![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
@@ -81,7 +79,6 @@ async fn start_pulsar() -> Result<
 /// Round-trip with the explicit `persistent://` prefix. Same path as the default
 /// `e2e_produce_consume_roundtrip` test, but pinned to the prefix so a future
 /// regression in topic-string handling (e.g. stripping the scheme) is caught.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_persistent_topic_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -134,7 +131,6 @@ async fn e2e_persistent_topic_round_trip() -> Result<(), Box<dyn std::error::Err
 /// producer sends — otherwise the messages are dropped at the dispatcher.
 ///
 /// Mirrors `NonPersistentTopicTest#testNonPersistentTopic` from the Java client.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_non_persistent_topic_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -189,7 +185,6 @@ async fn e2e_non_persistent_topic_round_trip() -> Result<(), Box<dyn std::error:
 ///
 /// This is the defining behavioural difference vs `persistent://` and is what the
 /// Java `NonPersistentTopicTest` exercises through the dispatcher tests.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_non_persistent_topic_drops_when_no_consumer() -> Result<(), Box<dyn std::error::Error>>
 {

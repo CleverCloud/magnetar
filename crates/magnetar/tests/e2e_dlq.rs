@@ -4,15 +4,13 @@
 //! real Apache Pulsar 4.x standalone broker.
 //!
 //! Mirrors Apache Pulsar's `DeadLetterTopicTest` (PIP-22 / PIP-58 / PIP-409)
-//! Java parity coverage. Gated behind `e2e`; run with:
+//! Java parity coverage. Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_dlq -- --nocapture
+//! cargo test -p magnetar --test e2e_dlq -- --nocapture
 //! ```
 //!
 //! Requires Docker on the host.
-
-#![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
@@ -71,7 +69,6 @@ async fn start_pulsar() -> Result<
 /// PIP-22 DLQ routing: once a message has been redelivered past
 /// `max_redeliver_count`, the consumer flags it as dead-letter; we then republish
 /// to the DLQ topic and verify a second consumer reads it back.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_dlq_max_redeliver_routes_to_dead_letter() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -158,7 +155,6 @@ async fn e2e_dlq_max_redeliver_routes_to_dead_letter() -> Result<(), Box<dyn std
 /// PIP-58 retry-letter (`reconsume_later`): republish a message with a delay onto
 /// the retry-letter topic, then re-subscribe to that topic and verify the
 /// delayed redelivery + `RECONSUMETIMES` property.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_reconsume_later_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -225,7 +221,6 @@ async fn e2e_reconsume_later_round_trip() -> Result<(), Box<dyn std::error::Erro
 
 /// Once a DLQ-routed message is consumed and acked on the DLQ topic, it must
 /// not reappear on a fresh subscription read.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_dlq_explicit_ack_terminates() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

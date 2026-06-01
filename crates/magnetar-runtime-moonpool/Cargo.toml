@@ -23,7 +23,7 @@ workspace = true
 #
 # A default crypto provider is set so the crate compiles cleanly when built
 # directly as a workspace member (e.g. `cargo build --workspace` or the e2e
-# job's `cargo test --workspace --features e2e,…`). The magnetar facade picks
+# job's `cargo test --workspace`). The magnetar facade picks
 # the provider via its own `crypto-*` features (which propagate through
 # `magnetar-runtime-moonpool?/crypto-*`); the per-provider build matrix in
 # `cargo xtask check-crypto-matrix` continues to gate each provider in

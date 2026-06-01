@@ -38,6 +38,7 @@ follow-up train; the gap is tracked below.
 | TableView | ✅ | ✅ |
 | Transactions (PIP-31) | ✅ | ✅ |
 | Typed schemas | ✅ | ✅ |
+| Binary proxy (`proxy_to_broker_url`, [ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)) | ✅ (`ProxyConnectionPool` pins per-broker connections, avoids the ~90 ms reconnect storm from issue #15) | 🟡 (moonpool lookup path returns `ProxyUnsupportedOnUnsupervisedClient`; the moonpool flavour of `ProxyConnectionPool` is tracked in [`follow-ups.md §3`](follow-ups.md#3-moonpool-proxyconnectionpool-parity)) |
 | Deterministic chaos pack | n/a | ✅ |
 | tokio ↔ moonpool differential equivalence harness | n/a | ✅ |
 
@@ -191,6 +192,6 @@ transitively activate under `-p`. See
 provider matrix and `cargo run -p xtask -- check-crypto-matrix` for the
 authoritative per-provider build sweep.
 
-Behind `--features e2e`, the suite spins `apachepulsar/pulsar:4.0.4`
+Per ADR-0045, the suite spins `apachepulsar/pulsar:4.0.4`
 in Docker and exercises the public surface against a real broker — see
 [`testing.md`](testing.md).

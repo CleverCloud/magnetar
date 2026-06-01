@@ -122,8 +122,10 @@ The default feature set enables the tokio engine. The feature flags catalog:
 | `auth-athenz` | no | Pulls in `magnetar-auth-athenz`. |
 | `auth-athenz-zts` | no | Implies `auth-athenz` and turns on the reqwest-backed ZTS exchange plus in-tree JWT signer support. |
 | `encryption` | no | Pulls in `magnetar-messagecrypto` plus the PIP-4 bridge type. |
-| `e2e` | no | Implies `tokio` + `admin`; flips on the `testcontainers`-backed end-to-end suite (requires Docker). |
-| `e2e-multi-cluster` | no | Implies `e2e`; enables the slower replicated-subscription two-cluster fixture. |
+<!-- `e2e` and `e2e-multi-cluster` features removed per ADR-0045: the
+end-to-end suite runs as a regular `cargo test` with no feature gate
+and no `#[ignore]`. Docker on the host is the only prerequisite. -->
+
 | `experimental-v5-client` | no | Enables the PIP-466 V5 wrapper surface (`magnetar::v5`) over the v4 wire commands. |
 | `scalable-topics` | no | Enables the experimental PIP-460 scalable-topic scaffold (`topic://`, DAG watch, StreamConsumer, `topic-info`). |
 | `crypto-aws-lc-rs` | yes | rustls crypto provider: `aws-lc-rs`; brings post-quantum hybrid KEX (X25519MLKEM768). See [TLS crypto provider](#tls-crypto-provider). |
@@ -649,7 +651,7 @@ known-missing feature.
 | Athenz (ZTS round-trip) | ✅ | ✅ | `feature = "auth-athenz-zts"` (default off). The pluggable `zts::ZtsClient` trait (`zts::HttpZtsClient` does the reqwest-backed POST) exchanges a signed JWT for a role token; `AthenzProvider` owns the expiry-aware cache and `ensure_role_token(now)` / `needs_refresh(now)` (sans-io clock injection). Build via `AthenzProvider::with_default_signer(config)` (cfg-active in-tree signer) or `AthenzProvider::builder()` (custom signer / client / `wall_clock`). The concrete `zts::JwtSigner` ships in two flavours — `jwt_signer::AwsLcRsSigner` and `jwt_signer::RingSigner` — gated on the crypto-provider matrix per [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md); parsed PKCS#8 DER wrapped in `zeroize::Zeroizing<…>`, byte-identical deterministic RS256 (RFC 8017 §8.2). Full four-layer cross-runtime coverage (tokio/moonpool/differential + e2e) per [ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md). See [`docs/athenz.md`](docs/athenz.md) and [ADR-0041](specs/adr/0041-athenz-provider-testability-seams.md). |
 | In-band `AUTH_CHALLENGE` refresh (PIP-30 / PIP-292) | ✅ | ✅ | Driver consults the configured `AuthProvider` and submits `CommandAuthResponse`. |
 | `pulsar+ssl://` URLs | ✅ | ✅ | Built-in. |
-| Binary proxy (`proxy_to_broker_url`) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
+| Binary proxy (`proxy_to_broker_url`) | ✅ | ✅ (tokio) / 🟡 (moonpool) | `ClientBuilder::proxy_to_broker_url`. Tokio ships the full `ProxyConnectionPool` ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)); moonpool lookup returns `ProxyUnsupportedOnUnsupervisedClient` until the moonpool pool variant lands ([`docs/follow-ups.md §3`](docs/follow-ups.md#3-moonpool-proxyconnectionpool-parity)). |
 
 ### Encryption (PIP-4)
 
@@ -690,7 +692,7 @@ known-missing feature.
 | `tlsAllowInsecureConnection` | ✅ | ✅ | `ClientBuilder::tls_allow_insecure_connection(true)` — accepts any server cert via a custom rustls verifier. **Insecure**, do not use in production. |
 | `enableTlsHostnameVerification` | ✅ | ✅ | `ClientBuilder::tls_hostname_verification_enable(bool)` — `true` uses the standard WebPKI verifier; `false` paired with `tls_trust_certs_pem` routes through `magnetar_runtime_tokio::tls_config_no_hostname` which delegates chain check to WebPKI and intercepts only `NotValidForName`. |
 | `serviceUrlProvider` (URL rotation) | ✅ | ✅ | `ClientBuilder::service_url_provider(Arc<dyn ServiceUrlProvider>)` — the supervised reconnect path calls `provider.get_service_url()` on every reconnect attempt so cluster-failover policies can swap URLs between attempts. |
-| `proxyServiceUrl` (binary proxy) | ✅ | ✅ | `ClientBuilder::proxy_to_broker_url`. |
+| `proxyServiceUrl` (binary proxy) | ✅ | ✅ (tokio) / 🟡 (moonpool) | `ClientBuilder::proxy_to_broker_url`. Tokio-only `ProxyConnectionPool` ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)); moonpool variant tracked in [`docs/follow-ups.md §3`](docs/follow-ups.md#3-moonpool-proxyconnectionpool-parity). |
 | `Authentication` plugin | ✅ | ✅ | `ClientBuilder::auth(Arc<dyn AuthProvider>)`. |
 | `memoryLimit` | ✅ | ✅ | `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy)`. Both `FailImmediately` (atomic CAS, [ADR-0017](specs/adr/0017-memory-limit-atomic-reservation.md)) and `ProducerBlock` (Waker slab, [ADR-0020](specs/adr/0020-memory-limit-producer-block.md)) ship. |
 | `dnsResolver` customisation | ✅ | ✅ | `ClientBuilder::dns_resolver(Arc<dyn DnsResolver>)` — `Transport::connect_with_resolver` resolves via the provider on every (re)connect; `TokioDnsResolver` is the default. |
@@ -860,11 +862,10 @@ RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-End-to-end tests against a real broker (Docker required, runs `pulsar:4.0.4`):
-
-```sh
-cargo test --workspace --features e2e
-```
+End-to-end tests against a real broker run as part of
+`cargo test --workspace --all-features` (ADR-0045 — no `--features e2e`,
+no `#[ignore]`). Docker is the only prerequisite; the suite spins
+`pulsar:4.0.4` via `testcontainers-rs`.
 
 Additional `xtask` checks specific to the sans-io invariants:
 

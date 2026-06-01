@@ -19,16 +19,13 @@
 //!   `Time` / `Timestamp`) so the broker stores the semantic intent. We round-trip a representative
 //!   i64 for each.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_schemas_extended -- --nocapture
+//! cargo test -p magnetar --test e2e_schemas_extended -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the dedicated `e2e`
-//! workflow (`workflow_dispatch` + `release/*` branches).
-
-#![cfg(feature = "e2e")]
+//! Requires Docker on the host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,7 +106,6 @@ const AVRO_USER_SCHEMA: &str = r#"{
 /// Avro schema parity with Java `SimpleSchemaTest` / `AvroSchemaTest`. Verifies
 /// `AvroSchema::parse_str` + the broker accept the parsing-canonical-form
 /// `schema_data`, and that `apache_avro` round-trips the value.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_avro_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -170,7 +166,6 @@ async fn e2e_schema_avro_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 /// `MessageMetadata.partition_key` carrier surfaced via `decode_with_key` —
 /// the inline form is the only path that round-trips fully through the typed
 /// consumer today.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_key_value_string_int32_inline_roundtrip()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -240,7 +235,6 @@ async fn e2e_schema_key_value_string_int32_inline_roundtrip()
 /// wire layout but with distinct `pb::schema::Type` discriminators. We
 /// round-trip representative values for each so any future regression in the
 /// `schema_type()` discriminator path is caught.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_schema_temporal_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

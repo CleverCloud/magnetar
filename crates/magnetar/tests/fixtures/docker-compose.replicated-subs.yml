@@ -8,15 +8,14 @@
 # target namespace to have `replicated_subscription_status=true`. See
 # fixtures/configure_replicated_subs.sh for the post-up setup.
 #
-# Usage (manual / weekly CI):
+# Usage (manual):
 #   docker compose -f docker-compose.replicated-subs.yml up -d
 #   ./configure_replicated_subs.sh
-#   cargo test --features 'e2e,e2e-multi-cluster' \
-#     -p magnetar --test e2e_replicated_subscriptions -- --include-ignored
+#   cargo test -p magnetar --test e2e_replicated_subscriptions
 #   docker compose -f docker-compose.replicated-subs.yml down -v
 #
-# Per ADR-0036 cost-shifting precedent, this fixture is *not* part of per-PR
-# CI — it lives in .github/workflows/e2e-replicated-subs.yml (weekly cadence).
+# Per ADR-0045 this fixture runs on every PR — the `test` job in
+# .github/workflows/ci.yml brings it up automatically before `cargo test`.
 
 services:
   zookeeper:

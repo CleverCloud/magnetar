@@ -3,10 +3,10 @@
 //! End-to-end tests for PIP-4 end-to-end encryption against a real Apache
 //! Pulsar 4.x standalone broker spun up via `testcontainers-rs`.
 //!
-//! Gated behind both `e2e` and `encryption` features. Run with:
+//! Gated behind the `encryption` feature. Run with:
 //!
 //! ```sh
-//! cargo test --features e2e,encryption -p magnetar --test e2e_crypto -- --nocapture
+//! cargo test --features encryption -p magnetar --test e2e_crypto -- --nocapture
 //! ```
 //!
 //! Requires Docker on the host. The broker is opaque to encryption — PIP-4 is
@@ -22,7 +22,7 @@
 //! 5. PIP-4 + PIP-37 cross-feature: a > `max_message_size` payload that is both chunked AND
 //!    encrypted reassembles + decrypts on the consumer.
 
-#![cfg(all(feature = "e2e", feature = "encryption"))]
+#![cfg(feature = "encryption")]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -184,7 +184,6 @@ fn bridge_for(crypto: Arc<MessageCrypto>) -> Arc<MessageCryptoBridge> {
 }
 
 /// (1) Happy path — same `MessageCrypto` on both sides round-trips plaintext.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_crypto_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -228,7 +227,6 @@ async fn e2e_crypto_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 
 /// (2) `CryptoFailureAction::Fail` — consumer surfaces a decrypt error when
 /// the configured decryptor refuses every message.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_crypto_failure_action_fail() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -275,7 +273,6 @@ async fn e2e_crypto_failure_action_fail() -> Result<(), Box<dyn std::error::Erro
 
 /// (3) `CryptoFailureAction::Discard` — undecryptable messages are silently
 /// acked + skipped. Then a non-encrypted message still flows through.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_crypto_failure_action_discard() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -340,7 +337,6 @@ async fn e2e_crypto_failure_action_discard() -> Result<(), Box<dyn std::error::E
 /// (4) `CryptoFailureAction::Consume` — ciphertext is handed back to the
 /// caller untouched. We assert the bytes don't match the plaintext and the
 /// `encryption_keys` metadata is preserved.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_crypto_failure_action_consume() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;
@@ -402,7 +398,6 @@ async fn e2e_crypto_failure_action_consume() -> Result<(), Box<dyn std::error::E
 ///
 /// Chunks-never-batched per PIP-37 — we explicitly disable batching even
 /// though it's already off by default.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

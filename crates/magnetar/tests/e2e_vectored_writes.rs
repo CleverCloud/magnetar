@@ -18,14 +18,8 @@
 //! producer exercises the driver merging several per-slot staged sends into
 //! one vectored transmit.
 //!
-//! Gated behind the `e2e` feature flag + `#[ignore]` (Docker), per ADR-0021.
-//! Run with:
-//!
-//! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_vectored_writes -- --include-ignored --nocapture
-//! ```
-
-#![cfg(feature = "e2e")]
+//! Runs as a regular test under `cargo test` (ADR-0045). Requires
+//! Docker on the host.
 
 use std::time::Duration;
 
@@ -86,7 +80,6 @@ async fn start_pulsar()
 /// `IoSlice` genuinely dominates the frame-head `IoSlice` — a coalescing
 /// regression would still pass, but the round-trip equality is the contract
 /// the vectored path must preserve.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_vectored_large_payload_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _container) = start_pulsar().await?;

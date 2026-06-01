@@ -6,8 +6,8 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo test --features e2e,auth-sasl-kerberos \
-//!   -p magnetar --test e2e_sasl_kerberos -- --nocapture --include-ignored
+//! cargo test --features auth-sasl-kerberos \
+//!   -p magnetar --test e2e_sasl_kerberos -- --nocapture
 //! ```
 //!
 //! The default KDC image is `gcavalcante8808/krb5-server` — a small,
@@ -29,7 +29,7 @@
 //! where the production [`magnetar_auth_sasl::LibGssapiClient`] runs
 //! against real Kerberos primitives.
 
-#![cfg(all(feature = "e2e", feature = "auth-sasl-kerberos"))]
+#![cfg(feature = "auth-sasl-kerberos")]
 
 use std::time::Duration;
 
@@ -98,7 +98,6 @@ async fn start_kdc()
 ///
 /// Either branch proves the production code path works end-to-end; only
 /// the credential-availability axis changes.
-#[ignore = "e2e: requires Docker + libkrb5"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_sasl_kerberos_provider_runs_against_dockerised_kdc()
 -> Result<(), Box<dyn std::error::Error>> {

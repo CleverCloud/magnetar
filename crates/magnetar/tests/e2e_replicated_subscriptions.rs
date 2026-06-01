@@ -11,10 +11,11 @@
 //! `crates/magnetar/tests/fixtures/docker-compose.replicated-subs.yml` and is
 //! brought up out-of-band by `configure_replicated_subs.sh`.
 //!
-//! Gated by the `e2e` *and* `e2e-multi-cluster` features so this 60s+ fixture
-//! is opt-in even within the e2e suite. The weekly CI workflow at
-//! `.github/workflows/e2e-replicated-subs.yml` is the canonical runner. Per
-//! ADR-0036 cost-shifting precedent, these tests are excluded from per-PR CI.
+//! Runs as a regular test under `cargo test` (ADR-0045 — the former
+//! `e2e` / `e2e-multi-cluster` Cargo features are gone). The two-cluster
+//! docker-compose fixture must be healthy before `cargo test` starts;
+//! per-PR CI brings it up automatically in the `test` job
+//! (`.github/workflows/ci.yml`).
 //!
 //! ## Running locally
 //!
@@ -22,12 +23,10 @@
 //! cd crates/magnetar/tests/fixtures
 //! docker compose -f docker-compose.replicated-subs.yml up -d
 //! ./configure_replicated_subs.sh
-//! cargo test --features 'e2e,e2e-multi-cluster' \
-//!     -p magnetar --test e2e_replicated_subscriptions -- --include-ignored
+//! cargo test -p magnetar --test e2e_replicated_subscriptions
 //! docker compose -f docker-compose.replicated-subs.yml down -v
 //! ```
 
-#![cfg(all(feature = "e2e", feature = "e2e-multi-cluster"))]
 #![allow(clippy::similar_names, clippy::duration_suboptimal_units)]
 
 use std::time::Duration;
@@ -48,7 +47,6 @@ async fn build_client(url: &str) -> Result<PulsarClient, Box<dyn std::error::Err
 /// fixture, so up to ~1s of redelivery, never less than half the consumed
 /// prefix).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "e2e: requires two-cluster Docker fixture (see fixtures/docker-compose.replicated-subs.yml)"]
 async fn consumer_resumes_within_one_second_after_cluster_failover()
 -> Result<(), Box<dyn std::error::Error>> {
     let topic = format!(
@@ -131,7 +129,6 @@ async fn consumer_resumes_within_one_second_after_cluster_failover()
 /// per-client buffer must surface at least one `REPLICATED_SUBSCRIPTION_*`
 /// marker within the snapshot window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "e2e: requires two-cluster Docker fixture (see fixtures/docker-compose.replicated-subs.yml)"]
 async fn marker_observation_event_fires_against_real_broker()
 -> Result<(), Box<dyn std::error::Error>> {
     let topic = format!(

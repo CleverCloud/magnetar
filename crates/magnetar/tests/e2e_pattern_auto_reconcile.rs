@@ -9,16 +9,13 @@
 //! topics that were created **after** the pattern consumer was built and
 //! subscribes to them.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_pattern_auto_reconcile -- --nocapture
+//! cargo test -p magnetar --test e2e_pattern_auto_reconcile -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the `e2e` workflow
-//! (`workflow_dispatch` + `release/*` branches).
-
-#![cfg(feature = "e2e")]
+//! Requires Docker on the host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +88,6 @@ async fn start_pulsar() -> Result<
 /// ticker subscribed and delivered the message within the ticker interval.
 ///
 /// Mirrors Java `PatternTopicsConsumerImplTest#testPatternTopicsConsumerCheck`.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_pattern_auto_reconcile_picks_up_new_topic() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

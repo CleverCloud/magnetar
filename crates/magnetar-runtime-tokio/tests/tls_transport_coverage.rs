@@ -8,8 +8,8 @@
 //! - [`tls_handshake_chaos.rs`](./tls_handshake_chaos.rs) — corrupt-byte rejection on
 //!   `rustls::ClientConnection`.
 //! - [`tls_crypto_provider_smoke.rs`](./tls_crypto_provider_smoke.rs) — per-provider TLS plumbing.
-//! - The e2e suite (`cargo test --features e2e -- --include-ignored`), which dials the Pulsar 4.x
-//!   container over `pulsar+ssl://`.
+//! - The e2e suite (`cargo test -- --include-ignored`), which dials the Pulsar 4.x container over
+//!   `pulsar+ssl://`.
 //!
 //! That leaves the moonpool-side TLS hunk in `transport.rs` as the
 //! biggest single uncovered region in the workspace. The moonpool

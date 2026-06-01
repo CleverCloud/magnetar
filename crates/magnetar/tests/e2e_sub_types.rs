@@ -11,17 +11,13 @@
 //! `e2e_produce_consume_roundtrip` already covers `Exclusive`; this file adds
 //! the three remaining variants for Java parity.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_sub_types -- --nocapture
+//! cargo test -p magnetar --test e2e_sub_types -- --nocapture
 //! ```
 //!
-//! Requires Docker on the host. CI runs these only in the `e2e` workflow
-//! (`workflow_dispatch` + `release/*` branches) so unrelated PRs don't pay
-//! the multi-minute container startup cost.
-
-#![cfg(feature = "e2e")]
+//! Requires Docker on the host.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -117,7 +113,6 @@ async fn drain_keys(
 /// Two consumers on a `Shared` subscription should split the message stream
 /// between them. We don't pin the exact split (broker may skew under load),
 /// only that the union covers every payload exactly once.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_shared_subscription_distributes_across_consumers()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -205,7 +200,6 @@ async fn e2e_shared_subscription_distributes_across_consumers()
 /// known race in 4.0 standalone. Rather than assume which one is active,
 /// we detect it dynamically: drain both consumers concurrently after the
 /// first batch and treat whichever one received as "active" for this run.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::error::Error>> {
@@ -370,7 +364,6 @@ async fn e2e_failover_subscription_active_only() -> Result<(), Box<dyn std::erro
 /// key-space across consumers so each key sticks to exactly one consumer.
 /// The Java baseline is `KeySharedSubscriptionTest` — we keep the assertion
 /// to broker-observable semantics: disjoint key sets, full key coverage.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_key_shared_sticks_per_key() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar().await?;

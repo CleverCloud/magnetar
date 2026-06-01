@@ -20,26 +20,17 @@
 //! Without ADR-0039's pool wiring this test would observe the
 //! ~90 ms reconnect storm from issue #15.
 //!
-//! ## Gating + runtime
+//! ## Runtime
 //!
-//! Gated behind the `e2e` feature flag (ADR-0021 allows `#[ignore]` for
-//! environment dependencies). Run with:
-//!
-//! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_pulsar_proxy -- --include-ignored --nocapture
-//! ```
-//!
-//! Requires Docker on the host. Two containers are started: a standalone
-//! broker (~30 s startup), and a proxy (~10 s startup once the broker is
-//! healthy). The proxy needs network reachability back to the
-//! standalone's mapped Zookeeper port. On Linux the test uses the
-//! standalone container's bridge IP (`get_bridge_ip_address`) so the
-//! proxy can reach Zookeeper directly. Falls back to `host.docker.internal`
-//! when the bridge IP is unavailable (Docker Desktop on macOS / Windows).
-//!
-//! CI runs these only in the dedicated `e2e` workflow.
-
-#![cfg(feature = "e2e")]
+//! Runs as a regular test under `cargo test` (ADR-0045 — no feature
+//! flag, no `#[ignore]`). Requires Docker on the host: two containers
+//! are started — a standalone broker (~30 s startup), and a proxy
+//! (~10 s startup once the broker is healthy). The proxy needs network
+//! reachability back to the standalone's mapped Zookeeper port. On
+//! Linux the test uses the standalone container's bridge IP
+//! (`get_bridge_ip_address`) so the proxy can reach Zookeeper directly.
+//! Falls back to `host.docker.internal` when the bridge IP is
+//! unavailable (Docker Desktop on macOS / Windows).
 
 use std::time::Duration;
 
@@ -141,7 +132,6 @@ async fn start_proxy(
     Ok((url, container))
 }
 
-#[ignore = "e2e: requires Docker + reachable host gateway between proxy and standalone"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_produce_consume_through_pulsar_proxy() -> Result<(), Box<dyn std::error::Error>> {
     // Skip when the gateway env var isn't set — the proxy container needs a
@@ -155,7 +145,7 @@ async fn e2e_produce_consume_through_pulsar_proxy() -> Result<(), Box<dyn std::e
         eprintln!(
             "skipping e2e_produce_consume_through_pulsar_proxy: \
              MAGNETAR_E2E_DOCKER_HOST_GATEWAY not set. Run with e.g. \
-             `MAGNETAR_E2E_DOCKER_HOST_GATEWAY=172.17.0.1 cargo test --features e2e \
+             `MAGNETAR_E2E_DOCKER_HOST_GATEWAY=172.17.0.1 cargo test \
              --test e2e_pulsar_proxy -- --include-ignored`."
         );
         return Ok(());

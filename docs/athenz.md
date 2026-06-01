@@ -192,7 +192,7 @@ behind `feature = "e2e,auth-athenz-zts"` and is `#[ignore]`'d by default
 (parity with every other `e2e_*.rs` test). Run with:
 
 ```sh
-cargo test --features e2e,auth-athenz-zts \
+cargo test --features auth-athenz-zts \
   -p magnetar --test e2e_athenz_zts -- --nocapture --include-ignored
 ```
 

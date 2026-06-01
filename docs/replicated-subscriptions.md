@@ -157,7 +157,7 @@ These are the two explicit non-goals locked in
   `CommandSubscribe`.
 - **End-to-end**: 2 tests at
   `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the
-  two-cluster Docker fixture. Opt-in via `--features e2e,e2e-multi-cluster`;
+  two-cluster Docker fixture. Runs as a regular `cargo test` per ADR-0045;
   CI runs them **weekly only** in
   [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml)
   per the ADR-0036 cost-shifting precedent.

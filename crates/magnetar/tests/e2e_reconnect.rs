@@ -22,13 +22,11 @@
 //! hook is exposed today, so that path is exercised only indirectly via
 //! the broker restart below.
 //!
-//! Gated behind the `e2e` feature flag. Run with:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_reconnect -- --nocapture --ignored
+//! cargo test -p magnetar --test e2e_reconnect -- --nocapture
 //! ```
-
-#![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
@@ -118,7 +116,6 @@ fn supervisor_for_e2e() -> SupervisorConfig {
 /// refused` until the test budget ran out (the symptom we observed before
 /// this fix). We shell out to `docker restart` instead — that re-runs the
 /// entrypoint and brings the broker back.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -235,7 +232,6 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
 /// `SendFut::poll` returns `Pending` across the whole cycle and resolves with
 /// `Ok(MessageId)` when the broker's `CommandSendReceipt` arrives on the new
 /// session.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
 -> Result<(), Box<dyn std::error::Error>> {

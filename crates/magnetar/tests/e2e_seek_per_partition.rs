@@ -15,9 +15,7 @@
 //!   5. Verify that partition 0 yields only the post-seek tail while the other three partitions
 //!      yield their full contents.
 //!
-//! Gated behind the `e2e` feature flag.
-
-#![cfg(feature = "e2e")]
+//! Runs as a regular test under `cargo test` (ADR-0045).
 
 use std::time::Duration;
 
@@ -73,7 +71,6 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Error>> {

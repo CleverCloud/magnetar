@@ -7,10 +7,10 @@
 //! commit publishes are visible, abort drops them, and consumer acks issued inside
 //! a transaction are rolled back on abort so a fresh subscription redelivers.
 //!
-//! Gated behind the `e2e` feature flag:
+//! Runs as a regular test under `cargo test` (ADR-0045). Run with:
 //!
 //! ```sh
-//! cargo test --features e2e -p magnetar --test e2e_transactions -- --nocapture --ignored
+//! cargo test -p magnetar --test e2e_transactions -- --nocapture
 //! ```
 //!
 //! ## Why double-ignored
@@ -22,8 +22,6 @@
 //! parity scaffolding and are skipped in every default test run — both
 //! `e2e: requires Docker` (shared with [`e2e_pulsar`]) and
 //! `e2e: requires transaction-coordinator-enabled broker` keep them opt-in.
-
-#![cfg(feature = "e2e")]
 
 use std::time::Duration;
 
@@ -120,7 +118,6 @@ fn unique_suffix() -> String {
 /// Commit path: 3 messages sent inside a transaction must all be visible to a
 /// consumer after `commit_transaction`. Mirrors Java
 /// `TransactionEndToEndTest#produceCommitTest`.
-#[ignore = "e2e: requires Docker + transaction-coordinator-enabled broker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_txn_commit_produces_visible() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar_with_txn().await?;
@@ -182,7 +179,6 @@ async fn e2e_txn_commit_produces_visible() -> Result<(), Box<dyn std::error::Err
 /// Abort path: messages produced inside a transaction must NOT be delivered to a
 /// consumer once the transaction is aborted. Mirrors Java
 /// `TransactionEndToEndTest#produceAbortTest`.
-#[ignore = "e2e: requires Docker + transaction-coordinator-enabled broker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_txn_abort_drops_messages() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, _admin_url, _container) = start_pulsar_with_txn().await?;
@@ -245,7 +241,6 @@ async fn e2e_txn_abort_drops_messages() -> Result<(), Box<dyn std::error::Error>
 /// were rolled back. Mirrors Java
 /// `TransactionEndToEndTest#txnAckTestNoBatchAndSharedSubAbort` /
 /// `TransactionTest#testAckMessageRollback`.
-#[ignore = "e2e: requires Docker + transaction-coordinator-enabled broker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_consumer_ack_with_txn_rolled_back_on_abort() -> Result<(), Box<dyn std::error::Error>>
 {

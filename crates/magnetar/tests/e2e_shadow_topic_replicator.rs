@@ -61,14 +61,8 @@
 //!    error before the topic-type gate is even reached. The test asserts an authorisation-flavoured
 //!    error surfaces on the producer create / send path — pinning whatever the broker does today.
 //!
-//! Both tests are gated behind `feature = "e2e"` + `#[ignore = "e2e:
-//! requires Docker"]`. They never run in the default `cargo test
-//! --workspace` invocation; the e2e job picks them up via:
-//!
-//! ```sh
-//! cargo test --features e2e -p magnetar \
-//!     --test e2e_shadow_topic_replicator -- --include-ignored --nocapture
-//! ```
+//! Both tests run as regular tests under `cargo test` (ADR-0045).
+//! Requires Docker on the host.
 //!
 //! # Token minting
 //!
@@ -80,8 +74,6 @@
 //! helper produces three tokens per run: `admin` (super-user, for the
 //! shadow-topic create + namespace grant), `replicator` (positive test),
 //! and `magnetar-test-user` (negative test).
-
-#![cfg(feature = "e2e")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -341,7 +333,6 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
 /// 3. Bootstrap a source topic, create a shadow over it via the in-container `pulsar-admin`, and
 ///    assert the same producer call is **accepted** on the shadow (the send is buffered without a
 ///    wire-level rejection within a bounded window).
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v4_replicator_role_can_assert_source_message_id()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -498,7 +489,6 @@ async fn e2e_v4_replicator_role_can_assert_source_message_id()
 /// and that the error carries a non-empty broker message (vs. a local
 /// timeout). This is the contract pin — if Pulsar's authorisation
 /// sequencing changes upstream, this test will tell us which arm flipped.
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_v4_non_replicator_role_send_with_source_id_is_rejected()
 -> Result<(), Box<dyn std::error::Error>> {

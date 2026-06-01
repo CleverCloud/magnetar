@@ -15,9 +15,7 @@
 //!   3. Call `consumer_a.unsubscribe(true)`.
 //!   4. Produce another message and verify consumer-B still receives it.
 //!
-//! Gated behind the `e2e` feature flag.
-
-#![cfg(feature = "e2e")]
+//! Runs as a regular test under `cargo test` (ADR-0045).
 
 use std::time::Duration;
 
@@ -73,7 +71,6 @@ async fn start_pulsar() -> Result<
     Ok((service_url, admin_url, container))
 }
 
-#[ignore = "e2e: requires Docker"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_force_unsubscribe_leaves_other_consumer_alive()
 -> Result<(), Box<dyn std::error::Error>> {

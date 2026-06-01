@@ -1,6 +1,6 @@
 # ADR-0034 — PIP-33 replicated subscriptions scope
 
-- **Status**: Accepted (2026-05-26)
+- **Status**: Accepted (2026-05-26), **partially superseded by [ADR-0045](0045-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** (the `e2e-multi-cluster` Cargo feature is removed; the two-cluster docker-compose fixture + the `e2e_replicated_subscriptions.rs` test are unchanged and now run on every per-PR CI run via the regular `test` job)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: pip-33, replicated-subscriptions, geo-replication, scope
