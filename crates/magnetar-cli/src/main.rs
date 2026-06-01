@@ -458,6 +458,36 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's cross-cluster replicator dispatch-rate policy.
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/replicatorDispatchRate`.
+    GetReplicatorDispatchRate {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's cross-cluster replicator dispatch-rate policy.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/replicatorDispatchRate`.
+    SetReplicatorDispatchRate {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Throttle in messages/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_msg: i32,
+        /// Throttle in bytes/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_byte: i64,
+        /// Averaging window in seconds.
+        #[arg(long, default_value_t = 1)]
+        period_seconds: i32,
+        /// Treat rate as additive on top of namespace publish rate.
+        #[arg(long, default_value_t = false)]
+        relative_to_publish: bool,
+    },
+    /// Remove a namespace's cross-cluster replicator dispatch-rate policy.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/replicatorDispatchRate`.
+    RemoveReplicatorDispatchRate {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1117,6 +1147,37 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         NamespacesCmd::RemoveSubscriptionDispatchRate { namespace } => {
             admin
                 .namespace_remove_subscription_dispatch_rate(&namespace)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetReplicatorDispatchRate { namespace } => print_json(
+            &admin
+                .namespace_get_replicator_dispatch_rate(&namespace)
+                .await?,
+        ),
+        NamespacesCmd::SetReplicatorDispatchRate {
+            namespace,
+            rate_msg,
+            rate_byte,
+            period_seconds,
+            relative_to_publish,
+        } => {
+            admin
+                .namespace_set_replicator_dispatch_rate(
+                    &namespace,
+                    DispatchRate {
+                        dispatch_throttling_rate_in_msg: rate_msg,
+                        dispatch_throttling_rate_in_byte: rate_byte,
+                        rate_period_in_second: period_seconds,
+                        relative_to_publish_rate: relative_to_publish,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveReplicatorDispatchRate { namespace } => {
+            admin
+                .namespace_remove_replicator_dispatch_rate(&namespace)
                 .await?;
             Ok(())
         }
