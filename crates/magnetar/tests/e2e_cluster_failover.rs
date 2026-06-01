@@ -90,6 +90,16 @@ async fn start_pulsar() -> Result<
     Box<dyn std::error::Error>,
 > {
     init_tracing();
+    // Shrink the JVM heap from Pulsar's default (~2GB) to ~512MB. The
+    // `test` CI job runs two of these standalone containers alongside
+    // the PIP-33 docker-compose fixture (zookeeper + 2 bookkeepers + 2
+    // brokers); at stock heap sizes a GitHub Actions runner OOM-kills
+    // a broker mid-test, surfacing as `io error: Connection refused`
+    // ~60s after the failover swap (run [26763302599] diagnostic
+    // tracing: producer.send succeeds against broker-b, then
+    // consumer.receive blocks on a supervisor reconnect that finds
+    // broker-b unreachable). 256m..512m is plenty for the
+    // single-publish round-trip this test exercises.
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
@@ -97,6 +107,7 @@ async fn start_pulsar() -> Result<
             "Created namespace public/default",
         ))
         .with_startup_timeout(Duration::from_secs(120))
+        .with_env_var("PULSAR_MEM", "-Xms256m -Xmx512m")
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
