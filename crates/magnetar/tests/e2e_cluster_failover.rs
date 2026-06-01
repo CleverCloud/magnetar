@@ -154,40 +154,44 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     assert_eq!(pre.payload.as_ref(), b"on-broker-a");
     consumer.ack(pre.message_id).await?;
 
-    // Pre-warm broker-B's bundle ownership for `public/default`.
+    // Pre-warm broker-B by *creating the topic on it* before broker-A
+    // is stopped.
     //
     // Each container is a standalone Pulsar broker with independent
-    // metadata. Standalone brokers lazy-claim namespace bundles on the
-    // first lookup that arrives for them; until that happens, the broker
-    // answers `producer-open` with
+    // metadata — they don't share topics. Without this step the
+    // post-failover producer rebuild lands on broker-B which has never
+    // seen this topic, broker-B's `NamespaceService` answers
     // `Namespace bundle for topic (…) not served by this instance:
     // localhost:8080. Please redo the lookup. Request is denied:
-    // namespace=public/default` and the runtime loops on the retry
-    // budget forever (no other broker to redirect to in standalone).
+    // namespace=public/default`, and the runtime loops on the retry
+    // budget until the test's `operation_timeout` fires (~90s, no
+    // other broker to redirect to in standalone).
     //
-    // Issue a lookup request directly against broker-B's admin REST
-    // before broker-A is stopped — broker-B claims the bundle eagerly
-    // as a side effect, so the producer rebuild post-failover finds an
-    // owner immediately. Without this, the test deterministically
-    // times out at 90s in CI even though the supervised reconnect
-    // path is healthy.
-    tracing::info!(%admin_url_b, %topic, "pre-warming broker-b bundle ownership");
-    let lookup_path = topic
+    // A `GET /lookup/v2/topic/...` against broker-B's admin REST is
+    // not enough — it reads the bundle state but doesn't force a
+    // claim. A `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}`
+    // creates the topic on broker-B, which side-effects the bundle
+    // claim AND ensures the topic exists when the supervised reconnect
+    // re-attaches a producer post-failover.
+    let topic_path = topic
         .strip_prefix("persistent://")
         .ok_or("topic must start with persistent://")?;
-    let lookup_url = format!("{admin_url_b}/lookup/v2/topic/persistent/{lookup_path}");
-    let lookup_response = reqwest::Client::new()
-        .get(&lookup_url)
+    let create_url = format!("{admin_url_b}/admin/v2/persistent/{topic_path}");
+    tracing::info!(%create_url, "pre-creating topic on broker-b");
+    let create_response = reqwest::Client::new()
+        .put(&create_url)
         .timeout(Duration::from_secs(15))
         .send()
         .await?;
-    let lookup_status = lookup_response.status();
-    let lookup_body = lookup_response.text().await.unwrap_or_default();
-    tracing::info!(%lookup_url, ?lookup_status, %lookup_body, "broker-b lookup result");
+    let create_status = create_response.status();
+    let create_body = create_response.text().await.unwrap_or_default();
+    tracing::info!(?create_status, %create_body, "broker-b topic create result");
+    // 204 No Content on first create; 409 Conflict if the topic already
+    // exists (we don't expect that here, but tolerate it defensively).
     assert!(
-        lookup_status.is_success() || lookup_status.is_redirection(),
-        "broker-b lookup must succeed (or 307/redirect) to claim the bundle; \
-         got {lookup_status} body={lookup_body}"
+        create_status.is_success() || create_status.as_u16() == 409,
+        "broker-b topic create must succeed (or 409 already-exists); \
+         got {create_status} body={create_body}"
     );
 
     // Flip the provider to broker-B and tear down broker-A. The provider
