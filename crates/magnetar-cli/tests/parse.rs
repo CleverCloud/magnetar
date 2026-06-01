@@ -15,7 +15,10 @@ use clap::Parser;
 #[allow(dead_code, unused_imports)]
 mod cli;
 
-use cli::{AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, TenantsCmd, TopicsCmd};
+use cli::{
+    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, SubscriptionsCmd, TenantsCmd,
+    TopicsCmd,
+};
 
 fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(args).expect("parse")
@@ -343,6 +346,145 @@ fn admin_topics_shadow_list() {
                         },
                 },
         } => assert_eq!(source, "acme/svc/source"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_subscriptions_list() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "subscriptions",
+        "list",
+        "acme/svc/orders",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Subscriptions {
+                    sub: SubscriptionsCmd::List { topic },
+                },
+        } => assert_eq!(topic, "acme/svc/orders"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_subscriptions_skip_with_count() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "subscriptions",
+        "skip",
+        "acme/svc/orders",
+        "s-a",
+        "--count",
+        "50",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Subscriptions {
+                    sub:
+                        SubscriptionsCmd::Skip {
+                            topic,
+                            subscription,
+                            count,
+                        },
+                },
+        } => {
+            assert_eq!(topic, "acme/svc/orders");
+            assert_eq!(subscription, "s-a");
+            assert_eq!(count, 50);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_subscriptions_reset_cursor_message_id_full_form() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "subscriptions",
+        "reset-cursor",
+        "acme/svc/orders",
+        "s-a",
+        "--message-id",
+        "17:42:0:-1",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Subscriptions {
+                    sub:
+                        SubscriptionsCmd::ResetCursor {
+                            topic,
+                            subscription,
+                            message_id,
+                            is_excluded,
+                        },
+                },
+        } => {
+            assert_eq!(topic, "acme/svc/orders");
+            assert_eq!(subscription, "s-a");
+            assert_eq!(message_id.ledger_id, 17);
+            assert_eq!(message_id.entry_id, 42);
+            assert_eq!(message_id.partition, 0);
+            assert_eq!(message_id.batch_index, -1);
+            assert!(!is_excluded);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_subscriptions_reset_cursor_message_id_short_form_defaults_to_neg_one() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "subscriptions",
+        "reset-cursor",
+        "acme/svc/orders",
+        "s-a",
+        "--message-id",
+        "5:9",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Subscriptions {
+                    sub: SubscriptionsCmd::ResetCursor { message_id, .. },
+                },
+        } => {
+            assert_eq!(message_id.ledger_id, 5);
+            assert_eq!(message_id.entry_id, 9);
+            assert_eq!(message_id.partition, -1);
+            assert_eq!(message_id.batch_index, -1);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_subscriptions_delete_force() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "subscriptions",
+        "delete",
+        "acme/svc/orders",
+        "s-a",
+        "--force",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Subscriptions {
+                    sub: SubscriptionsCmd::Delete { force, .. },
+                },
+        } => assert!(force),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }

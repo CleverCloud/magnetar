@@ -344,6 +344,183 @@ impl AdminClient {
         dto.try_into_message_id()
     }
 
+    // --- Subscriptions ---------------------------------------------------
+
+    /// List subscription names on a topic.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscriptions`.
+    /// Java: `PersistentTopics#getSubscriptions`.
+    pub async fn subscriptions_list(&self, topic: &str) -> Result<Vec<String>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "subscriptions"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Reset a subscription's cursor to a specific message-id position.
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscription/{sub}/resetcursor`
+    /// with body `{ledgerId, entryId, partitionIndex, batchIndex, isExcluded}`.
+    /// `is_excluded = true` skips the message at `message_id` itself; `false`
+    /// leaves it eligible for redelivery. Java: `PersistentTopics#resetCursorOnPosition`.
+    pub async fn subscription_reset_cursor_to_position(
+        &self,
+        topic: &str,
+        subscription: &str,
+        message_id: MessageId,
+        is_excluded: bool,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscription",
+            subscription,
+            "resetcursor",
+        ])?;
+        let body = ResetCursorData {
+            ledger_id: message_id.ledger_id,
+            entry_id: message_id.entry_id,
+            partition_index: message_id.partition,
+            batch_index: message_id.batch_index,
+            is_excluded,
+        };
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&body))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Reset a subscription's cursor to a wall-clock timestamp (millis since epoch).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscription/{sub}/resetcursor/
+    /// {timestamp}`. Java: `PersistentTopics#resetCursor(topic, sub, timestamp)`.
+    pub async fn subscription_reset_cursor_to_timestamp(
+        &self,
+        topic: &str,
+        subscription: &str,
+        timestamp_millis: u64,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let timestamp = timestamp_millis.to_string();
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscription",
+            subscription,
+            "resetcursor",
+            &timestamp,
+        ])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Advance a subscription's cursor past N undelivered messages.
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscription/{sub}/skip/
+    /// {numMessages}`. Java: `PersistentTopics#skipMessages`.
+    pub async fn subscription_skip_messages(
+        &self,
+        topic: &str,
+        subscription: &str,
+        num_messages: u64,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let n = num_messages.to_string();
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscription",
+            subscription,
+            "skip",
+            &n,
+        ])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Drain the entire backlog of a subscription (clear-backlog).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscription/{sub}/skip_all`.
+    /// Java: `PersistentTopics#skipAllMessages`.
+    pub async fn subscription_skip_all_messages(
+        &self,
+        topic: &str,
+        subscription: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscription",
+            subscription,
+            "skip_all",
+        ])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Expire all messages older than `expire_time_seconds` for a subscription.
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscription/{sub}/expireMessages/
+    /// {seconds}`. Java: `PersistentTopics#expireMessagesForSubscription`.
+    pub async fn subscription_expire_messages(
+        &self,
+        topic: &str,
+        subscription: &str,
+        expire_time_seconds: u64,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let s = expire_time_seconds.to_string();
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscription",
+            subscription,
+            "expireMessages",
+            &s,
+        ])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Delete (unsubscribe) a subscription.
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{namespace}/{topic}/subscription/{sub}?force={force}`.
+    /// `force = true` disconnects active consumers before deletion. Java:
+    /// `PersistentTopics#deleteSubscription`.
+    pub async fn subscription_delete(
+        &self,
+        topic: &str,
+        subscription: &str,
+        force: bool,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscription",
+            subscription,
+        ])?;
+        if force {
+            url.query_pairs_mut().append_pair("force", "true");
+        }
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Shadow topics (PIP-180 / ADR-0033) ------------------------------
 
     /// Create a shadow topic ([PIP-180](https://github.com/apache/pulsar/blob/master/pip/pip-180.md)).
@@ -613,6 +790,22 @@ pub struct TopicStats {
 #[serde(default)]
 struct PartitionedTopicMetadata {
     partitions: u32,
+}
+
+/// Request body for `POST .../subscription/{sub}/resetcursor` (Java
+/// `ResetCursorData`). The CLI exposes `message_id` and `is_excluded`;
+/// Pulsar's `batchIndexes` / `properties` fields are not currently set —
+/// they exist for transactional dedup metadata and would require
+/// txn-aware callers anyway.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCursorData {
+    ledger_id: u64,
+    entry_id: u64,
+    partition_index: i32,
+    batch_index: i32,
+    #[serde(rename = "isExcluded")]
+    is_excluded: bool,
 }
 
 /// Builder for [`AdminClient`].

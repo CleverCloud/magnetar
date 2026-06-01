@@ -45,7 +45,7 @@ use clap::{Parser, Subcommand};
 use magnetar::proto::TokenAuth;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
-use magnetar::{OutgoingMessage, PulsarClient};
+use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{AdminClient, AdminClientBuilder, AdminError, TenantInfo};
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -191,6 +191,12 @@ pub(crate) enum AdminCmd {
         #[command(subcommand)]
         sub: TopicsCmd,
     },
+    /// Subscription operations on a topic
+    /// (`/admin/v2/persistent/.../{topic}/subscription/...`).
+    Subscriptions {
+        #[command(subcommand)]
+        sub: SubscriptionsCmd,
+    },
 }
 
 /// `admin clusters <verb>`.
@@ -297,6 +303,79 @@ pub(crate) enum TopicsCmd {
     Shadow {
         #[command(subcommand)]
         sub: ShadowCmd,
+    },
+}
+
+/// `admin subscriptions <verb>`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum SubscriptionsCmd {
+    /// List subscription names on a topic.
+    List {
+        /// Fully qualified topic (`[persistent://]tenant/namespace/topic`).
+        topic: String,
+    },
+    /// Reset a subscription's cursor to a specific message position.
+    /// `--message-id` accepts `LEDGER:ENTRY[:PARTITION[:BATCH]]`;
+    /// partition and batch default to `-1` (non-partitioned, non-batched).
+    ResetCursor {
+        /// Fully qualified topic.
+        topic: String,
+        /// Subscription name.
+        subscription: String,
+        /// Target message id, `LEDGER:ENTRY[:PARTITION[:BATCH]]`.
+        #[arg(long = "message-id", value_parser = parse_message_id_position)]
+        message_id: MessageId,
+        /// Skip the message at `--message-id` itself (default: deliver it).
+        #[arg(long)]
+        is_excluded: bool,
+    },
+    /// Reset a subscription's cursor to a wall-clock timestamp.
+    ResetCursorByTimestamp {
+        /// Fully qualified topic.
+        topic: String,
+        /// Subscription name.
+        subscription: String,
+        /// Target timestamp in **milliseconds** since the Unix epoch.
+        #[arg(long)]
+        timestamp_millis: u64,
+    },
+    /// Advance the cursor past N undelivered messages.
+    Skip {
+        /// Fully qualified topic.
+        topic: String,
+        /// Subscription name.
+        subscription: String,
+        /// Number of messages to skip.
+        #[arg(long)]
+        count: u64,
+    },
+    /// Drain the entire backlog of a subscription (clear-backlog).
+    SkipAll {
+        /// Fully qualified topic.
+        topic: String,
+        /// Subscription name.
+        subscription: String,
+    },
+    /// Expire all messages older than `--expire-time-seconds`.
+    Expire {
+        /// Fully qualified topic.
+        topic: String,
+        /// Subscription name.
+        subscription: String,
+        /// Age threshold in **seconds**.
+        #[arg(long)]
+        expire_time_seconds: u64,
+    },
+    /// Delete (unsubscribe) a subscription. `--force` disconnects
+    /// active consumers first.
+    Delete {
+        /// Fully qualified topic.
+        topic: String,
+        /// Subscription name.
+        subscription: String,
+        /// Disconnect active consumers before deletion.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -500,6 +579,81 @@ async fn run_admin(
         AdminCmd::Tenants { sub } => run_admin_tenants(&admin, sub).await,
         AdminCmd::Namespaces { sub } => run_admin_namespaces(&admin, sub).await,
         AdminCmd::Topics { sub } => run_admin_topics(&admin, sub).await,
+        AdminCmd::Subscriptions { sub } => run_admin_subscriptions(&admin, sub).await,
+    }
+}
+
+async fn run_admin_subscriptions(
+    admin: &AdminClient,
+    cmd: SubscriptionsCmd,
+) -> Result<(), CliError> {
+    match cmd {
+        SubscriptionsCmd::List { topic } => print_json(&admin.subscriptions_list(&topic).await?),
+        SubscriptionsCmd::ResetCursor {
+            topic,
+            subscription,
+            message_id,
+            is_excluded,
+        } => {
+            admin
+                .subscription_reset_cursor_to_position(
+                    &topic,
+                    &subscription,
+                    message_id,
+                    is_excluded,
+                )
+                .await?;
+            Ok(())
+        }
+        SubscriptionsCmd::ResetCursorByTimestamp {
+            topic,
+            subscription,
+            timestamp_millis,
+        } => {
+            admin
+                .subscription_reset_cursor_to_timestamp(&topic, &subscription, timestamp_millis)
+                .await?;
+            Ok(())
+        }
+        SubscriptionsCmd::Skip {
+            topic,
+            subscription,
+            count,
+        } => {
+            admin
+                .subscription_skip_messages(&topic, &subscription, count)
+                .await?;
+            Ok(())
+        }
+        SubscriptionsCmd::SkipAll {
+            topic,
+            subscription,
+        } => {
+            admin
+                .subscription_skip_all_messages(&topic, &subscription)
+                .await?;
+            Ok(())
+        }
+        SubscriptionsCmd::Expire {
+            topic,
+            subscription,
+            expire_time_seconds,
+        } => {
+            admin
+                .subscription_expire_messages(&topic, &subscription, expire_time_seconds)
+                .await?;
+            Ok(())
+        }
+        SubscriptionsCmd::Delete {
+            topic,
+            subscription,
+            force,
+        } => {
+            admin
+                .subscription_delete(&topic, &subscription, force)
+                .await?;
+            Ok(())
+        }
     }
 }
 
@@ -663,6 +817,45 @@ pub(crate) enum CliError {
     /// I/O error while reading stdin or writing stdout.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Parse a `MessageId` from the canonical CLI form
+/// `LEDGER:ENTRY[:PARTITION[:BATCH]]`. Partition and batch default to
+/// `-1` (non-partitioned, non-batched). `batch_size` is always set to
+/// `-1` — it's broker-internal metadata that callers can't observe at
+/// the admin REST boundary.
+fn parse_message_id_position(s: &str) -> Result<MessageId, String> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if !(2..=4).contains(&parts.len()) {
+        return Err(format!(
+            "expected LEDGER:ENTRY[:PARTITION[:BATCH]], got `{s}`"
+        ));
+    }
+    let ledger_id: u64 = parts[0]
+        .parse()
+        .map_err(|e| format!("bad ledger id `{}`: {e}", parts[0]))?;
+    let entry_id: u64 = parts[1]
+        .parse()
+        .map_err(|e| format!("bad entry id `{}`: {e}", parts[1]))?;
+    let partition: i32 = parts
+        .get(2)
+        .map(|p| p.parse().map_err(|e| format!("bad partition `{p}`: {e}")))
+        .transpose()?
+        .unwrap_or(-1);
+    let batch_index: i32 = parts
+        .get(3)
+        .map(|b| b.parse().map_err(|e| format!("bad batch `{b}`: {e}")))
+        .transpose()?
+        .unwrap_or(-1);
+    Ok(MessageId {
+        ledger_id,
+        entry_id,
+        partition,
+        batch_index,
+        batch_size: -1,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
+    })
 }
 
 fn parse_property(spec: &str) -> Result<(String, String), String> {
