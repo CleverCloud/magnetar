@@ -370,6 +370,120 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Schemas ---------------------------------------------------------
+
+    /// Get the latest schema attached to a topic.
+    ///
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema`. Returns
+    /// `{ version, type, schema, properties, timestamp }`; raw JSON
+    /// because the `type` axis (`AVRO` / `JSON` / `PROTOBUF` /
+    /// `PROTOBUF_NATIVE` / `KEY_VALUE` / `STRING` / `BYTES` / …) is
+    /// open-ended and broker minor versions add keys (deletion
+    /// tombstones surface as `type: "DELETE"` on the GET, for
+    /// instance). Java: `SchemasResourceBase#getSchema`.
+    pub async fn schema_get_latest(&self, topic: &str) -> Result<serde_json::Value, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["schemas", tenant, namespace, name, "schema"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get a specific schema version attached to a topic.
+    ///
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema/{version}`.
+    /// `version` is the monotonically-increasing integer the broker
+    /// assigns at registration. Same wire shape as
+    /// [`Self::schema_get_latest`].
+    /// Java: `SchemasResourceBase#getSchema` (with version path param).
+    pub async fn schema_get_version(
+        &self,
+        topic: &str,
+        version: i64,
+    ) -> Result<serde_json::Value, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let v = version.to_string();
+        let url = self.url(&["schemas", tenant, namespace, name, "schema", &v])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// List every schema version registered for a topic.
+    ///
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schemas`. Returns a
+    /// JSON array — one entry per version, each carrying the same
+    /// per-version shape as [`Self::schema_get_latest`]. Raw JSON for
+    /// forward-compat.
+    /// Java: `SchemasResourceBase#getAllSchemas`.
+    pub async fn schema_list_versions(
+        &self,
+        topic: &str,
+    ) -> Result<Vec<serde_json::Value>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["schemas", tenant, namespace, name, "schemas"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Register a new schema version on a topic.
+    ///
+    /// `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/schema` with a JSON
+    /// [`PostSchemaPayload`] body. The broker returns `{ version: N }`;
+    /// raw JSON because the upstream response envelope wraps the
+    /// version under `data` on some 4.x point releases. Compatibility
+    /// is enforced server-side per the namespace's
+    /// `schemaCompatibilityStrategy` — incompatible posts fail with
+    /// 409. Java: `SchemasResourceBase#postSchema`.
+    pub async fn schema_post(
+        &self,
+        topic: &str,
+        payload: PostSchemaPayload,
+    ) -> Result<serde_json::Value, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["schemas", tenant, namespace, name, "schema"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&payload))
+            .await?;
+        json_ok(resp).await
+    }
+
+    /// Delete a topic's schema.
+    ///
+    /// `DELETE /admin/v2/schemas/{tenant}/{ns}/{topic}/schema?force={force}`.
+    /// `force = true` skips the broker's "is the schema in use"
+    /// guard — equivalent to `pulsar-admin schemas delete --force`.
+    /// Java: `SchemasResourceBase#deleteSchema`.
+    pub async fn schema_delete(&self, topic: &str, force: bool) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&["schemas", tenant, namespace, name, "schema"])?;
+        url.query_pairs_mut()
+            .append_pair("force", if force { "true" } else { "false" });
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Check whether a candidate schema would be compatible with the
+    /// topic's current schema.
+    ///
+    /// `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/compatibility` with
+    /// a JSON [`PostSchemaPayload`] body — the same shape
+    /// [`Self::schema_post`] sends, but the broker only evaluates
+    /// compatibility and never persists. Returns `{ isCompatible:
+    /// bool, schemaCompatibilityStrategy: "..." }`; raw JSON for
+    /// forward-compat.
+    /// Java: `SchemasResourceBase#testCompatibility`.
+    pub async fn schema_compatibility_check(
+        &self,
+        topic: &str,
+        payload: PostSchemaPayload,
+    ) -> Result<serde_json::Value, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["schemas", tenant, namespace, name, "compatibility"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&payload))
+            .await?;
+        json_ok(resp).await
+    }
+
     // --- Tenants ---------------------------------------------------------
 
     /// List tenants.
@@ -1581,6 +1695,25 @@ pub struct BookieInfo {
     /// Resolved hostname for the bookie. The broker uses it for
     /// log lines; it does not have to match DNS.
     pub hostname: String,
+}
+
+/// Java `PostSchemaPayload` — the request body for
+/// [`AdminClient::schema_post`] and
+/// [`AdminClient::schema_compatibility_check`]. The Java DTO has
+/// (`type`, `schema`, `properties`); both keys travel as-is on the wire.
+/// `schema` is the canonical-form blob for AVRO / JSON / PROTOBUF and
+/// the protobuf descriptor for `PROTOBUF_NATIVE`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PostSchemaPayload {
+    /// Schema type (`AVRO` / `JSON` / `PROTOBUF` / `PROTOBUF_NATIVE` /
+    /// `KEY_VALUE` / `STRING` / `BYTES` / ...).
+    #[serde(rename = "type")]
+    pub schema_type: String,
+    /// Schema definition, encoded per the type axis.
+    pub schema: String,
+    /// User-defined per-schema properties.
+    pub properties: std::collections::HashMap<String, String>,
 }
 
 /// Java `BacklogQuotaType` — selects which dimension a `BacklogQuota`
