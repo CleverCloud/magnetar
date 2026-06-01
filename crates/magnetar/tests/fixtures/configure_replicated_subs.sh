@@ -10,8 +10,10 @@
 #   ./configure_replicated_subs.sh
 #
 # Assumes both brokers are healthy on:
-#   - cluster-a admin: http://localhost:8080
-#   - cluster-b admin: http://localhost:8081
+#   - cluster-a admin: http://localhost:18080 (host port — see
+#     docker-compose.replicated-subs.yml for why we're off the
+#     default 8080)
+#   - cluster-b admin: http://localhost:18081
 #
 # Idempotent: re-running is safe (each command tolerates AlreadyExists).
 
@@ -20,10 +22,10 @@ set -euo pipefail
 # Host-port mappings used by the e2e test on the host (advertised back to
 # the caller). Inside `docker exec` we must use each broker's INTERNAL
 # admin port (8080 for both — see docker-compose.replicated-subs.yml's
-# `webServicePort=8080`); the 8081 host port is only the *mapping* for
+# `webServicePort=8080`); the 18081 host port is only the *mapping* for
 # broker-b and is not bound inside the container.
-ADMIN_A_HOST="${ADMIN_A_HOST:-http://localhost:8080}"
-ADMIN_B_HOST="${ADMIN_B_HOST:-http://localhost:8081}"
+ADMIN_A_HOST="${ADMIN_A_HOST:-http://localhost:18080}"
+ADMIN_B_HOST="${ADMIN_B_HOST:-http://localhost:18081}"
 ADMIN_INTERNAL="http://localhost:8080"
 
 # Wait until both brokers can answer cluster admin queries — the broker
