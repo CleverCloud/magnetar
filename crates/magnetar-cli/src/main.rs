@@ -794,6 +794,27 @@ pub(crate) enum NamespacesCmd {
         /// Fully qualified namespace.
         namespace: String,
     },
+    /// Get a namespace's max-unacked-messages-per-consumer limit (or `null`).
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerConsumer`.
+    GetMaxUnackedMessagesPerConsumer {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
+    /// Set a namespace's max-unacked-messages-per-consumer limit. `0` disables.
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerConsumer`.
+    SetMaxUnackedMessagesPerConsumer {
+        /// Fully qualified namespace.
+        namespace: String,
+        /// Max in-flight unacked messages per consumer. `0` disables.
+        #[arg(long)]
+        max_unacked: i32,
+    },
+    /// Remove a namespace's max-unacked-messages-per-consumer override.
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerConsumer`.
+    RemoveMaxUnackedMessagesPerConsumer {
+        /// Fully qualified namespace.
+        namespace: String,
+    },
 }
 
 /// `admin topics <verb>`.
@@ -1987,6 +2008,26 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
         NamespacesCmd::RemoveMaxConsumersPerTopic { namespace } => {
             admin
                 .namespace_remove_max_consumers_per_topic(&namespace)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::GetMaxUnackedMessagesPerConsumer { namespace } => print_json(
+            &admin
+                .namespace_get_max_unacked_messages_per_consumer(&namespace)
+                .await?,
+        ),
+        NamespacesCmd::SetMaxUnackedMessagesPerConsumer {
+            namespace,
+            max_unacked,
+        } => {
+            admin
+                .namespace_set_max_unacked_messages_per_consumer(&namespace, max_unacked)
+                .await?;
+            Ok(())
+        }
+        NamespacesCmd::RemoveMaxUnackedMessagesPerConsumer { namespace } => {
+            admin
+                .namespace_remove_max_unacked_messages_per_consumer(&namespace)
                 .await?;
             Ok(())
         }

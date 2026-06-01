@@ -1230,6 +1230,70 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's max-unacked-messages-per-consumer limit.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerConsumer`.
+    /// Returns a bare integer (the broker's per-consumer permit-pool cap
+    /// before it stops dispatching), or `null` (decoded as `None`) when
+    /// the broker default applies.
+    /// Java: `NamespacesBase#getMaxUnackedMessagesPerConsumer`.
+    pub async fn namespace_get_max_unacked_messages_per_consumer(
+        &self,
+        ns: &str,
+    ) -> Result<Option<i32>, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "maxUnackedMessagesPerConsumer",
+        ])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's max-unacked-messages-per-consumer limit.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerConsumer`
+    /// with a bare JSON integer body. `0` disables the limit.
+    /// Java: `NamespacesBase#setMaxUnackedMessagesPerConsumer`.
+    pub async fn namespace_set_max_unacked_messages_per_consumer(
+        &self,
+        ns: &str,
+        max_unacked: i32,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "maxUnackedMessagesPerConsumer",
+        ])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&max_unacked))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's max-unacked-messages-per-consumer override.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/maxUnackedMessagesPerConsumer`.
+    /// Java: `NamespacesBase#removeMaxUnackedMessagesPerConsumer`.
+    pub async fn namespace_remove_max_unacked_messages_per_consumer(
+        &self,
+        ns: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&[
+            "namespaces",
+            tenant,
+            namespace,
+            "maxUnackedMessagesPerConsumer",
+        ])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
