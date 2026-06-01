@@ -1308,6 +1308,7 @@ fn sim_chaos_produce_consume_with_invariants() {
         .invariant(AckAfterReceiveInvariant::default())
         .invariant(NoDupOnAckedInvariant::default())
         .invariant(HandleResolutionInvariant::default())
+        .set_debug_seeds(sweep_seeds(1))
         .set_iterations(1)
         .run();
     // The three continuous invariants (monotonic msg-id, ack-after-receive,
