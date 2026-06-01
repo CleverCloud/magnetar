@@ -774,6 +774,40 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
     },
+    /// Get all backlog-quota policies on a topic.
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/backlogQuotaMap`.
+    GetBacklogQuotas {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a backlog-quota policy on a topic.
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/backlogQuota?backlogQuotaType=...`.
+    SetBacklogQuota {
+        /// Fully qualified topic.
+        topic: String,
+        /// Quota dimension: `destination-storage` (bytes) or `message-age` (seconds).
+        #[arg(long = "type", value_parser = parse_backlog_quota_type)]
+        quota_type: BacklogQuotaType,
+        /// Maximum bytes for `destination-storage`. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        limit_size: i64,
+        /// Maximum age in seconds for `message-age`. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        limit_time: i32,
+        /// Action when the quota is exceeded — `producer_request_hold`,
+        /// `producer_exception`, or `consumer_backlog_eviction`.
+        #[arg(long)]
+        policy: String,
+    },
+    /// Remove a backlog-quota policy from a topic.
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/backlogQuota?backlogQuotaType=...`.
+    RemoveBacklogQuota {
+        /// Fully qualified topic.
+        topic: String,
+        /// Quota dimension: `destination-storage` or `message-age`.
+        #[arg(long = "type", value_parser = parse_backlog_quota_type)]
+        quota_type: BacklogQuotaType,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1602,6 +1636,33 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemoveRetention { topic } => {
             admin.topic_remove_retention(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::GetBacklogQuotas { topic } => {
+            print_json(&admin.topic_get_backlog_quotas(&topic).await?)
+        }
+        TopicsCmd::SetBacklogQuota {
+            topic,
+            quota_type,
+            limit_size,
+            limit_time,
+            policy,
+        } => {
+            admin
+                .topic_set_backlog_quota(
+                    &topic,
+                    quota_type,
+                    BacklogQuota {
+                        limit_size,
+                        limit_time,
+                        policy,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        TopicsCmd::RemoveBacklogQuota { topic, quota_type } => {
+            admin.topic_remove_backlog_quota(&topic, quota_type).await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,

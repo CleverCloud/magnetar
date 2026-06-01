@@ -1193,6 +1193,63 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get all backlog-quota policies on a topic.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/backlogQuotaMap`.
+    /// Returns `Map<BacklogQuotaType, BacklogQuota>` — kept as raw JSON
+    /// for the same reason as [`Self::namespace_get_backlog_quotas`]:
+    /// broker minor versions add quota types.
+    /// Java: `PersistentTopicsBase#getBacklogQuotaMap`.
+    pub async fn topic_get_backlog_quotas(
+        &self,
+        topic: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "backlogQuotaMap"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a backlog-quota policy on a topic (overrides the namespace
+    /// default for the matching `backlogQuotaType`).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/backlogQuota
+    /// ?backlogQuotaType={type}` with a JSON `BacklogQuota` body.
+    /// Java: `PersistentTopicsBase#setBacklogQuota`.
+    pub async fn topic_set_backlog_quota(
+        &self,
+        topic: &str,
+        backlog_quota_type: BacklogQuotaType,
+        quota: BacklogQuota,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&["persistent", tenant, namespace, name, "backlogQuota"])?;
+        url.query_pairs_mut()
+            .append_pair("backlogQuotaType", backlog_quota_type.as_query_value());
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&quota))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a backlog-quota policy from a topic.
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/backlogQuota
+    /// ?backlogQuotaType={type}`.
+    /// Java: `PersistentTopicsBase#removeBacklogQuota`.
+    pub async fn topic_remove_backlog_quota(
+        &self,
+        topic: &str,
+        backlog_quota_type: BacklogQuotaType,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let mut url = self.url(&["persistent", tenant, namespace, name, "backlogQuota"])?;
+        url.query_pairs_mut()
+            .append_pair("backlogQuotaType", backlog_quota_type.as_query_value());
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.

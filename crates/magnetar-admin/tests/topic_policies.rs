@@ -9,8 +9,8 @@
 //! verbs in `PersistentTopicsBase` (`getRetention`, `setRetention`,
 //! `removeRetention`, …).
 
-use magnetar_admin::{AdminClient, RetentionPolicies};
-use wiremock::matchers::{body_json, method, path};
+use magnetar_admin::{AdminClient, BacklogQuota, BacklogQuotaType, RetentionPolicies};
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client(mock: &MockServer) -> AdminClient {
@@ -74,4 +74,67 @@ async fn topic_retention_get_set_remove_cycle() {
         .topic_remove_retention("acme/svc/orders")
         .await
         .expect("remove topic retention");
+}
+
+#[tokio::test]
+async fn topic_backlog_quota_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/backlogQuotaMap"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "destination_storage": {
+                "limitSize": 1073741824_i64,
+                "limitTime": -1,
+                "policy": "consumer_backlog_eviction",
+            }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/backlogQuota"))
+        .and(query_param("backlogQuotaType", "destination_storage"))
+        .and(body_json(serde_json::json!({
+            "limitSize": 2147483648_i64,
+            "limitTime": -1,
+            "policy": "producer_request_hold",
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/backlogQuota"))
+        .and(query_param("backlogQuotaType", "message_age"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let v = admin
+        .topic_get_backlog_quotas("acme/svc/orders")
+        .await
+        .expect("get topic quotas");
+    assert_eq!(v["destination_storage"]["limitSize"], 1_073_741_824_i64);
+
+    admin
+        .topic_set_backlog_quota(
+            "acme/svc/orders",
+            BacklogQuotaType::DestinationStorage,
+            BacklogQuota {
+                limit_size: 2_147_483_648,
+                limit_time: -1,
+                policy: "producer_request_hold".into(),
+            },
+        )
+        .await
+        .expect("set topic backlog quota");
+    admin
+        .topic_remove_backlog_quota("acme/svc/orders", BacklogQuotaType::MessageAge)
+        .await
+        .expect("remove topic backlog quota");
 }
