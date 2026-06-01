@@ -1382,6 +1382,72 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a topic's per-subscription dispatch-rate policy (or `null`).
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/subscriptionDispatchRate`.
+    /// Reuses the [`DispatchRate`] body shape — the policy applies per
+    /// subscription rather than aggregated across all consumers.
+    /// Java: `PersistentTopicsBase#getSubscriptionDispatchRate`.
+    pub async fn topic_get_subscription_dispatch_rate(
+        &self,
+        topic: &str,
+    ) -> Result<Option<DispatchRate>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscriptionDispatchRate",
+        ])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a topic's per-subscription dispatch-rate policy (overrides namespace default).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/subscriptionDispatchRate`
+    /// with a JSON `DispatchRate` body.
+    /// Java: `PersistentTopicsBase#setSubscriptionDispatchRate`.
+    pub async fn topic_set_subscription_dispatch_rate(
+        &self,
+        topic: &str,
+        rate: DispatchRate,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscriptionDispatchRate",
+        ])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&rate))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a topic's per-subscription dispatch-rate policy.
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/subscriptionDispatchRate`.
+    /// Java: `PersistentTopicsBase#removeSubscriptionDispatchRate`.
+    pub async fn topic_remove_subscription_dispatch_rate(
+        &self,
+        topic: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&[
+            "persistent",
+            tenant,
+            namespace,
+            name,
+            "subscriptionDispatchRate",
+        ])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.

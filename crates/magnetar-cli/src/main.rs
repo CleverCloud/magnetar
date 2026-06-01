@@ -889,6 +889,36 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
     },
+    /// Get a topic's per-subscription dispatch-rate policy.
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/subscriptionDispatchRate`.
+    GetSubscriptionDispatchRate {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's per-subscription dispatch-rate policy.
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/subscriptionDispatchRate`.
+    SetSubscriptionDispatchRate {
+        /// Fully qualified topic.
+        topic: String,
+        /// Throttle in messages/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_msg: i32,
+        /// Throttle in bytes/sec. `-1` = unlimited.
+        #[arg(long, default_value_t = -1)]
+        rate_byte: i64,
+        /// Averaging window in seconds.
+        #[arg(long, default_value_t = 1)]
+        period_seconds: i32,
+        /// Treat rate as additive on top of namespace publish rate.
+        #[arg(long, default_value_t = false)]
+        relative_to_publish: bool,
+    },
+    /// Remove a topic's per-subscription dispatch-rate policy.
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/subscriptionDispatchRate`.
+    RemoveSubscriptionDispatchRate {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1809,6 +1839,35 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemoveDispatchRate { topic } => {
             admin.topic_remove_dispatch_rate(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::GetSubscriptionDispatchRate { topic } => {
+            print_json(&admin.topic_get_subscription_dispatch_rate(&topic).await?)
+        }
+        TopicsCmd::SetSubscriptionDispatchRate {
+            topic,
+            rate_msg,
+            rate_byte,
+            period_seconds,
+            relative_to_publish,
+        } => {
+            admin
+                .topic_set_subscription_dispatch_rate(
+                    &topic,
+                    DispatchRate {
+                        dispatch_throttling_rate_in_msg: rate_msg,
+                        dispatch_throttling_rate_in_byte: rate_byte,
+                        rate_period_in_second: period_seconds,
+                        relative_to_publish_rate: relative_to_publish,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        TopicsCmd::RemoveSubscriptionDispatchRate { topic } => {
+            admin
+                .topic_remove_subscription_dispatch_rate(&topic)
+                .await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,
