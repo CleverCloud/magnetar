@@ -523,6 +523,7 @@ fn check_no_channels() -> Result<()> {
         "::kanal::",
         "::postage::",
         "::tachyonix::",
+        "::thingbuf::",
     ];
 
     let mut offenders: Vec<String> = Vec::new();
@@ -557,14 +558,7 @@ fn visit(root: &Path, callback: &mut dyn FnMut(&Path, &str)) -> Result<()> {
     let skip = |name: &str| {
         matches!(
             name,
-            "target"
-                | ".git"
-                | ".github"
-                | "tasks"
-                | ".direnv"
-                | ".vscode"
-                | ".idea"
-                | ".claude"
+            "target" | ".git" | ".github" | "tasks" | ".direnv" | ".vscode" | ".idea" | ".claude"
         )
     };
     for entry in fs::read_dir(root)? {
