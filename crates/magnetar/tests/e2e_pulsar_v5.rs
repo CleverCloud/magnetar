@@ -26,6 +26,7 @@ use bytes::Bytes;
 use magnetar::PulsarClient;
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
 use magnetar::v5::PulsarClientV5;
+use magnetar::v5::mapping::V5SubscriptionInitialPosition;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -99,10 +100,15 @@ async fn e2e_v5_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Er
         producer.send(Bytes::copy_from_slice(p)).await?;
     }
 
-    // V5 stream consumer (Exclusive default).
+    // V5 stream consumer (Exclusive default). `initial_position(Earliest)`
+    // is load-bearing here: V5 mirrors Java's `Latest` default, but this
+    // test produces BEFORE subscribing, so a Latest consumer would never
+    // see the three payloads and `consumer.receive().await` would hang
+    // forever.
     let consumer = client
         .stream_consumer(topic)
         .subscription("magnetar-v5-e2e")
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
         .ack_timeout(Some(Duration::from_secs(30)))
         .negative_ack_redelivery_delay(Duration::from_secs(60))
         .subscribe()
