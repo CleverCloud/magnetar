@@ -1949,11 +1949,9 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
                 .await?;
             Ok(())
         }
-        NamespacesCmd::GetCompactionThreshold { namespace } => print_json(
-            &admin
-                .namespace_get_compaction_threshold(&namespace)
-                .await?,
-        ),
+        NamespacesCmd::GetCompactionThreshold { namespace } => {
+            print_json(&admin.namespace_get_compaction_threshold(&namespace).await?)
+        }
         NamespacesCmd::SetCompactionThreshold {
             namespace,
             threshold_bytes,

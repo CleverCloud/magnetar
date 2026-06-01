@@ -135,9 +135,7 @@ async fn compaction_threshold_get_set_remove_cycle() {
 
     Mock::given(method("GET"))
         .and(path("/admin/v2/namespaces/acme/svc/compactionThreshold"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!(536_870_912_i64)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(536_870_912_i64)))
         .expect(1)
         .mount(&mock)
         .await;

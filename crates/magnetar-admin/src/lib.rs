@@ -935,10 +935,7 @@ impl AdminClient {
     /// bare JSON boolean, or `null` (decoded as `None`) when the policy
     /// is unset and the broker default applies.
     /// Java: `NamespacesBase#getDeduplication`.
-    pub async fn namespace_get_deduplication(
-        &self,
-        ns: &str,
-    ) -> Result<Option<bool>, AdminError> {
+    pub async fn namespace_get_deduplication(&self, ns: &str) -> Result<Option<bool>, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "deduplication"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
@@ -1077,10 +1074,7 @@ impl AdminClient {
     ///
     /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold`.
     /// Java: `NamespacesBase#deleteCompactionThreshold`.
-    pub async fn namespace_remove_compaction_threshold(
-        &self,
-        ns: &str,
-    ) -> Result<(), AdminError> {
+    pub async fn namespace_remove_compaction_threshold(&self, ns: &str) -> Result<(), AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "compactionThreshold"])?;
         let resp = self.send(self.http.request(Method::DELETE, url)).await?;
