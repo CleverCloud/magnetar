@@ -109,11 +109,20 @@ async fn start_pulsar_with_token_auth()
             format!("token:{}", mint_internal_admin_token()),
         )
         .with_env_var("PULSAR_PREFIX_superUserRoles", "admin")
+        // The apachepulsar image's CMD is `sh` (no entrypoint that wires
+        // `apply-config-from-env*`), so the `PULSAR_PREFIX_*` env vars above
+        // would never reach `conf/standalone.conf` if we launched the broker
+        // directly. Apply them explicitly first — same pattern as
+        // `e2e_pattern_auto_reconcile.rs`. Without this step the broker boots
+        // with `authenticationEnabled=false` and the `INVALID_JWT` connect
+        // below is accepted, defeating the test.
         .with_cmd(vec![
-            "bin/pulsar".to_owned(),
-            "standalone".to_owned(),
-            "--no-functions-worker".to_owned(),
-            "--no-stream-storage".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "bin/apply-config-from-env-with-prefix.py PULSAR_PREFIX_ \
+                 conf/standalone.conf && bin/pulsar standalone \
+                 --no-functions-worker --no-stream-storage"
+                .to_owned(),
         ])
         .start()
         .await?;
