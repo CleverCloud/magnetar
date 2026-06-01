@@ -31,7 +31,10 @@
 //! They are *assertion-rich* multi-step tests that pin the contracts
 //! the per-method wire tests do not.
 
-use magnetar_admin::{AdminClient, AdminError, BacklogQuota, BacklogQuotaType, RetentionPolicies};
+use magnetar_admin::{
+    AdminClient, AdminError, BacklogQuota, BacklogQuotaType, DelayedDeliveryPolicies, DispatchRate,
+    PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
+};
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -456,4 +459,351 @@ async fn invariant_accept_header_present_on_every_call() {
     let admin = client(&mock);
     let clusters = admin.cluster_list().await.unwrap();
     assert_eq!(clusters, vec!["standalone".to_owned()]);
+}
+
+// -------- PR #2 / #3 / #4 invariant coverage extensions ---------------
+
+/// **Invariant — namespace policy set is idempotent**: applying the
+/// same `set_<policy>` mutation twice in a row produces an observably
+/// identical broker state. A regression that, say, tracked a "dirty"
+/// flag client-side and skipped the second POST would break this for
+/// brokers that coalesce duplicates — pin the wire shape every time.
+#[tokio::test]
+async fn invariant_namespace_policy_set_is_idempotent_across_families() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/persistence"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/dispatchRate"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/deduplication"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+
+    let pers = PersistencePolicies {
+        bookkeeper_ensemble: 2,
+        bookkeeper_write_quorum: 2,
+        bookkeeper_ack_quorum: 2,
+        managed_ledger_max_mark_delete_rate: 1.0,
+    };
+    admin
+        .namespace_set_persistence("acme/svc", pers.clone())
+        .await
+        .unwrap();
+    admin
+        .namespace_set_persistence("acme/svc", pers)
+        .await
+        .unwrap();
+
+    let rate = DispatchRate {
+        dispatch_throttling_rate_in_msg: 1000,
+        dispatch_throttling_rate_in_byte: 1_048_576,
+        rate_period_in_second: 1,
+        relative_to_publish_rate: false,
+    };
+    admin
+        .namespace_set_dispatch_rate("acme/svc", rate.clone())
+        .await
+        .unwrap();
+    admin
+        .namespace_set_dispatch_rate("acme/svc", rate)
+        .await
+        .unwrap();
+
+    admin
+        .namespace_set_deduplication("acme/svc", true)
+        .await
+        .unwrap();
+    admin
+        .namespace_set_deduplication("acme/svc", true)
+        .await
+        .unwrap();
+}
+
+/// **Invariant — topic policy overrides namespace policy at the wire**:
+/// the broker exposes two distinct URL prefixes — namespace policies
+/// at `/admin/v2/namespaces/...` and topic policies at
+/// `/admin/v2/persistent/.../{topic}/...`. A regression that pointed
+/// `topic_set_retention` at the namespace URL would silently apply at
+/// the wrong scope. Pin that each verb hits its expected URL.
+#[tokio::test]
+async fn invariant_topic_policies_target_persistent_topic_prefix() {
+    let mock = MockServer::start().await;
+    let ns_url = "/admin/v2/namespaces/acme/svc/retention";
+    let topic_url = "/admin/v2/persistent/acme/svc/orders/retention";
+
+    // Namespace-level set — must hit the namespace URL.
+    Mock::given(method("POST"))
+        .and(path(ns_url))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // Topic-level set — must hit the topic URL.
+    Mock::given(method("POST"))
+        .and(path(topic_url))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let pol = RetentionPolicies {
+        retention_time_in_minutes: 60,
+        retention_size_in_mb: 1024,
+    };
+    admin
+        .namespace_set_retention("acme/svc", pol)
+        .await
+        .unwrap();
+    admin
+        .topic_set_retention("acme/svc/orders", pol)
+        .await
+        .unwrap();
+}
+
+/// **Invariant — topic policy GET returns `Option<T>` for null body**:
+/// the broker emits `null` for a topic that has no override set; the
+/// client must decode this as `None`, not as a default-constructed
+/// `T`. (For namespace-level policies the broker emits the default
+/// value; for topic-level it emits `null`.) Pin the `None` decode for
+/// the load-bearing per-topic policies.
+#[tokio::test]
+async fn invariant_topic_policy_get_decodes_null_as_none() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/dispatchRate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/persistence"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/publishRate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("null"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    assert!(
+        admin
+            .topic_get_dispatch_rate("acme/svc/orders")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        admin
+            .topic_get_persistence("acme/svc/orders")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        admin
+            .topic_get_publish_rate("acme/svc/orders")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// **Invariant — delayed-delivery composability**: the
+/// `DelayedDeliveryPolicies { active, tickTimeMillis }` body must
+/// round-trip both fields. The Java field name `tickTimeMillis` is
+/// camelCase'd from `tick_time_millis` via `#[serde(rename_all =
+/// "camelCase")]`; a missing field on the GET would round-trip as
+/// `tick_time_millis = 0`, silently breaking a configured tick.
+#[tokio::test]
+async fn invariant_delayed_delivery_round_trips_both_fields() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
+        .and(body_json(serde_json::json!({
+            "active": true,
+            "tickTimeMillis": 1500,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "active": true,
+            "tickTimeMillis": 1500,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .namespace_set_delayed_delivery(
+            "acme/svc",
+            DelayedDeliveryPolicies {
+                active: true,
+                tick_time_millis: 1500,
+            },
+        )
+        .await
+        .unwrap();
+    let got = admin
+        .namespace_get_delayed_delivery("acme/svc")
+        .await
+        .unwrap();
+    assert!(got.is_some());
+    let got = got.unwrap();
+    assert!(got.active);
+    assert_eq!(got.tick_time_millis, 1500);
+}
+
+/// **Invariant — schema POST returns version; subsequent GET sees the
+/// same shape**. The Java `PostSchemaPayload` wire shape uses the
+/// field name `type` (Rust reserved; mapped via `schema_type` with
+/// `#[serde(rename = "type")]`). A regression on either side would
+/// surface as a 400 broker response.
+#[tokio::test]
+async fn invariant_schema_post_then_get_round_trips_avro_definition() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/schemas/acme/svc/orders/schema"))
+        .and(body_json(serde_json::json!({
+            "type": "AVRO",
+            "schema": "{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}",
+            "properties": {}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/schemas/acme/svc/orders/schema"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "version": 1,
+            "type": "AVRO",
+            "schema": "{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}",
+            "properties": {}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let payload = PostSchemaPayload {
+        schema_type: "AVRO".to_owned(),
+        schema: r#"{"type":"record","name":"X","fields":[]}"#.to_owned(),
+        properties: Default::default(),
+    };
+    let posted = admin.schema_post("acme/svc/orders", payload).await.unwrap();
+    assert_eq!(posted["version"], 1);
+    let got = admin.schema_get_latest("acme/svc/orders").await.unwrap();
+    assert_eq!(got["version"], 1);
+    assert_eq!(got["type"], "AVRO");
+}
+
+/// **Invariant — publish-rate set body uses `publishThrottlingRate*`
+/// camelCase**. The Java type `PublishRate { publishThrottlingRateInMsg,
+/// publishThrottlingRateInByte }` is named differently from
+/// `DispatchRate` — pin the wire shape so a future copy-paste regression
+/// (e.g. renaming `publish_throttling_rate_in_msg` to
+/// `dispatch_throttling_rate_in_msg`) is caught at the wire.
+#[tokio::test]
+async fn invariant_publish_rate_body_uses_publish_throttling_camel_case() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/publishRate"))
+        .and(body_json(serde_json::json!({
+            "publishThrottlingRateInMsg": 500,
+            "publishThrottlingRateInByte": 524288_i64,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .namespace_set_publish_rate(
+            "acme/svc",
+            PublishRate {
+                publish_throttling_rate_in_msg: 500,
+                publish_throttling_rate_in_byte: 524_288,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// **Invariant — backlog quota error path doesn't poison subsequent
+/// calls** (extension of the earlier error-no-mutation invariant for
+/// the wider policy surface added in PR #2 / #3). A 4xx from the
+/// broker on a backlog-quota POST must not stop a subsequent
+/// `set_dispatch_rate` from succeeding.
+#[tokio::test]
+async fn invariant_backlog_quota_error_does_not_perturb_other_policies() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/backlogQuota"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid policy"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/namespaces/acme/svc/dispatchRate"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let err = admin
+        .namespace_set_backlog_quota(
+            "acme/svc",
+            BacklogQuotaType::DestinationStorage,
+            BacklogQuota {
+                limit_size: -2,
+                limit_time: -1,
+                policy: "bogus".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AdminError::Status { code: 400, .. }));
+
+    admin
+        .namespace_set_dispatch_rate(
+            "acme/svc",
+            DispatchRate {
+                dispatch_throttling_rate_in_msg: 1,
+                dispatch_throttling_rate_in_byte: 1,
+                rate_period_in_second: 1,
+                relative_to_publish_rate: false,
+            },
+        )
+        .await
+        .unwrap();
 }
