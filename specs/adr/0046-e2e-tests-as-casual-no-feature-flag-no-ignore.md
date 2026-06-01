@@ -86,7 +86,7 @@ Under `--all-features` (the validation chain default) their e2e tests still run.
 - The PIP-460 stub tests in `e2e_scalable_topic.rs` trivially pass.
   They consume ~10ms of e2e wall time each and serve as named-test-name placeholders until upstream PIP-460 ships.
   When `docs/follow-ups.md §1` unblocks, the bodies get fleshed out in the same commit as the proto re-vendor.
-- The `magnetar-runtime-tokio` proxy parity claim in `docs/parity-status.md` + `README.md` is corrected in the same changeset (audit finding — moonpool returns `ProxyUnsupportedOnUnsupervisedClient`, not ✅).
+- The `magnetar-runtime-tokio` proxy parity claim in `README.md` (both the parity matrix and the engine-by-engine table) is corrected in the same changeset (audit finding — moonpool returns `ProxyUnsupportedOnUnsupervisedClient`, not ✅).
   The moonpool `ProxyConnectionPool` gap is added to `docs/follow-ups.md §3` as a new actionable item.
 
 ## Alternatives considered
@@ -115,5 +115,5 @@ Under `--all-features` (the validation chain default) their e2e tests still run.
 - `.github/workflows/ci.yml` — `e2e` job folded into `test`; Docker + KDC pre-pulls + two-cluster compose setup added to `test`.
 - `.github/workflows/e2e-replicated-subs.yml` — deleted by this ADR.
 - `docs/follow-ups.md` — §1 (PIP-460 e2e) rewritten; new §3 (moonpool `ProxyConnectionPool`) added.
-- `docs/parity-status.md`, `README.md` — moonpool proxy parity claim corrected (audit finding).
+- `README.md` — moonpool proxy parity claim corrected in both the parity matrix and the engine-by-engine table (audit finding).
 - Project `CLAUDE.md` — validation chain collapsed; invariant #8 (no silent `#[ignore]`) text updated to reflect the e2e ban.

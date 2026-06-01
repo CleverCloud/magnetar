@@ -7,7 +7,7 @@
 
 ## Context
 
-`docs/simulation-patterns.md` §3 documents [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)'s **assertion-density** rule: a function should carry ≥2 `debug_assert!`s, one stating the positive expectation and one covering the negative space.
+[`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#tigerbeetle--the-assertion-first-philosophy) documents [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)'s **assertion-density** rule: a function should carry ≥2 `debug_assert!`s, one stating the positive expectation and one covering the negative space.
 Under deterministic simulation, assertions downgrade silent correctness bugs into loud liveness bugs the simulator catches in seconds.
 
 `magnetar-proto`'s `Connection` state machine has the right shape for this — every entry runs to completion under the caller's mutex, no `.await` in the middle, so preconditions hold throughout the body.
@@ -35,7 +35,7 @@ Add pair-`debug_assert!`s (positive + negative space) on the following `Connecti
    - _Negative space_: at least one producer OR one consumer must be open.
      There is no first-op to succeed against an empty slot map.
 
-3. **`Connection::rebuild_producers` entry** (the canonical guard from `docs/simulation-patterns.md` §3 takeaway 2):
+3. **`Connection::rebuild_producers` entry** (the canonical guard from [`docs/moonpool-engine.md` — pair assertions](../../docs/moonpool-engine.md#tigerbeetle--the-assertion-first-philosophy)):
    - _Negative space_: `in_flight_publish_snapshots.is_empty() || session_epoch > 0`.
    - _Positive_: every snapshot key must reference a producer in the `producers` map (no orphan snapshots).
 
@@ -77,8 +77,8 @@ Tests under `mod conn_state_tests` construct the bad state manually and assert e
 
 ## References
 
-- `docs/simulation-patterns.md` §3 — TigerStyle reference and the canonical guard text.
-- `docs/simulation-deepening-plan.md` §P2 — scheduling for this ADR alongside ADR-0046.
+- [`docs/moonpool-engine.md` — TigerBeetle appendix](../../docs/moonpool-engine.md#tigerbeetle--the-assertion-first-philosophy) — TigerStyle reference and the canonical guard text.
+- Simulation-deepening rollout (removed after landing) §P2 — sequenced this ADR alongside ADR-0046; consolidated into ADRs 0047–0050.
 - `crates/magnetar-proto/src/conn.rs` — call sites where the asserts are wired in (search for `ADR-0047`).
 - [ADR-0011](0011-clock-injection-sans-io.md) — `Instant` is passed in; asserts on `last_activity` use that injection point.
 - [ADR-0021](0021-no-silent-test-ignore-or-remove.md) — failing asserts are fixed, not papered over.

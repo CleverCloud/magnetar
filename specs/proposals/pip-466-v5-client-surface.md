@@ -250,12 +250,12 @@ PIP-466 can land **in parallel** with PIP-460, PIP-180, and PIP-33.
    `QueueConsumer<T, E>` + tests.
 3. **Wave 3**: `PulsarClientV5<E>` + v4-escape-hatch test.
 4. **Wave 4**: Moonpool mirror tests (1:1 parity).
-5. **Wave 5**: docs (`docs/v5-client.md` NEW; parity-status; README).
+5. **Wave 5**: docs ([`docs/pip-features.md#v5-client-surface-pip-466`](../../docs/pip-features.md#v5-client-surface-pip-466); README).
 6. **Wave 6**: e2e mirror tests (×3).
 
 ## 8. Documentation deliverables (same wave)
 
-- `docs/v5-client.md` (NEW) — V5 surface overview, experimental banner, mapping table, examples.
+- [`docs/pip-features.md#v5-client-surface-pip-466`](../../docs/pip-features.md#v5-client-surface-pip-466) — V5 surface overview, experimental banner, mapping table, examples.
 - `docs/parity-status.md` — PIP-466 row, `🟡 experimental — Stream/Queue consumers + Producer; no Reader/TableView/Transaction/CheckpointConsumer in V5 module`.
 - `README.md` — parity-matrix row update.
 - `specs/README.md` — flip ADR-0032 to `Accepted` on sign-off.

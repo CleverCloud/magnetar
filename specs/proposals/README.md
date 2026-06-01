@@ -24,7 +24,7 @@ Once a proposal's work ships, the document either freezes with a `Status: Implem
 
 > **PIP-180 (shadow topic)** and **PIP-33 (replicated subscriptions)** have already landed.
 > Their proposals have been folded back into their authorising ADRs as an "Implementation footprint" section — [ADR-0033](../adr/0033-pip-180-shadow-topic-scope.md), [ADR-0034](../adr/0034-pip-33-replicated-subscriptions-scope.md).
-> User-facing docs live at [`docs/shadow-topic.md`](../../docs/shadow-topic.md) and [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md).
+> User-facing docs live at [`docs/pip-features.md#shadow-topics-pip-180`](../../docs/pip-features.md#shadow-topics-pip-180) and [`docs/pip-features.md#replicated-subscriptions-pip-33`](../../docs/pip-features.md#replicated-subscriptions-pip-33).
 
 ### Upstream-readiness legend
 

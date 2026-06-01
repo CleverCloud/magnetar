@@ -75,14 +75,14 @@ This ADR locks the PIP-180 surface: producer-side `CommandSend` shadow `message_
   PIP-180 doesn't introduce a new principal or trust boundary — shadow topics inherit the source topic's ACL.
   The admin methods inherit the existing admin-REST auth flow.
   One small consideration: the source `MessageId` on `CommandSend` is **client-asserted**; the broker validates that the producer is authorised to write to the shadow topic but does not (and cannot) cryptographically prove the source-message-id matches a real source message.
-  This is upstream's behaviour, not a magnetar-specific gap — documented in `docs/parity-status.md`.
+  This is upstream's behaviour, not a magnetar-specific gap — documented in `README.md`'s parity-matrix row.
 
 ## Status
 
 Accepted (2026-05-26).
 Implemented in `feat/pip-180-shadow-topic` — producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `ConnectionEvent::MessageReceivedFromShadow` classification driven by a sans-io `ShadowTopicMetadata` cache, three admin REST methods (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics`, plus the inverse `get_shadow_source`), `magnetar shadow {create,delete, list,source}` CLI subcommands, four-layer test set (proto unit, tokio integration, moonpool 1:1 mirror, differential equivalence) + e2e against `apachepulsar/pulsar:4.0.4`.
 No proto bump, no feature flag — regular sends remain byte-identical to the pre-PIP-180 behaviour.
-User-facing docs at [`docs/shadow-topic.md`](../../docs/shadow-topic.md).
+User-facing docs at [`docs/pip-features.md#shadow-topics-pip-180`](../../docs/pip-features.md#shadow-topics-pip-180).
 
 ## Implementation footprint
 
@@ -99,7 +99,7 @@ Authoritative landing artefacts:
 | Moonpool runtime mirror + scripted broker `ShadowTopic` workload       | [`crates/magnetar-runtime-moonpool/src/`](../../crates/magnetar-runtime-moonpool/src), `tests/sim_chaos.rs` |
 | Differential golden trace                                              | `crates/magnetar-differential/tests/golden/shadow_send_with_source.json`                                    |
 | CLI `magnetar shadow {create,delete,list,source}`                      | [`crates/magnetar-cli/src/main.rs`](../../crates/magnetar-cli/src/main.rs) (`ShadowCmd` + `run_shadow`)     |
-| User docs                                                              | [`docs/shadow-topic.md`](../../docs/shadow-topic.md)                                                        |
+| User docs                                                              | [`docs/pip-features.md#shadow-topics-pip-180`](../../docs/pip-features.md#shadow-topics-pip-180)            |
 | E2E                                                                    | `crates/magnetar/tests/e2e_shadow_topic.rs`                                                                 |
 
 Total landed footprint ≈ 1.5K LOC including tests.

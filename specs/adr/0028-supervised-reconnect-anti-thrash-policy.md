@@ -103,7 +103,7 @@ pub struct AntiThrashThreshold {
 
 - `anti_thrash_threshold: None`, `max_backoff_after_thrash: Duration::from_secs(30)` ship as the new defaults.
   Existing user configs compile unchanged.
-- Recommended starting values when opting in (documented in rustdoc + `docs/architecture-overview.md` supervisor section): `successful_attaches = 5`, `window = Duration::from_secs(2)`, `drop_within = Duration::from_millis(50)`.
+- Recommended starting values when opting in (documented in rustdoc + the supervisor section of [`ARCHITECTURE.md`](../../ARCHITECTURE.md#supervised-reconnect)): `successful_attaches = 5`, `window = Duration::from_secs(2)`, `drop_within = Duration::from_millis(50)`.
 
 ## Consequences
 
@@ -121,7 +121,7 @@ pub struct AntiThrashThreshold {
 - Adds `AntiThrashState` to `Connection`.
   Sized to a small ring (default capacity = `successful_attaches × 2`); ~hundreds of bytes per connection, no allocation on the hot path.
 - Detector semantics are subtle — operators who tune `drop_within` too low will miss the cascade; too high and they pay a 30 s reconnect floor on any healthy short-lived attach.
-- Documentation debt: requires a new section in `docs/architecture-overview.md` and a parity-matrix row update.
+- Documentation debt: requires a new section in [`ARCHITECTURE.md`](../../ARCHITECTURE.md) and a parity-matrix row update.
   Both land in the same changeset as the implementation, per the [`docs are code`](../../CLAUDE.md#principles) principle.
 
 **Incompatibilities.**

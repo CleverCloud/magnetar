@@ -12,8 +12,8 @@ What it does **not** exercise yet is the FoundationDB simulator's **swizzle-clog
 
 The pattern is described in:
 
-- [`docs/simulation-patterns.md`](../../docs/simulation-patterns.md) §1 "FoundationDB simulator → Fault injection → Swizzle-clogging" — the research note this plan operationalises.
-- [`docs/simulation-deepening-plan.md`](../../docs/simulation-deepening-plan.md) §P3 — the sequenced implementation plan that put this ADR in flight.
+- [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#foundationdb-simulator-the-reference-implementation) — "FoundationDB simulator → Fault injection → Swizzle-clogging" — the research note this plan operationalises.
+- Simulation-deepening rollout (removed after landing) §P3 — the sequenced implementation plan that put this ADR in flight; consolidated into ADRs 0047–0050.
 
 The chaos broker can drop one connection today (see `DropsTcpAfterCreate` at `sim_chaos.rs:1200`), but stopping N random _consumers'_ permit issuance and then restoring them in a different order is not yet expressible.
 That's exactly the bug shape FDB calls out: a consumer that lost permits during a partition and gets resumed last (after every other peer has already drained their queue) is a different code path from a consumer that resumed first — and both are different from the no-partition path.
@@ -41,7 +41,7 @@ The exemption is justified inline in the landing commit per ADR-0024's "Exemptio
 
 **Positive**
 
-- The chaos pack now exercises FDB's swizzle pattern, closing one of the five gaps in [`docs/simulation-patterns.md`](../../docs/simulation-patterns.md) §4.
+- The chaos pack now exercises FDB's swizzle pattern, closing one of the five gaps documented in [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#status-pattern-adoption-in-magnetar).
 - The new test feeds the 16-random-seed daily sweep ([ADR-0036](0036-moonpool-seed-sweep-daily-random.md)) and benefits from any future bump in seed coverage (per the simulation-deepening plan §P4, the daily sweep is queued to move from 16 → 128 seeds).
 - The shared-state design (the broker's `clogged_set` is an `Arc<Mutex<HashSet<u64>>>` consulted by per-session push code) makes future variants — randomised clog/restore delays, partial-clog where permits drip rather than stop, per-broker swizzles — drop-in extensions without re-architecting.
 
@@ -59,8 +59,8 @@ The exemption is justified inline in the landing commit per ADR-0024's "Exemptio
 
 ## References
 
-- [`docs/simulation-patterns.md`](../../docs/simulation-patterns.md) §1 — FDB simulator's swizzle-clogging definition.
-- [`docs/simulation-deepening-plan.md`](../../docs/simulation-deepening-plan.md) §P3 — the sequenced implementation plan.
+- [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#foundationdb-simulator-the-reference-implementation) — FDB simulator's swizzle-clogging definition.
+- Simulation-deepening rollout §P3 — the sequenced implementation plan, consolidated into ADRs 0047–0050.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — the chaos-pack carve-out from cross-runtime parity.
 - [ADR-0026 §D2](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md#d2--wire-moonpool-sim-option-1-pure-sim-chaos-suite--converged) — pure-sim chaos suite is moonpool-specific by design.
 - [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) — daily seed sweep cadence.

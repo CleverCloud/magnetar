@@ -10,7 +10,7 @@
 [ADR-0020](0020-memory-limit-producer-block.md) shipped `MemoryLimitPolicy::ProducerBlock` on the tokio engine via a `parking_lot::Mutex<Slab<Waker>>` on `ConnectionShared`.
 The moonpool engine intentionally deferred the same surface — the original follow-up flagged the drain-order determinism story under `moonpool_core::SimProviders` as the open question.
 
-The Java parity matrix tracks `MemoryLimitPolicy::ProducerBlock` per engine (see [`docs/parity-status.md`](../../docs/parity-status.md)); shipping the moonpool half closes the last back-pressure gap between the engines.
+The Java parity matrix tracks `MemoryLimitPolicy::ProducerBlock` per engine (see [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage)); shipping the moonpool half closes the last back-pressure gap between the engines.
 
 Constraints inherited from the workspace ADRs:
 
@@ -85,4 +85,4 @@ Callers wiring `ClientBuilder::memory_limit(bytes, MemoryLimitPolicy::ProducerBl
     Tests in the same file pin both
     policies.
 - `docs/memory-limit.md` — public-facing surface and reservation semantics (engine-agnostic).
-- `docs/parity-status.md` — engine-by-engine parity matrix.
+- [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage) — engine-by-engine parity matrix.

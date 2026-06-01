@@ -32,6 +32,6 @@ Targeting **4.0+** is also forward-looking: by the time magnetar 0.1 ships, Puls
 
 ## References
 
-- [`README.md` §"Supported broker versions"](../../README.md)
-- [`docs/parity-status.md`](../../docs/parity-status.md)
+- [`README.md` §"Supported broker versions"](../../README.md#supported-broker-versions)
+- [`README.md` §"Java client parity matrix"](../../README.md#java-client-parity-matrix)
 - `crates/magnetar/tests/e2e_pulsar.rs` — image pin (`apachepulsar/pulsar:4.0.4`)

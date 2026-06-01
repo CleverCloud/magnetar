@@ -7,13 +7,13 @@
 
 ## Context
 
-`docs/simulation-patterns.md` §2 documents FoundationDB's **buggify** pattern: scatter `if BUGGIFY then …` blocks at named choice points in the production state machine.
+[`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#appendix--reference-patterns-foundationdb-and-tigerbeetle) documents FoundationDB's **buggify** pattern: scatter `if BUGGIFY then …` blocks at named choice points in the production state machine.
 Each block is gated on a seed-controlled RNG roll; with simulation enabled, the simulator flips the gate true at a tunable probability so the surrounding code takes the rarely-exercised branch.
 With simulation off, the gate is a constant `false` and the alternate path is dead code.
 
 The pattern compounds with deterministic simulation: every (seed, buggify-point) pair is a bug-finding lever the simulator owns, and the cost-per-lever is one `if` block.
 
-`docs/simulation-deepening-plan.md` §P1 names four magnetar choice points where the pattern transfers directly:
+The simulation-deepening rollout (now consolidated into ADRs 0047–0050) named four magnetar choice points where the pattern transfers directly:
 
 | Label                         | Location                               | Effect under simulation                                                                                       |
 | ----------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -79,13 +79,13 @@ Probability picks (5% across the board) follow FoundationDB's "low probability, 
 
 - **`rand`-crate dependency in `magnetar-proto`**. Rejected: violates ADR-0004 (zero I/O deps in proto); pulling `rand` would force the proto crate to track an RNG state, which leaks the engine-side seed contract into the sans-io core.
 - **Closure-free trait `BuggifyRng: Send + Sync`**. Rejected: forces a dyn-trait surface on the proto crate for a one-method trait; the `Arc<dyn Fn>` shape matches the existing `wall_clock` injection and keeps the engine wiring consistent.
-- **More than four labels in the initial cut**. Rejected: the source spec in `docs/simulation-patterns.md` named these four as the highest-leverage points; additional labels are a tracked follow-up once the surface lands (per the plan in `docs/simulation-deepening-plan.md`).
+- **More than four labels in the initial cut**. Rejected: the source spec in [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md#appendix--reference-patterns-foundationdb-and-tigerbeetle) named these four as the highest-leverage points; additional labels are a tracked follow-up once the surface lands (per the simulation-deepening rollout, now consolidated into ADRs 0047–0050).
 - **Tunable per-label probability**. Rejected for now: a single 5% default keeps the call sites simple; tunable probabilities belong behind a `BuggifyConfig` struct that we'll add only when a real test needs it.
 
 ## References
 
-- `docs/simulation-patterns.md` — source comparison of FoundationDB, moonpool, and TigerBeetle simulation patterns.
-- `docs/simulation-deepening-plan.md` — orchestration sheet that schedules this ADR plus ADR-0047, ADR-0048, and the ADR-0036 amendment.
+- [`docs/moonpool-engine.md` — appendix](../../docs/moonpool-engine.md#appendix--reference-patterns-foundationdb-and-tigerbeetle) — source comparison of FoundationDB, moonpool, and TigerBeetle simulation patterns.
+- Simulation-deepening rollout (removed after landing) — sequenced this ADR alongside ADR-0047, ADR-0049, ADR-0050, and the ADR-0036 amendment; consolidated history lives in those ADRs.
 - `crates/magnetar-proto/src/buggify.rs` — helper implementation.
 - `crates/magnetar-proto/src/conn.rs` — three of the four choice points (`reset`, `flush_producer`, `handle_bytes_decode_loop`).
 - `crates/magnetar-proto/src/backoff.rs` — `retry_clock.skew` point.

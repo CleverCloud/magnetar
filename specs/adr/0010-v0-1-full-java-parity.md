@@ -25,14 +25,14 @@ Florentin's signoff (2026-05-20) chose **full Java parity, no deferrals**.
 
 ## Consequences
 
-- The implementation timeline is multi-month, tracked via the parity matrix in [`README.md`](../../README.md) and the per-feature status in [`docs/parity-status.md`](../../docs/parity-status.md).
+- The implementation timeline is multi-month, tracked via the [parity matrix](../../README.md#java-client-parity-matrix) and the [engine-by-engine surface coverage](../../README.md#engine-by-engine-surface-coverage) in `README.md`.
 - The parity matrix in `README.md` is the merge-gate document — a row going from ❌ → ✅ requires an accompanying test (unit + ideally e2e).
 - A release-cut decision becomes "the parity matrix is all ✅ or documented 🟡 with a clear remaining-scope statement".
 - Any features added beyond Java parity are tracked separately as follow-up work.
 
 ## References
 
-- [`README.md` §"Java client parity matrix"](../../README.md)
-- [`README.md` §"Supported PIPs"](../../README.md)
-- [`docs/parity-status.md`](../../docs/parity-status.md) — per-feature status snapshot
+- [`README.md` §"Java client parity matrix"](../../README.md#java-client-parity-matrix)
+- [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage) — per-feature, per-engine status snapshot
+- [`README.md` §"Supported PIPs"](../../README.md#supported-pips)
 - [ADR-0009 Pulsar 4 minimum](0009-pulsar-4-minimum.md)

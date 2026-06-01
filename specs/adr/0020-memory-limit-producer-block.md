@@ -120,7 +120,7 @@ The mutex hold time is `O(slab size)` and the slab only grows under live content
 
 - A spurious-wake storm is possible if many parked producers compete for tiny capacity windows: `release_memory(bytes)` wakes them all and only one wins the next CAS.
   Acceptable trade-off (fair under contention; matches Java) but worth a follow-up if profiling shows hot-loop thrash.
-  Documented in `docs/parity-status.md` as a polish opportunity, not a regression.
+  Documented in [`docs/follow-ups.md`](../../docs/follow-ups.md) as a polish opportunity, not a regression.
 - The slab grows under live contention but never shrinks below high-water mark.
   `Slab` uses a free-list so this is a memory-only cost; no per-iteration allocation.
 

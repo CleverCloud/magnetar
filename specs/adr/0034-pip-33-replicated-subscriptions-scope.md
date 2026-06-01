@@ -51,7 +51,7 @@ The amendment lifting PIP-33 out of the original ADR-0010 core-parity scope foll
      Snapshot generation is broker-side.
   2. Magnetar does **not** implement the broker-side geo-replication state machine.
      Setting `replicate_subscription_state(true)` only flips the flag; correctness depends on the broker cluster running with geo-replication enabled and the namespace configured with `replication_clusters` + `replicated_subscription_status_enabled`.
-     These are documented in `docs/replicated-subscriptions.md` so callers aren't surprised when the flag has no observable effect on a single-cluster broker.
+     These are documented in [`docs/pip-features.md#replicated-subscriptions-pip-33`](../../docs/pip-features.md#replicated-subscriptions-pip-33) so callers aren't surprised when the flag has no observable effect on a single-cluster broker.
 
 ## Consequences
 
@@ -74,7 +74,7 @@ The amendment lifting PIP-33 out of the original ADR-0010 core-parity scope foll
 
 ## Status
 
-Accepted — landed in feat/pip-33-replicated-subscriptions (see [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md)).
+Accepted — landed in feat/pip-33-replicated-subscriptions (see [`docs/pip-features.md#replicated-subscriptions-pip-33`](../../docs/pip-features.md#replicated-subscriptions-pip-33)).
 
 ## Implementation footprint
 
@@ -90,7 +90,7 @@ Authoritative landing artefacts:
 | `ConsumerBuilder::replicate_subscription_state(bool)`                                       | [`crates/magnetar/src/client.rs`](../../crates/magnetar/src/client.rs) (`ConsumerBuilder::replicate_subscription_state`)                       |
 | Moonpool scripted broker `InjectsReplicatedMarkers` workload                                | [`crates/magnetar-runtime-moonpool/tests/sim_chaos.rs`](../../crates/magnetar-runtime-moonpool/tests/sim_chaos.rs)                             |
 | Differential golden trace                                                                   | `crates/magnetar-differential/tests/golden/replicated_subscription_filter.json`                                                                |
-| User docs                                                                                   | [`docs/replicated-subscriptions.md`](../../docs/replicated-subscriptions.md)                                                                   |
+| User docs                                                                                   | [`docs/pip-features.md#replicated-subscriptions-pip-33`](../../docs/pip-features.md#replicated-subscriptions-pip-33)                           |
 | Two-cluster e2e                                                                             | `crates/magnetar/tests/e2e_replicated_subscriptions.rs` + `.github/workflows/e2e-replicated-subs.yml` (weekly)                                 |
 
 Total landed footprint ≈ 1K LOC including tests.

@@ -47,7 +47,7 @@ These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
    Replace with `Arc<parking_lot::Mutex<...>>` + `tokio::sync::Notify` + `core::task::Waker` slabs inside the state machine.
    ([ADR-0003](specs/adr/0003-no-channels-rule.md))
 2. **`magnetar-proto` has zero I/O deps.** No `tokio`, no `mio`, no `socket2`, no `async-trait`.
-   Enforced via `cargo xtask check-no-io-deps`.
+   Enforced via `cargo run -p xtask -- check-no-io-deps`.
    ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md))
 3. **Sans-io clock injection.** `Instant` is passed in via `now: Instant` parameters on every user-driven entry; `SystemTime` via the `wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>` provider.
    Engines snapshot the host clocks at the call site; moonpool plugs in virtual clocks.
@@ -66,8 +66,8 @@ These come from [`GUIDELINES.md`](GUIDELINES.md); read it once per session.
    `#[ignore]` for the bug-hide cases ADR-0021 §2 covers is still forbidden; the surface-and-wait protocol (ADR-0021 §4) is unchanged.
    ([ADR-0021](specs/adr/0021-no-silent-test-ignore-or-remove.md), [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md))
 9. **Cross-runtime test + coverage policy.** Every behavioral change (runtime behavior, public API, wire format) and every change inside `magnetar-proto` ships with **all four** test layers in the same commit: (a) `magnetar-proto` unit test, (b) `magnetar-runtime-tokio` integration test, (c) `magnetar-runtime-moonpool` integration test, (d) `magnetar-differential` equivalence test asserting tokio ↔ moonpool `EventStream` parity, plus an end-to-end test under `crates/magnetar/tests/e2e_*.rs`.
-   Moonpool sim coverage is **100% on the diff** (`cargo xtask check-sim-coverage`, `cargo-llvm-cov` patch-coverage style).
-   `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep a **strict 1:1 test count** (`cargo xtask check-runtime-test-parity`).
+   Moonpool sim coverage is **100% on the diff** (`cargo run -p xtask -- check-sim-coverage`, `cargo-llvm-cov` patch-coverage style).
+   `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep a **strict 1:1 test count** (`cargo run -p xtask -- check-runtime-test-parity`).
    Both checks are hard-failing in the local + CI validation chain.
    Exemptions: docs-only, comment-only, formatter-only, and dependency bumps with no functional impact — justify in the commit message.
    ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md))
@@ -100,6 +100,31 @@ Anywhere.
 Ever.
 ([ADR-0012](specs/adr/0012-no-claude-attribution.md))
 
+## Markdown style
+
+All `*.md` files in the repo are formatted with **Prettier** and follow **semantic line breaks** (one sentence per line, no column limit).
+
+- Config: [`.prettierrc.json`](.prettierrc.json) — `proseWrap: preserve` + `printWidth: 100000`.
+  Prettier never re-wraps paragraphs; it only normalises code blocks, tables, links, and emphasis style.
+- Ignore: [`.prettierignore`](.prettierignore) — excludes `target/`, `Cargo.lock`, `node_modules/`, and `AGENTS.md` (symlink to `CLAUDE.md`).
+- One-shot reformat: [`scripts/markdown-sembr.py`](scripts/markdown-sembr.py) joins hard-wrapped paragraphs / list items / blockquotes and re-splits at sentence boundaries.
+  Run it on edited files when adding new prose, then `prettier --write` to normalise the rest.
+
+Authoring rules:
+
+- Write one sentence per line.
+  Long sentences stay on one long line — there is no 80-column hard limit.
+- Backtick `snake_case` identifiers (function names, filenames) when they sit next to italic emphasis on the same line.
+  Prettier's emphasis normaliser is non-idempotent on `*italic*` adjacent to `snake_case` underscores in plain prose; backticking the identifier sidesteps it (this is how `ARCHITECTURE.md:422` and `specs/adr/0050-swizzle-clog-workload.md:18` are written).
+- Code fences, YAML frontmatter, tables, headings, horizontal rules, HTML blocks, and reference-link definitions are passed through untouched by both the script and Prettier.
+
+Validation:
+
+```
+find . -name '*.md' -not -path './target/*' -not -path './.git/*' -not -name AGENTS.md \
+  -print0 | xargs -0 npx prettier --check
+```
+
 ## Validation chain
 
 Run before declaring a task done (in this order):
@@ -107,7 +132,7 @@ Run before declaring a task done (in this order):
 > **Linux + FIPS note**: every `--all-features` command pulls in `crypto-fips`, which builds `aws-lc-fips-sys`.
 > Its `delocate` step requires clang-emitted assembly — gcc 16+ (Fedora 44 default) emits `.data.rel.ro.local` sections that delocate rejects.
 > Prefix the build / test / clippy commands below with `CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib` on Linux.
-> `cargo xtask check-crypto-matrix` sets these automatically for its `crypto-fips` cells.
+> `cargo run -p xtask -- check-crypto-matrix` sets these automatically for its `crypto-fips` cells.
 
 ```
 cargo +nightly fmt --all
@@ -127,14 +152,15 @@ done
 cargo deny check
 RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
   cargo doc --workspace --all-features --no-deps --locked
-cargo xtask check-no-channels         # banned-channel grep
-cargo xtask check-no-io-deps          # magnetar-proto = zero I/O deps
-cargo xtask check-no-internal-clock   # Instant::now() / SystemTime::now() outside the allowlist
-cargo xtask codegen --check           # proto codegen drift
-cargo xtask check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
-cargo xtask check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
-cargo xtask check-crypto-matrix       # per-provider build matrix (ADR-0035)
-cargo xtask check-known-failing-seeds # replay registry seeds (ADR-0047) — mirrors the per-PR `seed-replay` CI job
+# xtask gates — invoke via `cargo run -p xtask --` (there is no `cargo xtask` alias).
+cargo run -p xtask -- check-no-channels         # banned-channel grep
+cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps
+cargo run -p xtask -- check-no-internal-clock   # Instant::now() / SystemTime::now() outside the allowlist
+cargo run -p xtask -- codegen --check           # proto codegen drift
+cargo run -p xtask -- check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
+cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
+cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR-0035)
+cargo run -p xtask -- check-known-failing-seeds # replay registry seeds (ADR-0047) — mirrors the per-PR `seed-replay` CI job
 ```
 
 Per [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md) the e2e suite is **already included** in `cargo test --workspace --all-features` above (no separate command, no `--features e2e`, no `--include-ignored`).
@@ -173,24 +199,18 @@ For 4+ parallel agents, use the **supervisor pattern** — one `guidelines:super
 
 ## Documentation + ADRs
 
-- [`docs/`](docs/) — reference documentation.
-  Start at [`docs/README.md`](docs/README.md).
-  Topics:
-  - [`docs/architecture-overview.md`](docs/architecture-overview.md) — workspace topology, sans-io invariants, engine boundary.
-  - [`docs/moonpool-engine.md`](docs/moonpool-engine.md) — moonpool engine surface, supervised reconnect, TLS adapter, chaos pack, differential harness.
-  - [`docs/memory-limit.md`](docs/memory-limit.md) — `MemoryLimitPolicy` atomic CAS + Waker slab mechanics.
-  - [`docs/testing.md`](docs/testing.md) — test categories and how to run them.
-  - [`docs/parity-status.md`](docs/parity-status.md) — Java parity snapshot (engine-by-engine).
-  - [`docs/follow-ups.md`](docs/follow-ups.md) — consolidated open work tracker.
+[`docs/`](docs/) — reference documentation, indexed at [`docs/README.md`](docs/README.md).
+The load-bearing ones for everyday work:
 
-- [`specs/adr/`](specs/adr/) — Architecture Decision Records, one binding decision per file.
-  Index at [`specs/README.md`](specs/README.md).
+- Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md) (Overview section is the 10-minute read), [`memory-limit.md`](docs/memory-limit.md), [`moonpool-engine.md`](docs/moonpool-engine.md).
+- Testing + simulation: [`testing.md`](docs/testing.md), [`moonpool-engine.md`](docs/moonpool-engine.md) (engine surface + appendix on TigerBeetle / FDB patterns).
+- Status + roadmap: [`README.md#java-client-parity-matrix`](README.md#java-client-parity-matrix) (canonical parity matrix + engine-by-engine coverage), [`follow-ups.md`](docs/follow-ups.md).
+- PIP features + auth: [`pip-features.md`](docs/pip-features.md) (V5 / PIP-466, shadow-topics / PIP-180, replicated-subs / PIP-33, scalable-topics / PIP-460 experimental, Athenz), [`cli.md`](docs/cli.md).
 
+[`specs/adr/`](specs/adr/) — Architecture Decision Records, one binding decision per file.
+Index at [`specs/README.md`](specs/README.md).
 When you change a load-bearing decision, add the corresponding ADR in **the same** changeset that lands the code, and update the index in [`specs/README.md`](specs/README.md).
 Old ADRs flip to `Superseded by ADR-NNNN`; they are never edited in place.
 
-## Where the secrets aren't
-
-This repo has no production credentials, no broker URLs, no PII.
-Do not add any.
+This repo has no production credentials, no broker URLs, no PII; do not add any.
 The e2e suite runs against a local container.

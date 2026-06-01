@@ -68,7 +68,7 @@ Codex pushed back on "ship stubs and claim full parity": that violates ADR-0010'
 The right move is to **defer** (the user-facing position) and **amend** ADR-0010's parity matrix to mark SASL/Kerberos and Athenz/ZTS as `🟡 partial — PLAIN / pre-fetched token only, GSSAPI + ZTS as follow-up work`.
 Honest parity beats stubs-as-✅.
 
-`docs/parity-status.md` already marks both crates `🟡 pre-alpha` ([line 58–59](../../docs/parity-status.md)) but README's parity matrix should mirror that and ADR-0010 should reference this ADR for the scope amendment.
+The [`README.md` engine-by-engine table](../../README.md#engine-by-engine-surface-coverage) already marks both crates `🟡 pre-alpha`, and the parity matrix above mirrors that — ADR-0010 should reference this ADR for the scope amendment.
 
 ### D4 — Vendored proto bump: **implement `xtask vendor-proto`; milestone-based bumps**
 

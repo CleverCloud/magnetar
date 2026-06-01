@@ -7,24 +7,130 @@
 
 ## Table of contents
 
-1. [Layering](#layering)
-2. [Sans-io design](#sans-io-design)
-3. [The no-channels rationale](#the-no-channels-rationale)
-4. [Concurrency primitives we _do_ use](#concurrency-primitives-we-do-use)
-5. [The driver loop](#the-driver-loop)
-6. [Protocol state machine (`magnetar-proto`)](#protocol-state-machine-magnetar-proto)
-7. [Wire framing](#wire-framing)
-8. [Producer paths — batching vs chunking](#producer-paths--batching-vs-chunking)
-9. [Consumer paths — ack grouping, unacked tracker, nack tracker, DLQ](#consumer-paths--ack-grouping-unacked-tracker-nack-tracker-dlq)
-10. [Multi-topics fan-in](#multi-topics-fan-in)
-11. [Pattern consumer + topic watcher (PIP-145)](#pattern-consumer--topic-watcher-pip-145)
-12. [Runtime engines](#runtime-engines)
-13. [TLS sites](#tls-sites)
-14. [Schemas](#schemas)
-15. [PIP coverage map](#pip-coverage-map)
-16. [Tests](#tests)
-17. [Build & validation](#build--validation)
-18. [Further reading](#further-reading)
+1. [Overview](#overview)
+2. [Layering](#layering)
+3. [Sans-io design](#sans-io-design)
+4. [The no-channels rationale](#the-no-channels-rationale)
+5. [Concurrency primitives we _do_ use](#concurrency-primitives-we-do-use)
+6. [The driver loop](#the-driver-loop)
+7. [Protocol state machine (`magnetar-proto`)](#protocol-state-machine-magnetar-proto)
+8. [Wire framing](#wire-framing)
+9. [Producer paths — batching vs chunking](#producer-paths--batching-vs-chunking)
+10. [Consumer paths — ack grouping, unacked tracker, nack tracker, DLQ](#consumer-paths--ack-grouping-unacked-tracker-nack-tracker-dlq)
+11. [Multi-topics fan-in](#multi-topics-fan-in)
+12. [Pattern consumer + topic watcher (PIP-145)](#pattern-consumer--topic-watcher-pip-145)
+13. [Runtime engines](#runtime-engines)
+14. [TLS sites](#tls-sites)
+15. [Schemas](#schemas)
+16. [PIP coverage map](#pip-coverage-map)
+17. [Tests](#tests)
+18. [Build & validation](#build--validation)
+19. [Further reading](#further-reading)
+
+---
+
+## Overview
+
+A bird's-eye view of the workspace before the deep dive.
+For binding decisions read the [ADR series](specs/adr/); for the user-facing surface read [README.md](README.md).
+
+### Crate topology
+
+```text
+crates/
+  magnetar/                       Public façade — PulsarClient<E>, builders, typed schemas, partitioned / multi-topics / pattern / reader / table-view / interceptors
+  magnetar-proto/                 Sans-io state machine + codec + trackers + topic watcher (zero I/O deps)
+  magnetar-runtime-tokio/         Production engine (TCP, tokio-rustls, supervised reconnect)
+  magnetar-runtime-moonpool/      Deterministic-simulation engine over moonpool_core::Providers (rustls byte-pipe)
+  magnetar-admin/                 reqwest-backed REST admin client (rustls-tls)
+  magnetar-cli/                   `magnetar` binary
+  magnetar-fakes/                 In-process broker stub for tests
+  magnetar-messagecrypto/         PIP-4 AES-GCM (aws-lc-rs)
+  magnetar-auth-oauth2/           ClientCredentialsFlow + token caching
+  magnetar-auth-sasl/             SASL PLAIN + Kerberos/GSSAPI (libgssapi behind `kerberos` feature)
+  magnetar-auth-athenz/           Athenz role-token auth + optional ZTS round-trip
+  magnetar-differential/          tokio ↔ moonpool differential equivalence harness (test-only)
+xtask/                            Workspace automation (check-no-channels, check-no-io-deps, check-no-internal-clock, codegen)
+```
+
+The dependency direction is strictly downward:
+
+```text
+magnetar-cli ──> magnetar-admin
+            └──> magnetar ──> magnetar-runtime-tokio    ──┐
+                          ├──> magnetar-runtime-moonpool ──┤
+                          ├──> magnetar-auth-{oauth2,sasl,athenz}
+                          └──> magnetar-messagecrypto    ──┤
+                                                           v
+                                                    magnetar-proto
+```
+
+`magnetar-proto` is the only mandatory dependency for every other crate.
+Engine, auth, and crypto crates implement traits owned by `magnetar-proto` and the façade.
+Feature flags on `magnetar` gate which engine and which auth providers compile in ([README.md#installation](README.md#installation)).
+
+### Sans-io invariants
+
+The crate split is enforced, not aspirational.
+Each rule below is wired into a CI gate and has a corresponding ADR.
+
+| Invariant                                                            | ADR                                                                                                              | Enforcement                                                                                         |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `magnetar-proto` has zero I/O deps                                   | [ADR-0004](specs/adr/0004-sans-io-protocol-core.md)                                                              | `cargo run -p xtask -- check-no-io-deps`                                                            |
+| No channel crates anywhere                                           | [ADR-0003](specs/adr/0003-no-channels-rule.md)                                                                   | `cargo run -p xtask -- check-no-channels` + `clippy.toml::disallowed-types` + `cargo deny bans`     |
+| `magnetar-proto` does not read the host clock                        | [ADR-0011](specs/adr/0011-clock-injection-sans-io.md)                                                            | `cargo run -p xtask -- check-no-internal-clock`                                                     |
+| Generated proto code stays in lockstep with the vendored `.proto`    | [ADR-0004](specs/adr/0004-sans-io-protocol-core.md)                                                              | `cargo run -p xtask -- codegen --check`                                                             |
+| `rustls` only (openssl admitted only via `rustls-openssl`)           | [ADR-0005](specs/adr/0005-rustls-only-tls.md) amended by [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md) | `deny.toml` bans `native-tls`; `openssl` / `openssl-sys` scoped via `wrappers = ["rustls-openssl"]` |
+| Pluggable rustls crypto provider (aws-lc-rs / ring / openssl / fips) | [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)                                                          | `cargo run -p xtask -- check-crypto-matrix` + cfg-cascade `compile_error!`                          |
+| CRC32C verify-or-drop on frames                                      | (in-protocol; see §[Wire framing](#wire-framing))                                                                | `magnetar-proto::Connection::handle_bytes` drops mismatching frames; covered by codec tests         |
+| Sequence-id monotonicity                                             | (see §[Producer paths — batching vs chunking](#producer-paths--batching-vs-chunking))                            | Producer batch + chunk paths assert monotonic `SequenceId` on every send                            |
+
+The clock-injection check has two documented leak sites in [`crates/magnetar-proto`](crates/magnetar-proto): the PIP-37 chunk-set `uuid::Uuid::new_v4()` in [`producer.rs`](crates/magnetar-proto/src/producer.rs) and the one-shot `std::env::var()` bootstrap in [`auth/token.rs`](crates/magnetar-proto/src/auth/token.rs).
+Both are allowlisted in `xtask/src/main.rs::CLOCK_LEAK_ALLOWLIST` and called out in [§Known non-determinism leaks (documented)](#known-non-determinism-leaks-documented).
+
+### Engine boundary
+
+`PulsarClient<E: Engine = TokioEngine>` is generic over an `Engine` marker trait that selects per-engine storage ([`crates/magnetar/src/engine/mod.rs`](crates/magnetar/src/engine/mod.rs)).
+Two engines ship:
+
+- `TokioEngine` — production default.
+  Pulls in `tokio` + `tokio-rustls`.
+  One driver task per connection.
+  Lives in [`magnetar-runtime-tokio`](crates/magnetar-runtime-tokio).
+- `MoonpoolEngine<P>` — deterministic-simulation engine, generic over a `moonpool_core::Providers` bundle.
+  Lives in [`magnetar-runtime-moonpool`](crates/magnetar-runtime-moonpool).
+  Deep dive in [`docs/moonpool-engine.md`](docs/moonpool-engine.md).
+
+Engine-specific methods (`producer`, `consumer`, partitioned, …) live in concrete `impl PulsarClient<TokioEngine>` / `impl PulsarClient<MoonpoolEngine<P>>` blocks rather than on the trait.
+The connect signatures differ enough (URL vs. `host:port` + providers bundle) that a single `Engine::connect(...)` would either lose typing or reintroduce per-engine duplication ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md) §"Option B rejected").
+
+Most user-facing builders and dependent surfaces live on the engine-generic `impl<E: Engine> PulsarClient<E>` block and dispatch through per-surface extension traits (`SubscribeApi`, `CreateProducerApi`, `BrokerMetadataApi`, `TransactionApi`, `ProducerApi`, `ConsumerApi`).
+The `ConsumerApi` / `BrokerMetadataApi` lift to engine-generic shipped in [ADR-0037](specs/adr/0037-multi-topics-pattern-consumer-pass-2-lift.md).
+Tokio-only helper methods still yield a clean compile error when called against `PulsarClient<MoonpoolEngine<P>>` rather than a silent fallback.
+
+### Receive-path classifiers
+
+The `ConnectionEvent` stream is a single ordered queue, but the receive dispatch in `magnetar-proto::Connection` runs a thin classifier before emitting so callers see the most specific variant that matches the inbound frame.
+Two features use this pattern:
+
+- **Shadow-topic dispatch (PIP-180 / ADR-0033)** — when a consumer is shadow-attached via [`ConsumerState::set_shadow_metadata`](crates/magnetar-proto/src/consumer.rs) AND the inbound `MessageMetadata.replicated_from` is populated, the classifier emits `ConnectionEvent::MessageReceivedFromShadow` in place of `ConnectionEvent::Message`.
+  Regular (non-shadow) topics keep emitting `Message` — the wire path stays byte-identical.
+- **Replicated-subscription markers (PIP-33 / ADR-0034)** — markers carried in the payload of a `CommandMessage` with magic type `MarkerType::REPLICATED_SUBSCRIPTION_*` are intercepted by the consumer's receive path and re-emitted as `ConnectionEvent::ReplicatedSubscriptionMarkerObserved` rather than surfaced to user code as a regular `Message`.
+
+Both classifiers stay sans-io: they read only the per-consumer state cache (populated externally by the runtime engine at subscribe time) and the inbound metadata.
+No I/O, no clock reads.
+Full surfaces are documented under the PIP feature notes in [`docs/pip-features.md`](docs/pip-features.md).
+
+### Auto-update tickers
+
+Several Java client features rely on periodic background work (`PatternConsumer` topic rediscovery, `TableView` partition tracking, `PartitionedProducer`/`PartitionedConsumer`/`MultiTopicsConsumer` partition-count updates).
+The pattern is uniform:
+
+- The ticker spawns a `tokio::time::interval` task that signals a `Notify` on every tick.
+- The runtime façade (`magnetar-runtime-tokio`) takes the `Instant::now()` snapshot at the call site and forwards it into `magnetar-proto::Connection` entries.
+- `magnetar-proto` itself never reads the host clock — the `check-no-internal-clock` xtask enforces this.
+
+The schedule API lives on the relevant builder (`PartitionedProducerBuilder::auto_update_partitions_interval`, `MultiTopicsConsumerBuilder::auto_update_partitions_interval`, `TableViewBuilder::auto_update_partitions_interval`, `PatternConsumer::start_auto_reconcile`).
 
 ---
 
@@ -602,7 +708,7 @@ The decoder returns `Ok(None)` for txn markers (kinds 20..=22) and any unknown k
 
 The connection's receive-path filter at the `pb::base_command::Type::Message` arm in `conn.rs` consults this decoder before delivering to the consumer: replicated-subscription markers are diverted into `ConnectionEvent::ReplicatedSubscriptionMarkerObserved` and never reach `ConsumerState::deliver`.
 The consumer's `record_marker_consumed` helper bumps `consumed_since_flow` so permit accounting stays symmetric with the broker's view (otherwise the broker's perceived permit budget would drift by one per marker).
-See [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md) and [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md).
+See [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md) and [`docs/pip-features.md#replicated-subscriptions-pip-33`](docs/pip-features.md#replicated-subscriptions-pip-33).
 
 ### Transactions (`magnetar-proto/src/txn.rs`)
 
@@ -1218,6 +1324,24 @@ The workspace has **three** TLS sites.
 Source: GUIDELINES.md §"TLS" — rule is hard.
 `cargo deny check` rejects `openssl-sys` / `native-tls` / `native-tls-sys` outright.
 
+### Pluggable crypto provider (issue #9, ADR-0035)
+
+The rustls crypto primitives that back the handshake are selected at compile time on the `magnetar` façade via four mutually-pluggable features:
+
+| Feature            | Backend                                         |
+| ------------------ | ----------------------------------------------- |
+| `crypto-aws-lc-rs` | `aws-lc-rs` (default; brings X25519MLKEM768)    |
+| `crypto-ring`      | `ring`                                          |
+| `crypto-openssl`   | `rustls-openssl` (wraps system OpenSSL)         |
+| `crypto-fips`      | `aws-lc-fips-sys` (FIPS-validated; needs cmake) |
+
+Both runtime crates carry a sibling `tls_crypto` module that exposes `install_default_provider()` (idempotent) and `active_provider()`.
+The four production callsites (`tls_insecure.rs`, `tls_no_hostname.rs`, `transport.rs`, `client.rs`) go through `active_provider()` rather than the historical `CryptoProvider::get_default()` + `ring` fallback.
+Under `--all-features` the cfg cascade resolves to aws-lc-rs.
+
+`openssl` / `openssl-sys` are admitted only as transitive deps of `rustls-openssl` via `deny.toml`'s `wrappers = ["rustls-openssl"]` carve-out; the rest of [ADR-0005](specs/adr/0005-rustls-only-tls.md) (no `native-tls`, rustls everywhere) stays in force.
+See [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md).
+
 ---
 
 ## Schemas
@@ -1296,31 +1420,31 @@ The schema is advertised on `CommandProducer.schema` / `CommandSubscribe.schema`
 
 ## PIP coverage map
 
-| PIP                      | Title                                    | Status | Lives in                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| ------------------------ | ---------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| PIP-4                    | End-to-end encryption (AES-GCM)          | ✅     | `crates/magnetar-messagecrypto/src/lib.rs:98-220`; bridge: `crates/magnetar/src/crypto_bridge.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| PIP-22                   | DLQ topic                                | ✅     | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter`                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| PIP-30                   | In-band `AUTH_CHALLENGE` refresh         | ✅     | `crates/magnetar-proto/src/auth.rs`; dispatch: `crates/magnetar-runtime-tokio/src/driver.rs:42-66`                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| PIP-31                   | Transactions                             | ✅     | `crates/magnetar-proto/src/txn.rs`; client surface: `Client::new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`                                                                                                                                                                                                                                                                                                                                                                                               |
-| PIP-37                   | Chunking + `AckTimeoutRedeliveryBackoff` | ✅     | Chunked producer path: `crates/magnetar-proto/src/producer.rs`; backoff: `crates/magnetar-proto/src/trackers/nack.rs`                                                                                                                                                                                                                                                                                                                                                                                                             |
-| PIP-54                   | Partial-batch ACK (ack_set bitset)       | ✅     | `crates/magnetar-proto/src/consumer.rs:109-130`; ack stamping: `crates/magnetar-proto/src/conn.rs:1775`                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| PIP-58                   | Retry-letter topic                       | ✅     | `Consumer::reconsume_later` + `reconsume_later_with_properties`                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| PIP-68                   | Exclusive producer access mode           | ✅     | `ProducerBuilder::access_mode`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| PIP-90                   | Broker-entry metadata envelope           | ✅     | `crates/magnetar-proto/src/frame.rs:30-48`; consumer getters: `IncomingMessage::broker_publish_time_ms` / `broker_index`                                                                                                                                                                                                                                                                                                                                                                                                          |
-| PIP-124                  | Multi-DLQ topics for KeyShared           | ✅     | DLQ policy infra (shared with PIP-22)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| PIP-121                  | Cluster failover (Auto + Controlled)     | ✅     | `crates/magnetar-proto/src/service_url.rs`, `crates/magnetar-proto/src/cluster_failover.rs`, `crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs` (see [ADR-0016](specs/adr/0016-pip-121-cluster-failover.md))                                                                                                                                                                                                                                                                                                            |
-| PIP-145                  | Topic list watcher (regex pattern)       | ✅     | `crates/magnetar-proto/src/topic_watcher.rs`; consumer façade: `crates/magnetar/src/pattern_consumer.rs`                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| PIP-188                  | `TOPIC_MIGRATED` → reconnect-on-migrate  | ✅     | Driver event arm in `crates/magnetar-runtime-tokio/src/driver.rs` returns `ClientError` to trigger supervised reset + reconnect; see [ADR-0018](specs/adr/0018-pip-188-reconnect-on-migrate.md)                                                                                                                                                                                                                                                                                                                                   |
-| PIP-292                  | Better in-band auth refresh ergonomics   | ✅     | `crates/magnetar-runtime-tokio/src/driver.rs:42-66`                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| PIP-313                  | Force unsubscribe                        | ✅     | `CommandUnsubscribe.force` field plumbed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| PIP-34 / 119 / 282 / 379 | Key_Shared family                        | ✅     | `magnetar_proto::KeySharedConfig` + builder routing                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| PIP-391                  | Batch-index ACK polish                   | ✅     | Pairs with PIP-54                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| PIP-409                  | DLQ + retry-letter polish                | ✅     | DLQ + reconsume_later wiring                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| PIP-460                  | Scalable topics                          | 🟡     | Experimental scaffold behind `feature = "scalable-topics"` (default off); e2e waits for an upstream Pulsar release that pins the PIP-460 wire commands. See [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md) + [`docs/scalable-topics.md`](docs/scalable-topics.md)                                                                                                                                                                                                                                              |
-| PIP-466                  | V5 client API surface                    | ✅     | Experimental, engine-generic wrapper behind `feature = "experimental-v5-client"`; no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md) + [`docs/v5-client.md`](docs/v5-client.md)                                                                                                                                                                                                                                                                                                                    |
-| PIP-180                  | Shadow topic                             | ✅     | Admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/shadow-topic.md`](docs/shadow-topic.md) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md).                                                                                                                 |
-| PIP-415                  | `getMessageIdByIndex`                    | ✅     | `crates/magnetar-admin/src/lib.rs::AdminClient::topic_get_message_id_by_index` — REST-only ([PIP-415 spec](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) leaves "Binary protocol" empty; canonical impl [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin/broker/CLI only)                                                                                                                                                                                                             |
-| PIP-33                   | Replicated subscriptions                 | ✅     | `ConsumerBuilder::replicate_subscription_state(bool)` on the façade flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/replicated-subscriptions.md`](docs/replicated-subscriptions.md) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
+| PIP                      | Title                                    | Status | Lives in                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------ | ---------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PIP-4                    | End-to-end encryption (AES-GCM)          | ✅     | `crates/magnetar-messagecrypto/src/lib.rs:98-220`; bridge: `crates/magnetar/src/crypto_bridge.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| PIP-22                   | DLQ topic                                | ✅     | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| PIP-30                   | In-band `AUTH_CHALLENGE` refresh         | ✅     | `crates/magnetar-proto/src/auth.rs`; dispatch: `crates/magnetar-runtime-tokio/src/driver.rs:42-66`                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| PIP-31                   | Transactions                             | ✅     | `crates/magnetar-proto/src/txn.rs`; client surface: `Client::new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| PIP-37                   | Chunking + `AckTimeoutRedeliveryBackoff` | ✅     | Chunked producer path: `crates/magnetar-proto/src/producer.rs`; backoff: `crates/magnetar-proto/src/trackers/nack.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| PIP-54                   | Partial-batch ACK (ack_set bitset)       | ✅     | `crates/magnetar-proto/src/consumer.rs:109-130`; ack stamping: `crates/magnetar-proto/src/conn.rs:1775`                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| PIP-58                   | Retry-letter topic                       | ✅     | `Consumer::reconsume_later` + `reconsume_later_with_properties`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| PIP-68                   | Exclusive producer access mode           | ✅     | `ProducerBuilder::access_mode`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| PIP-90                   | Broker-entry metadata envelope           | ✅     | `crates/magnetar-proto/src/frame.rs:30-48`; consumer getters: `IncomingMessage::broker_publish_time_ms` / `broker_index`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| PIP-124                  | Multi-DLQ topics for KeyShared           | ✅     | DLQ policy infra (shared with PIP-22)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| PIP-121                  | Cluster failover (Auto + Controlled)     | ✅     | `crates/magnetar-proto/src/service_url.rs`, `crates/magnetar-proto/src/cluster_failover.rs`, `crates/magnetar-runtime-tokio/src/auto_cluster_failover.rs` (see [ADR-0016](specs/adr/0016-pip-121-cluster-failover.md))                                                                                                                                                                                                                                                                                                                                                    |
+| PIP-145                  | Topic list watcher (regex pattern)       | ✅     | `crates/magnetar-proto/src/topic_watcher.rs`; consumer façade: `crates/magnetar/src/pattern_consumer.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| PIP-188                  | `TOPIC_MIGRATED` → reconnect-on-migrate  | ✅     | Driver event arm in `crates/magnetar-runtime-tokio/src/driver.rs` returns `ClientError` to trigger supervised reset + reconnect; see [ADR-0018](specs/adr/0018-pip-188-reconnect-on-migrate.md)                                                                                                                                                                                                                                                                                                                                                                           |
+| PIP-292                  | Better in-band auth refresh ergonomics   | ✅     | `crates/magnetar-runtime-tokio/src/driver.rs:42-66`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| PIP-313                  | Force unsubscribe                        | ✅     | `CommandUnsubscribe.force` field plumbed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| PIP-34 / 119 / 282 / 379 | Key_Shared family                        | ✅     | `magnetar_proto::KeySharedConfig` + builder routing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| PIP-391                  | Batch-index ACK polish                   | ✅     | Pairs with PIP-54                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| PIP-409                  | DLQ + retry-letter polish                | ✅     | DLQ + reconsume_later wiring                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| PIP-460                  | Scalable topics                          | 🟡     | Experimental scaffold behind `feature = "scalable-topics"` (default off); e2e waits for an upstream Pulsar release that pins the PIP-460 wire commands. See [ADR-0031](specs/adr/0031-pip-460-scalable-subscription-scope.md) + [`docs/pip-features.md#scalable-topics-pip-460--experimental`](docs/pip-features.md#scalable-topics-pip-460--experimental)                                                                                                                                                                                                                |
+| PIP-466                  | V5 client API surface                    | ✅     | Experimental, engine-generic wrapper behind `feature = "experimental-v5-client"`; no wire change. See [ADR-0032](specs/adr/0032-pip-466-v5-client-surface-scope.md) + [`docs/pip-features.md#v5-client-surface-pip-466`](docs/pip-features.md#v5-client-surface-pip-466)                                                                                                                                                                                                                                                                                                  |
+| PIP-180                  | Shadow topic                             | ✅     | Admin REST (`create_shadow_topic` / `delete_shadow_topic` / `get_shadow_topics` / `get_shadow_source`), producer-side `send_with_source_message_id` propagating `CommandSend.message_id`, consumer-side `MessageReceivedFromShadow` event, structural `MessageId` equality across source ⇄ shadow. See [`docs/pip-features.md#shadow-topics-pip-180`](docs/pip-features.md#shadow-topics-pip-180) + [ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md).                                                                                                             |
+| PIP-415                  | `getMessageIdByIndex`                    | ✅     | `crates/magnetar-admin/src/lib.rs::AdminClient::topic_get_message_id_by_index` — REST-only ([PIP-415 spec](https://github.com/apache/pulsar/blob/master/pip/pip-415.md) leaves "Binary protocol" empty; canonical impl [`apache/pulsar#24222`](https://github.com/apache/pulsar/pull/24222) is admin/broker/CLI only)                                                                                                                                                                                                                                                     |
+| PIP-33                   | Replicated subscriptions                 | ✅     | `ConsumerBuilder::replicate_subscription_state(bool)` on the façade flips `CommandSubscribe` field 14; receive-path filter in `magnetar-proto::conn` drops `REPLICATED_SUBSCRIPTION_*` markers and surfaces them via `PulsarClient::next_replicated_subscription_marker` / `poll_replicated_subscription_marker`. Client never originates markers — broker-side machinery only. See [`docs/pip-features.md#replicated-subscriptions-pip-33`](docs/pip-features.md#replicated-subscriptions-pip-33) + [ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md). |
 
 ---
 

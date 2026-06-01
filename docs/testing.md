@@ -59,7 +59,7 @@ cargo test -p magnetar --tests
 Contributors with a FIPS toolchain installed locally can substitute `--all-features` for `--no-default-features --features "$FEATURES"` above.
 `cargo run -p xtask -- check-crypto-matrix` is the authoritative per-provider sweep regardless.
 
-The validation chain documented in [`parity-status.md#validation-chain-per-commit`](parity-status.md#validation-chain-per-commit) runs everything **including the e2e suite** (ADR-0046 folded the former opt-in `e2e` job into the regular `test` job).
+The validation chain documented in [`../CONTRIBUTING.md#validation-chain`](../CONTRIBUTING.md#validation-chain) runs everything **including the e2e suite** (ADR-0046 folded the former opt-in `e2e` job into the regular `test` job).
 
 ## Unit tests
 

@@ -14,7 +14,7 @@ The moonpool engine had no counterpart.
 Its engine crypto API (`MessageEncryptorApi` / `MessageDecryptorApi`) resolved to `NoEncryption`, so a moonpool producer / consumer could not encrypt or decrypt.
 Two consequences followed:
 
-1. The moonpool engine was **not** at PIP-4 parity with tokio, contrary to the engine-parity train tracked in [`docs/parity-status.md`](../../docs/parity-status.md).
+1. The moonpool engine was **not** at PIP-4 parity with tokio, contrary to the engine-parity train tracked in [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage).
 2. The `magnetar-differential` harness could not assert tokio ↔ moonpool equivalence for the encrypted path — both engines have to drive the crypto for the equivalence claim to mean anything.
    The `cryptoFailureAction` matrix golden trace was blocked on exactly this (former `docs/follow-ups.md` §3).
 
@@ -71,4 +71,4 @@ The moonpool engine gains the PIP-4 message-crypto bridge, mirroring the tokio e
 - `crates/magnetar/src/builders.rs` — the moonpool `.encryption()` / `.create_with_encryption()` / `.subscribe_with_decryption()` builders.
 - `crates/magnetar-differential/src/broker.rs` — PIP-4 metadata round-tripped verbatim.
 - [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md) §"PIP-4 message-crypto bridge" — the engine-side description.
-- [`docs/parity-status.md`](../../docs/parity-status.md) — the engine-by-engine parity snapshot.
+- [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage) — the engine-by-engine parity snapshot.

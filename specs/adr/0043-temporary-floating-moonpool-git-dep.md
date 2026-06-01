@@ -64,7 +64,7 @@ At that point this ADR's status changes to `Superseded by ADR-NNNN` (the re-pin 
 
 **Mitigations**
 
-- `Cargo.lock` records a concrete rev (`--locked` everywhere in the validation chain — CLAUDE.md / docs/testing.md / parity-status.md).
+- `Cargo.lock` records a concrete rev (`--locked` everywhere in the validation chain — CLAUDE.md / docs/testing.md / CONTRIBUTING.md).
 - The daily 128-random-seed moonpool sweep ([ADR-0036](0036-moonpool-seed-sweep-daily-random.md), [`.github/workflows/moonpool-seed-sweep.yml`](../../.github/workflows/moonpool-seed-sweep.yml)) guards against a silent moonpool-side scheduling regression sneaking in on a lock bump.
 - The four-layer cross-runtime + 1:1 parity gates ([ADR-0024](0024-cross-runtime-test-and-coverage-policy.md)) catch any tokio ↔ moonpool divergence introduced by the futures-io transport port.
 

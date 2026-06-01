@@ -29,7 +29,7 @@ Concretely:
 
 1. The parity-matrix row `✅` / `🟡` / `❌` markers reflect _tokio_-engine coverage.
    A row is `✅` iff the feature works end-to-end on `magnetar-runtime-tokio`.
-2. Moonpool gaps relative to tokio are tracked in [`docs/parity-status.md`](../../docs/parity-status.md) under "Moonpool parity train".
+2. Moonpool gaps relative to tokio are tracked in [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage).
 3. ADR-0010 is **clarified, not weakened**: "full Java parity" still holds; the qualifier is "as exposed by `PulsarClient<TokioEngine>`".
    The moonpool engine remained a _test-only_ deterministic-simulation surface until the façade was lifted onto an `Engine` trait.
    That lift landed on 2026-05-22: the façade now ships `PulsarClient<E: Engine = TokioEngine>` with a moonpool branch that re-exports the engine's shared-state and driver-handle plumbing without lifting the producer / consumer surface (that is the M7–M8 work).
@@ -54,7 +54,7 @@ Concretely:
 - Generic `PulsarClient<E>` adds turbofish noise (`PulsarClient::<TokioEngine>::new(...)`) to user code that wants to be explicit.
   The default type parameter mitigates this for the common case.
 - Two parity matrices conceptually exist (tokio-side + moonpool-side).
-  The README matrix tracks tokio; the moonpool gap is tracked in `docs/parity-status.md`.
+  Both live in `README.md`: the headline matrix tracks tokio and the [engine-by-engine surface coverage](../../README.md#engine-by-engine-surface-coverage) table tracks the moonpool gap.
   Future audits must keep both honest.
 - Trait-bound failures when a moonpool user reaches for an unimplemented feature are a learning curve.
   Documented in `crates/magnetar-runtime-moonpool/README.md`.
@@ -79,4 +79,4 @@ Concretely:
 - [ADR-0010](0010-v0-1-full-java-parity.md) — full Java parity (this ADR clarifies _which engine satisfies it_).
 - [ADR-0011](0011-clock-injection-sans-io.md) — clock injection.
 - `tasks/todo.md` Phase 2 M5–M8 — moonpool parity train.
-- `docs/parity-status.md` — moonpool gap table.
+- [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage) — moonpool gap table.

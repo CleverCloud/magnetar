@@ -81,7 +81,7 @@ The full DAG-aware split/merge surface, checkpoint consumer, and controller-brok
 Accepted (2026-05-28).
 The scaffold landed per the scope locked above: proto wire commands (hand-encoded behind `feature = "scalable-topics"` until the Pulsar 5.0 RC vendor bump), the `DagWatchSession` state machine, the `MessageId.segment_id` extension, both-engine `ScalableTopicsApi` impls, the `magnetar::scalable::StreamConsumer` surface (drop-on-DAG-change), the CLI `topic-info` subcommand, and the four-layer test set (proto unit + tokio + moonpool 1:1 + differential equivalence with a golden trace).
 E2E is `#[ignore]`'d behind `feature = "e2e,scalable-topics"` and remains deferred until upstream cuts a Pulsar 5.0 RC shipping PIP-460.
-See [`docs/scalable-topics.md`](../../docs/scalable-topics.md) and the implementation in `git log`.
+See [`docs/pip-features.md#scalable-topics-pip-460--experimental`](../../docs/pip-features.md#scalable-topics-pip-460--experimental) and the implementation in `git log`.
 
 ## References
 

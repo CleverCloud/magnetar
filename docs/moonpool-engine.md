@@ -5,7 +5,7 @@ It drives the same sans-io `magnetar-proto::Connection` state machine as the tok
 
 This document covers the engine's surface, supervised reconnect path, TLS adapter, chaos test pack, and the differential equivalence harness that proves it stays in lockstep with the tokio engine.
 
-For the production engine and the workspace-wide architecture, see [`architecture-overview.md`](architecture-overview.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
+For the production engine and the workspace-wide architecture, see [`../ARCHITECTURE.md`](../ARCHITECTURE.md) (its [Overview](../ARCHITECTURE.md#overview) section is the 10-minute read).
 
 ## What moonpool is
 
@@ -44,7 +44,7 @@ The user-facing client lives at [`magnetar-runtime-moonpool::Client<P>`](../crat
 
 At the façade layer the engine is selected via the `Engine` marker trait, so `PulsarClient<MoonpoolEngine<P>>` is the canonical public type ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)).
 The higher-level façade surfaces (partitioned, multi-topics, pattern, reader, table-view, transactions, typed schemas) were lifted to be engine-generic over `E: Engine`, so they build on both engines; only a few narrow tokio-only specialisations remain.
-See [`parity-status.md`](parity-status.md) for the authoritative per-feature, per-engine snapshot.
+See [`../README.md#engine-by-engine-surface-coverage`](../README.md#engine-by-engine-surface-coverage) for the authoritative per-feature, per-engine snapshot.
 
 ## Producer + consumer façades
 
@@ -90,7 +90,7 @@ This replaces the earlier placeholder that coalesced the `Vectored` segment list
 ## Supervised reconnect
 
 The moonpool driver loop mirrors the tokio supervisor exactly.
-See [`architecture-overview.md#driver-loop`](architecture-overview.md#driver-loop) for the shared algorithm.
+See [`../ARCHITECTURE.md#the-driver-loop`](../ARCHITECTURE.md#the-driver-loop) for the shared algorithm.
 Specifics for the moonpool engine:
 
 - Backoff is driven by `moonpool_core::TimeProvider::sleep_until` — under `SimProviders` this advances the virtual clock deterministically.
@@ -222,3 +222,93 @@ The earlier `LocalSet` + 25 ms `Kicker` pump were tied to a stale `spawn_local` 
   Stage 3 follow-up.
 
 Tracked in [`follow-ups.md`](follow-ups.md).
+
+## Appendix — reference patterns: FoundationDB and TigerBeetle
+
+> **Audience.** Engineers evaluating where magnetar's deterministic simulation infrastructure should evolve next.
+> This appendix is a research note, not a binding spec — for binding decisions see [`../specs/adr/`](../specs/adr/).
+
+Magnetar's simulation strategy is informed by two reference systems: Apple FoundationDB's simulator and TigerBeetle's VOPR.
+The current surface (chaos pack, differential harness, daily seed sweep) is documented above; this appendix captures the patterns that drove it and the ones that motivated the recent ADR-0047/0048/0049/0050 wave.
+
+### FoundationDB simulator (the reference implementation)
+
+The FoundationDB simulator is the canonical example of "the test strategy that made it possible to ship a production distributed database with a small team."
+Source: [apple.github.io/foundationdb/testing.html](https://apple.github.io/foundationdb/testing.html).
+
+**Determinism architecture**
+
+- **Single-threaded Flow execution.** FoundationDB is written in _Flow_, an actor-based language atop C++.
+  The simulator runs the full cluster (all servers + all clients) in a single OS thread.
+  No threading primitives, no preemption — every interleaving is a deterministic function of the seed.
+- **Synchronized time stepping.** The simulator advances a virtual clock and dispatches actor wake-ups in deterministic order.
+  Real durations are compressed (~10×) so a "one-day" outage in simulation completes in a few minutes of wall time.
+- **Production code IS the test target.** Flow is the same language used in production binaries.
+  There is no separate "mock" — the simulator replaces the I/O / time / random primitives only.
+
+**Fault injection — "buggify"**
+
+- **Buggify points** are explicit `if (BUGGIFY) { ... }` blocks spread throughout the production code: rare delays, dropped messages, partial writes, restarts.
+  Under simulation each buggify-block fires with controlled probability per seed; in production they never fire.
+  Magnetar's equivalent landed as [ADR-0048](../specs/adr/0048-buggify-fault-injection.md) — feature-flagged `#[cfg(feature = "buggify")]` blocks at four choice points in `magnetar-proto`.
+- **Multi-layer faults**: network (packet loss, reorder, partition, delay), machine (process crash, reboot, slow disk, full disk), datacenter (full-DC partition, asymmetric routing).
+  Each layer is modelled independently and composes.
+- **Swizzle-clogging**: stop random subsets of nodes' network traffic, then restart them in a different random order.
+  Exposes reconnection-ordering bugs that pure crash-restart misses.
+  Landed as [ADR-0050](../specs/adr/0050-swizzle-clog-workload.md).
+
+**Volume + workloads**
+
+- "Tens of thousands of simulations every night."
+  A new commit is expected to soak through that swarm before reaching production.
+- **Workload reuse**: the same workload definitions drive performance tests (real cluster, real time) and simulation (virtual cluster, virtual time).
+  One spec, two regimes.
+
+### TigerBeetle — the assertion-first philosophy
+
+[TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) is the explicit set of coding rules that make deterministic simulation actually work on TigerBeetle's codebase.
+It is _not_ just about the simulator — it's about how production code is written so that simulation discovers bugs cheaply.
+
+**Coding rules that make simulation effective**
+
+- **Assertion density ≥ 2 per function.** Pre/postconditions, invariants, compile-time relationships.
+  Assertions downgrade silent correctness bugs into loud liveness bugs (crashes), which the simulator catches immediately.
+  Magnetar's equivalent landed as [ADR-0049](../specs/adr/0049-assertion-density-magnetar-proto.md) — pair-assertions on `Connection` state machine entries.
+- **Pair assertions (positive + negative space).** Don't just assert what you expect — also assert what you don't.
+  "Data movement across trust boundaries" gets both sides asserted.
+- **Run-to-completion functions.** Functions that don't suspend preserve their preconditions throughout the body — no need to re-assert after every await point.
+  Maps directly to magnetar's sans-io `Connection` entries: `handle_bytes(now, &[u8])` runs to completion under the caller's lock.
+- **Static memory only on hot paths.** No heap allocations after startup — preallocate all buffers.
+  This rule does **not** transfer to magnetar: we use `Vec<u8>` buffers for arbitrary-sized Pulsar payloads, and Rust's allocator is fast enough that pre-allocation is not the lever it is on TigerBeetle's small fixed-size messages.
+- **No shared mutable state between actors.** Each actor owns its state; message-passing for coordination.
+  Magnetar enforces the no-channels variant via [ADR-0003](../specs/adr/0003-no-channels-rule.md) (Waker-slab pattern as the closest Rust analog).
+
+**VOPR — the simulator**
+
+VOPR (Viewstamped Operations Replicator) is TigerBeetle's simulator.
+Key properties:
+
+- **VOPR is the final line of defence, not the first.** "Assertions are a safety net, not a substitute for human understanding."
+  Engineers reason about correctness first; VOPR catches the residual.
+- **Single-threaded simulation of a full replica set.** Same pattern as FoundationDB.
+- **Deterministic state-machine fuzzing.** Random client workloads + random network faults + assertion density = bugs found in minutes that would take days of customer traffic.
+- **VOPR runs continuously on dedicated hardware.** Higher throughput than nightly sweeps because the cost of one bug escaping to production is operationally catastrophic.
+
+### Status: pattern adoption in magnetar
+
+| Pattern                                       | Source      | Status                                                                                                                                        |
+| --------------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Buggify points in `magnetar-proto`            | FDB         | **Landed** ([ADR-0048](../specs/adr/0048-buggify-fault-injection.md)).                                                                        |
+| Assertion density in `magnetar-proto`         | TigerBeetle | **Landed** ([ADR-0049](../specs/adr/0049-assertion-density-magnetar-proto.md)).                                                               |
+| Swizzle-clog workload in `sim_chaos`          | FDB         | **Landed** ([ADR-0050](../specs/adr/0050-swizzle-clog-workload.md)).                                                                          |
+| Per-handle invariant assertions               | TigerBeetle | **Landed** (`HandleResolutionInvariant`).                                                                                                     |
+| Failing-seed registry per PR                  | FDB         | **Landed** ([ADR-0047](../specs/adr/0047-failing-seed-registry-per-pr-replay.md)).                                                            |
+| Daily seed sweep 16 → 128                     | FDB         | **Landed** ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) amendment).                                                     |
+| Long-running soak (≥ 1 000 seeds)             | FDB         | **Out of scope today** — current sim runs ~50 ms per seed; 128 daily covers the seed space until a slow regression appears.                   |
+| VOPR-equivalent dedicated runner              | TigerBeetle | **Out of scope** — TigerBeetle runs VOPR on dedicated bare-metal because every seed costs hours; magnetar's seeds are sub-second.             |
+| Replacing moonpool with a different sim crate | —           | **Out of scope** — moonpool already supplies the FDB+TB primitives (single-threaded executor, seeded RNG, virtual clock, in-process network). |
+
+### References
+
+- FoundationDB: [apple.github.io/foundationdb/testing.html](https://apple.github.io/foundationdb/testing.html); Will Wilson, _Testing Distributed Systems w/ Deterministic Simulation_ (Strange Loop 2014); `BUGGIFY()` macro in [`apple/foundationdb/fdbrpc`](https://github.com/apple/foundationdb).
+- TigerBeetle: [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md); VOPR in [`tigerbeetle/tigerbeetle`](https://github.com/tigerbeetle/tigerbeetle) `src/vopr.zig`; TigerBeetle blog posts _It Takes Two To Contract_ (pair assertions) and _Testing Made Easy By VOPR_.

@@ -9,7 +9,7 @@
 
 [ADR-0010](0010-v0-1-full-java-parity.md) ships full Java-client parity, and originally deferred the **Athenz ZTS round-trip** as follow-up work.
 The deferral was locked in [ADR-0026 §D3](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md): shipping a fake-token stub and calling Athenz "✅" would lie to the parity matrix.
-The honest interim position was "PLAIN + pre-fetched role token now; ZTS round-trip as follow-up", and that is what `docs/parity-status.md` and `README.md`'s parity matrix recorded.
+The honest interim position was "PLAIN + pre-fetched role token now; ZTS round-trip as follow-up", and that is what `README.md`'s parity matrix recorded.
 
 Today the scaffolding lives in [`crates/magnetar-auth-athenz/src/lib.rs`](../../crates/magnetar-auth-athenz/src/lib.rs).
 `AthenzProvider::new(AthenzConfig { tenant_domain, tenant_service, provider_domain, key_id, private_key_pem, zts_url, principal_header, role_header })` builds a provider that — without a pre-fetched token — returns `AuthError::Unsupported("Athenz ZTS round-trip not yet implemented; provide a pre-fetched role token via AthenzProvider::with_role_token")` (see `lib.rs:91-100`).

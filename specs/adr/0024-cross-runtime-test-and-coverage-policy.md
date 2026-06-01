@@ -132,7 +132,7 @@ They do NOT apply to:
 - [ADR-0021 — tests are fixed, not silently ignored or removed](0021-no-silent-test-ignore-or-remove.md)
 - [`docs/testing.md`](../../docs/testing.md) — five test categories.
 - [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md) — chaos pack + differential harness.
-- [`docs/parity-status.md`](../../docs/parity-status.md) — per-engine parity snapshot.
+- [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage) — per-engine parity snapshot.
 - [`xtask/src/main.rs`](../../xtask/src/main.rs) — `check-sim-coverage` and `check-runtime-test-parity` subcommands.
 - [`docs/follow-ups.md`](../../docs/follow-ups.md) — the tracked follow-up; the executable prompt lives locally in `tasks/coverage-closure-prompt.md` (gitignored).
 - [`CLAUDE.md`](../../CLAUDE.md) §"Non-negotiable invariants" #9 — references this ADR.

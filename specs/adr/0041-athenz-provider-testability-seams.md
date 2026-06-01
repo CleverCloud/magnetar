@@ -61,4 +61,4 @@ Supersedes [ADR-0030](0030-athenz-zts-round-trip-scope.md).
 - [ADR-0011](0011-clock-injection-sans-io.md) — `now: Instant` + `wall_clock` injection.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — four-layer test plan.
 - [ADR-0035](0035-pluggable-crypto-provider.md) — aws-lc-rs / ring crypto-provider matrix that backs the signer.
-- `docs/athenz.md` — client-side configuration + cross-runtime coverage.
+- [`docs/pip-features.md#athenz-auth-provider`](../../docs/pip-features.md#athenz-auth-provider) — client-side configuration + cross-runtime coverage.

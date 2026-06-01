@@ -444,7 +444,7 @@ Once Pulsar 5.0 GA ships, e2e becomes blocking — at which point we cut a follo
    Mitigation: vendor on the RC tag, not on master; the proposal's §1 field numbers are explicitly provisional.
 2. **Controller-broker disconnect semantics under-specified upstream.** Mitigation: the client surfaces `DagWatchClosed { reason }` and lets the caller decide.
    No silent retry.
-   Documented in `docs/scalable-topics.md` (NEW) alongside the experimental banner.
+   Documented in [`docs/pip-features.md#scalable-topics-pip-460--experimental`](../../docs/pip-features.md#scalable-topics-pip-460--experimental) alongside the experimental banner.
 3. **Test-count parity strain.** The 1:1 rule means moonpool needs a working scripted controller-broker before any tokio test lands.
    Mitigation: land the `ScalableTopicBroker` fake **before** the tokio surface, in a prerequisite PR.
 4. **Feature-flag combinatorics.** `scalable-topics` × `crypto-{aws-lc-rs,ring,openssl,fips}` per [ADR-0035](../adr/0035-pluggable-crypto-provider.md).
@@ -471,7 +471,7 @@ No revert PR needed; pre-PIP-460-compatible callers are unaffected.
 
 ## 8. Documentation deliverables (same wave)
 
-- `docs/scalable-topics.md` (NEW) — surface overview, experimental banner, drop-on-change semantics, examples.
+- [`docs/pip-features.md#scalable-topics-pip-460--experimental`](../../docs/pip-features.md#scalable-topics-pip-460--experimental) — surface overview, experimental banner, drop-on-change semantics, examples.
 - `docs/parity-status.md` — add PIP-460 row, `🟡 experimental`.
 - `README.md` — Java-client parity matrix row update.
 - `specs/README.md` ADR index — flip ADR-0031 status to `Accepted` the moment Florentin signs the proposal off.

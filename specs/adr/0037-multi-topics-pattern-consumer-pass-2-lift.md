@@ -58,7 +58,7 @@ Concretely:
 
 - Code targeting the moonpool engine can now use the full `MultiTopicsConsumer` / `PartitionedConsumer` / `PatternConsumer` surface.
   The differential harness can write coordinated multi-topic workloads on both engines without lifting the type signature outside the workspace.
-- The `ConsumerApi` trait is now broad enough that any future multi-consumer aggregator can build on top of it without lifting yet more methods (the trait is "comprehensive" — see `docs/parity-status.md`).
+- The `ConsumerApi` trait is now broad enough that any future multi-consumer aggregator can build on top of it without lifting yet more methods (the trait is "comprehensive" — see [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage)).
 - `PulsarClient::partitions_for_topic` and `PulsarClient::topic_list_snapshot` are now engine-generic, so any caller that holds `&PulsarClient<E>` rather than the tokio default gains those methods automatically (gated on the `BrokerMetadataApi` bound).
 - The matched `type Producer: ProducerApi` associated type sets a precedent for cleanly pairing producer + consumer roles in future trait extensions (e.g. a future "TransactionalProducer" surface).
 
@@ -85,7 +85,7 @@ Concretely:
 - [`crates/magnetar/src/multi_topics.rs`](../../crates/magnetar/src/multi_topics.rs) — `MultiTopicsConsumer<C>` impl-body lift.
 - [`crates/magnetar/src/pattern_consumer.rs`](../../crates/magnetar/src/pattern_consumer.rs) — `PatternConsumer<C>` impl-body lift + PIP-145 auto-reconcile via `SubscribeApi`.
 - [`crates/magnetar/src/partitioned_consumer.rs`](../../crates/magnetar/src/partitioned_consumer.rs) — `PartitionedConsumerBuilder<'a, E>` lift.
-- [`docs/parity-status.md`](../../docs/parity-status.md) — engine parity row flips.
+- [`README.md` §"Engine-by-engine surface coverage"](../../README.md#engine-by-engine-surface-coverage) — engine parity row flips.
 - [`docs/follow-ups.md`](../../docs/follow-ups.md) — six-of-seven D1 surfaces now lifted.
 - [ADR-0019](0019-engine-scope-and-moonpool-parity.md) — `PulsarClient<E>` generic + no silent tokio fallback.
 - [ADR-0026](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) §D1 — concrete-generic surfaces over GATs.
