@@ -6,12 +6,12 @@
 //! Per ADR-0024 four-layer test rule. The HIGH-1 fix from the lookup
 //! multi-agent review changes how the runtime routes data ops after a
 //! `LookupOutcome::Connect { broker_service_url: Some(_),
-//! proxy_through_service_url: false }` (DIRECT-with-a-broker-URL): the
-//! tokio engine opens a pinned pool entry that dials the resolved broker,
-//! the moonpool engine reuses the bootstrap (its pool is the in-flight
-//! follow-up `docs/follow-ups.md §3`). Their *proto-level* outcome is
-//! identical though — both observe the same `OpOutcome::LookupResponse`
-//! and decode `broker_service_url` to the same `Some(url)` value.
+//! proxy_through_service_url: false }` (DIRECT-with-a-broker-URL): both
+//! engines open a pinned pool entry that dials the resolved broker
+//! directly. Their *proto-level* outcome is identical — both observe the
+//! same `OpOutcome::LookupResponse` and decode `broker_service_url` to
+//! the same `Some(url)` value, which is the load-bearing field
+//! `resolve_target` reads to pick the pool entry.
 //!
 //! This test feeds the same scripted lookup-response bytes into both
 //! engines' [`magnetar_proto::Connection`] surface and asserts:
@@ -21,12 +21,12 @@
 //!    the multi-broker DIRECT routing decision in `Client::lookup_topic`.
 //!
 //! Adding a full client-level cross-engine assertion would require
-//! standing up a pair of brokers for each engine and reconciling the
-//! tokio engine's pool-dial against the moonpool engine's bootstrap-only
-//! routing (which differs by design until the moonpool pool lands). The
-//! proto-level invariant — both engines see the same wire decision — is
-//! the load-bearing equivalence; the engine-level routing decision is
-//! covered by the per-engine integration tests.
+//! standing up a pair of brokers for each engine; the proto-level
+//! invariant — both engines see the same wire decision — is the
+//! load-bearing equivalence. The engine-level routing decision (DIRECT
+//! pool entry + bootstrap-equality fast path) is covered by the per-engine
+//! integration tests
+//! (`crates/magnetar-runtime-{tokio,moonpool}/tests/lookup_direct_multi_broker.rs`).
 
 #![forbid(unsafe_code)]
 

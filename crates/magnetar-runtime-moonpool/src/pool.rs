@@ -1,11 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-broker connection pool for the Apache Pulsar Proxy (ADR-0039),
-//! moonpool engine flavour.
+//! Per-broker connection pool for the Apache Pulsar Proxy and for
+//! multi-broker DIRECT routing (ADR-0039 — base proxy entry +
+//! 2026-06-01 amendment), moonpool engine flavour.
 //!
 //! 1:1 with [`magnetar_runtime_tokio::pool`]. Stays generic over
 //! [`moonpool_core::Providers`] so the pool behaves identically in production
 //! `TokioProviders` runs and `moonpool-sim` deterministic substrates.
+//!
+//! Two routing shapes share this pool, keyed on
+//! `(logical_broker_url, physical_dial_address)`:
+//!
+//! 1. **Proxy-routed** (`proxy_through_service_url = true` on the lookup): every pool entry dials
+//!    the same `physical` (the proxy on the bootstrap address);
+//!    `CommandConnect.proxy_to_broker_url` is `Some(logical)` so the proxy forwards every frame on
+//!    that connection to the resolved broker.
+//! 2. **Direct multi-broker** (`proxy_through_service_url = false` plus a `broker_service_url` that
+//!    names a broker *other than* the bootstrap): the pool dials the resolved broker directly
+//!    (`logical == physical`), `CommandConnect.proxy_to_broker_url` is **`None`** (we are talking
+//!    directly to the broker, no proxy in the middle). The 2026-06-01 amendment to ADR-0039 wires
+//!    this path so the second producer / consumer on a multi-broker cluster lands on the broker the
+//!    lookup actually resolved to, instead of bouncing on the bootstrap with
+//!    `ServerError::NotConnected "not served by this instance"`.
 //!
 //! See [`magnetar_runtime_tokio::pool`] for the design notes — both engines
 //! pull the same shared contract out of `magnetar-proto`'s
@@ -48,8 +64,10 @@ use crate::{ConnectionShared, EngineError, handshake_plain, make_shared_with_pro
 /// it).
 #[derive(Clone)]
 pub(crate) struct ConnectionFactory<P: Providers> {
-    /// The `host:port` the proxy listens on. Every pool entry dials this same
-    /// address — only `CommandConnect.proxy_to_broker_url` differs per entry.
+    /// The `host:port` the bootstrap connection dialled. On the proxy path every pool entry dials
+    /// this same address (it is the proxy). On the multi-broker DIRECT path the per-call
+    /// `physical` argument to [`get_or_open`] overrides it, so each direct entry dials its own
+    /// broker. Mirrors the tokio pool's `factory.url`.
     pub(crate) addr: String,
     /// Template `ConnectionConfig`. Cloned per entry; `proxy_to_broker_url`
     /// is overwritten with the logical broker URL before handshake.
@@ -212,7 +230,20 @@ impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
     }
 }
 
-/// Get or lazily open the pool entry for `(logical, physical=pool.factory.addr)`.
+/// Get or lazily open the pool entry for `(logical, physical)`.
+///
+/// `logical` is the broker URL the lookup resolved to. `physical` is the
+/// `host:port` magnetar actually dials.
+///
+/// `proxy_to_broker_url` controls the `CommandConnect.proxy_to_broker_url`
+/// field on the entry's CONNECT frame:
+///
+/// * `Some(host_port)` — proxy path (the value the Pulsar Proxy expects, `host:port` form, no
+///   scheme). The pool entry rides on `physical` (= the proxy address) and the proxy forwards each
+///   frame to the broker named in `proxy_to_broker_url`. Mirrors Java `Commands.newConnect(...,
+///   targetBroker)`.
+/// * `None` — direct multi-broker routing. The pool entry dials `physical` (= the resolved broker)
+///   directly, no proxy in the middle. ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)".
 ///
 /// Concurrency: if two callers race for the same key, only one dial task
 /// is spawned; the loser awaits the winner's [`PendingDial`].
@@ -232,11 +263,13 @@ impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
 pub(crate) async fn get_or_open<P>(
     pool: Arc<ProxyConnectionPool<P>>,
     logical: &str,
+    physical: &str,
+    proxy_to_broker_url: Option<String>,
 ) -> Result<Arc<ConnectionShared>, EngineError>
 where
     P: Providers + Send + Sync,
 {
-    let key: PoolKey = (logical.to_owned(), pool.factory.addr.clone());
+    let key: PoolKey = (logical.to_owned(), physical.to_owned());
 
     // Fast path or race-resolution decision under the lock.
     let pending = {
@@ -253,7 +286,8 @@ where
             drop(entries);
             spawn_dial(
                 pool.clone(),
-                logical.to_owned(),
+                physical.to_owned(),
+                proxy_to_broker_url,
                 key.clone(),
                 handles.handles(),
             );
@@ -279,7 +313,8 @@ where
 /// doesn't propagate back to the caller's future.
 fn spawn_dial<P>(
     pool: Arc<ProxyConnectionPool<P>>,
-    logical: String,
+    physical: String,
+    proxy_to_broker_url: Option<String>,
     key: PoolKey,
     pending: PendingDial,
 ) where
@@ -292,7 +327,7 @@ fn spawn_dial<P>(
     // outcome it produces is delivered to waiters via `pending.notify`
     // and the entries-map promotion below. Drop, don't `.await`.
     let _detached = task.spawn_task("magnetar-moonpool-pool-dial", async move {
-        let outcome = build_entry_async::<P>(&factory, &logical).await;
+        let outcome = build_entry_async::<P>(&factory, &physical, proxy_to_broker_url).await;
         // Publish the outcome to waiters BEFORE swapping the entry-state
         // to Ready/Removed, so a freshly-polling waiter sees the slot
         // populated either via the `notify` wake-up (parked waiters) or
@@ -331,19 +366,28 @@ fn spawn_dial<P>(
 /// which moonpool declares `#[async_trait(?Send)]`. It is therefore only
 /// called from inside a `spawn_task`-spawned task whose future is not
 /// required to be `Send`.
+///
+/// `physical` is the `host:port` we dial; `proxy_to_broker_url` is what we
+/// put on `CommandConnect.proxy_to_broker_url` (proxy path) or `None` for
+/// the multi-broker DIRECT path. See [`get_or_open`] for the routing
+/// shape mapping.
 async fn build_entry_async<P: Providers>(
     factory: &ConnectionFactory<P>,
-    logical: &str,
+    physical: &str,
+    proxy_to_broker_url: Option<String>,
 ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
     // Per-entry ConnectionConfig: clone the bootstrap, override the
-    // `proxy_to_broker_url` so `CommandConnect` carries the logical broker
-    // URL on this connection.
+    // `proxy_to_broker_url` according to the routing shape:
+    //   * `Some(host_port)` — proxy path, CONNECT carries the logical broker URL so the proxy can
+    //     forward subsequent frames.
+    //   * `None` — direct multi-broker path, CONNECT carries no `proxy_to_broker_url` (we are
+    //     dialling the broker directly).
     let mut cfg = factory.bootstrap_config.clone();
-    cfg.proxy_to_broker_url = Some(logical.to_owned());
+    cfg.proxy_to_broker_url = proxy_to_broker_url;
 
     let mut transport = Transport::<P>::connect_with_resolver(
         factory.providers.network(),
-        &factory.addr,
+        physical,
         factory.dns_resolver.as_deref(),
     )
     .await?;
@@ -352,7 +396,7 @@ async fn build_entry_async<P: Providers>(
     handshake_plain::<P>(&shared, &mut transport).await?;
 
     let ctx = ReconnectContext {
-        host_port: factory.addr.clone(),
+        host_port: physical.to_owned(),
         service_url_provider: factory.service_url_provider.clone(),
         dns_resolver: factory.dns_resolver.clone(),
     };

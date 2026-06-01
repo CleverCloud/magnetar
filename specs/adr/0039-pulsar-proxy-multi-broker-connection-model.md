@@ -452,13 +452,18 @@ proxy path strips to `host:port` per ADR-0045).
 
 Moonpool's `LookupTarget` mirror grows the same `Option<String>` field
 on the `Direct` arm. `lookup_topic_target` captures the broker URL
-identically. `resolve_target` is synchronous (engine-shape constraint
-— `moonpool_core::NetworkProvider` is `#[async_trait(?Send)]`) and
-falls back to the bootstrap for both DIRECT shapes. Multi-broker
-DIRECT routing under moonpool waits on the moonpool flavour of
-`ProxyConnectionPool` (`docs/follow-ups.md §3`); once that lands, the
-same `(logical, physical)` + `proxy_to_broker_url: Option<String>`
-parameterisation is portable.
+identically. The async `resolve_target` (its `Send`-safety is hoisted
+into a `spawn_task`-detached dial — see the moonpool pool docs) routes
+DIRECT-with-a-broker-URL through the same
+[`pool::get_or_open(logical, physical, /* proxy_to_broker_url = */ None)`](../../crates/magnetar-runtime-moonpool/src/pool.rs)
+surface used by the proxy path. The bootstrap-equality fast path
+mirrors the tokio engine: if the resolved `host:port` matches the
+bootstrap's, the bootstrap connection is reused (no extra dial). For
+unsupervised clients (`Client::connect_plain` / `Client::from_parts`)
+the pool is absent so DIRECT degrades to bootstrap-only with a
+`tracing::warn!`. Same `(logical, physical)` +
+`proxy_to_broker_url: Option<String>` parameterisation as the tokio
+pool — both engines pick their entries via identical keys.
 
 ### Tests (ADR-0024 four-layer matrix)
 
@@ -480,9 +485,12 @@ parameterisation is portable.
      bootstrap-equality fast path bypasses the pool (single session).
 - **Moonpool integration** —
   `crates/magnetar-runtime-moonpool/tests/lookup_direct_multi_broker.rs`:
-  1:1 mirror that exercises the proto-level capture of `broker_url` in
-  `LookupTarget::Direct { broker_url: Some(_) }`; until the moonpool
-  pool lands, multi-broker DIRECT routing falls back to the bootstrap.
+  1:1 mirror of the tokio integration test (two in-process brokers,
+  bootstrap A redirects to broker B). Asserts the moonpool runtime opens
+  the second TCP session to B with no `proxy_to_broker_url`, that two
+  producers reuse one pinned pool entry, and that the bootstrap-equality
+  fast path bypasses the pool when the lookup resolves to the bootstrap
+  broker itself.
 - **Differential** —
   `crates/magnetar-differential/tests/lookup_direct_multi_broker_equivalence.rs`:
   both engines decode the same DIRECT-with-broker-URL LOOKUP response
@@ -507,7 +515,11 @@ parameterisation is portable.
 - `crates/magnetar-runtime-tokio/src/pool.rs` — generalised
   `get_or_open` accepting `proxy_to_broker_url: Option<String>`.
 - `crates/magnetar-runtime-moonpool/src/client.rs` — mirror
-  `LookupTarget` shape.
+  `LookupTarget` shape + `resolve_direct_broker` (bootstrap-equality
+  fast path).
+- `crates/magnetar-runtime-moonpool/src/pool.rs` — generalised
+  `get_or_open` (matching tokio surface, `(logical, physical,
+  proxy_to_broker_url: Option<String>)`).
 - Upstream:
   [`BinaryProtoLookupService.findBroker`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/BinaryProtoLookupService.java),
   [`ConnectionPool.getConnection`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java),

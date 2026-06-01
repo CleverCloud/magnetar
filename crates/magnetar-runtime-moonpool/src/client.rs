@@ -118,29 +118,25 @@ pub struct Client<P: Providers> {
 /// callers keep their full proto view; runtime code (producer / consumer open paths) uses
 /// this routing-decision enum instead.
 ///
-/// **moonpool note**: the `Proxy` arm and the `Direct { broker_url: Some(_) }` arm are
-/// detected at the proto level but not yet routed — see [`Client::resolve_target`] for the
-/// follow-up tracker. Both depend on the (in-flight) moonpool flavour of
-/// `ProxyConnectionPool` tracked in `docs/follow-ups.md §3`. ADR-0039 §"Multi-broker DIRECT
-/// routing (2026-06-01)" documents the symmetry with the tokio engine.
+/// Both routing shapes ride through the moonpool [`ProxyConnectionPool`] (see
+/// [`Client::resolve_target`]). ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)" documents
+/// the symmetry with the tokio engine.
 #[derive(Debug, Clone)]
 pub(crate) enum LookupTarget {
     /// Direct connection.
     /// * `broker_url = None` — no broker URL advertised; the bootstrap connection serves as the
-    ///   data plane (today's behaviour).
-    /// * `broker_url = Some(url)` — the lookup resolved to a specific broker. The tokio engine
-    ///   routes through its `ProxyConnectionPool`; on moonpool the resolution still uses the
-    ///   bootstrap connection if `url` matches `host:port` of the bootstrap, and otherwise errors
-    ///   with `ProxyUnsupportedOnUnsupervisedClient` (no moonpool pool yet — see
-    ///   `docs/follow-ups.md §3`).
+    ///   data plane.
+    /// * `broker_url = Some(url)` — the lookup resolved to a specific broker. Routed through the
+    ///   [`ProxyConnectionPool`] with `CommandConnect.proxy_to_broker_url = None` (dialling the
+    ///   broker directly), unless `url` matches the bootstrap's `host:port` — in which case the
+    ///   bootstrap-equality fast path reuses the bootstrap connection (parity with Java's
+    ///   pool-identity check).
     Direct {
         #[allow(dead_code)]
         broker_url: Option<String>,
     },
-    /// Proxy-routed: a pool entry keyed by `broker_url` with
-    /// `CommandConnect.proxy_to_broker_url = broker_url`. The `broker_url` is
-    /// captured for the follow-up wiring; on moonpool today the resolution
-    /// errors out before consuming the field.
+    /// Proxy-routed: a pool entry dialling the bootstrap (proxy) address with
+    /// `CommandConnect.proxy_to_broker_url = Some(broker_url)`.
     Proxy {
         #[allow(dead_code)]
         broker_url: String,
@@ -384,6 +380,17 @@ impl<P: Providers> Client<P> {
     /// Resolve a [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
     /// CommandProducer / CommandSubscribe on (ADR-0039).
     ///
+    /// * [`LookupTarget::Direct { broker_url: None }`] — bootstrap connection (no broker URL was
+    ///   advertised; single-broker behaviour).
+    /// * [`LookupTarget::Direct { broker_url: Some(url) }`] — multi-broker DIRECT routing. If
+    ///   `url`'s `host:port` matches the bootstrap, reuse the bootstrap. Otherwise open (or reuse)
+    ///   a pool entry keyed by `(url, host:port)` and dial the resolved broker directly
+    ///   (`CommandConnect.proxy_to_broker_url = None`). ADR-0039 §"Multi-broker DIRECT routing
+    ///   (2026-06-01)".
+    /// * [`LookupTarget::Proxy { broker_url }`] — opens (or reuses) the pool entry keyed by
+    ///   `(broker_url, bootstrap host:port)` with `CommandConnect.proxy_to_broker_url =
+    ///   Some(broker_url)`.
+    ///
     /// **Send-safety on moonpool**: `moonpool_core::NetworkProvider` is
     /// declared `#[async_trait(?Send)]` (single-core design), so dialling a
     /// fresh pool entry inside this future body would break the
@@ -395,14 +402,6 @@ impl<P: Providers> Client<P> {
     /// only `.await`s a [`tokio::sync::Notify`] and a `Mutex<Option<...>>`
     /// slot, both of which are `Send`. See `crate::pool::get_or_open` for
     /// the full mechanism.
-    ///
-    /// Multi-broker DIRECT (F7 in the lookup-hardening pass) is not yet
-    /// pool-routed on moonpool: a `Direct { broker_url: Some(_) }` falls
-    /// back to the bootstrap connection. The pool side already exists
-    /// (F8); wiring it for the Direct arm is a one-line change to
-    /// `pool::get_or_open(_, broker_url, /* proxy_to_broker_url = */ None)`
-    /// once the pool surface admits the parameter. Tracked in
-    /// `docs/follow-ups.md §3`.
     pub(crate) async fn resolve_target(
         &self,
         target: &LookupTarget,
@@ -414,31 +413,79 @@ impl<P: Providers> Client<P> {
         match target {
             LookupTarget::Direct { broker_url: None } => Ok(self.shared.clone()),
             LookupTarget::Direct {
-                broker_url: Some(_),
-            } => {
-                // Multi-broker DIRECT on moonpool: the pool already exists
-                // (F8) but its `get_or_open` surface only takes a logical
-                // broker URL (the proxy case). Wiring DIRECT through it is a
-                // follow-up; for now fall back to the bootstrap connection
-                // — same as the pre-amendment behaviour. Tokio's engine
-                // does the full per-broker dial.
-                Ok(self.shared.clone())
-            }
+                broker_url: Some(broker_url),
+            } => self.resolve_direct_broker(broker_url, topic).await,
             LookupTarget::Proxy { broker_url } => {
                 let pool = self.pool.as_ref().ok_or_else(|| {
                     ClientError::ProxyUnsupportedOnUnsupervisedClient {
                         topic: topic.to_owned(),
                     }
                 })?;
-                // Every pool entry dials the same physical address — the
-                // proxy URL the bootstrap was built with. The proto-layer's
-                // `CommandConnect.proxy_to_broker_url` (set on the cloned
-                // ConnectionConfig inside the pool) tells the proxy which
-                // backend broker this connection serves.
-                let shared = crate::pool::get_or_open(pool.clone(), broker_url).await?;
+                // Proxy entries dial the same physical address — the proxy URL the bootstrap was
+                // built with. `CommandConnect.proxy_to_broker_url = Some(broker_url)` tells the
+                // proxy which backend broker this connection serves.
+                let physical = pool.bootstrap_addr().to_owned();
+                let shared = crate::pool::get_or_open(
+                    pool.clone(),
+                    broker_url,
+                    &physical,
+                    Some(broker_url.clone()),
+                )
+                .await?;
                 Ok(shared)
             }
         }
+    }
+
+    /// Resolve a multi-broker DIRECT routing target. If the resolved broker's `host:port` matches
+    /// the bootstrap's `host:port`, the bootstrap connection is reused (no extra dial). Otherwise
+    /// the pool opens (or reuses) a pinned connection that dials the broker directly with
+    /// `CommandConnect.proxy_to_broker_url = None`. ADR-0039 §"Multi-broker DIRECT routing
+    /// (2026-06-01)".
+    ///
+    /// `broker_url` may be a full Pulsar URL (`pulsar://host:port` / `pulsar+ssl://host:port`) or a
+    /// bare `host:port` pair. Both forms must round-trip to the same parsed `host:port` for the
+    /// bootstrap-equality check to bypass the pool dial.
+    ///
+    /// Falls back to the bootstrap connection when the moonpool client was built without a
+    /// supervisor (no pool) — single-broker scenarios still work; multi-broker dial requests would
+    /// have nowhere to land.
+    async fn resolve_direct_broker(
+        &self,
+        broker_url: &str,
+        _topic: &str,
+    ) -> Result<Arc<ConnectionShared>, ClientError>
+    where
+        P: Send + Sync,
+    {
+        let Some(pool) = self.pool.as_ref() else {
+            // No pool (built via `connect_plain` / `from_parts`) — the bootstrap is the only
+            // connection available. Single-broker / bootstrap-equality scenarios still work;
+            // a genuine multi-broker dial would have nowhere to land. Mirrors the tokio
+            // engine's `from_socket` fallback.
+            tracing::warn!(
+                broker_url,
+                "lookup resolved to a specific broker but moonpool client has no proxy pool \
+                 (unsupervised); falling back to bootstrap connection"
+            );
+            return Ok(self.shared.clone());
+        };
+
+        let physical = direct_broker_authority(broker_url);
+        // Bootstrap-equality fast path: same `host:port` as the connect-time URL → reuse the
+        // bootstrap connection. Saves one TCP handshake on every single-broker / bootstrap-broker
+        // lookup, and keeps existing single-broker tests on exactly one socket (no spurious pool
+        // entry). Mirrors the tokio engine's identically-named bypass.
+        if physical == pool.bootstrap_addr() {
+            return Ok(self.shared.clone());
+        }
+
+        // Different broker → pin a dedicated pool entry. `logical == broker_url`, `physical` is the
+        // `host:port` we dial; the pool entry's CONNECT carries no `proxy_to_broker_url` (DIRECT
+        // routing, no proxy in the middle). Two DIRECT lookups to the same broker URL share one
+        // entry, just like two PROXY lookups for the same backend share one.
+        let shared = crate::pool::get_or_open(pool.clone(), broker_url, &physical, None).await?;
+        Ok(shared)
     }
 
     /// Issue a `CommandLookupTopic` and await the broker's response.
@@ -918,6 +965,29 @@ fn proxy_broker_authority(input: &str) -> String {
         Some(port) if !host_port.contains(':') => format!("{host_port}:{port}"),
         _ => host_port.to_owned(),
     }
+}
+
+/// Normalise an advertised broker URL into the `host:port` form moonpool's
+/// [`crate::transport::Transport::connect_with_resolver`] dials. Used by the
+/// multi-broker DIRECT routing path (ADR-0039 §"Multi-broker DIRECT routing
+/// (2026-06-01)") — the pool keys on `(logical, physical = host:port)` and dials
+/// `physical` directly, so the helper must produce exactly the address shape
+/// `connect_with_resolver` consumes.
+///
+/// Accepts the same input shapes as the tokio engine's
+/// `parse_direct_broker_url`: a full Pulsar URL (`pulsar://host:port` or
+/// `pulsar+ssl://host:port`) **or** a bare `host:port`. The scheme is stripped
+/// and the default port is filled in when the URL omitted it; bare `host:port`
+/// input is forwarded unchanged.
+///
+/// Reuses the same scheme-strip logic as [`proxy_broker_authority`] since
+/// moonpool dials by `host:port` regardless of routing shape (TLS posture for
+/// per-broker DIRECT dials is the bootstrap's posture — see ADR-0039
+/// §"TLS posture"). The two helpers are deliberately distinct so each carries
+/// its own contract docstring; both engines pin this contract at the type
+/// level (see the tokio counterparts).
+fn direct_broker_authority(input: &str) -> String {
+    proxy_broker_authority(input)
 }
 
 #[cfg(test)]
