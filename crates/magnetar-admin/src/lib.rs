@@ -1292,6 +1292,52 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a topic's persistence policy.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/persistence`. The
+    /// broker emits a `PersistencePolicies` JSON when the topic override
+    /// is set and `null` (decoded as `Option::None`) when no override is
+    /// in place — callers fall back to the namespace policy in that case.
+    /// Java: `PersistentTopicsBase#getPersistence`.
+    pub async fn topic_get_persistence(
+        &self,
+        topic: &str,
+    ) -> Result<Option<PersistencePolicies>, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "persistence"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a topic's persistence policy (overrides the namespace default).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/persistence` with a
+    /// JSON `PersistencePolicies` body.
+    /// Java: `PersistentTopicsBase#setPersistence`.
+    pub async fn topic_set_persistence(
+        &self,
+        topic: &str,
+        policy: PersistencePolicies,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "persistence"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&policy))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a topic's persistence policy (fall back to namespace default).
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/persistence`.
+    /// Java: `PersistentTopicsBase#removePersistence`.
+    pub async fn topic_remove_persistence(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "persistence"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.

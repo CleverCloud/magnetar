@@ -9,7 +9,9 @@
 //! verbs in `PersistentTopicsBase` (`getRetention`, `setRetention`,
 //! `removeRetention`, …).
 
-use magnetar_admin::{AdminClient, BacklogQuota, BacklogQuotaType, RetentionPolicies};
+use magnetar_admin::{
+    AdminClient, BacklogQuota, BacklogQuotaType, PersistencePolicies, RetentionPolicies,
+};
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -179,4 +181,69 @@ async fn topic_message_ttl_get_set_remove_with_bare_integer_body() {
         .topic_remove_message_ttl("acme/svc/orders")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn topic_persistence_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/persistence"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "bookkeeperEnsemble": 3,
+            "bookkeeperWriteQuorum": 2,
+            "bookkeeperAckQuorum": 2,
+            "managedLedgerMaxMarkDeleteRate": 1.0,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/persistence"))
+        .and(body_json(serde_json::json!({
+            "bookkeeperEnsemble": 5,
+            "bookkeeperWriteQuorum": 3,
+            "bookkeeperAckQuorum": 2,
+            "managedLedgerMaxMarkDeleteRate": 2.5,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/persistence"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let pol = admin
+        .topic_get_persistence("acme/svc/orders")
+        .await
+        .expect("get topic persistence")
+        .expect("non-null body");
+    assert_eq!(pol.bookkeeper_ensemble, 3);
+    assert_eq!(pol.bookkeeper_write_quorum, 2);
+    assert_eq!(pol.bookkeeper_ack_quorum, 2);
+    assert!((pol.managed_ledger_max_mark_delete_rate - 1.0).abs() < f64::EPSILON);
+
+    admin
+        .topic_set_persistence(
+            "acme/svc/orders",
+            PersistencePolicies {
+                bookkeeper_ensemble: 5,
+                bookkeeper_write_quorum: 3,
+                bookkeeper_ack_quorum: 2,
+                managed_ledger_max_mark_delete_rate: 2.5,
+            },
+        )
+        .await
+        .expect("set topic persistence");
+    admin
+        .topic_remove_persistence("acme/svc/orders")
+        .await
+        .expect("remove topic persistence");
 }

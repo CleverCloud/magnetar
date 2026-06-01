@@ -829,6 +829,36 @@ pub(crate) enum TopicsCmd {
         /// Fully qualified topic.
         topic: String,
     },
+    /// Get a topic's persistence policy (or `null` if no override).
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/persistence`.
+    GetPersistence {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's persistence policy (overrides namespace default).
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/persistence`.
+    SetPersistence {
+        /// Fully qualified topic.
+        topic: String,
+        /// BookKeeper ensemble size.
+        #[arg(long)]
+        ensemble: i32,
+        /// BookKeeper write quorum.
+        #[arg(long)]
+        write_quorum: i32,
+        /// BookKeeper ack quorum.
+        #[arg(long)]
+        ack_quorum: i32,
+        /// Managed-ledger mark-delete-rate cap (ops/sec). `0` disables.
+        #[arg(long, default_value_t = 0.0)]
+        mark_delete_rate: f64,
+    },
+    /// Remove a topic's persistence policy (fall back to namespace default).
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/persistence`.
+    RemovePersistence {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1695,6 +1725,33 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::RemoveMessageTtl { topic } => {
             admin.topic_remove_message_ttl(&topic).await?;
+            Ok(())
+        }
+        TopicsCmd::GetPersistence { topic } => {
+            print_json(&admin.topic_get_persistence(&topic).await?)
+        }
+        TopicsCmd::SetPersistence {
+            topic,
+            ensemble,
+            write_quorum,
+            ack_quorum,
+            mark_delete_rate,
+        } => {
+            admin
+                .topic_set_persistence(
+                    &topic,
+                    PersistencePolicies {
+                        bookkeeper_ensemble: ensemble,
+                        bookkeeper_write_quorum: write_quorum,
+                        bookkeeper_ack_quorum: ack_quorum,
+                        managed_ledger_max_mark_delete_rate: mark_delete_rate,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        TopicsCmd::RemovePersistence { topic } => {
+            admin.topic_remove_persistence(&topic).await?;
             Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,
