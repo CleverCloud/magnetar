@@ -81,12 +81,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Single crypto provider per ADR-0035 (the providers are mutually
+      # pluggable; `--all-features` is reserved for the per-cell
+      # `check-crypto-matrix` xtask). Same invocation as the per-PR
+      # `seed-replay` job in `.github/workflows/ci.yml` so the
+      # discovery axis and the replay axis are bit-for-bit comparable.
       - name: Build moonpool engine
-        run: cargo build -p magnetar-runtime-moonpool --all-features --locked
+        run: |
+          cargo build -p magnetar-runtime-moonpool \
+            --no-default-features --features crypto-aws-lc-rs --locked
       - name: Run moonpool-sim test suite
         env:
           MOONPOOL_SEED: ${{ matrix.seed }}
-        run: cargo test -p magnetar-runtime-moonpool --all-features --locked
+        run: |
+          cargo test -p magnetar-runtime-moonpool \
+            --no-default-features --features crypto-aws-lc-rs --locked
       # Record the seed for the report-failures job. We write the value
       # to `failed.txt` only if the previous step failed; the artifact
       # is always uploaded so the downstream job's `download-artifact`

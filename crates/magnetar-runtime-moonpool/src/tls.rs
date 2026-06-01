@@ -177,11 +177,11 @@ mod tests {
     /// is picked by the workspace's `crypto-*` feature (issue #9, ADR-0035)
     /// via the explicit [`crate::tls_crypto::active_provider`] shim.
     fn make_session() -> rustls::ClientConnection {
-        // With both `ring` and `aws-lc-rs` features active in the dep graph
-        // (reqwest 0.13 pulls `rustls-platform-verifier` which enables
-        // `aws-lc-rs`), rustls no longer auto-selects a provider. Install
-        // the `ring` provider for the test process; idempotent across tests.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // `active_provider()` (via the cfg-priority cascade in
+        // `tls_crypto`) installs whichever `crypto-*` feature is active.
+        // Idempotent across tests; safe under any single-provider build
+        // and under `--all-features` (the cascade picks aws-lc-rs first).
+        crate::tls_crypto::install_default_provider();
         let root_store = rustls::RootCertStore::empty();
         let config = std::sync::Arc::new(
             rustls::ClientConfig::builder_with_provider(crate::tls_crypto::active_provider())

@@ -1147,7 +1147,12 @@ mod tests {
     #[test]
     #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
     fn connect_tls_compiles() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Use the cfg-cascaded provider so any single-`crypto-*` build
+        // compiles this test (ADR-0035). Hardcoding `ring` here broke
+        // `--no-default-features --features crypto-aws-lc-rs` since
+        // `rustls::crypto::ring` is gated behind the `ring` feature
+        // that single-aws-lc-rs builds don't pull in.
+        crate::tls_crypto::install_default_provider();
         let providers = TokioProviders::new();
         let engine = MoonpoolEngine::new(providers);
         let tls_config = std::sync::Arc::new(

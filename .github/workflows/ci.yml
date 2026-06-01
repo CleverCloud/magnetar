@@ -194,12 +194,20 @@ jobs:
           fi
           echo "Replaying ${#seeds[@]} open seed(s) from the registry:"
           printf '  %s\n' "${seeds[@]}"
+          # Single crypto provider per ADR-0035 (the providers are
+          # mutually pluggable; `--all-features` activates every one of
+          # them and is reserved for the per-cell `check-crypto-matrix`
+          # xtask). `crypto-aws-lc-rs` matches the workspace default and
+          # satisfies the moonpool sim invariants without dragging the
+          # FIPS C toolchain in. Mirror this in
+          # `.github/workflows/moonpool-seed-sweep.yml` so the discovery
+          # axis and the replay axis are bit-for-bit comparable.
           failed=()
           for seed in "${seeds[@]}"; do
             echo "::group::seed=${seed}"
             if MOONPOOL_SEED="${seed}" cargo test \
                 -p magnetar-runtime-moonpool \
-                --features crypto-aws-lc-rs --locked; then
+                --no-default-features --features crypto-aws-lc-rs --locked; then
               echo "::endgroup::"
               echo "  seed=${seed}: PASS (consider removing from the registry in the same PR)"
             else
