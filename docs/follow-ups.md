@@ -38,7 +38,6 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep ·
 | - | --- | --- |
 | 1 | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
 | 2 | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main) | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
-| 3 | [Moonpool `ProxyConnectionPool` parity (proxy ✓ / multi-broker DIRECT pending)](#3-moonpool-proxyconnectionpool-parity) | 🟡 partial — the proxy arm is closed (2026-06-01, [ADR-0039 amendment](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md#moonpool-engine-parity-2026-06-01)); the multi-broker DIRECT arm from F7 lands on tokio but the moonpool engine still falls back to the bootstrap for `Direct { broker_url: Some(_) }`. One-line wiring through `pool::get_or_open(_, broker_url)` once the pool surface admits the DIRECT case. |
 
 ---
 
@@ -94,47 +93,6 @@ migration and the vectored entry.
 
 ---
 
-## 3. Moonpool `ProxyConnectionPool` parity
-
-**Gap.** ADR-0039 (Pulsar Proxy multi-broker connection model + 2026-06-01
-amendment for multi-broker DIRECT routing) ships a `ProxyConnectionPool`
-on the tokio engine (`crates/magnetar-runtime-tokio/src/pool.rs`,
-~370 LOC) that pins a per-broker connection both on
-`proxy_through_service_url = true` lookups (proxy path) and on
-`proxy_through_service_url = false` lookups whose `broker_service_url`
-names a different broker than the bootstrap (multi-broker DIRECT path).
-Pool entries are keyed by `(logical_broker_url, physical_dial_addr)` with
-`CommandConnect.proxy_to_broker_url` set to `Some(host_port)` on the
-proxy entries and `None` on the direct entries. The moonpool engine does
-**not** have a counterpart yet — the lookup path returns
-`ClientError::ProxyUnsupportedOnUnsupervisedClient` on the proxy branch
-(`crates/magnetar-runtime-moonpool/src/client.rs:362-376`,
-`crates/magnetar-runtime-moonpool/src/producer.rs:595`), falls back to
-the bootstrap on the multi-broker DIRECT branch (single-broker
-correctness preserved, multi-broker cluster correctness deferred), and
-the `crates/magnetar-runtime-moonpool/src/lib.rs:70` carries a
-`TODO(proxy)` flagging the work. Both
-[`docs/parity-status.md`](parity-status.md) and [the README parity
-matrix](../README.md#java-client-parity-matrix) currently mis-state
-moonpool's binary-proxy row as ✅ — fixed in the same changeset that
-adds this entry.
-
-**Why it stays open.** Implementation work, not external blocker. The
-tokio pool is the reference; the moonpool variant needs to be ported
-on top of `moonpool_core::Providers` (network + clock) and wired into
-the supervised-redial path. The 2026-06-01 amendment widens the
-generalised pool surface — the moonpool port now covers both routing
-shapes for free once the engine-shape `?Send` constraint on the dial
-hand-off is resolved.
-
-**`/goal` (ready to dispatch).**
-
-```text
-/goal land a moonpool flavour of magnetar_runtime_tokio::pool::ProxyConnectionPool per docs/follow-ups.md §3 / ADR-0039 (including the 2026-06-01 multi-broker DIRECT amendment). Read crates/magnetar-runtime-tokio/src/pool.rs as the reference implementation, then port the pin-per-broker pool to crates/magnetar-runtime-moonpool/src/pool.rs over moonpool_core::Providers (NetworkProvider + clock injection per ADR-0011), preserving the get_or_open `proxy_to_broker_url: Option<String>` parameterisation so both proxy AND direct multi-broker routing share the pool. Wire it into the moonpool client's lookup path so `proxy_through_service_url = true` responses route through the pool instead of returning ClientError::ProxyUnsupportedOnUnsupervisedClient, AND the `Direct { broker_url: Some(url) }` non-bootstrap arm routes through the pool with `proxy_to_broker_url = None` instead of falling back to the bootstrap (crates/magnetar-runtime-moonpool/src/client.rs:362-376, crates/magnetar-runtime-moonpool/src/producer.rs:595). Remove the `TODO(proxy)` at crates/magnetar-runtime-moonpool/src/lib.rs:70. Land the four-layer test parity per ADR-0024 (proto unit, tokio integration, moonpool 1:1 integration, differential equivalence) plus an e2e exercise that piggybacks the existing crates/magnetar/tests/e2e_pulsar_proxy.rs fixture. After this lands, flip docs/parity-status.md + README.md's parity-matrix proxy row to genuinely ✅ on moonpool and trim the multi-broker DIRECT caveat from the parity row. Validation chain per CLAUDE.md.
-```
-
----
-
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships. The
@@ -147,10 +105,8 @@ expected churn:
    post-implementation reference); partially-closed items are trimmed
    to their remaining residual.
 
-All remaining items carry either a `/goal …` block ready to dispatch or
-an explicit external blocker (upstream moonpool / Pulsar release). The
-only fully-external blockers are the PIP-460 e2e flesh-out
-([§1](#1-pip-460-scalable-topics-e2e)) and the moonpool re-pin
-([§2](#2-re-pin-moonpool-off-git-branch-main)). The moonpool
-`ProxyConnectionPool` parity ([§3](#3-moonpool-proxyconnectionpool-parity))
-is dispatchable today.
+Both remaining items are fully external blockers: the PIP-460 e2e
+flesh-out ([§1](#1-pip-460-scalable-topics-e2e)) waits on a Pulsar 5.0
+RC carrying PIP-460, and the moonpool re-pin
+([§2](#2-re-pin-moonpool-off-git-branch-main)) waits on a moonpool
+crates.io release shipping PR #113.
