@@ -152,3 +152,71 @@ async fn dispatch_rate_get_set_remove_cycle() {
         .await
         .expect("remove dispatch rate");
 }
+
+#[tokio::test]
+async fn subscription_dispatch_rate_get_set_remove_cycle() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/subscriptionDispatchRate",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dispatchThrottlingRateInMsg": 500,
+            "dispatchThrottlingRateInByte": 524288_i64,
+            "ratePeriodInSecond": 1,
+            "relativeToPublishRate": false,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/subscriptionDispatchRate",
+        ))
+        .and(body_json(serde_json::json!({
+            "dispatchThrottlingRateInMsg": 2000,
+            "dispatchThrottlingRateInByte": -1,
+            "ratePeriodInSecond": 2,
+            "relativeToPublishRate": false,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/admin/v2/namespaces/acme/svc/subscriptionDispatchRate",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let rate = admin
+        .namespace_get_subscription_dispatch_rate("acme/svc")
+        .await
+        .expect("get subscription dispatch rate");
+    assert_eq!(rate.dispatch_throttling_rate_in_msg, 500);
+    assert_eq!(rate.dispatch_throttling_rate_in_byte, 524_288);
+
+    admin
+        .namespace_set_subscription_dispatch_rate(
+            "acme/svc",
+            DispatchRate {
+                dispatch_throttling_rate_in_msg: 2000,
+                dispatch_throttling_rate_in_byte: -1,
+                rate_period_in_second: 2,
+                relative_to_publish_rate: false,
+            },
+        )
+        .await
+        .expect("set subscription dispatch rate");
+    admin
+        .namespace_remove_subscription_dispatch_rate("acme/svc")
+        .await
+        .expect("remove subscription dispatch rate");
+}

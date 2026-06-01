@@ -498,6 +498,54 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    /// Get a namespace's per-subscription dispatch-rate policy.
+    ///
+    /// `GET /admin/v2/namespaces/{tenant}/{ns}/subscriptionDispatchRate`.
+    /// Reuses the [`DispatchRate`] body shape — the policy applies per
+    /// subscription rather than aggregated across all consumers.
+    /// Java: `NamespacesBase#getSubscriptionDispatchRate`.
+    pub async fn namespace_get_subscription_dispatch_rate(
+        &self,
+        ns: &str,
+    ) -> Result<DispatchRate, AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "subscriptionDispatchRate"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a namespace's per-subscription dispatch-rate policy.
+    ///
+    /// `POST /admin/v2/namespaces/{tenant}/{ns}/subscriptionDispatchRate`
+    /// with a JSON `DispatchRate` body.
+    /// Java: `NamespacesBase#setSubscriptionDispatchRate`.
+    pub async fn namespace_set_subscription_dispatch_rate(
+        &self,
+        ns: &str,
+        rate: DispatchRate,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "subscriptionDispatchRate"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&rate))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a namespace's per-subscription dispatch-rate policy.
+    ///
+    /// `DELETE /admin/v2/namespaces/{tenant}/{ns}/subscriptionDispatchRate`.
+    /// Java: `NamespacesBase#deleteSubscriptionDispatchRate`.
+    pub async fn namespace_remove_subscription_dispatch_rate(
+        &self,
+        ns: &str,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace) = split_namespace(ns)?;
+        let url = self.url(&["namespaces", tenant, namespace, "subscriptionDispatchRate"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Topics ----------------------------------------------------------
 
     /// List persistent topics in a namespace.
