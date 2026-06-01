@@ -750,6 +750,30 @@ pub(crate) enum TopicsCmd {
         #[arg(long)]
         index: i64,
     },
+    /// Get a topic's retention policy.
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/retention`.
+    GetRetention {
+        /// Fully qualified topic.
+        topic: String,
+    },
+    /// Set a topic's retention policy (overrides namespace default).
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/retention`.
+    SetRetention {
+        /// Fully qualified topic.
+        topic: String,
+        /// Retention time in minutes. `-1` = infinite, `0` = none.
+        #[arg(long)]
+        time_minutes: i32,
+        /// Retention size in MB. `-1` = infinite, `0` = none.
+        #[arg(long)]
+        size_mb: i64,
+    },
+    /// Remove a topic's retention policy (fall back to namespace default).
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/retention`.
+    RemoveRetention {
+        /// Fully qualified topic.
+        topic: String,
+    },
     /// Shadow-topic operations (PIP-180 / ADR-0033). A shadow topic shares
     /// its ledger storage with a source topic and exposes a read-only view
     /// of every entry to consumers — a lightweight fan-out alternative to
@@ -1558,6 +1582,27 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
                 "batchSize": id.batch_size,
             });
             print_json(&json)
+        }
+        TopicsCmd::GetRetention { topic } => print_json(&admin.topic_get_retention(&topic).await?),
+        TopicsCmd::SetRetention {
+            topic,
+            time_minutes,
+            size_mb,
+        } => {
+            admin
+                .topic_set_retention(
+                    &topic,
+                    RetentionPolicies {
+                        retention_time_in_minutes: time_minutes,
+                        retention_size_in_mb: size_mb,
+                    },
+                )
+                .await?;
+            Ok(())
+        }
+        TopicsCmd::RemoveRetention { topic } => {
+            admin.topic_remove_retention(&topic).await?;
+            Ok(())
         }
         TopicsCmd::Shadow { sub } => run_admin_topics_shadow(admin, sub).await,
     }

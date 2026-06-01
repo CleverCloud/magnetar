@@ -1147,6 +1147,52 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Topic policies — per-topic overrides ---------------------------
+
+    /// Get a topic's retention policy.
+    ///
+    /// `GET /admin/v2/persistent/{tenant}/{ns}/{topic}/retention`.
+    /// Returns the per-topic [`RetentionPolicies`] override; the broker
+    /// emits a `RetentionPolicies` JSON when the policy is set and a bare
+    /// `null` (decoded as `RetentionPolicies::default()` via `#[serde(default)]`)
+    /// when no override is in place — callers fall back to the namespace
+    /// policy in that case. Java: `PersistentTopicsBase#getRetention`.
+    pub async fn topic_get_retention(&self, topic: &str) -> Result<RetentionPolicies, AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "retention"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Set a topic's retention policy (overrides the namespace default).
+    ///
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/retention` with a
+    /// JSON `RetentionPolicies` body. `-1` means infinite (size or time).
+    /// Java: `PersistentTopicsBase#setRetention`.
+    pub async fn topic_set_retention(
+        &self,
+        topic: &str,
+        policy: RetentionPolicies,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "retention"])?;
+        let resp = self
+            .send(self.http.request(Method::POST, url).json(&policy))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Remove a topic's retention policy (fall back to namespace default).
+    ///
+    /// `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/retention`.
+    /// Java: `PersistentTopicsBase#removeRetention`.
+    pub async fn topic_remove_retention(&self, topic: &str) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name, "retention"])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Subscriptions ---------------------------------------------------
 
     /// List subscription names on a topic.
