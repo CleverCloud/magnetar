@@ -154,6 +154,42 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     assert_eq!(pre.payload.as_ref(), b"on-broker-a");
     consumer.ack(pre.message_id).await?;
 
+    // Pre-warm broker-B's bundle ownership for `public/default`.
+    //
+    // Each container is a standalone Pulsar broker with independent
+    // metadata. Standalone brokers lazy-claim namespace bundles on the
+    // first lookup that arrives for them; until that happens, the broker
+    // answers `producer-open` with
+    // `Namespace bundle for topic (…) not served by this instance:
+    // localhost:8080. Please redo the lookup. Request is denied:
+    // namespace=public/default` and the runtime loops on the retry
+    // budget forever (no other broker to redirect to in standalone).
+    //
+    // Issue a lookup request directly against broker-B's admin REST
+    // before broker-A is stopped — broker-B claims the bundle eagerly
+    // as a side effect, so the producer rebuild post-failover finds an
+    // owner immediately. Without this, the test deterministically
+    // times out at 90s in CI even though the supervised reconnect
+    // path is healthy.
+    tracing::info!(%admin_url_b, %topic, "pre-warming broker-b bundle ownership");
+    let lookup_path = topic
+        .strip_prefix("persistent://")
+        .ok_or("topic must start with persistent://")?;
+    let lookup_url = format!("{admin_url_b}/lookup/v2/topic/persistent/{lookup_path}");
+    let lookup_response = reqwest::Client::new()
+        .get(&lookup_url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await?;
+    let lookup_status = lookup_response.status();
+    let lookup_body = lookup_response.text().await.unwrap_or_default();
+    tracing::info!(%lookup_url, ?lookup_status, %lookup_body, "broker-b lookup result");
+    assert!(
+        lookup_status.is_success() || lookup_status.is_redirection(),
+        "broker-b lookup must succeed (or 307/redirect) to claim the bundle; \
+         got {lookup_status} body={lookup_body}"
+    );
+
     // Flip the provider to broker-B and tear down broker-A. The provider
     // is consulted on every reconnect, so the supervisor's next redial
     // must land on broker-B.
