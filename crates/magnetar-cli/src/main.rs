@@ -295,7 +295,7 @@ pub(crate) enum BrokersCmd {
     /// `GET /admin/v2/brokers/configuration/runtime`.
     RuntimeConfig,
     /// Get the broker's internal-stack endpoints (metadata-store
-    /// URLs, BookKeeper service URI, ledger root paths).
+    /// URLs, `BookKeeper` service URI, ledger root paths).
     /// `GET /admin/v2/brokers/internal-configuration`.
     InternalConfig,
     /// Probe broker health — produces and consumes one heartbeat on
@@ -331,7 +331,7 @@ pub(crate) enum BrokersCmd {
 #[derive(Debug, Subcommand)]
 pub(crate) enum BookiesCmd {
     /// List every bookie the broker knows about (writable +
-    /// read-only) as registered in BookKeeper metadata.
+    /// read-only) as registered in `BookKeeper` metadata.
     /// `GET /admin/v2/bookies/all`.
     List,
     /// Get every bookie's group + rack assignment.
@@ -340,7 +340,7 @@ pub(crate) enum BookiesCmd {
     /// Set (or update) a bookie's rack assignment.
     /// `POST /admin/v2/bookies/racks-info/{bookie}`.
     SetRack {
-        /// Bookie `host:port` (matches BookKeeper metadata).
+        /// Bookie `host:port` (matches `BookKeeper` metadata).
         bookie: String,
         /// Placement group.
         #[arg(long, default_value = "default")]
@@ -994,13 +994,13 @@ pub(crate) enum NamespacesCmd {
     SetPersistence {
         /// Fully qualified namespace.
         namespace: String,
-        /// BookKeeper ensemble size.
+        /// `BookKeeper` ensemble size.
         #[arg(long)]
         ensemble: i32,
-        /// BookKeeper write quorum.
+        /// `BookKeeper` write quorum.
         #[arg(long)]
         write_quorum: i32,
-        /// BookKeeper ack quorum.
+        /// `BookKeeper` ack quorum.
         #[arg(long)]
         ack_quorum: i32,
         /// Managed-ledger mark-delete-rate cap (ops/sec). `0` disables.
@@ -1473,13 +1473,13 @@ pub(crate) enum TopicsCmd {
     SetPersistence {
         /// Fully qualified topic.
         topic: String,
-        /// BookKeeper ensemble size.
+        /// `BookKeeper` ensemble size.
         #[arg(long)]
         ensemble: i32,
-        /// BookKeeper write quorum.
+        /// `BookKeeper` write quorum.
         #[arg(long)]
         write_quorum: i32,
-        /// BookKeeper ack quorum.
+        /// `BookKeeper` ack quorum.
         #[arg(long)]
         ack_quorum: i32,
         /// Managed-ledger mark-delete-rate cap (ops/sec). `0` disables.
@@ -2128,6 +2128,7 @@ async fn run_admin_schemas(admin: &AdminClient, cmd: SchemasCmd) -> Result<(), C
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(), CliError> {
     match cmd {
         FunctionsCmd::List { namespace } => {
@@ -2273,6 +2274,7 @@ async fn run_admin_tenants(admin: &AdminClient, cmd: TenantsCmd) -> Result<(), C
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result<(), CliError> {
     match cmd {
         NamespacesCmd::List { tenant } => print_json(&admin.namespaces_list(&tenant).await?),
@@ -2651,6 +2653,7 @@ async fn run_admin_namespaces(admin: &AdminClient, cmd: NamespacesCmd) -> Result
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), CliError> {
     match cmd {
         TopicsCmd::List { namespace } => print_json(&admin.topics_list(&namespace).await?),
@@ -3215,7 +3218,7 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
 /// internally — no parallel parsers, no divergent error categories.
 /// The CLI surface stringifies the `AdminError` so it routes through
 /// `CliError::BadArg` rather than `CliError::Admin`, matching the
-/// "argument-parse-error → BadArg" convention every other CLI parser
+/// "argument-parse-error → `BadArg`" convention every other CLI parser
 /// uses.
 fn split_io_id(spec: &str) -> Result<(&str, &str, &str), String> {
     magnetar_admin::split_function_id(spec).map_err(|e| e.to_string())
@@ -3317,7 +3320,7 @@ fn parse_message_id_position(s: &str) -> Result<MessageId, String> {
 }
 
 /// Parse a `BacklogQuotaType` from the CLI form. Accepts both
-/// kebab-case (operator-friendly) and the snake_case the broker REST
+/// kebab-case (operator-friendly) and the `snake_case` the broker REST
 /// surface emits, so a JSON-driven script that round-trips the value
 /// gets `--type destination_storage` for free.
 fn parse_backlog_quota_type(s: &str) -> Result<BacklogQuotaType, String> {

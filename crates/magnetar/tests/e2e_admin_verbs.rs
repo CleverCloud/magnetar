@@ -8,7 +8,7 @@
 //! namespace-isolation-policies).
 //!
 //! Drives a single `apachepulsar/pulsar:4.0.4` standalone container per
-//! test — start-up amortised across many AdminClient calls. Per
+//! test — start-up amortised across many `AdminClient` calls. Per
 //! ADR-0046 the file ships as a regular test under `cargo test`; the
 //! suite is gated on Docker being reachable, not on a feature flag or
 //! an `#[ignore]`. Tests are split by destructiveness:
@@ -561,7 +561,7 @@ async fn e2e_admin_brokers_bookies_schemas() -> Result<(), Box<dyn std::error::E
         schema_type: "AVRO".to_owned(),
         schema: r#"{"type":"record","name":"X","fields":[{"name":"v","type":"string"}]}"#
             .to_owned(),
-        properties: Default::default(),
+        properties: std::collections::HashMap::default(),
     };
     let posted = admin.schema_post(topic, payload).await?;
     assert!(
