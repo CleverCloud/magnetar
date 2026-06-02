@@ -82,6 +82,47 @@ async fn reset_cursor_to_position_posts_reset_cursor_data_body() {
 }
 
 #[tokio::test]
+async fn reset_cursor_to_position_maps_sentinel_u64_max_to_negative_one() {
+    // Regression guard: `MessageId::EARLIEST` and `MessageId::LATEST`
+    // carry `ledger_id = entry_id = u64::MAX` on the Rust side. Pulsar
+    // Jackson-binds the wire fields to Java `long` (i64) and uses `-1`
+    // as the sentinel. Without the u64::MAX → -1 mapping, serde emits
+    // 18446744073709551615 which overflows the broker's `long` parser
+    // and the call fails 400 instead of resetting the cursor.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/admin/v2/persistent/public/default/orders/subscription/s-a/resetcursor",
+        ))
+        .and(body_json(serde_json::json!({
+            "ledgerId": -1,
+            "entryId": -1,
+            "partitionIndex": -1,
+            "batchIndex": -1,
+            "isExcluded": false,
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let earliest = MessageId {
+        ledger_id: u64::MAX,
+        entry_id: u64::MAX,
+        partition: -1,
+        batch_index: -1,
+        batch_size: -1,
+        #[cfg(feature = "scalable-topics")]
+        segment_id: None,
+    };
+    admin
+        .subscription_reset_cursor_to_position("public/default/orders", "s-a", earliest, false)
+        .await
+        .expect("reset to EARLIEST returns 204");
+}
+
+#[tokio::test]
 async fn reset_cursor_to_timestamp_uses_path_param() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))

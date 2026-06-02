@@ -2433,8 +2433,8 @@ impl AdminClient {
             "resetcursor",
         ])?;
         let body = ResetCursorData {
-            ledger_id: message_id.ledger_id,
-            entry_id: message_id.entry_id,
+            ledger_id: message_id_field_for_wire(message_id.ledger_id),
+            entry_id: message_id_field_for_wire(message_id.entry_id),
             partition_index: message_id.partition,
             batch_index: message_id.batch_index,
             is_excluded,
@@ -3819,18 +3819,42 @@ pub struct LongRunningProcessStatus {
 
 /// Request body for `POST .../subscription/{sub}/resetcursor` (Java
 /// `ResetCursorData`). The CLI exposes `message_id` and `is_excluded`;
-/// Pulsar's `batchIndexes` / `properties` fields are not currently set —
-/// they exist for transactional dedup metadata and would require
+/// Pulsar's `batchIndexes` / `properties` fields are not currently set
+/// — they exist for transactional dedup metadata and would require
 /// txn-aware callers anyway.
+///
+/// `ledger_id` / `entry_id` are `i64` on the wire because Pulsar
+/// Jackson-binds them to Java `long`. `MessageId` on the Rust side uses
+/// `u64` (matching the wire-protocol envelope), with `u64::MAX` as the
+/// `EARLIEST` / `LATEST` sentinel — the conversion below maps those
+/// sentinels to `-1` (the Java sentinel) so a reset-to-earliest /
+/// reset-to-latest doesn't overflow Java's `long` parser.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ResetCursorData {
-    ledger_id: u64,
-    entry_id: u64,
+    ledger_id: i64,
+    entry_id: i64,
     partition_index: i32,
     batch_index: i32,
     #[serde(rename = "isExcluded")]
     is_excluded: bool,
+}
+
+/// Map a `MessageId` u64 ledger/entry id onto Pulsar's Java-`long`
+/// wire field, translating the Rust-side `u64::MAX` sentinel (used by
+/// `MessageId::EARLIEST` / `LATEST`) to Java's `-1` sentinel.
+/// Non-sentinel values are passed through verbatim — Pulsar's
+/// `LedgerHandle` / `EntryId` indices fit in `i64::MAX` long before
+/// overflowing.
+#[inline]
+fn message_id_field_for_wire(value: u64) -> i64 {
+    if value == u64::MAX {
+        -1
+    } else {
+        // Pulsar entry indices fit in i63 — `as i64` cannot overflow
+        // for any legitimate broker-emitted value.
+        value as i64
+    }
 }
 
 /// Builder for [`AdminClient`].
