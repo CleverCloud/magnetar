@@ -48,8 +48,8 @@ use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
-    DelayedDeliveryPolicies, DispatchRate, PersistencePolicies, PostSchemaPayload, PublishRate,
-    RetentionPolicies, TenantInfo,
+    DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PersistencePolicies, PostSchemaPayload,
+    PublishRate, RetentionPolicies, TenantInfo, split_function_id,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -215,6 +215,13 @@ pub(crate) enum AdminCmd {
     Schemas {
         #[command(subcommand)]
         sub: SchemasCmd,
+    },
+    /// Pulsar Functions management (`/admin/v3/functions/...`). The
+    /// URL-based register / update path is supported; multipart JAR
+    /// uploads from a local file are intentionally out of scope.
+    Functions {
+        #[command(subcommand)]
+        sub: FunctionsCmd,
     },
 }
 
@@ -398,6 +405,145 @@ pub(crate) enum SchemasCmd {
         /// User-defined property in `key=value` form. Repeatable.
         #[arg(long = "property", value_parser = parse_property)]
         properties: Vec<(String, String)>,
+    },
+}
+
+/// `admin functions <verb>` — Pulsar Functions management
+/// (`/admin/v3/functions/...`).
+///
+/// Read verbs (`list` / `get` / `status` / `stats`) print the broker's
+/// JSON envelope verbatim because the upstream `FunctionConfig` and
+/// `FunctionStatus` shapes grow on every minor release.
+///
+/// Write verbs accept the fully qualified `tenant/namespace/name`
+/// triple as a single positional argument (mirroring `pulsarctl
+/// functions <verb> NAME --tenant ... --namespace ...` but without the
+/// flag duplication); the parser sits in `magnetar_admin` as
+/// `split_function_id`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum FunctionsCmd {
+    /// List every function under a namespace.
+    /// `GET /admin/v3/functions/{tenant}/{namespace}`.
+    List {
+        /// Fully qualified namespace (`tenant/namespace`).
+        namespace: String,
+    },
+    /// Get a function's configuration.
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}`.
+    Get {
+        /// Fully qualified function name (`tenant/namespace/name`).
+        name: String,
+    },
+    /// Get a function's status (aggregate or per-instance).
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}[/{instance_id}]/status`.
+    Status {
+        /// Fully qualified function name (`tenant/namespace/name`).
+        name: String,
+        /// Restrict to one instance (`0..parallelism`).
+        #[arg(long)]
+        instance_id: Option<i32>,
+    },
+    /// Get a function's runtime statistics (aggregate or per-instance).
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}[/{instance_id}]/stats`.
+    Stats {
+        /// Fully qualified function name.
+        name: String,
+        /// Restrict to one instance (`0..parallelism`).
+        #[arg(long)]
+        instance_id: Option<i32>,
+    },
+    /// Register a function from a remote package URL.
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}` (multipart).
+    CreateWithUrl {
+        /// Tenant.
+        #[arg(long)]
+        tenant: String,
+        /// Namespace (bare name, not `tenant/namespace`).
+        #[arg(long)]
+        namespace: String,
+        /// Function name (unique within the namespace).
+        #[arg(long)]
+        name: String,
+        /// Broker-resolvable URL of the compiled package (HTTP / S3 /
+        /// GCS / `function://` / `file://`).
+        #[arg(long)]
+        url: String,
+        /// Entry-point class name (`com.acme.MyFunction` for Java).
+        #[arg(long = "class-name")]
+        class_name: String,
+        /// Runtime — `JAVA`, `PYTHON`, or `GO`.
+        #[arg(long, default_value = "JAVA")]
+        runtime: String,
+        /// Input topic the function subscribes to. Repeat for multiple.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+        /// Output topic the function produces to.
+        #[arg(long, default_value = "")]
+        output: String,
+        /// Number of parallel instances.
+        #[arg(long, default_value_t = 1)]
+        parallelism: i32,
+    },
+    /// Update an existing function from a remote package URL.
+    /// `PUT /admin/v3/functions/{tenant}/{namespace}/{name}` (multipart).
+    UpdateWithUrl {
+        /// Tenant.
+        #[arg(long)]
+        tenant: String,
+        /// Namespace.
+        #[arg(long)]
+        namespace: String,
+        /// Function name.
+        #[arg(long)]
+        name: String,
+        /// Broker-resolvable package URL.
+        #[arg(long)]
+        url: String,
+        /// Entry-point class name.
+        #[arg(long = "class-name")]
+        class_name: String,
+        /// Runtime — `JAVA`, `PYTHON`, or `GO`.
+        #[arg(long, default_value = "JAVA")]
+        runtime: String,
+        /// Input topic. Repeat for multiple.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+        /// Output topic.
+        #[arg(long, default_value = "")]
+        output: String,
+        /// Number of parallel instances.
+        #[arg(long, default_value_t = 1)]
+        parallelism: i32,
+    },
+    /// Deregister (delete) a function.
+    /// `DELETE /admin/v3/functions/{tenant}/{namespace}/{name}`.
+    Delete {
+        /// Fully qualified function name.
+        name: String,
+    },
+    /// Start a function (aggregate or per-instance).
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}[/{instance_id}]/start`.
+    Start {
+        /// Fully qualified function name.
+        name: String,
+        /// Restrict to one instance.
+        #[arg(long)]
+        instance_id: Option<i32>,
+    },
+    /// Stop a function (aggregate or per-instance).
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}[/{instance_id}]/stop`.
+    Stop {
+        /// Fully qualified function name.
+        name: String,
+        /// Restrict to one instance.
+        #[arg(long)]
+        instance_id: Option<i32>,
+    },
+    /// Restart every instance of a function.
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}/restart`.
+    Restart {
+        /// Fully qualified function name.
+        name: String,
     },
 }
 
@@ -1473,6 +1619,7 @@ async fn run_admin(
         AdminCmd::Brokers { sub } => run_admin_brokers(&admin, sub).await,
         AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
+        AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
     }
 }
 
@@ -1665,6 +1812,125 @@ async fn run_admin_schemas(admin: &AdminClient, cmd: SchemasCmd) -> Result<(), C
                 properties: properties.into_iter().collect(),
             };
             print_json(&admin.schema_compatibility_check(&topic, payload).await?)
+        }
+    }
+}
+
+async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(), CliError> {
+    match cmd {
+        FunctionsCmd::List { namespace } => {
+            // `tenant/namespace` parser: kept inline because the admin
+            // helper for the three-segment form is `split_function_id`;
+            // adding a separate two-segment public helper would
+            // duplicate `split_namespace` (which stays private to the
+            // admin crate). The inline parse mirrors the one the admin
+            // crate runs on every namespace method.
+            let (tenant, ns) = namespace.split_once('/').ok_or_else(|| {
+                CliError::Admin(AdminError::InvalidName(format!(
+                    "expected tenant/namespace, got {namespace:?}"
+                )))
+            })?;
+            print_json(&admin.functions_list_by_namespace(tenant, ns).await?)
+        }
+        FunctionsCmd::Get { name } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            print_json(&admin.function_get(t, n, fn_name).await?)
+        }
+        FunctionsCmd::Status { name, instance_id } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let value = match instance_id {
+                Some(id) => admin.function_instance_status(t, n, fn_name, id).await?,
+                None => admin.function_status(t, n, fn_name).await?,
+            };
+            print_json(&value)
+        }
+        FunctionsCmd::Stats { name, instance_id } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let value = match instance_id {
+                Some(id) => admin.function_instance_stats(t, n, fn_name, id).await?,
+                None => admin.function_stats(t, n, fn_name).await?,
+            };
+            print_json(&value)
+        }
+        FunctionsCmd::CreateWithUrl {
+            tenant,
+            namespace,
+            name,
+            url,
+            class_name,
+            runtime,
+            inputs,
+            output,
+            parallelism,
+        } => {
+            let cfg = FunctionConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                class_name,
+                inputs,
+                output,
+                runtime,
+                parallelism,
+                user_config: None,
+            };
+            admin
+                .function_create_with_url(&tenant, &namespace, &name, &url, cfg)
+                .await?;
+            Ok(())
+        }
+        FunctionsCmd::UpdateWithUrl {
+            tenant,
+            namespace,
+            name,
+            url,
+            class_name,
+            runtime,
+            inputs,
+            output,
+            parallelism,
+        } => {
+            let cfg = FunctionConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                class_name,
+                inputs,
+                output,
+                runtime,
+                parallelism,
+                user_config: None,
+            };
+            admin
+                .function_update_with_url(&tenant, &namespace, &name, &url, cfg)
+                .await?;
+            Ok(())
+        }
+        FunctionsCmd::Delete { name } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            admin.function_delete(t, n, fn_name).await?;
+            Ok(())
+        }
+        FunctionsCmd::Start { name, instance_id } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            match instance_id {
+                Some(id) => admin.function_start_instance(t, n, fn_name, id).await?,
+                None => admin.function_start(t, n, fn_name).await?,
+            };
+            Ok(())
+        }
+        FunctionsCmd::Stop { name, instance_id } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            match instance_id {
+                Some(id) => admin.function_stop_instance(t, n, fn_name, id).await?,
+                None => admin.function_stop(t, n, fn_name).await?,
+            };
+            Ok(())
+        }
+        FunctionsCmd::Restart { name } => {
+            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            admin.function_restart(t, n, fn_name).await?;
+            Ok(())
         }
     }
 }
