@@ -16,8 +16,8 @@ use clap::Parser;
 mod cli;
 
 use cli::{
-    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, SubscriptionsCmd, TenantsCmd,
-    TopicsCmd,
+    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, SourcesCmd, SubscriptionsCmd,
+    TenantsCmd, TopicsCmd,
 };
 
 fn parse(args: &[&str]) -> Cli {
@@ -560,6 +560,90 @@ fn root_flags_accepted_after_subcommand() {
             }
         }
     ));
+}
+
+#[test]
+fn admin_sources_list_takes_namespace_positional() {
+    let cli = parse(&["magnetar", "admin", "sources", "list", "acme/svc"]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Sources {
+                    sub: SourcesCmd::List { namespace },
+                },
+        } => assert_eq!(namespace, "acme/svc"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_sources_create_with_url_collects_all_flags() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "sources",
+        "create-with-url",
+        "--tenant",
+        "acme",
+        "--namespace",
+        "svc",
+        "--name",
+        "kafka-in",
+        "--url",
+        "https://repo.example/kafka.nar",
+        "--class-name",
+        "org.apache.pulsar.io.kafka.KafkaSource",
+        "--topic-name",
+        "persistent://acme/svc/ingest",
+        "--parallelism",
+        "3",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Sources {
+                    sub:
+                        SourcesCmd::CreateWithUrl {
+                            tenant,
+                            namespace,
+                            name,
+                            url,
+                            class_name,
+                            topic_name,
+                            parallelism,
+                        },
+                },
+        } => {
+            assert_eq!(tenant, "acme");
+            assert_eq!(namespace, "svc");
+            assert_eq!(name, "kafka-in");
+            assert_eq!(url, "https://repo.example/kafka.nar");
+            assert_eq!(class_name, "org.apache.pulsar.io.kafka.KafkaSource");
+            assert_eq!(topic_name, "persistent://acme/svc/ingest");
+            assert_eq!(parallelism, 3);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_sources_restart_takes_positional_id() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "sources",
+        "restart",
+        "acme/svc/kafka-in",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Sources {
+                    sub: SourcesCmd::Restart { source },
+                },
+        } => assert_eq!(source, "acme/svc/kafka-in"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
 }
 
 #[test]

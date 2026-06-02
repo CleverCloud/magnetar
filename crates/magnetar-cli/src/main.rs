@@ -49,7 +49,7 @@ use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
     DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PersistencePolicies, PostSchemaPayload,
-    PublishRate, RetentionPolicies, TenantInfo, split_function_id,
+    PublishRate, RetentionPolicies, SourceConfig, TenantInfo, split_function_id,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -222,6 +222,12 @@ pub(crate) enum AdminCmd {
     Functions {
         #[command(subcommand)]
         sub: FunctionsCmd,
+    },
+    /// Pulsar IO Sources (`/admin/v3/sources/...`) — pull data INTO
+    /// topics from external systems.
+    Sources {
+        #[command(subcommand)]
+        sub: SourcesCmd,
     },
 }
 
@@ -544,6 +550,109 @@ pub(crate) enum FunctionsCmd {
     Restart {
         /// Fully qualified function name.
         name: String,
+    },
+}
+
+/// `admin sources <verb>` — Pulsar IO Sources.
+///
+/// `list` / `get` / `status` accept positional `tenant/namespace` or
+/// `tenant/namespace/name`; `create-with-url` / `update-with-url` take
+/// each segment as a flag for read-clarity around the multi-flag
+/// connector config.
+#[derive(Debug, Subcommand)]
+pub(crate) enum SourcesCmd {
+    /// List sources in a namespace.
+    /// `GET /admin/v3/sources/{tenant}/{namespace}`.
+    List {
+        /// `tenant/namespace`.
+        namespace: String,
+    },
+    /// Get a source's configuration.
+    /// `GET /admin/v3/sources/{tenant}/{namespace}/{name}`.
+    Get {
+        /// `tenant/namespace/name`.
+        source: String,
+    },
+    /// Get a source's running status.
+    /// `GET /admin/v3/sources/{tenant}/{namespace}/{name}/status`.
+    Status {
+        /// `tenant/namespace/name`.
+        source: String,
+    },
+    /// Register a source from a remote package URL.
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}`.
+    CreateWithUrl {
+        /// Tenant.
+        #[arg(long)]
+        tenant: String,
+        /// Namespace.
+        #[arg(long)]
+        namespace: String,
+        /// Source name.
+        #[arg(long)]
+        name: String,
+        /// Package URL (`http(s)://`, `file://`, or `function://`).
+        #[arg(long)]
+        url: String,
+        /// Fully-qualified connector class
+        /// (e.g. `org.apache.pulsar.io.kafka.KafkaSource`).
+        #[arg(long)]
+        class_name: String,
+        /// Destination topic the source writes to.
+        #[arg(long)]
+        topic_name: String,
+        /// Number of source instances to schedule.
+        #[arg(long, default_value_t = 1)]
+        parallelism: i32,
+    },
+    /// Update a source from a remote package URL.
+    /// `PUT /admin/v3/sources/{tenant}/{namespace}/{name}`.
+    UpdateWithUrl {
+        /// Tenant.
+        #[arg(long)]
+        tenant: String,
+        /// Namespace.
+        #[arg(long)]
+        namespace: String,
+        /// Source name.
+        #[arg(long)]
+        name: String,
+        /// Package URL.
+        #[arg(long)]
+        url: String,
+        /// Fully-qualified connector class.
+        #[arg(long)]
+        class_name: String,
+        /// Destination topic.
+        #[arg(long)]
+        topic_name: String,
+        /// Number of source instances.
+        #[arg(long, default_value_t = 1)]
+        parallelism: i32,
+    },
+    /// Delete a source.
+    /// `DELETE /admin/v3/sources/{tenant}/{namespace}/{name}`.
+    Delete {
+        /// `tenant/namespace/name`.
+        source: String,
+    },
+    /// Start every instance of a source.
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}/start`.
+    Start {
+        /// `tenant/namespace/name`.
+        source: String,
+    },
+    /// Stop every instance of a source.
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}/stop`.
+    Stop {
+        /// `tenant/namespace/name`.
+        source: String,
+    },
+    /// Restart every instance of a source.
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}/restart`.
+    Restart {
+        /// `tenant/namespace/name`.
+        source: String,
     },
 }
 
@@ -1620,6 +1729,7 @@ async fn run_admin(
         AdminCmd::Bookies { sub } => run_admin_bookies(&admin, sub).await,
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
         AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
+        AdminCmd::Sources { sub } => run_admin_sources(&admin, sub).await,
     }
 }
 
@@ -2655,6 +2765,123 @@ async fn run_admin_topics_shadow(admin: &AdminClient, cmd: ShadowCmd) -> Result<
         ShadowCmd::List { source } => print_json(&admin.get_shadow_topics(&source).await?),
         ShadowCmd::Source { shadow } => print_json(&admin.get_shadow_source(&shadow).await?),
     }
+}
+
+async fn run_admin_sources(admin: &AdminClient, cmd: SourcesCmd) -> Result<(), CliError> {
+    match cmd {
+        SourcesCmd::List { namespace } => {
+            let (tenant, ns) = split_namespace_ref(&namespace).map_err(CliError::BadArg)?;
+            print_json(&admin.sources_list_by_namespace(tenant, ns).await?)
+        }
+        SourcesCmd::Get { source } => {
+            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            print_json(&admin.source_get(tenant, ns, name).await?)
+        }
+        SourcesCmd::Status { source } => {
+            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            print_json(&admin.source_status(tenant, ns, name).await?)
+        }
+        SourcesCmd::CreateWithUrl {
+            tenant,
+            namespace,
+            name,
+            url,
+            class_name,
+            topic_name,
+            parallelism,
+        } => {
+            let config = SourceConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                class_name,
+                topic_name,
+                parallelism,
+                configs: None,
+            };
+            admin
+                .source_create_with_url(&tenant, &namespace, &name, &url, config)
+                .await?;
+            Ok(())
+        }
+        SourcesCmd::UpdateWithUrl {
+            tenant,
+            namespace,
+            name,
+            url,
+            class_name,
+            topic_name,
+            parallelism,
+        } => {
+            let config = SourceConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                class_name,
+                topic_name,
+                parallelism,
+                configs: None,
+            };
+            admin
+                .source_update_with_url(&tenant, &namespace, &name, &url, config)
+                .await?;
+            Ok(())
+        }
+        SourcesCmd::Delete { source } => {
+            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            admin.source_delete(tenant, ns, name).await?;
+            Ok(())
+        }
+        SourcesCmd::Start { source } => {
+            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            admin.source_start(tenant, ns, name).await?;
+            Ok(())
+        }
+        SourcesCmd::Stop { source } => {
+            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            admin.source_stop(tenant, ns, name).await?;
+            Ok(())
+        }
+        SourcesCmd::Restart { source } => {
+            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            admin.source_restart(tenant, ns, name).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Split `tenant/namespace/name` into its three segments. Used by
+/// Pulsar IO Sources / Sinks and Pulsar Packages — the broker's
+/// `SourcesBase` / `SinksBase` / `PackagesBase` resources all carry
+/// the same `{tenant}/{namespace}/{name}` URL shape for a Function /
+/// Source / Sink / Package id. Symmetric with the admin client's
+/// `split_topic` helper (which accepts an optional `persistent://`
+/// scheme); this variant intentionally rejects URI schemes — a
+/// connector name is never a topic URL.
+fn split_function_id(spec: &str) -> Result<(&str, &str, &str), String> {
+    let mut parts = spec.splitn(3, '/');
+    let tenant = parts.next().unwrap_or("");
+    let namespace = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    if tenant.is_empty() || namespace.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(format!("expected tenant/namespace/name, got `{spec}`"));
+    }
+    Ok((tenant, namespace, name))
+}
+
+/// Split `tenant/namespace` into its two segments. Used by the
+/// namespace-scoped `list` verbs on Pulsar IO Sources / Sinks /
+/// Packages. The admin client's own `split_namespace` is private —
+/// duplicating the parser here keeps the CLI's error surface
+/// (`CliError::BadArg`) cohesive without exposing internals.
+fn split_namespace_ref(spec: &str) -> Result<(&str, &str), String> {
+    let (tenant, namespace) = spec
+        .split_once('/')
+        .ok_or_else(|| format!("expected tenant/namespace, got `{spec}` (no '/')"))?;
+    if tenant.is_empty() || namespace.is_empty() || namespace.contains('/') {
+        return Err(format!("expected tenant/namespace, got `{spec}`"));
+    }
+    Ok((tenant, namespace))
 }
 
 fn build_admin(

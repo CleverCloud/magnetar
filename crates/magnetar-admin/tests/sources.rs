@@ -227,4 +227,3 @@ impl wiremock::Match for HeaderPrefixMatcher {
             .is_some_and(|v| v.starts_with(self.prefix))
     }
 }
-
