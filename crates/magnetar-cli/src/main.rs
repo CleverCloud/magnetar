@@ -2056,11 +2056,8 @@ async fn run_admin_bookies(admin: &AdminClient, cmd: BookiesCmd) -> Result<(), C
             admin
                 .bookies_set_rack(
                     &bookie,
-                    BookieInfo {
-                        group,
-                        rack,
-                        hostname,
-                    },
+                    &group,
+                    BookieInfo { rack, hostname },
                 )
                 .await?;
             Ok(())

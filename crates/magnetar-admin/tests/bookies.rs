@@ -9,7 +9,7 @@
 //! `updateBookieRackInfo`, `deleteBookieRackInfo`).
 
 use magnetar_admin::{AdminClient, BookieInfo};
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client(mock: &MockServer) -> AdminClient {
@@ -83,14 +83,17 @@ async fn bookies_racks_info_returns_nested_map() {
 }
 
 #[tokio::test]
-async fn bookies_set_rack_posts_camelcase_body() {
+async fn bookies_set_rack_posts_camelcase_body_and_group_query() {
     let mock = MockServer::start().await;
-    // The body matches Java's `BookieInfo` Jackson shape — bare
-    // camelCase keys, no envelope. `updateBookieRackInfo` returns 204.
+    // Pulsar's BookiesBase#updateBookieRackInfo takes `group` as a
+    // @QueryParam; the JSON body Jackson-binds only to `{rack,
+    // hostname}`. Pin both the query parameter AND the body shape so a
+    // regression that puts `group` back in the body (silently ignored
+    // by the broker) is caught.
     Mock::given(method("POST"))
         .and(path("/admin/v2/bookies/racks-info/bookie-1:3181"))
+        .and(query_param("group", "default"))
         .and(body_json(serde_json::json!({
-            "group": "default",
             "rack": "rack-a",
             "hostname": "bookie-1.example",
         })))
@@ -103,8 +106,8 @@ async fn bookies_set_rack_posts_camelcase_body() {
     admin
         .bookies_set_rack(
             "bookie-1:3181",
+            "default",
             BookieInfo {
-                group: "default".into(),
                 rack: "rack-a".into(),
                 hostname: "bookie-1.example".into(),
             },

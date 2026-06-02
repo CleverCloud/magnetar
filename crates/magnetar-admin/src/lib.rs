@@ -355,13 +355,27 @@ impl AdminClient {
 
     /// Set (or update) a bookie's rack assignment.
     ///
-    /// `POST /admin/v2/bookies/racks-info/{bookie}` with a JSON
-    /// [`BookieInfo`] body. `bookie` is the `host:port` registered in
-    /// `BookKeeper` metadata. The placement policy picks up the new
-    /// rack on its next reconciliation tick.
+    /// `POST /admin/v2/bookies/racks-info/{bookie}?group={group}` with
+    /// a JSON [`BookieInfo`] body carrying only `{rack, hostname}`.
+    /// `bookie` is the `host:port` registered in `BookKeeper` metadata.
+    /// The placement policy picks up the new rack on its next
+    /// reconciliation tick.
+    ///
+    /// `group` is **a query parameter**, not a body field — Pulsar's
+    /// `BookiesBase#updateBookieRackInfo(@PathParam("bookie") String,
+    /// @QueryParam("group") String, BookieInfo)` Jackson-binds the body
+    /// to `{rack, hostname}` only; an unknown `group` body field is
+    /// silently ignored and the query param defaults to `null`,
+    /// dropping the operator's group choice on the wire.
     /// Java: `BookiesBase#updateBookieRackInfo`.
-    pub async fn bookies_set_rack(&self, bookie: &str, info: BookieInfo) -> Result<(), AdminError> {
-        let url = self.url(&["bookies", "racks-info", bookie])?;
+    pub async fn bookies_set_rack(
+        &self,
+        bookie: &str,
+        group: &str,
+        info: BookieInfo,
+    ) -> Result<(), AdminError> {
+        let mut url = self.url(&["bookies", "racks-info", bookie])?;
+        url.query_pairs_mut().append_pair("group", group);
         let resp = self
             .send(self.http.request(Method::POST, url).json(&info))
             .await?;
@@ -3507,16 +3521,20 @@ pub struct BacklogQuota {
     pub policy: String,
 }
 
-/// Java `BookieInfo` — a single bookie's group + rack assignment, as
-/// stored in the `racks-info` metadata path and shipped on
+/// Java `BookieInfo` — a single bookie's rack assignment, as stored in
+/// the `racks-info` metadata path and shipped on
 /// [`AdminClient::bookies_set_rack`]. Field names are camelCase on the
-/// wire (matching `org.apache.pulsar.common.policies.data.BookieInfo`).
+/// wire (matching `org.apache.pulsar.common.policies.data.BookieInfo`,
+/// which carries only `rack` and `hostname`).
+///
+/// The placement group is **not** part of this body — Pulsar's
+/// `BookiesBase#updateBookieRackInfo` exposes `group` as a
+/// `@QueryParam`, and the JSON body Jackson-binds only to
+/// `{rack, hostname}`. Treating it as a body field silently drops the
+/// operator's group choice on the wire.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BookieInfo {
-    /// Rack-aware placement group. Defaults to `"default"` when unset
-    /// in older brokers; modern brokers expose every group explicitly.
-    pub group: String,
     /// Rack identifier within the group — opaque to the broker, only
     /// the placement policy cares about it.
     pub rack: String,
