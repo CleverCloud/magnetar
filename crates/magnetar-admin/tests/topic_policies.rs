@@ -152,9 +152,14 @@ async fn topic_message_ttl_get_set_remove_with_bare_integer_body() {
         .expect(1)
         .mount(&mock)
         .await;
+    // Topic-level setMessageTTL takes the TTL as a query param
+    // (`@QueryParam("messageTTL")`), not a JSON body — verified against
+    // apache/pulsar v4.0.4 and branch-4.2 `PersistentTopics.java`. The
+    // wiremock pin protects against silent regression: sending a JSON body
+    // makes the broker return 204 but never persist the policy.
     Mock::given(method("POST"))
         .and(path("/admin/v2/persistent/acme/svc/orders/messageTTL"))
-        .and(body_json(serde_json::json!(7200)))
+        .and(query_param("messageTTL", "7200"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&mock)

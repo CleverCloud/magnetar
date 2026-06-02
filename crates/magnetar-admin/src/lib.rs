@@ -2133,8 +2133,18 @@ impl AdminClient {
 
     /// Set a topic's message-TTL (seconds).
     ///
-    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL` with
-    /// a bare integer body. `0` disables (broker treats as no TTL).
+    /// `POST /admin/v2/persistent/{tenant}/{ns}/{topic}/messageTTL?messageTTL={n}`.
+    /// `0` disables (broker treats as no TTL).
+    ///
+    /// Note: unlike the **namespace**-level `setNamespaceMessageTTL` (which
+    /// takes the TTL as a JSON int body), the topic-level setter binds
+    /// `@QueryParam("messageTTL") Integer messageTTL` on both Pulsar 4.0 and
+    /// 4.2 (`pulsar-broker/.../v2/PersistentTopics.java#setMessageTTL`).
+    /// Sending the value as a JSON body returns 204 No Content but the
+    /// broker reads the query param as `null` and silently treats the call
+    /// as "no override" — the topic policy never persists, and a subsequent
+    /// `topic_get_message_ttl` surfaces `Ok(None)`. Older Pulsar releases
+    /// tolerated both encodings; 4.2 enforces the query-param shape.
     /// Java: `PersistentTopicsBase#setMessageTTL`.
     pub async fn topic_set_message_ttl(
         &self,
@@ -2142,10 +2152,10 @@ impl AdminClient {
         ttl_seconds: i32,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
-        let url = self.url(&["persistent", tenant, namespace, name, "messageTTL"])?;
-        let resp = self
-            .send(self.http.request(Method::POST, url).json(&ttl_seconds))
-            .await?;
+        let mut url = self.url(&["persistent", tenant, namespace, name, "messageTTL"])?;
+        url.query_pairs_mut()
+            .append_pair("messageTTL", &ttl_seconds.to_string());
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
         empty_ok(resp).await
     }
 
