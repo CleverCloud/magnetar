@@ -1723,17 +1723,33 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
-    /// Delete a partitioned topic.
+    /// Delete a topic, auto-detecting partitioned vs non-partitioned.
     ///
-    /// `DELETE /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions?force={force}`.
-    /// Java: `PersistentTopics.java#deletePartitionedTopic`
-    /// (`@DELETE @Path("/{tenant}/{namespace}/{topic}/partitions")`,
-    /// `@QueryParam("force")`).
+    /// Pulsar exposes two distinct delete endpoints — the partitioned
+    /// parent uses `DELETE .../{topic}/partitions?force=…` and the
+    /// non-partitioned topic uses `DELETE .../{topic}?force=…`. Hitting
+    /// the partitioned endpoint on a non-partitioned topic returns 404
+    /// ("Topic is not partitioned"), which used to surface as "the
+    /// topic doesn't exist" to operators using `magnetar admin topics
+    /// delete`.
+    ///
+    /// Probe via `topic_partitions_count` first (`GET .../partitions`
+    /// returns `partitions: 0` for non-partitioned topics, `> 0` for a
+    /// partitioned parent) and route to the matching endpoint. Same
+    /// behaviour as pulsarctl's `topics delete`.
+    ///
+    /// Java: `PersistentTopics.java#deletePartitionedTopic` /
+    /// `PersistentTopics.java#deleteTopic`.
     pub async fn topic_delete(&self, topic: &str, force: bool) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
-        let mut url = self.url(&["persistent", tenant, namespace, name, "partitions"])?;
-        url.query_pairs_mut()
-            .append_pair("force", if force { "true" } else { "false" });
+        let partitions = self.topic_partitions_count(topic).await?;
+        let force_str = if force { "true" } else { "false" };
+        let mut url = if partitions > 0 {
+            self.url(&["persistent", tenant, namespace, name, "partitions"])?
+        } else {
+            self.url(&["persistent", tenant, namespace, name])?
+        };
+        url.query_pairs_mut().append_pair("force", force_str);
         let resp = self.send(self.http.request(Method::DELETE, url)).await?;
         empty_ok(resp).await
     }

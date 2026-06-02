@@ -148,3 +148,72 @@ async fn topic_update_partitions_propagates_409_on_shrink() {
         .unwrap_err();
     assert!(matches!(err, AdminError::Status { code: 409, .. }));
 }
+
+#[tokio::test]
+async fn topic_delete_auto_detects_partitioned_route() {
+    // Pulsar exposes two distinct delete endpoints; the partitioned
+    // parent at `…/{topic}/partitions?force=…` and the non-partitioned
+    // topic at `…/{topic}?force=…`. The client probes
+    // `topic_partitions_count` (a `GET .../partitions` returning
+    // `partitions: N`) and routes accordingly. Pinned for both shapes.
+    let mock = MockServer::start().await;
+    // Probe: partitioned → 4 partitions.
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/persistent/public/default/orders/partitions",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "partitions": 4,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // Route → partitioned delete endpoint (`/partitions`).
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/admin/v2/persistent/public/default/orders/partitions",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = AdminClient::builder()
+        .service_url(mock.uri().parse().unwrap())
+        .build()
+        .unwrap();
+    admin
+        .topic_delete("public/default/orders", false)
+        .await
+        .expect("partitioned delete returns 204");
+}
+
+#[tokio::test]
+async fn topic_delete_auto_detects_non_partitioned_route() {
+    let mock = MockServer::start().await;
+    // Probe: non-partitioned → `partitions: 0`.
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/public/default/oneoff/partitions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "partitions": 0,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // Route → bare topic endpoint (no `/partitions` suffix).
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v2/persistent/public/default/oneoff"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = AdminClient::builder()
+        .service_url(mock.uri().parse().unwrap())
+        .build()
+        .unwrap();
+    admin
+        .topic_delete("public/default/oneoff", true)
+        .await
+        .expect("non-partitioned delete returns 204");
+}
