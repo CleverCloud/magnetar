@@ -140,7 +140,9 @@ async fn compaction_threshold_get_set_remove_cycle() {
         .mount(&mock)
         .await;
 
-    Mock::given(method("POST"))
+    // Pulsar 4 uses PUT for setCompactionThreshold (not POST). The wiremock
+    // pinning protects against silent verb regressions.
+    Mock::given(method("PUT"))
         .and(path("/admin/v2/namespaces/acme/svc/compactionThreshold"))
         .and(body_json(serde_json::json!(1_073_741_824_i64)))
         .respond_with(ResponseTemplate::new(204))

@@ -183,6 +183,13 @@ impl AdminClient {
     /// broker returns a `Map<String, NamespaceIsolationData>` carrying
     /// the namespace regex, primary/secondary broker lists, and the
     /// auto-failover policy. Exposed as raw JSON for forward-compat.
+    ///
+    /// A cluster with no isolation policies configured surfaces as
+    /// `404 NamespaceIsolationPolicies for cluster ... does not exist`
+    /// (Pulsar 4.0.x) rather than an empty map; we mirror the Java
+    /// client's `Map<String, _>` surface by mapping that specific 404 to
+    /// an empty `{}` object. Other 404s (auth, wrong cluster) still
+    /// surface as `AdminError::Status`.
     /// Java: `ClustersBase#getNamespaceIsolationPolicies`.
     pub async fn namespace_isolation_policies_list(
         &self,
@@ -191,7 +198,15 @@ impl AdminClient {
         validate_segment(cluster)?;
         let url = self.url(&["clusters", cluster, "namespaceIsolationPolicies"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        match json_ok::<serde_json::Value>(resp).await {
+            Ok(v) => Ok(v),
+            Err(AdminError::Status { code: 404, body })
+                if body.contains("NamespaceIsolationPolicies") =>
+            {
+                Ok(serde_json::Value::Object(serde_json::Map::new()))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // --- Brokers ---------------------------------------------------------
@@ -226,11 +241,26 @@ impl AdminClient {
     /// `ServiceConfiguration` fields tagged `@FieldContext(dynamic = true)`
     /// — the set of keys that `brokers_set_dynamic_config` accepts. Use
     /// [`Self::brokers_dynamic_config_overrides`] for the current values.
-    /// Java: `BrokersBase#getDynamicConfigurationName`.
+    ///
+    /// Pulsar 4 normally returns a JSON array (`List<String>` from
+    /// `BrokerService#getDynamicConfiguration`), but some packaging /
+    /// proxy paths surface the underlying `Map<String, ConfigField>`
+    /// shape instead. We accept both — array → values, object → keys —
+    /// to stay version-tolerant. Java: `BrokersBase#getDynamicConfigurationName`.
     pub async fn brokers_dynamic_config_keys(&self) -> Result<Vec<String>, AdminError> {
         let url = self.url(&["brokers", "configuration"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        let v: serde_json::Value = json_ok(resp).await?;
+        match v {
+            serde_json::Value::Array(items) => Ok(items
+                .into_iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .collect()),
+            serde_json::Value::Object(map) => Ok(map.into_iter().map(|(k, _)| k).collect()),
+            other => Err(AdminError::Protocol(format!(
+                "brokers/configuration returned unexpected shape: {other}"
+            ))),
+        }
     }
 
     /// Get the currently-overridden dynamic configuration values.
@@ -1413,8 +1443,12 @@ impl AdminClient {
 
     /// Set a namespace's compaction threshold (bytes).
     ///
-    /// `POST /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold` with
+    /// `PUT /admin/v2/namespaces/{tenant}/{ns}/compactionThreshold` with
     /// a bare JSON long body. `0` disables automatic compaction.
+    ///
+    /// Note: this endpoint is `@PUT` in Pulsar 4 (`Namespaces.java`
+    /// declares `@PUT @Path("/{tenant}/{namespace}/compactionThreshold")`),
+    /// not POST — using POST yields a `405 Method Not Allowed`.
     /// Java: `NamespacesBase#setCompactionThreshold`.
     pub async fn namespace_set_compaction_threshold(
         &self,
@@ -1424,7 +1458,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "compactionThreshold"])?;
         let resp = self
-            .send(self.http.request(Method::POST, url).json(&threshold_bytes))
+            .send(self.http.request(Method::PUT, url).json(&threshold_bytes))
             .await?;
         empty_ok(resp).await
     }
@@ -1919,14 +1953,23 @@ impl AdminClient {
     /// Terminate (seal) a topic — no further produces succeed.
     ///
     /// `POST /admin/v2/persistent/{tenant}/{namespace}/{topic}/terminate`.
-    /// Returns the [`MessageId`] of the last message that landed before the
-    /// seal. Java: `PersistentTopics#terminate`.
-    pub async fn topic_terminate(&self, topic: &str) -> Result<MessageId, AdminError> {
+    /// Returns the [`MessageId`] of the last message that landed before
+    /// the seal, or `None` when the broker reports the
+    /// `MessageIdImpl(-1, -1)` sentinel — meaning the topic was sealed
+    /// before any confirmed entry was written (a freshly-created topic,
+    /// or a topic whose owner was just re-elected). The Java client
+    /// surfaces that case as `MessageId.earliest`; we use `Option` so
+    /// callers don't have to special-case a magic value.
+    /// Java: `PersistentTopics#terminate`.
+    pub async fn topic_terminate(&self, topic: &str) -> Result<Option<MessageId>, AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "terminate"])?;
         let resp = self.send(self.http.request(Method::POST, url)).await?;
         let dto: MessageIdResponse = json_ok(resp).await?;
-        dto.try_into_message_id()
+        if dto.ledger_id < 0 && dto.entry_id < 0 {
+            return Ok(None);
+        }
+        dto.try_into_message_id().map(Some)
     }
 
     /// Grow a partitioned topic's partition count.

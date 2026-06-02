@@ -50,6 +50,39 @@ async fn brokers_dynamic_config_keys_returns_string_list() {
 }
 
 #[tokio::test]
+async fn brokers_dynamic_config_keys_accepts_object_shape() {
+    // Some Pulsar surfaces (Function Worker, proxy splits) emit the
+    // dynamic-configuration endpoint as the underlying
+    // `Map<String, ConfigField>` rather than the documented
+    // `List<String>`. We accept both — object → keys — so the CLI
+    // doesn't break on those deployments.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/brokers/configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "brokerShutdownTimeoutMs": {"type": "long", "doc": "shutdown grace"},
+            "loadBalancerEnabled":    {"type": "boolean", "doc": "lb master switch"},
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let mut keys = admin
+        .brokers_dynamic_config_keys()
+        .await
+        .expect("keys returns 200 + JSON object");
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "brokerShutdownTimeoutMs".to_owned(),
+            "loadBalancerEnabled".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn brokers_dynamic_config_overrides_returns_map() {
     let mock = MockServer::start().await;
     // `getAllDynamicConfigurations` returns only the keys an operator

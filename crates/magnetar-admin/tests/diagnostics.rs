@@ -134,3 +134,30 @@ async fn namespace_isolation_policies_list_returns_map() {
         .expect("list returns 200");
     assert_eq!(map["policy-a"]["primary"][0], "broker-a:8080");
 }
+
+#[tokio::test]
+async fn namespace_isolation_policies_list_404_returns_empty_map() {
+    // Pulsar 4 surfaces "no isolation policies on this cluster" as 404
+    // with a `NamespaceIsolationPolicies for cluster X does not exist`
+    // body, not an empty `{}`. We pin the Java-client semantic: empty
+    // configuration = empty map, never an error.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/clusters/standalone/namespaceIsolationPolicies",
+        ))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            r#"{"reason":"NamespaceIsolationPolicies for cluster standalone does not exist"}"#,
+        ))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let map = admin
+        .namespace_isolation_policies_list("standalone")
+        .await
+        .expect("404 with the well-known body must not surface as Status error");
+    assert!(map.is_object(), "expected empty `{{}}`, got {map}");
+    assert_eq!(map.as_object().map(|m| m.len()), Some(0));
+}

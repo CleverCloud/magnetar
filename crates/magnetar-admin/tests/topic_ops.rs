@@ -98,10 +98,37 @@ async fn topic_terminate_posts_and_returns_last_message_id() {
     let last = admin
         .topic_terminate("public/default/orders")
         .await
-        .expect("terminate returns the last message id");
+        .expect("terminate returns the last message id")
+        .expect("non-sentinel ledgerId/entryId → Some");
     assert_eq!(last.ledger_id, 123);
     assert_eq!(last.entry_id, 456);
     assert_eq!(last.partition, -1);
+}
+
+#[tokio::test]
+async fn topic_terminate_sentinel_negative_one_is_none() {
+    // A topic terminated before any entry was confirmed returns
+    // `MessageIdImpl(-1, -1, -1)` on the wire. We surface that as
+    // `None` rather than failing with `Protocol("negative entryId")` —
+    // freshly-created or just-unloaded topics legitimately hit this.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v2/persistent/public/default/empty/terminate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ledgerId": -1,
+            "entryId": -1,
+            "partitionIndex": -1,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let last = admin
+        .topic_terminate("public/default/empty")
+        .await
+        .expect("terminate sentinel must not surface as Protocol error");
+    assert!(last.is_none(), "sentinel (-1, -1) should map to None");
 }
 
 #[tokio::test]
