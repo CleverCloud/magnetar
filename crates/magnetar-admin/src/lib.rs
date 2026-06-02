@@ -143,6 +143,7 @@ impl AdminClient {
         &self,
         cluster: &str,
     ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(cluster)?;
         let url = self.url(&["clusters", cluster, "failureDomains"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         json_ok(resp).await
@@ -157,6 +158,8 @@ impl AdminClient {
         cluster: &str,
         domain: &str,
     ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(cluster)?;
+        validate_segment(domain)?;
         let url = self.url(&["clusters", cluster, "failureDomains", domain])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         json_ok(resp).await
@@ -173,6 +176,7 @@ impl AdminClient {
         &self,
         cluster: &str,
     ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(cluster)?;
         let url = self.url(&["clusters", cluster, "namespaceIsolationPolicies"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         json_ok(resp).await
@@ -186,6 +190,7 @@ impl AdminClient {
     /// strings — one entry per broker that's currently registered with
     /// the cluster's metadata store. Java: `BrokersBase#getActiveBrokers`.
     pub async fn brokers_list(&self, cluster: &str) -> Result<Vec<String>, AdminError> {
+        validate_segment(cluster)?;
         let url = self.url(&["brokers", cluster])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         json_ok(resp).await
@@ -283,6 +288,8 @@ impl AdminClient {
         cluster: &str,
         broker: &str,
     ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(cluster)?;
+        validate_segment(broker)?;
         let url = self.url(&["brokers", cluster, broker, "ownedNamespaces"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         json_ok(resp).await
@@ -374,6 +381,7 @@ impl AdminClient {
         group: &str,
         info: BookieInfo,
     ) -> Result<(), AdminError> {
+        validate_segment(bookie)?;
         let mut url = self.url(&["bookies", "racks-info", bookie])?;
         url.query_pairs_mut().append_pair("group", group);
         let resp = self
@@ -389,6 +397,7 @@ impl AdminClient {
     /// [`Self::bookies_set_rack`] is called again.
     /// Java: `BookiesBase#deleteBookieRackInfo`.
     pub async fn bookies_delete_rack(&self, bookie: &str) -> Result<(), AdminError> {
+        validate_segment(bookie)?;
         let url = self.url(&["bookies", "racks-info", bookie])?;
         let resp = self.send(self.http.request(Method::DELETE, url)).await?;
         empty_ok(resp).await
@@ -2423,6 +2432,7 @@ impl AdminClient {
         is_excluded: bool,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
+        validate_segment(subscription)?;
         let url = self.url(&[
             "persistent",
             tenant,
@@ -2456,6 +2466,7 @@ impl AdminClient {
         timestamp_millis: u64,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
+        validate_segment(subscription)?;
         let timestamp = timestamp_millis.to_string();
         let url = self.url(&[
             "persistent",
@@ -2482,6 +2493,7 @@ impl AdminClient {
         num_messages: u64,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
+        validate_segment(subscription)?;
         let n = num_messages.to_string();
         let url = self.url(&[
             "persistent",
@@ -2507,6 +2519,7 @@ impl AdminClient {
         subscription: &str,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
+        validate_segment(subscription)?;
         let url = self.url(&[
             "persistent",
             tenant,
@@ -2531,6 +2544,7 @@ impl AdminClient {
         expire_time_seconds: u64,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
+        validate_segment(subscription)?;
         let s = expire_time_seconds.to_string();
         let url = self.url(&[
             "persistent",
@@ -2558,6 +2572,7 @@ impl AdminClient {
         force: bool,
     ) -> Result<(), AdminError> {
         let (tenant, namespace, name) = split_topic(topic)?;
+        validate_segment(subscription)?;
         let mut url = self.url(&[
             "persistent",
             tenant,
