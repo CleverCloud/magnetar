@@ -2701,15 +2701,20 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
         }
         TopicsCmd::Terminate { topic } => {
             // `MessageId` doesn't derive `Serialize` — build the JSON manually
-            // (same shape as `topics get-message-id-by-index`).
-            let id = admin.topic_terminate(&topic).await?;
-            let json = serde_json::json!({
-                "ledgerId": id.ledger_id,
-                "entryId": id.entry_id,
-                "partition": id.partition,
-                "batchIndex": id.batch_index,
-                "batchSize": id.batch_size,
-            });
+            // (same shape as `topics get-message-id-by-index`). `None` means
+            // the broker returned the `(-1, -1)` sentinel ("no confirmed entry
+            // at terminate time") — surface as JSON `null` so scripts can
+            // distinguish from a real message-id.
+            let json = match admin.topic_terminate(&topic).await? {
+                Some(id) => serde_json::json!({
+                    "ledgerId": id.ledger_id,
+                    "entryId": id.entry_id,
+                    "partition": id.partition,
+                    "batchIndex": id.batch_index,
+                    "batchSize": id.batch_size,
+                }),
+                None => serde_json::Value::Null,
+            };
             print_json(&json)
         }
         TopicsCmd::UpdatePartitions { topic, partitions } => {
