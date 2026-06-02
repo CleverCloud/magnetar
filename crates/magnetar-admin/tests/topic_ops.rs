@@ -193,7 +193,9 @@ async fn topic_delete_auto_detects_non_partitioned_route() {
     let mock = MockServer::start().await;
     // Probe: non-partitioned → `partitions: 0`.
     Mock::given(method("GET"))
-        .and(path("/admin/v2/persistent/public/default/oneoff/partitions"))
+        .and(path(
+            "/admin/v2/persistent/public/default/oneoff/partitions",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "partitions": 0,
         })))

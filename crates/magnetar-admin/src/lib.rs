@@ -685,7 +685,12 @@ impl AdminClient {
         let endpoint = self.url_v3(&["functions", tenant, namespace, name])?;
         let form = function_pkg_form(url, &config)?;
         let resp = self
-            .send(self.http.request(Method::POST, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
+            .send(
+                self.http
+                    .request(Method::POST, endpoint)
+                    .multipart(form)
+                    .timeout(PACKAGE_REGISTER_TIMEOUT),
+            )
             .await?;
         empty_ok(resp).await
     }
@@ -710,7 +715,12 @@ impl AdminClient {
         let endpoint = self.url_v3(&["functions", tenant, namespace, name])?;
         let form = function_pkg_form(url, &config)?;
         let resp = self
-            .send(self.http.request(Method::PUT, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
+            .send(
+                self.http
+                    .request(Method::PUT, endpoint)
+                    .multipart(form)
+                    .timeout(PACKAGE_REGISTER_TIMEOUT),
+            )
             .await?;
         empty_ok(resp).await
     }
@@ -2839,7 +2849,12 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sources", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sourceConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::POST, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
+            .send(
+                self.http
+                    .request(Method::POST, endpoint)
+                    .multipart(form)
+                    .timeout(PACKAGE_REGISTER_TIMEOUT),
+            )
             .await?;
         empty_ok(resp).await
     }
@@ -2863,7 +2878,12 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sources", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sourceConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::PUT, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
+            .send(
+                self.http
+                    .request(Method::PUT, endpoint)
+                    .multipart(form)
+                    .timeout(PACKAGE_REGISTER_TIMEOUT),
+            )
             .await?;
         empty_ok(resp).await
     }
@@ -3025,7 +3045,12 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sinks", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sinkConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::POST, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
+            .send(
+                self.http
+                    .request(Method::POST, endpoint)
+                    .multipart(form)
+                    .timeout(PACKAGE_REGISTER_TIMEOUT),
+            )
             .await?;
         empty_ok(resp).await
     }
@@ -3049,7 +3074,12 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sinks", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sinkConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::PUT, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
+            .send(
+                self.http
+                    .request(Method::PUT, endpoint)
+                    .multipart(form)
+                    .timeout(PACKAGE_REGISTER_TIMEOUT),
+            )
             .await?;
         empty_ok(resp).await
     }
@@ -4106,7 +4136,15 @@ fn validate_segment(segment: &str) -> Result<(), AdminError> {
     Ok(())
 }
 
-fn split_namespace(ns: &str) -> Result<(&str, &str), AdminError> {
+/// Split a `tenant/namespace` string into its two segments.
+///
+/// Exposed for the CLI (and any other admin-client wrapper) so the
+/// `tenant/namespace` shape used by the namespace-scoped list verbs
+/// (`functions list`, `sources list`, `sinks list`, `packages list`)
+/// validates against the same `validate_segment` rules every admin
+/// method enforces internally — no parallel parsers, no divergent
+/// error categories.
+pub fn split_namespace(ns: &str) -> Result<(&str, &str), AdminError> {
     let (tenant, namespace) = ns.split_once('/').ok_or_else(|| {
         AdminError::InvalidName(format!("expected tenant/namespace, got {ns:?} (no '/')"))
     })?;

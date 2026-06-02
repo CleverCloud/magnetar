@@ -50,7 +50,7 @@ use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
     DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PackageMetadata, PackageType,
     PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies, SinkConfig,
-    SourceConfig, TenantInfo, split_function_id,
+    SourceConfig, TenantInfo,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -2143,11 +2143,11 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             print_json(&admin.functions_list_by_namespace(tenant, ns).await?)
         }
         FunctionsCmd::Get { name } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             print_json(&admin.function_get(t, n, fn_name).await?)
         }
         FunctionsCmd::Status { name, instance_id } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             let value = match instance_id {
                 Some(id) => admin.function_instance_status(t, n, fn_name, id).await?,
                 None => admin.function_status(t, n, fn_name).await?,
@@ -2155,7 +2155,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             print_json(&value)
         }
         FunctionsCmd::Stats { name, instance_id } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             let value = match instance_id {
                 Some(id) => admin.function_instance_stats(t, n, fn_name, id).await?,
                 None => admin.function_stats(t, n, fn_name).await?,
@@ -2219,12 +2219,12 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             Ok(())
         }
         FunctionsCmd::Delete { name } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             admin.function_delete(t, n, fn_name).await?;
             Ok(())
         }
         FunctionsCmd::Start { name, instance_id } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             match instance_id {
                 Some(id) => admin.function_start_instance(t, n, fn_name, id).await?,
                 None => admin.function_start(t, n, fn_name).await?,
@@ -2232,7 +2232,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             Ok(())
         }
         FunctionsCmd::Stop { name, instance_id } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             match instance_id {
                 Some(id) => admin.function_stop_instance(t, n, fn_name, id).await?,
                 None => admin.function_stop(t, n, fn_name).await?,
@@ -2240,7 +2240,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             Ok(())
         }
         FunctionsCmd::Restart { name } => {
-            let (t, n, fn_name) = split_function_id(&name).map_err(CliError::Admin)?;
+            let (t, n, fn_name) = split_io_id(&name).map_err(CliError::BadArg)?;
             admin.function_restart(t, n, fn_name).await?;
             Ok(())
         }
@@ -3207,35 +3207,28 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
 /// Split `tenant/namespace/name` into its three segments. Used by
 /// Pulsar IO Sources / Sinks and Pulsar Packages — the broker's
 /// `SourcesBase` / `SinksBase` / `PackagesBase` resources all carry
-/// the same `{tenant}/{namespace}/{name}` URL shape for a Function /
-/// Source / Sink / Package id. Symmetric with the admin client's
-/// `split_topic` helper (which accepts an optional `persistent://`
-/// scheme); this variant intentionally rejects URI schemes — a
-/// connector name is never a topic URL.
+/// the same `{tenant}/{namespace}/{name}` URL shape.
+///
+/// Thin wrapper over [`magnetar_admin::split_function_id`] so the
+/// segment-validation rules (reject empty, `.`, `..`, `%2F` /
+/// `%2f`, control bytes) match what every admin method enforces
+/// internally — no parallel parsers, no divergent error categories.
+/// The CLI surface stringifies the `AdminError` so it routes through
+/// `CliError::BadArg` rather than `CliError::Admin`, matching the
+/// "argument-parse-error → BadArg" convention every other CLI parser
+/// uses.
 fn split_io_id(spec: &str) -> Result<(&str, &str, &str), String> {
-    let mut parts = spec.splitn(3, '/');
-    let tenant = parts.next().unwrap_or("");
-    let namespace = parts.next().unwrap_or("");
-    let name = parts.next().unwrap_or("");
-    if tenant.is_empty() || namespace.is_empty() || name.is_empty() || name.contains('/') {
-        return Err(format!("expected tenant/namespace/name, got `{spec}`"));
-    }
-    Ok((tenant, namespace, name))
+    magnetar_admin::split_function_id(spec).map_err(|e| e.to_string())
 }
 
 /// Split `tenant/namespace` into its two segments. Used by the
-/// namespace-scoped `list` verbs on Pulsar IO Sources / Sinks /
-/// Packages. The admin client's own `split_namespace` is private —
-/// duplicating the parser here keeps the CLI's error surface
-/// (`CliError::BadArg`) cohesive without exposing internals.
+/// namespace-scoped `list` verbs on Pulsar Functions / IO Sources /
+/// Sinks / Packages.
+///
+/// Thin wrapper over [`magnetar_admin::split_namespace`] (newly public)
+/// so the validation rules match every admin method.
 fn split_namespace_ref(spec: &str) -> Result<(&str, &str), String> {
-    let (tenant, namespace) = spec
-        .split_once('/')
-        .ok_or_else(|| format!("expected tenant/namespace, got `{spec}` (no '/')"))?;
-    if tenant.is_empty() || namespace.is_empty() || namespace.contains('/') {
-        return Err(format!("expected tenant/namespace, got `{spec}`"));
-    }
-    Ok((tenant, namespace))
+    magnetar_admin::split_namespace(spec).map_err(|e| e.to_string())
 }
 
 fn build_admin(
