@@ -2075,11 +2075,7 @@ async fn run_admin_bookies(admin: &AdminClient, cmd: BookiesCmd) -> Result<(), C
         } => {
             let hostname = hostname.unwrap_or_else(|| bookie.clone());
             admin
-                .bookies_set_rack(
-                    &bookie,
-                    &group,
-                    BookieInfo { rack, hostname },
-                )
+                .bookies_set_rack(&bookie, &group, BookieInfo { rack, hostname })
                 .await?;
             Ok(())
         }

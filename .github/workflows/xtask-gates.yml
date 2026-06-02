@@ -63,7 +63,11 @@ jobs:
     # The FIPS cells build aws-lc-fips-sys's C library, so reclaim runner
     # disk like the test / e2e jobs do.
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 180 min covers the 16-cell build matrix on a cold cache. The FIPS
+    # cells alone take ~10–15 min each on the runner; non-FIPS cells
+    # ~3–5 min. Previous 120 was tight and led to mid-matrix cancels on
+    # cold runs after the crypto provider expansion.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
@@ -78,7 +82,23 @@ jobs:
           swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `aws-lc-sys` 0.41+ (pulled in by every non-FIPS crypto cell via
+      # rustls' aws_lc_rs provider) runs its `compiler_features_tests`
+      # probe through `clang` and PANICS if the tool is not found. The
+      # FIPS cells need clang too — `aws-lc-fips-sys`'s `delocate` step
+      # only accepts clang-emitted assembly (see the workspace memory
+      # `reference-fips-needs-clang-on-linux`). Install clang + libclang
+      # headers so every cell of the matrix builds. Also install the
+      # libgssapi headers for the `auth-sasl-kerberos` feature path.
+      - name: Install clang + libclang-dev + libkrb5-dev (aws-lc, FIPS delocate, GSSAPI)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libkrb5-dev
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-crypto-matrix
+        env:
+          CC: clang
+          CXX: clang++
+          ASM: clang
+          AR: llvm-ar
+          RANLIB: llvm-ranlib
 
   sim-coverage:
     name: sim-coverage (moonpool patch coverage)

@@ -87,7 +87,7 @@ async fn topic_backlog_quota_get_set_remove_cycle() {
         .and(path("/admin/v2/persistent/acme/svc/orders/backlogQuotaMap"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "destination_storage": {
-                "limitSize": 1073741824_i64,
+                "limitSize": 1_073_741_824_i64,
                 "limitTime": -1,
                 "policy": "consumer_backlog_eviction",
             }
@@ -100,7 +100,7 @@ async fn topic_backlog_quota_get_set_remove_cycle() {
         .and(path("/admin/v2/persistent/acme/svc/orders/backlogQuota"))
         .and(query_param("backlogQuotaType", "destination_storage"))
         .and(body_json(serde_json::json!({
-            "limitSize": 2147483648_i64,
+            "limitSize": 2_147_483_648_i64,
             "limitTime": -1,
             "policy": "producer_request_hold",
         })))
@@ -257,7 +257,7 @@ async fn topic_dispatch_rate_get_set_remove_cycle() {
         .and(path("/admin/v2/persistent/acme/svc/orders/dispatchRate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 1000,
-            "dispatchThrottlingRateInByte": 1048576_i64,
+            "dispatchThrottlingRateInByte": 1_048_576_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -322,7 +322,7 @@ async fn topic_subscription_dispatch_rate_get_set_remove_cycle() {
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 500,
-            "dispatchThrottlingRateInByte": 524288_i64,
+            "dispatchThrottlingRateInByte": 524_288_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -391,7 +391,7 @@ async fn topic_replicator_dispatch_rate_get_set_remove_cycle() {
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 100,
-            "dispatchThrottlingRateInByte": 65536_i64,
+            "dispatchThrottlingRateInByte": 65_536_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -405,7 +405,7 @@ async fn topic_replicator_dispatch_rate_get_set_remove_cycle() {
         ))
         .and(body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 300,
-            "dispatchThrottlingRateInByte": 131072_i64,
+            "dispatchThrottlingRateInByte": 131_072_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -458,7 +458,7 @@ async fn topic_publish_rate_get_set_remove_cycle() {
         .and(path("/admin/v2/persistent/acme/svc/orders/publishRate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "publishThrottlingRateInMsg": 5000,
-            "publishThrottlingRateInByte": 2097152_i64,
+            "publishThrottlingRateInByte": 2_097_152_i64,
         })))
         .expect(1)
         .mount(&mock)

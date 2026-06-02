@@ -198,10 +198,7 @@ async fn sink_start_stop_restart_round_trip() {
 /// integration tests self-contained (cargo doesn't ship a "tests
 /// common module" pattern that survives `cargo test --test sinks` in
 /// isolation without a `pub mod`).
-fn header_prefix(
-    name: &'static str,
-    prefix: &'static str,
-) -> impl wiremock::Match + Send + Sync + 'static {
+fn header_prefix(name: &'static str, prefix: &'static str) -> impl wiremock::Match + 'static {
     HeaderPrefixMatcher { name, prefix }
 }
 

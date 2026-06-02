@@ -185,8 +185,15 @@ impl Buggify {
     /// No-feature fast path. Returns `false` unconditionally so the
     /// choice-point branches at every `should_fire` call collapse to
     /// dead code under `cargo build` without the feature.
+    ///
+    /// `#[inline(always)]` here is load-bearing — the body is a single
+    /// `false`, and LLVM only eliminates the dead caller-side branch if
+    /// the call is inlined. Clippy's `inline_always` lint flags it as
+    /// "usually a bad idea"; this is the documented exception, hence
+    /// the explicit allow.
     #[cfg(not(feature = "buggify"))]
     #[inline(always)]
+    #[allow(clippy::inline_always)]
     pub fn should_fire(&self, _label: &'static str, _probability: f64) -> bool {
         false
     }

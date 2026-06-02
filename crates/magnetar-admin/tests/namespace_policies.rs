@@ -84,7 +84,7 @@ async fn backlog_quota_set_with_destination_storage_type() {
         .and(path("/admin/v2/namespaces/acme/svc/backlogQuota"))
         .and(query_param("backlogQuotaType", "destination_storage"))
         .and(body_json(serde_json::json!({
-            "limitSize": 1073741824_i64,
+            "limitSize": 1_073_741_824_i64,
             "limitTime": -1,
             "policy": "consumer_backlog_eviction",
         })))
@@ -133,7 +133,7 @@ async fn backlog_quotas_map_returns_keyed_object() {
         .and(path("/admin/v2/namespaces/acme/svc/backlogQuotaMap"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "destination_storage": {
-                "limitSize": 1073741824_i64,
+                "limitSize": 1_073_741_824_i64,
                 "limitTime": -1,
                 "policy": "consumer_backlog_eviction",
             }

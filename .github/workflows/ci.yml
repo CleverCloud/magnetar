@@ -39,7 +39,12 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 min covers `--workspace --all-features` clippy on a cold
+    # cache (aws-lc-fips-sys + bindgen for libgssapi dominate, ~15 min
+    # alone) plus the lint pass on every test binary the admin /
+    # CLI / e2e expansion now ships. The previous 60 min was tight
+    # against the post-PR-5 surface.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -58,7 +63,11 @@ jobs:
   build:
     name: build (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 min: same rationale as clippy — `--all-features` cold-cache
+    # build on the runner takes ~20–25 min for the FIPS C build, plus
+    # the workspace + every test binary's rlibs. Beta toolchain can
+    # add a few minutes on top.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -84,7 +93,15 @@ jobs:
     # pre-pulls, and the PIP-33 two-cluster docker-compose fixture all
     # live below.
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 180 min covers the cold-cache compile (~20 min of `--all-features`,
+    # heaviest in the admin surface expansion + V3 Functions/IO/Packages),
+    # the PIP-33 two-broker fixture warm-up (~1 min), the e2e suite
+    # against `apachepulsar/pulsar:4.0.4` (~10–15 min), and the
+    # full workspace `cargo test`. The previous 120 min was triggering
+    # mid-test cancels on cold-cache runs; the extra 60 min absorbs the
+    # tail latency without masking real hangs (any individual test has
+    # its own #[tokio::test] timeout under 5 min).
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v6
       # The `--all-features` build (aws-lc-fips-sys's C build + every
@@ -229,7 +246,10 @@ jobs:
   doc:
     name: doc
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 60 min: rustdoc on the workspace under `-D warnings` has the same
+    # cold-cache compile cost as the build job (it depends on every
+    # crate's `cargo check` graph) plus the doc generation pass.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -291,7 +311,9 @@ jobs:
     # than slipping into a release. Mirrors the `build` job but with the
     # toolchain pinned exactly to the MSRV, not the rolling stable.
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 min: same cold-cache cost as the `build` job (FIPS C build,
+    # workspace `--all-features`, bindgen via libclang).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.88.0

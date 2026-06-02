@@ -34,7 +34,7 @@
 use magnetar_admin::{
     AdminClient, AdminError, BacklogQuota, BacklogQuotaType, DelayedDeliveryPolicies, DispatchRate,
     FunctionConfig, PackageType, PersistencePolicies, PostSchemaPayload, PublishRate,
-    RetentionPolicies, SinkConfig, SourceConfig,
+    RetentionPolicies, SourceConfig,
 };
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -501,7 +501,7 @@ async fn invariant_namespace_policy_set_is_idempotent_across_families() {
         managed_ledger_max_mark_delete_rate: 1.0,
     };
     admin
-        .namespace_set_persistence("acme/svc", pers.clone())
+        .namespace_set_persistence("acme/svc", pers)
         .await
         .unwrap();
     admin
@@ -516,7 +516,7 @@ async fn invariant_namespace_policy_set_is_idempotent_across_families() {
         relative_to_publish_rate: false,
     };
     admin
-        .namespace_set_dispatch_rate("acme/svc", rate.clone())
+        .namespace_set_dispatch_rate("acme/svc", rate)
         .await
         .unwrap();
     admin
@@ -635,8 +635,8 @@ async fn invariant_topic_policy_get_decodes_null_as_none() {
 /// `serde_json::from_slice::<Option<T>>(b"")` fails with
 /// `EOF while parsing a value`. The client routes every
 /// `Option<T>`-returning getter through `json_ok_optional`, which
-/// treats both shapes as `Ok(None)`. Pinned for namespace_get_*
-/// (i32 + Policies) and topic_get_* (i32) to defend against a
+/// treats both shapes as `Ok(None)`. Pinned for `namespace_get_*`
+/// (i32 + Policies) and `topic_get_*` (i32) to defend against a
 /// regression that re-introduces the unconditional `json_ok` path.
 #[tokio::test]
 async fn invariant_optional_getter_tolerates_empty_body_and_204() {
@@ -702,7 +702,7 @@ async fn invariant_optional_getter_tolerates_empty_body_and_204() {
     );
 }
 
-/// **Invariant — DispatchRate / PublishRate / BacklogQuota partial
+/// **Invariant — `DispatchRate` / `PublishRate` / `BacklogQuota` partial
 /// decode defaults to `-1` (unlimited), not `0` (zero-throttle).
 /// Pulsar emits these policies with `-1` as the documented "unlimited"
 /// sentinel and `0` as a legal value ("throttle to zero"). A
@@ -828,7 +828,7 @@ async fn invariant_schema_post_then_get_round_trips_avro_definition() {
     let payload = PostSchemaPayload {
         schema_type: "AVRO".to_owned(),
         schema: r#"{"type":"record","name":"X","fields":[]}"#.to_owned(),
-        properties: Default::default(),
+        properties: std::collections::HashMap::default(),
     };
     let posted = admin.schema_post("acme/svc/orders", payload).await.unwrap();
     assert_eq!(posted["version"], 1);
@@ -850,7 +850,7 @@ async fn invariant_publish_rate_body_uses_publish_throttling_camel_case() {
         .and(path("/admin/v2/namespaces/acme/svc/publishRate"))
         .and(body_json(serde_json::json!({
             "publishThrottlingRateInMsg": 500,
-            "publishThrottlingRateInByte": 524288_i64,
+            "publishThrottlingRateInByte": 524_288_i64,
         })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -1116,7 +1116,7 @@ async fn invariant_function_instance_lifecycle_routes_to_instance_url() {
         .unwrap();
 }
 
-/// **Invariant — SourceConfig + SinkConfig camelCase**. Per Java's
+/// **Invariant — `SourceConfig` + `SinkConfig` camelCase**. Per Java's
 /// `org.apache.pulsar.common.io.SourceConfig` / `SinkConfig`, the wire
 /// fields are camelCase. Pin via the `sourceConfig` / `sinkConfig`
 /// multipart JSON body shape so a Rust field rename doesn't silently

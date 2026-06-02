@@ -206,10 +206,7 @@ async fn source_start_stop_restart_round_trip() {
 /// a prefix-aware matcher here. Using `header(name, _)` (any value)
 /// would weaken the assertion to "header present", which would not
 /// catch a regression that emits, say, `application/x-www-form-urlencoded`.
-fn header_prefix(
-    name: &'static str,
-    prefix: &'static str,
-) -> impl wiremock::Match + Send + Sync + 'static {
+fn header_prefix(name: &'static str, prefix: &'static str) -> impl wiremock::Match + 'static {
     HeaderPrefixMatcher { name, prefix }
 }
 

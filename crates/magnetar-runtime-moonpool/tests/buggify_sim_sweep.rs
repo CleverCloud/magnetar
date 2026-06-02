@@ -24,18 +24,34 @@
 
 #![forbid(unsafe_code)]
 
+// The `Backoff` + `Buggify` + `splitmix_rng` arsenal is only reachable
+// from `#[cfg(feature = "buggify")]` test functions below — the
+// moonpool-seed-sweep CI workflow builds without `buggify`, so those
+// imports / the helper fn need the same gate or the `-D warnings`
+// lint trips with `unused_imports` / `dead_code`.
+//
+// `ConnectionShared`, `ConnectionConfig`, and `labels` are used by
+// the non-feature-gated `moonpool_buggify_default_disabled` test
+// (pins the "no auto-arm" contract under every build), so they stay
+// unconditional.
+#[cfg(feature = "buggify")]
 use std::sync::Arc;
 
+#[cfg(feature = "buggify")]
+use magnetar_proto::Buggify;
+use magnetar_proto::ConnectionConfig;
+#[cfg(feature = "buggify")]
 use magnetar_proto::backoff::Backoff;
 use magnetar_proto::buggify::labels;
-use magnetar_proto::{Buggify, ConnectionConfig};
 use magnetar_runtime_moonpool::ConnectionShared;
+#[cfg(feature = "buggify")]
 use parking_lot::Mutex;
 
 /// SplitMix64-shaped seed → infinite `u64` stream. Mirrors what
 /// `moonpool_sim::SimRandomProvider` advertises via
 /// `RandomProvider::random()`, scoped down to the single primitive
 /// our `Buggify::roll_u64` consumes.
+#[cfg(feature = "buggify")]
 fn splitmix_rng(seed: u64) -> Arc<dyn Fn() -> u64 + Send + Sync> {
     let state = Arc::new(Mutex::new(seed));
     Arc::new(move || {

@@ -1041,7 +1041,7 @@ impl AdminClient {
     /// Get a namespace's persistence policy.
     ///
     /// `GET /admin/v2/namespaces/{tenant}/{ns}/persistence`. Returns the
-    /// BookKeeper ensemble / write-quorum / ack-quorum triple plus the
+    /// `BookKeeper` ensemble / write-quorum / ack-quorum triple plus the
     /// managed-ledger mark-delete rate cap. `null` body decodes to
     /// `PersistencePolicies::default()` via `#[serde(default)]`.
     /// Java: `NamespacesBase#getPersistence`.
@@ -2792,8 +2792,8 @@ impl AdminClient {
     /// package URL — `http(s)://`, `file://`, or `function://` per the
     /// broker's `WorkerUtils#downloadFileFromPackageUrl`) and a
     /// `sourceConfig` JSON part with the [`SourceConfig`] body.
-    /// Sibling [`Self::source_create`] (binary upload) is intentionally
-    /// not yet exposed — this URL-based variant covers every
+    /// A sibling `source_create` (binary upload) is intentionally not
+    /// yet exposed — this URL-based variant covers every
     /// CI/operator scenario that does not need to ship a JAR through
     /// the admin client itself.
     /// Java: `SourcesBase#registerSource`.
@@ -3450,7 +3450,7 @@ pub struct RetentionPolicies {
     pub retention_size_in_mb: i64,
 }
 
-/// Java `PersistencePolicies` — namespace-level BookKeeper layout +
+/// Java `PersistencePolicies` — namespace-level `BookKeeper` layout +
 /// managed-ledger write-shaping knobs. Maps to the broker's
 /// `org.apache.pulsar.common.policies.data.PersistencePolicies`.
 ///
@@ -3463,15 +3463,15 @@ pub struct RetentionPolicies {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistencePolicies {
-    /// BookKeeper ensemble size — the number of bookies the managed
+    /// `BookKeeper` ensemble size — the number of bookies the managed
     /// ledger striping is spread across. Default: 2.
     #[serde(default = "default_bookkeeper_quorum")]
     pub bookkeeper_ensemble: i32,
-    /// BookKeeper write quorum — the number of bookies each entry is
+    /// `BookKeeper` write quorum — the number of bookies each entry is
     /// written to. Default: 2.
     #[serde(default = "default_bookkeeper_quorum")]
     pub bookkeeper_write_quorum: i32,
-    /// BookKeeper ack quorum — the number of acks required before an
+    /// `BookKeeper` ack quorum — the number of acks required before an
     /// add is considered durable. Default: 2.
     #[serde(default = "default_bookkeeper_quorum")]
     pub bookkeeper_ack_quorum: i32,
@@ -3808,7 +3808,7 @@ pub enum BacklogQuotaType {
 }
 
 impl BacklogQuotaType {
-    /// Render as the lowercase snake_case value the broker REST surface
+    /// Render as the lowercase `snake_case` value the broker REST surface
     /// expects in the `backlogQuotaType` query parameter.
     #[must_use]
     pub fn as_query_value(self) -> &'static str {
@@ -4129,7 +4129,8 @@ fn function_pkg_form(
 /// Split a `tenant/namespace/name` Functions / IO identifier into its
 /// three segments. Pulsar Functions never carry a `persistent://`
 /// scheme prefix (functions are not topics), so the parser is stricter
-/// than [`split_topic`].
+/// than the internal `split_topic` (rustdoc cannot resolve the bare
+/// identifier because `split_topic` is module-private).
 ///
 /// Exposed for the CLI, which parses the fully qualified name out of a
 /// single positional argument before calling the admin methods (which

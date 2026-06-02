@@ -97,7 +97,7 @@ async fn dispatch_rate_get_set_remove_cycle() {
         .and(path("/admin/v2/namespaces/acme/svc/dispatchRate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 1000,
-            "dispatchThrottlingRateInByte": 1048576_i64,
+            "dispatchThrottlingRateInByte": 1_048_576_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -163,7 +163,7 @@ async fn subscription_dispatch_rate_get_set_remove_cycle() {
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 500,
-            "dispatchThrottlingRateInByte": 524288_i64,
+            "dispatchThrottlingRateInByte": 524_288_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -229,7 +229,7 @@ async fn replicator_dispatch_rate_get_set_remove_cycle() {
         .and(path("/admin/v2/namespaces/acme/svc/replicatorDispatchRate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 100,
-            "dispatchThrottlingRateInByte": 65536_i64,
+            "dispatchThrottlingRateInByte": 65_536_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -241,7 +241,7 @@ async fn replicator_dispatch_rate_get_set_remove_cycle() {
         .and(path("/admin/v2/namespaces/acme/svc/replicatorDispatchRate"))
         .and(body_json(serde_json::json!({
             "dispatchThrottlingRateInMsg": 300,
-            "dispatchThrottlingRateInByte": 131072_i64,
+            "dispatchThrottlingRateInByte": 131_072_i64,
             "ratePeriodInSecond": 1,
             "relativeToPublishRate": false,
         })))
@@ -291,7 +291,7 @@ async fn publish_rate_get_set_remove_cycle() {
         .and(path("/admin/v2/namespaces/acme/svc/publishRate"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "publishThrottlingRateInMsg": 5000,
-            "publishThrottlingRateInByte": 2097152_i64,
+            "publishThrottlingRateInByte": 2_097_152_i64,
         })))
         .expect(1)
         .mount(&mock)
