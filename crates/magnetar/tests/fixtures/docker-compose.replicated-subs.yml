@@ -19,7 +19,7 @@
 
 services:
   zookeeper:
-    image: apachepulsar/pulsar:4.0.4
+    image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-zookeeper
     restart: unless-stopped
     environment:
@@ -35,7 +35,7 @@ services:
       retries: 30
 
   pulsar-init:
-    image: apachepulsar/pulsar:4.0.4
+    image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-init
     depends_on:
       zookeeper:
@@ -55,7 +55,7 @@ services:
                  --broker-service-url pulsar://broker-b:6650 || true"
 
   bookkeeper-a:
-    image: apachepulsar/pulsar:4.0.4
+    image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-bk-a
     restart: unless-stopped
     depends_on:
@@ -72,7 +72,7 @@ services:
                exec bin/pulsar bookie"
 
   bookkeeper-b:
-    image: apachepulsar/pulsar:4.0.4
+    image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-bk-b
     restart: unless-stopped
     depends_on:
@@ -88,7 +88,7 @@ services:
                exec bin/pulsar bookie"
 
   broker-a:
-    image: apachepulsar/pulsar:4.0.4
+    image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-broker-a
     restart: unless-stopped
     depends_on:
@@ -128,7 +128,7 @@ services:
       retries: 30
 
   broker-b:
-    image: apachepulsar/pulsar:4.0.4
+    image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-broker-b
     restart: unless-stopped
     depends_on:

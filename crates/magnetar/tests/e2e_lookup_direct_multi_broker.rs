@@ -3,7 +3,7 @@
 //! End-to-end coverage for ADR-0039 §"Multi-broker DIRECT routing
 //! (2026-06-01)" / HIGH-1 from the lookup multi-agent review.
 //!
-//! `apachepulsar/pulsar:4.0.4` runs as a single-broker standalone in this
+//! `apachepulsar/pulsar:latest` runs as a single-broker standalone in this
 //! suite (single-node mode is the only configuration that fits the
 //! per-PR e2e budget). A true multi-broker DIRECT routing scenario
 //! requires the official 3+ broker cluster fixture, which is out of
@@ -39,7 +39,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

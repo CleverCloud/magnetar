@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Requires Docker on the host. The broker is opaque to encryption — PIP-4 is
-//! a client-side concern — so we reuse the standard `apachepulsar/pulsar:4.0.4`
+//! a client-side concern — so we reuse the standard `apachepulsar/pulsar:latest`
 //! fixture from `e2e_pulsar.rs` and exercise:
 //!
 //! 1. Happy-path encrypt/decrypt round trip with a shared `MessageCrypto`.
@@ -41,7 +41,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

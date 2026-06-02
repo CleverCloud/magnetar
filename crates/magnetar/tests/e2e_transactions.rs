@@ -15,7 +15,7 @@
 //!
 //! ## Why double-ignored
 //!
-//! The default `apachepulsar/pulsar:4.0.4` standalone image does NOT spin up the
+//! The default `apachepulsar/pulsar:latest` standalone image does NOT spin up the
 //! transaction coordinator. Enabling it requires either a custom config that sets
 //! `transactionCoordinatorEnabled=true` plus the system namespace bootstrap, or a
 //! purpose-built image. Until we ship that harness these tests are landed as
@@ -33,7 +33,7 @@ use testcontainers::{GenericImage, ImageExt};
 use uuid::Uuid;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 const TXN_TIMEOUT: Duration = Duration::from_secs(30);

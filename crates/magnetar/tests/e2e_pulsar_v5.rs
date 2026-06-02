@@ -13,7 +13,7 @@
 //!
 //! Requires Docker on the host.
 //!
-//! Mirrors `e2e_pulsar.rs`'s setup pattern (same `apachepulsar/pulsar:4.0.4`
+//! Mirrors `e2e_pulsar.rs`'s setup pattern (same `apachepulsar/pulsar:latest`
 //! image, same `start_pulsar` shape) but drives the V5 surface
 //! (`PulsarClientV5`, `v5::producer::ProducerBuilder`,
 //! `v5::stream_consumer::StreamConsumerBuilder`).
@@ -32,7 +32,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

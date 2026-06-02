@@ -96,7 +96,7 @@ jobs:
     # 180 min covers the cold-cache compile (~20 min of `--all-features`,
     # heaviest in the admin surface expansion + V3 Functions/IO/Packages),
     # the PIP-33 two-broker fixture warm-up (~1 min), the e2e suite
-    # against `apachepulsar/pulsar:4.0.4` (~10–15 min), and the
+    # against `apachepulsar/pulsar:latest` (~10–15 min), and the
     # full workspace `cargo test`. The previous 120 min was triggering
     # mid-test cancels on cold-cache runs; the extra 60 min absorbs the
     # tail latency without masking real hangs (any individual test has
@@ -127,7 +127,7 @@ jobs:
       # Pre-pull Docker images so the e2e suite (now part of `cargo test`)
       # doesn't pay the pull cost inside the test wall budget. ADR-0046.
       - name: Pre-pull Pulsar broker image
-        run: docker pull apachepulsar/pulsar:4.0.4
+        run: docker pull apachepulsar/pulsar:latest
       - name: Pre-pull KDC image (for the SASL Kerberos e2e)
         run: docker pull gcavalcante8808/krb5-server:latest || true
       # Bring up the PIP-33 two-cluster docker-compose fixture. ADR-0046

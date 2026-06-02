@@ -5,9 +5,9 @@
 //!
 //! Spins up:
 //!
-//! 1. `apachepulsar/pulsar:4.0.4` in **standalone** mode (embedded Zookeeper on `2181`, broker
+//! 1. `apachepulsar/pulsar:latest` in **standalone** mode (embedded Zookeeper on `2181`, broker
 //!    binary on `6650`, admin REST on `8080`).
-//! 2. `apachepulsar/pulsar:4.0.4` in **proxy** mode, pointed at the standalone container's
+//! 2. `apachepulsar/pulsar:latest` in **proxy** mode, pointed at the standalone container's
 //!    Zookeeper via `--zookeeper-servers <standalone-host>:<mapped-zk-port>` and serving the proxy
 //!    binary protocol on a random host port.
 //!
@@ -41,7 +41,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const STANDALONE_BINARY_PORT: u16 = 6650;
 const STANDALONE_ZK_PORT: u16 = 2181;
 const STANDALONE_HTTP_PORT: u16 = 8080;

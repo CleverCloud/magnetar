@@ -7,7 +7,7 @@
 //! broker / cluster diagnostics (brokers list, leader, failure-domains,
 //! namespace-isolation-policies).
 //!
-//! Drives a single `apachepulsar/pulsar:4.0.4` standalone container per
+//! Drives a single `apachepulsar/pulsar:latest` standalone container per
 //! test — start-up amortised across many `AdminClient` calls. Per
 //! ADR-0046 the file ships as a regular test under `cargo test`; the
 //! suite is gated on Docker being reachable, not on a feature flag or
@@ -33,7 +33,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 
@@ -465,9 +465,9 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
 
     // --- Topic retention ----------------------------------------------
 
-    // The Apache Pulsar 4.0.4 docker image ships a `standalone.conf`
+    // The Apache Pulsar `:latest` docker image (verified on 4.2.x) ships a `standalone.conf`
     // with `backlogQuotaDefaultLimitGB=10` (verified via
-    // `docker run apachepulsar/pulsar:4.0.4 cat /pulsar/conf/standalone.conf`).
+    // `docker run apachepulsar/pulsar:latest cat /pulsar/conf/standalone.conf`).
     // Per broker `checkBacklogQuota`, topic-level retention must
     // exceed the effective backlog quota; with a 10 GiB default
     // floor, any concrete retention <= 10 GiB on a freshly-created

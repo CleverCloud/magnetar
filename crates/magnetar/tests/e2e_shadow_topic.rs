@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! PIP-180 / ADR-0033 — end-to-end shadow topic tests against a real
-//! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:4.0.4`).
+//! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:latest`).
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires
 //! Docker on the host. PIP-180 is available against the baseline broker
@@ -18,7 +18,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

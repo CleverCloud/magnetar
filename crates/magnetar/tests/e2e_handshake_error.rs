@@ -28,7 +28,7 @@
 //!
 //! ## Image
 //!
-//! Uses `apachepulsar/pulsar:4.0.4` (Pulsar 4.0 LTS, our minimum supported
+//! Uses `apachepulsar/pulsar:latest` (Pulsar 4.0 LTS, our minimum supported
 //! broker version). Override with `MAGNETAR_PULSAR_IMAGE_REPO` /
 //! `MAGNETAR_PULSAR_IMAGE_TAG` env vars if you need a different tag
 //! locally.
@@ -45,7 +45,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

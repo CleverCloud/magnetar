@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! PIP-180 / ADR-0033 — replicator-role end-to-end coverage against a real
-//! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:4.0.4`).
+//! Apache Pulsar 4.x standalone broker (`apachepulsar/pulsar:latest`).
 //!
 //! Sibling of [`e2e_shadow_topic.rs`](e2e_shadow_topic.rs), which exercises
 //! the **admin REST + produce/consume happy path** against an
@@ -89,7 +89,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

@@ -23,7 +23,7 @@
 //! report wedged state.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires Docker
-//! on the host with `apachepulsar/pulsar:4.0.4` reachable.
+//! on the host with `apachepulsar/pulsar:latest` reachable.
 
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
-const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
 

@@ -94,7 +94,7 @@
 //!   either side aligns.
 //!
 //! Topics that need full Java byte parity should be validated against
-//! `apachepulsar/pulsar:4.0.4` end-to-end before being promoted to production.
+//! `apachepulsar/pulsar:latest` end-to-end before being promoted to production.
 
 use std::collections::HashSet;
 use std::marker::PhantomData;
