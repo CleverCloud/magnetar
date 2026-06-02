@@ -583,3 +583,84 @@ async fn e2e_admin_brokers_bookies_schemas() -> Result<(), Box<dyn std::error::E
 
     Ok(())
 }
+
+/// V3 admin surface (PR #5) — Functions / Sources / Sinks / Packages.
+/// Pulsar 4.0.4 standalone starts the Functions Worker by default;
+/// these tests exercise the read endpoints (list / get-as-404) which
+/// don't require a deployed connector. A real
+/// `function_create_with_url` test would need a broker-resolvable
+/// package URL — skipped here so the test stays self-contained.
+///
+/// The wiremock tests in `crates/magnetar-admin/tests/functions.rs`,
+/// `sources.rs`, `sinks.rs`, and `packages.rs` already pin the wire
+/// shape per verb; this e2e adds "broker accepts and responds" on top.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_admin_v3_functions_sources_sinks_packages() -> Result<(), Box<dyn std::error::Error>> {
+    let (_service_url, admin_url, _container) = start_pulsar().await?;
+    let admin = build_admin(&admin_url)?;
+
+    // --- Functions: list returns an empty array on a fresh broker. ---
+    let fns = admin
+        .functions_list_by_namespace("public", "default")
+        .await?;
+    assert!(
+        fns.is_empty(),
+        "functions_list_by_namespace expected empty on fresh broker, got {fns:?}"
+    );
+
+    // --- Sources: same — empty list. ---
+    let sources = admin.sources_list_by_namespace("public", "default").await?;
+    assert!(
+        sources.is_empty(),
+        "sources_list_by_namespace expected empty on fresh broker, got {sources:?}"
+    );
+
+    // --- Sinks: same. ---
+    let sinks = admin.sinks_list_by_namespace("public", "default").await?;
+    assert!(
+        sinks.is_empty(),
+        "sinks_list_by_namespace expected empty on fresh broker, got {sinks:?}"
+    );
+
+    // --- Get on a missing function must surface as Status 404 (not as
+    //     a transport error). Pin the error class so a regression that
+    //     swallowed the 404 as a transient gets caught.
+    let err = admin
+        .function_get("public", "default", "no-such-function")
+        .await
+        .expect_err("missing function must error");
+    match err {
+        magnetar_admin::AdminError::Status { code, .. } => {
+            assert!(
+                code == 404 || code == 400 || code == 500,
+                "missing function unexpected status {code}"
+            );
+        }
+        other => panic!("missing function should be AdminError::Status, got {other:?}"),
+    }
+
+    // --- Packages: list with `function` type — broker exposes the
+    //     endpoint when the Functions Worker is enabled. On a default
+    //     standalone the namespace is empty; pin "broker responds with
+    //     200 + list shape" rather than the (empty) value.
+    let pkgs = admin
+        .packages_list(magnetar_admin::PackageType::Function, "public", "default")
+        .await;
+    match pkgs {
+        Ok(list) => assert!(
+            list.is_empty(),
+            "packages_list expected empty on fresh broker, got {list:?}"
+        ),
+        Err(magnetar_admin::AdminError::Status { code, .. }) => {
+            // Some Pulsar 4.x builds 404 the namespace-scoped list
+            // until at least one package is uploaded; accept that too.
+            assert!(
+                code == 404,
+                "packages_list unexpected non-404 broker error: {code}"
+            );
+        }
+        Err(other) => panic!("packages_list transport error: {other}"),
+    }
+
+    Ok(())
+}

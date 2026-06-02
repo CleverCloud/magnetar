@@ -33,7 +33,8 @@
 
 use magnetar_admin::{
     AdminClient, AdminError, BacklogQuota, BacklogQuotaType, DelayedDeliveryPolicies, DispatchRate,
-    PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
+    FunctionConfig, PackageType, PersistencePolicies, PostSchemaPayload, PublishRate,
+    RetentionPolicies, SinkConfig, SourceConfig,
 };
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -802,6 +803,250 @@ async fn invariant_backlog_quota_error_does_not_perturb_other_policies() {
                 dispatch_throttling_rate_in_byte: 1,
                 rate_period_in_second: 1,
                 relative_to_publish_rate: false,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+// -------- PR #5 invariant coverage (V3 surface) -----------------------
+
+/// **Invariant — V3 endpoints hit `/admin/v3/` prefix, not `/admin/v2/`**.
+/// Functions / Sources / Sinks / Packages live at the V3 prefix; a
+/// regression that routed them at V2 would silently 404 against every
+/// real broker. Pin each top-level family's list endpoint hits the V3
+/// URL prefix.
+#[tokio::test]
+async fn invariant_v3_endpoints_use_admin_v3_prefix() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/admin/v3/functions/acme/svc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v3/sources/acme/svc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v3/sinks/acme/svc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v3/packages/function/acme/svc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .functions_list_by_namespace("acme", "svc")
+        .await
+        .unwrap();
+    admin
+        .sources_list_by_namespace("acme", "svc")
+        .await
+        .unwrap();
+    admin.sinks_list_by_namespace("acme", "svc").await.unwrap();
+    admin
+        .packages_list(PackageType::Function, "acme", "svc")
+        .await
+        .unwrap();
+}
+
+/// **Invariant — multipart envelope shape for URL-based register
+/// calls**. The V3 create-with-url surface for Functions / Sources /
+/// Sinks emits a `multipart/form-data` body with two parts: `url`
+/// (text) and the typed config (JSON). Pin that the broker sees the
+/// `url` field with the supplied package URL. The exact content-type
+/// header carries a boundary string that wiremock can't pin
+/// deterministically, so we assert it starts with the literal
+/// `multipart/form-data`.
+#[tokio::test]
+async fn invariant_url_based_register_uses_multipart_envelope() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v3/functions/acme/svc/echo"))
+        .respond_with(|req: &Request| {
+            let ct = req
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !ct.starts_with("multipart/form-data") {
+                return ResponseTemplate::new(500)
+                    .set_body_string(format!("expected multipart, got {ct:?}"));
+            }
+            let body = std::str::from_utf8(&req.body).unwrap_or("");
+            if !body.contains("https://example.com/echo.jar") {
+                return ResponseTemplate::new(500).set_body_string("missing url part");
+            }
+            if !body.contains("\"className\":\"com.acme.Echo\"") {
+                return ResponseTemplate::new(500).set_body_string("missing functionConfig part");
+            }
+            ResponseTemplate::new(204)
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .function_create_with_url(
+            "acme",
+            "svc",
+            "echo",
+            "https://example.com/echo.jar",
+            FunctionConfig {
+                tenant: "acme".into(),
+                namespace: "svc".into(),
+                name: "echo".into(),
+                class_name: "com.acme.Echo".into(),
+                inputs: vec!["persistent://acme/svc/in".into()],
+                output: "persistent://acme/svc/out".into(),
+                runtime: "JAVA".into(),
+                parallelism: 1,
+                user_config: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// **Invariant — `package_delete` does not affect a different package's
+/// state**. Pin that the URL is package-scoped: deleting `pkg-a` v1.0.0
+/// emits a DELETE to its own URL and never touches `pkg-b`.
+#[tokio::test]
+async fn invariant_package_delete_targets_only_the_named_package() {
+    let mock = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/admin/v3/packages/function/acme/svc/pkg-a/1.0.0"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // A DELETE that lands on `pkg-b` would 404 (no mock); we never
+    // expect it.
+    let admin = client(&mock);
+    admin
+        .package_delete(PackageType::Function, "acme", "svc", "pkg-a", "1.0.0")
+        .await
+        .unwrap();
+}
+
+/// **Invariant — Sources and Sinks share the same wire shape per
+/// family** but distinct URL families. A regression that routed a
+/// `sink_status` call at `/sources/...` would silently report the
+/// wrong subsystem's state. Pin both call distinct URLs.
+#[tokio::test]
+async fn invariant_sources_and_sinks_target_distinct_url_families() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v3/sources/acme/svc/connector-a/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v3/sinks/acme/svc/connector-a/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .source_status("acme", "svc", "connector-a")
+        .await
+        .unwrap();
+    admin
+        .sink_status("acme", "svc", "connector-a")
+        .await
+        .unwrap();
+}
+
+/// **Invariant — `function_start_instance` / `stop_instance` route to
+/// the instance-scoped URL, not the aggregate**. A regression that
+/// dropped the `instance_id` segment would start/stop ALL instances
+/// instead of one. Pin instance-scoped URL.
+#[tokio::test]
+async fn invariant_function_instance_lifecycle_routes_to_instance_url() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v3/functions/acme/svc/echo/2/start"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/admin/v3/functions/acme/svc/echo/2/stop"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .function_start_instance("acme", "svc", "echo", 2)
+        .await
+        .unwrap();
+    admin
+        .function_stop_instance("acme", "svc", "echo", 2)
+        .await
+        .unwrap();
+}
+
+/// **Invariant — SourceConfig + SinkConfig camelCase**. Per Java's
+/// `org.apache.pulsar.common.io.SourceConfig` / `SinkConfig`, the wire
+/// fields are camelCase. Pin via the `sourceConfig` / `sinkConfig`
+/// multipart JSON body shape so a Rust field rename doesn't silently
+/// drop a field on the wire.
+#[tokio::test]
+async fn invariant_io_configs_use_camel_case_field_names() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/admin/v3/sources/acme/svc/src"))
+        .respond_with(|req: &Request| {
+            let body = std::str::from_utf8(&req.body).unwrap_or("");
+            for needle in [
+                "\"className\":\"org.apache.pulsar.io.kafka.KafkaSource\"",
+                "\"topicName\":\"persistent://acme/svc/in\"",
+                "\"parallelism\":2",
+            ] {
+                if !body.contains(needle) {
+                    return ResponseTemplate::new(500).set_body_string(format!("missing {needle}"));
+                }
+            }
+            ResponseTemplate::new(204)
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .source_create_with_url(
+            "acme",
+            "svc",
+            "src",
+            "https://example.com/src.jar",
+            SourceConfig {
+                tenant: "acme".into(),
+                namespace: "svc".into(),
+                name: "src".into(),
+                class_name: "org.apache.pulsar.io.kafka.KafkaSource".into(),
+                topic_name: "persistent://acme/svc/in".into(),
+                parallelism: 2,
+                configs: None,
             },
         )
         .await
