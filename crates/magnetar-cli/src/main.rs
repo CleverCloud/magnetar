@@ -49,7 +49,7 @@ use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
     DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PersistencePolicies, PostSchemaPayload,
-    PublishRate, RetentionPolicies, SourceConfig, TenantInfo, split_function_id,
+    PublishRate, RetentionPolicies, SinkConfig, SourceConfig, TenantInfo, split_function_id,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -228,6 +228,12 @@ pub(crate) enum AdminCmd {
     Sources {
         #[command(subcommand)]
         sub: SourcesCmd,
+    },
+    /// Pulsar IO Sinks (`/admin/v3/sinks/...`) — push topic data OUT
+    /// to external systems.
+    Sinks {
+        #[command(subcommand)]
+        sub: SinksCmd,
     },
 }
 
@@ -653,6 +659,106 @@ pub(crate) enum SourcesCmd {
     Restart {
         /// `tenant/namespace/name`.
         source: String,
+    },
+}
+
+/// `admin sinks <verb>` — Pulsar IO Sinks.
+///
+/// Mirrors [`SourcesCmd`] exactly except for `--input` (repeatable on
+/// `create-with-url` / `update-with-url`) replacing `--topic-name`.
+#[derive(Debug, Subcommand)]
+pub(crate) enum SinksCmd {
+    /// List sinks in a namespace.
+    /// `GET /admin/v3/sinks/{tenant}/{namespace}`.
+    List {
+        /// `tenant/namespace`.
+        namespace: String,
+    },
+    /// Get a sink's configuration.
+    /// `GET /admin/v3/sinks/{tenant}/{namespace}/{name}`.
+    Get {
+        /// `tenant/namespace/name`.
+        sink: String,
+    },
+    /// Get a sink's running status.
+    /// `GET /admin/v3/sinks/{tenant}/{namespace}/{name}/status`.
+    Status {
+        /// `tenant/namespace/name`.
+        sink: String,
+    },
+    /// Register a sink from a remote package URL.
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}`.
+    CreateWithUrl {
+        /// Tenant.
+        #[arg(long)]
+        tenant: String,
+        /// Namespace.
+        #[arg(long)]
+        namespace: String,
+        /// Sink name.
+        #[arg(long)]
+        name: String,
+        /// Package URL.
+        #[arg(long)]
+        url: String,
+        /// Fully-qualified connector class.
+        #[arg(long)]
+        class_name: String,
+        /// Source topic the sink reads from. Repeatable.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+        /// Number of sink instances.
+        #[arg(long, default_value_t = 1)]
+        parallelism: i32,
+    },
+    /// Update a sink from a remote package URL.
+    /// `PUT /admin/v3/sinks/{tenant}/{namespace}/{name}`.
+    UpdateWithUrl {
+        /// Tenant.
+        #[arg(long)]
+        tenant: String,
+        /// Namespace.
+        #[arg(long)]
+        namespace: String,
+        /// Sink name.
+        #[arg(long)]
+        name: String,
+        /// Package URL.
+        #[arg(long)]
+        url: String,
+        /// Fully-qualified connector class.
+        #[arg(long)]
+        class_name: String,
+        /// Source topic. Repeatable.
+        #[arg(long = "input")]
+        inputs: Vec<String>,
+        /// Number of sink instances.
+        #[arg(long, default_value_t = 1)]
+        parallelism: i32,
+    },
+    /// Delete a sink.
+    /// `DELETE /admin/v3/sinks/{tenant}/{namespace}/{name}`.
+    Delete {
+        /// `tenant/namespace/name`.
+        sink: String,
+    },
+    /// Start every instance of a sink.
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}/start`.
+    Start {
+        /// `tenant/namespace/name`.
+        sink: String,
+    },
+    /// Stop every instance of a sink.
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}/stop`.
+    Stop {
+        /// `tenant/namespace/name`.
+        sink: String,
+    },
+    /// Restart every instance of a sink.
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}/restart`.
+    Restart {
+        /// `tenant/namespace/name`.
+        sink: String,
     },
 }
 
@@ -1730,6 +1836,7 @@ async fn run_admin(
         AdminCmd::Schemas { sub } => run_admin_schemas(&admin, sub).await,
         AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
         AdminCmd::Sources { sub } => run_admin_sources(&admin, sub).await,
+        AdminCmd::Sinks { sub } => run_admin_sinks(&admin, sub).await,
     }
 }
 
@@ -2845,6 +2952,89 @@ async fn run_admin_sources(admin: &AdminClient, cmd: SourcesCmd) -> Result<(), C
         SourcesCmd::Restart { source } => {
             let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
             admin.source_restart(tenant, ns, name).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_admin_sinks(admin: &AdminClient, cmd: SinksCmd) -> Result<(), CliError> {
+    match cmd {
+        SinksCmd::List { namespace } => {
+            let (tenant, ns) = split_namespace_ref(&namespace).map_err(CliError::BadArg)?;
+            print_json(&admin.sinks_list_by_namespace(tenant, ns).await?)
+        }
+        SinksCmd::Get { sink } => {
+            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            print_json(&admin.sink_get(tenant, ns, name).await?)
+        }
+        SinksCmd::Status { sink } => {
+            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            print_json(&admin.sink_status(tenant, ns, name).await?)
+        }
+        SinksCmd::CreateWithUrl {
+            tenant,
+            namespace,
+            name,
+            url,
+            class_name,
+            inputs,
+            parallelism,
+        } => {
+            let config = SinkConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                class_name,
+                inputs,
+                parallelism,
+                configs: None,
+            };
+            admin
+                .sink_create_with_url(&tenant, &namespace, &name, &url, config)
+                .await?;
+            Ok(())
+        }
+        SinksCmd::UpdateWithUrl {
+            tenant,
+            namespace,
+            name,
+            url,
+            class_name,
+            inputs,
+            parallelism,
+        } => {
+            let config = SinkConfig {
+                tenant: tenant.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                class_name,
+                inputs,
+                parallelism,
+                configs: None,
+            };
+            admin
+                .sink_update_with_url(&tenant, &namespace, &name, &url, config)
+                .await?;
+            Ok(())
+        }
+        SinksCmd::Delete { sink } => {
+            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            admin.sink_delete(tenant, ns, name).await?;
+            Ok(())
+        }
+        SinksCmd::Start { sink } => {
+            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            admin.sink_start(tenant, ns, name).await?;
+            Ok(())
+        }
+        SinksCmd::Stop { sink } => {
+            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            admin.sink_stop(tenant, ns, name).await?;
+            Ok(())
+        }
+        SinksCmd::Restart { sink } => {
+            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            admin.sink_restart(tenant, ns, name).await?;
             Ok(())
         }
     }

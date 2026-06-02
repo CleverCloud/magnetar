@@ -16,8 +16,8 @@ use clap::Parser;
 mod cli;
 
 use cli::{
-    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, SourcesCmd, SubscriptionsCmd,
-    TenantsCmd, TopicsCmd,
+    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, SinksCmd, SourcesCmd,
+    SubscriptionsCmd, TenantsCmd, TopicsCmd,
 };
 
 fn parse(args: &[&str]) -> Cli {
@@ -642,6 +642,80 @@ fn admin_sources_restart_takes_positional_id() {
                     sub: SourcesCmd::Restart { source },
                 },
         } => assert_eq!(source, "acme/svc/kafka-in"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_sinks_create_with_url_repeats_input_flag() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "sinks",
+        "create-with-url",
+        "--tenant",
+        "acme",
+        "--namespace",
+        "svc",
+        "--name",
+        "jdbc-out",
+        "--url",
+        "https://repo.example/jdbc.nar",
+        "--class-name",
+        "org.apache.pulsar.io.jdbc.PostgresJdbcAutoSchemaSink",
+        "--input",
+        "persistent://acme/svc/orders",
+        "--input",
+        "persistent://acme/svc/refunds",
+        "--parallelism",
+        "2",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Sinks {
+                    sub:
+                        SinksCmd::CreateWithUrl {
+                            tenant,
+                            namespace,
+                            name,
+                            url,
+                            class_name,
+                            inputs,
+                            parallelism,
+                        },
+                },
+        } => {
+            assert_eq!(tenant, "acme");
+            assert_eq!(namespace, "svc");
+            assert_eq!(name, "jdbc-out");
+            assert_eq!(url, "https://repo.example/jdbc.nar");
+            assert_eq!(
+                class_name,
+                "org.apache.pulsar.io.jdbc.PostgresJdbcAutoSchemaSink"
+            );
+            assert_eq!(
+                inputs,
+                vec![
+                    "persistent://acme/svc/orders".to_owned(),
+                    "persistent://acme/svc/refunds".to_owned(),
+                ]
+            );
+            assert_eq!(parallelism, 2);
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_sinks_status_takes_positional_id() {
+    let cli = parse(&["magnetar", "admin", "sinks", "status", "acme/svc/jdbc-out"]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub: AdminCmd::Sinks {
+                sub: SinksCmd::Status { sink },
+            },
+        } => assert_eq!(sink, "acme/svc/jdbc-out"),
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
