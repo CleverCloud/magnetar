@@ -1916,7 +1916,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             match instance_id {
                 Some(id) => admin.function_start_instance(t, n, fn_name, id).await?,
                 None => admin.function_start(t, n, fn_name).await?,
-            };
+            }
             Ok(())
         }
         FunctionsCmd::Stop { name, instance_id } => {
@@ -1924,7 +1924,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             match instance_id {
                 Some(id) => admin.function_stop_instance(t, n, fn_name, id).await?,
                 None => admin.function_stop(t, n, fn_name).await?,
-            };
+            }
             Ok(())
         }
         FunctionsCmd::Restart { name } => {
