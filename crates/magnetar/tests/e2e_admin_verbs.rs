@@ -465,14 +465,26 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
 
     // --- Topic retention ----------------------------------------------
 
+    // The Apache Pulsar 4.0.4 docker image ships a `standalone.conf`
+    // with `backlogQuotaDefaultLimitGB=10` (verified via
+    // `docker run apachepulsar/pulsar:4.0.4 cat /pulsar/conf/standalone.conf`).
+    // Per broker `checkBacklogQuota`, topic-level retention must
+    // exceed the effective backlog quota; with a 10 GiB default
+    // floor, any concrete retention <= 10 GiB on a freshly-created
+    // namespace (no namespace-level quota override) trips PRECONDITION
+    // FAILED. Use unlimited (-1, -1) — the broker short-circuits the
+    // check (`size <= 0 && time <= 0 → true`), and the wire format
+    // round-trips negative values verbatim, so the assertion still
+    // proves the API works without depending on the broker's quota
+    // defaults.
     let pol = RetentionPolicies {
-        retention_time_in_minutes: 30,
-        retention_size_in_mb: 512,
+        retention_time_in_minutes: -1,
+        retention_size_in_mb: -1,
     };
     admin.topic_set_retention(topic, pol).await?;
     let got = admin.topic_get_retention(topic).await?;
-    assert_eq!(got.retention_time_in_minutes, 30);
-    assert_eq!(got.retention_size_in_mb, 512);
+    assert_eq!(got.retention_time_in_minutes, -1);
+    assert_eq!(got.retention_size_in_mb, -1);
     admin.topic_remove_retention(topic).await?;
 
     // --- Topic dispatch-rate ------------------------------------------

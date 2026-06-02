@@ -78,6 +78,43 @@ async fn retention_get_set_remove_cycle() {
 }
 
 #[tokio::test]
+async fn retention_get_handles_post_remove_empty_body() {
+    // Pulsar 4 `getRetention` calls `asyncResponse.resume(policies.retention_policies)`
+    // — after a `remove`, `retention_policies` is null, which Jersey
+    // serialises as 204 No Content with an empty body (or, depending
+    // on the JAX-RS config, a literal `null` text body). Strict
+    // `json_ok` decoding errors with `EOF while parsing a value` /
+    // `invalid type: null, expected struct RetentionPolicies`. The
+    // tolerant decoder folds either case to `RetentionPolicies::default()`
+    // — matching the broker semantic "policy unset = broker default".
+    for (body, status) in [
+        (None, 204_u16),                      // No Content
+        (Some(serde_json::Value::Null), 200), // literal `null`
+        (Some(serde_json::json!({})), 200),   // empty object (older brokers)
+    ] {
+        let mock = MockServer::start().await;
+        let resp = if let Some(b) = body {
+            ResponseTemplate::new(status).set_body_json(b)
+        } else {
+            ResponseTemplate::new(status)
+        };
+        Mock::given(method("GET"))
+            .and(path("/admin/v2/namespaces/acme/svc/retention"))
+            .respond_with(resp)
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let admin = client(&mock);
+        let pol = admin
+            .namespace_get_retention("acme/svc")
+            .await
+            .expect("post-remove get must not surface as EOF / type error");
+        assert_eq!(pol.retention_time_in_minutes, 0);
+        assert_eq!(pol.retention_size_in_mb, 0);
+    }
+}
+
+#[tokio::test]
 async fn backlog_quota_set_with_destination_storage_type() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))

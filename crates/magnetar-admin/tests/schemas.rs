@@ -51,7 +51,10 @@ async fn schema_get_latest_returns_envelope() {
 }
 
 #[tokio::test]
-async fn schema_list_versions_returns_array() {
+async fn schema_list_versions_accepts_bare_array() {
+    // Legacy / proxy surfaces may emit a bare JSON array for this
+    // endpoint; pinning that we still accept the flat shape so
+    // older deployments don't break on upgrade.
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/admin/v2/schemas/public/default/orders/schemas"))
@@ -68,6 +71,36 @@ async fn schema_list_versions_returns_array() {
         .schema_list_versions("public/default/orders")
         .await
         .expect("list-versions returns 200");
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0]["version"], 1);
+    assert_eq!(versions[1]["version"], 2);
+}
+
+#[tokio::test]
+async fn schema_list_versions_unwraps_get_all_versions_envelope() {
+    // Pulsar 4 wraps per-version entries in
+    // `GetAllVersionsSchemaResponse { getSchemaResponses: [...] }`
+    // (per `SchemasResourceBase#convertToAllVersionsSchemaResponse`).
+    // The admin client unwraps that envelope at the boundary so
+    // callers see a flat `Vec<Value>`.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/schemas/public/default/orders/schemas"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "getSchemaResponses": [
+                { "version": 1, "type": "AVRO", "schema": "v1", "properties": {} },
+                { "version": 2, "type": "AVRO", "schema": "v2", "properties": {} },
+            ]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let versions = admin
+        .schema_list_versions("public/default/orders")
+        .await
+        .expect("list-versions returns 200 envelope");
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0]["version"], 1);
     assert_eq!(versions[1]["version"], 2);

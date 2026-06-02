@@ -484,11 +484,16 @@ impl AdminClient {
 
     /// List every schema version registered for a topic.
     ///
-    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schemas`. Returns a
-    /// JSON array — one entry per version, each carrying the same
-    /// per-version shape as [`Self::schema_get_latest`]. Raw JSON for
-    /// forward-compat.
-    /// Java: `SchemasResourceBase#getAllSchemas`.
+    /// `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schemas`. Pulsar 4
+    /// wraps the per-version entries in a
+    /// `GetAllVersionsSchemaResponse { getSchemaResponses: [...] }`
+    /// envelope (verified against `apache/pulsar@v4.0.4`
+    /// `SchemasResourceBase#convertToAllVersionsSchemaResponse`). We
+    /// unwrap that envelope at the boundary so callers see the flat
+    /// `Vec<Value>` they expect; a bare-array shape (older or
+    /// alternative serialisations) is still accepted. Raw JSON
+    /// per-entry for forward-compat. Java:
+    /// `SchemasResourceBase#getAllSchemas`.
     pub async fn schema_list_versions(
         &self,
         topic: &str,
@@ -496,7 +501,23 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["schemas", tenant, namespace, name, "schemas"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        let v: serde_json::Value = json_ok(resp).await?;
+        match v {
+            serde_json::Value::Array(items) => Ok(items),
+            serde_json::Value::Object(mut envelope) => {
+                if let Some(serde_json::Value::Array(items)) = envelope.remove("getSchemaResponses")
+                {
+                    return Ok(items);
+                }
+                Err(AdminError::Protocol(format!(
+                    "schemas/.../schemas envelope missing `getSchemaResponses` array: {}",
+                    serde_json::Value::Object(envelope)
+                )))
+            }
+            other => Err(AdminError::Protocol(format!(
+                "schemas/.../schemas returned unexpected shape: {other}"
+            ))),
+        }
     }
 
     /// Register a new schema version on a topic.
@@ -953,12 +974,15 @@ impl AdminClient {
     ///
     /// `GET /admin/v2/namespaces/{tenant}/{ns}/retention`.
     /// Returns `RetentionPolicies { retentionTimeInMinutes, retentionSizeInMB }`.
+    /// A fresh namespace, or a namespace whose retention was just
+    /// removed, surfaces as 204 / empty body / `null` — we fold those
+    /// to `RetentionPolicies::default()` (broker semantic).
     /// Java: `NamespacesBase#getRetention`.
     pub async fn namespace_get_retention(&self, ns: &str) -> Result<RetentionPolicies, AdminError> {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "retention"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_or_default(resp).await
     }
 
     /// Set a namespace's retention policy.
@@ -1104,7 +1128,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "persistence"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_or_default(resp).await
     }
 
     /// Set a namespace's persistence policy.
@@ -1146,7 +1170,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "dispatchRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_or_default(resp).await
     }
 
     /// Set a namespace's consumer dispatch-rate policy.
@@ -1284,7 +1308,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "publishRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_or_default(resp).await
     }
 
     /// Set a namespace's publish-rate policy.
@@ -2005,7 +2029,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "retention"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_or_default(resp).await
     }
 
     /// Set a topic's retention policy (overrides the namespace default).
@@ -4099,6 +4123,39 @@ where
     let resp = ensure_status(resp).await?;
     let bytes = resp.bytes().await?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Decode a JSON response body, defaulting to `T::default()` when the
+/// broker returns 204 / empty body / literal `null`. Pulsar's
+/// "policy-unset" pattern collapses to one of those three encodings:
+///
+/// - `getRetention` / `getPersistence` / `getDispatchRate` / `getPublishRate` on a fresh namespace
+///   surface `null` through Jersey's `resume(null)`, which travels as 204 No Content;
+/// - `getTopicPolicies` on a topic with no explicit policy returns either 204 or the literal JSON
+///   `null`.
+///
+/// `json_ok::<RetentionPolicies>` errors with `EOF while parsing a
+/// value` for either case; this helper maps them to
+/// `RetentionPolicies::default()` (broker semantic: missing fields ==
+/// broker default). Callers asserting "post-remove returns the
+/// default" stay correct without changing the public signature.
+async fn json_ok_or_default<T>(resp: Response) -> Result<T, AdminError>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    let resp = ensure_status(resp).await?;
+    if resp.status() == StatusCode::NO_CONTENT {
+        return Ok(T::default());
+    }
+    let bytes = resp.bytes().await?;
+    if bytes.is_empty() {
+        return Ok(T::default());
+    }
+    // `null` body — broker says "policy unset" — also folds to default.
+    if bytes.as_ref().trim_ascii() == b"null" {
+        return Ok(T::default());
+    }
+    Ok(serde_json::from_slice::<T>(&bytes)?)
 }
 
 /// Decode a JSON response body that the broker may emit as an empty
