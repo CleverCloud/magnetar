@@ -3437,56 +3437,125 @@ pub struct RetentionPolicies {
 
 /// Java `PersistencePolicies` — namespace-level BookKeeper layout +
 /// managed-ledger write-shaping knobs. Maps to the broker's
-/// `org.apache.pulsar.common.policies.data.PersistencePolicies`. Use
-/// `Default` (`0/0/0/0.0`) only for "unset" semantics — the broker
-/// rejects ensemble values < 1 on `set`.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+/// `org.apache.pulsar.common.policies.data.PersistencePolicies`.
+///
+/// `Default::default()` returns the broker's documented default for a
+/// new namespace (`2/2/2/0.0`), NOT all zeros — the broker rejects
+/// ensemble values < 1 on `set`, so an all-zero policy is unusable
+/// for a round-trip. Missing fields on decode default the same way:
+/// a partial body where the broker omits one field round-trips with
+/// the legal default, never with the illegal `0`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PersistencePolicies {
     /// BookKeeper ensemble size — the number of bookies the managed
-    /// ledger striping is spread across.
+    /// ledger striping is spread across. Default: 2.
+    #[serde(default = "default_bookkeeper_quorum")]
     pub bookkeeper_ensemble: i32,
     /// BookKeeper write quorum — the number of bookies each entry is
-    /// written to.
+    /// written to. Default: 2.
+    #[serde(default = "default_bookkeeper_quorum")]
     pub bookkeeper_write_quorum: i32,
     /// BookKeeper ack quorum — the number of acks required before an
-    /// add is considered durable.
+    /// add is considered durable. Default: 2.
+    #[serde(default = "default_bookkeeper_quorum")]
     pub bookkeeper_ack_quorum: i32,
     /// Managed-ledger mark-delete-rate cap (ops/sec). `0.0` disables
-    /// the throttle.
+    /// the throttle. Default: 0.0 (disabled).
+    #[serde(default)]
     pub managed_ledger_max_mark_delete_rate: f64,
+}
+
+impl Default for PersistencePolicies {
+    fn default() -> Self {
+        Self {
+            bookkeeper_ensemble: 2,
+            bookkeeper_write_quorum: 2,
+            bookkeeper_ack_quorum: 2,
+            managed_ledger_max_mark_delete_rate: 0.0,
+        }
+    }
+}
+
+#[inline]
+fn default_bookkeeper_quorum() -> i32 {
+    2
 }
 
 /// Java `DispatchRate` — a sliding-window throttle (msg/sec + byte/sec
 /// over a `ratePeriodInSecond` window). Shared shape between the
 /// per-namespace consumer dispatch rate, the per-subscription dispatch
-/// rate, and the cross-cluster replicator dispatch rate. `-1` on either
-/// dimension disables that axis of the throttle.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+/// rate, and the cross-cluster replicator dispatch rate.
+///
+/// `-1` on either rate dimension disables that axis of the throttle —
+/// missing fields default to `-1` (not `0`) so a broker-omitted
+/// dimension round-trips as "no throttle", never as "throttle to
+/// zero" (which would block consumer dispatch on the namespace).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DispatchRate {
     /// Throttle in messages/sec. `-1` = unlimited.
+    #[serde(default = "neg_one_i32")]
     pub dispatch_throttling_rate_in_msg: i32,
     /// Throttle in bytes/sec. `-1` = unlimited.
+    #[serde(default = "neg_one_i64")]
     pub dispatch_throttling_rate_in_byte: i64,
     /// Window size in seconds the throttle averages over.
+    #[serde(default = "default_rate_period_seconds")]
     pub rate_period_in_second: i32,
     /// If `true`, dispatch rate is interpreted as an addend on top of
     /// the namespace publish rate rather than an absolute cap.
+    #[serde(default)]
     pub relative_to_publish_rate: bool,
 }
 
+impl Default for DispatchRate {
+    fn default() -> Self {
+        Self {
+            dispatch_throttling_rate_in_msg: -1,
+            dispatch_throttling_rate_in_byte: -1,
+            rate_period_in_second: 1,
+            relative_to_publish_rate: false,
+        }
+    }
+}
+
 /// Java `PublishRate` — producer-side throttle (msg/sec + byte/sec).
-/// `-1` on either dimension disables that axis of the throttle. Unlike
-/// `DispatchRate`, there is no rate-period field — the broker uses a
-/// fixed 1-second window.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+/// `-1` on either dimension disables that axis of the throttle.
+/// Missing fields default to `-1` (not `0`) — same sentinel semantics
+/// as [`DispatchRate`]. Unlike `DispatchRate`, there is no
+/// rate-period field; the broker uses a fixed 1-second window.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublishRate {
     /// Throttle in messages/sec. `-1` = unlimited.
+    #[serde(default = "neg_one_i32")]
     pub publish_throttling_rate_in_msg: i32,
     /// Throttle in bytes/sec. `-1` = unlimited.
+    #[serde(default = "neg_one_i64")]
     pub publish_throttling_rate_in_byte: i64,
+}
+
+impl Default for PublishRate {
+    fn default() -> Self {
+        Self {
+            publish_throttling_rate_in_msg: -1,
+            publish_throttling_rate_in_byte: -1,
+        }
+    }
+}
+
+#[inline]
+fn neg_one_i32() -> i32 {
+    -1
+}
+#[inline]
+fn neg_one_i64() -> i64 {
+    -1
+}
+#[inline]
+fn default_rate_period_seconds() -> i32 {
+    1
 }
 
 /// Java `DelayedDeliveryPolicies` — namespace-level switch + index-tick
@@ -3515,17 +3584,34 @@ pub struct DelayedDeliveryPolicies {
 /// map. `policy` is a string (`producer_request_hold`,
 /// `producer_exception`, `consumer_backlog_eviction`) rather than a
 /// closed Rust enum so new broker enum values forward-decode cleanly.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+///
+/// `-1` on either limit dimension disables that axis — missing fields
+/// default to `-1` (not `0`) so a broker-omitted dimension round-trips
+/// as "no quota", never as "expire-everything" or "block-everything".
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BacklogQuota {
     /// Maximum allowed backlog in bytes (when type=`destination_storage`).
     /// `-1` = unlimited.
+    #[serde(default = "neg_one_i64")]
     pub limit_size: i64,
     /// Maximum allowed backlog age in seconds (when type=`message_age`).
     /// `-1` = unlimited.
+    #[serde(default = "neg_one_i32")]
     pub limit_time: i32,
     /// Action when the quota is exceeded.
+    #[serde(default)]
     pub policy: String,
+}
+
+impl Default for BacklogQuota {
+    fn default() -> Self {
+        Self {
+            limit_size: -1,
+            limit_time: -1,
+            policy: String::new(),
+        }
+    }
 }
 
 /// Java `BookieInfo` — a single bookie's rack assignment, as stored in

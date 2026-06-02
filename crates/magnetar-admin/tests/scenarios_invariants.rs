@@ -702,6 +702,44 @@ async fn invariant_optional_getter_tolerates_empty_body_and_204() {
     );
 }
 
+/// **Invariant — DispatchRate / PublishRate / BacklogQuota partial
+/// decode defaults to `-1` (unlimited), not `0` (zero-throttle).
+/// Pulsar emits these policies with `-1` as the documented "unlimited"
+/// sentinel and `0` as a legal value ("throttle to zero"). A
+/// `#[serde(default)]` that uses `0` would silently turn a
+/// broker-omitted dimension into a full block on GET-then-SET
+/// round-trips — pin the right sentinel.
+#[tokio::test]
+async fn invariant_rate_dtos_default_missing_fields_to_minus_one_sentinel() {
+    let mock = MockServer::start().await;
+
+    // Broker emits a partial DispatchRate body (only the msg rate set).
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/dispatchRate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dispatchThrottlingRateInMsg": 1000,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    let rate = admin
+        .topic_get_dispatch_rate("acme/svc/orders")
+        .await
+        .expect("decode partial dispatch-rate body")
+        .expect("topic-level override present");
+    assert_eq!(rate.dispatch_throttling_rate_in_msg, 1000);
+    assert_eq!(
+        rate.dispatch_throttling_rate_in_byte, -1,
+        "missing byte rate should default to -1 (unlimited)"
+    );
+    assert_eq!(
+        rate.rate_period_in_second, 1,
+        "missing rate period should default to 1 second"
+    );
+}
+
 /// **Invariant — delayed-delivery composability**: the
 /// `DelayedDeliveryPolicies { active, tickTime }` body must round-trip
 /// both fields. The Java field name is `tickTime` (not
