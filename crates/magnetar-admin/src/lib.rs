@@ -995,7 +995,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "messageTTL"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's message-TTL (seconds).
@@ -1267,7 +1267,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "deduplication"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's broker-side message deduplication flag.
@@ -1318,7 +1318,7 @@ impl AdminClient {
             "deduplicationSnapshotInterval",
         ])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's deduplication-snapshot interval (entries).
@@ -1377,7 +1377,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "compactionThreshold"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's compaction threshold (bytes).
@@ -1422,7 +1422,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "delayedDelivery"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's delayed-delivery policy.
@@ -1468,7 +1468,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "maxProducersPerTopic"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's max-producers-per-topic limit.
@@ -1517,7 +1517,7 @@ impl AdminClient {
         let (tenant, namespace) = split_namespace(ns)?;
         let url = self.url(&["namespaces", tenant, namespace, "maxConsumersPerTopic"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's max-consumers-per-topic limit.
@@ -1571,7 +1571,7 @@ impl AdminClient {
             "maxUnackedMessagesPerConsumer",
         ])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's max-unacked-messages-per-consumer limit.
@@ -1636,7 +1636,7 @@ impl AdminClient {
             "maxUnackedMessagesPerSubscription",
         ])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a namespace's max-unacked-messages-per-subscription limit.
@@ -2014,7 +2014,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "messageTTL"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's message-TTL (seconds).
@@ -2060,7 +2060,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "persistence"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's persistence policy (overrides the namespace default).
@@ -2105,7 +2105,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "dispatchRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's consumer dispatch-rate policy (overrides namespace default).
@@ -2155,7 +2155,7 @@ impl AdminClient {
             "subscriptionDispatchRate",
         ])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's per-subscription dispatch-rate policy (overrides namespace default).
@@ -2221,7 +2221,7 @@ impl AdminClient {
             "replicatorDispatchRate",
         ])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's cross-cluster replicator dispatch-rate policy.
@@ -2281,7 +2281,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "publishRate"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's publish-rate policy (overrides namespace default).
@@ -2322,7 +2322,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "maxProducers"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's max-producers cap.
@@ -2364,7 +2364,7 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(topic)?;
         let url = self.url(&["persistent", tenant, namespace, name, "maxConsumers"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_optional(resp).await
     }
 
     /// Set a topic's max-consumers cap.
@@ -3873,6 +3873,34 @@ where
     let resp = ensure_status(resp).await?;
     let bytes = resp.bytes().await?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Decode a JSON response body that the broker may emit as an empty
+/// payload to mean "no value here". Pulsar's pattern for "no override
+/// set" on the policy GET endpoints is to return `204 No Content` (or
+/// a 200 with an empty body) rather than the literal JSON `null`;
+/// `serde_json::from_slice::<Option<T>>(b"")` errors with `EOF while
+/// parsing a value`, so every `namespace_get_*` / `topic_get_*` that
+/// returns `Option<T>` needs this tolerant decoder.
+///
+/// Decoding rules:
+///   - 204 No Content                  → `Ok(None)`
+///   - 2xx with empty body bytes       → `Ok(None)`
+///   - 2xx with the literal `null`     → `Ok(None)`
+///   - 2xx with a JSON value           → `Ok(Some(value))` via serde
+async fn json_ok_optional<T>(resp: Response) -> Result<Option<T>, AdminError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let resp = ensure_status(resp).await?;
+    if resp.status() == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    let bytes = resp.bytes().await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice::<Option<T>>(&bytes)?)
 }
 
 /// Discard a successful no-content response body.

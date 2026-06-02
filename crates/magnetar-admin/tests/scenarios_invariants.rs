@@ -629,6 +629,79 @@ async fn invariant_topic_policy_get_decodes_null_as_none() {
     );
 }
 
+/// **Invariant — Option<T> getter decodes empty body / 204 No Content
+/// as `None`**. In practice the broker emits the literal `null`
+/// inconsistently — many policy GETs simply 204 with no body, and
+/// `serde_json::from_slice::<Option<T>>(b"")` fails with
+/// `EOF while parsing a value`. The client routes every
+/// `Option<T>`-returning getter through `json_ok_optional`, which
+/// treats both shapes as `Ok(None)`. Pinned for namespace_get_*
+/// (i32 + Policies) and topic_get_* (i32) to defend against a
+/// regression that re-introduces the unconditional `json_ok` path.
+#[tokio::test]
+async fn invariant_optional_getter_tolerates_empty_body_and_204() {
+    let mock = MockServer::start().await;
+
+    // 204 No Content — namespace_get_message_ttl.
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/messageTTL"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // 200 with empty body — namespace_get_deduplication.
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/deduplication"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // 200 with empty body — namespace_get_delayed_delivery.
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    // 204 No Content — topic_get_max_producers.
+    Mock::given(method("GET"))
+        .and(path("/admin/v2/persistent/acme/svc/orders/maxProducers"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    assert!(
+        admin
+            .namespace_get_message_ttl("acme/svc")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        admin
+            .namespace_get_deduplication("acme/svc")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        admin
+            .namespace_get_delayed_delivery("acme/svc")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        admin
+            .topic_get_max_producers("acme/svc/orders")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// **Invariant — delayed-delivery composability**: the
 /// `DelayedDeliveryPolicies { active, tickTime }` body must round-trip
 /// both fields. The Java field name is `tickTime` (not
