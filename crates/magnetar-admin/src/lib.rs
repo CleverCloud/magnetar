@@ -616,6 +616,70 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    // --- Pulsar Functions (URL-based register / update) ----------------
+
+    /// Register a function from a remote package URL.
+    ///
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}` with a
+    /// `multipart/form-data` body carrying two parts: `url=<pkg-url>`
+    /// (the broker-resolvable HTTP / `function://` / `file://` URL of
+    /// the compiled package) and `functionConfig=<json>` (the
+    /// serialised [`FunctionConfig`]). The local-file upload path
+    /// (Java's `FunctionsBase#registerFunction` with a
+    /// `FormDataMultiPart` `data` part) is intentionally out of scope
+    /// for this method — operators with a pre-built JAR served over
+    /// HTTP / S3 / GCS use the URL path.
+    ///
+    /// The two-part envelope matches Java's
+    /// `FunctionsBase#registerFunction(@PathParam tenant, ...,
+    /// @FormDataParam("url") String functionPkgUrl,
+    /// @FormDataParam("functionConfig") FunctionConfig functionConfig)`
+    /// — when `data` is null and `url` is non-null the broker takes the
+    /// URL fast-path and skips the upload step.
+    pub async fn function_create_with_url(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        url: &str,
+        config: FunctionConfig,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let endpoint = self.url_v3(&["functions", tenant, namespace, name])?;
+        let form = function_pkg_form(url, &config)?;
+        let resp = self
+            .send(self.http.request(Method::POST, endpoint).multipart(form))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Update an existing function from a remote package URL.
+    ///
+    /// `PUT /admin/v3/functions/{tenant}/{namespace}/{name}` with the
+    /// same two-part `multipart/form-data` shape as
+    /// [`Self::function_create_with_url`]. Java:
+    /// `FunctionsBase#updateFunction` with non-null `pkgUrl`.
+    pub async fn function_update_with_url(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        url: &str,
+        config: FunctionConfig,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let endpoint = self.url_v3(&["functions", tenant, namespace, name])?;
+        let form = function_pkg_form(url, &config)?;
+        let resp = self
+            .send(self.http.request(Method::PUT, endpoint).multipart(form))
+            .await?;
+        empty_ok(resp).await
+    }
+
     // --- Pulsar Functions (lifecycle) -----------------------------------
 
     /// Deregister (delete) a function.
@@ -3207,6 +3271,26 @@ fn split_topic(topic: &str) -> Result<(&str, &str, &str), AdminError> {
     validate_segment(namespace)?;
     validate_segment(name)?;
     Ok((tenant, namespace, name))
+}
+
+/// Build the two-part `multipart/form-data` envelope the broker expects
+/// on URL-based function register / update calls. Order is fixed (`url`
+/// then `functionConfig`) so wire-level tests can pin the body shape.
+/// The `functionConfig` part carries an explicit `application/json`
+/// content type; without it the broker's Jersey
+/// `FormDataMultiPartFeature` falls back to `text/plain` and refuses
+/// the JSON.
+fn function_pkg_form(
+    pkg_url: &str,
+    config: &FunctionConfig,
+) -> Result<reqwest::multipart::Form, AdminError> {
+    let config_json = serde_json::to_string(config)?;
+    let config_part = reqwest::multipart::Part::text(config_json)
+        .mime_str("application/json")
+        .map_err(|err| AdminError::Builder(format!("invalid multipart mime: {err}")))?;
+    Ok(reqwest::multipart::Form::new()
+        .text("url", pkg_url.to_owned())
+        .part("functionConfig", config_part))
 }
 
 /// Split a `tenant/namespace/name` Functions / IO identifier into its
