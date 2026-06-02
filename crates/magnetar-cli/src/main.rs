@@ -48,8 +48,9 @@ use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
     AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
-    DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PersistencePolicies, PostSchemaPayload,
-    PublishRate, RetentionPolicies, SinkConfig, SourceConfig, TenantInfo, split_function_id,
+    DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PackageMetadata, PackageType,
+    PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies, SinkConfig,
+    SourceConfig, TenantInfo, split_function_id,
 };
 
 /// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -234,6 +235,13 @@ pub(crate) enum AdminCmd {
     Sinks {
         #[command(subcommand)]
         sub: SinksCmd,
+    },
+    /// Pulsar Packages (`/admin/v3/packages/...`) — the versioned
+    /// binary registry that Functions / Sources / Sinks JARs and
+    /// NARs live in.
+    Packages {
+        #[command(subcommand)]
+        sub: PackagesCmd,
     },
 }
 
@@ -759,6 +767,78 @@ pub(crate) enum SinksCmd {
     Restart {
         /// `tenant/namespace/name`.
         sink: String,
+    },
+}
+
+/// `admin packages <verb>` — Pulsar Packages registry.
+///
+/// `TYPE` is parsed via [`parse_package_type`] (accepts both singular
+/// and pluralised aliases — `function` / `functions`, etc.).
+#[derive(Debug, Subcommand)]
+pub(crate) enum PackagesCmd {
+    /// List package names declared for one type under a namespace.
+    /// `GET /admin/v3/packages/{type}/{tenant}/{namespace}`.
+    List {
+        /// Package type (`function` / `source` / `sink`).
+        #[arg(value_parser = parse_package_type)]
+        package_type: PackageType,
+        /// `tenant/namespace`.
+        namespace: String,
+    },
+    /// List the versions declared for one package.
+    /// `GET /admin/v3/packages/{type}/{tenant}/{namespace}/{name}`.
+    Versions {
+        /// Package type.
+        #[arg(value_parser = parse_package_type)]
+        package_type: PackageType,
+        /// `tenant/namespace/name`.
+        package: String,
+    },
+    /// Get the metadata envelope for one package version.
+    /// `GET .../{name}/{version}/metadata`.
+    MetadataGet {
+        /// Package type.
+        #[arg(value_parser = parse_package_type)]
+        package_type: PackageType,
+        /// `tenant/namespace/name`.
+        package: String,
+        /// Package version (broker treats versions as opaque
+        /// strings — `1.0.0`, `latest`, build hashes).
+        #[arg(long)]
+        version: String,
+    },
+    /// Replace the metadata envelope for one package version.
+    /// `PUT .../{name}/{version}/metadata`.
+    MetadataSet {
+        /// Package type.
+        #[arg(value_parser = parse_package_type)]
+        package_type: PackageType,
+        /// `tenant/namespace/name`.
+        package: String,
+        /// Package version.
+        #[arg(long)]
+        version: String,
+        /// Free-form description.
+        #[arg(long)]
+        description: String,
+        /// Maintainer contact (email / team handle).
+        #[arg(long)]
+        contact: String,
+        /// Arbitrary property in `key=value` form. Repeatable.
+        #[arg(long = "property", value_parser = parse_property)]
+        properties: Vec<(String, String)>,
+    },
+    /// Delete one package version.
+    /// `DELETE .../{name}/{version}`.
+    Delete {
+        /// Package type.
+        #[arg(value_parser = parse_package_type)]
+        package_type: PackageType,
+        /// `tenant/namespace/name`.
+        package: String,
+        /// Package version.
+        #[arg(long)]
+        version: String,
     },
 }
 
@@ -1837,6 +1917,7 @@ async fn run_admin(
         AdminCmd::Functions { sub } => run_admin_functions(&admin, sub).await,
         AdminCmd::Sources { sub } => run_admin_sources(&admin, sub).await,
         AdminCmd::Sinks { sub } => run_admin_sinks(&admin, sub).await,
+        AdminCmd::Packages { sub } => run_admin_packages(&admin, sub).await,
     }
 }
 
@@ -3040,6 +3121,75 @@ async fn run_admin_sinks(admin: &AdminClient, cmd: SinksCmd) -> Result<(), CliEr
     }
 }
 
+async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(), CliError> {
+    match cmd {
+        PackagesCmd::List {
+            package_type,
+            namespace,
+        } => {
+            let (tenant, ns) = split_namespace_ref(&namespace).map_err(CliError::BadArg)?;
+            print_json(&admin.packages_list(package_type, tenant, ns).await?)
+        }
+        PackagesCmd::Versions {
+            package_type,
+            package,
+        } => {
+            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            print_json(
+                &admin
+                    .package_versions_list(package_type, tenant, ns, name)
+                    .await?,
+            )
+        }
+        PackagesCmd::MetadataGet {
+            package_type,
+            package,
+            version,
+        } => {
+            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            print_json(
+                &admin
+                    .package_metadata_get(package_type, tenant, ns, name, &version)
+                    .await?,
+            )
+        }
+        PackagesCmd::MetadataSet {
+            package_type,
+            package,
+            version,
+            description,
+            contact,
+            properties,
+        } => {
+            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            let metadata = PackageMetadata {
+                description,
+                contact,
+                // Read-only on the broker; it overwrites caller-supplied
+                // values with its receive timestamp. Sending `0` keeps the
+                // body shape honest without inviting a stale clock.
+                modification_time: 0,
+                properties: properties.into_iter().collect(),
+            };
+            admin
+                .package_metadata_set(package_type, tenant, ns, name, &version, metadata)
+                .await?;
+            Ok(())
+        }
+        PackagesCmd::Delete {
+            package_type,
+            package,
+            version,
+        } => {
+            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            admin
+                .package_delete(package_type, tenant, ns, name, &version)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
 /// Split `tenant/namespace/name` into its three segments. Used by
 /// Pulsar IO Sources / Sinks and Pulsar Packages — the broker's
 /// `SourcesBase` / `SinksBase` / `PackagesBase` resources all carry
@@ -3178,6 +3328,15 @@ fn parse_property(spec: &str) -> Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got `{spec}`"))?;
     Ok((k.to_owned(), v.to_owned()))
+}
+
+/// Parse a Pulsar Packages `{type}` token from the CLI form. Delegates
+/// to `PackageType::FromStr` (which accepts the broker's lowercase
+/// tokens plus their pluralised aliases) and re-shapes the
+/// `AdminError::InvalidName` into the plain `String` that clap's
+/// `value_parser` expects.
+fn parse_package_type(s: &str) -> Result<PackageType, String> {
+    s.parse::<PackageType>().map_err(|e| e.to_string())
 }
 
 fn parse_sub_type(s: &str) -> Result<SubType, String> {

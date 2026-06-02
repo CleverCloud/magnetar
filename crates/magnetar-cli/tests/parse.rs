@@ -16,9 +16,10 @@ use clap::Parser;
 mod cli;
 
 use cli::{
-    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, ShadowCmd, SinksCmd, SourcesCmd,
+    AdminCmd, Cli, ClustersCmd, Cmd, NamespacesCmd, PackagesCmd, ShadowCmd, SinksCmd, SourcesCmd,
     SubscriptionsCmd, TenantsCmd, TopicsCmd,
 };
+use magnetar_admin::PackageType;
 
 fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(args).expect("parse")
@@ -716,6 +717,147 @@ fn admin_sinks_status_takes_positional_id() {
                 sub: SinksCmd::Status { sink },
             },
         } => assert_eq!(sink, "acme/svc/jdbc-out"),
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_packages_list_accepts_function_token() {
+    let cli = parse(&[
+        "magnetar", "admin", "packages", "list", "function", "acme/svc",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Packages {
+                    sub:
+                        PackagesCmd::List {
+                            package_type,
+                            namespace,
+                        },
+                },
+        } => {
+            assert_eq!(package_type, PackageType::Function);
+            assert_eq!(namespace, "acme/svc");
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_packages_versions_accepts_pluralised_source() {
+    // FromStr accepts both `source` and `sources` — the CLI delegates to
+    // the admin parser, so confirm the alias flows through clap.
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "packages",
+        "versions",
+        "sources",
+        "acme/svc/kafka-in",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Packages {
+                    sub:
+                        PackagesCmd::Versions {
+                            package_type,
+                            package,
+                        },
+                },
+        } => {
+            assert_eq!(package_type, PackageType::Source);
+            assert_eq!(package, "acme/svc/kafka-in");
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_packages_metadata_set_collects_properties() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "packages",
+        "metadata-set",
+        "sink",
+        "acme/svc/jdbc-out",
+        "--version",
+        "1.0.0",
+        "--description",
+        "JDBC sink for prod",
+        "--contact",
+        "team-data@acme.example",
+        "--property",
+        "owner=team-a",
+        "--property",
+        "release=2026-Q1",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Packages {
+                    sub:
+                        PackagesCmd::MetadataSet {
+                            package_type,
+                            package,
+                            version,
+                            description,
+                            contact,
+                            properties,
+                        },
+                },
+        } => {
+            assert_eq!(package_type, PackageType::Sink);
+            assert_eq!(package, "acme/svc/jdbc-out");
+            assert_eq!(version, "1.0.0");
+            assert_eq!(description, "JDBC sink for prod");
+            assert_eq!(contact, "team-data@acme.example");
+            assert_eq!(properties.len(), 2);
+            assert!(
+                properties
+                    .iter()
+                    .any(|(k, v)| k == "owner" && v == "team-a")
+            );
+            assert!(
+                properties
+                    .iter()
+                    .any(|(k, v)| k == "release" && v == "2026-Q1")
+            );
+        }
+        other => panic!("unexpected cmd: {other:?}"),
+    }
+}
+
+#[test]
+fn admin_packages_delete_requires_version_flag() {
+    let cli = parse(&[
+        "magnetar",
+        "admin",
+        "packages",
+        "delete",
+        "sink",
+        "acme/svc/jdbc-out",
+        "--version",
+        "1.0.0",
+    ]);
+    match cli.cmd {
+        Cmd::Admin {
+            sub:
+                AdminCmd::Packages {
+                    sub:
+                        PackagesCmd::Delete {
+                            package_type,
+                            package,
+                            version,
+                        },
+                },
+        } => {
+            assert_eq!(package_type, PackageType::Sink);
+            assert_eq!(package, "acme/svc/jdbc-out");
+            assert_eq!(version, "1.0.0");
+        }
         other => panic!("unexpected cmd: {other:?}"),
     }
 }
