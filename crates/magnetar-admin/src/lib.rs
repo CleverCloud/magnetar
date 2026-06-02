@@ -3069,6 +3069,148 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Pulsar Packages (/admin/v3/packages/...) -----------------------
+
+    /// List package names declared under (`type`, `tenant`, `namespace`).
+    ///
+    /// `GET /admin/v3/packages/{type}/{tenant}/{namespace}`. Returns the
+    /// list of package names — *not* versions; one entry per declared
+    /// package. Use [`Self::package_versions_list`] to enumerate the
+    /// versions of one package.
+    /// Java: `pulsar-broker/src/main/java/org/apache/pulsar/broker/
+    /// admin/v3/Packages.java#listPackages`.
+    pub async fn packages_list(
+        &self,
+        pkg_type: PackageType,
+        tenant: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        let url = self.url_v3(&["packages", pkg_type.as_str(), tenant, namespace])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// List the versions declared for one package.
+    ///
+    /// `GET /admin/v3/packages/{type}/{tenant}/{namespace}/{name}`.
+    /// Returns the list of version strings (Pulsar treats versions as
+    /// opaque strings — `1.0.0`, `latest`, build hashes — and only the
+    /// metadata endpoints understand them).
+    /// Java: `PackagesBase#listPackageVersions`.
+    pub async fn package_versions_list(
+        &self,
+        pkg_type: PackageType,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<String>, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["packages", pkg_type.as_str(), tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get the metadata envelope for one package version.
+    ///
+    /// `GET /admin/v3/packages/{type}/{tenant}/{namespace}/{name}/
+    /// {version}/metadata`. Returns the `PackageMetadata` envelope as
+    /// raw JSON for forward-compat — broker minor versions extend the
+    /// shape with `tags`, `documentationUrl`, etc.
+    /// Java: `PackagesBase#getPackageMetadata`.
+    pub async fn package_metadata_get(
+        &self,
+        pkg_type: PackageType,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        validate_segment(version)?;
+        let url = self.url_v3(&[
+            "packages",
+            pkg_type.as_str(),
+            tenant,
+            namespace,
+            name,
+            version,
+            "metadata",
+        ])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Replace the metadata envelope for one package version.
+    ///
+    /// `PUT /admin/v3/packages/{type}/{tenant}/{namespace}/{name}/
+    /// {version}/metadata` with a [`PackageMetadata`] JSON body.
+    /// The broker rejects this verb with 404 if the package version
+    /// does not exist — `package_metadata_set` is *update*, never
+    /// *create*. Java: `PackagesBase#updatePackageMetadata`.
+    pub async fn package_metadata_set(
+        &self,
+        pkg_type: PackageType,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        version: &str,
+        metadata: PackageMetadata,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        validate_segment(version)?;
+        let url = self.url_v3(&[
+            "packages",
+            pkg_type.as_str(),
+            tenant,
+            namespace,
+            name,
+            version,
+            "metadata",
+        ])?;
+        let resp = self
+            .send(self.http.request(Method::PUT, url).json(&metadata))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Delete one package version.
+    ///
+    /// `DELETE /admin/v3/packages/{type}/{tenant}/{namespace}/{name}/
+    /// {version}`. The broker drops the version's metadata + storage
+    /// atomically; other versions of the same package are untouched.
+    /// Java: `PackagesBase#deletePackage`.
+    pub async fn package_delete(
+        &self,
+        pkg_type: PackageType,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        validate_segment(version)?;
+        let url = self.url_v3(&[
+            "packages",
+            pkg_type.as_str(),
+            tenant,
+            namespace,
+            name,
+            version,
+        ])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Internal --------------------------------------------------------
 
     /// Build a request URL by joining `segments` onto `base_url`. Each segment
@@ -3457,6 +3599,76 @@ pub struct SinkConfig {
     /// `None` so a `null` does not override the broker default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configs: Option<serde_json::Value>,
+}
+
+/// Pulsar Packages namespace dimension — the `{type}` segment of the
+/// `/admin/v3/packages/{type}/...` URL. Maps to upstream's
+/// `PackageType` enum
+/// (`pulsar-packages-management/pulsar-packages-management-core/.../
+/// PackageType.java`): the broker only accepts the three lowercase
+/// tokens `function`, `source`, `sink` and rejects everything else
+/// with 400. Modelled as a closed Rust enum so the URL builder
+/// cannot emit a value the broker will refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageType {
+    /// `function` — Pulsar Functions JAR.
+    Function,
+    /// `source` — Pulsar IO Source NAR.
+    Source,
+    /// `sink` — Pulsar IO Sink NAR.
+    Sink,
+}
+
+impl PackageType {
+    /// Render as the lowercase token the broker URL surface expects.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Source => "source",
+            Self::Sink => "sink",
+        }
+    }
+}
+
+impl std::str::FromStr for PackageType {
+    type Err = AdminError;
+
+    /// Parse from the lowercase tokens the broker emits (`function` /
+    /// `source` / `sink`). Hyphenated aliases are accepted to make the
+    /// CLI feel idiomatic — `package-type=source` vs the broker's
+    /// `source` are equivalent.
+    fn from_str(s: &str) -> Result<Self, AdminError> {
+        match s.to_ascii_lowercase().as_str() {
+            "function" | "functions" => Ok(Self::Function),
+            "source" | "sources" => Ok(Self::Source),
+            "sink" | "sinks" => Ok(Self::Sink),
+            other => Err(AdminError::InvalidName(format!(
+                "unknown package type {other:?} (expected: function | source | sink)"
+            ))),
+        }
+    }
+}
+
+/// Java `PackageMetadata` — the metadata envelope Pulsar Packages
+/// attaches to each `(type, tenant, namespace, name, version)` tuple.
+/// Mirrors `org.apache.pulsar.packages.management.core.common.PackageMetadata`
+/// (Jackson camelCase on the wire). `modification_time` is a
+/// broker-side timestamp in milliseconds-since-epoch — the broker
+/// emits it on `GET` and ignores caller-supplied values on `PUT`
+/// (overwriting them with the receive timestamp).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageMetadata {
+    /// Free-form package description.
+    pub description: String,
+    /// Maintainer contact (typically an email or team handle).
+    pub contact: String,
+    /// Last-modification timestamp in ms-since-epoch. Read-only for
+    /// callers — the broker overwrites the value on `PUT`.
+    pub modification_time: i64,
+    /// Arbitrary key/value labels (release notes, CI ids, etc.).
+    pub properties: std::collections::HashMap<String, String>,
 }
 
 /// Java `BacklogQuotaType` — selects which dimension a `BacklogQuota`
