@@ -81,9 +81,19 @@ impl std::fmt::Debug for AdminAuth {
 }
 
 /// Apache Pulsar admin REST client.
+///
+/// Holds two pre-computed base URLs: `base_url` anchored at
+/// `/admin/v2/` (clusters / tenants / namespaces / topics /
+/// subscriptions / brokers / bookies / schemas) and `base_url_v3`
+/// anchored at `/admin/v3/` (Pulsar Functions / IO Sources / IO Sinks
+/// / Packages). The split mirrors Pulsar's own routing — Java's
+/// `PulsarAdmin` keeps them separate too. Both URLs are derived from
+/// the same broker root at builder time, so a caller never has to
+/// know which version family an endpoint belongs to.
 #[derive(Debug, Clone)]
 pub struct AdminClient {
     base_url: Url,
+    base_url_v3: Url,
     http: reqwest::Client,
     auth: AdminAuth,
 }
@@ -2382,19 +2392,34 @@ impl AdminClient {
     /// Build a request URL by joining `segments` onto `base_url`. Each segment
     /// is percent-encoded for the URL path.
     fn url(&self, segments: &[&str]) -> Result<Url, AdminError> {
-        let mut url = self.base_url.clone();
+        Self::url_for(&self.base_url, segments)
+    }
+
+    /// Build a request URL by joining `segments` onto the `/admin/v3/`
+    /// base. Used by Pulsar Functions / IO Sources / IO Sinks /
+    /// Packages, which Pulsar moved off of `/admin/v2/` historically.
+    #[allow(dead_code)] // wired by PR #5 (Functions / Sources / Sinks / Packages).
+    fn url_v3(&self, segments: &[&str]) -> Result<Url, AdminError> {
+        Self::url_for(&self.base_url_v3, segments)
+    }
+
+    /// Shared URL-builder body for the v2 / v3 helpers.
+    fn url_for(base: &Url, segments: &[&str]) -> Result<Url, AdminError> {
+        let mut url = base.clone();
         {
             // `Url::path_segments_mut` only fails for cannot-be-a-base URLs;
             // builder already rejected those.
             let mut path = url
                 .path_segments_mut()
                 .map_err(|()| AdminError::Builder("base url is cannot-be-a-base".into()))?;
-            // `base_url` is anchored at `/admin/v2/` (trailing slash), so the
-            // segments iterator carries a sentinel empty trailing segment.
-            // Drop it before appending API segments — otherwise pushes land
+            // Both `base_url` (anchored at `/admin/v2/`) and `base_url_v3`
+            // (`/admin/v3/`) carry a trailing slash, which produces a
+            // sentinel empty trailing segment in `path_segments_mut`. Drop
+            // it before appending API segments — otherwise pushes land
             // after the empty, producing `/admin/v2//persistent/...`. Real
-            // brokers tolerate the double slash; strict mocks (wiremock) do
-            // not, and Java's `PulsarAdmin` emits the single-slash form.
+            // brokers tolerate the double slash; strict mocks (wiremock)
+            // do not, and Java's `PulsarAdmin` emits the single-slash
+            // form.
             path.pop_if_empty();
             for segment in segments {
                 path.push(segment);
@@ -2743,9 +2768,10 @@ impl AdminClientBuilder {
                 "service_url cannot be a base url: {base_url}"
             )));
         }
-        // Anchor every API call below `/admin/v2/`. We append the suffix here
-        // so callers pass plain `http://broker:8080` rather than baking the
-        // prefix in.
+        // Anchor every V2 API call below `/admin/v2/` and every V3 call
+        // below `/admin/v3/`. We append the suffix here so callers pass
+        // plain `http://broker:8080` rather than baking either prefix in.
+        let base_url_v3 = base_url.join("admin/v3/")?;
         let base_url = base_url.join("admin/v2/")?;
 
         // reqwest 0.13 panics in `Client::builder().build()` when the active
@@ -2766,6 +2792,7 @@ impl AdminClientBuilder {
 
         Ok(AdminClient {
             base_url,
+            base_url_v3,
             http,
             auth: self.auth,
         })
