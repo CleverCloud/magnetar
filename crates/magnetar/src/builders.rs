@@ -190,7 +190,7 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
         self,
     ) -> Result<<E::ClientState as crate::CreateProducerApi>::Producer, PulsarError>
     where
-        E::ClientState: crate::CreateProducerApi,
+        E::ClientState: crate::BrokerMetadataApi + crate::CreateProducerApi,
     {
         if self.encryptor.is_some() {
             return Err(PulsarError::Other(
@@ -200,6 +200,33 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
                  through the engine-generic CreateProducerApi)"
                     .to_owned(),
             ));
+        }
+        // Pre-check the partition metadata: if the topic happens to be
+        // partitioned, opening a bare-topic producer surfaces as the broker's
+        // `NotAllowedError(22) "Found partitioned metadata for non-partitioned
+        // topic"`. Catch that here and surface an actionable error pointing at
+        // `client.partitioned_producer(...)`, which fans out into one child
+        // producer per partition (the Java client's
+        // `PulsarClientImpl#createProducerAsync` does the same thing
+        // transparently — magnetar makes the routing explicit per ADR-0051).
+        //
+        // The per-partition fast path in `partitioned_topic_metadata`
+        // short-circuits `<base>-partition-<N>` suffixes to `N == 0` without
+        // a broker round-trip; for other topic names this is one
+        // `CommandPartitionedTopicMetadata` round-trip, the same cost the
+        // Java client pays.
+        let topic = self.req.topic.clone();
+        let partitions =
+            crate::BrokerMetadataApi::partitioned_topic_metadata(&self.client.inner, &topic)
+                .await
+                .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
+        if partitions > 0 {
+            return Err(PulsarError::Other(format!(
+                "topic `{topic}` is partitioned (broker reports {partitions} partitions); \
+                 call `client.partitioned_producer(\"{topic}\").create()` instead — \
+                 a bare `client.producer(t).create()` would round-trip to a broker \
+                 NotAllowedError(22) \"Found partitioned metadata for non-partitioned topic\"."
+            )));
         }
         crate::CreateProducerApi::open_producer(&self.client.inner, self.req)
             .await

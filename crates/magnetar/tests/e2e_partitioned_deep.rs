@@ -279,3 +279,60 @@ async fn e2e_partitioned_consumer_aggregates_all() -> Result<(), Box<dyn std::er
     assert_eq!(received, total);
     Ok(())
 }
+
+/// Regression test for the bug Rémi (otelgw) reported via Slack on
+/// 2026-06-02: `client.producer(topic).create()` on a topic that has
+/// partition metadata in the broker surfaces as
+/// `NotAllowedError(22) "Found partitioned metadata for non-partitioned
+/// topic"` — magnetar caller code had no obvious way to discover the
+/// topic was partitioned without parsing the broker error string.
+///
+/// Pin the new contract: the façade pre-checks
+/// `CommandPartitionedTopicMetadata` and surfaces a `PulsarError::Other`
+/// whose message points the caller at `client.partitioned_producer(...)`.
+/// `client.partitioned_producer(...).create()` keeps working on the same
+/// topic (we exercise it inline as the recovery path) so the assertion
+/// is end-to-end against a real broker, not just a string match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn producer_create_on_partitioned_topic_returns_actionable_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, admin_url, _container) = start_pulsar().await?;
+    let topic = fresh_topic("producer-precheck");
+    create_partitioned_topic(&admin_url, &topic).await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    // Bare `client.producer(...).create()` must NOT swallow the partition
+    // metadata; it surfaces the actionable error instead of the raw
+    // broker `NotAllowedError(22)`.
+    let err = client
+        .producer(topic.clone())
+        .create()
+        .await
+        .err()
+        .expect("producer().create() on a partitioned topic must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("is partitioned") && msg.contains("partitioned_producer"),
+        "expected actionable error pointing at partitioned_producer(); got: {msg}"
+    );
+    assert!(
+        !msg.contains("NotAllowedError"),
+        "the broker code=22 should not be the surfaced error: {msg}"
+    );
+
+    // The recovery path the error message recommends must work end-to-end.
+    let producer = client.partitioned_producer(topic.clone()).create().await?;
+    assert_eq!(producer.partitions(), PARTITIONS);
+    producer
+        .new_message()
+        .value(b"warmup".as_slice())
+        .send()
+        .await?;
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}

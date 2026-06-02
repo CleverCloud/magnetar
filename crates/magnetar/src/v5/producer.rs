@@ -149,7 +149,7 @@ impl<'a, E: Engine> ProducerBuilder<'a, E> {
     /// Propagates the v4 builder's `.create()` error path.
     pub async fn create(self) -> Result<Producer<E>, crate::PulsarError>
     where
-        E::ClientState: CreateProducerApi,
+        E::ClientState: CreateProducerApi + crate::BrokerMetadataApi,
     {
         // Translate V5 → v4 wire types via the mapping table. The v4
         // `send_timeout` is already `Duration`-typed (millis happens

@@ -455,7 +455,7 @@ impl<'a, S: Schema, E: crate::Engine> TypedProducerBuilder<'a, S, E> {
 
 impl<S: Schema, E: crate::Engine> TypedProducerBuilder<'_, S, E>
 where
-    E::ClientState: crate::CreateProducerApi,
+    E::ClientState: crate::CreateProducerApi + crate::BrokerMetadataApi,
 {
     /// Build and open the producer via the engine-generic
     /// [`crate::CreateProducerApi`] trait. The configured schema is

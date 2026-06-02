@@ -831,68 +831,107 @@ impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
                     .to_owned(),
             ));
         }
-        let partitions_count =
-            crate::BrokerMetadataApi::partitioned_topic_metadata(&self.client.inner, &self.topic)
-                .await
-                .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
-
-        let partition_topics: Vec<String> = if partitions_count == 0 {
-            vec![self.topic.clone()]
-        } else {
-            (0..partitions_count)
-                .map(|i| format!("{}-partition-{}", self.topic, i))
-                .collect()
+        let base_req = CreateProducerRequest {
+            topic: self.topic,
+            producer_name: self.name,
+            compression: self.compression,
+            enable_batching: self.enable_batching,
+            enable_chunking: self.enable_chunking,
+            max_batch_size_bytes: self.max_batch_size_bytes,
+            max_messages_in_batch: self.max_messages_in_batch,
+            schema: self.schema,
+            initial_sequence_id: self.initial_sequence_id,
+            access_mode: self.access_mode,
+            producer_metadata: self.producer_metadata,
+            send_timeout: self.send_timeout,
+            batching_max_publish_delay: self.batching_max_publish_delay,
         };
+        open_partitioned_with_metadata(
+            self.client,
+            base_req,
+            self.routing,
+            self.router,
+            self.auto_update_partitions_interval,
+        )
+        .await
+    }
+}
 
-        let mut child_producers: Vec<<E::ClientState as crate::CreateProducerApi>::Producer> =
-            Vec::with_capacity(partition_topics.len());
-        for child_topic in &partition_topics {
-            let req = CreateProducerRequest {
-                topic: child_topic.clone(),
-                producer_name: self.name.clone(),
-                compression: self.compression,
-                enable_batching: self.enable_batching,
-                enable_chunking: self.enable_chunking,
-                max_batch_size_bytes: self.max_batch_size_bytes,
-                max_messages_in_batch: self.max_messages_in_batch,
-                schema: self.schema.clone(),
-                initial_sequence_id: self.initial_sequence_id,
-                access_mode: self.access_mode,
-                producer_metadata: self.producer_metadata.clone(),
-                send_timeout: self.send_timeout,
-                batching_max_publish_delay: self.batching_max_publish_delay,
-            };
-            let result = crate::CreateProducerApi::open_producer(&self.client.inner, req).await;
-            match result {
-                Ok(p) => child_producers.push(p),
-                Err(e) => {
-                    for p in child_producers {
-                        let _ = crate::ProducerApi::close_owned(p).await;
-                    }
-                    return Err(PulsarError::Other(format!("open_producer: {e}")));
+/// Resolve partition metadata for `base_req.topic`, open one producer per
+/// resolved partition (or a single producer on the bare topic when `N == 0`),
+/// and wrap the result in a [`PartitionedProducer`].
+///
+/// Shared by [`PartitionedProducerBuilder::create`] and
+/// [`crate::builders::ProducerBuilder::create`]; the latter delegates here so
+/// that `client.producer(t).create().await` auto-dispatches between a single
+/// producer and a partitioned fan-out exactly like Java's
+/// `PulsarClientImpl#createProducerAsync`. Without this round-trip a bare
+/// `open_producer` on a partitioned topic surfaces as broker
+/// `NotAllowedError(22) "Found partitioned metadata for non-partitioned topic"`
+/// — the rough edge that drove ADR-0051.
+///
+/// On per-partition open failure every already-opened child is closed before
+/// the error propagates, so a partial fan-out never leaks producers on the
+/// broker side.
+pub(crate) async fn open_partitioned_with_metadata<E>(
+    client: &PulsarClient<E>,
+    base_req: CreateProducerRequest,
+    routing: MessageRoutingMode,
+    router: Option<Arc<dyn MessageRouter>>,
+    auto_update_partitions_interval: Option<Duration>,
+) -> Result<PartitionedProducer<<E::ClientState as crate::CreateProducerApi>::Producer>, PulsarError>
+where
+    E: Engine,
+    E::ClientState: crate::BrokerMetadataApi + crate::CreateProducerApi,
+{
+    let base_topic = base_req.topic.clone();
+    let partitions_count =
+        crate::BrokerMetadataApi::partitioned_topic_metadata(&client.inner, &base_topic)
+            .await
+            .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
+
+    let partition_topics: Vec<String> = if partitions_count == 0 {
+        vec![base_topic.clone()]
+    } else {
+        (0..partitions_count)
+            .map(|i| format!("{base_topic}-partition-{i}"))
+            .collect()
+    };
+
+    let mut child_producers: Vec<<E::ClientState as crate::CreateProducerApi>::Producer> =
+        Vec::with_capacity(partition_topics.len());
+    for child_topic in &partition_topics {
+        let mut req = base_req.clone();
+        req.topic = child_topic.clone();
+        let result = crate::CreateProducerApi::open_producer(&client.inner, req).await;
+        match result {
+            Ok(p) => child_producers.push(p),
+            Err(e) => {
+                for p in child_producers {
+                    let _ = crate::ProducerApi::close_owned(p).await;
                 }
+                return Err(PulsarError::Other(format!("open_producer: {e}")));
             }
         }
-
-        // Spawn the partition-watcher timer iff the builder configured a non-zero
-        // interval. The timer itself only emits ticks via `Notify`; callers drive the
-        // actual `partitions_for_topic` call via
-        // [`PartitionedProducer::refresh_partitions`] (the crate-wide
-        // `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime into
-        // a `'static` spawn).
-        let auto_update = self
-            .auto_update_partitions_interval
-            .map(|interval| spawn_auto_update_task(self.topic.clone(), interval, partitions_count));
-
-        Ok(PartitionedProducer {
-            partitions: child_producers,
-            base_topic: self.topic,
-            routing: self.routing,
-            router: self.router,
-            cursor: AtomicU64::new(0),
-            auto_update,
-        })
     }
+
+    // Spawn the partition-watcher timer iff the builder configured a non-zero
+    // interval. The timer itself only emits ticks via `Notify`; callers drive
+    // the actual `partitions_for_topic` call via
+    // [`PartitionedProducer::refresh_partitions`] (the crate-wide
+    // `#![forbid(unsafe_code)]` rules out punning the `&PulsarClient` lifetime
+    // into a `'static` spawn).
+    let auto_update = auto_update_partitions_interval
+        .map(|interval| spawn_auto_update_task(base_topic.clone(), interval, partitions_count));
+
+    Ok(PartitionedProducer {
+        partitions: child_producers,
+        base_topic,
+        routing,
+        router,
+        cursor: AtomicU64::new(0),
+        auto_update,
+    })
 }
 
 /// Tokio-engine-specific `PartitionedProducerBuilder` methods that need
