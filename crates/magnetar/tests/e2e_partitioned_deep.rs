@@ -294,7 +294,7 @@ async fn e2e_partitioned_consumer_aggregates_all() -> Result<(), Box<dyn std::er
 /// topic (we exercise it inline as the recovery path) so the assertion
 /// is end-to-end against a real broker, not just a string match.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn producer_create_on_partitioned_topic_returns_actionable_error()
+async fn e2e_producer_create_on_partitioned_topic_returns_actionable_error()
 -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;
     let topic = fresh_topic("producer-precheck");
@@ -312,8 +312,7 @@ async fn producer_create_on_partitioned_topic_returns_actionable_error()
         .producer(topic.clone())
         .create()
         .await
-        .err()
-        .expect("producer().create() on a partitioned topic must fail");
+        .expect_err("producer().create() on a partitioned topic must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("is partitioned") && msg.contains("partitioned_producer"),
