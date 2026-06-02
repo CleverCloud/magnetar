@@ -3677,7 +3677,7 @@ pub struct PostSchemaPayload {
 /// the open-ended `configs` map so a forward broker can add fields
 /// without a magnetar release.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct SourceConfig {
     /// Tenant owning the source. Must match the URL path tenant.
     pub tenant: String,
@@ -3706,7 +3706,7 @@ pub struct SourceConfig {
 /// ride in `configs` for the same forward-compat reason as
 /// [`SourceConfig`].
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct SinkConfig {
     /// Tenant owning the sink. Must match the URL path tenant.
     pub tenant: String,
@@ -3784,7 +3784,7 @@ impl std::str::FromStr for PackageType {
 /// emits it on `GET` and ignores caller-supplied values on `PUT`
 /// (overwriting them with the receive timestamp).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct PackageMetadata {
     /// Free-form package description.
     pub description: String,
