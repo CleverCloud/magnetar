@@ -318,9 +318,16 @@ async fn e2e_producer_create_on_partitioned_topic_returns_actionable_error()
         msg.contains("is partitioned") && msg.contains("partitioned_producer"),
         "expected actionable error pointing at partitioned_producer(); got: {msg}"
     );
+    // The hint *mentions* the underlying broker code (`NotAllowedError(22)`)
+    // as an explanation of what the pre-check is preventing — that's
+    // educational, not the surfaced bare broker error. The discriminating
+    // signal is that the message must NOT be the raw open-producer string
+    // (`open_producer: broker error: code=22 message=Found partitioned
+    // metadata for non-partitioned topic`), which is what we'd see if the
+    // pre-check were absent.
     assert!(
-        !msg.contains("NotAllowedError"),
-        "the broker code=22 should not be the surfaced error: {msg}"
+        !msg.contains("open_producer: broker error"),
+        "the bare broker open_producer rejection should not be the surfaced error: {msg}"
     );
 
     // The recovery path the error message recommends must work end-to-end.
