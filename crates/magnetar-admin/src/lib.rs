@@ -2691,6 +2691,199 @@ impl AdminClient {
         Ok(s.filter(|t| !t.is_empty()))
     }
 
+    // --- Pulsar IO Sources (/admin/v3/sources/...) ----------------------
+
+    /// List sources configured under a namespace.
+    ///
+    /// `GET /admin/v3/sources/{tenant}/{namespace}`. Returns the list of
+    /// source names (the broker emits a JSON array of strings — one
+    /// entry per declared source, regardless of running state).
+    /// Java:
+    /// `pulsar-broker/src/main/java/org/apache/pulsar/broker/admin/v3/Sources.java`
+    /// (`@Path("/sources")`) +
+    /// `pulsar-broker/.../admin/impl/SourcesBase.java#listSources`.
+    pub async fn sources_list_by_namespace(
+        &self,
+        tenant: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        let url = self.url_v3(&["sources", tenant, namespace])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get one source's configuration.
+    ///
+    /// `GET /admin/v3/sources/{tenant}/{namespace}/{name}`. Returns the
+    /// stored `SourceConfig` envelope as raw JSON — minor broker
+    /// versions extend the shape (new connector knobs, secret refs)
+    /// faster than a typed Rust DTO can keep up.
+    /// Java: `SourcesBase#getSourceInfo`.
+    pub async fn source_get(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sources", tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get a source's running status (per-instance worker telemetry).
+    ///
+    /// `GET /admin/v3/sources/{tenant}/{namespace}/{name}/status`.
+    /// Returns the broker's `SourceStatus` envelope (`numInstances`,
+    /// `numRunning`, per-instance `workerId` + `running` + last
+    /// received timestamp). Exposed as raw JSON for forward-compat.
+    /// Java: `SourcesBase#getSourceStatus`.
+    pub async fn source_status(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sources", tenant, namespace, name, "status"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Register a source from a remote package URL.
+    ///
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}` with
+    /// `multipart/form-data` carrying two parts: a `url` text part (the
+    /// package URL — `http(s)://`, `file://`, or `function://` per the
+    /// broker's `WorkerUtils#downloadFileFromPackageUrl`) and a
+    /// `sourceConfig` JSON part with the [`SourceConfig`] body.
+    /// Sibling [`Self::source_create`] (binary upload) is intentionally
+    /// not yet exposed — this URL-based variant covers every
+    /// CI/operator scenario that does not need to ship a JAR through
+    /// the admin client itself.
+    /// Java: `SourcesBase#registerSource`.
+    pub async fn source_create_with_url(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        url: &str,
+        config: SourceConfig,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let endpoint = self.url_v3(&["sources", tenant, namespace, name])?;
+        let form = build_url_config_multipart(url, "sourceConfig", &config)?;
+        let resp = self
+            .send(self.http.request(Method::POST, endpoint).multipart(form))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Update a source from a remote package URL.
+    ///
+    /// `PUT /admin/v3/sources/{tenant}/{namespace}/{name}` with the
+    /// same multipart shape as [`Self::source_create_with_url`].
+    /// Java: `SourcesBase#updateSource`.
+    pub async fn source_update_with_url(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        url: &str,
+        config: SourceConfig,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let endpoint = self.url_v3(&["sources", tenant, namespace, name])?;
+        let form = build_url_config_multipart(url, "sourceConfig", &config)?;
+        let resp = self
+            .send(self.http.request(Method::PUT, endpoint).multipart(form))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Delete a source.
+    ///
+    /// `DELETE /admin/v3/sources/{tenant}/{namespace}/{name}`. Removes
+    /// the source declaration and tears the running instances down.
+    /// Java: `SourcesBase#deregisterSource`.
+    pub async fn source_delete(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sources", tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Start every instance of a source.
+    ///
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}/start`.
+    /// Java: `SourcesBase#startSource`.
+    pub async fn source_start(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sources", tenant, namespace, name, "start"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Stop every instance of a source.
+    ///
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}/stop`.
+    /// Java: `SourcesBase#stopSource`.
+    pub async fn source_stop(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sources", tenant, namespace, name, "stop"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Restart every instance of a source.
+    ///
+    /// `POST /admin/v3/sources/{tenant}/{namespace}/{name}/restart`.
+    /// Java: `SourcesBase#restartSource`.
+    pub async fn source_restart(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sources", tenant, namespace, name, "restart"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Internal --------------------------------------------------------
 
     /// Build a request URL by joining `segments` onto `base_url`. Each segment
@@ -3024,6 +3217,34 @@ pub struct PostSchemaPayload {
     pub properties: std::collections::HashMap<String, String>,
 }
 
+/// Java `SourceConfig` — declarative description of a Pulsar IO
+/// Source. Mirrors `org.apache.pulsar.common.io.SourceConfig` (Jackson
+/// camelCase on the wire). Only the fields the JAX-RS `create` /
+/// `update` paths require are typed; per-connector knobs ride along in
+/// the open-ended `configs` map so a forward broker can add fields
+/// without a magnetar release.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceConfig {
+    /// Tenant owning the source. Must match the URL path tenant.
+    pub tenant: String,
+    /// Namespace owning the source. Must match the URL path namespace.
+    pub namespace: String,
+    /// Source name. Must match the URL path name.
+    pub name: String,
+    /// Fully-qualified connector class (e.g.
+    /// `org.apache.pulsar.io.kafka.KafkaSource`).
+    pub class_name: String,
+    /// Destination topic the source writes to.
+    pub topic_name: String,
+    /// Number of source instances to schedule.
+    pub parallelism: i32,
+    /// Connector-specific configuration map. Skipped from JSON when
+    /// `None` so a `null` does not override the broker default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configs: Option<serde_json::Value>,
+}
+
 /// Java `BacklogQuotaType` — selects which dimension a `BacklogQuota`
 /// entry limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3284,13 +3505,7 @@ fn function_pkg_form(
     pkg_url: &str,
     config: &FunctionConfig,
 ) -> Result<reqwest::multipart::Form, AdminError> {
-    let config_json = serde_json::to_string(config)?;
-    let config_part = reqwest::multipart::Part::text(config_json)
-        .mime_str("application/json")
-        .map_err(|err| AdminError::Builder(format!("invalid multipart mime: {err}")))?;
-    Ok(reqwest::multipart::Form::new()
-        .text("url", pkg_url.to_owned())
-        .part("functionConfig", config_part))
+    build_url_config_multipart(pkg_url, "functionConfig", config)
 }
 
 /// Split a `tenant/namespace/name` Functions / IO identifier into its
@@ -3316,6 +3531,32 @@ pub fn split_function_id(id: &str) -> Result<(&str, &str, &str), AdminError> {
     validate_segment(namespace)?;
     validate_segment(name)?;
     Ok((tenant, namespace, name))
+}
+
+/// Build the two-part `multipart/form-data` body Pulsar IO's
+/// `register*` / `update*` endpoints expect when the package is
+/// referenced by URL (`http(s)://`, `file://`, `function://`): a `url`
+/// text part and a `<config_field>` JSON part. The broker enforces
+/// both parts at the dispatcher boundary
+/// (`SourcesBase#registerSource`, `SinksBase#registerSink`) — missing
+/// either yields 400. Generic over the config type so Functions,
+/// Sources, and Sinks share one helper (`functionConfig` /
+/// `sourceConfig` / `sinkConfig` via the `config_field` argument).
+fn build_url_config_multipart<T: Serialize>(
+    pkg_url: &str,
+    config_field: &str,
+    config: &T,
+) -> Result<reqwest::multipart::Form, AdminError> {
+    let body = serde_json::to_string(config)?;
+    // `mime_str` only fails on a malformed string; the literal we pass
+    // is well-formed so the `expect` is on a never-taken branch.
+    let config_part = reqwest::multipart::Part::text(body)
+        .mime_str("application/json")
+        .expect("application/json is a well-formed media type");
+    let form = reqwest::multipart::Form::new()
+        .text("url", pkg_url.to_owned())
+        .part(config_field.to_owned(), config_part);
+    Ok(form)
 }
 
 #[cfg(test)]

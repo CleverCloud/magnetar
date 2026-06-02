@@ -142,10 +142,13 @@ moonpool-sim = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool",
 # picked by each downstream crate from its `crypto-*` feature; the workspace
 # dep stays free of a hard-wired provider sub-feature (issue #9, ADR-0035).
 # `form` (gated behind its own feature in 0.13) powers the OAuth2 token
-# exchange's `RequestBuilder::form`. `multipart` powers the
-# `POST/PUT /admin/v3/functions/.../{name}` URL-based registration calls,
-# which the broker only accepts as a `multipart/form-data` envelope
-# carrying `url=<pkg-url>` + `functionConfig=<json>` parts (PR #5).
+# exchange's `RequestBuilder::form`. `multipart` (also gated since 0.13)
+# powers the V3 URL-based create / register family:
+# `POST/PUT /admin/v3/functions/.../{name}` for Functions,
+# `POST/PUT /admin/v3/sources/.../{name}` and `.../sinks/.../{name}` for
+# IO connectors. The broker insists on `multipart/form-data` with a
+# `url=<pkg-url>` part and a typed JSON part (`functionConfig` /
+# `sourceConfig` / `sinkConfig`), even when no file is uploaded.
 reqwest = { version = "^0.13.4", default-features = false, features = ["json", "form", "multipart"] }
 url     = "^2.5.8"
 http    = "^1.4.1"
