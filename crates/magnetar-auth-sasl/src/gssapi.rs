@@ -66,16 +66,19 @@ impl LibGssapiClient {
     /// construction (missing default credential cache, KDC unreachable,
     /// unsupported mechanism).
     pub fn new(service_principal: &str) -> Result<Self, GssapiError> {
-        let target = Name::new(service_principal.as_bytes(), Some(&GSS_NT_KRB5_PRINCIPAL))
+        // libgssapi 0.10 changed the `Oid` parameter shape on `Name::new`,
+        // `Name::canonicalize`, and `ClientCtx::new` from `Option<&Oid>`
+        // to `Option<Oid>` (Oid is `Copy`-ish), and `OidSet::new` no
+        // longer returns a `Result`. Mirror those signatures verbatim.
+        let target = Name::new(service_principal.as_bytes(), Some(GSS_NT_KRB5_PRINCIPAL))
             .map_err(|err| GssapiError::Library(format!("Name::new failed: {err}")))?;
         let target = target
-            .canonicalize(Some(&GSS_MECH_KRB5))
+            .canonicalize(Some(GSS_MECH_KRB5))
             .map_err(|err| GssapiError::Library(format!("Name::canonicalize failed: {err}")))?;
 
-        let mut desired_mechs = OidSet::new()
-            .map_err(|err| GssapiError::Library(format!("OidSet::new failed: {err}")))?;
+        let mut desired_mechs = OidSet::new();
         desired_mechs
-            .add(&GSS_MECH_KRB5)
+            .add(GSS_MECH_KRB5)
             .map_err(|err| GssapiError::Library(format!("OidSet::add failed: {err}")))?;
 
         let cred = Cred::acquire(None, None, CredUsage::Initiate, Some(&desired_mechs))
@@ -84,7 +87,7 @@ impl LibGssapiClient {
             Some(cred),
             target,
             CtxFlags::GSS_C_MUTUAL_FLAG,
-            Some(&GSS_MECH_KRB5),
+            Some(GSS_MECH_KRB5),
         );
         Ok(Self {
             ctx: Mutex::new(ctx),

@@ -119,7 +119,7 @@ base64     = { version = "^0.22.1", default-features = false, features = ["std"]
 # (libkrb5 / Heimdal). Only opted-in by `magnetar-auth-sasl` under its
 # `kerberos` feature; downstream crates stay free of `libkrb5` link
 # requirements on hosts that don't enable Kerberos. See ADR-0029.
-libgssapi  = { version = "^0.9.1", default-features = false }
+libgssapi  = { version = "^0.11.0", default-features = false }
 
 # moonpool engine — temporarily floating on git `main` (per ADR-0043) to
 # pick up the futures-io `TcpStream` + segment-granular `write_vectored`
