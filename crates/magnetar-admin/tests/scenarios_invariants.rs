@@ -630,11 +630,12 @@ async fn invariant_topic_policy_get_decodes_null_as_none() {
 }
 
 /// **Invariant — delayed-delivery composability**: the
-/// `DelayedDeliveryPolicies { active, tickTimeMillis }` body must
-/// round-trip both fields. The Java field name `tickTimeMillis` is
-/// camelCase'd from `tick_time_millis` via `#[serde(rename_all =
-/// "camelCase")]`; a missing field on the GET would round-trip as
-/// `tick_time_millis = 0`, silently breaking a configured tick.
+/// `DelayedDeliveryPolicies { active, tickTime }` body must round-trip
+/// both fields. The Java field name is `tickTime` (not
+/// `tickTimeMillis` — the unit is documented in the class doc but the
+/// wire key omits the suffix); pinned explicitly here so a regression
+/// that flips back to the camelCase-of-the-Rust-name `tickTimeMillis`
+/// is caught immediately.
 #[tokio::test]
 async fn invariant_delayed_delivery_round_trips_both_fields() {
     let mock = MockServer::start().await;
@@ -642,7 +643,7 @@ async fn invariant_delayed_delivery_round_trips_both_fields() {
         .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
         .and(body_json(serde_json::json!({
             "active": true,
-            "tickTimeMillis": 1500,
+            "tickTime": 1500,
         })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -652,7 +653,7 @@ async fn invariant_delayed_delivery_round_trips_both_fields() {
         .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "active": true,
-            "tickTimeMillis": 1500,
+            "tickTime": 1500,
         })))
         .expect(1)
         .mount(&mock)

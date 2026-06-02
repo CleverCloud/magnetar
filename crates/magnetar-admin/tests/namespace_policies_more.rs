@@ -181,7 +181,7 @@ async fn delayed_delivery_get_set_remove_cycle() {
         .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "active": true,
-            "tickTimeMillis": 1000,
+            "tickTime": 1000,
         })))
         .expect(1)
         .mount(&mock)
@@ -191,7 +191,7 @@ async fn delayed_delivery_get_set_remove_cycle() {
         .and(path("/admin/v2/namespaces/acme/svc/delayedDelivery"))
         .and(body_json(serde_json::json!({
             "active": false,
-            "tickTimeMillis": 5000,
+            "tickTime": 5000,
         })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)

@@ -3492,15 +3492,22 @@ pub struct PublishRate {
 /// Java `DelayedDeliveryPolicies` — namespace-level switch + index-tick
 /// granularity for the broker's delayed-message delivery tracker.
 /// Maps to `org.apache.pulsar.common.policies.data.DelayedDeliveryPolicies`.
-/// `tick_time_millis` controls how often the broker's delay-index buckets
-/// are re-evaluated; smaller values give tighter delivery accuracy at a
+/// `tick_time` controls how often the broker's delay-index buckets are
+/// re-evaluated; smaller values give tighter delivery accuracy at a
 /// higher tracker cost.
+///
+/// The Java field name is `tickTime` (carrying a `@JsonProperty("tickTime")`
+/// annotation), **not** `tickTimeMillis`. The unit is documented as
+/// milliseconds (see the upstream class doc), but the wire key drops
+/// the unit suffix — Jackson on the broker only binds the literal
+/// `tickTime`.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct DelayedDeliveryPolicies {
     /// Whether delayed delivery is enabled for the namespace.
     pub active: bool,
-    /// Index-tick granularity in milliseconds.
+    /// Index-tick granularity in milliseconds. Wire key `tickTime`.
+    #[serde(rename = "tickTime")]
     pub tick_time_millis: i64,
 }
 
