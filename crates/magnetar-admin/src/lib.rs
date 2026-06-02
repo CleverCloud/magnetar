@@ -494,6 +494,246 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    // --- Pulsar Functions (read) ----------------------------------------
+
+    /// List every function registered under a namespace.
+    ///
+    /// `GET /admin/v3/functions/{tenant}/{namespace}`. Returns a JSON
+    /// array of bare function names (no tenant / namespace prefix) —
+    /// matches Java's `FunctionsBase#listFunctions` body shape.
+    pub async fn functions_list_by_namespace(
+        &self,
+        tenant: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        let url = self.url_v3(&["functions", tenant, namespace])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get a function's registered `FunctionConfig`.
+    ///
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}`. The
+    /// `FunctionConfig` Java type has ~30 fields and grows on every
+    /// minor release — return raw JSON for forward-compat. Java:
+    /// `FunctionsBase#getFunctionInfo`.
+    pub async fn function_get(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get a function's aggregate status (all instances).
+    ///
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}/status`.
+    /// Returns Java's `FunctionStatus` envelope:
+    /// `{numInstances, numRunning, instances: [...]}`. Raw JSON because
+    /// the per-instance shape carries broker-version-dependent fields.
+    /// Java: `FunctionsBase#getFunctionStatus`.
+    pub async fn function_status(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name, "status"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get a function's aggregate runtime statistics (all instances).
+    ///
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}/stats`.
+    /// Returns Java's `FunctionStats` envelope — message rates,
+    /// processed counts, average latency, per-instance breakdown. Raw
+    /// JSON for forward-compat. Java: `FunctionsBase#getFunctionStats`.
+    pub async fn function_stats(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name, "stats"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get one instance's status.
+    ///
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}/{instance_id}/status`.
+    /// `instance_id` is the integer index the broker assigns at
+    /// schedule time (`0..parallelism`). Java:
+    /// `FunctionsBase#getFunctionInstanceStatus`.
+    pub async fn function_instance_status(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        instance_id: i32,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let id = instance_id.to_string();
+        let url = self.url_v3(&["functions", tenant, namespace, name, &id, "status"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get one instance's runtime statistics.
+    ///
+    /// `GET /admin/v3/functions/{tenant}/{namespace}/{name}/{instance_id}/stats`.
+    /// Java: `FunctionsBase#getFunctionInstanceStats`.
+    pub async fn function_instance_stats(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        instance_id: i32,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let id = instance_id.to_string();
+        let url = self.url_v3(&["functions", tenant, namespace, name, &id, "stats"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    // --- Pulsar Functions (lifecycle) -----------------------------------
+
+    /// Deregister (delete) a function.
+    ///
+    /// `DELETE /admin/v3/functions/{tenant}/{namespace}/{name}`. The
+    /// broker stops every running instance and drops the
+    /// `FunctionConfig` from metadata. Java:
+    /// `FunctionsBase#deregisterFunction`.
+    pub async fn function_delete(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Start every instance of a function (idempotent).
+    ///
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}/start`. No
+    /// body. Java: `FunctionsBase#startFunction`.
+    pub async fn function_start(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name, "start"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Stop every instance of a function.
+    ///
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}/stop`. The
+    /// broker leaves the `FunctionConfig` in metadata; a subsequent
+    /// `function_start` brings it back. Java:
+    /// `FunctionsBase#stopFunction`.
+    pub async fn function_stop(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name, "stop"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Restart every instance of a function.
+    ///
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}/restart`.
+    /// Java: `FunctionsBase#restartFunction`.
+    pub async fn function_restart(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["functions", tenant, namespace, name, "restart"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Start one specific instance.
+    ///
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}/{instance_id}/start`.
+    /// Java: `FunctionsBase#startFunctionInstance`.
+    pub async fn function_start_instance(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        instance_id: i32,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let id = instance_id.to_string();
+        let url = self.url_v3(&["functions", tenant, namespace, name, &id, "start"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Stop one specific instance.
+    ///
+    /// `POST /admin/v3/functions/{tenant}/{namespace}/{name}/{instance_id}/stop`.
+    /// Java: `FunctionsBase#stopFunctionInstance`.
+    pub async fn function_stop_instance(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        instance_id: i32,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let id = instance_id.to_string();
+        let url = self.url_v3(&["functions", tenant, namespace, name, &id, "stop"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Tenants ---------------------------------------------------------
 
     /// List tenants.
@@ -2398,7 +2638,6 @@ impl AdminClient {
     /// Build a request URL by joining `segments` onto the `/admin/v3/`
     /// base. Used by Pulsar Functions / IO Sources / IO Sinks /
     /// Packages, which Pulsar moved off of `/admin/v2/` historically.
-    #[allow(dead_code)] // wired by PR #5 (Functions / Sources / Sinks / Packages).
     fn url_v3(&self, segments: &[&str]) -> Result<Url, AdminError> {
         Self::url_for(&self.base_url_v3, segments)
     }
@@ -2443,6 +2682,50 @@ impl AdminClient {
         };
         Ok(req.send().await?)
     }
+}
+
+/// Pulsar Functions configuration — the subset of Java's
+/// `org.apache.pulsar.common.functions.FunctionConfig` that the URL-based
+/// `register` / `update` calls actually require. The Java type carries
+/// ~30 fields (process / k8s runtime tuning, secrets, deadletter
+/// topics, …); we expose the load-bearing ones an operator running a
+/// pre-compiled JAR needs. Unknown fields on the wire are tolerated by
+/// the broker, so adding extra knobs is an additive change later.
+///
+/// `tenant` / `namespace` / `name` are duplicated in the body because
+/// the broker re-validates them against the URL path (Java's
+/// `WorkerUtils.validateFunctionName`). The CLI fills these in from the
+/// fully qualified name the operator passes on the command line.
+///
+/// `runtime` is the string `"JAVA"`, `"PYTHON"`, or `"GO"` — matches
+/// Java's `org.apache.pulsar.common.functions.FunctionConfig.Runtime`
+/// enum serialised by name.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FunctionConfig {
+    /// Owning tenant.
+    pub tenant: String,
+    /// Owning namespace (bare name, not `tenant/namespace`).
+    pub namespace: String,
+    /// Function name (unique within the namespace).
+    pub name: String,
+    /// Fully qualified entry-point class name (`com.acme.MyFunction`
+    /// for Java; `module.fn` for Python; `main` for Go).
+    #[serde(rename = "className")]
+    pub class_name: String,
+    /// Input topics the function subscribes to.
+    pub inputs: Vec<String>,
+    /// Output topic the function produces to. Empty when the function
+    /// has no output sink.
+    pub output: String,
+    /// Runtime — `"JAVA"`, `"PYTHON"`, or `"GO"`.
+    pub runtime: String,
+    /// Number of parallel instances the worker schedules.
+    pub parallelism: i32,
+    /// Optional opaque user-config map passed to the function's
+    /// `Context#getUserConfigValue`. JSON object on the wire.
+    #[serde(rename = "userConfig", skip_serializing_if = "Option::is_none")]
+    pub user_config: Option<serde_json::Value>,
 }
 
 /// Tenant policy info — admin roles and allowed clusters.
@@ -2926,6 +3209,31 @@ fn split_topic(topic: &str) -> Result<(&str, &str, &str), AdminError> {
     Ok((tenant, namespace, name))
 }
 
+/// Split a `tenant/namespace/name` Functions / IO identifier into its
+/// three segments. Pulsar Functions never carry a `persistent://`
+/// scheme prefix (functions are not topics), so the parser is stricter
+/// than [`split_topic`].
+///
+/// Exposed for the CLI, which parses the fully qualified name out of a
+/// single positional argument before calling the admin methods (which
+/// take `tenant`, `namespace`, `name` separately so the broker's
+/// per-segment validation maps 1:1 to the URL path).
+pub fn split_function_id(id: &str) -> Result<(&str, &str, &str), AdminError> {
+    let mut parts = id.splitn(3, '/');
+    let tenant = parts.next().unwrap_or("");
+    let namespace = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    if tenant.is_empty() || namespace.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(AdminError::InvalidName(format!(
+            "expected tenant/namespace/name, got {id:?}"
+        )));
+    }
+    validate_segment(tenant)?;
+    validate_segment(namespace)?;
+    validate_segment(name)?;
+    Ok((tenant, namespace, name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3033,6 +3341,33 @@ mod tests {
     fn split_topic_rejects_short_name() {
         assert!(matches!(
             split_topic("acme/svc"),
+            Err(AdminError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn split_function_id_ok() {
+        let (t, n, name) = split_function_id("public/default/my-fn").unwrap();
+        assert_eq!((t, n, name), ("public", "default", "my-fn"));
+    }
+
+    #[test]
+    fn split_function_id_rejects_short_name() {
+        assert!(matches!(
+            split_function_id("public/default"),
+            Err(AdminError::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn split_function_id_rejects_persistent_scheme() {
+        // Functions never carry a `persistent://` prefix — the parser
+        // refuses one rather than silently treating the scheme as the
+        // tenant name (which `validate_segment` would later catch via
+        // the percent-encoded slash rule, but we want a clearer error
+        // up front).
+        assert!(matches!(
+            split_function_id("persistent://acme/svc/fn"),
             Err(AdminError::InvalidName(_))
         ));
     }
