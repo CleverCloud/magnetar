@@ -159,5 +159,5 @@ async fn namespace_isolation_policies_list_404_returns_empty_map() {
         .await
         .expect("404 with the well-known body must not surface as Status error");
     assert!(map.is_object(), "expected empty `{{}}`, got {map}");
-    assert_eq!(map.as_object().map(|m| m.len()), Some(0));
+    assert_eq!(map.as_object().map(serde_json::Map::len), Some(0));
 }
