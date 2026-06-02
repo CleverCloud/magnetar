@@ -2135,17 +2135,15 @@ async fn run_admin_schemas(admin: &AdminClient, cmd: SchemasCmd) -> Result<(), C
 async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(), CliError> {
     match cmd {
         FunctionsCmd::List { namespace } => {
-            // `tenant/namespace` parser: kept inline because the admin
-            // helper for the three-segment form is `split_function_id`;
-            // adding a separate two-segment public helper would
-            // duplicate `split_namespace` (which stays private to the
-            // admin crate). The inline parse mirrors the one the admin
-            // crate runs on every namespace method.
-            let (tenant, ns) = namespace.split_once('/').ok_or_else(|| {
-                CliError::Admin(AdminError::InvalidName(format!(
-                    "expected tenant/namespace, got {namespace:?}"
-                )))
-            })?;
+            // Use the shared CLI helper so `tenant/ns/extra` (typo,
+            // extra segment) fails fast with a clean BadArg error,
+            // matching the symmetric `admin sources list` / `sinks
+            // list` / `packages list` surfaces. Previously this used
+            // an inline `split_once('/')` that accepted the right-hand
+            // half verbatim — the admin client's `validate_segment` is
+            // permissive on internal `/`, so the broker eventually
+            // 404'd with a confusing `…/ns%2Fextra` URL.
+            let (tenant, ns) = split_namespace_ref(&namespace).map_err(CliError::BadArg)?;
             print_json(&admin.functions_list_by_namespace(tenant, ns).await?)
         }
         FunctionsCmd::Get { name } => {
