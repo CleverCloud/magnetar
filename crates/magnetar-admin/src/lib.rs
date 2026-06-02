@@ -2884,6 +2884,191 @@ impl AdminClient {
         empty_ok(resp).await
     }
 
+    // --- Pulsar IO Sinks (/admin/v3/sinks/...) --------------------------
+
+    /// List sinks configured under a namespace.
+    ///
+    /// `GET /admin/v3/sinks/{tenant}/{namespace}`. Returns the list of
+    /// sink names. Mirrors [`Self::sources_list_by_namespace`] —
+    /// Pulsar's Sources / Sinks REST surfaces are intentionally
+    /// symmetric.
+    /// Java:
+    /// `pulsar-broker/src/main/java/org/apache/pulsar/broker/admin/v3/Sinks.java`
+    /// (`@Path("/sinks")`) +
+    /// `pulsar-broker/.../admin/impl/SinksBase.java#listSinks`.
+    pub async fn sinks_list_by_namespace(
+        &self,
+        tenant: &str,
+        namespace: &str,
+    ) -> Result<Vec<String>, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        let url = self.url_v3(&["sinks", tenant, namespace])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get one sink's configuration.
+    ///
+    /// `GET /admin/v3/sinks/{tenant}/{namespace}/{name}`. Returns the
+    /// stored `SinkConfig` as raw JSON for the same forward-compat
+    /// reason as [`Self::source_get`]. Java: `SinksBase#getSinkInfo`.
+    pub async fn sink_get(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sinks", tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Get a sink's running status (per-instance worker telemetry).
+    ///
+    /// `GET /admin/v3/sinks/{tenant}/{namespace}/{name}/status`.
+    /// Same envelope shape as the Sources status. Raw JSON.
+    /// Java: `SinksBase#getSinkStatus`.
+    pub async fn sink_status(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sinks", tenant, namespace, name, "status"])?;
+        let resp = self.send(self.http.request(Method::GET, url)).await?;
+        json_ok(resp).await
+    }
+
+    /// Register a sink from a remote package URL.
+    ///
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}` with
+    /// `multipart/form-data` carrying a `url` text part and a
+    /// `sinkConfig` JSON part. Mirrors
+    /// [`Self::source_create_with_url`]; the only wire-level
+    /// difference is the JSON-part field name (`sinkConfig` vs
+    /// `sourceConfig`). Java: `SinksBase#registerSink`.
+    pub async fn sink_create_with_url(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        url: &str,
+        config: SinkConfig,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let endpoint = self.url_v3(&["sinks", tenant, namespace, name])?;
+        let form = build_url_config_multipart(url, "sinkConfig", &config)?;
+        let resp = self
+            .send(self.http.request(Method::POST, endpoint).multipart(form))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Update a sink from a remote package URL.
+    ///
+    /// `PUT /admin/v3/sinks/{tenant}/{namespace}/{name}` with the same
+    /// multipart shape as [`Self::sink_create_with_url`].
+    /// Java: `SinksBase#updateSink`.
+    pub async fn sink_update_with_url(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+        url: &str,
+        config: SinkConfig,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let endpoint = self.url_v3(&["sinks", tenant, namespace, name])?;
+        let form = build_url_config_multipart(url, "sinkConfig", &config)?;
+        let resp = self
+            .send(self.http.request(Method::PUT, endpoint).multipart(form))
+            .await?;
+        empty_ok(resp).await
+    }
+
+    /// Delete a sink.
+    ///
+    /// `DELETE /admin/v3/sinks/{tenant}/{namespace}/{name}`.
+    /// Java: `SinksBase#deregisterSink`.
+    pub async fn sink_delete(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sinks", tenant, namespace, name])?;
+        let resp = self.send(self.http.request(Method::DELETE, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Start every instance of a sink.
+    ///
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}/start`.
+    /// Java: `SinksBase#startSink`.
+    pub async fn sink_start(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sinks", tenant, namespace, name, "start"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Stop every instance of a sink.
+    ///
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}/stop`.
+    /// Java: `SinksBase#stopSink`.
+    pub async fn sink_stop(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sinks", tenant, namespace, name, "stop"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
+    /// Restart every instance of a sink.
+    ///
+    /// `POST /admin/v3/sinks/{tenant}/{namespace}/{name}/restart`.
+    /// Java: `SinksBase#restartSink`.
+    pub async fn sink_restart(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), AdminError> {
+        validate_segment(tenant)?;
+        validate_segment(namespace)?;
+        validate_segment(name)?;
+        let url = self.url_v3(&["sinks", tenant, namespace, name, "restart"])?;
+        let resp = self.send(self.http.request(Method::POST, url)).await?;
+        empty_ok(resp).await
+    }
+
     // --- Internal --------------------------------------------------------
 
     /// Build a request URL by joining `segments` onto `base_url`. Each segment
@@ -3238,6 +3423,35 @@ pub struct SourceConfig {
     /// Destination topic the source writes to.
     pub topic_name: String,
     /// Number of source instances to schedule.
+    pub parallelism: i32,
+    /// Connector-specific configuration map. Skipped from JSON when
+    /// `None` so a `null` does not override the broker default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configs: Option<serde_json::Value>,
+}
+
+/// Java `SinkConfig` — declarative description of a Pulsar IO Sink.
+/// Mirrors `org.apache.pulsar.common.io.SinkConfig` (Jackson camelCase
+/// on the wire). The `inputs` slot is the list of source topics the
+/// sink reads from — the broker accepts either fully-qualified topic
+/// names or `tenant/namespace/topic` shorthand. Per-connector knobs
+/// ride in `configs` for the same forward-compat reason as
+/// [`SourceConfig`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SinkConfig {
+    /// Tenant owning the sink. Must match the URL path tenant.
+    pub tenant: String,
+    /// Namespace owning the sink. Must match the URL path namespace.
+    pub namespace: String,
+    /// Sink name. Must match the URL path name.
+    pub name: String,
+    /// Fully-qualified connector class (e.g.
+    /// `org.apache.pulsar.io.jdbc.PostgresJdbcAutoSchemaSink`).
+    pub class_name: String,
+    /// Source topics the sink subscribes to.
+    pub inputs: Vec<String>,
+    /// Number of sink instances to schedule.
     pub parallelism: i32,
     /// Connector-specific configuration map. Skipped from JSON when
     /// `None` so a `null` does not override the broker default.
