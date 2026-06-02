@@ -44,18 +44,21 @@ fn builder_with_trailing_slash() {
 }
 
 #[test]
-fn builder_with_path_prefix_strips_path() {
-    // `Url::join("admin/v2/")` against `http://host/something` resolves
-    // relative to the parent — i.e. the trailing path component is replaced.
-    // This mirrors how Java's `PulsarAdminBuilder` accepts a service URL and
-    // appends `/admin/v2/` itself.
+fn builder_with_path_prefix_is_preserved() {
+    // The previous build path called `Url::join("admin/v2/")` directly,
+    // which per WHATWG semantics REPLACES the last path segment when
+    // the base has no trailing slash — `http://host/something` +
+    // `admin/v2/` collapsed to `http://host/admin/v2/`. The builder now
+    // normalises the trailing slash first so a path-prefixed admin URL
+    // (`http://gateway/pulsar`, common K8s ingress shape) survives the
+    // join intact.
     let client = AdminClient::builder()
-        .service_url("http://localhost:8080/ignored".parse().unwrap())
+        .service_url("http://localhost:8080/pulsar".parse().unwrap())
         .build()
         .unwrap();
     assert_eq!(
         client.base_url().as_str(),
-        "http://localhost:8080/admin/v2/"
+        "http://localhost:8080/pulsar/admin/v2/"
     );
 }
 

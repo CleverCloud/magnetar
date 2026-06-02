@@ -3765,6 +3765,20 @@ impl AdminClientBuilder {
         // Anchor every V2 API call below `/admin/v2/` and every V3 call
         // below `/admin/v3/`. We append the suffix here so callers pass
         // plain `http://broker:8080` rather than baking either prefix in.
+        //
+        // `Url::join` follows WHATWG semantics: if `base_url` has no
+        // trailing slash, its last path segment is replaceable. So
+        // `http://broker/pulsar` + `admin/v2/` would yield
+        // `http://broker/admin/v2/` — the `pulsar` prefix silently
+        // dropped (common for path-prefixed K8s ingresses). Normalise
+        // the base to end with `/` first so the join always appends.
+        let base_url = {
+            let mut b = base_url.clone();
+            if !b.path().ends_with('/') {
+                b.set_path(&format!("{}/", b.path()));
+            }
+            b
+        };
         let base_url_v3 = base_url.join("admin/v3/")?;
         let base_url = base_url.join("admin/v2/")?;
 
@@ -4167,6 +4181,31 @@ mod tests {
         assert_eq!(
             url2.as_str(),
             "http://broker.example:8080/admin/v2/persistent/public/default/topic/stats"
+        );
+    }
+
+    #[test]
+    fn url_helper_preserves_path_prefix_without_trailing_slash() {
+        // Regression guard: per WHATWG URL semantics, `Url::join("admin/v2/")`
+        // on a base whose path has no trailing slash REPLACES the last segment
+        // — `http://broker/pulsar` + `admin/v2/` becomes
+        // `http://broker/admin/v2/`, silently dropping `/pulsar`. The builder
+        // normalises the base to end in `/` before joining so any operator
+        // running behind a path-prefixed K8s ingress (`--admin-url
+        // http://gw/pulsar`) gets the right URLs on both V2 and V3 endpoints.
+        let client = AdminClient::builder()
+            .service_url("http://broker.example:8080/pulsar".parse().unwrap())
+            .build()
+            .unwrap();
+        let url = client.url(&["clusters"]).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://broker.example:8080/pulsar/admin/v2/clusters"
+        );
+        let url_v3 = client.url_v3(&["functions", "a", "b"]).unwrap();
+        assert_eq!(
+            url_v3.as_str(),
+            "http://broker.example:8080/pulsar/admin/v3/functions/a/b"
         );
     }
 
