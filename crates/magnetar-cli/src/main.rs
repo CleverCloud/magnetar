@@ -2962,11 +2962,11 @@ async fn run_admin_sources(admin: &AdminClient, cmd: SourcesCmd) -> Result<(), C
             print_json(&admin.sources_list_by_namespace(tenant, ns).await?)
         }
         SourcesCmd::Get { source } => {
-            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&source).map_err(CliError::BadArg)?;
             print_json(&admin.source_get(tenant, ns, name).await?)
         }
         SourcesCmd::Status { source } => {
-            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&source).map_err(CliError::BadArg)?;
             print_json(&admin.source_status(tenant, ns, name).await?)
         }
         SourcesCmd::CreateWithUrl {
@@ -3016,22 +3016,22 @@ async fn run_admin_sources(admin: &AdminClient, cmd: SourcesCmd) -> Result<(), C
             Ok(())
         }
         SourcesCmd::Delete { source } => {
-            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&source).map_err(CliError::BadArg)?;
             admin.source_delete(tenant, ns, name).await?;
             Ok(())
         }
         SourcesCmd::Start { source } => {
-            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&source).map_err(CliError::BadArg)?;
             admin.source_start(tenant, ns, name).await?;
             Ok(())
         }
         SourcesCmd::Stop { source } => {
-            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&source).map_err(CliError::BadArg)?;
             admin.source_stop(tenant, ns, name).await?;
             Ok(())
         }
         SourcesCmd::Restart { source } => {
-            let (tenant, ns, name) = split_function_id(&source).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&source).map_err(CliError::BadArg)?;
             admin.source_restart(tenant, ns, name).await?;
             Ok(())
         }
@@ -3045,11 +3045,11 @@ async fn run_admin_sinks(admin: &AdminClient, cmd: SinksCmd) -> Result<(), CliEr
             print_json(&admin.sinks_list_by_namespace(tenant, ns).await?)
         }
         SinksCmd::Get { sink } => {
-            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&sink).map_err(CliError::BadArg)?;
             print_json(&admin.sink_get(tenant, ns, name).await?)
         }
         SinksCmd::Status { sink } => {
-            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&sink).map_err(CliError::BadArg)?;
             print_json(&admin.sink_status(tenant, ns, name).await?)
         }
         SinksCmd::CreateWithUrl {
@@ -3099,22 +3099,22 @@ async fn run_admin_sinks(admin: &AdminClient, cmd: SinksCmd) -> Result<(), CliEr
             Ok(())
         }
         SinksCmd::Delete { sink } => {
-            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&sink).map_err(CliError::BadArg)?;
             admin.sink_delete(tenant, ns, name).await?;
             Ok(())
         }
         SinksCmd::Start { sink } => {
-            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&sink).map_err(CliError::BadArg)?;
             admin.sink_start(tenant, ns, name).await?;
             Ok(())
         }
         SinksCmd::Stop { sink } => {
-            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&sink).map_err(CliError::BadArg)?;
             admin.sink_stop(tenant, ns, name).await?;
             Ok(())
         }
         SinksCmd::Restart { sink } => {
-            let (tenant, ns, name) = split_function_id(&sink).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&sink).map_err(CliError::BadArg)?;
             admin.sink_restart(tenant, ns, name).await?;
             Ok(())
         }
@@ -3134,7 +3134,7 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
             package_type,
             package,
         } => {
-            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&package).map_err(CliError::BadArg)?;
             print_json(
                 &admin
                     .package_versions_list(package_type, tenant, ns, name)
@@ -3146,7 +3146,7 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
             package,
             version,
         } => {
-            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&package).map_err(CliError::BadArg)?;
             print_json(
                 &admin
                     .package_metadata_get(package_type, tenant, ns, name, &version)
@@ -3161,7 +3161,7 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
             contact,
             properties,
         } => {
-            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&package).map_err(CliError::BadArg)?;
             let metadata = PackageMetadata {
                 description,
                 contact,
@@ -3181,7 +3181,7 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
             package,
             version,
         } => {
-            let (tenant, ns, name) = split_function_id(&package).map_err(CliError::BadArg)?;
+            let (tenant, ns, name) = split_io_id(&package).map_err(CliError::BadArg)?;
             admin
                 .package_delete(package_type, tenant, ns, name, &version)
                 .await?;
@@ -3198,7 +3198,7 @@ async fn run_admin_packages(admin: &AdminClient, cmd: PackagesCmd) -> Result<(),
 /// `split_topic` helper (which accepts an optional `persistent://`
 /// scheme); this variant intentionally rejects URI schemes — a
 /// connector name is never a topic URL.
-fn split_function_id(spec: &str) -> Result<(&str, &str, &str), String> {
+fn split_io_id(spec: &str) -> Result<(&str, &str, &str), String> {
     let mut parts = spec.splitn(3, '/');
     let tenant = parts.next().unwrap_or("");
     let namespace = parts.next().unwrap_or("");
