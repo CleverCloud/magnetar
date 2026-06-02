@@ -53,6 +53,18 @@ use url::Url;
 /// PulsarAdminBuilderImpl.java`).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Longer per-call timeout for `*_create_with_url` / `*_update_with_url`
+/// endpoints. The broker fetches the package from the supplied URL
+/// before responding, so the round-trip can comfortably exceed 60 s
+/// against a slow internal registry (S3 / GCS / function://) or a
+/// large `.nar` / `.jar` artifact. Overrides the client-level timeout
+/// for those calls only — every other admin verb keeps the 60 s
+/// budget [`DEFAULT_TIMEOUT`] provides.
+///
+/// 5 min matches the Java admin client's read-timeout for register
+/// paths.
+pub const PACKAGE_REGISTER_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Authentication strategy used by the admin client.
 ///
 /// `Token(...)` adds `Authorization: Bearer <token>` to every request.
@@ -673,7 +685,7 @@ impl AdminClient {
         let endpoint = self.url_v3(&["functions", tenant, namespace, name])?;
         let form = function_pkg_form(url, &config)?;
         let resp = self
-            .send(self.http.request(Method::POST, endpoint).multipart(form))
+            .send(self.http.request(Method::POST, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
             .await?;
         empty_ok(resp).await
     }
@@ -698,7 +710,7 @@ impl AdminClient {
         let endpoint = self.url_v3(&["functions", tenant, namespace, name])?;
         let form = function_pkg_form(url, &config)?;
         let resp = self
-            .send(self.http.request(Method::PUT, endpoint).multipart(form))
+            .send(self.http.request(Method::PUT, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
             .await?;
         empty_ok(resp).await
     }
@@ -2827,7 +2839,7 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sources", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sourceConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::POST, endpoint).multipart(form))
+            .send(self.http.request(Method::POST, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
             .await?;
         empty_ok(resp).await
     }
@@ -2851,7 +2863,7 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sources", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sourceConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::PUT, endpoint).multipart(form))
+            .send(self.http.request(Method::PUT, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
             .await?;
         empty_ok(resp).await
     }
@@ -3013,7 +3025,7 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sinks", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sinkConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::POST, endpoint).multipart(form))
+            .send(self.http.request(Method::POST, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
             .await?;
         empty_ok(resp).await
     }
@@ -3037,7 +3049,7 @@ impl AdminClient {
         let endpoint = self.url_v3(&["sinks", tenant, namespace, name])?;
         let form = build_url_config_multipart(url, "sinkConfig", &config)?;
         let resp = self
-            .send(self.http.request(Method::PUT, endpoint).multipart(form))
+            .send(self.http.request(Method::PUT, endpoint).multipart(form).timeout(PACKAGE_REGISTER_TIMEOUT))
             .await?;
         empty_ok(resp).await
     }
