@@ -495,7 +495,10 @@ pub(crate) enum FunctionsCmd {
         #[arg(long, default_value = "JAVA")]
         runtime: String,
         /// Input topic the function subscribes to. Repeat for multiple.
-        #[arg(long = "input")]
+        /// At least one is required — Pulsar's
+        /// `FunctionConfigUtils#inferMissingArguments` rejects a
+        /// function with no inputs at HTTP 400.
+        #[arg(long = "input", required = true, num_args = 1..)]
         inputs: Vec<String>,
         /// Output topic the function produces to.
         #[arg(long, default_value = "")]
@@ -503,9 +506,21 @@ pub(crate) enum FunctionsCmd {
         /// Number of parallel instances.
         #[arg(long, default_value_t = 1)]
         parallelism: i32,
+        /// Per-function user-config JSON object. Operators can pass
+        /// arbitrary key/value metadata the function reads at runtime.
+        /// Accepted as a single JSON string (`--user-config '{"k":"v"}'`).
+        #[arg(long = "user-config", value_parser = parse_json_object)]
+        user_config: Option<serde_json::Value>,
     },
     /// Update an existing function from a remote package URL.
     /// `PUT /admin/v3/functions/{tenant}/{namespace}/{name}` (multipart).
+    ///
+    /// **Full replace**: Pulsar's `updateFunction` replaces the stored
+    /// `FunctionConfig` in-toto from the body it receives, with no
+    /// merge semantics. Fields you don't pass on the CLI — most
+    /// notably `--user-config` — get wiped on the broker side.
+    /// Re-pass `--user-config '<json>'` (or any other policy you
+    /// expect to preserve) on every update.
     UpdateWithUrl {
         /// Tenant.
         #[arg(long)]
@@ -525,8 +540,8 @@ pub(crate) enum FunctionsCmd {
         /// Runtime — `JAVA`, `PYTHON`, or `GO`.
         #[arg(long, default_value = "JAVA")]
         runtime: String,
-        /// Input topic. Repeat for multiple.
-        #[arg(long = "input")]
+        /// Input topic. Repeat for multiple. At least one required.
+        #[arg(long = "input", required = true, num_args = 1..)]
         inputs: Vec<String>,
         /// Output topic.
         #[arg(long, default_value = "")]
@@ -534,6 +549,12 @@ pub(crate) enum FunctionsCmd {
         /// Number of parallel instances.
         #[arg(long, default_value_t = 1)]
         parallelism: i32,
+        /// Per-function user-config JSON object. **Must be re-passed on
+        /// every update** — Pulsar's `updateFunction` is a full
+        /// replace, so omitting `--user-config` wipes the broker's
+        /// stored map.
+        #[arg(long = "user-config", value_parser = parse_json_object)]
+        user_config: Option<serde_json::Value>,
     },
     /// Deregister (delete) a function.
     /// `DELETE /admin/v3/functions/{tenant}/{namespace}/{name}`.
@@ -2157,6 +2178,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             inputs,
             output,
             parallelism,
+            user_config,
         } => {
             let cfg = FunctionConfig {
                 tenant: tenant.clone(),
@@ -2167,7 +2189,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
                 output,
                 runtime,
                 parallelism,
-                user_config: None,
+                user_config,
             };
             admin
                 .function_create_with_url(&tenant, &namespace, &name, &url, cfg)
@@ -2184,6 +2206,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
             inputs,
             output,
             parallelism,
+            user_config,
         } => {
             let cfg = FunctionConfig {
                 tenant: tenant.clone(),
@@ -2194,7 +2217,7 @@ async fn run_admin_functions(admin: &AdminClient, cmd: FunctionsCmd) -> Result<(
                 output,
                 runtime,
                 parallelism,
-                user_config: None,
+                user_config,
             };
             admin
                 .function_update_with_url(&tenant, &namespace, &name, &url, cfg)
@@ -3325,6 +3348,29 @@ fn parse_property(spec: &str) -> Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got `{spec}`"))?;
     Ok((k.to_owned(), v.to_owned()))
+}
+
+/// Parse a `--user-config '<json>'` argument into a `serde_json::Value`.
+/// The broker stores a `Map<String, Object>` here, so we require an
+/// object at the top level — a bare string / number / array would fail
+/// at the broker boundary with a less helpful message.
+fn parse_json_object(spec: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(spec)
+        .map_err(|err| format!("invalid JSON for --user-config: {err}"))?;
+    if !value.is_object() {
+        return Err(format!(
+            "--user-config must be a JSON object, got {kind}",
+            kind = match &value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => unreachable!(),
+            }
+        ));
+    }
+    Ok(value)
 }
 
 /// Parse a Pulsar Packages `{type}` token from the CLI form. Delegates
