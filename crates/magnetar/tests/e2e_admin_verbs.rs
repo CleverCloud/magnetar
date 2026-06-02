@@ -238,6 +238,21 @@ async fn e2e_admin_topic_ops() -> Result<(), Box<dyn std::error::Error>> {
         st.status
     );
 
+    // Terminate before unload: unloading re-elects ownership, and the
+    // new owner may surface the `(-1, -1)` "no confirmed entry yet"
+    // sentinel before its managed ledger catches up. Terminating on the
+    // owner that already saw the warmup produce guarantees a non-None
+    // `last`. (`topic_terminate` itself handles the sentinel for
+    // callers that hit the post-unload window.)
+    let last = admin
+        .topic_terminate(nonpart)
+        .await?
+        .expect("terminate after a confirmed produce should return a real MessageId");
+    assert!(
+        last.ledger_id > 0,
+        "terminate returned ledger_id=0 (expected the last-produced entry's ledger)"
+    );
+
     // Unload — broker accepts and re-elects ownership. Must return 204.
     admin.topic_unload(nonpart).await?;
 
@@ -248,16 +263,6 @@ async fn e2e_admin_topic_ops() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(admin.topic_partitions_count(part).await?, 2);
     admin.topic_update_partitions(part, 4).await?;
     assert_eq!(admin.topic_partitions_count(part).await?, 4);
-
-    // Terminate on the non-partitioned topic. Returns the last
-    // message-id that landed before the seal. Pin that we get a
-    // `ledger_id > 0` shape — the exact entry_id depends on broker
-    // internals.
-    let last = admin.topic_terminate(nonpart).await?;
-    assert!(
-        last.ledger_id > 0,
-        "terminate returned ledger_id=0 (expected the last-produced entry's ledger)"
-    );
 
     Ok(())
 }
@@ -433,7 +438,21 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
         .build()
         .await?;
 
-    let topic = "persistent://public/default/magnetar-e2e-topic-policies";
+    // Dedicated namespace per test: `cargo test` runs e2e cases in
+    // parallel on the same container, so `public/default` is shared.
+    // The sibling `e2e_admin_namespace_and_diagnostics` test sets a
+    // 1GiB backlog quota on `public/default` mid-flight, which makes
+    // any topic-level retention < 1GiB on a child topic 412 with
+    // "Retention Quota must exceed configured backlog quota". An
+    // isolated namespace dodges the entire class of cross-test
+    // pollution.
+    let ns = "public/magnetar-e2e-topic-policies";
+    // Best-effort precleanup — a previous run that aborted before its
+    // tear-down may have left the namespace behind. Ignore errors here.
+    let _ = admin.namespace_delete(ns).await;
+    admin.namespace_create(ns).await?;
+
+    let topic = "persistent://public/magnetar-e2e-topic-policies/topic-policies";
 
     // Bootstrap topic with a single produce — Pulsar autocreates.
     {
@@ -482,6 +501,11 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
     let got = admin.topic_get_message_ttl(topic).await?;
     assert_eq!(got, Some(3600));
     admin.topic_remove_message_ttl(topic).await?;
+
+    // Tear down the dedicated namespace — keeps the standalone clean
+    // for re-runs. Best-effort: if the broker is mid-flight on another
+    // test the delete may surface a 409, which is fine to swallow.
+    let _ = admin.namespace_delete(ns).await;
 
     Ok(())
 }
