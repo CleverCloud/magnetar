@@ -140,6 +140,14 @@ mod crypto_bridge;
 #[cfg(all(feature = "tokio", feature = "encryption"))]
 pub use crypto_bridge::MessageCryptoBridge;
 
+/// OpenTelemetry context propagation for Pulsar messages. Behind
+/// `feature = "opentelemetry"` (default off). When enabled, the current span
+/// context is automatically injected into every outgoing message's properties.
+/// Use [`otel::extract_context`] on the consumer side to recover the parent
+/// context from a received message.
+#[cfg(feature = "opentelemetry")]
+pub mod otel;
+
 /// **Experimental** — PIP-466 V5 client surface (ADR-0032). Behind
 /// `feature = "experimental-v5-client"` (default off). The wire
 /// protocol is unchanged; V5 wraps the v4 surface with `Duration`-typed

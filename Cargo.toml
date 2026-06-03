@@ -155,6 +155,8 @@ http    = "^1.4.1"
 clap    = { version = "^4.6.1", features = ["derive", "env"] }
 
 # Telemetry + errors
+opentelemetry      = { version = "^0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk  = { version = "^0.32.1", default-features = false, features = ["trace"] }
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 thiserror          = "^2.0.18"

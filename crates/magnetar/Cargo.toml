@@ -37,6 +37,7 @@ auth-athenz = ["dep:magnetar-auth-athenz"]
 # into the athenz crate (see `magnetar-auth-athenz/zts`).
 auth-athenz-zts = ["auth-athenz", "magnetar-auth-athenz/zts"]
 encryption  = ["dep:magnetar-messagecrypto"]
+opentelemetry = ["dep:opentelemetry"]
 # Note (ADR-0046): the former `e2e` and `e2e-multi-cluster` Cargo features
 # are gone. End-to-end tests run as regular tests on every `cargo test`
 # and every CI push — gating moved from compile-time + `#[ignore]` to "the
@@ -126,6 +127,7 @@ magnetar-auth-oauth2       = { workspace = true, optional = true }
 magnetar-auth-sasl         = { workspace = true, optional = true }
 magnetar-auth-athenz       = { workspace = true, optional = true }
 magnetar-messagecrypto     = { workspace = true, optional = true }
+opentelemetry              = { workspace = true, optional = true }
 bytes                      = { workspace = true }
 futures-util               = { workspace = true, optional = true, features = ["std", "async-await"] }
 parking_lot                = { workspace = true }
@@ -146,6 +148,8 @@ aws-lc-rs          = { workspace = true }
 # Pure dev-dep — not pulled in for non-test builds.
 base64             = { workspace = true }
 magnetar-fakes     = { workspace = true }
+opentelemetry      = { workspace = true }
+opentelemetry_sdk  = { workspace = true }
 reqwest            = { workspace = true }
 schemars           = { workspace = true }
 serde              = { workspace = true }

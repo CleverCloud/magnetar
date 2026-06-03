@@ -173,7 +173,13 @@ impl OutgoingMessage {
 }
 
 impl From<OutgoingMessage> for magnetar_proto::producer::OutgoingMessage {
-    fn from(msg: OutgoingMessage) -> Self {
+    fn from(
+        #[cfg(feature = "opentelemetry")] mut msg: OutgoingMessage,
+        #[cfg(not(feature = "opentelemetry"))] msg: OutgoingMessage,
+    ) -> Self {
+        #[cfg(feature = "opentelemetry")]
+        crate::otel::inject_context(&mut msg.properties);
+
         let mut metadata = pb::MessageMetadata::default();
         if let Some(k) = msg.key {
             metadata.partition_key = Some(k);
