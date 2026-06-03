@@ -90,8 +90,16 @@ jobs:
       # `reference-fips-needs-clang-on-linux`). Install clang + libclang
       # headers so every cell of the matrix builds. Also install the
       # libgssapi headers for the `auth-sasl-kerberos` feature path.
-      - name: Install clang + libclang-dev + libkrb5-dev (aws-lc, FIPS delocate, GSSAPI)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev libkrb5-dev
+      - name: Install clang + llvm + libclang-dev + libkrb5-dev (aws-lc, FIPS delocate, GSSAPI)
+        # `llvm` ships the unversioned /usr/bin/llvm-ar + /usr/bin/llvm-ranlib
+        # that the job-level AR/RANLIB env below points at for every cell (not
+        # just the FIPS ones — the env is set at step level, whereas xtask's
+        # apply_fips_toolchain only sets it for crypto-fips). `clang` alone does
+        # not pull llvm-ar in, and the earlier free-disk-space step purges any
+        # `^llvm-.*` the runner image shipped, so without this cc-rs (building
+        # the zstd-sys C dep) fails the whole matrix with
+        # `failed to find tool "llvm-ar"`.
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libclang-dev libkrb5-dev
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-crypto-matrix
         env:
           CC: clang
