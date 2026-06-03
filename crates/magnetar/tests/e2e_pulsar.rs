@@ -134,22 +134,21 @@ async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Err
         .service_url(service_url)
         .build()
         .await?;
-    let producer = client.producer(topic).create().await?;
+    let producer = client.partitioned_producer(topic).create().await?;
 
     let n = 16usize;
     for i in 0..n {
         producer
             .send(
                 OutgoingMessage::with_payload(format!("msg-{i}").into_bytes())
-                    .key(format!("key-{}", i % 4))
-                    .into(),
+                    .key(format!("key-{}", i % 4)),
             )
             .await?;
     }
     producer.close().await?;
 
     let consumer = client
-        .consumer(topic)
+        .partitioned_consumer(topic)
         .subscription("magnetar-e2e-partitioned")
         .subscription_type(SubType::Shared)
         .initial_position(InitialPosition::Earliest)
@@ -158,9 +157,13 @@ async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Err
 
     let mut received = 0usize;
     while received < n {
-        let msg = consumer.receive().await?;
+        // Timeout guard mirrors e2e_partitioned_consumer_aggregates_all: a
+        // partition-discovery miss fails fast instead of hanging the harness.
+        let msg = tokio::time::timeout(Duration::from_secs(20), consumer.receive())
+            .await
+            .map_err(|_| format!("partitioned consumer timeout: got {received} of {n}"))??;
         received += 1;
-        consumer.ack(msg.message_id).await?;
+        consumer.ack(&msg.topic, msg.message.message_id).await?;
     }
     consumer.close().await?;
     client.close().await;
