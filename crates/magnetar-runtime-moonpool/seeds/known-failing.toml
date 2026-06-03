@@ -14,7 +14,9 @@
 # Schema (one TOML array entry per failing seed):
 #
 #   [[seed]]
-#   value         = 12345                # the u64 to seed MOONPOOL_SEED with
+#   value         = "0x..." | 12345      # the u64 seed for MOONPOOL_SEED; use a hex STRING for
+#                                         # values > i64::MAX (TOML ints are signed 64-bit and
+#                                         # cannot hold them losslessly)
 #   discovered    = "2026-06-01"         # YYYY-MM-DD UTC, day the daily sweep flagged it
 #   workflow_run  = "https://github.com/CleverCloud/magnetar/actions/runs/…"
 #   commit_sha    = "abcdef1234..."      # the main HEAD when the failure was observed
@@ -33,5 +35,61 @@
 # code). Anyone editing this file without a paired fix PR is in
 # process violation — see ADR-0047 §6.
 #
-# The registry is currently empty. Per-PR `seed-replay` is a trivial
-# pass until the daily sweep finds (and a human triages) something.
+# Anchor entries (convention): a small number of historically-severe
+# seeds are retained here with `status = "open"` even AFTER their fix
+# lands, as permanent per-PR regression anchors — the `seed-replay` job
+# re-validates the fix on every PR and fails if the seed ever reproduces
+# again. Anchor entries carry "RETAINED as a regression anchor" in their
+# `note`; do NOT remove them on a green replay (this overrides the
+# "remove when fixed" guidance above). The replay job's
+# "consider removing / stale" log line is advisory and does not apply to
+# anchors.
+
+# --- ADR-0038 re-entrant-mutex driver deadlock (fixed by ef0754b) ---
+# The two seeds the daily sweep flagged that exercised the driver's
+# re-entrant `parking_lot::Mutex` self-deadlock. Both pass since ef0754b;
+# kept as anchors so the per-PR replay guards the fix.
+
+[[seed]]
+value        = "0x56201ccaba82dbc1"
+discovered   = "2026-06-02"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/26799269295"
+commit_sha   = "93d58cfdb12deb8e68d821c50ae5278c87d7f041"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/65"
+note         = """
+Re-entrant parking_lot::Mutex self-deadlock in the connection driver's
+inbound read loop (ADR-0038): the `shared.inner` guard held by the
+`if let Err(_) = …handle_bytes_owned(…)` scrutinee outlived the
+consequent block, so the error arm re-locked the same non-reentrant
+mutex. This seed reorders the swizzle-clog clog/restore sequence into a
+frame the proto state machine rejects mid-session, which drives that arm.
+
+FIXED by ef0754b (the driver binds the result to a `let` so the guard
+drops before the error arm re-locks, both engines). RETAINED as a
+regression anchor — do NOT remove on a green replay: the per-PR
+seed-replay re-validates the ADR-0038 fix. Also pinned by the
+sim_chaos_swizzle_clog_sweep_16_seeds debug-seed set. Discovery issue
+#65 (closed resolved).
+"""
+
+[[seed]]
+value        = "0xdc638c565234d23f"
+discovered   = "2026-06-02"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/26799269295"
+commit_sha   = "93d58cfdb12deb8e68d821c50ae5278c87d7f041"
+test_name    = "sim_chaos_swizzle_clog_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/136"
+note         = """
+Second seed exercising the same re-entrant parking_lot::Mutex
+self-deadlock as the #65 anchor (ADR-0038): a swizzle-clog reorder
+produces a mid-session frame the proto rejects, driving the driver's
+error arm into a re-lock of the guard it already held.
+
+FIXED by ef0754b. RETAINED as a regression anchor — do NOT remove on a
+green replay: the per-PR seed-replay re-validates the ADR-0038 fix. Also
+pinned by the sim_chaos_swizzle_clog_sweep_16_seeds debug-seed set.
+Discovery issue #136 (closed resolved).
+"""
