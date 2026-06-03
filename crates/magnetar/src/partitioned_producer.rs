@@ -861,12 +861,14 @@ impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
 /// resolved partition (or a single producer on the bare topic when `N == 0`),
 /// and wrap the result in a [`PartitionedProducer`].
 ///
-/// Shared by [`PartitionedProducerBuilder::create`] and
-/// [`crate::builders::ProducerBuilder::create`]; the latter delegates here so
-/// that `client.producer(t).create().await` auto-dispatches between a single
-/// producer and a partitioned fan-out exactly like Java's
-/// `PulsarClientImpl#createProducerAsync`. Without this round-trip a bare
-/// `open_producer` on a partitioned topic surfaces as broker
+/// Used only by [`PartitionedProducerBuilder::create`] — the explicit
+/// partitioned-producer entry point. A bare
+/// [`crate::builders::ProducerBuilder::create`] does NOT delegate here: per
+/// ADR-0051 it pre-checks the partition metadata and, on a partitioned topic,
+/// returns an actionable error pointing the caller at
+/// `client.partitioned_producer(...)` rather than silently fanning out (the
+/// rejected "auto-dispatch exactly like Java" option). Without that pre-check a
+/// bare `open_producer` on a partitioned topic surfaces as broker
 /// `NotAllowedError(22) "Found partitioned metadata for non-partitioned topic"`
 /// — the rough edge that drove ADR-0051.
 ///
