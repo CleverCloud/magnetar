@@ -840,7 +840,18 @@ where
                 // is unchanged; SimProviders threads `time.now()` through
                 // the closure installed by `MoonpoolEngine::make_shared`.
                 let now = shared.now_instant();
-                if let Err(err) = shared.inner.lock().handle_bytes_owned(now, chunk) {
+                // ADR-0038: the `shared.inner` guard returned by `lock()` is a
+                // *temporary* in the `if let` scrutinee, which lives until the
+                // end of the consequent block. Re-locking `shared.inner` inside
+                // the error branch would re-enter the non-reentrant
+                // `parking_lot::Mutex` and self-deadlock the driver task. Bind
+                // the result to a `let` first: the guard drops at the `;`,
+                // before the branch body takes the lock again. (Surfaced by
+                // sim_chaos swizzle-clog seeds 0x56201ccaba82dbc1 /
+                // 0xdc638c565234d23f, which drive `handle_bytes_owned` to `Err`
+                // mid-reorder.)
+                let handle_result = shared.inner.lock().handle_bytes_owned(now, chunk);
+                if let Err(err) = handle_result {
                     shared.inner.lock().mark_disconnected();
                     return Err(err.into());
                 }

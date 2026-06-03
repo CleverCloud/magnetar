@@ -4540,6 +4540,54 @@ mod conn_state_tests {
     }
 
     #[test]
+    fn handle_bytes_owned_rejects_malformed_mid_session_frame() {
+        // Layer (a) of the ADR-0024 four-layer policy for the driver
+        // re-entrant-mutex deadlock fix (ADR-0038).
+        //
+        // This pins the *proto contract the runtime read loop relies
+        // on*: a malformed inbound frame received **mid-session**
+        // (after the handshake) is a hard reject — `handle_bytes_owned`
+        // returns `Err`, not `Ok` and not a silent park. That `Err` is
+        // exactly what drives the driver's error arm, where the
+        // deadlock used to live: the engines' read loop re-locked the
+        // already-held `shared.inner` `parking_lot::Mutex` to call
+        // `mark_disconnected()` and self-deadlocked. The fix (binding
+        // the result to a `let` so the guard drops first) is only
+        // *reachable* because this reject path exists, so the contract
+        // is pinned here and the no-deadlock behaviour in the runtime
+        // layers (b)/(c).
+        //
+        // The cheapest deterministic reject is a frame whose 4-byte
+        // big-endian `total_size` prefix is zero: `peek_full_frame_len`
+        // rejects `total_size == 0` up front with
+        // `FrameError::BadLength(0)` — no CRC / protobuf subtlety, only
+        // four bytes on the wire (matching the swizzle-clog seeds
+        // #65/#136, which reorder the clog/restore sequence into a
+        // frame the state machine rejects).
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes_owned(Instant::now(), handshake_response_bytes())
+            .expect("handshake completes");
+        assert!(conn.is_connected(), "mid-session precondition");
+
+        let mut malformed = bytes::BytesMut::with_capacity(4);
+        malformed.extend_from_slice(&[0u8; 4]); // total_size == 0
+        let err = conn
+            .handle_bytes_owned(Instant::now(), malformed)
+            .expect_err("a total_size=0 frame must be a hard reject, not Ok / a park");
+        assert!(
+            matches!(
+                err,
+                ProtocolError::Frame(crate::frame::FrameError::BadLength(0))
+            ),
+            "malformed mid-session frame must surface as a framing BadLength reject, got {err:?}",
+        );
+    }
+
+    #[test]
     fn poll_transmit_vectored_emits_segments_when_outbound_empty() {
         // ADR-0040 wave 1.2: when `outbound_segments` is non-empty and
         // the contiguous `outbound` buffer is empty,
