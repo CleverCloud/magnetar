@@ -1948,7 +1948,7 @@ dependencies = [
 [[package]]
 name = "moonpool-core"
 version = "0.6.0"
-source = "git+https://github.com/PierreZ/moonpool?branch=main#3863d1dfb3dcbc2fefbab93f4091da9af969ea9e"
+source = "git+https://github.com/FlorentinDUBOIS/moonpool?branch=fix%2Fno-progress-detector-busy-peer#f431e82e029670e1368579d43bcb87e0c35579e7"
 dependencies = [
  "futures",
  "rand 0.10.1",
@@ -1963,7 +1963,7 @@ dependencies = [
 [[package]]
 name = "moonpool-explorer"
 version = "0.6.0"
-source = "git+https://github.com/PierreZ/moonpool?branch=main#3863d1dfb3dcbc2fefbab93f4091da9af969ea9e"
+source = "git+https://github.com/FlorentinDUBOIS/moonpool?branch=fix%2Fno-progress-detector-busy-peer#f431e82e029670e1368579d43bcb87e0c35579e7"
 dependencies = [
  "libc",
 ]
@@ -1971,7 +1971,7 @@ dependencies = [
 [[package]]
 name = "moonpool-sim"
 version = "0.6.0"
-source = "git+https://github.com/PierreZ/moonpool?branch=main#3863d1dfb3dcbc2fefbab93f4091da9af969ea9e"
+source = "git+https://github.com/FlorentinDUBOIS/moonpool?branch=fix%2Fno-progress-detector-busy-peer#f431e82e029670e1368579d43bcb87e0c35579e7"
 dependencies = [
  "async-trait",
  "crc32c",

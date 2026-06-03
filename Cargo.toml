@@ -212,3 +212,14 @@ opt-level = 0
 
 [profile.test]
 opt-level = 1   # tests still need to be quick under the sans-io harness
+
+# TEMPORARY: validate magnetar against the moonpool no-progress-detector fix
+# (ADR-0052 pivot — orchestrator `run_time_budget` catches the busy-peer
+# keepalive storm as a DEADLOCK without magnetar-side timers). Points at the
+# PR #116 branch on the fork (https://github.com/PierreZ/moonpool/pull/116).
+# MUST be removed once the moonpool PR lands, and replaced by bumping the
+# moonpool git pin to PierreZ/moonpool `main`.
+[patch."https://github.com/PierreZ/moonpool"]
+moonpool-core = { git = "https://github.com/FlorentinDUBOIS/moonpool", branch = "fix/no-progress-detector-busy-peer" }
+moonpool-sim = { git = "https://github.com/FlorentinDUBOIS/moonpool", branch = "fix/no-progress-detector-busy-peer" }
+moonpool-explorer = { git = "https://github.com/FlorentinDUBOIS/moonpool", branch = "fix/no-progress-detector-busy-peer" }
