@@ -232,11 +232,18 @@ impl ProxyConnectionPool {
         // tracks the bootstrap config 1:1.
         let mut cfg = self.factory.bootstrap_config.clone();
         cfg.proxy_to_broker_url = proxy_to_broker_url;
+        let connect_timeout = cfg.connect_timeout;
+        let operation_timeout = cfg.operation_timeout;
 
+        // Bound the initial pool dial with the `connect_timeout` chokepoint so a
+        // hung dial surfaces as `Io(TimedOut)` instead of parking the pool entry
+        // forever — mirrors the moonpool pool's `Transport::connect` chokepoint
+        // (ADR-0052).
         let socket = Transport::connect_with_resolver(
             physical,
             self.factory.tls_config.clone(),
             self.factory.dns_resolver.as_deref(),
+            connect_timeout,
         )
         .await?;
 
@@ -256,8 +263,34 @@ impl ProxyConnectionPool {
         let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
 
         // Block until the new socket has finished its handshake — the caller
-        // expects a ready-to-use connection.
-        if let Err(err) = crate::client::wait_connected(shared.clone()).await {
+        // expects a ready-to-use connection — but bound the wait with
+        // `operation_timeout`. A pool dial whose supervised connection storms on
+        // a connect-hang (broker accepts the SYN but never CONNECTED) must
+        // surface as a timeout ERROR so the operation terminates, instead of
+        // parking forever. Java parity: `operationTimeoutMs` bounds the
+        // operation, NOT the connection (a flaky connection keeps reconnecting).
+        // Mirrors the moonpool pool's `get_or_open` `operation_timeout` deadline
+        // (ADR-0052).
+        let connected = tokio::time::timeout(
+            operation_timeout,
+            crate::client::wait_connected(shared.clone()),
+        )
+        .await;
+        let connected = match connected {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                driver.abort();
+                let (host, port) = physical.socket_addr();
+                return Err(ClientError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "pool dial to {host}:{port} exceeded operation_timeout \
+                         ({operation_timeout:?})"
+                    ),
+                )));
+            }
+        };
+        if let Err(err) = connected {
             driver.abort();
             return Err(err);
         }

@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use magnetar_proto::ConnectionConfig;
-use moonpool_core::{Providers, TaskProvider};
+use moonpool_core::{Providers, TaskProvider, TimeProvider};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -295,7 +295,19 @@ where
         }
     };
 
-    // Park until the dial task publishes the outcome.
+    // Park until the dial task publishes the outcome, bounded by the
+    // operation timeout (ADR-0052). A pool dial whose supervised connection
+    // storms on a moonpool-sim connect-hang (or a real broker that never
+    // finishes establishing) must surface as a timeout ERROR to the caller —
+    // so the workload/operation terminates — instead of parking forever. The
+    // deadline is driven by the engine `TimeProvider` (virtual time under
+    // moonpool, ADR-0011), so it fires deterministically and never depends on
+    // wall-clock. Java parity: this is `operationTimeoutMs` bounding the
+    // operation, NOT the connection (a flaky connection keeps reconnecting).
+    let time = pool.factory.providers.time();
+    let op_timeout = pool.factory.bootstrap_config.operation_timeout;
+    let deadline = time.sleep(op_timeout);
+    tokio::pin!(deadline);
     loop {
         if let Some(outcome) = pending.result.lock().as_ref().map(Arc::clone) {
             return match &*outcome {
@@ -303,7 +315,16 @@ where
                 Err(err) => Err(clone_engine_error(err)),
             };
         }
-        pending.notify.notified().await;
+        tokio::select! {
+            biased;
+            () = pending.notify.notified() => {}
+            _ = &mut deadline => {
+                return Err(EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("pool dial to {physical} exceeded operation_timeout ({op_timeout:?})"),
+                )));
+            }
+        }
     }
 }
 
@@ -385,10 +406,21 @@ async fn build_entry_async<P: Providers>(
     let mut cfg = factory.bootstrap_config.clone();
     cfg.proxy_to_broker_url = proxy_to_broker_url;
 
-    let mut transport = Transport::<P>::connect_with_resolver(
-        factory.providers.network(),
-        physical,
-        factory.dns_resolver.as_deref(),
+    let connect_timeout = cfg.connect_timeout;
+    let operation_timeout = cfg.operation_timeout;
+    let mut transport = crate::dial_with_retry::<P, _, _>(
+        factory.providers.time(),
+        cfg.connect_max_retries,
+        operation_timeout,
+        || {
+            Transport::<P>::connect_with_resolver(
+                factory.providers.network(),
+                physical,
+                factory.dns_resolver.as_deref(),
+                factory.providers.time(),
+                connect_timeout,
+            )
+        },
     )
     .await?;
 

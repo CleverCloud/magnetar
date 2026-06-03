@@ -46,7 +46,40 @@ impl Transport {
     /// it is ignored. The TLS server-name still comes from `url.host`, not from the resolved
     /// address, so SNI / hostname verification stay correct even when the resolver pins a
     /// specific IP.
+    ///
+    /// `connect_timeout` is the single chokepoint that bounds the whole dial
+    /// (TCP connect + TLS handshake) — every dial site (initial connect, the
+    /// multi-broker pool, the supervisor reconnect) routes through here, so a
+    /// broker that accepts the SYN but never finishes establishing is abandoned
+    /// as `Io(TimedOut)` instead of parking forever. Mirrors the moonpool
+    /// engine's `Transport::connect` chokepoint (real `tokio::time` here; safe
+    /// because the tokio engine has no virtual-clock hazard). (ADR-0052)
     pub(crate) async fn connect_with_resolver(
+        url: &ParsedUrl,
+        tls_config: Option<Arc<rustls::ClientConfig>>,
+        resolver: Option<&dyn DnsResolver>,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        match tokio::time::timeout(
+            connect_timeout,
+            Self::connect_with_resolver_inner(url, tls_config, resolver),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_elapsed) => Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "connect dial to {}:{} exceeded connect_timeout ({connect_timeout:?})",
+                    url.host, url.port
+                ),
+            ))),
+        }
+    }
+
+    /// Inner dial body — the unbounded TCP connect + TLS handshake. Always
+    /// invoked under the [`Self::connect_with_resolver`] chokepoint timeout.
+    async fn connect_with_resolver_inner(
         url: &ParsedUrl,
         tls_config: Option<Arc<rustls::ClientConfig>>,
         resolver: Option<&dyn DnsResolver>,
@@ -220,9 +253,14 @@ mod tests {
         // refused on 127.0.0.1.
         let url = ParsedUrl::parse("pulsar://should-be-ignored.invalid:6650").expect("parse");
 
-        let err = Transport::connect_with_resolver(&url, None, Some(&resolver))
-            .await
-            .expect_err("connection to 127.0.0.1:65535 must fail");
+        let err = Transport::connect_with_resolver(
+            &url,
+            None,
+            Some(&resolver),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect_err("connection to 127.0.0.1:65535 must fail");
 
         // Must surface as an I/O error (connection refused / reset), not the DNS-failure
         // `ClientError::Other` path. That confirms the resolver address actually reached
@@ -238,9 +276,10 @@ mod tests {
         // No resolver — the URL host must be used. Pick an obviously-unreachable port on
         // loopback so we still get a fast I/O error rather than waiting on real DNS.
         let url = ParsedUrl::parse("pulsar://127.0.0.1:65535").expect("parse");
-        let err = Transport::connect_with_resolver(&url, None, None)
-            .await
-            .expect_err("connection to 127.0.0.1:65535 must fail");
+        let err =
+            Transport::connect_with_resolver(&url, None, None, std::time::Duration::from_secs(10))
+                .await
+                .expect_err("connection to 127.0.0.1:65535 must fail");
         assert!(
             matches!(err, ClientError::Io(_)),
             "expected ClientError::Io, got {err:?}"

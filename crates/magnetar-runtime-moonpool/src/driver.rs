@@ -503,6 +503,10 @@ where
         }
 
         let supervisor_cfg = shared.inner.lock().supervisor_config().cloned();
+        // Per-attempt dial budget for each reconnect (ADR-0052): the supervisor
+        // loop already retries, so the chokepoint timeout on `Transport::connect`
+        // is all the reconnect dial needs to avoid parking on a connect-hang.
+        let connect_timeout = shared.inner.lock().connect_timeout();
         let Some(cfg) = supervisor_cfg else {
             return last_inner_result;
         };
@@ -621,6 +625,8 @@ where
                 providers.network(),
                 &target_host_port,
                 resolver,
+                providers.time(),
+                connect_timeout,
             )
             .await
             {

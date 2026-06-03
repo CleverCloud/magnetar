@@ -184,6 +184,18 @@ pub struct ConnectionConfig {
     pub keepalive_interval: Duration,
     /// Operation timeout (e.g. lookup + send). Default `30 s`.
     pub operation_timeout: Duration,
+    /// Per-attempt timeout for the *initial* TCP/TLS dial. A dial that does not
+    /// complete within this budget is abandoned and retried (see
+    /// [`Self::connect_max_retries`]). Mirrors Java's `connectionTimeoutMs`.
+    /// Default `10 s` (Java `connectionTimeoutMs`).
+    /// ([ADR-0052](../../specs/adr/0052-initial-connect-timeout-retry.md))
+    pub connect_timeout: Duration,
+    /// Bounded retries for the *initial* dial when it times out or fails with a
+    /// transient I/O error. `0` means a single attempt (no retry). Each retry
+    /// re-dials after an exponential backoff. The Pulsar handshake that follows
+    /// a successful dial is NOT retried here — surviving mid-stream transport
+    /// drops is the supervisor's job ([`Self::supervisor`]). Default `8`.
+    pub connect_max_retries: u32,
     /// Default compression for producers (overridable per producer).
     pub default_compression: CompressionKind,
     /// Default max-message-size if the broker omits it. Pulsar default = 5 MiB.
@@ -278,6 +290,8 @@ impl Default for ConnectionConfig {
             feature_flags: pb::FeatureFlags::default(),
             keepalive_interval: Duration::from_secs(30),
             operation_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
+            connect_max_retries: 8,
             default_compression: CompressionKind::None,
             default_max_message_size: 5 * 1024 * 1024,
             proxy_to_broker_url: None,
@@ -383,6 +397,80 @@ mod redirect_url_allow_list_tests {
         assert!(!list.is_allowed("http://broker.example.com:6650"));
         assert!(!list.is_allowed("tcp://broker.example.com:6650"));
         assert!(!list.is_allowed("javascript:broker.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod connect_resilience_config_tests {
+    //! Layer (a) of the ADR-0024 four-layer policy for the dual-cap
+    //! initial-dial retry (ADR-0052). Pins the [`ConnectionConfig`]
+    //! defaults the moonpool + tokio engines read when bounding the
+    //! initial connect, and confirms the dual-cap fields survive a
+    //! round-trip through `Clone` (the engines clone the config off the
+    //! `ConnectionShared` per dial site).
+    //!
+    //! The runtime-side wiring is exercised in
+    //! `magnetar-runtime-moonpool/tests/connect_resilience.rs`, the
+    //! mirrored `magnetar-runtime-tokio/tests/connect_resilience.rs`, the
+    //! `magnetar-differential` equivalence layer, and the e2e suite.
+
+    use core::time::Duration;
+
+    use super::ConnectionConfig;
+
+    #[test]
+    fn default_dual_cap_matches_java_client() {
+        let cfg = ConnectionConfig::default();
+        // Per-attempt initial-dial budget — exact Java `connectionTimeoutMs`.
+        assert_eq!(
+            cfg.connect_timeout,
+            Duration::from_secs(10),
+            "connect_timeout default must be 10s (Java connectionTimeoutMs parity)",
+        );
+        // Count backstop — Java's reconnect-attempt count for the initial dial.
+        assert_eq!(
+            cfg.connect_max_retries, 8,
+            "connect_max_retries default must be 8 (count backstop)",
+        );
+        // Total connect-operation budget — Java `operationTimeoutMs`. The
+        // dual cap stops the retry loop on whichever of count / budget
+        // trips first.
+        assert_eq!(
+            cfg.operation_timeout,
+            Duration::from_secs(30),
+            "operation_timeout default must be 30s (total connect-operation budget)",
+        );
+    }
+
+    #[test]
+    fn dual_cap_fields_round_trip_through_clone() {
+        // The engines clone the config at each dial site
+        // (`connect_plain_with_resolver`, `connect_tls`, pool `build_entry`),
+        // so the dual-cap fields must survive `Clone` byte-identically.
+        let cfg = ConnectionConfig {
+            connect_timeout: Duration::from_millis(1_234),
+            connect_max_retries: 3,
+            operation_timeout: Duration::from_millis(7_777),
+            ..ConnectionConfig::default()
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.connect_timeout, Duration::from_millis(1_234));
+        assert_eq!(cloned.connect_max_retries, 3);
+        assert_eq!(cloned.operation_timeout, Duration::from_millis(7_777));
+    }
+
+    #[test]
+    fn zero_retries_is_a_valid_fail_fast_config() {
+        // `connect_max_retries = 0` means a single dial attempt with no
+        // retry — the fail-fast shape the tokio integration test exercises.
+        // Confirm the field accepts it and the other caps stay independent.
+        let cfg = ConnectionConfig {
+            connect_max_retries: 0,
+            ..ConnectionConfig::default()
+        };
+        assert_eq!(cfg.connect_max_retries, 0);
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.operation_timeout, Duration::from_secs(30));
     }
 }
 

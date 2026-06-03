@@ -76,7 +76,7 @@ mod transport;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Waker;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use magnetar_proto::{Connection, ConnectionConfig};
@@ -854,8 +854,23 @@ impl<P: Providers> MoonpoolEngine<P> {
         config: ConnectionConfig,
         resolver: Option<&dyn DnsResolver>,
     ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
-        let mut transport =
-            Transport::<P>::connect_with_resolver(self.providers.network(), addr, resolver).await?;
+        let connect_timeout = config.connect_timeout;
+        let operation_timeout = config.operation_timeout;
+        let mut transport = dial_with_retry::<P, _, _>(
+            self.providers.time(),
+            config.connect_max_retries,
+            operation_timeout,
+            || {
+                Transport::<P>::connect_with_resolver(
+                    self.providers.network(),
+                    addr,
+                    resolver,
+                    self.providers.time(),
+                    connect_timeout,
+                )
+            },
+        )
+        .await?;
         let shared = self.make_shared(config);
 
         // Drive the handshake inline. Once `Connected` lands we hand the
@@ -898,9 +913,25 @@ impl<P: Providers> MoonpoolEngine<P> {
         config: ConnectionConfig,
         resolver: Option<&dyn DnsResolver>,
     ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
-        let mut transport =
-            Transport::<P>::connect_tls(self.providers.network(), addr, host, tls_config, resolver)
-                .await?;
+        let connect_timeout = config.connect_timeout;
+        let operation_timeout = config.operation_timeout;
+        let mut transport = dial_with_retry::<P, _, _>(
+            self.providers.time(),
+            config.connect_max_retries,
+            operation_timeout,
+            || {
+                Transport::<P>::connect_tls(
+                    self.providers.network(),
+                    addr,
+                    host,
+                    tls_config.clone(),
+                    resolver,
+                    self.providers.time(),
+                    connect_timeout,
+                )
+            },
+        )
+        .await?;
         let shared = self.make_shared(config);
         handshake_plain::<P>(&shared, &mut transport).await?;
         let driver = driver::spawn::<P>(
@@ -935,10 +966,21 @@ impl<P: Providers> MoonpoolEngine<P> {
         service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
         dns_resolver: Option<Arc<dyn DnsResolver>>,
     ) -> Result<(Arc<ConnectionShared>, DriverHandle), EngineError> {
-        let mut transport = Transport::<P>::connect_with_resolver(
-            self.providers.network(),
-            addr,
-            dns_resolver.as_deref(),
+        let connect_timeout = config.connect_timeout;
+        let operation_timeout = config.operation_timeout;
+        let mut transport = dial_with_retry::<P, _, _>(
+            self.providers.time(),
+            config.connect_max_retries,
+            operation_timeout,
+            || {
+                Transport::<P>::connect_with_resolver(
+                    self.providers.network(),
+                    addr,
+                    dns_resolver.as_deref(),
+                    self.providers.time(),
+                    connect_timeout,
+                )
+            },
         )
         .await?;
         let shared = self.make_shared(config);
@@ -953,6 +995,86 @@ impl<P: Providers> MoonpoolEngine<P> {
             driver::spawn_supervised::<P>(shared.clone(), transport, ctx, self.providers.clone());
         Ok((shared, driver))
     }
+}
+
+/// Dial the transport with a per-attempt timeout and bounded retry.
+///
+/// The *initial* dial is the one network step magnetar cannot otherwise
+/// recover from: there is no connection yet for the supervisor to rebuild, so
+/// a dial that never resolves — moonpool-sim's `ConnectFailureMode`
+/// connect-hang fault, or a real broker that accepts the SYN but never
+/// finishes establishing — would park the caller forever. Each attempt is
+/// bounded by the chokepoint connect-timeout inside [`Transport::connect`]
+/// (driven by the engine [`TimeProvider`] so it fires under moonpool virtual
+/// time, not wall time — a `tokio::time` timeout would never advance the
+/// simulated clock). This helper re-dials the transient `Io` outcomes up to
+/// `max_retries` times with exponential backoff, returning the last error once
+/// the budget is exhausted. The supervisor reconnect loop has its own retry, so
+/// it calls the timed dial directly rather than through this helper.
+///
+/// # Dual cap (Java parity)
+///
+/// Two independent caps bound the retry loop; whichever trips **first** ends
+/// it:
+///
+/// 1. **Count** -- `max_retries` re-dials (the `connect_max_retries` backstop).
+/// 2. **Total budget** -- `operation_timeout` measured from the *first* attempt (Java
+///    `operationTimeoutMs`, the total connect-operation budget). The elapsed check is a
+///    [`TimeProvider::now`] **comparison** against the start instant, NOT a new scheduled timer: a
+///    fresh [`TimeProvider::sleep`] / `timeout` here would perturb moonpool's virtual schedule and
+///    re-trigger the busy-peer connect-hang on some seed, whereas a pure `now()` delta read does
+///    not.
+///
+/// ([ADR-0052](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0052-initial-connect-timeout-retry.md))
+pub(crate) async fn dial_with_retry<P, F, Fut>(
+    time: &P::Time,
+    max_retries: u32,
+    operation_timeout: Duration,
+    mut dial: F,
+) -> Result<Transport<P>, EngineError>
+where
+    P: Providers,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Transport<P>, EngineError>>,
+{
+    // Snapshot the start instant once. The total-budget cap is a comparison
+    // against this `now()` reading -- no new TimeProvider timer is armed, so the
+    // deterministic moonpool schedule is left untouched (see the dual-cap note).
+    let started = time.now();
+    let mut attempt: u32 = 0;
+    loop {
+        // The dial closure funnels through `Transport::connect`, which already
+        // bounds the dial with the chokepoint connect-timeout; here we only
+        // retry the transient outcomes it surfaces. Only `Io` failures (the
+        // timeout lands as `Io(TimedOut)`, a refusal as `Io(ConnectionRefused)`)
+        // are worth re-dialling — a permanent error (bad TLS name/cert,
+        // protocol) will not change on retry, so surface it immediately.
+        match dial().await {
+            Ok(transport) => return Ok(transport),
+            Err(err) => {
+                // Dual cap: stop on a non-transient error, on the count
+                // backstop, or once the total operation budget is spent --
+                // whichever trips first.
+                let elapsed = time.now().saturating_sub(started);
+                if !matches!(err, EngineError::Io(_))
+                    || attempt >= max_retries
+                    || elapsed >= operation_timeout
+                {
+                    return Err(err);
+                }
+                attempt += 1;
+                let _ = time.sleep(connect_backoff(attempt)).await;
+            }
+        }
+    }
+}
+
+/// Exponential backoff for [`dial_with_retry`]: 50 ms doubling, capped at 1 s.
+/// Deterministic (no jitter) so moonpool replays the retry schedule
+/// bit-for-bit.
+fn connect_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    Duration::from_millis((50u64 << shift).min(1_000))
 }
 
 /// Drive the byte pump until the handshake completes.

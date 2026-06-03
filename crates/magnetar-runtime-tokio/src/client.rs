@@ -78,6 +78,69 @@ enum LookupTarget {
     Proxy { broker_url: String },
 }
 
+/// Dial the transport with a bounded retry.
+///
+/// The *initial* dial is the one network step the reconnect supervisor cannot
+/// recover (there is no connection yet to rebuild), so a dial that blocks — a
+/// broker that accepts the SYN but never finishes establishing, or a transient
+/// refusal — would otherwise propagate straight to the caller. Each attempt is
+/// bounded by the `connect_timeout` chokepoint inside
+/// [`Transport::connect_with_resolver`] (the dial closure carries it); here we
+/// only retry the transient outcomes it surfaces. Only transient `Io` failures
+/// (the chokepoint timeout lands as `Io(TimedOut)`) are retried; a permanent
+/// error (bad TLS name/cert, protocol) is surfaced immediately. Production
+/// analogue of the moonpool engine's `dial_with_retry` — both consume the same
+/// [`ConnectionConfig::connect_max_retries`] / [`ConnectionConfig::operation_timeout`]
+/// so the engines retry alike.
+///
+/// # Dual cap (Java parity)
+///
+/// Two independent caps bound the retry loop; whichever trips **first** ends
+/// it:
+///
+/// 1. **Count** — `max_retries` re-dials (`connect_max_retries`).
+/// 2. **Total budget** — `operation_timeout` (Java `operationTimeoutMs`) measured from the *first*
+///    attempt. Tokio runs on real wall time with no virtual-clock hazard, so the elapsed check is a
+///    plain [`std::time::Instant`] comparison; this mirrors the moonpool engine's
+///    `now()`-comparison dual cap.
+///
+/// ([ADR-0052](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0052-initial-connect-timeout-retry.md))
+async fn dial_with_retry<S, F, Fut>(
+    max_retries: u32,
+    operation_timeout: std::time::Duration,
+    mut dial: F,
+) -> Result<S, ClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<S, ClientError>>,
+{
+    let started = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        let err = match dial().await {
+            Ok(socket) => return Ok(socket),
+            Err(err) => err,
+        };
+        // Dual cap: stop on a non-transient error, on the count backstop, or
+        // once the total operation budget is spent — whichever trips first.
+        if !matches!(err, ClientError::Io(_))
+            || attempt >= max_retries
+            || started.elapsed() >= operation_timeout
+        {
+            return Err(err);
+        }
+        attempt += 1;
+        tokio::time::sleep(connect_backoff(attempt)).await;
+    }
+}
+
+/// Exponential backoff for [`dial_with_retry`]: 50 ms doubling, capped at 1 s.
+/// Matches the moonpool engine's schedule so the two engines retry in lockstep.
+fn connect_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    std::time::Duration::from_millis((50u64 << shift).min(1_000))
+}
+
 impl Client {
     /// Connect to the given `url` using the supplied protocol-layer config.
     ///
@@ -209,9 +272,16 @@ impl Client {
         service_url_provider: Option<Arc<dyn magnetar_proto::ServiceUrlProvider>>,
         dns_resolver: Option<Arc<dyn DnsResolver>>,
     ) -> Result<Self, ClientError> {
-        let socket =
-            Transport::connect_with_resolver(&url, tls_config.clone(), dns_resolver.as_deref())
-                .await?;
+        let connect_timeout = config.connect_timeout;
+        let socket = dial_with_retry(config.connect_max_retries, config.operation_timeout, || {
+            Transport::connect_with_resolver(
+                &url,
+                tls_config.clone(),
+                dns_resolver.as_deref(),
+                connect_timeout,
+            )
+        })
+        .await?;
         Self::start_supervised_handshake(
             socket,
             url,

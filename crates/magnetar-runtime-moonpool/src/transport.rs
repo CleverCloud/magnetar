@@ -22,10 +22,11 @@
 use std::io;
 use std::io::IoSlice;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
-use moonpool_core::{NetworkProvider, Providers};
+use moonpool_core::{NetworkProvider, Providers, TimeProvider};
 use rustls::ClientConnection;
 use rustls::pki_types::ServerName;
 
@@ -112,8 +113,30 @@ impl<P: Providers> Transport<P> {
     /// # Errors
     /// Surfaces the underlying [`NetworkProvider::connect`] failure as
     /// [`EngineError::Io`].
-    pub(crate) async fn connect(network: &P::Network, addr: &str) -> Result<Self, EngineError> {
-        let stream = network.connect(addr).await.map_err(EngineError::Io)?;
+    pub(crate) async fn connect(
+        network: &P::Network,
+        addr: &str,
+        time: &P::Time,
+        connect_timeout: Duration,
+    ) -> Result<Self, EngineError> {
+        // Single chokepoint for every dial site (initial connect, the proxy /
+        // multi-broker pool, and the supervisor reconnect): bound
+        // `NetworkProvider::connect` with the engine `TimeProvider` so a hung
+        // dial — moonpool-sim's `ConnectFailureMode` connect-hang, or a real
+        // broker that stalls mid-establish — is abandoned under virtual time
+        // instead of parking forever, surfacing as `Io(TimedOut)` for the
+        // caller's retry/backoff to act on. (ADR-0052)
+        let connect_fut = network.connect(addr);
+        tokio::pin!(connect_fut);
+        let stream = tokio::select! {
+            biased;
+            res = &mut connect_fut => res,
+            _ = time.sleep(connect_timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("connect dial to {addr} exceeded connect_timeout ({connect_timeout:?})"),
+            )),
+        }
+        .map_err(EngineError::Io)?;
         Ok(Self::Plain {
             stream,
             read_scratch: new_read_scratch(),
@@ -138,9 +161,11 @@ impl<P: Providers> Transport<P> {
         network: &P::Network,
         addr: &str,
         resolver: Option<&dyn DnsResolver>,
+        time: &P::Time,
+        connect_timeout: Duration,
     ) -> Result<Self, EngineError> {
         let Some(resolver) = resolver else {
-            return Self::connect(network, addr).await;
+            return Self::connect(network, addr, time, connect_timeout).await;
         };
         let (host, port) = split_host_port(addr)?;
         let addrs = resolver.resolve(host, port).await?;
@@ -149,22 +174,21 @@ impl<P: Providers> Transport<P> {
                 "dns resolver returned no addresses for {host}:{port}"
             )));
         }
-        let mut last_err: Option<io::Error> = None;
+        let mut last_err: Option<EngineError> = None;
         for sa in addrs {
             let formatted = sa.to_string();
-            match network.connect(&formatted).await {
-                Ok(stream) => {
-                    return Ok(Self::Plain {
-                        stream,
-                        read_scratch: new_read_scratch(),
-                    });
-                }
+            // Each candidate dial inherits the chokepoint timeout via `connect`.
+            match Self::connect(network, &formatted, time, connect_timeout).await {
+                Ok(transport) => return Ok(transport),
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(EngineError::Io(
-            last_err.expect("at least one connect attempt was made"),
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            EngineError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no resolved candidate could be dialled",
+            ))
+        }))
     }
 
     /// Establish a TLS connection — dial `addr` via the
@@ -189,8 +213,11 @@ impl<P: Providers> Transport<P> {
         host: &str,
         tls_config: Arc<rustls::ClientConfig>,
         resolver: Option<&dyn DnsResolver>,
+        time: &P::Time,
+        connect_timeout: Duration,
     ) -> Result<Self, EngineError> {
-        let plain = Self::connect_with_resolver(network, addr, resolver).await?;
+        let plain =
+            Self::connect_with_resolver(network, addr, resolver, time, connect_timeout).await?;
         let stream = match plain {
             Self::Plain { stream, .. } => stream,
             Self::Tls { .. } => unreachable!("connect_with_resolver only yields Plain"),

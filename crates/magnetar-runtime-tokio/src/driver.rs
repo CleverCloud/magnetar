@@ -633,10 +633,16 @@ async fn supervised_driver_loop(
                 };
 
             let resolver = reconnect_ctx.dns_resolver.as_deref();
+            // Each reconnect dial inherits the `connect_timeout` chokepoint so a
+            // hung re-dial is abandoned instead of stalling the supervisor loop
+            // (ADR-0052). Snapshot per-iteration so a future dynamic config
+            // update takes effect on the next attempt.
+            let connect_timeout = shared.inner.lock().connect_timeout();
             match Transport::connect_with_resolver(
                 &target_url,
                 reconnect_ctx.tls_config.clone(),
                 resolver,
+                connect_timeout,
             )
             .await
             {

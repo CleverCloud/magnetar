@@ -456,6 +456,14 @@ impl Connection {
         self.config.supervisor.as_ref()
     }
 
+    /// The per-attempt initial-dial timeout ([`ConnectionConfig::connect_timeout`]).
+    /// The runtime supervisor reads this to bound each reconnect dial under the
+    /// engine clock, matching the initial connect's retry path (ADR-0052).
+    #[must_use]
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        self.config.connect_timeout
+    }
+
     /// Configure the anti-thrash detector (ADR-0028). Pass `threshold = None`
     /// to disable. Engines call this once at supervisor start time after
     /// reading [`crate::supervisor::SupervisorConfig::anti_thrash_threshold`]

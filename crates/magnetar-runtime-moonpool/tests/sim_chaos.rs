@@ -108,6 +108,27 @@ async fn read_into<S: AsyncRead + Unpin>(
 /// address derivation trivial.
 const BROKER_PORT: u16 = 6650;
 
+/// Per-run virtual-time budget for every chaos builder below
+/// ([`SimulationBuilder::run_time_budget`]).
+///
+/// moonpool's default is one *simulated* hour, sized never to trip a
+/// legitimate long-running simulation. These chaos workloads consume at
+/// most a few simulated seconds per run (connect retries, chaos delays,
+/// reconnect backoffs, the ~100 ms swizzle-clog window), so the
+/// one-hour default lets a self-perpetuating-timer storm advance
+/// simulated time for the full hour — which, under parallel/CI
+/// execution, pins a core spinning the sim event queue until it lands.
+///
+/// `CHAOS_RUN_TIME_BUDGET` tightens that to a value comfortably above
+/// the empirically-measured legitimate ceiling (low single-digit
+/// simulated seconds across all nine builders, storming seeds included)
+/// yet tight enough that a storm trips the detector — graceful shutdown
+/// at one budget of simulated time, deadlock at two — long before it can
+/// burn a wall-clock core. The decision is a pure function of the
+/// simulated event schedule, so it never perturbs replay determinism
+/// (ADR-0011, ADR-0036).
+const CHAOS_RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
+
 /// Workload that runs an in-simulator Pulsar broker speaking the minimum
 /// wire subset needed to complete the client handshake and a handful of
 /// follow-up commands.
@@ -392,6 +413,7 @@ fn _reserved(_: Bytes, _: &mut Vec<u32>) {}
 #[test]
 fn sim_handshake_smoke() {
     let _ = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(BrokerWorkload::new())
         .workload(ClientWorkload::new())
         .set_iterations(1)
@@ -403,6 +425,7 @@ fn sim_handshake_smoke() {
 #[test]
 fn sim_handshake_sweep_16_seeds() {
     let _ = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(BrokerWorkload::new())
         .workload(ClientWorkload::new())
         .set_debug_seeds(sweep_seeds(16))
@@ -1302,6 +1325,7 @@ impl Workload for ProducerConsumerWorkload {
 #[test]
 fn sim_chaos_produce_consume_with_invariants() {
     let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
         .workload(ProducerConsumerWorkload::new())
         .invariant(MonotonicMsgIdInvariant::default())
@@ -1329,6 +1353,7 @@ fn sim_chaos_produce_consume_with_invariants() {
 #[test]
 fn sim_chaos_produce_consume_sweep_16_seeds() {
     let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
         .workload(ProducerConsumerWorkload::new())
         .invariant(MonotonicMsgIdInvariant::default())
@@ -1359,6 +1384,7 @@ fn sim_chaos_produce_consume_sweep_16_seeds() {
 #[test]
 fn sim_chaos_seed_2_does_not_hang() {
     let _ = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
         .workload(ProducerConsumerWorkload::new())
         .invariant(MonotonicMsgIdInvariant::default())
@@ -1647,6 +1673,7 @@ impl Workload for AntiThrashClientWorkload {
 #[test]
 fn sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds() {
     let _ = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(DropsTcpAfterCreate::new(5))
         .workload(AntiThrashClientWorkload::new())
         .set_debug_seeds(sweep_seeds(16))
@@ -1942,6 +1969,7 @@ impl Workload for ProxyClientWorkload {
 fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
     let sessions = Arc::new(Mutex::new(Vec::<ProxySessionRecord>::new()));
     let _ = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
         })
@@ -2578,6 +2606,7 @@ fn sim_chaos_swizzle_clog_sweep_16_seeds() {
     // of the iteration via a check-time copy below.
     let state_for_mirror = broker.state.clone();
     let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(broker)
         .workload(SwizzleClogMirroringClient::new(
             swizzle_snapshot.clone(),
@@ -2604,6 +2633,7 @@ fn sim_chaos_swizzle_clog_smoke() {
     let swizzle_snapshot = Arc::new(Mutex::new(None));
     let state_for_mirror = broker.state.clone();
     let _ = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(broker)
         .workload(SwizzleClogMirroringClient::new(
             swizzle_snapshot,
