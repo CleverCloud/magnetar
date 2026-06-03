@@ -79,10 +79,34 @@ pub(crate) fn inject_context(properties: &mut Vec<(String, String)>) {
 ///
 /// Returns a root (empty) context when the message carries no propagation
 /// headers or when no propagator is installed.
+///
+/// Use this when you need the raw [`opentelemetry::Context`] (e.g. to pass
+/// it to a span builder). For the common case of attaching it as the
+/// current context for the duration of message processing, prefer
+/// [`attach_context`].
 pub fn extract_context(msg: &magnetar_proto::event::IncomingMessage) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&MetadataPropertiesExtractor(&msg.metadata.properties))
     })
+}
+
+/// Extract the parent context from a received message and
+/// [`attach`](opentelemetry::Context::attach) it as the current context.
+///
+/// The returned guard resets the context when dropped, so hold it for the
+/// entire message-processing scope:
+///
+/// ```ignore
+/// let msg = consumer.receive().await?;
+/// let _guard = magnetar::otel::attach_context(&msg);
+/// // spans created here are children of the producer's span
+/// ```
+///
+/// No-op (returns immediately) when no propagator is installed.
+pub fn attach_context(
+    msg: &magnetar_proto::event::IncomingMessage,
+) -> opentelemetry::ContextGuard {
+    extract_context(msg).attach()
 }
 
 #[cfg(test)]
