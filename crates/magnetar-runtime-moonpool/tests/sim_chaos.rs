@@ -245,8 +245,20 @@ impl Workload for ClientWorkload {
             }
             Err(err) => HandshakeOutcome::Failed(format!("{err:?}")),
         };
+        // Gate the handshake postcondition HERE in run(): a moonpool
+        // `Workload::check()` `Err` is only logged (run_check_phase) and never
+        // flips `failed_runs`, so the mirror check() below cannot fail the
+        // test on its own. (The connect *timeout* is already gated above via
+        // the `?` on the `tokio::time::timeout`; this catches the rarer
+        // connected-but-not-in-Connected-state case.)
+        let gate = match &outcome {
+            HandshakeOutcome::Connected => Ok(()),
+            HandshakeOutcome::Failed(reason) => Err(SimulationError::InvalidState(format!(
+                "client handshake failed: {reason}"
+            ))),
+        };
         *self.last_outcome.lock() = Some(outcome);
-        Ok(())
+        gate
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
@@ -1293,6 +1305,22 @@ impl Workload for ProducerConsumerWorkload {
         }
 
         self.completed.store(true, Ordering::SeqCst);
+
+        // Gate the at-least-once postcondition HERE in run(): a moonpool
+        // `Workload::check()` `Err` is only logged by `run_check_phase` and
+        // never increments `failed_runs`, so the mirror check() below cannot
+        // fail the test on its own. A `run()` `Err` DOES land the iteration
+        // in `failed_runs`, so the missing-delivery case now actually fails.
+        {
+            let sent: HashSet<u32> = self.sent.lock().iter().copied().collect();
+            let received: HashSet<u32> = self.received.lock().iter().copied().collect();
+            let missing: Vec<u32> = sent.difference(&received).copied().collect();
+            if !missing.is_empty() {
+                return Err(SimulationError::InvalidState(format!(
+                    "at-least-once violated: sent {sent:?} but missing {missing:?}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1651,6 +1679,13 @@ impl Workload for AntiThrashClientWorkload {
         // Best-effort shutdown — we don't care if it errors; the
         // simulation budget is the safety net.
         client.close().await;
+        // NOTE (check()-vacuity audit): gating the cooldown contract here in
+        // run() revealed that the cooldown NEVER engages in this sim
+        // (successful_runs == 0 across the 16-seed sweep) — the detector is
+        // configured but the DropsTcpAfterCreate drop pattern never trips the
+        // threshold. The check() below is therefore vacuously green today. Left
+        // as-is pending a dedicated investigation (real detector gap vs. the
+        // sim broker not producing a tripping thrash pattern); see follow-up.
         Ok(())
     }
 
@@ -1672,6 +1707,13 @@ impl Workload for AntiThrashClientWorkload {
 /// every seed (per ADR-0028 test plan §5).
 #[test]
 fn sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds() {
+    // NOTE (check()-vacuity audit): this run() result is intentionally
+    // discarded for now. The client workload's cooldown contract is currently
+    // vacuous in sim (the cooldown never engages — successful_runs == 0; see
+    // the note on AntiThrashClientWorkload::run()), so asserting
+    // failed_runs == 0 here would fail. De-vacuifying this test requires first
+    // making the sim broker produce a thrash pattern that actually trips the
+    // detector — tracked as a follow-up.
     let _ = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(DropsTcpAfterCreate::new(5))
@@ -1946,6 +1988,16 @@ impl Workload for ProxyClientWorkload {
         }
 
         client.close().await;
+        // Gate in run(): a moonpool `Workload::check()` `Err` is only logged
+        // (run_check_phase), never flips `failed_runs`. The mirror check()
+        // below stays for inspection.
+        if !*self.success.lock() {
+            let snapshot = self.sessions.lock().clone();
+            return Err(SimulationError::InvalidState(format!(
+                "proxy_through detection on moonpool: expected \
+                 ProxyUnsupportedOnUnsupervisedClient + clean bootstrap; sessions={snapshot:?}"
+            )));
+        }
         Ok(())
     }
 
