@@ -186,8 +186,7 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
         mut msg: crate::OutgoingMessage,
     ) -> Pin<Box<dyn Future<Output = Result<magnetar_proto::MessageId, Self::Error>> + Send + '_>>
     {
-        #[cfg(feature = "opentelemetry")]
-        crate::otel::inject_context(&mut msg.properties);
+        crate::inject_otel_context(&mut msg.properties);
         Box::pin(magnetar_runtime_tokio::Producer::send(self, msg.into()))
     }
 

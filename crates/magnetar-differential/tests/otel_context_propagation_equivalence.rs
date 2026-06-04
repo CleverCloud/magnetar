@@ -9,6 +9,17 @@
 //! be clean of `traceparent`/`tracestate` properties — the test
 //! catches any accidental injection leak at the runner level.
 //!
+//! **ADR-0053 §D2 (retry / DLQ re-injection) scope at this layer.** D2 adds
+//! no tokio↔moonpool divergence by construction: re-injection lives only in
+//! the tokio façade (`TypedConsumer::reconsume_later` / `republish_dead_letters`),
+//! and the underlying runtime merge (`Consumer::apply_property_overrides`) is
+//! byte-identical code in both engines, unit-tested 1:1 on each side. The
+//! differential `EventStream` also cannot observe message properties
+//! (`Event::Received` carries only payload + id), so property-level OTel
+//! equivalence is asserted in the proto / runtime-unit / e2e layers rather than
+//! here; this equivalence test guards the determinism property D2 relies on —
+//! that neither runtime injects on its own.
+//!
 //! The companion layers are:
 //! - `crates/magnetar-proto/src/conn.rs` (property round-trip unit test)
 //! - `crates/magnetar-runtime-tokio/tests/otel_context_propagation.rs`

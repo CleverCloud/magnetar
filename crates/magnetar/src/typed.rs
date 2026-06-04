@@ -321,8 +321,7 @@ impl<S: Schema> TypedMessageBuilder<'_, S> {
             .encode(value)
             .map_err(schema_to_pulsar)?;
         let mut with_payload = self.msg.value(bytes);
-        #[cfg(feature = "opentelemetry")]
-        crate::otel::inject_context(&mut with_payload.properties);
+        crate::inject_otel_context(&mut with_payload.properties);
         let id = self
             .producer
             .inner
@@ -1054,12 +1053,20 @@ impl<S: Schema> TypedConsumer<S, Consumer> {
 
     /// Drain the DLQ pending list and republish every entry via `dlq_producer`. See the
     /// runtime's `Consumer::republish_dead_letters`. Returns the number republished.
+    ///
+    /// With the `opentelemetry` feature on, the republish span context is re-injected onto
+    /// every dead-letter copy (overwriting any inbound `traceparent` / `tracestate`) so the
+    /// republish is traced under the caller's current span; the original trace stays
+    /// reachable via the `REAL_TOPIC` / `ORIGINAL_MESSAGE_ID` correlation stamps
+    /// (ADR-0053 §D2).
     pub async fn republish_dead_letters(
         &self,
         dlq_producer: &magnetar_runtime_tokio::Producer,
     ) -> Result<usize, PulsarError> {
+        let mut extra_properties = Vec::new();
+        crate::inject_otel_context(&mut extra_properties);
         self.inner
-            .republish_dead_letters(dlq_producer)
+            .republish_dead_letters_with_properties(dlq_producer, extra_properties)
             .await
             .map_err(PulsarError::Client)
     }
@@ -1068,27 +1075,38 @@ impl<S: Schema> TypedConsumer<S, Consumer> {
     /// Java `Consumer#reconsumeLater(Message, long, TimeUnit)`. Takes the raw
     /// `IncomingMessage` (use [`TypedMessage::raw`]) so the original payload is
     /// preserved verbatim through the retry topic.
+    ///
+    /// With the `opentelemetry` feature on, the retrying consumer's current span context is
+    /// re-injected onto the retry-letter copy, replacing the inbound `traceparent` /
+    /// `tracestate` (ADR-0053 §D2).
     pub async fn reconsume_later(
         &self,
         retry_producer: &magnetar_runtime_tokio::Producer,
         msg: magnetar_proto::IncomingMessage,
         delay: std::time::Duration,
     ) -> Result<(), PulsarError> {
-        self.inner
-            .reconsume_later(retry_producer, msg, delay)
+        // Route through the properties-aware variant so the OTel re-injection (ADR-0053 §D2)
+        // happens on this path too.
+        self.reconsume_later_with_properties(retry_producer, msg, Vec::new(), delay)
             .await
-            .map_err(PulsarError::Client)
     }
 
     /// Same as [`Self::reconsume_later`] but stamps custom properties on the republished
     /// message. Mirrors Java's properties-aware reconsumeLater overload.
+    ///
+    /// With the `opentelemetry` feature on, the current span context is re-injected into
+    /// `custom_properties` before the runtime merges them (override on key collision), so
+    /// the retry-letter copy carries the retrying consumer's trace rather than the inbound
+    /// one (ADR-0053 §D2). An explicit `traceparent` / `tracestate` in `custom_properties`
+    /// is overwritten by the injected value.
     pub async fn reconsume_later_with_properties(
         &self,
         retry_producer: &magnetar_runtime_tokio::Producer,
         msg: magnetar_proto::IncomingMessage,
-        custom_properties: Vec<(String, String)>,
+        mut custom_properties: Vec<(String, String)>,
         delay: std::time::Duration,
     ) -> Result<(), PulsarError> {
+        crate::inject_otel_context(&mut custom_properties);
         self.inner
             .reconsume_later_with_properties(retry_producer, msg, custom_properties, delay)
             .await

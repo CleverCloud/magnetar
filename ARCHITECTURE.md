@@ -256,9 +256,9 @@ Two non-time sources of host-environment dependency remain in `magnetar-proto`; 
 2. **`std::env::var()` in `crates/magnetar-proto/src/auth/token.rs`** — read once at `TokenAuth` construction so the auth provider can resolve `$ENV_VAR -> token text`.
    This is a one-shot bootstrap read, not on the state-machine hot path.
 
-3. **`opentelemetry::Context::current()` + global propagator in `crate::otel::inject_context`** — the façade's send boundary reads the caller's ambient OTel span context and the process-global propagator to inject `traceparent`/`tracestate` properties.
+3. **`opentelemetry::Context::current()` + global propagator in `crate::otel::inject_context`** — the façade reads the caller's ambient OTel span context and the process-global propagator to inject `traceparent`/`tracestate` properties at every tokio send boundary (producer send, plus the `TypedConsumer` retry-letter `reconsume_later` and DLQ `republish_dead_letters` re-injection paths, ADR-0053 §D2).
    This is a façade-level (not `magnetar-proto`) leak, gated on `feature = "opentelemetry"` + `feature = "tokio"`.
-   The moonpool `ProducerApi::send` impl does **not** call `inject_context`, keeping sim determinism intact (ADR-0053).
+   The moonpool engine never calls `inject_context` on any path, keeping sim determinism intact (ADR-0053).
 
 A `cargo run -p xtask -- check-no-internal-clock` step treepunches the call graph for any new `Instant::now()` / `SystemTime::now()` / `uuid::new_v4` / `env::var` site introduced outside the documented leaks above.
 
