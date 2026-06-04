@@ -7937,4 +7937,72 @@ mod otel_property_round_trip_tests {
             .expect("tracestate in wire frame");
         assert_eq!(ts.value, tracestate);
     }
+
+    /// ADR-0053 §D2 — a retry-letter / DLQ message carries the re-injected
+    /// `traceparent` alongside the `REAL_TOPIC` / `ORIGINAL_MESSAGE_ID`
+    /// correlation stamps; all three survive the Connection send path so the
+    /// republished copy is traceable while still pointing back to its source.
+    #[test]
+    fn otel_reinjected_traceparent_survives_with_correlation_stamps() {
+        let at = Instant::now();
+        let mut conn = fresh_handshaked(at);
+        let handle = open_ready_producer(&mut conn, at);
+
+        let reinjected = "00-11111111111111111111111111111111-2222222222222222-01";
+
+        let mut metadata = pb::MessageMetadata::default();
+        // Shape produced by the runtime retry/DLQ paths: re-injected trace +
+        // correlation stamps (the inbound traceparent has already been replaced
+        // in place by `apply_property_overrides`, so only one is present here).
+        metadata.properties.push(pb::KeyValue {
+            key: "traceparent".to_owned(),
+            value: reinjected.to_owned(),
+        });
+        metadata.properties.push(pb::KeyValue {
+            key: "REAL_TOPIC".to_owned(),
+            value: "persistent://public/default/otel-props-t".to_owned(),
+        });
+        metadata.properties.push(pb::KeyValue {
+            key: "ORIGINAL_MESSAGE_ID".to_owned(),
+            value: "1:0:-1:-1".to_owned(),
+        });
+
+        let msg = crate::producer::OutgoingMessage {
+            payload: bytes::Bytes::from_static(b"retry"),
+            metadata,
+            uncompressed_size: 5,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        };
+        conn.send(handle, msg, 1_700_000_000, at).expect("send");
+
+        let wire = conn.poll_transmit();
+        let frame = crate::decode_one(&mut wire.clone()).expect("decode");
+        let meta = frame
+            .payload
+            .as_ref()
+            .map(|p| &p.metadata)
+            .expect("payload present");
+        let value_of = |key: &str| {
+            meta.properties
+                .iter()
+                .find(|kv| kv.key == key)
+                .map(|kv| kv.value.as_str())
+        };
+        assert_eq!(value_of("traceparent"), Some(reinjected));
+        assert_eq!(
+            value_of("REAL_TOPIC"),
+            Some("persistent://public/default/otel-props-t")
+        );
+        assert_eq!(value_of("ORIGINAL_MESSAGE_ID"), Some("1:0:-1:-1"));
+        assert_eq!(
+            meta.properties
+                .iter()
+                .filter(|kv| kv.key == "traceparent")
+                .count(),
+            1,
+            "exactly one traceparent on the republished frame"
+        );
+    }
 }

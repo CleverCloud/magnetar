@@ -31,6 +31,41 @@
 //! propagator) are reserved for propagation.
 //! Setting them manually on an [`OutgoingMessage`](crate::OutgoingMessage)
 //! will be silently overwritten at send time.
+//!
+//! # Retry and dead-letter paths
+//!
+//! `traceparent` / `tracestate` are also re-injected on the retry-letter
+//! (`reconsume_later`) and DLQ (`republish_dead_letters`) paths of the tokio
+//! [`TypedConsumer`](crate::TypedConsumer): when the retrying/republishing
+//! consumer has an **active span**, its context replaces the inbound trace on
+//! the republished copy, while the original trace stays reachable through the
+//! `REAL_TOPIC` / `ORIGINAL_MESSAGE_ID` correlation properties (ADR-0053 §D2).
+//! Injection follows standard OTel semantics: with no active span (or no
+//! installed propagator) nothing is written, so the inbound trace is left
+//! intact — attach the consumer's span before calling these methods (the
+//! examples show this), exactly as on the producer send path.
+//! The generic [`MultiTopicsConsumer`](crate::MultiTopicsConsumer) retry path is
+//! engine-agnostic (it must stay deterministic for the moonpool engine) and does
+//! **not** auto-inject; call [`inject_context`](crate::otel::inject_context)
+//! into the custom properties yourself there.
+//!
+//! # Security — treat inbound trace context as untrusted
+//!
+//! Inbound `traceparent` / `tracestate` are peer-controlled. A hostile or buggy
+//! producer can:
+//!
+//! - **Force-sample** by setting the `sampled` flag, amplifying your ingest cost
+//!   and polluting traces. A `ParentBased` sampler does **not** help here — it
+//!   honours a sampled remote parent unconditionally (the root delegate only
+//!   applies when there is no parent). To bound this, do not attach untrusted
+//!   inbound context as the sampling parent (extract it into a span *link* or a
+//!   fresh root instead), or use a custom `ShouldSample` sampler that ignores /
+//!   rate-limits remote-sampled parents, or strip the inbound `sampled` bit at
+//!   the trust boundary before [`attach`](opentelemetry::Context::attach)ing.
+//! - **Inflate `tracestate`**. The Rust propagator does not enforce the W3C
+//!   32-member limit, so [`extract_context`](crate::otel::extract_context)
+//!   defensively truncates over-long `tracestate` (right-most members dropped)
+//!   before parsing (ADR-0053 §E1).
 
 use magnetar_proto::pb;
 use opentelemetry::propagation::{Extractor, Injector};
@@ -97,12 +132,67 @@ pub fn inject_context(properties: &mut Vec<(String, String)>) {
 // Extract
 // ---------------------------------------------------------------------------
 
+/// W3C Trace Context Level 1 caps `tracestate` at 32 list-members.
+const MAX_TRACESTATE_MEMBERS: usize = 32;
+
+/// Defensively cap a peer-controlled `tracestate` value.
+///
+/// Inbound `tracestate` comes from an untrusted producer, and the Rust
+/// `opentelemetry` propagator does not enforce the W3C 32-member limit. To bound
+/// the parse work a hostile or buggy peer can force on the consumer, we drop the
+/// right-most members (the W3C-mandated truncation order) of any over-long value
+/// before it reaches the propagator (ADR-0053 §E1).
+///
+/// Returns the truncated value, or `None` when the input is already within the
+/// cap (the common case — no allocation on the fast path).
+///
+/// Both the over-cap check and the truncation are bounded: `nth` stops after at
+/// most `MAX_TRACESTATE_MEMBERS + 1` members and `take` stops at the cap, so a
+/// hostile value is never scanned in full.
+fn capped_tracestate(value: &str) -> Option<String> {
+    // `nth(MAX)` yields the (MAX + 1)-th member iff the value exceeds the cap,
+    // walking at most MAX + 1 members rather than the whole string.
+    let over_cap = value.split(',').nth(MAX_TRACESTATE_MEMBERS).is_some();
+    if !over_cap {
+        return None;
+    }
+    Some(
+        value
+            .split(',')
+            .take(MAX_TRACESTATE_MEMBERS)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 /// Extract a parent OpenTelemetry context from message metadata properties.
 ///
 /// This is the low-level helper that operates on a `&[pb::KeyValue]` slice.
 /// Prefer the convenience wrappers [`extract_context`] /
 /// [`extract_context_facade`] which accept full message types.
+///
+/// Over-long inbound `tracestate` is truncated to [`MAX_TRACESTATE_MEMBERS`]
+/// before extraction (ADR-0053 §E1).
 fn extract_from_properties(properties: &[pb::KeyValue]) -> opentelemetry::Context {
+    // Fast path: nothing over the cap, extract directly with no copy.
+    let needs_cap = properties
+        .iter()
+        .any(|kv| kv.key == "tracestate" && capped_tracestate(&kv.value).is_some());
+    if needs_cap {
+        let sanitized: Vec<pb::KeyValue> = properties
+            .iter()
+            .map(|kv| match (kv.key.as_str(), capped_tracestate(&kv.value)) {
+                ("tracestate", Some(value)) => pb::KeyValue {
+                    key: kv.key.clone(),
+                    value,
+                },
+                _ => kv.clone(),
+            })
+            .collect();
+        return opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&MetadataPropertiesExtractor(&sanitized))
+        });
+    }
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&MetadataPropertiesExtractor(properties))
     })
@@ -310,6 +400,41 @@ mod tests {
         let cx = extract_context(&incoming);
         let sc = cx.span().span_context().clone();
         assert!(!sc.is_valid(), "expected invalid (root) span context");
+    }
+
+    /// ADR-0053 §E1 — a peer-controlled `tracestate` over the W3C 32-member cap
+    /// is truncated (right-most dropped) before extraction; values within the cap
+    /// are left untouched. Pure helper, no global propagator state.
+    #[test]
+    fn capped_tracestate_truncates_oversized() {
+        let within = (0..10)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            capped_tracestate(&within).is_none(),
+            "a tracestate within the cap must not be rewritten"
+        );
+
+        let oversized = (0..40)
+            .map(|i| format!("k{i}=v{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let capped = capped_tracestate(&oversized).expect("oversized tracestate must be capped");
+        assert_eq!(
+            capped.split(',').count(),
+            MAX_TRACESTATE_MEMBERS,
+            "must truncate to exactly the W3C cap"
+        );
+        assert!(capped.starts_with("k0=v0"), "left-most members are kept");
+        assert!(
+            capped.ends_with("k31=v31"),
+            "right-most members are dropped: {capped}"
+        );
+        assert!(
+            !capped.contains("k32="),
+            "members past the cap must be gone: {capped}"
+        );
     }
 
     // --- test helpers ---

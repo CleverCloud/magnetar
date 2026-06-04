@@ -4,7 +4,9 @@
 //!
 //! Verifies that `traceparent` / `tracestate` properties injected by the
 //! producer survive the Pulsar broker round-trip and are extractable on
-//! the consumer side.
+//! the consumer side, and (ADR-0053 §D2) that the retry-letter
+//! (`reconsume_later`) path on the façade `TypedConsumer` re-injects the
+//! retrying consumer's current span, replacing the inbound trace.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
@@ -156,6 +158,145 @@ async fn e2e_otel_traceparent_round_trip() -> Result<(), Box<dyn std::error::Err
     client.close().await;
 
     // Reset propagator.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry::trace::noop::NoopTextMapPropagator::new(),
+    );
+
+    Ok(())
+}
+
+/// ADR-0053 §D2 — produce a message under trace A, then `reconsume_later` it
+/// under trace B on the façade `TypedConsumer`. The retry-letter copy must carry
+/// trace B (the retrying consumer's current span), not the inbound trace A, and
+/// must carry exactly one `traceparent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // single-shot e2e scenario; splitting scatters the produce → reconsume → assert narrative
+async fn e2e_otel_reconsume_reinjects_traceparent() -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use magnetar_proto::schema::StringSchema;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
+
+    const TRACE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TRACE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let (service_url, _container) = start_pulsar().await?;
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-otel-retry-{id}");
+    let retry_topic = format!("{topic}-RETRY");
+
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let span_ctx = |trace: &str, span: &str| {
+        SpanContext::new(
+            TraceId::from_hex(trace).unwrap(),
+            SpanId::from_hex(span).unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        )
+    };
+
+    let client = PulsarClient::builder()
+        .service_url(&service_url)
+        .build()
+        .await?;
+
+    // Produce under trace A — TypedProducer::send auto-injects at the send boundary.
+    let producer = client
+        .typed_producer(&topic, Arc::new(StringSchema::new()))
+        .create()
+        .await?;
+    {
+        let cx_a =
+            opentelemetry::Context::current().with_remote_span_context(span_ctx(TRACE_A, "a1a1a1a1a1a1a1a1"));
+        let _guard = cx_a.attach();
+        producer.send(&"retry-me".to_owned(), None).await?;
+    }
+    producer.flush().await?;
+    producer.close().await?;
+
+    // Consume on a façade TypedConsumer and reconsume under trace B.
+    let consumer = client
+        .typed_consumer(&topic, Arc::new(StringSchema::new()))
+        .subscription("otel-retry-sub")
+        .subscription_type(SubType::Shared)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let received = tokio::time::timeout(Duration::from_secs(10), consumer.receive())
+        .await
+        .expect("receive should not time out")?;
+
+    // Sanity: the original carries trace A.
+    let inbound_tp = received
+        .raw
+        .metadata
+        .properties
+        .iter()
+        .find(|kv| kv.key == "traceparent")
+        .map(|kv| kv.value.clone());
+    assert!(
+        inbound_tp.as_deref().is_some_and(|v| v.contains(TRACE_A)),
+        "original message should carry trace A: {inbound_tp:?}"
+    );
+
+    let retry_producer = client.producer(retry_topic.clone()).create().await?;
+    {
+        let cx_b =
+            opentelemetry::Context::current().with_remote_span_context(span_ctx(TRACE_B, "b2b2b2b2b2b2b2b2"));
+        let _guard = cx_b.attach();
+        consumer
+            .reconsume_later(&retry_producer, received.raw, Duration::from_secs(1))
+            .await?;
+    }
+
+    // Pull the retry-letter copy and assert the trace was re-injected (B), not A.
+    let retry_consumer = client
+        .consumer(retry_topic.clone())
+        .subscription("otel-retry-tail")
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let redelivered = tokio::time::timeout(Duration::from_secs(15), retry_consumer.receive())
+        .await
+        .expect("retry receive should not time out")?;
+
+    let traceparents: Vec<&str> = redelivered
+        .metadata
+        .properties
+        .iter()
+        .filter(|kv| kv.key == "traceparent")
+        .map(|kv| kv.value.as_str())
+        .collect();
+    assert_eq!(
+        traceparents.len(),
+        1,
+        "exactly one traceparent on the retry copy: {:?}",
+        redelivered.metadata.properties
+    );
+    assert!(
+        traceparents[0].contains(TRACE_B),
+        "retry copy must carry the reconsume span (trace B): {}",
+        traceparents[0]
+    );
+    assert!(
+        !traceparents[0].contains(TRACE_A),
+        "inbound trace A must have been replaced: {}",
+        traceparents[0]
+    );
+
+    retry_consumer.ack(redelivered.message_id).await?;
+    retry_consumer.close().await?;
+    retry_producer.close().await?;
+    consumer.close().await?;
+    client.close().await;
+
     opentelemetry::global::set_text_map_propagator(
         opentelemetry::trace::noop::NoopTextMapPropagator::new(),
     );

@@ -306,6 +306,28 @@ impl<P: Providers> Consumer<P> {
         &self,
         dlq_producer: &crate::Producer<P>,
     ) -> Result<usize, ClientError> {
+        self.republish_dead_letters_with_properties(dlq_producer, Vec::new())
+            .await
+    }
+
+    /// Same as [`Self::republish_dead_letters`] but stamps `extra_properties`
+    /// on every republished message (override on key collision). The façade
+    /// uses this to re-inject the current OpenTelemetry span context
+    /// (`traceparent` / `tracestate`) onto the dead-letter copy so the
+    /// republished message is traced under the republish span instead of
+    /// carrying the stale inbound trace (ADR-0053 §D2). Correlation back to
+    /// the source is preserved via the `REAL_TOPIC` / `ORIGINAL_MESSAGE_ID`
+    /// stamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`ClientError`] encountered. Already-republished
+    /// messages stay republished — partial progress is not rolled back.
+    pub async fn republish_dead_letters_with_properties(
+        &self,
+        dlq_producer: &crate::Producer<P>,
+        extra_properties: Vec<(String, String)>,
+    ) -> Result<usize, ClientError> {
         let drained = self.drain_dead_letter();
         let mut count = 0;
         for msg in drained {
@@ -317,23 +339,27 @@ impl<P: Providers> Consumer<P> {
                 properties: msg.metadata.properties.clone(),
                 ..magnetar_proto::pb::MessageMetadata::default()
             };
-            // Tag the republished message with the original id so DLQ
-            // consumers can correlate back to the source. Mirrors Java's
-            // `DeadLetterTopicMessageId` property convention.
-            metadata.properties.push(magnetar_proto::pb::KeyValue {
-                key: "REAL_TOPIC".to_owned(),
-                value: self
-                    .shared
-                    .inner
-                    .lock()
-                    .consumer_topic(self.handle)
-                    .unwrap_or("")
-                    .to_owned(),
-            });
-            metadata.properties.push(magnetar_proto::pb::KeyValue {
-                key: "ORIGINAL_MESSAGE_ID".to_owned(),
-                value: msg.message_id.to_string(),
-            });
+            // Re-inject / override (e.g. OTel traceparent) before the
+            // correlation stamps. Mirrors Java's `DeadLetterTopicMessageId`
+            // property convention.
+            Self::apply_property_overrides(&mut metadata.properties, extra_properties.clone());
+            // Stamp REAL_TOPIC + ORIGINAL_MESSAGE_ID through the override helper
+            // so the correlation stamps always win over (and never duplicate) a
+            // caller-supplied value.
+            let real_topic = self
+                .shared
+                .inner
+                .lock()
+                .consumer_topic(self.handle)
+                .unwrap_or("")
+                .to_owned();
+            Self::apply_property_overrides(
+                &mut metadata.properties,
+                vec![
+                    ("REAL_TOPIC".to_owned(), real_topic),
+                    ("ORIGINAL_MESSAGE_ID".to_owned(), msg.message_id.to_string()),
+                ],
+            );
             let payload_len = msg.payload.len();
             let outgoing = magnetar_proto::producer::OutgoingMessage {
                 payload: msg.payload,
@@ -348,6 +374,21 @@ impl<P: Providers> Consumer<P> {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Merge `extra` properties into `props`, replacing any existing entry
+    /// with the same key (override on collision) rather than appending a
+    /// duplicate. Shared by the reconsume / DLQ-republish paths so a
+    /// re-injected OTel `traceparent` / `tracestate` overwrites the inbound
+    /// value (ADR-0053 §D2).
+    fn apply_property_overrides(
+        props: &mut Vec<magnetar_proto::pb::KeyValue>,
+        extra: Vec<(String, String)>,
+    ) {
+        for (k, v) in extra {
+            props.retain(|kv| kv.key != k);
+            props.push(magnetar_proto::pb::KeyValue { key: k, value: v });
+        }
     }
 
     /// Republish a single message via `retry_producer` with a delay
@@ -402,12 +443,7 @@ impl<P: Providers> Consumer<P> {
             ..magnetar_proto::pb::MessageMetadata::default()
         };
         // Apply custom properties (overrides on key collision).
-        for (k, v) in custom_properties {
-            metadata.properties.retain(|kv| kv.key != k);
-            metadata
-                .properties
-                .push(magnetar_proto::pb::KeyValue { key: k, value: v });
-        }
+        Self::apply_property_overrides(&mut metadata.properties, custom_properties);
         // Bump the RECONSUMETIMES property if present, otherwise stamp it
         // at 1. Mirrors the Java retry-letter convention so downstream
         // consumers can enforce caps.
@@ -418,28 +454,25 @@ impl<P: Providers> Consumer<P> {
             .and_then(|kv| kv.value.parse::<u64>().ok())
             .unwrap_or(0)
             + 1;
-        metadata.properties.retain(|kv| kv.key != "RECONSUMETIMES");
-        metadata.properties.push(magnetar_proto::pb::KeyValue {
-            key: "RECONSUMETIMES".to_owned(),
-            value: reconsumetimes.to_string(),
-        });
-        // Stamp REAL_TOPIC + ORIGINAL_MESSAGE_ID like the DLQ republish
-        // does so consumers of the retry topic can correlate back to the
-        // source.
-        metadata.properties.push(magnetar_proto::pb::KeyValue {
-            key: "REAL_TOPIC".to_owned(),
-            value: self
-                .shared
-                .inner
-                .lock()
-                .consumer_topic(self.handle)
-                .unwrap_or("")
-                .to_owned(),
-        });
-        metadata.properties.push(magnetar_proto::pb::KeyValue {
-            key: "ORIGINAL_MESSAGE_ID".to_owned(),
-            value: msg.message_id.to_string(),
-        });
+        let real_topic = self
+            .shared
+            .inner
+            .lock()
+            .consumer_topic(self.handle)
+            .unwrap_or("")
+            .to_owned();
+        // Stamp RECONSUMETIMES + REAL_TOPIC + ORIGINAL_MESSAGE_ID through the
+        // override helper so they always win over (and never duplicate) a
+        // caller-supplied value, and consumers of the retry topic can correlate
+        // back to the source.
+        Self::apply_property_overrides(
+            &mut metadata.properties,
+            vec![
+                ("RECONSUMETIMES".to_owned(), reconsumetimes.to_string()),
+                ("REAL_TOPIC".to_owned(), real_topic),
+                ("ORIGINAL_MESSAGE_ID".to_owned(), msg.message_id.to_string()),
+            ],
+        );
         // Set deliver_at_time so the broker queues the message for
         // `delay` past now. ADR-0011 — invariant #3: read the engine
         // wall clock (moonpool-virtualised under SimProviders, host
@@ -1463,6 +1496,52 @@ mod tests {
     use super::{Consumer, ReceiveFut};
     use crate::client::{Client, ClientError};
     use crate::{ConnectionShared, MoonpoolEngine};
+
+    /// ADR-0053 §D2 — the reconsume / DLQ-republish property merge replaces an
+    /// inbound key (e.g. a re-injected OTel `traceparent`) in place rather than
+    /// duplicating it, and leaves unrelated keys untouched.
+    #[test]
+    fn apply_property_overrides_replaces_inbound_keys() {
+        let mut props = vec![
+            pb::KeyValue {
+                key: "traceparent".to_owned(),
+                value: "inbound".to_owned(),
+            },
+            pb::KeyValue {
+                key: "user".to_owned(),
+                value: "keep".to_owned(),
+            },
+        ];
+        Consumer::<TokioProviders>::apply_property_overrides(
+            &mut props,
+            vec![
+                ("traceparent".to_owned(), "reinjected".to_owned()),
+                ("tracestate".to_owned(), "ts=1".to_owned()),
+            ],
+        );
+        let traceparents: Vec<&str> = props
+            .iter()
+            .filter(|kv| kv.key == "traceparent")
+            .map(|kv| kv.value.as_str())
+            .collect();
+        assert_eq!(
+            traceparents,
+            vec!["reinjected"],
+            "inbound traceparent replaced exactly once, not duplicated"
+        );
+        assert!(
+            props
+                .iter()
+                .any(|kv| kv.key == "user" && kv.value == "keep"),
+            "unrelated key preserved"
+        );
+        assert!(
+            props
+                .iter()
+                .any(|kv| kv.key == "tracestate" && kv.value == "ts=1"),
+            "new override key appended"
+        );
+    }
 
     fn handshake_response_bytes() -> BytesMut {
         let cmd = pb::BaseCommand {

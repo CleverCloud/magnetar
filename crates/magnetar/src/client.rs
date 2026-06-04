@@ -168,8 +168,7 @@ impl OutgoingMessage {
         mut self,
         producer: &magnetar_runtime_tokio::Producer,
     ) -> magnetar_runtime_tokio::SendFut {
-        #[cfg(feature = "opentelemetry")]
-        crate::otel::inject_context(&mut self.properties);
+        crate::inject_otel_context(&mut self.properties);
         producer.send(self.into())
     }
 }
@@ -281,8 +280,7 @@ pub async fn send_with_interceptors(
     for i in &eligible {
         i.before_send(&mut msg);
     }
-    #[cfg(feature = "opentelemetry")]
-    crate::otel::inject_context(&mut msg.properties);
+    crate::inject_otel_context(&mut msg.properties);
     let snapshot = msg.clone();
     let mapped: Result<magnetar_proto::MessageId, PulsarError> =
         producer.send(msg.into()).await.map_err(PulsarError::Client);
@@ -525,8 +523,7 @@ impl MessageBuilder<'_> {
     /// Submit the message to the producer captured at `new_message()` time. Mirrors Java's
     /// terminal `TypedMessageBuilder#send`.
     pub fn send(mut self) -> magnetar_runtime_tokio::SendFut {
-        #[cfg(feature = "opentelemetry")]
-        crate::otel::inject_context(&mut self.msg.properties);
+        crate::inject_otel_context(&mut self.msg.properties);
         self.producer.send(self.msg.into())
     }
 }

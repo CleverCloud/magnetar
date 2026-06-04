@@ -144,11 +144,35 @@ pub use crypto_bridge::MessageCryptoBridge;
 
 /// OpenTelemetry context propagation for Pulsar messages. Behind
 /// `feature = "opentelemetry"` (default off). When enabled, the current span
-/// context is automatically injected into every outgoing message's properties.
+/// context is injected into outgoing message properties at every tokio send
+/// boundary (producer send, retry-letter `reconsume_later`, and DLQ republish).
 /// Use [`otel::extract_context`] on the consumer side to recover the parent
 /// context from a received message.
 #[cfg(feature = "opentelemetry")]
 pub mod otel;
+
+/// Inject the current OpenTelemetry span context (`traceparent` / `tracestate`)
+/// into `properties` at a send boundary. A no-op unless the `opentelemetry`
+/// feature is enabled (ADR-0053). Routing every send / retry / DLQ call site
+/// through this shim keeps them feature-agnostic — no per-site `#[cfg]`, and the
+/// bindings they mutate are never flagged `unused_mut` in a build without the
+/// feature.
+///
+/// Gated on `tokio` because every call site lives on the tokio engine surface;
+/// without `tokio` there are no callers, so the shim is simply absent.
+#[cfg(all(feature = "tokio", feature = "opentelemetry"))]
+#[inline]
+pub(crate) fn inject_otel_context(properties: &mut Vec<(String, String)>) {
+    otel::inject_context(properties);
+}
+
+/// No-op variant compiled when `tokio` is on but `opentelemetry` is off (ADR-0053).
+#[cfg(all(feature = "tokio", not(feature = "opentelemetry")))]
+#[inline]
+#[allow(clippy::ptr_arg)]
+pub(crate) fn inject_otel_context(properties: &mut Vec<(String, String)>) {
+    let _ = properties;
+}
 
 /// **Experimental** — PIP-466 V5 client surface (ADR-0032). Behind
 /// `feature = "experimental-v5-client"` (default off). The wire
