@@ -38,6 +38,8 @@
 //! - `admin`: re-export [`magnetar_admin`] under [`admin`] for the REST admin client.
 //! - `auth-oauth2`, `auth-sasl`, `auth-athenz`: pluggable auth providers.
 //! - `encryption`: PIP-4 end-to-end encryption.
+//! - `opentelemetry` (default off): inject/extract W3C `traceparent`/`tracestate` into message
+//!   properties (ADR-0053).
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]

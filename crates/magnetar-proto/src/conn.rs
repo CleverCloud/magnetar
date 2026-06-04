@@ -7827,3 +7827,114 @@ mod handshake_failure_reason_tests {
         );
     }
 }
+
+/// ADR-0053 — OpenTelemetry context propagation relies on message
+/// properties (`traceparent`, `tracestate`) surviving the Connection's
+/// send path. This test pins the property round-trip at the sans-io
+/// layer.
+#[cfg(test)]
+mod otel_property_round_trip_tests {
+    use super::*;
+
+    fn fresh_handshaked(at: Instant) -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(SystemTime::now),
+        );
+        conn.begin_handshake().expect("begin");
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode");
+        conn.handle_bytes(at, &buf).expect("connected");
+        while let Some(_e) = conn.poll_event() {}
+        conn
+    }
+
+    fn open_ready_producer(conn: &mut Connection, at: Instant) -> ProducerHandle {
+        let req = CreateProducerRequest {
+            topic: "persistent://public/default/otel-props-t".to_owned(),
+            ..Default::default()
+        };
+        let handle = conn.create_producer(req);
+        let rid = RequestId(conn.peek_next_request_id_for_test());
+        let ack = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id: rid.0,
+                producer_name: "p-0".to_owned(),
+                last_sequence_id: Some(-1),
+                schema_version: None,
+                topic_epoch: None,
+                producer_ready: Some(true),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack).expect("encode");
+        conn.handle_bytes(at, &buf).expect("ack");
+        while let Some(_e) = conn.poll_event() {}
+        let _ = conn.poll_transmit();
+        handle
+    }
+
+    /// `traceparent` and `tracestate` properties on an `OutgoingMessage`
+    /// survive the Connection send path and appear in the wire frame.
+    #[test]
+    fn otel_properties_survive_send_path() {
+        let at = Instant::now();
+        let mut conn = fresh_handshaked(at);
+        let handle = open_ready_producer(&mut conn, at);
+
+        let traceparent = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01";
+        let tracestate = "rojo=00f067aa0ba902b7";
+
+        let mut metadata = pb::MessageMetadata::default();
+        metadata.properties.push(pb::KeyValue {
+            key: "traceparent".to_owned(),
+            value: traceparent.to_owned(),
+        });
+        metadata.properties.push(pb::KeyValue {
+            key: "tracestate".to_owned(),
+            value: tracestate.to_owned(),
+        });
+
+        let msg = crate::producer::OutgoingMessage {
+            payload: bytes::Bytes::from_static(b"otel"),
+            metadata,
+            uncompressed_size: 4,
+            num_messages: 1,
+            txn_id: None,
+            source_message_id: None,
+        };
+        conn.send(handle, msg, 1_700_000_000, at).expect("send");
+
+        let wire = conn.poll_transmit();
+        let frame = crate::decode_one(&mut wire.clone()).expect("decode");
+        let meta = frame
+            .payload
+            .as_ref()
+            .map(|p| &p.metadata)
+            .expect("payload present");
+        let tp = meta
+            .properties
+            .iter()
+            .find(|kv| kv.key == "traceparent")
+            .expect("traceparent in wire frame");
+        assert_eq!(tp.value, traceparent);
+        let ts = meta
+            .properties
+            .iter()
+            .find(|kv| kv.key == "tracestate")
+            .expect("tracestate in wire frame");
+        assert_eq!(ts.value, tracestate);
+    }
+}
