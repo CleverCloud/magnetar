@@ -878,7 +878,19 @@ where
                 if n == 0 {
                     // Peer closed cleanly. Mark the state machine as disconnected so user
                     // futures see is_connected() flip and the disconnect timestamp records.
-                    shared.inner.lock().mark_disconnected();
+                    // State-consistency postcondition (asserted on the *same* guard — no
+                    // re-lock, so no race with concurrent user futures; ADR-0038): once
+                    // `mark_disconnected()` runs the connection must report
+                    // `!is_connected()` (state snaps to `Failed`). A regression that left it
+                    // `Connected` would leak a dead socket into user-facing `is_connected()`.
+                    {
+                        let mut conn = shared.inner.lock();
+                        conn.mark_disconnected();
+                        debug_assert!(
+                            !conn.is_connected(),
+                            "mark_disconnected() must clear is_connected() (ADR-0038)"
+                        );
+                    }
                     return Err(ClientError::PeerClosed);
                 }
                 // ADR-0040 wave 3 (read-path ownership pass-through):
@@ -892,6 +904,16 @@ where
                 // `BytesMut::with_capacity(READ_BUFFER_CAPACITY)` for
                 // the next iteration (via `split()`'s O(1) move).
                 let chunk = read_buf.split();
+                // Read-buffer postcondition: `read_buf` is drained via `split()` on every
+                // inbound-arm iteration and never appended to elsewhere, so it is empty when
+                // `read_buf()` runs — the freshly split chunk therefore carries exactly the
+                // `n` bytes just read. A mismatch would mean stale bytes leaked across loop
+                // iterations into the byte stream fed to `handle_bytes_owned`.
+                debug_assert_eq!(
+                    chunk.len(),
+                    n,
+                    "read chunk length must equal the byte count just read"
+                );
                 let now = Instant::now();
                 // ADR-0038: the `shared.inner` guard returned by `lock()` is a
                 // *temporary* in the `if let` scrutinee, which lives until the

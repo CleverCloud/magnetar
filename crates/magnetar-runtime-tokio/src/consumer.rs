@@ -994,6 +994,24 @@ impl Consumer {
                 PostProcessOutcome::Fail(err) => return Err(err),
             }
         }
+        // Postcondition (ADR-0024): the batch accumulator never exceeds the
+        // caller's `max_messages` cap. The `while out.len() < max_messages`
+        // guard plus the at-most-one `out.push` per iteration (the `Discard`
+        // arm pushes nothing, `Deliver` pushes exactly one) make this a pure
+        // function of the local loop — it can never fire on broker/wire input.
+        debug_assert!(
+            out.len() <= max_messages,
+            "receive_batch overshot max_messages: out.len()={} max_messages={max_messages}",
+            out.len()
+        );
+        // The first message is unconditionally pushed before the loop (Java's
+        // "deliver at least one" semantic), so any path that reaches here
+        // returns a non-empty batch — the empty-result cases (zero caps,
+        // first-receive timeout/error) return earlier.
+        debug_assert!(
+            !out.is_empty(),
+            "receive_batch reached the return with an empty accumulator"
+        );
         Ok(out)
     }
 }

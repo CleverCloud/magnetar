@@ -106,16 +106,23 @@ impl Transport {
                         }
                     }
                 }
-                match connected {
-                    Some(s) => s,
-                    None => {
-                        // Unwrap is safe: `addrs` was non-empty, so either we connected or
-                        // we recorded at least one error.
-                        return Err(last_err
-                            .expect("at least one connect attempt was made")
-                            .into());
-                    }
-                }
+                let Some(s) = connected else {
+                    // State-consistency postcondition (mirrors the moonpool engine's
+                    // `connect_with_resolver`): `addrs` was checked non-empty above, so the
+                    // dial loop ran at least once; reaching this `else` arm means every dial
+                    // failed and therefore recorded a `last_err`. Cannot fire on legitimate
+                    // broker/DNS input — only a refactor that drops the non-empty guard.
+                    debug_assert!(
+                        last_err.is_some(),
+                        "all-candidates-failed arm reached without recording any connect error",
+                    );
+                    // Unwrap is safe: `addrs` was non-empty, so either we connected or
+                    // we recorded at least one error.
+                    return Err(last_err
+                        .expect("at least one connect attempt was made")
+                        .into());
+                };
+                s
             }
             None => TcpStream::connect(url.socket_addr()).await?,
         };

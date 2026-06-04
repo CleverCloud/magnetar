@@ -822,7 +822,18 @@ where
                     }
                 };
                 if n == 0 {
-                    shared.inner.lock().mark_disconnected();
+                    // Peer closed cleanly. State-consistency postcondition (asserted on the
+                    // *same* guard — no re-lock, so no race with concurrent user futures;
+                    // ADR-0038): once `mark_disconnected()` runs the connection must report
+                    // `!is_connected()` (state snaps to `Failed`). Mirror of the tokio engine.
+                    {
+                        let mut conn = shared.inner.lock();
+                        conn.mark_disconnected();
+                        debug_assert!(
+                            !conn.is_connected(),
+                            "mark_disconnected() must clear is_connected() (ADR-0038)"
+                        );
+                    }
                     return Err(EngineError::PeerClosed);
                 }
                 // ADR-0040 wave 3 (read-path ownership pass-through):
@@ -833,6 +844,17 @@ where
                 // into place with zero memcpy. Mid-frame fall-back
                 // re-uses the legacy `extend_from_slice` path.
                 let chunk = read_buf.split();
+                // Read-buffer postcondition (mirror of the tokio engine): `read_buf` is
+                // drained via `split()` on every inbound-arm iteration and never appended to
+                // elsewhere, so it is empty when `read_buf()` runs — the freshly split chunk
+                // therefore carries exactly the `n` bytes just read. A mismatch would mean
+                // stale bytes leaked across loop iterations into the byte stream fed to
+                // `handle_bytes_owned`.
+                debug_assert_eq!(
+                    chunk.len(),
+                    n,
+                    "read chunk length must equal the byte count just read"
+                );
                 // ADR-0011: feed the sans-io state machine an Instant pulled
                 // through the engine-supplied clock so `SimProviders` runs
                 // are bit-for-bit reproducible. The default provider reads

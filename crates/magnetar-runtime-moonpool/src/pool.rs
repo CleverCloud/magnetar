@@ -282,7 +282,20 @@ where
         } else {
             let pending = PendingDial::new();
             let handles = pending.handles();
-            entries.insert(key.clone(), Arc::new(EntryState::Pending(pending)));
+            // State-consistency mirror of the tokio pool's insert site
+            // (`magnetar_runtime_tokio::pool::ProxyConnectionPool::get_or_open`):
+            // we reach this arm only inside the `else` of the `get(&key)` miss,
+            // with the entries-lock held continuously — so `key` is provably
+            // absent and inserting the fresh `Pending` must not clobber an
+            // existing entry. A `Some` here would mean a second dial races the
+            // same key (a pool-bookkeeping bug) and would orphan the clobbered
+            // entry's `PendingDial`/`Ready` state. Cannot fire on legitimate
+            // broker/wire input — pure map bookkeeping under the same lock.
+            let clobbered = entries.insert(key.clone(), Arc::new(EntryState::Pending(pending)));
+            debug_assert!(
+                clobbered.is_none(),
+                "pool entry insert clobbered a live entry — double registration for one key"
+            );
             drop(entries);
             spawn_dial(
                 pool.clone(),

@@ -292,6 +292,18 @@ impl Producer {
         publish_time_ms: u64,
         reserved_bytes: u64,
     ) -> SendFut {
+        // Precondition (ADR-0038): the per-slot Arc this `Producer` was built
+        // with must denote the same producer as `self.handle`. The hot path
+        // routes the send through `self.slot` (per-slot lock only) while the
+        // eventual `SendFut` correlates the receipt by `self.handle`; a
+        // mismatch would silently queue against the wrong slot. Identity read
+        // takes no lock, so this cannot self-deadlock.
+        debug_assert_eq!(
+            self.slot.identity.handle, self.handle,
+            "producer slot/handle mismatch: slot is for {:?} but handle is {:?}",
+            self.slot.identity.handle, self.handle,
+        );
+
         let now = std::time::Instant::now();
         let result = self.slot.queue_send(msg, publish_time_ms, now);
 
@@ -299,12 +311,29 @@ impl Producer {
         self.shared.driver_waker.notify_one();
 
         match result {
-            Ok(seq) => SendFut {
-                shared: self.shared.clone(),
-                handle: self.handle,
-                state: SendState::Pending { sequence_id: seq },
-                reserved_bytes,
-            },
+            Ok(seq) => {
+                // Postcondition: `ProducerSlot::queue_send` returns
+                // `SequenceId(last_sequence_id_pushed.max(0))`, so the pushed
+                // sequence id is now non-negative and equals the returned seq.
+                // The proto helper has already dropped its per-slot guard, so
+                // re-locking here is a fresh scoped acquisition (no
+                // re-entrancy, ADR-0038-safe).
+                debug_assert!(
+                    {
+                        let pushed = self.slot.state.lock().last_sequence_id_pushed;
+                        pushed >= 0 && seq.0 == pushed as u64
+                    },
+                    "queue_send postcondition: returned seq {} must match the \
+                     non-negative pushed sequence id",
+                    seq.0,
+                );
+                SendFut {
+                    shared: self.shared.clone(),
+                    handle: self.handle,
+                    state: SendState::Pending { sequence_id: seq },
+                    reserved_bytes,
+                }
+            }
             Err(err) => {
                 // The state machine rejected the send (e.g. producer not yet open); release
                 // the reservation so the budget reflects only actually-in-flight bytes.

@@ -388,6 +388,17 @@ impl ConnectionShared {
         let now_instant_provider: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(Instant::now);
         let mut conn = Connection::new(config, wall_clock_provider);
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
+        // Construction postcondition: a freshly-built connection has not begun
+        // the handshake, so it can be neither `Connected` nor terminal. This
+        // runs before any socket I/O, so it cannot fire on broker / wire input;
+        // it would only trip if `Connection::new` ever stopped starting in
+        // `HandshakeState::Uninitialized`. Mirrored 1:1 in the tokio engine's
+        // `ConnectionShared::with_auth` (ADR-0038 symmetry).
+        debug_assert!(
+            !conn.is_connected() && !conn.is_closed(),
+            "freshly-constructed ConnectionShared must start in a non-connected, \
+             non-terminal handshake state",
+        );
         Arc::new(Self {
             inner: Mutex::new(conn),
             driver_waker: Notify::new(),

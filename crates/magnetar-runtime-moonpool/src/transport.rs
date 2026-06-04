@@ -183,6 +183,16 @@ impl<P: Providers> Transport<P> {
                 Err(e) => last_err = Some(e),
             }
         }
+        // State-consistency postcondition (mirrors the tokio engine's
+        // `connect_with_resolver_inner`): `addrs` was checked non-empty above, so the dial
+        // loop ran at least once; falling out of it without an early `Ok` return means every
+        // candidate failed and therefore recorded a `last_err`. Cannot fire on legitimate
+        // broker/DNS input — only a refactor that drops the non-empty guard. The
+        // `unwrap_or_else` fallback below stays as the release-mode safety net.
+        debug_assert!(
+            last_err.is_some(),
+            "all-candidates-failed arm reached without recording any connect error",
+        );
         Err(last_err.unwrap_or_else(|| {
             EngineError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,

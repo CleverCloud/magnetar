@@ -212,7 +212,19 @@ impl ProxyConnectionPool {
                 }
                 return Ok(shared);
             }
-            entries.insert(key, entry.clone());
+            // State-consistency: we reach this arm only after the `get(&key)`
+            // miss above, and the entries-lock has been held continuously
+            // since — so `key` is provably absent and the insert must not
+            // clobber a live entry. A `Some` here would mean a second
+            // registration races the same key (a pool-bookkeeping bug), which
+            // would silently orphan a handshaked `ConnectionShared` + its
+            // supervised driver. Cannot fire on legitimate broker/wire input —
+            // it is pure map bookkeeping checked under the same lock.
+            let clobbered = entries.insert(key, entry.clone());
+            debug_assert!(
+                clobbered.is_none(),
+                "pool entry insert clobbered a live entry — double registration for one key"
+            );
         }
         Ok(entry.shared.clone())
     }

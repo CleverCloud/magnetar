@@ -428,6 +428,17 @@ impl ConnectionShared {
         let mut conn =
             magnetar_proto::Connection::new(config, Arc::new(std::time::SystemTime::now));
         conn.set_anti_thrash(anti_thrash_threshold, anti_thrash_cooldown);
+        // Construction postcondition: a freshly-built connection has not begun
+        // the handshake, so it can be neither `Connected` nor terminal. This
+        // runs before any socket I/O, so it cannot fire on broker / wire input;
+        // it would only trip if `Connection::new` ever stopped starting in
+        // `HandshakeState::Uninitialized`. Mirrored 1:1 in the moonpool engine's
+        // `ConnectionShared::with_auth_and_wall_clock_base` (ADR-0038 symmetry).
+        debug_assert!(
+            !conn.is_connected() && !conn.is_closed(),
+            "freshly-constructed ConnectionShared must start in a non-connected, \
+             non-terminal handshake state",
+        );
         Arc::new(Self {
             inner: Mutex::new(conn),
             driver_waker: Notify::new(),
