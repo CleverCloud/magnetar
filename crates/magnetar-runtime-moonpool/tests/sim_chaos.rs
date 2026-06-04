@@ -2480,6 +2480,49 @@ impl SwizzleClogClientWorkload {
             swizzle_snapshot,
         }
     }
+
+    /// Validate the ADR-0050 swizzle-window properties against the recorded
+    /// per-consumer deliveries + the broker's clogged-set spec. Read-only
+    /// (callers reset per-iteration state separately). Used both as the
+    /// run()-phase gate — a moonpool `Workload::check()` `Err` is only logged
+    /// and never flips `failed_runs` — and as the check()-phase mirror.
+    fn validate_swizzle(&self) -> SimulationResult<()> {
+        if !self.completed.load(Ordering::SeqCst) {
+            return Err(SimulationError::InvalidState(
+                "swizzle client workload did not complete".into(),
+            ));
+        }
+        let snapshot = self.received_per_consumer.lock().clone();
+        let spec = self.swizzle_snapshot.lock().clone();
+        // 1. No duplicate messages on unaffected consumers (id NOT in `restore_order`).
+        let clogged: HashSet<u64> = spec
+            .as_ref()
+            .map(|s| s.restore_order.iter().copied().collect())
+            .unwrap_or_default();
+        for (cid, msgs) in &snapshot {
+            if clogged.contains(cid) {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            for key in msgs {
+                if !seen.insert(*key) {
+                    return Err(SimulationError::InvalidState(format!(
+                        "duplicate delivery on unaffected consumer {cid}: msg={key:?}"
+                    )));
+                }
+            }
+        }
+        // 2. Every clogged consumer eventually received at least one message.
+        for cid in &clogged {
+            let drained = snapshot.get(cid).is_some_and(|v| !v.is_empty());
+            if !drained {
+                return Err(SimulationError::InvalidState(format!(
+                    "clogged consumer {cid} never received (and no SessionLost surfaced)"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2611,59 +2654,15 @@ impl Workload for SwizzleClogClientWorkload {
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
-        if !self.completed.load(Ordering::SeqCst) {
-            return Err(SimulationError::InvalidState(
-                "swizzle client workload did not complete".into(),
-            ));
-        }
-
-        let snapshot = self.received_per_consumer.lock().clone();
-        let spec = self.swizzle_snapshot.lock().clone();
-
-        // The plan asserts three swizzle-window properties. They map
-        // to the following workload-side checks (the cross-cutting
-        // `MonotonicMsgIdInvariant` is wired into the builder
-        // separately so it observes every iteration).
-        //
-        // 1. No duplicate messages on unaffected consumers — a consumer whose id was NOT in
-        //    `restore_order` must have a duplicate-free received list.
-        let clogged: HashSet<u64> = spec
-            .as_ref()
-            .map(|s| s.restore_order.iter().copied().collect())
-            .unwrap_or_default();
-        for (cid, msgs) in &snapshot {
-            if clogged.contains(cid) {
-                continue;
-            }
-            let mut seen = HashSet::new();
-            for key in msgs {
-                if !seen.insert(*key) {
-                    return Err(SimulationError::InvalidState(format!(
-                        "duplicate delivery on unaffected consumer {cid}: msg={key:?}"
-                    )));
-                }
-            }
-        }
-
-        // 2. Every clogged consumer eventually received at least one message OR the iteration
-        //    surfaced a SessionLost. The sim budget is generous enough that the restored side
-        //    drains its tail before `check()` runs; an empty received-list here means the restore
-        //    never landed.
-        for cid in &clogged {
-            let drained = snapshot.get(cid).is_some_and(|v| !v.is_empty());
-            if !drained {
-                return Err(SimulationError::InvalidState(format!(
-                    "clogged consumer {cid} never received (and no SessionLost surfaced)"
-                )));
-            }
-        }
-
-        // Reset per-iteration state so the sweep starts each seed
-        // clean.
+        // The swizzle-window contract is gated in the MirroringClient's run()
+        // (a moonpool check() Err is only logged, never flips failed_runs).
+        // Re-validate here as a mirror, then ALWAYS reset the per-iteration
+        // state so the next seed in the sweep starts clean.
+        let result = self.validate_swizzle();
         self.received_per_consumer.lock().clear();
         self.completed.store(false, Ordering::SeqCst);
         *self.swizzle_snapshot.lock() = None;
-        Ok(())
+        result
     }
 }
 
@@ -2712,7 +2711,13 @@ fn sim_chaos_swizzle_clog_sweep_16_seeds() {
         report.assertion_violations.is_empty(),
         "swizzle invariant violation(s): {report:?}"
     );
-    assert!(report.successful_runs >= 1, "report: {report:?}");
+    // The MirroringClient now gates the ADR-0050 swizzle-window properties in
+    // run() (a moonpool check() Err is only logged, never flips failed_runs),
+    // so a seed where a window property was violated lands in failed_runs.
+    assert_eq!(
+        report.failed_runs, 0,
+        "every seed must satisfy the swizzle-window properties: {report:?}"
+    );
 }
 
 /// Smoke test — single seed, single iteration. Confirms the swizzle
@@ -2723,7 +2728,7 @@ fn sim_chaos_swizzle_clog_smoke() {
     let broker = SwizzleClogBrokerWorkload::new(2, 100);
     let swizzle_snapshot = Arc::new(Mutex::new(None));
     let state_for_mirror = broker.state.clone();
-    let _ = SimulationBuilder::new()
+    let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(broker)
         .workload(SwizzleClogMirroringClient::new(
@@ -2734,6 +2739,10 @@ fn sim_chaos_swizzle_clog_smoke() {
         .invariant(HandleResolutionInvariant::default())
         .set_iterations(1)
         .run();
+    assert_eq!(
+        report.failed_runs, 0,
+        "swizzle smoke: the single iteration must satisfy the window properties: {report:?}"
+    );
 }
 
 /// Thin client wrapper that mirrors the broker's
@@ -2765,7 +2774,18 @@ impl Workload for SwizzleClogMirroringClient {
     }
 
     async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
-        self.inner.run(ctx).await
+        self.inner.run(ctx).await?;
+        // Gate the swizzle-window contract HERE in run() — a moonpool
+        // `Workload::check()` `Err` is only logged and never flips
+        // `failed_runs`. Mirror the broker's final spec into the inner
+        // workload first (the controller has populated it by the time
+        // inner.run() returns), then validate. (The swizzle DEADLOCK is
+        // guarded upstream by the no-progress detector; this gates the
+        // ADR-0050 window properties.)
+        if let Some(spec) = self.broker_state.lock().spec.clone() {
+            *self.inner.swizzle_snapshot.lock() = Some(spec);
+        }
+        self.inner.validate_swizzle()
     }
 
     async fn check(&mut self, ctx: &SimContext) -> SimulationResult<()> {
