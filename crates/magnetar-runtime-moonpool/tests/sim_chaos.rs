@@ -1585,17 +1585,23 @@ where
 /// open-producer loop. Once the detector trips, the supervisor's cooldown
 /// keeps the connection idle for the remainder of the simulation budget.
 struct AntiThrashClientWorkload {
-    /// True if the client observed at least one
-    /// [`magnetar_proto::ConnectionEvent::AntiThrashCooldown`] in its event
-    /// queue (or the connection state shows a non-`Normal` disposition).
-    /// `check()` asserts on this.
+    /// True once the client observed the anti-thrash cooldown engage
+    /// (`anti_thrash_tick` returned a non-`Normal` disposition).
     cooldown_observed: Arc<Mutex<bool>>,
+    /// Shared with the [`DropsTcpAfterCreate`] broker — the cumulative drop
+    /// count. The per-iteration delta tells the gate whether the broker
+    /// actually drove the thrash pattern (so the cooldown is *required*), or
+    /// whether a Probabilistic connect-hang fault on the reconnect dial
+    /// prevented enough drops (so the iteration is *tolerated*, not a
+    /// cooldown failure).
+    broker_drops: Arc<Mutex<u32>>,
 }
 
 impl AntiThrashClientWorkload {
-    fn new() -> Self {
+    fn new(broker_drops: Arc<Mutex<u32>>) -> Self {
         Self {
             cooldown_observed: Arc::new(Mutex::new(false)),
+            broker_drops,
         }
     }
 }
@@ -1612,6 +1618,10 @@ impl Workload for AntiThrashClientWorkload {
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        // Snapshot the broker's cumulative drop count so we can measure how
+        // many create-then-drop cycles THIS iteration drove (the per-iteration
+        // thrash volume) when deciding whether the cooldown was required.
+        let drops_before = *self.broker_drops.lock();
 
         let cfg = ConnectionConfig {
             supervisor: Some(magnetar_proto::SupervisorConfig {
@@ -1632,33 +1642,44 @@ impl Workload for AntiThrashClientWorkload {
             ..ConnectionConfig::default()
         };
 
+        // The anti-thrash detector is fed ONLY by the supervised driver loop
+        // (`record_reattach_outcome` in driver.rs lives inside
+        // `spawn_supervised`'s reconnect loop). `connect_plain` spawns the
+        // NON-supervised driver and silently ignores `cfg.supervisor`, so the
+        // cooldown could never engage — use the supervised constructor that
+        // `cfg.supervisor = Some(..)` clearly intends.
         let connect_res = tokio::time::timeout(
             Duration::from_secs(20),
-            Client::connect_plain(&engine, &addr, cfg),
+            Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
         )
         .await;
         let Ok(Ok(client)) = connect_res else {
-            // The broker may have dropped before the handshake even
-            // completed on some seeds; that's still a valid thrash
-            // signal — the supervisor will have logged it. Mark
-            // the iteration as having seen the broker misbehave so
-            // `check()` doesn't fail.
-            *self.cooldown_observed.lock() = true;
+            // A Probabilistic connect-hang fault sank the *initial* dial on
+            // this seed — the broker never got a producer to drop, so the
+            // thrash pattern can't play out. Tolerate it (no drops occurred,
+            // so the drops-delta gate below would tolerate it too): a
+            // connect-fault, not a cooldown regression.
             return Ok(());
         };
 
-        // Burn through enough producer-open cycles to let the supervisor
-        // observe the thrash pattern. Each iteration: try to open a
-        // producer, then poll the event queue for AntiThrashCooldown.
-        for _ in 0..16u32 {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(500),
-                client.open_producer(magnetar_proto::CreateProducerRequest {
-                    topic: "persistent://public/default/sim-anti-thrash".to_owned(),
-                    ..Default::default()
-                }),
-            )
-            .await;
+        // Hold ONE producer open so the supervisor REPLAYS it on every
+        // reconnect; each replayed create makes the broker drop again, which
+        // is what produces the repeated re-attach/drop pairs the anti-thrash
+        // detector counts. (The previous loop dropped each handle, so after
+        // the first drop there was nothing to replay and the supervisor never
+        // re-established the connection — the cooldown could never trip.)
+        let _producer = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.open_producer(magnetar_proto::CreateProducerRequest {
+                topic: "persistent://public/default/sim-anti-thrash".to_owned(),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        // Poll for the cooldown while the supervisor drives the
+        // replay-create-drop cascade in the background.
+        for _ in 0..40u32 {
             let in_cooldown = {
                 let conn = client.shared().inner.lock();
                 !matches!(
@@ -1679,48 +1700,66 @@ impl Workload for AntiThrashClientWorkload {
         // Best-effort shutdown — we don't care if it errors; the
         // simulation budget is the safety net.
         client.close().await;
-        // NOTE (check()-vacuity audit): gating the cooldown contract here in
-        // run() revealed that the cooldown NEVER engages in this sim
-        // (successful_runs == 0 across the 16-seed sweep) — the detector is
-        // configured but the DropsTcpAfterCreate drop pattern never trips the
-        // threshold. The check() below is therefore vacuously green today. Left
-        // as-is pending a dedicated investigation (real detector gap vs. the
-        // sim broker not producing a tripping thrash pattern); see follow-up.
+
+        // Gate in run(): a moonpool `Workload::check()` `Err` is only logged
+        // (run_check_phase), never flips `failed_runs`. The mirror check()
+        // below only resets the flag.
+        //
+        // The cooldown is REQUIRED only when the broker actually drove the
+        // thrash pattern this iteration (>= `successful_attaches` = 3
+        // create-then-drop cycles). On seeds where a Probabilistic
+        // connect-hang fault sank the reconnect dial, the broker couldn't
+        // drive that many drops, so the cooldown cannot be expected —
+        // tolerate those (connect-faults, not cooldown regressions). If the
+        // broker DID thrash enough yet the cooldown never engaged, that is
+        // the regression this guards (e.g. the pre-fix `connect_plain` /
+        // dropped-producer-handle bug that left the detector starved).
+        let drops_this_iter = self.broker_drops.lock().saturating_sub(drops_before);
+        if !*self.cooldown_observed.lock() && drops_this_iter >= 3 {
+            return Err(SimulationError::InvalidState(format!(
+                "broker drove {drops_this_iter} create-then-drop cycles but the anti-thrash \
+                 cooldown never engaged"
+            )));
+        }
         Ok(())
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
-        let observed = *self.cooldown_observed.lock();
-        if !observed {
-            return Err(SimulationError::InvalidState(
-                "anti-thrash cooldown never engaged under DropsTcpAfterCreate broker".into(),
-            ));
-        }
-        // Reset for the next iteration of the sweep.
+        // The cooldown contract is gated in run() (a check() Err is only
+        // logged, never flips failed_runs). Reset the per-iteration flag so
+        // the next seed in the sweep starts clean.
         *self.cooldown_observed.lock() = false;
         Ok(())
     }
 }
 
 /// 16-seed sweep — drives the anti-thrash detector under the
-/// `DropsTcpAfterCreate` broker workload. Asserts the cooldown engages on
-/// every seed (per ADR-0028 test plan §5).
+/// `DropsTcpAfterCreate` broker workload (per ADR-0028 test plan §5).
+///
+/// The client workload gates the cooldown contract in `run()` (a moonpool
+/// `check()` Err is only logged, never flips `failed_runs`), so a seed
+/// where the broker drove the thrash pattern yet the cooldown never engaged
+/// lands in `failed_runs`. Seeds where a Probabilistic connect-hang fault
+/// sank the reconnect dial (the broker couldn't drive enough drops) are
+/// tolerated in `run()` — they are connect-faults, not cooldown regressions.
 #[test]
 fn sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds() {
-    // NOTE (check()-vacuity audit): this run() result is intentionally
-    // discarded for now. The client workload's cooldown contract is currently
-    // vacuous in sim (the cooldown never engages — successful_runs == 0; see
-    // the note on AntiThrashClientWorkload::run()), so asserting
-    // failed_runs == 0 here would fail. De-vacuifying this test requires first
-    // making the sim broker produce a thrash pattern that actually trips the
-    // detector — tracked as a follow-up.
-    let _ = SimulationBuilder::new()
+    let broker = DropsTcpAfterCreate::new(5);
+    // Share the broker's cumulative drop counter with the client so it can
+    // tell "broker thrashed but no cooldown" (regression) from "connect-hang
+    // prevented thrashing" (tolerated) per iteration.
+    let drops = broker.drops_performed.clone();
+    let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
-        .workload(DropsTcpAfterCreate::new(5))
-        .workload(AntiThrashClientWorkload::new())
+        .workload(broker)
+        .workload(AntiThrashClientWorkload::new(drops))
         .set_debug_seeds(sweep_seeds(16))
         .set_iterations(16)
         .run();
+    assert_eq!(
+        report.failed_runs, 0,
+        "anti-thrash cooldown must engage on every seed that actually thrashed: {report:?}"
+    );
 }
 
 // =============================================================================
