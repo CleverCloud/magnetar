@@ -253,8 +253,28 @@ impl Workload for ClientWorkload {
             Err(other) => DriverOutcome::OtherError(format!("{other:?}")),
             Ok(()) => DriverOutcome::CleanExit,
         };
-        *self.outcome.lock() = Some(outcome);
-        Ok(())
+        *self.outcome.lock() = Some(outcome.clone());
+
+        // Gate the *secondary* contract HERE in run(): a moonpool
+        // `Workload::check()` Err is only logged (run_check_phase) and never
+        // flips `failed_runs`, so the check() below cannot fail the test on
+        // its own. The deadlock itself is still caught upstream — join()
+        // would never resolve, run() never completes, and the no-progress
+        // detector trips — but a driver that terminated with the *wrong*
+        // error (or exited cleanly) would have slipped past check(). A
+        // run() Err DOES land the iteration in `failed_runs`.
+        match outcome {
+            DriverOutcome::RejectedAndTerminated => Ok(()),
+            DriverOutcome::OtherError(reason) => Err(SimulationError::InvalidState(format!(
+                "driver terminated with an unexpected error (expected a BadLength protocol \
+                 reject): {reason}"
+            ))),
+            DriverOutcome::CleanExit => Err(SimulationError::InvalidState(
+                "driver exited cleanly on a malformed mid-session frame — it must surface the \
+                 framing reject"
+                    .into(),
+            )),
+        }
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
