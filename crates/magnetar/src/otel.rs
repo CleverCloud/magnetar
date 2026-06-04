@@ -2,14 +2,16 @@
 
 //! OpenTelemetry context propagation for Pulsar messages.
 //!
-//! When the `opentelemetry` feature is enabled, the current span context is
-//! **automatically injected** into every outgoing message's properties during
-//! the [`From<OutgoingMessage>`](crate::OutgoingMessage) conversion that every
-//! send path goes through.
+//! When the `opentelemetry` feature is enabled the current span context is
+//! injected into every outgoing message's properties at the **send boundary**
+//! (the façade's send methods) — not during the
+//! [`From<OutgoingMessage>`](crate::OutgoingMessage) conversion, which stays
+//! pure and deterministic (ADR-0053).
 //!
-//! On the consumer side, call [`extract_context`] to recover the parent context
-//! from a received message and [`attach`](opentelemetry::Context::attach) it
-//! before processing:
+//! On the consumer side, call
+//! [`extract_context`](crate::otel::extract_context) to recover the parent
+//! context from a received message and
+//! [`attach`](opentelemetry::Context::attach) it before processing:
 //!
 //! ```ignore
 //! let msg = consumer.receive().await?;
@@ -21,6 +23,14 @@
 //! If no propagator has been installed via
 //! [`opentelemetry::global::set_text_map_propagator`], the global no-op
 //! propagator runs and inject / extract are silent no-ops.
+//!
+//! # Reserved property names
+//!
+//! When this feature is enabled, the property names `traceparent` and
+//! `tracestate` (and any other keys written by a composite or baggage
+//! propagator) are reserved for propagation.
+//! Setting them manually on an [`OutgoingMessage`](crate::OutgoingMessage)
+//! will be silently overwritten at send time.
 
 use magnetar_proto::pb;
 use opentelemetry::propagation::{Extractor, Injector};
@@ -31,11 +41,13 @@ use opentelemetry::propagation::{Extractor, Injector};
 
 /// Adapts `&mut Vec<(String, String)>` to the [`opentelemetry::propagation::Injector`] trait
 /// so the global propagator can write `traceparent` / `tracestate` into message properties.
+///
+/// The `set` implementation replaces an existing key (idempotent) rather than
+/// appending a duplicate, so double-injection is safe.
 struct MessagePropertiesInjector<'a>(&'a mut Vec<(String, String)>);
 
 impl Injector for MessagePropertiesInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        // Replace an existing key (idempotent) rather than appending a duplicate.
         self.0.retain(|(k, _)| k != key);
         self.0.push((key.to_owned(), value));
     }
@@ -62,11 +74,17 @@ impl Extractor for MetadataPropertiesExtractor<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inject
+// ---------------------------------------------------------------------------
+
 /// Inject the current OpenTelemetry span context into message properties.
 ///
-/// Called automatically during the [`From<OutgoingMessage>`](crate::OutgoingMessage)
-/// conversion. No-op when no propagator is installed.
-pub(crate) fn inject_context(properties: &mut Vec<(String, String)>) {
+/// Called at the façade's send boundary (not inside `From<OutgoingMessage>`)
+/// so the conversion stays pure and moonpool-sim determinism is preserved
+/// (ADR-0053, ADR-0011).
+/// No-op when no propagator is installed.
+pub fn inject_context(properties: &mut Vec<(String, String)>) {
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.inject_context(
             &opentelemetry::Context::current(),
@@ -75,7 +93,23 @@ pub(crate) fn inject_context(properties: &mut Vec<(String, String)>) {
     });
 }
 
-/// Extract a parent OpenTelemetry context from a received message's properties.
+// ---------------------------------------------------------------------------
+// Extract
+// ---------------------------------------------------------------------------
+
+/// Extract a parent OpenTelemetry context from message metadata properties.
+///
+/// This is the low-level helper that operates on a `&[pb::KeyValue]` slice.
+/// Prefer the convenience wrappers [`extract_context`] /
+/// [`extract_context_facade`] which accept full message types.
+fn extract_from_properties(properties: &[pb::KeyValue]) -> opentelemetry::Context {
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&MetadataPropertiesExtractor(properties))
+    })
+}
+
+/// Extract a parent OpenTelemetry context from a received
+/// [`magnetar_proto::event::IncomingMessage`].
 ///
 /// Returns a root (empty) context when the message carries no propagation
 /// headers or when no propagator is installed.
@@ -85,12 +119,21 @@ pub(crate) fn inject_context(properties: &mut Vec<(String, String)>) {
 /// current context for the duration of message processing, prefer
 /// [`attach_context`].
 pub fn extract_context(msg: &magnetar_proto::event::IncomingMessage) -> opentelemetry::Context {
-    opentelemetry::global::get_text_map_propagator(|propagator| {
-        propagator.extract(&MetadataPropertiesExtractor(&msg.metadata.properties))
-    })
+    extract_from_properties(&msg.metadata.properties)
 }
 
-/// Extract the parent context from a received message and
+/// Extract a parent OpenTelemetry context from a façade
+/// [`IncomingMessage`](crate::IncomingMessage).
+///
+/// Identical to [`extract_context`] but accepts the façade type returned by
+/// `Consumer::receive()`, `Reader::read_next`, and interceptor surfaces.
+#[cfg(feature = "tokio")]
+pub fn extract_context_facade(msg: &crate::IncomingMessage) -> opentelemetry::Context {
+    extract_from_properties(&msg.metadata.properties)
+}
+
+/// Extract the parent context from a received
+/// [`magnetar_proto::event::IncomingMessage`] and
 /// [`attach`](opentelemetry::Context::attach) it as the current context.
 ///
 /// The returned guard resets the context when dropped, so hold it for the
@@ -103,18 +146,41 @@ pub fn extract_context(msg: &magnetar_proto::event::IncomingMessage) -> opentele
 /// ```
 ///
 /// No-op (returns immediately) when no propagator is installed.
-pub fn attach_context(
-    msg: &magnetar_proto::event::IncomingMessage,
-) -> opentelemetry::ContextGuard {
+///
+/// # `!Send` caveat
+///
+/// The returned [`opentelemetry::ContextGuard`] is `!Send`.
+/// Do **not** hold it across `.await` points on a multi-threaded runtime —
+/// the resulting future would be `!Send` and will not compile.
+/// Drop the guard before any `.await`.
+pub fn attach_context(msg: &magnetar_proto::event::IncomingMessage) -> opentelemetry::ContextGuard {
     extract_context(msg).attach()
+}
+
+/// Façade variant of [`attach_context`] that accepts the façade
+/// [`IncomingMessage`](crate::IncomingMessage).
+///
+/// # `!Send` caveat
+///
+/// The returned [`opentelemetry::ContextGuard`] is `!Send`.
+/// Do **not** hold it across `.await` points on a multi-threaded runtime.
+#[cfg(feature = "tokio")]
+pub fn attach_context_facade(msg: &crate::IncomingMessage) -> opentelemetry::ContextGuard {
+    extract_context_facade(msg).attach()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
+
+    use super::*;
+
+    /// Serialises all propagator-mutating tests. The `OTel` global propagator
+    /// is a process-wide singleton; concurrent tests can observe each
+    /// other's mutations without this lock.
+    static PROPAGATOR_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn dummy_incoming(proto_props: Vec<pb::KeyValue>) -> magnetar_proto::event::IncomingMessage {
         let metadata = magnetar_proto::pb::MessageMetadata {
@@ -140,10 +206,13 @@ mod tests {
         }
     }
 
-    /// Round-trip: inject with the W3C TraceContext propagator, then extract.
+    /// Round-trip: inject with the W3C `TraceContext` propagator, then extract.
     /// Verifies that `traceparent` survives the facade → proto property conversion.
     #[test]
     fn inject_extract_round_trip() {
+        let _lock = PROPAGATOR_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = PropagatorGuard::install();
 
         let trace_id = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap();
@@ -184,9 +253,10 @@ mod tests {
     /// When no propagator is installed (default no-op), inject produces no properties.
     #[test]
     fn no_propagator_is_noop() {
-        opentelemetry::global::set_text_map_propagator(
-            opentelemetry::trace::noop::NoopTextMapPropagator::new(),
-        );
+        let _lock = PROPAGATOR_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = PropagatorGuard::install_noop();
 
         let mut properties: Vec<(String, String)> = Vec::new();
         inject_context(&mut properties);
@@ -199,6 +269,9 @@ mod tests {
     /// Injecting twice replaces the key rather than duplicating it.
     #[test]
     fn inject_is_idempotent() {
+        let _lock = PROPAGATOR_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = PropagatorGuard::install();
 
         let span_ctx = SpanContext::new(
@@ -228,6 +301,9 @@ mod tests {
     /// Extract from a message with no `traceparent` returns a root context.
     #[test]
     fn extract_missing_traceparent_returns_root() {
+        let _lock = PROPAGATOR_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = PropagatorGuard::install();
 
         let incoming = dummy_incoming(vec![]);
@@ -244,6 +320,13 @@ mod tests {
         fn install() -> Self {
             opentelemetry::global::set_text_map_propagator(
                 opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            );
+            Self
+        }
+
+        fn install_noop() -> Self {
+            opentelemetry::global::set_text_map_propagator(
+                opentelemetry::trace::noop::NoopTextMapPropagator::new(),
             );
             Self
         }

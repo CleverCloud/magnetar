@@ -67,6 +67,8 @@ Pulsar Java client.
   `AtomicU64` CAS in `Producer::send` with release on `Drop`.
 - **Observability**: cumulative counters + `hdrhistogram` p50/p99/max latency
   + rolling-window msgs/sec + bytes/sec rates (`record_rate_window`).
+  OpenTelemetry context propagation (`traceparent`/`tracestate` via message
+  properties, `feature = "opentelemetry"`, ADR-0053).
 - **Transports**: TCP, TLS 1.3 (`rustls`-only — no `native-tls`,
   no `openssl`), binary proxy (`proxy_to_broker_url`), pluggable DNS
   (`DnsResolver` trait + `TokioDnsResolver` default routed through
@@ -514,6 +516,7 @@ known-missing feature.
 | `Properties` (per-message key/value) | ✅ | ✅ | `OutgoingMessage::property`. |
 | `TypedMessageBuilder` | ✅ | ✅ | `MessageBuilder` via `ProducerExt::new_message`. |
 | `ProducerInterceptor` SPI | ✅ | ✅ | `magnetar::ProducerInterceptor` + `send_with_interceptors`. |
+| OpenTelemetry context propagation | ❌ | ✅ | `feature = "opentelemetry"` — auto-inject `traceparent`/`tracestate` at send boundary (ADR-0053). |
 | `pendingQueueSize` getter | ✅ | ✅ | `Producer::pending_count` (`batch_len` + `batch_bytes` are bonus). |
 
 ### Consumer

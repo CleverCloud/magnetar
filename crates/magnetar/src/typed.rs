@@ -320,7 +320,9 @@ impl<S: Schema> TypedMessageBuilder<'_, S> {
             .schema
             .encode(value)
             .map_err(schema_to_pulsar)?;
-        let with_payload = self.msg.value(bytes);
+        let mut with_payload = self.msg.value(bytes);
+        #[cfg(feature = "opentelemetry")]
+        crate::otel::inject_context(&mut with_payload.properties);
         let id = self
             .producer
             .inner
