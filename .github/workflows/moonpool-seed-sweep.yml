@@ -130,7 +130,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download failure markers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: failure-markers
           pattern: failing-seed-*
