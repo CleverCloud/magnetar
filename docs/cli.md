@@ -130,20 +130,20 @@ Pulsar's own routing makes the split — `magnetar-admin` keeps two pre-computed
 
 ### `admin clusters`
 
-| Command                                                       | REST endpoint                                                                  |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `admin clusters list`                                         | `GET /admin/v2/clusters`                                                       |
-| `admin clusters list-failure-domains <cluster>`               | `GET /admin/v2/clusters/{cluster}/failureDomains`                              |
-| `admin clusters get-failure-domain <cluster> <domain>`        | `GET /admin/v2/clusters/{cluster}/failureDomains/{domain}`                     |
-| `admin clusters list-namespace-isolation-policies <cluster>`  | `GET /admin/v2/clusters/{cluster}/namespaceIsolationPolicies`                  |
+| Command                                                      | REST endpoint                                                 |
+| ------------------------------------------------------------ | ------------------------------------------------------------- |
+| `admin clusters list`                                        | `GET /admin/v2/clusters`                                      |
+| `admin clusters list-failure-domains <cluster>`              | `GET /admin/v2/clusters/{cluster}/failureDomains`             |
+| `admin clusters get-failure-domain <cluster> <domain>`       | `GET /admin/v2/clusters/{cluster}/failureDomains/{domain}`    |
+| `admin clusters list-namespace-isolation-policies <cluster>` | `GET /admin/v2/clusters/{cluster}/namespaceIsolationPolicies` |
 
 ### `admin tenants`
 
-| Command                                                                            | REST endpoint                  |
-| ---------------------------------------------------------------------------------- | ------------------------------ |
-| `admin tenants list`                                                               | `GET /admin/v2/tenants`        |
-| `admin tenants create <name> --admin-role <r>… --cluster <c>…`                     | `PUT /admin/v2/tenants/{name}` |
-| `admin tenants delete <name>`                                                      | `DELETE /admin/v2/tenants/{name}` |
+| Command                                                        | REST endpoint                     |
+| -------------------------------------------------------------- | --------------------------------- |
+| `admin tenants list`                                           | `GET /admin/v2/tenants`           |
+| `admin tenants create <name> --admin-role <r>… --cluster <c>…` | `PUT /admin/v2/tenants/{name}`    |
+| `admin tenants delete <name>`                                  | `DELETE /admin/v2/tenants/{name}` |
 
 ### `admin namespaces`
 
@@ -152,42 +152,42 @@ Each policy follows a `get-<policy>` / `set-<policy>` / `remove-<policy>` triple
 
 **CRUD**
 
-| Command                                                | REST endpoint                                          |
-| ------------------------------------------------------ | ------------------------------------------------------ |
-| `admin namespaces list <tenant>`                       | `GET /admin/v2/namespaces/{tenant}`                    |
-| `admin namespaces create <tenant>/<ns>`                | `PUT /admin/v2/namespaces/{tenant}/{ns}`               |
-| `admin namespaces delete <tenant>/<ns>`                | `DELETE /admin/v2/namespaces/{tenant}/{ns}`            |
+| Command                                 | REST endpoint                               |
+| --------------------------------------- | ------------------------------------------- |
+| `admin namespaces list <tenant>`        | `GET /admin/v2/namespaces/{tenant}`         |
+| `admin namespaces create <tenant>/<ns>` | `PUT /admin/v2/namespaces/{tenant}/{ns}`    |
+| `admin namespaces delete <tenant>/<ns>` | `DELETE /admin/v2/namespaces/{tenant}/{ns}` |
 
 **Retention / backlog / TTL**
 
-| Command                                                                                                                              | REST endpoint                                       |
-| ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
-| `admin namespaces get-retention <ns>` / `set-retention <ns> --time-minutes N --size-mb M` / `remove-retention <ns>`                  | `/admin/v2/namespaces/{tenant}/{ns}/retention`      |
+| Command                                                                                                                                                                                                                                                              | REST endpoint                                                                                                      |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `admin namespaces get-retention <ns>` / `set-retention <ns> --time-minutes N --size-mb M` / `remove-retention <ns>`                                                                                                                                                  | `/admin/v2/namespaces/{tenant}/{ns}/retention`                                                                     |
 | `admin namespaces get-backlog-quotas <ns>` / `set-backlog-quota <ns> --type {destination-storage\|message-age} --limit-size N --limit-time T --policy {producer_request_hold\|producer_exception\|consumer_backlog_eviction}` / `remove-backlog-quota <ns> --type T` | `/admin/v2/namespaces/{tenant}/{ns}/backlogQuotaMap` (GET) and `…/backlogQuota?backlogQuotaType=…` (POST / DELETE) |
-| `admin namespaces get-message-ttl <ns>` / `set-message-ttl <ns> --ttl-seconds N` / `remove-message-ttl <ns>`                         | `/admin/v2/namespaces/{tenant}/{ns}/messageTTL`     |
+| `admin namespaces get-message-ttl <ns>` / `set-message-ttl <ns> --ttl-seconds N` / `remove-message-ttl <ns>`                                                                                                                                                         | `/admin/v2/namespaces/{tenant}/{ns}/messageTTL`                                                                    |
 
 **Persistence + rate policies**
 
-| Command                                                                                                                                                                       | REST suffix                          |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `admin namespaces get-persistence` / `set-persistence --ensemble N --write-quorum N --ack-quorum N --max-mark-delete-rate F` / `remove-persistence`                            | `…/persistence`                      |
-| `admin namespaces get-dispatch-rate` / `set-dispatch-rate --rate-in-msg N --rate-in-byte N --period-seconds N [--relative-to-publish-rate]` / `remove-dispatch-rate`           | `…/dispatchRate`                     |
-| `admin namespaces get-subscription-dispatch-rate` / `set-subscription-dispatch-rate …` / `remove-subscription-dispatch-rate`                                                  | `…/subscriptionDispatchRate`         |
-| `admin namespaces get-replicator-dispatch-rate` / `set-replicator-dispatch-rate …` / `remove-replicator-dispatch-rate`                                                        | `…/replicatorDispatchRate`           |
-| `admin namespaces get-publish-rate` / `set-publish-rate --rate-in-msg N --rate-in-byte N` / `remove-publish-rate`                                                              | `…/publishRate`                      |
+| Command                                                                                                                                                              | REST suffix                  |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| `admin namespaces get-persistence` / `set-persistence --ensemble N --write-quorum N --ack-quorum N --max-mark-delete-rate F` / `remove-persistence`                  | `…/persistence`              |
+| `admin namespaces get-dispatch-rate` / `set-dispatch-rate --rate-in-msg N --rate-in-byte N --period-seconds N [--relative-to-publish-rate]` / `remove-dispatch-rate` | `…/dispatchRate`             |
+| `admin namespaces get-subscription-dispatch-rate` / `set-subscription-dispatch-rate …` / `remove-subscription-dispatch-rate`                                         | `…/subscriptionDispatchRate` |
+| `admin namespaces get-replicator-dispatch-rate` / `set-replicator-dispatch-rate …` / `remove-replicator-dispatch-rate`                                               | `…/replicatorDispatchRate`   |
+| `admin namespaces get-publish-rate` / `set-publish-rate --rate-in-msg N --rate-in-byte N` / `remove-publish-rate`                                                    | `…/publishRate`              |
 
 **Limits + dedup + delayed delivery**
 
-| Command                                                                                                            | REST suffix                                    |
-| ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
-| `admin namespaces get-deduplication` / `set-deduplication --enabled` / `remove-deduplication`                      | `…/deduplication`                              |
-| `admin namespaces get-deduplication-snapshot-interval` / `set-deduplication-snapshot-interval --interval N` / `remove-deduplication-snapshot-interval` | `…/deduplicationSnapshotInterval`              |
-| `admin namespaces get-compaction-threshold` / `set-compaction-threshold --threshold-bytes N` / `remove-compaction-threshold` | `…/compactionThreshold`                        |
-| `admin namespaces get-delayed-delivery` / `set-delayed-delivery --active --tick-time-millis N` / `remove-delayed-delivery` | `…/delayedDelivery`                            |
-| `admin namespaces get-max-producers-per-topic` / `set-max-producers-per-topic --max N` / `remove-max-producers-per-topic` | `…/maxProducersPerTopic`                       |
-| `admin namespaces get-max-consumers-per-topic` / `set-max-consumers-per-topic --max N` / `remove-max-consumers-per-topic` | `…/maxConsumersPerTopic`                       |
-| `admin namespaces get-max-unacked-messages-per-consumer` / `set-max-unacked-messages-per-consumer --max N` / `remove-max-unacked-messages-per-consumer` | `…/maxUnackedMessagesPerConsumer`              |
-| `admin namespaces get-max-unacked-messages-per-subscription` / `set-max-unacked-messages-per-subscription --max N` / `remove-max-unacked-messages-per-subscription` | `…/maxUnackedMessagesPerSubscription`          |
+| Command                                                                                                                                                             | REST suffix                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `admin namespaces get-deduplication` / `set-deduplication --enabled` / `remove-deduplication`                                                                       | `…/deduplication`                     |
+| `admin namespaces get-deduplication-snapshot-interval` / `set-deduplication-snapshot-interval --interval N` / `remove-deduplication-snapshot-interval`              | `…/deduplicationSnapshotInterval`     |
+| `admin namespaces get-compaction-threshold` / `set-compaction-threshold --threshold-bytes N` / `remove-compaction-threshold`                                        | `…/compactionThreshold`               |
+| `admin namespaces get-delayed-delivery` / `set-delayed-delivery --active --tick-time-millis N` / `remove-delayed-delivery`                                          | `…/delayedDelivery`                   |
+| `admin namespaces get-max-producers-per-topic` / `set-max-producers-per-topic --max N` / `remove-max-producers-per-topic`                                           | `…/maxProducersPerTopic`              |
+| `admin namespaces get-max-consumers-per-topic` / `set-max-consumers-per-topic --max N` / `remove-max-consumers-per-topic`                                           | `…/maxConsumersPerTopic`              |
+| `admin namespaces get-max-unacked-messages-per-consumer` / `set-max-unacked-messages-per-consumer --max N` / `remove-max-unacked-messages-per-consumer`             | `…/maxUnackedMessagesPerConsumer`     |
+| `admin namespaces get-max-unacked-messages-per-subscription` / `set-max-unacked-messages-per-subscription --max N` / `remove-max-unacked-messages-per-subscription` | `…/maxUnackedMessagesPerSubscription` |
 
 ### `admin topics`
 
@@ -195,41 +195,41 @@ CRUD + stats + operational verbs + per-topic policy overrides + the PIP-180 shad
 
 **CRUD + stats**
 
-| Command                                                                                                                          | REST endpoint                                                                                                                 |
-| -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `admin topics list <tenant>/<ns>`                                                                                                | `GET /admin/v2/persistent/{tenant}/{ns}`                                                                                       |
-| `admin topics create <topic> --partitions N`                                                                                     | `PUT /admin/v2/persistent/{tenant}/{ns}/{topic}/partitions`                                                                    |
-| `admin topics delete <topic> [--force]`                                                                                          | `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/partitions?force=…`                                                         |
-| `admin topics stats <topic>`                                                                                                     | `GET .../partitions` (probe) → `…/stats` or `…/partitioned-stats` per partition count.                                         |
+| Command                                      | REST endpoint                                                                          |
+| -------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `admin topics list <tenant>/<ns>`            | `GET /admin/v2/persistent/{tenant}/{ns}`                                               |
+| `admin topics create <topic> --partitions N` | `PUT /admin/v2/persistent/{tenant}/{ns}/{topic}/partitions`                            |
+| `admin topics delete <topic> [--force]`      | `DELETE /admin/v2/persistent/{tenant}/{ns}/{topic}/partitions?force=…`                 |
+| `admin topics stats <topic>`                 | `GET .../partitions` (probe) → `…/stats` or `…/partitioned-stats` per partition count. |
 
 **Operational verbs**
 
-| Command                                                                  | REST endpoint                                              |
-| ------------------------------------------------------------------------ | ---------------------------------------------------------- |
-| `admin topics compact <topic>`                                           | `PUT .../compaction`                                       |
-| `admin topics compaction-status <topic>`                                 | `GET .../compaction` — returns `LongRunningProcessStatus`. |
-| `admin topics unload <topic>`                                            | `PUT .../unload`                                           |
-| `admin topics terminate <topic>`                                         | `POST .../terminate` — returns the last `MessageId`.       |
-| `admin topics update-partitions <topic> --partitions N`                  | `POST .../partitions` (forward grow only; broker 409s on shrink). |
-| `admin topics get-message-id-by-index <topic> --index N`                 | `GET .../getMessageIdByIndex?index=N` (PIP-415).            |
+| Command                                                  | REST endpoint                                                     |
+| -------------------------------------------------------- | ----------------------------------------------------------------- |
+| `admin topics compact <topic>`                           | `PUT .../compaction`                                              |
+| `admin topics compaction-status <topic>`                 | `GET .../compaction` — returns `LongRunningProcessStatus`.        |
+| `admin topics unload <topic>`                            | `PUT .../unload`                                                  |
+| `admin topics terminate <topic>`                         | `POST .../terminate` — returns the last `MessageId`.              |
+| `admin topics update-partitions <topic> --partitions N`  | `POST .../partitions` (forward grow only; broker 409s on shrink). |
+| `admin topics get-message-id-by-index <topic> --index N` | `GET .../getMessageIdByIndex?index=N` (PIP-415).                  |
 
 **Per-topic policy overrides**
 
 Same policy taxonomy as `admin namespaces` but at `/admin/v2/persistent/{tenant}/{ns}/{topic}/<suffix>`.
 A topic-level policy overrides the namespace default for that one topic.
 
-| Command                                                                                                                                                  | REST suffix                       |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| `get-retention` / `set-retention --time-minutes N --size-mb M` / `remove-retention`                                                                       | `…/retention`                     |
-| `get-backlog-quotas` / `set-backlog-quota --type … --limit-size … --limit-time … --policy …` / `remove-backlog-quota --type …`                            | `…/backlogQuota`                  |
-| `get-message-ttl` / `set-message-ttl --ttl-seconds N` / `remove-message-ttl`                                                                              | `…/messageTTL`                    |
-| `get-persistence` / `set-persistence …` / `remove-persistence`                                                                                            | `…/persistence`                   |
-| `get-dispatch-rate` / `set-dispatch-rate …` / `remove-dispatch-rate`                                                                                      | `…/dispatchRate`                  |
-| `get-subscription-dispatch-rate` / `set-subscription-dispatch-rate …` / `remove-subscription-dispatch-rate`                                              | `…/subscriptionDispatchRate`      |
-| `get-replicator-dispatch-rate` / `set-replicator-dispatch-rate …` / `remove-replicator-dispatch-rate`                                                    | `…/replicatorDispatchRate`        |
-| `get-publish-rate` / `set-publish-rate …` / `remove-publish-rate`                                                                                         | `…/publishRate`                   |
-| `get-max-producers` / `set-max-producers --max N` / `remove-max-producers`                                                                                | `…/maxProducers`                  |
-| `get-max-consumers` / `set-max-consumers --max N` / `remove-max-consumers`                                                                                | `…/maxConsumers`                  |
+| Command                                                                                                                        | REST suffix                  |
+| ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------- |
+| `get-retention` / `set-retention --time-minutes N --size-mb M` / `remove-retention`                                            | `…/retention`                |
+| `get-backlog-quotas` / `set-backlog-quota --type … --limit-size … --limit-time … --policy …` / `remove-backlog-quota --type …` | `…/backlogQuota`             |
+| `get-message-ttl` / `set-message-ttl --ttl-seconds N` / `remove-message-ttl`                                                   | `…/messageTTL`               |
+| `get-persistence` / `set-persistence …` / `remove-persistence`                                                                 | `…/persistence`              |
+| `get-dispatch-rate` / `set-dispatch-rate …` / `remove-dispatch-rate`                                                           | `…/dispatchRate`             |
+| `get-subscription-dispatch-rate` / `set-subscription-dispatch-rate …` / `remove-subscription-dispatch-rate`                    | `…/subscriptionDispatchRate` |
+| `get-replicator-dispatch-rate` / `set-replicator-dispatch-rate …` / `remove-replicator-dispatch-rate`                          | `…/replicatorDispatchRate`   |
+| `get-publish-rate` / `set-publish-rate …` / `remove-publish-rate`                                                              | `…/publishRate`              |
+| `get-max-producers` / `set-max-producers --max N` / `remove-max-producers`                                                     | `…/maxProducers`             |
+| `get-max-consumers` / `set-max-consumers --max N` / `remove-max-consumers`                                                     | `…/maxConsumers`             |
 
 A topic-level GET returns `null` when no override is set — the CLI decodes that as JSON `null` so a downstream script can branch on it.
 
@@ -238,26 +238,26 @@ A topic-level GET returns `null` when no override is set — the CLI decodes tha
 PIP-180 lets a "shadow" topic share its ledger storage with a "source" topic and expose a read-only view to consumers — a lightweight fan-out alternative to geo-replication.
 See [`docs/shadow-topic.md`](shadow-topic.md) and [`docs/pip-features.md#shadow-topics-pip-180`](pip-features.md#shadow-topics-pip-180) for concepts + caveats.
 
-| Command                                                              | REST endpoint                                                                                                                                    |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `admin topics shadow create <source> <shadow>`                       | `PUT /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics` — body is a bare JSON array `[<shadow>]`.                                          |
-| `admin topics shadow delete <shadow> [--force]`                      | `DELETE /admin/v2/persistent/{tenant}/{ns}/{shadow}?force=…` — `--force` kicks off connected subscribers.                                         |
-| `admin topics shadow list <source>`                                  | `GET /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics`                                                                                    |
-| `admin topics shadow source <shadow>`                                | `GET /admin/v2/persistent/{tenant}/{ns}/{shadow}/shadowSource` — returns `null` for a non-shadow topic.                                           |
+| Command                                         | REST endpoint                                                                                             |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `admin topics shadow create <source> <shadow>`  | `PUT /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics` — body is a bare JSON array `[<shadow>]`.  |
+| `admin topics shadow delete <shadow> [--force]` | `DELETE /admin/v2/persistent/{tenant}/{ns}/{shadow}?force=…` — `--force` kicks off connected subscribers. |
+| `admin topics shadow list <source>`             | `GET /admin/v2/persistent/{tenant}/{ns}/{source}/shadowTopics`                                            |
+| `admin topics shadow source <shadow>`           | `GET /admin/v2/persistent/{tenant}/{ns}/{shadow}/shadowSource` — returns `null` for a non-shadow topic.   |
 
 ### `admin subscriptions`
 
 Operator-facing subscription management.
 
-| Command                                                                                                                                | REST endpoint                                                                                  |
-| -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `admin subscriptions list <topic>`                                                                                                     | `GET .../{topic}/subscriptions`                                                                |
-| `admin subscriptions reset-cursor <topic> <sub> --message-id LEDGER:ENTRY[:PARTITION[:BATCH]] [--is-excluded]`                         | `POST .../{topic}/subscription/{sub}/resetcursor` with `ResetCursorData` body.                 |
-| `admin subscriptions reset-cursor-by-timestamp <topic> <sub> --timestamp-millis N`                                                     | `POST .../{topic}/subscription/{sub}/resetcursor/{timestamp}`                                  |
-| `admin subscriptions skip <topic> <sub> --count N`                                                                                     | `POST .../{topic}/subscription/{sub}/skip/{count}`                                             |
-| `admin subscriptions skip-all <topic> <sub>`                                                                                           | `POST .../{topic}/subscription/{sub}/skip_all` — broker endpoint is snake-case, not kebab.     |
-| `admin subscriptions expire <topic> <sub> --expire-time-seconds N`                                                                     | `POST .../{topic}/subscription/{sub}/expireMessages/{seconds}`                                 |
-| `admin subscriptions delete <topic> <sub> [--force]`                                                                                   | `DELETE .../{topic}/subscription/{sub}?force=…` — `--force` disconnects active consumers.      |
+| Command                                                                                                        | REST endpoint                                                                              |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `admin subscriptions list <topic>`                                                                             | `GET .../{topic}/subscriptions`                                                            |
+| `admin subscriptions reset-cursor <topic> <sub> --message-id LEDGER:ENTRY[:PARTITION[:BATCH]] [--is-excluded]` | `POST .../{topic}/subscription/{sub}/resetcursor` with `ResetCursorData` body.             |
+| `admin subscriptions reset-cursor-by-timestamp <topic> <sub> --timestamp-millis N`                             | `POST .../{topic}/subscription/{sub}/resetcursor/{timestamp}`                              |
+| `admin subscriptions skip <topic> <sub> --count N`                                                             | `POST .../{topic}/subscription/{sub}/skip/{count}`                                         |
+| `admin subscriptions skip-all <topic> <sub>`                                                                   | `POST .../{topic}/subscription/{sub}/skip_all` — broker endpoint is snake-case, not kebab. |
+| `admin subscriptions expire <topic> <sub> --expire-time-seconds N`                                             | `POST .../{topic}/subscription/{sub}/expireMessages/{seconds}`                             |
+| `admin subscriptions delete <topic> <sub> [--force]`                                                           | `DELETE .../{topic}/subscription/{sub}?force=…` — `--force` disconnects active consumers.  |
 
 The `LEDGER:ENTRY[:PARTITION[:BATCH]]` message-id format mirrors pulsarctl: partition and batch default to `-1` (non-partitioned, non-batched) when omitted.
 
@@ -267,43 +267,43 @@ Broker diagnostics + dynamic configuration.
 
 **Diagnostics**
 
-| Command                                                                       | REST endpoint                                              |
-| ----------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `admin brokers list <cluster>`                                                | `GET /admin/v2/brokers/{cluster}`                          |
-| `admin brokers leader`                                                        | `GET /admin/v2/brokers/leaderBroker`                       |
-| `admin brokers health-check`                                                  | `GET /admin/v2/brokers/health` — returns `"ok"` plain text. |
-| `admin brokers owned-namespaces <cluster> <broker>`                           | `GET /admin/v2/brokers/{cluster}/{broker}/ownedNamespaces` |
-| `admin brokers runtime-config`                                                | `GET /admin/v2/brokers/configuration/runtime`              |
-| `admin brokers internal-config`                                               | `GET /admin/v2/brokers/internal-configuration`             |
+| Command                                             | REST endpoint                                               |
+| --------------------------------------------------- | ----------------------------------------------------------- |
+| `admin brokers list <cluster>`                      | `GET /admin/v2/brokers/{cluster}`                           |
+| `admin brokers leader`                              | `GET /admin/v2/brokers/leaderBroker`                        |
+| `admin brokers health-check`                        | `GET /admin/v2/brokers/health` — returns `"ok"` plain text. |
+| `admin brokers owned-namespaces <cluster> <broker>` | `GET /admin/v2/brokers/{cluster}/{broker}/ownedNamespaces`  |
+| `admin brokers runtime-config`                      | `GET /admin/v2/brokers/configuration/runtime`               |
+| `admin brokers internal-config`                     | `GET /admin/v2/brokers/internal-configuration`              |
 
 **Dynamic configuration**
 
-| Command                                                                       | REST endpoint                                              |
-| ----------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `admin brokers dynamic-config-keys`                                           | `GET /admin/v2/brokers/configuration` — names of mutable knobs. |
-| `admin brokers dynamic-config-overrides`                                      | `GET /admin/v2/brokers/configuration/values` — currently-set overrides. |
-| `admin brokers set-dynamic-config --name K --value V`                         | `POST /admin/v2/brokers/configuration/{name}/{value}`       |
-| `admin brokers delete-dynamic-config --name K`                                | `DELETE /admin/v2/brokers/configuration/{name}`             |
+| Command                                               | REST endpoint                                                           |
+| ----------------------------------------------------- | ----------------------------------------------------------------------- |
+| `admin brokers dynamic-config-keys`                   | `GET /admin/v2/brokers/configuration` — names of mutable knobs.         |
+| `admin brokers dynamic-config-overrides`              | `GET /admin/v2/brokers/configuration/values` — currently-set overrides. |
+| `admin brokers set-dynamic-config --name K --value V` | `POST /admin/v2/brokers/configuration/{name}/{value}`                   |
+| `admin brokers delete-dynamic-config --name K`        | `DELETE /admin/v2/brokers/configuration/{name}`                         |
 
 ### `admin bookies`
 
-| Command                                                                        | REST endpoint                                          |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------ |
-| `admin bookies list`                                                           | `GET /admin/v2/bookies/all`                            |
-| `admin bookies racks-info`                                                     | `GET /admin/v2/bookies/racks-info`                     |
-| `admin bookies set-rack <bookie> --group G --rack R --hostname H`              | `POST /admin/v2/bookies/racks-info/{bookie}` with `BookieInfo` body. |
-| `admin bookies delete-rack <bookie>`                                           | `DELETE /admin/v2/bookies/racks-info/{bookie}`         |
+| Command                                                           | REST endpoint                                                        |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `admin bookies list`                                              | `GET /admin/v2/bookies/all`                                          |
+| `admin bookies racks-info`                                        | `GET /admin/v2/bookies/racks-info`                                   |
+| `admin bookies set-rack <bookie> --group G --rack R --hostname H` | `POST /admin/v2/bookies/racks-info/{bookie}` with `BookieInfo` body. |
+| `admin bookies delete-rack <bookie>`                              | `DELETE /admin/v2/bookies/racks-info/{bookie}`                       |
 
 ### `admin schemas`
 
-| Command                                                                                                              | REST endpoint                                                  |
-| -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `admin schemas get-latest <topic>`                                                                                   | `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema`           |
-| `admin schemas get-version <topic> --version V`                                                                      | `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema/{version}` |
-| `admin schemas list-versions <topic>`                                                                                | `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schemas`          |
-| `admin schemas post <topic> --type {AVRO\|JSON\|PROTOBUF\|…} --schema <definition> [--property key=value]…`         | `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/schema` with `PostSchemaPayload` body. |
-| `admin schemas delete <topic> [--force]`                                                                             | `DELETE /admin/v2/schemas/{tenant}/{ns}/{topic}/schema?force=…` |
-| `admin schemas compatibility <topic> --type … --schema <definition>`                                                 | `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/compatibility`   |
+| Command                                                                                                     | REST endpoint                                                                        |
+| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `admin schemas get-latest <topic>`                                                                          | `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema`                                 |
+| `admin schemas get-version <topic> --version V`                                                             | `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schema/{version}`                       |
+| `admin schemas list-versions <topic>`                                                                       | `GET /admin/v2/schemas/{tenant}/{ns}/{topic}/schemas`                                |
+| `admin schemas post <topic> --type {AVRO\|JSON\|PROTOBUF\|…} --schema <definition> [--property key=value]…` | `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/schema` with `PostSchemaPayload` body. |
+| `admin schemas delete <topic> [--force]`                                                                    | `DELETE /admin/v2/schemas/{tenant}/{ns}/{topic}/schema?force=…`                      |
+| `admin schemas compatibility <topic> --type … --schema <definition>`                                        | `POST /admin/v2/schemas/{tenant}/{ns}/{topic}/compatibility`                         |
 
 The `--schema` argument carries the schema definition as a string — typically a JSON-stringified AVRO record for `--type AVRO`.
 
@@ -313,18 +313,18 @@ Pulsar Functions — serverless Java / Python / Go user code running inside the 
 The CLI covers the URL-based register / update path (compiled package fetched by the broker from a URL).
 Local-file multipart uploads (`@FormDataParam("data")`) are out of scope today.
 
-| Command                                                                                                                                                                                                | REST endpoint                                                          |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| `admin functions list <tenant>/<ns>`                                                                                                                                                                   | `GET /admin/v3/functions/{tenant}/{ns}`                                |
-| `admin functions get <tenant>/<ns>/<name>`                                                                                                                                                             | `GET /admin/v3/functions/{tenant}/{ns}/{name}`                         |
-| `admin functions status <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                                        | `GET /admin/v3/functions/{tenant}/{ns}/{name}[/{instance_id}]/status`  |
-| `admin functions stats <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                                         | `GET /admin/v3/functions/{tenant}/{ns}/{name}[/{instance_id}]/stats`   |
-| `admin functions create-with-url --tenant T --namespace N --name X --url U --class-name C --runtime {JAVA\|PYTHON\|GO} --input <topic>… [--output <topic>] [--parallelism N]`                          | `POST /admin/v3/functions/{tenant}/{ns}/{name}` (multipart `url` + `functionConfig`). |
-| `admin functions update-with-url …`                                                                                                                                                                    | `PUT /admin/v3/functions/{tenant}/{ns}/{name}` (same multipart shape). |
-| `admin functions delete <tenant>/<ns>/<name>`                                                                                                                                                          | `DELETE /admin/v3/functions/{tenant}/{ns}/{name}`                      |
-| `admin functions start <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                                         | `POST .../{name}[/{instance_id}]/start`                                |
-| `admin functions stop <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                                          | `POST .../{name}[/{instance_id}]/stop`                                 |
-| `admin functions restart <tenant>/<ns>/<name>`                                                                                                                                                         | `POST .../{name}/restart`                                              |
+| Command                                                                                                                                                                       | REST endpoint                                                                         |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `admin functions list <tenant>/<ns>`                                                                                                                                          | `GET /admin/v3/functions/{tenant}/{ns}`                                               |
+| `admin functions get <tenant>/<ns>/<name>`                                                                                                                                    | `GET /admin/v3/functions/{tenant}/{ns}/{name}`                                        |
+| `admin functions status <tenant>/<ns>/<name> [--instance-id N]`                                                                                                               | `GET /admin/v3/functions/{tenant}/{ns}/{name}[/{instance_id}]/status`                 |
+| `admin functions stats <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                | `GET /admin/v3/functions/{tenant}/{ns}/{name}[/{instance_id}]/stats`                  |
+| `admin functions create-with-url --tenant T --namespace N --name X --url U --class-name C --runtime {JAVA\|PYTHON\|GO} --input <topic>… [--output <topic>] [--parallelism N]` | `POST /admin/v3/functions/{tenant}/{ns}/{name}` (multipart `url` + `functionConfig`). |
+| `admin functions update-with-url …`                                                                                                                                           | `PUT /admin/v3/functions/{tenant}/{ns}/{name}` (same multipart shape).                |
+| `admin functions delete <tenant>/<ns>/<name>`                                                                                                                                 | `DELETE /admin/v3/functions/{tenant}/{ns}/{name}`                                     |
+| `admin functions start <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                | `POST .../{name}[/{instance_id}]/start`                                               |
+| `admin functions stop <tenant>/<ns>/<name> [--instance-id N]`                                                                                                                 | `POST .../{name}[/{instance_id}]/stop`                                                |
+| `admin functions restart <tenant>/<ns>/<name>`                                                                                                                                | `POST .../{name}/restart`                                                             |
 
 The `--url` argument accepts any broker-resolvable scheme (`http(s)://`, `file://`, `function://`) — the broker fetches the package itself.
 A `file://` URL is **read by the broker** from its local filesystem, not from the CLI host.
@@ -334,29 +334,29 @@ A `file://` URL is **read by the broker** from its local filesystem, not from th
 Pulsar IO connectors — Sources pull data **into** Pulsar from external systems, Sinks push topic data **out**.
 Same verb taxonomy for both families.
 
-| Command (substitute `sources` / `sinks` for `<x>`)                                                                                                                                       | REST endpoint                                              |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `admin <x> list <tenant>/<ns>`                                                                                                                                                            | `GET /admin/v3/<x>/{tenant}/{ns}`                          |
-| `admin <x> get <tenant>/<ns>/<name>`                                                                                                                                                      | `GET /admin/v3/<x>/{tenant}/{ns}/{name}`                   |
-| `admin <x> status <tenant>/<ns>/<name>`                                                                                                                                                   | `GET /admin/v3/<x>/{tenant}/{ns}/{name}/status`            |
-| `admin sources create-with-url --tenant T --namespace N --name X --url U --class-name C --topic-name T [--parallelism N]`                                                                  | `POST /admin/v3/sources/{tenant}/{ns}/{name}` (multipart). |
-| `admin sinks create-with-url --tenant T --namespace N --name X --url U --class-name C --input <topic>… [--parallelism N]`                                                                  | `POST /admin/v3/sinks/{tenant}/{ns}/{name}` (multipart).   |
-| `admin <x> update-with-url …`                                                                                                                                                             | `PUT .../{name}` (same multipart shape).                   |
-| `admin <x> delete <tenant>/<ns>/<name>`                                                                                                                                                   | `DELETE .../{name}`                                        |
-| `admin <x> start <tenant>/<ns>/<name>` / `stop` / `restart`                                                                                                                               | `POST .../{name}/{start\|stop\|restart}`                   |
+| Command (substitute `sources` / `sinks` for `<x>`)                                                                        | REST endpoint                                              |
+| ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `admin <x> list <tenant>/<ns>`                                                                                            | `GET /admin/v3/<x>/{tenant}/{ns}`                          |
+| `admin <x> get <tenant>/<ns>/<name>`                                                                                      | `GET /admin/v3/<x>/{tenant}/{ns}/{name}`                   |
+| `admin <x> status <tenant>/<ns>/<name>`                                                                                   | `GET /admin/v3/<x>/{tenant}/{ns}/{name}/status`            |
+| `admin sources create-with-url --tenant T --namespace N --name X --url U --class-name C --topic-name T [--parallelism N]` | `POST /admin/v3/sources/{tenant}/{ns}/{name}` (multipart). |
+| `admin sinks create-with-url --tenant T --namespace N --name X --url U --class-name C --input <topic>… [--parallelism N]` | `POST /admin/v3/sinks/{tenant}/{ns}/{name}` (multipart).   |
+| `admin <x> update-with-url …`                                                                                             | `PUT .../{name}` (same multipart shape).                   |
+| `admin <x> delete <tenant>/<ns>/<name>`                                                                                   | `DELETE .../{name}`                                        |
+| `admin <x> start <tenant>/<ns>/<name>` / `stop` / `restart`                                                               | `POST .../{name}/{start\|stop\|restart}`                   |
 
 ### `admin packages` (V3)
 
 Pulsar Packages — versioned binary registry for Functions / Sources / Sinks JARs.
 The `<type>` argument selects which subregistry: `function`, `source`, or `sink`.
 
-| Command                                                                                                                                                                          | REST endpoint                                                                |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `admin packages list <type> <tenant>/<ns>`                                                                                                                                       | `GET /admin/v3/packages/{type}/{tenant}/{ns}`                                |
-| `admin packages versions <type> <tenant>/<ns>/<name>`                                                                                                                            | `GET /admin/v3/packages/{type}/{tenant}/{ns}/{name}`                         |
-| `admin packages metadata-get <type> <tenant>/<ns>/<name> --version V`                                                                                                            | `GET /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}/metadata`      |
-| `admin packages metadata-set <type> <tenant>/<ns>/<name> --version V --description D --contact C [--property key=value]…`                                                       | `PUT /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}/metadata`      |
-| `admin packages delete <type> <tenant>/<ns>/<name> --version V`                                                                                                                  | `DELETE /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}`            |
+| Command                                                                                                                   | REST endpoint                                                           |
+| ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `admin packages list <type> <tenant>/<ns>`                                                                                | `GET /admin/v3/packages/{type}/{tenant}/{ns}`                           |
+| `admin packages versions <type> <tenant>/<ns>/<name>`                                                                     | `GET /admin/v3/packages/{type}/{tenant}/{ns}/{name}`                    |
+| `admin packages metadata-get <type> <tenant>/<ns>/<name> --version V`                                                     | `GET /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}/metadata` |
+| `admin packages metadata-set <type> <tenant>/<ns>/<name> --version V --description D --contact C [--property key=value]…` | `PUT /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}/metadata` |
+| `admin packages delete <type> <tenant>/<ns>/<name> --version V`                                                           | `DELETE /admin/v3/packages/{type}/{tenant}/{ns}/{name}/{version}`       |
 
 ### `produce` / `consume` (M9 stubs)
 
