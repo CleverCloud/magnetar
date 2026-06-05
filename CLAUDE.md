@@ -144,6 +144,7 @@ RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
 cargo run -p xtask -- check-no-channels         # banned-channel grep
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps
 cargo run -p xtask -- check-no-internal-clock   # Instant::now() / SystemTime::now() outside the allowlist
+cargo run -p xtask -- check-log-fields          # error!/warn!/info! carry ≥1 structured field (ADR-0054)
 cargo run -p xtask -- codegen --check           # proto codegen drift
 cargo run -p xtask -- check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)

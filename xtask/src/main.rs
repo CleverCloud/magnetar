@@ -9,6 +9,9 @@
 //! - `check-no-internal-clock`: assert `magnetar-proto/src/**` never reads the host clock
 //!   (`Instant::now()` / `SystemTime::now()`) outside the two documented leak files. Mirrors
 //!   ADR-0011.
+//! - `check-log-fields`: assert every `error!` / `warn!` / `info!` tracing event in non-test
+//!   workspace code carries at least one structured field (`debug!` / `trace!` exempt). Mirrors
+//!   ADR-0054.
 //! - `check-sim-coverage`: assert that every line added relative to `git merge-base origin/main
 //!   HEAD` is executed by at least one moonpool test (`cargo-llvm-cov` patch-coverage style).
 //!   Mirrors ADR-0024.
@@ -83,6 +86,19 @@ enum Cmd {
     /// [`std::time::SystemTime::now`] outside `#[cfg(test)]` blocks and
     /// outside the two documented leak files. See ADR-0011.
     CheckNoInternalClock,
+    /// Assert every `error!` / `warn!` / `info!` tracing event carries at
+    /// least one structured field.
+    ///
+    /// Parses macro invocations parenthesis-balanced (multi-line invocations
+    /// are the house style) in non-`#[cfg(test)]` workspace library/binary
+    /// code; brace/bracket delimiter forms (`warn!{…}` / `warn![…]`) are
+    /// hard violations since the field grammar only parses parenthesized
+    /// invocations. A bare `target:`-only or literal-message-only event is a
+    /// violation. Known limitation: a bare named constant in message
+    /// position (`info!(SOME_CONST)`) is indistinguishable from `tracing`'s
+    /// ident-capture shorthand and passes as a field. `debug!` / `trace!`
+    /// are exempt. See ADR-0054.
+    CheckLogFields,
     /// Assert that every line added relative to the merge base is covered
     /// by at least one `magnetar-runtime-moonpool` test.
     ///
@@ -139,6 +155,7 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoChannels => check_no_channels(),
         Cmd::CheckNoIoDeps => check_no_io_deps(),
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
+        Cmd::CheckLogFields => check_log_fields(),
         Cmd::CheckSimCoverage { base } => check_sim_coverage(&base),
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
         Cmd::CheckCryptoMatrix => check_crypto_matrix(),
@@ -325,6 +342,11 @@ fn check_no_io_deps() -> Result<()> {
     // do not use `--format` because older cargo versions on stable have
     // different placeholder support; the default human-readable format is
     // stable across MSRV.
+    // Note: without a dependency-kind edge filter the tree INCLUDES proto's
+    // dev-dependency edges (e.g. the ADR-0054 `tracing-subscriber` capture
+    // dev-dep), so a dev-dep pulling a forbidden I/O crate trips this gate
+    // too — intentionally stricter than a production-graph-only scan
+    // (ADR-0054 §5).
     let workspace_root = workspace_root()?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = StdCommand::new(cargo)
@@ -551,6 +573,533 @@ fn check_no_channels() -> Result<()> {
             offenders.len()
         );
     }
+    Ok(())
+}
+
+/// Workspace-relative file paths exempt from `check-log-fields`, matched
+/// with [`str::ends_with`] against forward-slash relative paths (mirrors
+/// [`CLOCK_LEAK_ALLOWLIST`]). The list starts — and should stay — empty:
+/// every `error!` / `warn!` / `info!` event must carry at least one
+/// structured field per ADR-0054. Add an entry only with a rationale
+/// documented in the same changeset.
+const LOG_FIELDS_ALLOWLIST: &[&str] = &[];
+
+/// Path fragments excluded from `check-log-fields`: test, bench, example,
+/// and fuzz code is not the operator-facing logging surface ADR-0054
+/// governs. `#[cfg(test)]` modules inside `src/**` are excluded separately
+/// by [`cfg_test_line_flags`]. Matched against `/`-prefixed
+/// workspace-relative paths.
+const LOG_FIELDS_EXCLUDE_FRAGMENTS: &[&str] = &["/tests/", "/benches/", "/examples/", "/fuzz/"];
+
+/// The tracing event macros `check-log-fields` enforces fields on, with the
+/// level name used in violation reports. `debug!` / `trace!` are exempt per
+/// ADR-0054 (per-operation internals; not operator-load-bearing).
+const LOG_LEVEL_MACROS: &[(&str, &str)] =
+    &[("error!", "error"), ("warn!", "warn"), ("info!", "info")];
+
+/// A single `error!` / `warn!` / `info!` invocation found in a source file.
+struct LogInvocation {
+    /// 1-indexed line of the macro name.
+    line: usize,
+    /// Level name (`"error"` / `"warn"` / `"info"`), for reporting.
+    level: &'static str,
+    /// The raw macro-argument text between the balanced outer parentheses,
+    /// or `None` for an unsupported `{…}` / `[…]` delimiter form — a hard
+    /// violation, since the field grammar only parses parenthesized
+    /// invocations.
+    args: Option<String>,
+}
+
+/// Violation reason: a parenthesized invocation without a structured field.
+const LOG_FIELDS_NO_FIELD: &str = "carries no structured field";
+
+/// Violation reason: a brace/bracket macro form the field grammar cannot
+/// parse — using it would silently bypass the gate, so it is rejected
+/// outright.
+const LOG_FIELDS_NON_PAREN: &str =
+    "uses brace/bracket macro delimiters; use parentheses so the field grammar can parse it";
+
+/// If `bytes[i]` opens a lexical region the scanner must not look inside —
+/// a line or (nested) block comment, a string / raw-string / byte-string
+/// literal, or a char literal — return the index just past that region.
+/// Returns `None` when `bytes[i]` is plain code (including lifetimes, which
+/// consume only their `'` here and leave the identifier as plain code).
+fn skip_inert_region(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes[i] {
+        b'/' if bytes.get(i + 1) == Some(&b'/') => {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            // Block comments nest, per the Rust lexer.
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < bytes.len() && depth > 0 {
+                if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            Some(j)
+        }
+        b'"' => Some(skip_string_literal(bytes, i)),
+        b'r' | b'b' => skip_raw_or_byte_literal(bytes, i),
+        b'\'' => skip_char_literal(bytes, i),
+        _ => None,
+    }
+}
+
+/// Skip a regular `"…"` string literal starting at `bytes[i]` (the opening
+/// quote). Handles `\` escapes, including escaped quotes and the
+/// line-continuation `\<newline>`.
+fn skip_string_literal(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => return j + 1,
+            _ => j += 1,
+        }
+    }
+    j
+}
+
+/// Skip a raw string (`r"…"`, `r#"…"#`, `br"…"`), byte string (`b"…"`), or
+/// byte char (`b'…'`) literal starting at `bytes[i]`. Returns `None` when
+/// the `r` / `b` is just the start of an identifier (including raw
+/// identifiers like `r#match`).
+fn skip_raw_or_byte_literal(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    if bytes[j] == b'b' {
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b'r') {
+        j += 1;
+        let mut hashes = 0usize;
+        while bytes.get(j) == Some(&b'#') {
+            hashes += 1;
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'"') {
+            return None; // identifier (possibly raw) — plain code
+        }
+        j += 1;
+        while j < bytes.len() {
+            if bytes[j] == b'"'
+                && bytes.len() - (j + 1) >= hashes
+                && bytes[j + 1..j + 1 + hashes].iter().all(|b| *b == b'#')
+            {
+                return Some(j + 1 + hashes);
+            }
+            j += 1;
+        }
+        Some(j)
+    } else if bytes[i] == b'b' && bytes.get(j) == Some(&b'"') {
+        Some(skip_string_literal(bytes, j))
+    } else if bytes[i] == b'b' && bytes.get(j) == Some(&b'\'') {
+        skip_char_literal(bytes, j)
+    } else {
+        None
+    }
+}
+
+/// Skip a char literal starting at the `'` at `bytes[i]`. Returns `None`
+/// for lifetimes (`'a`), which have no closing quote — the caller then
+/// treats the `'` as plain code and advances one byte.
+fn skip_char_literal(bytes: &[u8], i: usize) -> Option<usize> {
+    let j = i + 1;
+    if j >= bytes.len() {
+        return None;
+    }
+    if bytes[j] == b'\\' {
+        // Escaped char literal (`'\n'`, `'\''`, `'\u{7FFF}'`): scan to the
+        // closing quote.
+        let mut k = j + 2;
+        while k < bytes.len() && bytes[k] != b'\'' {
+            k += 1;
+        }
+        return Some((k + 1).min(bytes.len()));
+    }
+    // Unescaped single-byte char literal: `'x'`.
+    if bytes.get(j + 1) == Some(&b'\'') {
+        return Some(j + 2);
+    }
+    None
+}
+
+/// Extract the argument text between balanced parentheses, with
+/// `bytes[open]` being the opening `(`. Comments and string/char literals
+/// inside the arguments do not perturb the balance. Returns the inner text
+/// plus the index just past the closing `)`.
+fn extract_balanced_parens(bytes: &[u8], open: usize) -> Option<(String, usize)> {
+    let mut depth = 0usize;
+    let mut j = open;
+    let start = open + 1;
+    while j < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, j) {
+            j = next.max(j + 1);
+            continue;
+        }
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = String::from_utf8_lossy(&bytes[start..j]).into_owned();
+                    return Some((inner, j + 1));
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Find every `error!(…)` / `warn!(…)` / `info!(…)` invocation in
+/// `contents`, parenthesis-balanced so multi-line invocations parse whole.
+/// Path-qualified forms (`tracing::warn!`) match too; identifiers merely
+/// ending in a level name (`my_error!`) do not. Occurrences inside
+/// comments and string literals are ignored. Brace/bracket delimiter forms
+/// (`warn!{…}` / `warn![…]`) are returned with `args: None` — hard
+/// violations, never silently skipped.
+fn find_log_invocations(contents: &str) -> Vec<LogInvocation> {
+    let bytes = contents.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        let mut matched = false;
+        for (needle, level) in LOG_LEVEL_MACROS {
+            if !bytes[i..].starts_with(needle.as_bytes()) {
+                continue;
+            }
+            // Reject matches inside larger identifiers (`my_error!`); a
+            // preceding `:` (`tracing::error!`) is a path separator and fine.
+            if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                continue;
+            }
+            let mut j = i + needle.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            // Brace/bracket delimiter forms would silently bypass the
+            // parenthesis-only field grammar — record them as hard
+            // violations instead of skipping.
+            if matches!(bytes.get(j), Some(&b'{' | &b'[')) {
+                let line = contents[..i].bytes().filter(|b| *b == b'\n').count() + 1;
+                out.push(LogInvocation {
+                    line,
+                    level,
+                    args: None,
+                });
+                i = j;
+                matched = true;
+                break;
+            }
+            if bytes.get(j) != Some(&b'(') {
+                continue;
+            }
+            if let Some((args, end)) = extract_balanced_parens(bytes, j) {
+                let line = contents[..i].bytes().filter(|b| *b == b'\n').count() + 1;
+                out.push(LogInvocation {
+                    line,
+                    level,
+                    args: Some(args),
+                });
+                i = end;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Split macro-argument text on top-level commas. Commas nested inside
+/// `()` / `[]` / `{}`, strings, or comments do not split.
+fn split_top_level_args(args: &str) -> Vec<&str> {
+    let bytes = args.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        parts.push(&args[start..]);
+    }
+    parts
+}
+
+/// If `part` starts with a `name:` / `target:` / `parent:` macro spec
+/// keyword (single colon — `target::x` is a path, not a spec), return the
+/// remainder after the colon.
+fn strip_spec_keyword(part: &str) -> Option<&str> {
+    for keyword in ["target", "parent", "name"] {
+        if let Some(rest) = part.strip_prefix(keyword) {
+            let rest = rest.trim_start();
+            if rest.starts_with(':') && !rest.starts_with("::") {
+                return Some(&rest[1..]);
+            }
+        }
+    }
+    None
+}
+
+/// If `part` begins with a tracing field path (`ident` or
+/// `ident.nested.path`), return the remainder after the path. Returns
+/// `None` when the first token is not an identifier.
+fn strip_ident_path(part: &str) -> Option<&str> {
+    let bytes = part.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return None;
+    }
+    let mut i = 0usize;
+    loop {
+        let segment_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == segment_start {
+            return None; // `.` not followed by an identifier
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    Some(&part[i..])
+}
+
+/// True when `rest` opens a field assignment: a single `=` (not `==` /
+/// `=>`).
+fn is_field_assignment(rest: &str) -> bool {
+    rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>")
+}
+
+/// If `part` starts with a string / raw-string literal, return the
+/// remainder after it; `None` otherwise.
+fn strip_leading_string_literal(part: &str) -> Option<&str> {
+    let bytes = part.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let end = match bytes[0] {
+        b'"' => skip_string_literal(bytes, 0),
+        b'r' => skip_raw_or_byte_literal(bytes, 0)?,
+        _ => return None,
+    };
+    Some(&part[end.min(part.len())..])
+}
+
+/// Decide whether one `error!` / `warn!` / `info!` argument list carries at
+/// least one structured field.
+///
+/// Mirrors the tracing shortcut-macro grammar: optional `name:` / `target:`
+/// / `parent:` spec args, then zero or more fields (`ident = value`,
+/// `field.path = value`, `"quoted.name" = value`, `%shorthand`,
+/// `?shorthand`, bare `ident` capture), then the message format string and
+/// its format args. The first non-spec, non-field argument is the message —
+/// everything after it (inline format args included) is NOT a structured
+/// field, so `error!("failed: {}", err)` is a violation while
+/// `error!(error = %err, "failed")` is not.
+fn has_structured_field(args: &str) -> bool {
+    for raw in split_top_level_args(args) {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue; // trailing comma
+        }
+        if strip_spec_keyword(part).is_some() {
+            continue;
+        }
+        // `%value` / `?value` sigil shorthand.
+        if part.starts_with('%') || part.starts_with('?') {
+            return true;
+        }
+        // `{ field = value, … }` brace-delimited field block.
+        if let Some(inner) = part.strip_prefix('{') {
+            let inner = inner.strip_suffix('}').unwrap_or(inner).trim();
+            if !inner.is_empty() {
+                return true;
+            }
+            continue;
+        }
+        // A leading string literal is either a `"quoted.name" = value`
+        // field or the message itself.
+        if let Some(rest) = strip_leading_string_literal(part) {
+            return is_field_assignment(rest.trim_start());
+        }
+        // `ident.path` alone (capture shorthand) or `ident.path = value`.
+        if let Some(rest) = strip_ident_path(part) {
+            let rest = rest.trim_start();
+            return rest.is_empty() || is_field_assignment(rest);
+        }
+        // Some other expression sits in message position — no fields seen.
+        return false;
+    }
+    false
+}
+
+/// Per-line `#[cfg(test)]`-membership flags for `contents` (1 entry per
+/// line, 1-indexed lines map to `flags[line - 1]`).
+///
+/// Same line-based brace-tracking heuristic as [`check_no_internal_clock`]:
+/// a `#[cfg(…test…)]` attribute arms a pending state; the next `{` opens
+/// the excluded span, which closes when the brace depth returns to zero. A
+/// braceless `;` declaration (`#[cfg(test)] mod tests;`) excludes only its
+/// own lines.
+fn cfg_test_line_flags(contents: &str) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut in_cfg_test = false;
+    let mut pending = false;
+    let mut depth: i32 = 0;
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        let opens = line.matches('{').count() as i32;
+        let closes = line.matches('}').count() as i32;
+
+        if !in_cfg_test && !pending && trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
+            flags.push(true);
+            if opens > 0 {
+                // Single-line gated item: `#[cfg(test)] mod tests { … }`.
+                in_cfg_test = true;
+                depth = opens - closes;
+                if depth <= 0 {
+                    in_cfg_test = false;
+                    depth = 0;
+                }
+            } else if !trimmed.ends_with(';') {
+                pending = true;
+            }
+            continue;
+        }
+
+        if pending {
+            flags.push(true);
+            if opens > 0 {
+                pending = false;
+                in_cfg_test = true;
+                depth = opens - closes;
+                if depth <= 0 {
+                    in_cfg_test = false;
+                    depth = 0;
+                }
+            } else if trimmed.ends_with(';') {
+                // `#[cfg(test)]` + `mod tests;` — gated declaration, no block.
+                pending = false;
+            }
+            continue;
+        }
+
+        if in_cfg_test {
+            flags.push(true);
+            depth += opens - closes;
+            if depth <= 0 {
+                in_cfg_test = false;
+                depth = 0;
+            }
+            continue;
+        }
+
+        flags.push(false);
+    }
+    flags
+}
+
+/// Scan one file's contents for `error!` / `warn!` / `info!` invocations
+/// without a structured field (or with an unparseable brace/bracket
+/// delimiter form), excluding `#[cfg(test)]` regions. Returns
+/// `(line, level, reason)` per violation.
+fn scan_log_field_violations(contents: &str) -> Vec<(usize, &'static str, &'static str)> {
+    let in_test = cfg_test_line_flags(contents);
+    find_log_invocations(contents)
+        .into_iter()
+        .filter(|inv| !in_test.get(inv.line - 1).copied().unwrap_or(false))
+        .filter_map(|inv| match inv.args {
+            None => Some((inv.line, inv.level, LOG_FIELDS_NON_PAREN)),
+            Some(args) if !has_structured_field(&args) => {
+                Some((inv.line, inv.level, LOG_FIELDS_NO_FIELD))
+            }
+            Some(_) => None,
+        })
+        .collect()
+}
+
+fn check_log_fields() -> Result<()> {
+    let workspace_root = workspace_root()?;
+
+    let mut offenders: Vec<String> = Vec::new();
+    visit(&workspace_root, &mut |path, contents| {
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            return;
+        }
+        // xtask itself mentions the macro names literally (this very check).
+        if path.starts_with(workspace_root.join("xtask")) {
+            return;
+        }
+        let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let probe = format!("/{rel}");
+        if LOG_FIELDS_EXCLUDE_FRAGMENTS
+            .iter()
+            .any(|frag| probe.contains(frag))
+        {
+            return;
+        }
+        if LOG_FIELDS_ALLOWLIST
+            .iter()
+            .any(|allowed| rel == *allowed || rel.ends_with(allowed))
+        {
+            return;
+        }
+        for (line, level, reason) in scan_log_field_violations(contents) {
+            offenders.push(format!("{rel}:{line}: {level}! {reason}"));
+        }
+    })?;
+
+    if !offenders.is_empty() {
+        offenders.sort();
+        for line in &offenders {
+            eprintln!("unstructured log event — {line}");
+        }
+        bail!(
+            "log-fields check failed: {} offender(s). Every `error!` / `warn!` / `info!` \
+             event must carry at least one structured field (`debug!` / `trace!` are \
+             exempt) — see specs/adr/0054-logging-policy.md.",
+            offenders.len()
+        );
+    }
+    eprintln!("xtask check-log-fields: every error!/warn!/info! event carries structured fields.");
     Ok(())
 }
 
@@ -1462,5 +2011,150 @@ fn check_crypto_matrix() -> Result<()> {
             "xtask check-crypto-matrix: {} of {total_cells} cell(s) failed.",
             failures.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── check-log-fields parser ─────────────────────────────────────
+
+    #[test]
+    fn log_fields_flags_bare_message() {
+        let src = r#"
+fn run() {
+    tracing::error!("supervisor: begin_handshake after reset failed");
+}
+"#;
+        let violations = scan_log_field_violations(src);
+        assert_eq!(violations, vec![(3, "error", LOG_FIELDS_NO_FIELD)]);
+    }
+
+    #[test]
+    fn log_fields_flags_inline_format_args_only() {
+        // Inline-formatted values in the message string are NOT structured
+        // fields (ADR-0054 §2.2) — and neither are positional format args
+        // after the message.
+        let src = r#"
+fn run() {
+    tracing::warn!("reconnect attempt {attempt} failed: {err}; will retry");
+    tracing::warn!("gave up after {} attempt(s)", attempts);
+}
+"#;
+        let violations = scan_log_field_violations(src);
+        assert_eq!(
+            violations,
+            vec![
+                (3, "warn", LOG_FIELDS_NO_FIELD),
+                (4, "warn", LOG_FIELDS_NO_FIELD)
+            ]
+        );
+    }
+
+    #[test]
+    fn log_fields_accepts_structured_fields() {
+        let src = r#"
+fn run() {
+    tracing::warn!(attempt, max_attempts = max, "reconnect failed");
+    tracing::info!(?handle, code, %message, "transient error; retrying");
+    tracing::error!(error = %err, "lookup failed");
+    tracing::warn!(target: "magnetar::auth", auth_method = %method, "auth refresh failed");
+    tracing::info!("question.answer" = 42, "quoted field name");
+    info!(count);
+}
+"#;
+        assert!(scan_log_field_violations(src).is_empty());
+    }
+
+    #[test]
+    fn log_fields_parses_multi_line_invocations() {
+        // Parenthesis-balanced parsing: the structured invocation spans
+        // several lines, the bare one wraps its message string. A line-window
+        // heuristic would misclassify both.
+        let src = r#"
+fn run() {
+    tracing::warn!(
+        source,
+        rejected_url = broker_service_url.as_deref(),
+        "broker-advertised redirect URL rejected by redirect_url_allow_list; \
+         ignoring the hint",
+    );
+    tracing::warn!(
+        "supervisor: service-url provider returned an unparseable URL \
+         on this attempt; falling back to the cached URL"
+    );
+}
+"#;
+        let violations = scan_log_field_violations(src);
+        assert_eq!(violations, vec![(9, "warn", LOG_FIELDS_NO_FIELD)]);
+    }
+
+    #[test]
+    fn log_fields_skips_cfg_test_modules() {
+        let src = r#"
+fn run() {
+    tracing::info!(topic = %topic, "producer created");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capture() {
+        tracing::error!("bare message inside a test module is fine");
+    }
+}
+"#;
+        assert!(scan_log_field_violations(src).is_empty());
+    }
+
+    #[test]
+    fn log_fields_flags_target_only_invocation() {
+        // `target:` (and `name:` / `parent:`) are macro spec args, not
+        // structured fields.
+        let src = r#"
+fn run() {
+    tracing::info!(target: "magnetar::pattern_consumer", "discovery tick");
+    tracing::info!(target: "magnetar::pattern_consumer", added, "discovery delta");
+}
+"#;
+        let violations = scan_log_field_violations(src);
+        assert_eq!(violations, vec![(3, "info", LOG_FIELDS_NO_FIELD)]);
+    }
+
+    #[test]
+    fn log_fields_rejects_brace_and_bracket_delimiter_forms() {
+        // The field grammar parses only parenthesized invocations; the
+        // other delimiter forms would bypass it silently, so they are hard
+        // violations even WITH a structured field inside.
+        let src = r#"
+fn run() {
+    tracing::warn!{ error = %err, "brace form" };
+    info!["bracket form"];
+}
+"#;
+        let violations = scan_log_field_violations(src);
+        assert_eq!(
+            violations,
+            vec![
+                (3, "warn", LOG_FIELDS_NON_PAREN),
+                (4, "info", LOG_FIELDS_NON_PAREN)
+            ]
+        );
+    }
+
+    #[test]
+    fn log_fields_ignores_comments_strings_and_lookalike_macros() {
+        let src = r#"
+fn run() {
+    // tracing::error!("commented out");
+    /* tracing::warn!("block comment") */
+    let doc = "error!(\"inside a string literal\")";
+    my_error!("custom macro, not tracing");
+    tracing::debug!("debug is exempt");
+    tracing::trace!("trace is exempt");
+}
+"#;
+        assert!(scan_log_field_violations(src).is_empty());
     }
 }
