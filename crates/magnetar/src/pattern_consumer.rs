@@ -208,6 +208,16 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
                 report.added += 1;
             }
         }
+        // Discovery-update record (ADR-0054) — only reached when at least
+        // one delta was drained, so this never fires on quiescent ticks.
+        tracing::debug!(
+            target: "magnetar::pattern_consumer",
+            namespace = %self.namespace(),
+            pattern = %self.pattern(),
+            added = report.added,
+            removed = report.removed,
+            "pattern discovery delta"
+        );
         Ok(report)
     }
 

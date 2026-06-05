@@ -92,18 +92,26 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     | ConnectionEvent::ProducerOpenFailedTransient { .. }
                     | ConnectionEvent::SubscribeFailedTransient { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
+                    | ConnectionEvent::ChecksumMismatch { .. }
+                    | ConnectionEvent::LookupResponse {
+                        result: magnetar_proto::LookupOutcome::Redirected { .. },
+                        ..
+                    }
             )
         });
         let Some(event) = event else {
             return Ok(());
         };
         match event {
-            ConnectionEvent::AuthChallenge {
-                method: _,
-                challenge,
-            } => {
+            ConnectionEvent::AuthChallenge { method, challenge } => {
                 let Some(provider) = shared.auth_provider.clone() else {
+                    // `method` is the broker-requested auth method —
+                    // hostile-peer-controlled, so it is truncated before
+                    // landing in the field (ADR-0054).
                     tracing::warn!(
+                        auth_method = method
+                            .as_deref()
+                            .map_or("none", crate::log_fields::truncate_broker_str),
                         "broker requested in-band auth refresh but no AuthProvider configured; \
                          the connection will be reset"
                     );
@@ -113,9 +121,29 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     ));
                 };
                 let bytes = challenge.unwrap_or_default();
-                let refreshed = provider
-                    .respond_to_challenge(&bytes)
-                    .map_err(|err| ClientError::Other(format!("auth refresh failed: {err}")))?;
+                // ADR-0054 no-secrets rule: the challenge bytes and the
+                // refreshed credential are NEVER logged, at any level.
+                tracing::debug!(
+                    auth_method = %provider.method(),
+                    "auth challenge received; refreshing credentials"
+                );
+                let refreshed = match provider.respond_to_challenge(&bytes) {
+                    Ok(refreshed) => refreshed,
+                    Err(err) => {
+                        // ADR-0054 auth-path rule: a third-party
+                        // `AuthProvider`'s `Display`/`Debug` impl is an
+                        // uncontrolled secret channel — log the method plus
+                        // a stable error class only, never the provider
+                        // error chain. The full error still reaches the
+                        // caller via the returned `ClientError`.
+                        tracing::warn!(
+                            auth_method = %provider.method(),
+                            error_class = "auth_refresh_failed",
+                            "in-band auth refresh failed; the connection will be reset"
+                        );
+                        return Err(ClientError::Other(format!("auth refresh failed: {err}")));
+                    }
+                };
                 let method = provider.method().to_owned();
                 shared
                     .inner
@@ -160,8 +188,12 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 // that's a normal transport drop, not a credential leak).
                 tracing::warn!(
                     source,
-                    rejected_url = broker_service_url.as_deref(),
-                    rejected_url_tls = broker_service_url_tls.as_deref(),
+                    rejected_url = broker_service_url
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
+                    rejected_url_tls = broker_service_url_tls
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
                     "broker-advertised redirect URL rejected by redirect_url_allow_list; \
                      ignoring the hint (auth provider NOT replayed against the unverified host)",
                 );
@@ -186,8 +218,12 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 tracing::info!(
                     ?producer,
                     ?consumer,
-                    new_url = broker_service_url.as_deref(),
-                    new_url_tls = broker_service_url_tls.as_deref(),
+                    new_url = broker_service_url
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
+                    new_url_tls = broker_service_url_tls
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
                     "broker requested PIP-188 topic migration; supervised reconnect will fire"
                 );
                 return Err(ClientError::Other(
@@ -207,10 +243,13 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 // broker to (re)acquire bundle ownership, after which the
                 // `CommandProducer` retry actually succeeds. Mirrors Java's
                 // `ProducerImpl.connectionOpened` → `lookupRequest` flow.
-                tracing::info!(
+                //
+                // `warn!` per ADR-0054 §2.1: degraded-but-recovering background
+                // retry, not surfaced as `Err` to any caller while it retries.
+                tracing::warn!(
                     ?handle,
                     code,
-                    %message,
+                    message = crate::log_fields::truncate_broker_str(&message),
                     "producer-open transient error; scheduling lookup + retry"
                 );
                 let shared_for_retry = shared.clone();
@@ -239,10 +278,12 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 code,
                 message,
             } => {
-                tracing::info!(
+                // `warn!` per ADR-0054 §2.1 — same level rule as the
+                // producer-open transient arm above.
+                tracing::warn!(
                     ?handle,
                     code,
-                    %message,
+                    message = crate::log_fields::truncate_broker_str(&message),
                     "consumer-subscribe transient error; scheduling lookup + retry"
                 );
                 let shared_for_retry = shared.clone();
@@ -327,6 +368,19 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     });
                 shared.scalable_notify.notify_waiters();
             }
+            // Diagnostic events consumed SILENTLY — single-owner rule
+            // (ADR-0054, decision Q1): `magnetar-proto` owns the
+            // point-of-detection logs for CRC32C checksum mismatches and
+            // lookup-redirect hops, where it holds the richest context
+            // (computed/expected checksum, hop count, chased URL). The
+            // engine drains the events here only so they cannot accumulate
+            // unbounded in the proto event queue under a corrupting or
+            // redirect-happy peer; logging them again here would
+            // double-report. The `LookupResponse` arm only ever sees
+            // `LookupOutcome::Redirected` — the `poll_event_if` predicate
+            // above admits no other lookup result.
+            ConnectionEvent::ChecksumMismatch { .. } => {}
+            ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }
     }
@@ -564,7 +618,8 @@ async fn supervised_driver_loop(
             if until > now {
                 let dur = until.saturating_duration_since(now);
                 tracing::warn!(
-                    "supervisor: anti-thrash cooldown engaged; sleeping {dur:?} before next redial"
+                    cooldown_ms = u64::try_from(dur.as_millis()).unwrap_or(u64::MAX),
+                    "supervisor: anti-thrash cooldown engaged; sleeping before next redial"
                 );
                 tokio::time::sleep(dur).await;
             }
@@ -594,8 +649,9 @@ async fn supervised_driver_loop(
             if let Some(max) = cfg.max_attempts {
                 if attempt > max {
                     tracing::warn!(
-                        "supervisor: gave up after {attempt} reconnect attempt(s) \
-                         (max_attempts={max})"
+                        attempt,
+                        max_attempts = max,
+                        "supervisor: gave up; reconnect attempt budget exhausted"
                     );
                     return last_inner_result;
                 }
@@ -621,9 +677,10 @@ async fn supervised_driver_loop(
                             Ok(parsed) => std::borrow::Cow::Owned(parsed),
                             Err(err) => {
                                 tracing::warn!(
-                                    "supervisor: service-url provider returned an unparseable URL \
-                                 {raw:?} on attempt {attempt}: {err}; falling back to the \
-                                 cached URL"
+                                    attempt,
+                                    error = %err,
+                                    "supervisor: service-url provider returned an unparseable \
+                                     URL; falling back to the cached URL"
                                 );
                                 std::borrow::Cow::Borrowed(&reconnect_ctx.url)
                             }
@@ -646,12 +703,24 @@ async fn supervised_driver_loop(
             )
             .await
             {
-                Ok(t) => break t,
+                Ok(t) => {
+                    let (host, port) = target_url.socket_addr();
+                    tracing::info!(
+                        attempt,
+                        host = %host,
+                        port,
+                        "supervisor: reconnected to broker"
+                    );
+                    break t;
+                }
                 Err(err) => {
                     let (host, port) = target_url.socket_addr();
                     tracing::warn!(
-                        "supervisor: reconnect attempt {attempt} failed (url={host}:{port}): \
-                         {err}; will retry"
+                        attempt,
+                        host = %host,
+                        port,
+                        error = %err,
+                        "supervisor: reconnect attempt failed; will retry"
                     );
                     // Loop and back off again.
                 }
@@ -667,7 +736,7 @@ async fn supervised_driver_loop(
             if let Err(err) = conn.begin_handshake() {
                 // Should never happen — reset() snaps state back to Uninitialized — but if it
                 // does, surface it.
-                tracing::error!("supervisor: begin_handshake after reset failed: {err}");
+                tracing::error!(error = %err, "supervisor: begin_handshake after reset failed");
                 return Err(err.into());
             }
         }

@@ -198,6 +198,14 @@ pub struct ScriptedBroker {
     /// count. Surfaces the per-txn ack ledger's drain/drop side-effect
     /// to the golden-trace assertion path.
     txn_drain_log: TxnDrainLog,
+    /// When `true`, every session writes ONE CRC32C-corrupted frame
+    /// immediately after answering `CommandConnect` with
+    /// `CommandConnected`. Armed by
+    /// [`Self::inject_corrupted_frame_after_connected`] for the
+    /// corrupted-frame differential scenario (ADR-0054 / decision Q2):
+    /// the receiving proto layer must log + drop the frame and both
+    /// engines must keep the connection alive.
+    corrupt_after_connected: Arc<Mutex<bool>>,
 }
 
 impl std::fmt::Debug for ScriptedBroker {
@@ -225,6 +233,8 @@ impl ScriptedBroker {
         let seeked_partitions_clone = seeked_partitions.clone();
         let txn_drain_log: TxnDrainLog = Arc::new(Mutex::new(Vec::new()));
         let txn_drain_log_clone = txn_drain_log.clone();
+        let corrupt_after_connected = Arc::new(Mutex::new(false));
+        let corrupt_after_connected_clone = corrupt_after_connected.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let accept = listener.accept();
@@ -235,7 +245,8 @@ impl ScriptedBroker {
                                 let log = frame_log_clone.clone();
                                 let seeks = seeked_partitions_clone.clone();
                                 let drains = txn_drain_log_clone.clone();
-                                tokio::spawn(handle_session(stream, log, seeks, drains));
+                                let corrupt = corrupt_after_connected_clone.clone();
+                                tokio::spawn(handle_session(stream, log, seeks, drains, corrupt));
                             }
                             Err(_) => break,
                         }
@@ -251,7 +262,19 @@ impl ScriptedBroker {
             frame_log,
             seeked_partitions,
             txn_drain_log,
+            corrupt_after_connected,
         })
+    }
+
+    /// Arm the corrupted-frame injection: every subsequent session writes
+    /// ONE CRC32C-corrupted frame immediately after answering
+    /// `CommandConnect` with `CommandConnected` (construction mirrors the
+    /// proto unit test `frame::tests::detects_crc32c_mismatch`). Used by
+    /// the corrupted-frame differential scenario (ADR-0054 / decision Q2)
+    /// to prove both engines drop the frame at the proto layer and keep
+    /// the connection — and the subsequent trace traffic — flowing.
+    pub fn inject_corrupted_frame_after_connected(&self) {
+        *self.corrupt_after_connected.lock() = true;
     }
 
     /// Snapshot the frame log: every `BaseCommand` kind seen so far,
@@ -357,6 +380,7 @@ async fn handle_session(
     frame_log: FrameLog,
     seeked_partitions: SeekedPartitionLog,
     txn_drain_log: TxnDrainLog,
+    corrupt_after_connected: Arc<Mutex<bool>>,
 ) {
     let state = Arc::new(Mutex::new(SessionState::default()));
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
@@ -386,12 +410,14 @@ async fn handle_session(
             let _ = read_buf.split_to(consumed);
             eprintln!("[broker] decoded frame type={}", frame.command.r#type);
             frame_log.lock().push(frame.command.r#type);
+            let corrupt = *corrupt_after_connected.lock();
             handle_frame(
                 &state,
                 &frame,
                 &mut out_buf,
                 &seeked_partitions,
                 &txn_drain_log,
+                corrupt,
             );
         }
 
@@ -429,12 +455,23 @@ fn handle_frame(
     out: &mut BytesMut,
     seeked_partitions: &SeekedPartitionLog,
     txn_drain_log: &TxnDrainLog,
+    corrupt_after_connected: bool,
 ) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
     };
     match kind {
-        pb::base_command::Type::Connect => emit_connected(out),
+        pb::base_command::Type::Connect => {
+            emit_connected(out);
+            // Corrupted-frame differential scenario (ADR-0054 / decision
+            // Q2): when armed, follow the handshake reply with ONE
+            // CRC32C-corrupted frame so both engine legs observe the
+            // corruption at the same wire position — right behind
+            // `CommandConnected`, ahead of any lookup traffic.
+            if corrupt_after_connected {
+                emit_corrupted_frame(out);
+            }
+        }
         pb::base_command::Type::Ping => emit_pong(out),
         pb::base_command::Type::Lookup => {
             if let Some(l) = &frame.command.lookup_topic {
@@ -751,6 +788,50 @@ fn emit_connected(out: &mut BytesMut) {
         ..Default::default()
     };
     let _ = encode_command(out, &cmd);
+}
+
+/// Encode one deliberately CRC32C-corrupted payload frame: a broker-push
+/// `CommandMessage` whose last payload byte is flipped after encoding so the
+/// CRC32C in the frame no longer matches the carried bytes (construction
+/// mirrors the proto unit test `frame::tests::detects_crc32c_mismatch`).
+///
+/// The receiving proto layer must log the mismatch at the point of
+/// detection, push `ConnectionEvent::ChecksumMismatch`, drop the frame, and
+/// keep the connection alive (workspace invariant 4, "CRC32C verify or
+/// drop") — the corrupted-frame differential trace asserts both engines do
+/// so identically.
+fn emit_corrupted_frame(out: &mut BytesMut) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Message as i32,
+        message: Some(pb::CommandMessage {
+            consumer_id: u64::MAX,
+            message_id: pb::MessageIdData {
+                ledger_id: u64::MAX,
+                entry_id: u64::MAX,
+                partition: Some(-1),
+                batch_index: Some(-1),
+                ack_set: Vec::new(),
+                batch_size: Some(0),
+                first_chunk_message_id: None,
+            },
+            redelivery_count: Some(0),
+            ack_set: Vec::new(),
+            consumer_epoch: None,
+        }),
+        ..Default::default()
+    };
+    let meta = pb::MessageMetadata {
+        producer_name: "diff-broker-corrupt".to_owned(),
+        sequence_id: 0,
+        publish_time: 1_700_000_000,
+        ..Default::default()
+    };
+    let mut frame = BytesMut::new();
+    encode_payload(&mut frame, &cmd, &meta, b"corrupt-me")
+        .expect("static corrupted-frame fixture must encode");
+    let last = frame.len() - 1;
+    frame[last] ^= 0xff;
+    out.extend_from_slice(&frame);
 }
 
 fn emit_pong(out: &mut BytesMut) {

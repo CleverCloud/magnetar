@@ -102,6 +102,7 @@ pub mod error;
 pub mod event;
 pub mod frame;
 pub mod health_probe;
+pub(crate) mod log_fields;
 pub mod lookup;
 pub mod markers;
 pub mod producer;

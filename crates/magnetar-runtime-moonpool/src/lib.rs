@@ -67,6 +67,7 @@ mod consumer;
 pub mod crypto;
 pub mod dns;
 mod driver;
+mod log_fields;
 mod pool;
 mod producer;
 pub mod tls;
@@ -887,7 +888,7 @@ impl<P: Providers> MoonpoolEngine<P> {
         // Drive the handshake inline. Once `Connected` lands we hand the
         // transport over to the long-running driver task so user-facing
         // futures can start enqueueing producer/consumer commands.
-        handshake_plain::<P>(&shared, &mut transport).await?;
+        handshake_plain::<P>(&shared, &mut transport, addr, false).await?;
         let driver = driver::spawn::<P>(
             shared.clone(),
             transport,
@@ -944,7 +945,7 @@ impl<P: Providers> MoonpoolEngine<P> {
         )
         .await?;
         let shared = self.make_shared(config);
-        handshake_plain::<P>(&shared, &mut transport).await?;
+        handshake_plain::<P>(&shared, &mut transport, addr, true).await?;
         let driver = driver::spawn::<P>(
             shared.clone(),
             transport,
@@ -996,7 +997,7 @@ impl<P: Providers> MoonpoolEngine<P> {
         .await?;
         let shared = self.make_shared(config);
 
-        handshake_plain::<P>(&shared, &mut transport).await?;
+        handshake_plain::<P>(&shared, &mut transport, addr, false).await?;
         let ctx = driver::ReconnectContext {
             host_port: addr.to_owned(),
             service_url_provider,
@@ -1099,9 +1100,15 @@ fn connect_backoff(attempt: u32) -> Duration {
 /// driver. Without this, `poll_transmit` returns no bytes and the loop
 /// parks on `read_buf` forever (the M8 differential `golden_traces`
 /// regression).
+///
+/// `addr` (the dialled `host:port`) and `tls` are threaded in for the
+/// ADR-0054 "connection established" lifecycle record — the moonpool twin
+/// of the tokio engine's post-`wait_connected` log sites.
 pub(crate) async fn handshake_plain<P: Providers>(
     shared: &Arc<ConnectionShared>,
     transport: &mut Transport<P>,
+    addr: &str,
+    tls: bool,
 ) -> Result<(), EngineError> {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
 
@@ -1132,6 +1139,36 @@ pub(crate) async fn handshake_plain<P: Providers>(
                 magnetar_proto::HandshakeState::Connected
                     | magnetar_proto::HandshakeState::AuthChallenging
             ) {
+                // Lifecycle record (ADR-0054) — moonpool twin of the tokio
+                // engine's "connection established" sites. `auth_method` is
+                // the provider's method name, NEVER `auth_data`. On the
+                // in-band-challenge path the broker has accepted the
+                // CONNECT and opened the challenge round-trip, which the
+                // spawned driver completes; `auth_challenge_pending`
+                // distinguishes the two.
+                // The guard-dependent field is captured first and the guard
+                // dropped BEFORE emitting, matching the tokio twin's
+                // lock-free emit (ADR-0054 §Consequences / ADR-0038 ethos);
+                // the conditional move borrow-checks because this branch
+                // diverges.
+                let auth_challenge_pending = matches!(
+                    conn.state(),
+                    magnetar_proto::HandshakeState::AuthChallenging
+                );
+                drop(conn);
+                let (host, port) = addr.split_once(':').unwrap_or((addr, ""));
+                let auth_method = shared
+                    .auth_provider
+                    .as_deref()
+                    .map_or("none", |p| p.method());
+                tracing::info!(
+                    host = %host,
+                    port = %port,
+                    tls,
+                    auth_method,
+                    auth_challenge_pending,
+                    "connection established"
+                );
                 return Ok(());
             }
             if matches!(

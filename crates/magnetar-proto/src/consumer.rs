@@ -706,6 +706,19 @@ impl ConsumerState {
                     return Ok(DeliverOutcome::Dropped);
                 }
                 entry.received_chunks += 1;
+                // ADR-0054 §5: chunk-reassembly progress has no
+                // `ConnectionEvent`, so proto logs it at the point of
+                // detection. The broker-assigned chunk UUID is logged as a
+                // presence boolean only (hostile-peer-controlled string).
+                tracing::debug!(
+                    target: "magnetar_proto::consumer",
+                    consumer_id = self.handle.0,
+                    chunk_id,
+                    total_chunks = total,
+                    received_chunks = entry.received_chunks,
+                    uuid_present = !uuid.is_empty(),
+                    "chunk buffered for reassembly",
+                );
                 if entry.received_chunks < entry.expected_chunks {
                     return Ok(DeliverOutcome::Buffered);
                 }

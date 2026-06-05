@@ -99,18 +99,27 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     | ConnectionEvent::TopicMigrated { .. }
                     | ConnectionEvent::RedirectUrlRejected { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
+                    | ConnectionEvent::ChecksumMismatch { .. }
+                    | ConnectionEvent::LookupResponse {
+                        result: magnetar_proto::LookupOutcome::Redirected { .. },
+                        ..
+                    }
             )
         });
         let Some(event) = event else {
             return Ok(());
         };
         match event {
-            ConnectionEvent::AuthChallenge {
-                method: _,
-                challenge,
-            } => {
+            ConnectionEvent::AuthChallenge { method, challenge } => {
                 let Some(provider) = shared.auth_provider.clone() else {
+                    // `method` is the broker-requested auth method —
+                    // hostile-peer-controlled, so it is truncated before
+                    // landing in the field (ADR-0054). Mirror of the tokio
+                    // driver.
                     tracing::warn!(
+                        auth_method = method
+                            .as_deref()
+                            .map_or("none", crate::log_fields::truncate_broker_str),
                         "broker requested in-band auth refresh but no AuthProvider configured; \
                          the connection will be reset"
                     );
@@ -120,9 +129,29 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     ));
                 };
                 let bytes = challenge.unwrap_or_default();
-                let refreshed = provider
-                    .respond_to_challenge(&bytes)
-                    .map_err(|err| EngineError::Config(format!("auth refresh failed: {err}")))?;
+                // ADR-0054 no-secrets rule: the challenge bytes and the
+                // refreshed credential are NEVER logged, at any level.
+                tracing::debug!(
+                    auth_method = %provider.method(),
+                    "auth challenge received; refreshing credentials"
+                );
+                let refreshed = match provider.respond_to_challenge(&bytes) {
+                    Ok(refreshed) => refreshed,
+                    Err(err) => {
+                        // ADR-0054 auth-path rule: a third-party
+                        // `AuthProvider`'s `Display`/`Debug` impl is an
+                        // uncontrolled secret channel — log the method plus
+                        // a stable error class only, never the provider
+                        // error chain. The full error still reaches the
+                        // caller via the returned `EngineError`.
+                        tracing::warn!(
+                            auth_method = %provider.method(),
+                            error_class = "auth_refresh_failed",
+                            "in-band auth refresh failed; the connection will be reset"
+                        );
+                        return Err(EngineError::Config(format!("auth refresh failed: {err}")));
+                    }
+                };
                 let method = provider.method().to_owned();
                 shared
                     .inner
@@ -162,8 +191,12 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                 // credentials are NOT handed to the unverified host.
                 tracing::warn!(
                     source,
-                    rejected_url = broker_service_url.as_deref(),
-                    rejected_url_tls = broker_service_url_tls.as_deref(),
+                    rejected_url = broker_service_url
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
+                    rejected_url_tls = broker_service_url_tls
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
                     "broker-advertised redirect URL rejected by redirect_url_allow_list; \
                      ignoring the hint (auth provider NOT replayed against the unverified host)",
                 );
@@ -185,8 +218,12 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                 tracing::info!(
                     ?producer,
                     ?consumer,
-                    new_url = broker_service_url.as_deref(),
-                    new_url_tls = broker_service_url_tls.as_deref(),
+                    new_url = broker_service_url
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
+                    new_url_tls = broker_service_url_tls
+                        .as_deref()
+                        .map(crate::log_fields::truncate_broker_str),
                     "broker requested PIP-188 topic migration; supervised reconnect will fire"
                 );
                 return Err(EngineError::Config(
@@ -254,6 +291,20 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     });
                 shared.scalable_notify.notify_waiters();
             }
+            // Diagnostic events consumed SILENTLY — single-owner rule
+            // (ADR-0054, decision Q1): `magnetar-proto` owns the
+            // point-of-detection logs for CRC32C checksum mismatches and
+            // lookup-redirect hops, where it holds the richest context
+            // (computed/expected checksum, hop count, chased URL). The
+            // engine drains the events here only so they cannot accumulate
+            // unbounded in the proto event queue under a corrupting or
+            // redirect-happy peer; logging them again here would
+            // double-report. The `LookupResponse` arm only ever sees
+            // `LookupOutcome::Redirected` — the `poll_event_if` predicate
+            // above admits no other lookup result. Mirror of the tokio
+            // driver.
+            ConnectionEvent::ChecksumMismatch { .. } => {}
+            ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }
     }
@@ -552,7 +603,8 @@ where
             if until > now {
                 let dur = until.saturating_duration_since(now);
                 tracing::warn!(
-                    "supervisor: anti-thrash cooldown engaged; sleeping {dur:?} before next redial"
+                    cooldown_ms = u64::try_from(dur.as_millis()).unwrap_or(u64::MAX),
+                    "supervisor: anti-thrash cooldown engaged; sleeping before next redial"
                 );
                 let _ = time.sleep(dur).await;
             }
@@ -589,8 +641,9 @@ where
             if let Some(max) = cfg.max_attempts {
                 if attempt > max {
                     tracing::warn!(
-                        "supervisor: gave up after {attempt} reconnect attempt(s) \
-                         (max_attempts={max})"
+                        attempt,
+                        max_attempts = max,
+                        "supervisor: gave up; reconnect attempt budget exhausted"
                     );
                     return last_inner_result;
                 }
@@ -611,8 +664,9 @@ where
                 if let Some(provider) = reconnect_ctx.service_url_provider.as_ref() {
                     strip_url_to_host_port(&provider.get_service_url()).unwrap_or_else(|| {
                         tracing::warn!(
-                            "supervisor: service-url provider returned an unparseable URL \
-                         on attempt {attempt}; falling back to the cached host:port"
+                            attempt,
+                            "supervisor: service-url provider returned an unparseable URL; \
+                             falling back to the cached host:port"
                         );
                         reconnect_ctx.host_port.clone()
                     })
@@ -630,11 +684,20 @@ where
             )
             .await
             {
-                Ok(t) => break t,
+                Ok(t) => {
+                    tracing::info!(
+                        attempt,
+                        target = %target_host_port,
+                        "supervisor: reconnected to broker"
+                    );
+                    break t;
+                }
                 Err(err) => {
                     tracing::warn!(
-                        "supervisor: reconnect attempt {attempt} failed \
-                         (target={target_host_port}): {err}; will retry"
+                        attempt,
+                        target = %target_host_port,
+                        error = %err,
+                        "supervisor: reconnect attempt failed; will retry"
                     );
                     // Loop and back off again.
                 }
@@ -648,7 +711,7 @@ where
             let mut conn = shared.inner.lock();
             conn.reset();
             if let Err(err) = conn.begin_handshake() {
-                tracing::error!("supervisor: begin_handshake after reset failed: {err}");
+                tracing::error!(error = %err, "supervisor: begin_handshake after reset failed");
                 return Err(EngineError::Protocol(err));
             }
         }

@@ -119,6 +119,16 @@ impl<P: Providers> Transport<P> {
         time: &P::Time,
         connect_timeout: Duration,
     ) -> Result<Self, EngineError> {
+        // Per-operation dial record — `debug!` per ADR-0054 §2.1; failures
+        // are logged by the callers (supervisor / connect retry). Moonpool
+        // twin of the tokio `Transport::connect_with_resolver` record; the
+        // TLS upgrade (when any) is logged by `connect_tls` below.
+        tracing::debug!(
+            addr = %addr,
+            tls = false,
+            connect_timeout_ms = u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            "dialling broker"
+        );
         // Single chokepoint for every dial site (initial connect, the proxy /
         // multi-broker pool, and the supervisor reconnect): bound
         // `NetworkProvider::connect` with the engine `TimeProvider` so a hung
@@ -226,6 +236,15 @@ impl<P: Providers> Transport<P> {
         time: &P::Time,
         connect_timeout: Duration,
     ) -> Result<Self, EngineError> {
+        // TLS-upgrade record (ADR-0054) — pairs with the plain dial record
+        // emitted inside `connect` / `connect_with_resolver`.
+        tracing::debug!(
+            addr = %addr,
+            host = %host,
+            tls = true,
+            connect_timeout_ms = u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            "dialling broker"
+        );
         let plain =
             Self::connect_with_resolver(network, addr, resolver, time, connect_timeout).await?;
         let stream = match plain {

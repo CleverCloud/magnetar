@@ -438,7 +438,7 @@ async fn build_entry_async<P: Providers>(
     .await?;
 
     let shared = make_shared_with_providers::<P>(&factory.providers, cfg);
-    handshake_plain::<P>(&shared, &mut transport).await?;
+    handshake_plain::<P>(&shared, &mut transport, physical, false).await?;
 
     let ctx = ReconnectContext {
         host_port: physical.to_owned(),

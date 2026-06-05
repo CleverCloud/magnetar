@@ -1847,6 +1847,7 @@ dependencies = [
  "prost",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1892,6 +1893,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1918,6 +1920,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "valuable",
 ]
 
@@ -1947,6 +1950,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "wiremock",
  "zstd",

@@ -383,6 +383,23 @@ impl Connection {
         self.state
     }
 
+    /// Transition the handshake state machine, logging the edge at `debug!`
+    /// (ADR-0054 §5: proto owns the handshake state-transition logs — the
+    /// state machine is the point of detection). Only the state names are
+    /// logged; `auth_data` / challenge bytes never appear (ADR-0054 §3).
+    /// No-op transitions (same state) are not logged.
+    fn set_handshake_state(&mut self, next: HandshakeState) {
+        if self.state != next {
+            tracing::debug!(
+                target: "magnetar_proto::conn",
+                from = ?self.state,
+                to = ?next,
+                "handshake state transition",
+            );
+        }
+        self.state = next;
+    }
+
     /// Returns whether the connection is ready to accept producer / consumer opens.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, HandshakeState::Connected)
@@ -435,7 +452,7 @@ impl Connection {
         ) {
             self.last_disconnected_at = Some((self.wall_clock)());
         }
-        self.state = HandshakeState::Failed;
+        self.set_handshake_state(HandshakeState::Failed);
     }
 
     /// Monotonic session epoch — incremented each time the supervisor invokes
@@ -795,7 +812,7 @@ impl Connection {
 
         // (5) Back to Uninitialized so begin_handshake on the freshly-handshaked socket
         // succeeds.
-        self.state = HandshakeState::Uninitialized;
+        self.set_handshake_state(HandshakeState::Uninitialized);
         self.broker_max_message_size = None;
         self.broker_protocol_version = 0;
         self.feature_flags = pb::FeatureFlags::default();
@@ -1077,7 +1094,7 @@ impl Connection {
             ..Default::default()
         };
         self.encode_command(&cmd)?;
-        self.state = HandshakeState::ConnectSent;
+        self.set_handshake_state(HandshakeState::ConnectSent);
         Ok(())
     }
 
@@ -1185,6 +1202,18 @@ impl Connection {
                 Err(crate::frame::FrameError::ChecksumMismatch { computed, expected }) => {
                     // CRC mismatch — drop the corrupt frame, emit the
                     // observation event, and keep decoding.
+                    //
+                    // ADR-0054 §5 single-owner rule: this is the point of
+                    // detection (`computed` / `expected` in scope), so the
+                    // `error!` lives here; the engines drain the companion
+                    // event silently. `error!` per §1: the drop is never
+                    // surfaced as `Err` to any caller.
+                    tracing::error!(
+                        target: "magnetar_proto::conn",
+                        computed,
+                        expected,
+                        "CRC32C checksum mismatch; corrupt frame dropped",
+                    );
                     self.events
                         .push_back(ConnectionEvent::ChecksumMismatch { computed, expected });
                 }
@@ -1222,7 +1251,7 @@ impl Connection {
                 let connected = command
                     .connected
                     .ok_or(ProtocolError::Handshake("missing CommandConnected"))?;
-                self.state = HandshakeState::Connected;
+                self.set_handshake_state(HandshakeState::Connected);
                 self.last_connected_at = Some((self.wall_clock)());
                 self.broker_max_message_size = connected.max_message_size.map(|v| v as usize);
                 self.broker_protocol_version = connected.protocol_version.unwrap_or(0);
@@ -1249,7 +1278,7 @@ impl Connection {
                 let challenge = command
                     .auth_challenge
                     .ok_or(ProtocolError::Handshake("missing CommandAuthChallenge"))?;
-                self.state = HandshakeState::AuthChallenging;
+                self.set_handshake_state(HandshakeState::AuthChallenging);
                 self.events.push_back(ConnectionEvent::AuthChallenge {
                     method: challenge
                         .challenge
@@ -1704,6 +1733,31 @@ impl Connection {
                     let (outcome, retry) = crate::lookup::translate_lookup_response(&resp, &req);
                     match retry {
                         Some(retry) => {
+                            // ADR-0054 §5 single-owner rule: proto owns the
+                            // redirect-chase hop log at the point of
+                            // detection; the engines drain the companion
+                            // `LookupResponse(Redirected)` event silently.
+                            // Broker-advertised URLs are truncated per §3.
+                            if let LookupOutcome::Redirected {
+                                broker_service_url,
+                                broker_service_url_tls,
+                            } = &outcome
+                            {
+                                tracing::debug!(
+                                    target: "magnetar_proto::conn",
+                                    topic = %retry.topic,
+                                    hop = crate::lookup::MAX_LOOKUP_REDIRECTS
+                                        - retry.hops_remaining,
+                                    hops_remaining = retry.hops_remaining,
+                                    broker_service_url = broker_service_url
+                                        .as_deref()
+                                        .map_or("", crate::log_fields::truncate_broker_str),
+                                    broker_service_url_tls = broker_service_url_tls
+                                        .as_deref()
+                                        .map_or("", crate::log_fields::truncate_broker_str),
+                                    "lookup redirected; chasing internally",
+                                );
+                            }
                             // HIGH-4 (lookup multi-agent review): the
                             // intermediate `Redirected` outcome is
                             // diagnostic-only. We push it to the
@@ -3989,7 +4043,7 @@ impl Connection {
         ) {
             self.last_disconnected_at = Some((self.wall_clock)());
         }
-        self.state = HandshakeState::Closing;
+        self.set_handshake_state(HandshakeState::Closing);
         self.events
             .push_back(ConnectionEvent::Closed { reason: None });
     }
@@ -4011,7 +4065,7 @@ impl Connection {
         };
         let _ = self.encode_command(&base);
         if self.state == HandshakeState::AuthChallenging {
-            self.state = HandshakeState::Connected;
+            self.set_handshake_state(HandshakeState::Connected);
         }
     }
 
