@@ -247,6 +247,8 @@ The public surface mirrors [`quinn-proto`]:
 | `poll_timeout() -> Option<Instant>`       | state → engine | Next deadline (keepalive, tracker tick, send timeout).                                                           |
 | `handle_timeout(now)`                     | engine → state | Drive timers that elapsed.                                                                                       |
 
+Diagnostics are two-channel per [ADR-0054](specs/adr/0054-logging-policy.md): semantic events the engine must react to ride `poll_event()`, while proto also emits `tracing` logs at points of detection (checksum mismatch, redirect-chase hops, handshake transitions) under the single-owner rule — each fault logs exactly once, at the layer holding the richest context.
+
 ### Known non-determinism leaks (documented)
 
 Two non-time sources of host-environment dependency remain in `magnetar-proto`; both are accepted with rationale:
@@ -542,6 +544,7 @@ After the lock drops, the driver pulls semantic events via `poll_event()` and re
 - `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes the delta into `ConnectionShared.topic_list_changes` and wakes `topic_list_notify` (PIP-145).
 - `ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker }` — driver pushes the observation into `ConnectionShared.replicated_subscription_markers` and wakes `replicated_subscription_marker_notify` (PIP-33 / ADR-0034).
   The marker is filtered off the user-visible message stream upstream in the `magnetar-proto` receive path so it never reaches `Consumer::receive`.
+- `ConnectionEvent::ChecksumMismatch { … }` and `ConnectionEvent::LookupResponse` carrying `LookupOutcome::Redirected` — diagnostic events proto already logs at the point of detection ([ADR-0054](specs/adr/0054-logging-policy.md) single-owner rule); both engines admit them to the drain predicate and consume them **silently**, which stops them accumulating unbounded in the proto event queue.
 
 The `MessageReceivedFromShadow` variant (PIP-180 / ADR-0033) is emitted in place of `Message` for shadow-topic consumers; user-facing futures pick it up directly via the same Waker slab as `Message`, so the driver does not need to special-case it.
 
