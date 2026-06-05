@@ -54,18 +54,16 @@
 //! Inbound `traceparent` / `tracestate` are peer-controlled. A hostile or buggy
 //! producer can:
 //!
-//! - **Force-sample** by setting the `sampled` flag, amplifying your ingest cost
-//!   and polluting traces. A `ParentBased` sampler does **not** help here — it
-//!   honours a sampled remote parent unconditionally (the root delegate only
-//!   applies when there is no parent). To bound this, do not attach untrusted
-//!   inbound context as the sampling parent (extract it into a span *link* or a
-//!   fresh root instead), or use a custom `ShouldSample` sampler that ignores /
-//!   rate-limits remote-sampled parents, or strip the inbound `sampled` bit at
-//!   the trust boundary before [`attach`](opentelemetry::Context::attach)ing.
-//! - **Inflate `tracestate`**. The Rust propagator does not enforce the W3C
-//!   32-member limit, so [`extract_context`](crate::otel::extract_context)
-//!   defensively truncates over-long `tracestate` (right-most members dropped)
-//!   before parsing (ADR-0053 §E1).
+//! - **Force-sample** by setting the `sampled` flag, amplifying your ingest cost and polluting
+//!   traces. A `ParentBased` sampler does **not** help here — it honours a sampled remote parent
+//!   unconditionally (the root delegate only applies when there is no parent). To bound this, do
+//!   not attach untrusted inbound context as the sampling parent (extract it into a span *link* or
+//!   a fresh root instead), or use a custom `ShouldSample` sampler that ignores / rate-limits
+//!   remote-sampled parents, or strip the inbound `sampled` bit at the trust boundary before
+//!   [`attach`](opentelemetry::Context::attach)ing.
+//! - **Inflate `tracestate`**. The Rust propagator does not enforce the W3C 32-member limit, so
+//!   [`extract_context`](crate::otel::extract_context) defensively truncates over-long `tracestate`
+//!   (right-most members dropped) before parsing (ADR-0053 §E1).
 
 use magnetar_proto::pb;
 use opentelemetry::propagation::{Extractor, Injector};
