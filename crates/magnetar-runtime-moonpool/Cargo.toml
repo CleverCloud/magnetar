@@ -103,5 +103,5 @@ prost          = { workspace = true }
 # `rcgen` mints a self-signed cert at fixture build time so the suite has
 # no on-disk PEM dependency. Both crates are dev-only — neither leaks
 # into the published crate's surface.
-rcgen          = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio-rustls   = { workspace = true, features = ["aws_lc_rs"] }

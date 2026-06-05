@@ -92,12 +92,12 @@ impl Drop for TlsFixture {
 /// so we never accidentally mismatch the server's identity from the
 /// client's expectations.
 fn build_tls_material() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
-    let CertifiedKey { cert, key_pair } =
+    let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec![FIXTURE_HOSTNAME.to_owned(), "localhost".to_owned()])
             .expect("rcgen self-signed cert");
     let cert_der: CertificateDer<'static> = cert.der().clone();
     let key_der: PrivateKeyDer<'static> =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
 
     // Server side: present the cert+key on every inbound connection.
     // Use `builder_with_provider` so the test never trips rustls's
