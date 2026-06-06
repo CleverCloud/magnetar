@@ -69,6 +69,17 @@ While it stands, `cargo update -p moonpool-core` can advance the rev to an arbit
 
 (Related residual, waived in the ADR-0054 changeset as pre-existing in degree: error-`Display` fields that can embed peer-supplied text — e.g. the supervisor reconnect-failed `error = %err`, which may wrap a broker-supplied handshake reason — are not yet length-bounded; fold a normalization/truncation decision for error fields into this follow-up.)
 
+## 4. Reconnect parity residuals (surfaced by the re-attach replay fix)
+
+**Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix:
+
+1. **Moonpool transient-retry arms are missing**: the moonpool driver never consumes `ProducerOpenFailedTransient` / `SubscribeFailedTransient` (the tokio driver runs the lookup-then-retry leg; moonpool has zero `Transient` matches). A post-restart broker answering a rebuild with `ServiceNotReady` dead-ends the re-attach on the moonpool engine. The `reconnect_replay_gating` twins document the asymmetry in-file.
+2. **Differential harness has no connection-drop knob**: `ScriptedBroker` accepts multiple sessions but cannot script a mid-scenario drop + redial, so the re-attach replay fix carries proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out in the commit message. Add a `drop_connection_after(...)` injection and a reconnect equivalence scenario.
+3. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires. Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
+4. **`e2e_reconnect` send-loop hygiene**: `producer.send().await` is unbounded by design (transparent replay keeps the future pending); the test's bounded-attempts loop only bounds `Err` returns. Wrap each attempt in `tokio::time::timeout` so an engine regression fails in seconds instead of hanging the binary.
+
+**Why it stays open.** 1 + 2 are engine/harness features with their own ADR-0024 test obligations; 3 changes user-visible supervision semantics (needs a small design pass against Java parity); 4 is test-only polish riding whichever item lands first.
+
 **Why it stays open.** Needs a design decision on where the mechanism lives (subscriber vs library) before any guidance is written; picking the library side adds per-callsite state and an API surface that the subscriber side gets for free.
 
 **`/goal` (once the design question is settled).**

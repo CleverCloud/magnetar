@@ -329,21 +329,15 @@ impl Producer {
 
         match result {
             Ok(seq) => {
-                // Postcondition: `ProducerSlot::queue_send` returns
-                // `SequenceId(last_sequence_id_pushed.max(0))`, so the pushed
-                // sequence id is now non-negative and equals the returned seq.
-                // The proto helper has already dropped its per-slot guard, so
-                // re-locking here is a fresh scoped acquisition (no
-                // re-entrancy, ADR-0038-safe).
-                debug_assert!(
-                    {
-                        let pushed = self.slot.state.lock().last_sequence_id_pushed;
-                        pushed >= 0 && seq.0 == pushed as u64
-                    },
-                    "queue_send postcondition: returned seq {} must match the \
-                     non-negative pushed sequence id",
-                    seq.0,
-                );
+                // NOTE: no cross-lock postcondition assert here. The returned
+                // seq is computed under the per-slot guard INSIDE
+                // `ProducerSlot::queue_send`; re-locking afterwards to compare
+                // against `last_sequence_id_pushed` raced the driver's
+                // reset/replay machinery (snapshot + ack-gated re-emit can
+                // interleave between the two acquisitions during a supervised
+                // reconnect) and panicked debug builds on a perfectly legal
+                // schedule. The contract is pinned where it is sound — in the
+                // proto unit tests, under a single guard.
                 // ADR-0054 hot-path record: no lock is held here (the
                 // per-slot guard inside `ProducerSlot::queue_send` has been
                 // released), two integer fields, and the disabled-level cost

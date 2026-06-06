@@ -735,13 +735,20 @@ impl Connection {
             }
         }
 
-        // Drop any remaining (orphaned) wakers — every legitimate one was either
-        // dispatched above or belongs to an op the runtime will re-register after the
-        // reconnect.
+        // Sweep the remaining slab wakers. Request keys get `SessionLost` —
+        // their broker round-trip died with the session. Send keys must NOT:
+        // a send future that re-polled during a PREVIOUS reset's snapshot
+        // window parks its waker on the slab (the slot op is in the snapshot,
+        // see `register_waker`), and the transparent-replay contract keeps it
+        // pending across any number of resets until the replayed receipt
+        // lands. Wake it without an outcome so it re-registers, exactly like
+        // the snapshot path above.
         let leftover_keys: Vec<PendingOpKey> = self.wakers.keys().copied().collect();
         for key in leftover_keys {
             if let Some(w) = self.wakers.remove(&key) {
-                self.outcomes.insert(key, OpOutcome::SessionLost { key });
+                if !matches!(key, PendingOpKey::Send(..)) {
+                    self.outcomes.insert(key, OpOutcome::SessionLost { key });
+                }
                 w.wake();
             }
         }
@@ -855,13 +862,17 @@ impl Connection {
     /// the broker can detect — and accept — the re-attach (rejecting stale reconnects of older
     /// epochs). Mirrors Java `ProducerImpl#reconnectLater`.
     ///
-    /// Snapshotted publishes (see `in_flight_publish_snapshots`) are replayed onto
-    /// `producer.outbound` in their original FIFO order with their original sequence ids, then
-    /// drained onto the connection's outbound buffer. Each replayed [`crate::producer::OpSend`]
-    /// goes back into the producer's `pending` queue verbatim — its `waker` field is `None`
-    /// (cleared by [`Self::reset`]) so the user-facing send future re-registers on its next
-    /// poll and the eventual `CommandSendReceipt` resolves the future normally.
-    /// Mirrors Java `ProducerImpl#resendMessages`.
+    /// Snapshotted publishes (see `in_flight_publish_snapshots`) are NOT replayed here —
+    /// they stay in the map until the broker acks each producer's re-attachment with
+    /// `CommandProducerSuccess`, whose handler replays them onto `producer.outbound` in
+    /// their original FIFO order with their original sequence ids (each replayed
+    /// [`crate::producer::OpSend`] goes back into the producer's `pending` queue verbatim —
+    /// its `waker` field is `None`, cleared by [`Self::reset`], so the user-facing send
+    /// future re-registers on its next poll and the eventual `CommandSendReceipt` resolves
+    /// the future normally). Replaying before the ack made the broker close the whole
+    /// connection ("Received message, but the producer is not ready") in an endless
+    /// reconnect cycle. Mirrors Java `ProducerImpl#handleProducerSuccess` →
+    /// `resendMessages`.
     ///
     /// Producers explicitly closed via [`Self::close_producer`] (or by the broker via
     /// `CommandCloseProducer`) are skipped — their `closed` flag is honoured. Any snapshot
@@ -914,25 +925,20 @@ impl Connection {
             }
             let request_id = self.emit_command_producer(handle, &req);
             request_ids.push(request_id);
-            // Replay any snapshotted in-flight publishes onto this producer's outbound queue
-            // and reinstall them in `pending`. The wire-frame data was captured at
-            // emit time so the replay is byte-for-byte identical to the original publish
-            // (apart from the freshly-bumped `CommandProducer.epoch` that the broker now
-            // associates with this producer).
-            if let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle)
-                && let Some(slot) = self.producers.get(&handle)
-            {
-                slot.state.lock().replay_snapshots(snapshots);
-            }
+            // Snapshotted in-flight publishes are deliberately NOT replayed here. The
+            // wire-frame data stays in `in_flight_publish_snapshots` until this handle's
+            // `CommandProducerSuccess` arrives — the broker attaches asynchronously and
+            // closes the whole connection on a `CommandSend` that lands before the attach
+            // completes ("Received message, but the producer is not ready"), which turned
+            // every reconnect-with-in-flight-sends into an endless cycle. The
+            // `ProducerSuccess` handler replays the snapshots and opens the per-slot
+            // drain gate (`broker_ready`).
         }
         // Drop any snapshots that belong to producers we did NOT rebuild (e.g. ones closed
         // between reset and rebuild). Their `OpSend`s never reach a future — the user-facing
         // close path is responsible for surfacing the disposition (`Closed` error).
         self.in_flight_publish_snapshots
             .retain(|h, _| live_handles.contains(h));
-        // Drain the freshly-replayed outbound frames onto the wire — same path the regular
-        // `Connection::send` uses after a `queue_send`.
-        self.drain_producer_outbound();
         request_ids
     }
 
@@ -982,11 +988,17 @@ impl Connection {
             // persisted cursor if both are absent).
             let resume = resume_from.or(req.start_message_id);
             let subscribe_request_id = self.emit_command_subscribe(handle, &req, resume);
-            // Re-issue the initial flow now so the broker starts dispatching as soon as it
-            // acks the subscribe. `initial_flow` quietly tolerates an unknown handle, but the
-            // consumer must already be in `self.consumers` (it is — we filtered above), so
-            // the flow command goes onto the wire alongside the subscribe.
-            self.initial_flow(handle);
+            // The initial flow is DEFERRED to the broker's subscribe ack (the
+            // `Success` arm reads this flag): Pulsar silently drops
+            // `CommandFlow` for a consumer id whose subscribe is still being
+            // processed — post-restart cursor recovery makes that window
+            // seconds long, and flow-alongside-subscribe starved the
+            // re-attached consumer with zero broker-side permits. Java
+            // `ConsumerImpl#reconnectLater` ordering (ARCHITECTURE.md
+            // §Supervised reconnect step 6).
+            if let Some(slot) = self.consumers.get(&handle) {
+                slot.state.lock().flow_on_subscribe_ack = true;
+            }
             request_ids.push(subscribe_request_id);
         }
         request_ids
@@ -1294,6 +1306,12 @@ impl Connection {
                         "missing CommandSendReceipt body",
                     ))?;
                 let handle = ProducerHandle(receipt.producer_id);
+                tracing::trace!(
+                    target: "magnetar_proto::conn",
+                    producer_id = receipt.producer_id,
+                    sequence_id = receipt.sequence_id,
+                    "send receipt received"
+                );
                 let resolved: Vec<(SequenceId, MessageId, Option<Waker>)> =
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
@@ -1512,10 +1530,33 @@ impl Connection {
                 if let Some(PendingRequestKind::ProducerOpen { handle }) =
                     self.pending_requests.remove(&request_id)
                 {
+                    let snapshots = self.in_flight_publish_snapshots.remove(&handle);
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
                         producer.name = Some(ok.producer_name.clone());
                         producer.last_sequence_id_published = ok.last_sequence_id.unwrap_or(-1);
+                        // Java `ProducerImpl#handleProducerSuccess` →
+                        // `resendMessages` parity (producer-not-ready livelock
+                        // fix): the broker has acked the (re-)attachment — only
+                        // NOW may queued sends flow. Re-emit pending frames the
+                        // broker silently dropped during a transient window,
+                        // reinstall reset-time snapshots at the front (they
+                        // predate anything staged during the rebuild window),
+                        // then open the drain gate.
+                        let pending_before = producer.pending.len();
+                        let snapshot_count = snapshots.as_ref().map_or(0, Vec::len);
+                        producer.replay_pending_outbound();
+                        if let Some(snapshots) = snapshots {
+                            producer.replay_snapshots(snapshots);
+                        }
+                        producer.broker_ready = true;
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            pending = pending_before,
+                            replayed_snapshots = snapshot_count,
+                            "producer re-attach acked; replay staged and drain gate opened"
+                        );
                     }
                     self.outcomes.insert(
                         PendingOpKey::Request(request_id),
@@ -1558,6 +1599,21 @@ impl Connection {
                         crate::anti_thrash::ReAttachHandle::Consumer(handle),
                         crate::anti_thrash::ReAttachOutcomeKind::ReAttachOk,
                     );
+                    // Re-attach flow gate (rebuild / transient-retry paths):
+                    // the broker has acked the re-subscribe — NOW the initial
+                    // flow lands on a registered consumer id instead of being
+                    // silently dropped mid-subscribe.
+                    let flow_now = self.consumers.get(&handle).is_some_and(|slot| {
+                        std::mem::take(&mut slot.state.lock().flow_on_subscribe_ack)
+                    });
+                    if flow_now {
+                        let _ = self.initial_flow(handle);
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            "consumer re-attach acked; initial flow re-issued"
+                        );
+                    }
                 }
                 if let Some(PendingRequestKind::ConsumerSeek { handle }) = kind {
                     if let Some(slot) = self.consumers.get(&handle) {
@@ -1634,6 +1690,13 @@ impl Connection {
                         // left every subsequent `producer.send()` hanging on a
                         // "unknown producer handle".
                         if is_transient_open_error(err.error) {
+                            // The attachment failed — close the drain gate so no
+                            // staged send reaches the wire before the retry's
+                            // `ProducerSuccess` (the broker closes the whole
+                            // connection on a send to a not-ready producer).
+                            if let Some(slot) = self.producers.get(&handle) {
+                                slot.state.lock().broker_ready = false;
+                            }
                             self.events
                                 .push_back(ConnectionEvent::ProducerOpenFailedTransient {
                                     handle,
@@ -1899,6 +1962,13 @@ impl Connection {
                 // though the broker is willing to re-accept it.
                 //
                 // Refs: Task #56.
+                // The broker detached the producer — close the drain gate so no
+                // staged send reaches the wire before the re-attachment's
+                // `ProducerSuccess` (send-to-detached-producer closes the whole
+                // connection broker-side).
+                if let Some(slot) = self.producers.get(&handle) {
+                    slot.state.lock().broker_ready = false;
+                }
                 self.events
                     .push_back(ConnectionEvent::ProducerClosedByBroker {
                         handle,
@@ -2552,8 +2622,18 @@ impl Connection {
         match key {
             PendingOpKey::Send(handle, seq) => {
                 if let Some(slot) = self.producers.get(&handle) {
-                    slot.state.lock().register_waker(seq, waker);
-                    return;
+                    // Attach to the pending OpSend when it exists. During the
+                    // reset → `ProducerSuccess` window the op is parked in the
+                    // reset snapshot (NOT in `pending`), so the slot
+                    // registration no-ops — fall through to the
+                    // connection-wide slab; the receipt / send-error /
+                    // timeout arms all fall back to the slab when the op
+                    // carries no waker. Unconditionally returning here
+                    // silently dropped the waker and left the user's send
+                    // future starved forever after a replayed receipt.
+                    if slot.state.lock().register_waker(seq, waker.clone()) {
+                        return;
+                    }
                 }
             }
             PendingOpKey::Request(_) => {}
@@ -3056,24 +3136,46 @@ impl Connection {
     /// lock is held). Takes each per-slot mutex briefly to drain frames —
     /// the canonical global → per-slot order.
     pub fn drain_producer_outbound(&mut self) {
-        // Pull every queued frame from every producer and emit it into the connection's
-        // outbound byte buffer.
+        // Producer-not-ready gate (Java `handleProducerSuccess` parity): no
+        // SEND frame may reach the wire before the handshake is `Connected`
+        // AND the slot's (re-)attachment is acked — Pulsar closes the WHOLE
+        // connection on a send to a not-ready producer ("Received message,
+        // but the producer is not ready"). Frames stay staged in the slot;
+        // the `ProducerSuccess` handler opens the per-slot gate.
+        if self.state != HandshakeState::Connected {
+            return;
+        }
+        // Pull every queued frame from every ready producer and emit it into
+        // the connection's outbound byte buffer.
         let handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in handles {
             // SAFETY (lock-ordering): the global Connection mutex is held by the
             // caller (Connection's `&mut self`); we take the per-slot mutex
             // BELOW it, never above. See ADR-0038.
+            let mut emitted: u32 = 0;
             loop {
-                let frame = self
-                    .producers
-                    .get(&handle)
-                    .and_then(|slot| slot.state.lock().next_outbound_frame());
+                let frame = self.producers.get(&handle).and_then(|slot| {
+                    let mut state = slot.state.lock();
+                    if !state.broker_ready {
+                        return None;
+                    }
+                    state.next_outbound_frame()
+                });
                 let Some(frame) = frame else { break };
+                emitted = emitted.saturating_add(1);
                 let _ = encode_payload(
                     &mut self.outbound,
                     &frame.command,
                     &frame.metadata,
                     &frame.payload,
+                );
+            }
+            if emitted > 0 {
+                tracing::trace!(
+                    target: "magnetar_proto::conn",
+                    handle = ?handle,
+                    frames = emitted,
+                    "drained staged producer frames into connection buffer"
                 );
             }
         }
@@ -3095,14 +3197,33 @@ impl Connection {
     /// global lock is held). Takes each per-slot mutex briefly to
     /// drain frames — the canonical global → per-slot order.
     pub fn drain_producer_outbound_vectored(&mut self) {
+        // Same producer-not-ready gate as [`Self::drain_producer_outbound`].
+        if self.state != HandshakeState::Connected {
+            return;
+        }
         let handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in handles {
+            let mut emitted: u32 = 0;
             loop {
-                let frame = self
-                    .producers
-                    .get(&handle)
-                    .and_then(|slot| slot.state.lock().next_outbound_frame());
-                let Some(frame) = frame else { break };
+                let frame = self.producers.get(&handle).and_then(|slot| {
+                    let mut state = slot.state.lock();
+                    if !state.broker_ready {
+                        return None;
+                    }
+                    state.next_outbound_frame()
+                });
+                let Some(frame) = frame else {
+                    if emitted > 0 {
+                        tracing::trace!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            frames = emitted,
+                            "drained staged producer frames into segment list"
+                        );
+                    }
+                    break;
+                };
+                emitted = emitted.saturating_add(1);
                 let Ok(head) = encode_payload_head(&frame.command, &frame.metadata, &frame.payload)
                 else {
                     // Encoding only fails for `BadLength` (>u32::MAX
@@ -4443,20 +4564,14 @@ impl Connection {
             p.epoch = p.epoch.saturating_add(1);
         }
         let request_id = self.emit_command_producer(handle, &req);
-        // Pending `OpSend`s from the transient window have already had their wire frames
-        // written to the socket — but the broker dropped them because the producer wasn't
-        // attached (Pulsar silently discards `CommandSend` for an unknown `producer_id`).
-        // After `CommandProducer` lands the new attachment, replay each pending op's
-        // wire frame so the broker re-publishes and the user's `SendFut` finally observes
-        // a `CommandSendReceipt`. The frames go onto outbound AFTER `CommandProducer`, so
-        // the broker processes the attach first and the sends second — same ordering Java's
-        // `ProducerImpl#resendMessages` enforces after a reattach. Mirrors the snapshot
-        // replay in `rebuild_producers` (Stage 3 at-least-once parity), but targeted at a
-        // single producer's already-in-`pending` ops rather than the reset-time snapshot.
-        if let Some(slot) = self.producers.get(&handle) {
-            slot.state.lock().replay_pending_outbound();
-        }
-        self.drain_producer_outbound();
+        // Pending `OpSend`s from the transient window had their wire frames written and
+        // silently dropped by the broker (Pulsar discards `CommandSend` for an unknown
+        // `producer_id` without an error). Their replay is DEFERRED to the
+        // `ProducerSuccess` handler (`replay_pending_outbound` there) — wire ordering
+        // alone is not enough, because the broker attaches asynchronously and closes the
+        // whole connection on a send that arrives before the attach completes ("Received
+        // message, but the producer is not ready"). Java parity:
+        // `ProducerImpl#handleProducerSuccess` → `resendMessages`.
         Some(request_id)
     }
 
@@ -4481,8 +4596,11 @@ impl Connection {
             c.last_acked_message_id
         };
         let request_id = self.emit_command_subscribe(handle, &req, resume_from);
-        let _ = self.initial_flow(handle);
-        self.drain_producer_outbound();
+        // Flow deferred to the subscribe ack — same gate as
+        // `rebuild_consumers` (the broker drops pre-ack flow silently).
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().flow_on_subscribe_ack = true;
+        }
         Some(request_id)
     }
 
@@ -5815,6 +5933,31 @@ mod conn_state_tests {
         commands
     }
 
+    /// Feed a `CommandProducerSuccess` for `request_id` — the broker ack that
+    /// opens the producer-not-ready drain gate (`ProducerState::broker_ready`)
+    /// and triggers the snapshot/pending replay. Every create/rebuild in these
+    /// tests needs this step before SEND frames may reach the wire, mirroring
+    /// the real protocol (Java `ProducerImpl#handleProducerSuccess`).
+    fn ack_producer_success(conn: &mut Connection, request_id: u64) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id,
+                producer_name: "p-test".to_owned(),
+                last_sequence_id: Some(-1),
+                schema_version: None,
+                topic_epoch: None,
+                producer_ready: Some(true),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode ProducerSuccess");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle ProducerSuccess");
+        while let Some(_e) = conn.poll_event() {}
+    }
+
     #[test]
     fn rebuild_producers_re_emits_command_producer_after_reset() {
         let mut conn = Connection::new(
@@ -5976,18 +6119,45 @@ mod conn_state_tests {
         assert_eq!(smid.ledger_id, acked.ledger_id);
         assert_eq!(smid.entry_id, acked.entry_id);
 
-        // A CommandFlow must follow the subscribe so the broker resumes dispatching as soon
-        // as it acks.
-        let flow_cmd = cmds
-            .iter()
-            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
-            .find_map(|c| c.flow.as_ref())
-            .expect("CommandFlow re-emitted alongside subscribe");
-        assert_eq!(flow_cmd.consumer_id, c_handle.0);
-        assert_eq!(flow_cmd.message_permits, 128);
+        // NO CommandFlow may ride alongside the subscribe: the broker
+        // silently drops flow for a consumer id whose subscribe is still
+        // being processed (post-restart cursor recovery makes that window
+        // seconds long), starving the re-attached consumer of broker-side
+        // permits. Java `ConsumerImpl#reconnectLater` ordering: flow goes
+        // out only on the subscribe ACK.
+        assert!(
+            cmds.iter()
+                .all(|c| c.r#type != pb::base_command::Type::Flow as i32),
+            "no CommandFlow may go out before the subscribe ack"
+        );
 
         // The returned RequestId must match the one stamped on the subscribe frame.
         assert_eq!(request_ids[0].0, subscribe_cmd.request_id);
+        let subscribe_rid = subscribe_cmd.request_id;
+
+        // Broker acks the re-subscribe — the initial flow goes out NOW.
+        let ack = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: subscribe_rid,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack).expect("encode Success");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle subscribe ack");
+        while let Some(_e) = conn.poll_event() {}
+
+        let post_ack = drain_outbound_commands(&mut conn);
+        let flow_cmd = post_ack
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Flow as i32)
+            .find_map(|c| c.flow.as_ref())
+            .expect("CommandFlow re-emitted on the subscribe ack");
+        assert_eq!(flow_cmd.consumer_id, c_handle.0);
+        assert_eq!(flow_cmd.message_permits, 128);
     }
 
     #[test]
@@ -6416,7 +6586,11 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("Connected on retry");
         let _ = drain_outbound_commands(&mut conn);
-        conn.rebuild_producers();
+        let rebuild_rids = conn.rebuild_producers();
+        // The replay is gated on the broker acking the re-attachment
+        // (producer-not-ready fix) — feed the `ProducerSuccess` so the
+        // snapshot reinstalls into `pending` before the receipt arrives.
+        ack_producer_success(&mut conn, rebuild_rids[0].0);
         let _ = drain_outbound_commands(&mut conn);
 
         // The future "re-polled" — the runtime SendFut would register a fresh waker now.
@@ -6607,12 +6781,15 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
 
+        let create_rid = conn.peek_next_request_id_for_test();
         let producer = conn.create_producer(CreateProducerRequest {
             topic: "persistent://public/default/replay-pending".to_owned(),
             ..Default::default()
         });
-        // Discard initial `CommandProducer` frame.
+        // Discard initial `CommandProducer` frame, then ack it so the drain
+        // gate opens and the pre-reset sends can reach the wire.
         let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
 
         // Queue three publishes and drain their wire frames so the post-replay drain is
         // isolated.
@@ -6644,15 +6821,36 @@ mod conn_state_tests {
             .expect("handle reconnect");
         let _ = drain_outbound_commands(&mut conn);
 
-        conn.rebuild_producers();
+        let rebuild_rids = conn.rebuild_producers();
 
-        // The snapshot is consumed; pending now holds the three replayed OpSends in
-        // original order.
+        // Producer-not-ready gate: until the broker acks the re-attachment, the
+        // snapshots stay parked and NO send frame may reach the wire — only the
+        // rebuild's `CommandProducer` goes out (a premature send makes the real
+        // broker close the whole connection).
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 3);
+        assert_eq!(conn.producer_pending_count(producer), 0);
+        let pre_ack_cmds = drain_outbound_commands(&mut conn);
+        assert!(
+            pre_ack_cmds
+                .iter()
+                .any(|c| c.r#type == pb::base_command::Type::Producer as i32),
+            "rebuild must re-emit CommandProducer"
+        );
+        assert!(
+            pre_ack_cmds
+                .iter()
+                .all(|c| c.r#type != pb::base_command::Type::Send as i32),
+            "no CommandSend may go out before ProducerSuccess"
+        );
+
+        // Broker acks the re-attachment — the snapshot is consumed; pending now
+        // holds the three replayed OpSends in original order.
+        ack_producer_success(&mut conn, rebuild_rids[0].0);
         assert_eq!(conn.in_flight_publish_snapshot_len(producer), 0);
         assert_eq!(conn.producer_pending_count(producer), 3);
 
-        // The outbound buffer now carries one `CommandProducer` (the rebuild) followed by
-        // three `CommandSend` frames in the original `[0, 1, 2]` sequence-id order.
+        // The outbound buffer now carries the three `CommandSend` frames in the
+        // original `[0, 1, 2]` sequence-id order.
         let cmds = drain_outbound_commands(&mut conn);
         let sends: Vec<&pb::CommandSend> = cmds
             .iter()
@@ -6682,11 +6880,13 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
 
+        let create_rid = conn.peek_next_request_id_for_test();
         let producer = conn.create_producer(CreateProducerRequest {
             topic: "persistent://public/default/replay-receipt".to_owned(),
             ..Default::default()
         });
         let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
 
         let seq = conn
             .send(
@@ -6711,7 +6911,10 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("Connected on retry");
         let _ = drain_outbound_commands(&mut conn);
-        conn.rebuild_producers();
+        let rebuild_rids = conn.rebuild_producers();
+        // Broker acks the re-attachment — only then is the snapshot replayed
+        // (producer-not-ready gate).
+        ack_producer_success(&mut conn, rebuild_rids[0].0);
         let _ = drain_outbound_commands(&mut conn);
 
         // Replayed OpSend is back in pending.
@@ -6758,11 +6961,13 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
 
+        let create_rid = conn.peek_next_request_id_for_test();
         let producer = conn.create_producer(CreateProducerRequest {
             topic: "persistent://public/default/replay-order".to_owned(),
             ..Default::default()
         });
         let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
 
         // Three single sends — sequence ids 0, 1, 2.
         let mut expected_payloads: Vec<&'static [u8]> = Vec::new();
@@ -6791,10 +6996,13 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle reconnect");
         let _ = drain_outbound_commands(&mut conn);
-        conn.rebuild_producers();
+        let rebuild_rids = conn.rebuild_producers();
+        // Broker acks the re-attachment — only then are the snapshots replayed
+        // (producer-not-ready gate).
+        ack_producer_success(&mut conn, rebuild_rids[0].0);
 
-        // The post-rebuild outbound buffer carries the CommandProducer first, then the
-        // three replayed CommandSend frames in FIFO order. Decode payloads to verify.
+        // The post-ack outbound buffer carries the three replayed CommandSend
+        // frames in FIFO order. Decode payloads to verify.
         let raw_bytes = conn.poll_transmit();
         let mut cursor = bytes::Bytes::copy_from_slice(&raw_bytes);
         let mut send_payloads: Vec<Vec<u8>> = Vec::new();
@@ -6818,6 +7026,212 @@ mod conn_state_tests {
                 "replay preserves original payload at position {i}"
             );
         }
+    }
+
+    /// A send future that re-polls DURING the reset → `ProducerSuccess`
+    /// window (its op parked in the reset snapshot, not in `pending`) must
+    /// still be woken by the replayed receipt. `Connection::register_waker`
+    /// used to hand the waker to the slot unconditionally — where it
+    /// silently no-oped for snapshot-parked ops — instead of falling back
+    /// to the connection-wide slab; the receipt then resolved with no waker
+    /// anywhere and the user's send hung forever (the e2e_reconnect
+    /// starvation, root cause #2 behind the pre-ack-replay livelock).
+    #[test]
+    fn waker_registered_during_snapshot_window_fires_on_replayed_receipt() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/snapshot-window-waker".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue");
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Drop the session: the op moves into the reset snapshot.
+        conn.reset();
+
+        // The send future re-polls NOW — mid-window, before rebuild/ack.
+        // This registration must not be silently dropped.
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&counter).into();
+        conn.register_waker(PendingOpKey::Send(producer, seq), waker);
+
+        // Re-handshake, rebuild, broker ack → snapshot replays.
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = drain_outbound_commands(&mut conn);
+        let rebuild_rids = conn.rebuild_producers();
+        ack_producer_success(&mut conn, rebuild_rids[0].0);
+        let _ = drain_outbound_commands(&mut conn);
+
+        // The replayed publish's receipt lands — the mid-window waker MUST fire.
+        let receipt_bytes = send_receipt_bytes(producer, seq);
+        conn.handle_bytes(Instant::now(), &receipt_bytes)
+            .expect("handle SendReceipt");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the waker registered during the snapshot window must fire on the replayed receipt"
+        );
+        assert!(
+            matches!(
+                conn.take_outcome(PendingOpKey::Send(producer, seq)),
+                Some(OpOutcome::SendReceipt { .. })
+            ),
+            "the outcome must be present for the woken future to consume"
+        );
+    }
+
+    /// The live e2e_reconnect flow, at the proto layer: a send queued while
+    /// disconnected, then reset → rebuild → broker answers the rebuild's
+    /// `CommandProducer` with a TRANSIENT error (`ServiceNotReady` — the
+    /// post-restart "namespace bundle not served, redo the lookup" case) →
+    /// `retry_producer_open` → broker acks the retry with
+    /// `ProducerSuccess`. The queued send must reach the wire exactly once,
+    /// only after the ack (producer-not-ready gate), with its original
+    /// sequence id.
+    #[test]
+    fn transient_rebuild_error_then_retry_ack_replays_queued_send() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/transient-replay".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        // Queue one send and let it reach the wire (in-flight at drop time).
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"inflight"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 8,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue");
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Drop + reconnect + rebuild.
+        conn.reset();
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("Connected on retry");
+        let _ = drain_outbound_commands(&mut conn);
+        let rebuild_rids = conn.rebuild_producers();
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Broker rejects the rebuild's CommandProducer with a TRANSIENT code
+        // (ServiceNotReady = 6) — the post-restart bundle-not-served case.
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: rebuild_rids[0].0,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "Please redo the lookup".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle transient error");
+        // The transient event surfaces; producer state survives.
+        let mut saw_transient = false;
+        while let Some(ev) = conn.poll_event() {
+            if matches!(ev, ConnectionEvent::ProducerOpenFailedTransient { .. }) {
+                saw_transient = true;
+            }
+        }
+        assert!(saw_transient, "transient open failure must surface");
+
+        // Driver retry path: re-emit CommandProducer for the single handle.
+        let retry_rid = conn
+            .retry_producer_open(producer)
+            .expect("retry must re-emit");
+        let pre_ack = drain_outbound_commands(&mut conn);
+        assert!(
+            pre_ack
+                .iter()
+                .any(|c| c.r#type == pb::base_command::Type::Producer as i32),
+            "retry must re-emit CommandProducer"
+        );
+        assert!(
+            pre_ack
+                .iter()
+                .all(|c| c.r#type != pb::base_command::Type::Send as i32),
+            "no CommandSend may go out before the retry's ProducerSuccess"
+        );
+
+        // Broker acks the retry — the queued send must now reach the wire,
+        // exactly once, with its original sequence id.
+        ack_producer_success(&mut conn, retry_rid.0);
+        let post_ack = drain_outbound_commands(&mut conn);
+        let sends: Vec<&pb::CommandSend> = post_ack
+            .iter()
+            .filter(|c| c.r#type == pb::base_command::Type::Send as i32)
+            .filter_map(|c| c.send.as_ref())
+            .collect();
+        assert_eq!(
+            sends.len(),
+            1,
+            "exactly one replayed send after the retry ack; got commands: {:?}",
+            post_ack.iter().map(|c| c.r#type).collect::<Vec<_>>()
+        );
+        assert_eq!(sends[0].sequence_id, seq.0, "original sequence id preserved");
     }
 
     /// Batch cleared on reset: messages buffered in the producer's batch container (i.e.
@@ -7918,8 +8332,12 @@ mod otel_property_round_trip_tests {
             topic: "persistent://public/default/otel-props-t".to_owned(),
             ..Default::default()
         };
-        let handle = conn.create_producer(req);
+        // Peek BEFORE create — `create_producer` consumes the next request id
+        // for its `CommandProducer`, and the ack below must correlate with it
+        // (the producer-not-ready drain gate only opens on a matching
+        // `ProducerSuccess`).
         let rid = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(req);
         let ack = pb::BaseCommand {
             r#type: pb::base_command::Type::ProducerSuccess as i32,
             producer_success: Some(pb::CommandProducerSuccess {

@@ -895,8 +895,13 @@ where
         // drain, so the extra `flush()` is wasted syscall overhead.
         if !write_data.is_empty() {
             let write_result = match &write_data {
-                magnetar_proto::TransmitOwned::Contiguous(buf) => socket.write_all(buf).await,
+                magnetar_proto::TransmitOwned::Contiguous(buf) => {
+                    tracing::trace!(bytes = buf.len(), "writing outbound bytes (contiguous)");
+                    socket.write_all(buf).await
+                }
                 magnetar_proto::TransmitOwned::Vectored(segs) => {
+                    let total: usize = segs.iter().map(bytes::Bytes::len).sum();
+                    tracing::trace!(bytes = total, "writing outbound bytes (vectored)");
                     write_all_vectored(socket, segs).await
                 }
             };

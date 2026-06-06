@@ -145,6 +145,12 @@ pub struct OpSend {
 }
 
 /// Per-producer state.
+// reason: `batching_enabled` / `chunking_enabled` / `closed` /
+// `broker_ready` are orthogonal protocol axes (two config toggles, the
+// user-close latch, and the re-attach drain gate), not an encodable state
+// machine — collapsing them into enums would invent product states that
+// cannot occur.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct ProducerState {
     /// Producer id assigned by the [`Connection`](crate::Connection).
@@ -183,6 +189,19 @@ pub struct ProducerState {
     outbound: VecDeque<OutboundFrame>,
     /// Closed flag — once set, all subsequent sends fail with [`ProducerError::Closed`].
     pub closed: bool,
+    /// Whether the broker has acked this producer's (re-)attachment on the
+    /// CURRENT session via `CommandProducerSuccess`. Starts `false`; flipped
+    /// true by the `ProducerSuccess` handler, back to `false` on session
+    /// reset ([`Self::snapshot_pending_sends`]), on a transient open
+    /// failure, and on a broker-forced `CommandCloseProducer`. While
+    /// `false`, the connection-wide drain skips this slot: Pulsar closes
+    /// the WHOLE connection on a `CommandSend` for a producer that is not
+    /// ready ("Received message, but the producer is not ready : N.
+    /// Closing the connection.") — staged sends wait in the slot until the
+    /// ack lands. Mirrors Java `ProducerImpl#handleProducerSuccess` →
+    /// `resendMessages`, which only re-issues pending messages after the
+    /// broker confirms the attachment.
+    pub broker_ready: bool,
     /// Cumulative count of logical messages handed to the wire (sum of `num_messages` per
     /// emitted SEND, including each chunk of a chunked publish). Mirrors Java
     /// `ProducerStats#getTotalMsgsSent`.
@@ -497,6 +516,7 @@ impl ProducerState {
             batch: BatchContainer::default(),
             outbound: VecDeque::new(),
             closed: false,
+            broker_ready: false,
             total_msgs_sent: 0,
             total_bytes_sent: 0,
             total_send_failed: 0,
@@ -1337,12 +1357,20 @@ impl ProducerState {
     }
 
     /// Register a waker for the given pending sequence id.
-    pub fn register_waker(&mut self, sequence_id: SequenceId, waker: Waker) {
+    /// Returns `true` when the waker was attached to a pending [`OpSend`].
+    /// Returns `false` when no such op exists — notably during the
+    /// reset → `ProducerSuccess` window, where in-flight ops are parked in
+    /// the connection's reset snapshot rather than in `pending`. The caller
+    /// MUST then park the waker on the connection-wide slab instead, or the
+    /// replayed receipt can never wake the future.
+    pub fn register_waker(&mut self, sequence_id: SequenceId, waker: Waker) -> bool {
         if let Some(idx) = self.pending_index.get(&sequence_id).copied() {
             if let Some(op) = self.pending.get_mut(idx) {
                 op.waker = Some(waker);
+                return true;
             }
         }
+        false
     }
 
     /// Clear the waker (if any) parked on the pending [`OpSend`] for the
@@ -1397,6 +1425,9 @@ impl ProducerState {
     /// `enqueued_at` on each snapshot is preserved from the original send, so the
     /// post-rebuild send-timeout sweep still uses the original deadline.
     pub fn snapshot_pending_sends(&mut self) -> (Vec<(SequenceId, Option<Waker>)>, Vec<OpSend>) {
+        // The session is gone — the broker must re-ack the attachment before
+        // any send may flow again (drain gate, see `broker_ready`).
+        self.broker_ready = false;
         let mut wakers = Vec::with_capacity(self.pending.len());
         let mut snapshots = Vec::with_capacity(self.pending.len());
         while let Some(mut op) = self.pending.pop_front() {
@@ -1422,13 +1453,20 @@ impl ProducerState {
     }
 
     /// Re-issue a vector of [`OpSend`] snapshots produced by
-    /// [`Self::snapshot_pending_sends`]. For each snapshot:
+    /// [`Self::snapshot_pending_sends`]. Called from the `ProducerSuccess`
+    /// handler — i.e. only AFTER the broker acked the re-attachment
+    /// (Java `ProducerImpl#handleProducerSuccess` → `resendMessages`
+    /// parity; replaying earlier makes the broker close the connection
+    /// with "producer is not ready"). For each snapshot:
     ///
-    /// 1. Every cached [`OutboundFrame`] is pushed back onto the producer's outbound queue
-    ///    (preserving wire order; a chunked publish replays N frames in the same relative order as
-    ///    the original emit).
-    /// 2. The snapshot's [`OpSend`] is re-inserted into `pending` with `waker: None`. The user's
-    ///    send future re-registers on the next `poll` after the wake-up.
+    /// 1. Every cached [`OutboundFrame`] is pushed onto the FRONT of the producer's outbound
+    ///    queue (preserving wire order; a chunked publish replays N frames in the same relative
+    ///    order as the original emit). Front insertion keeps sequence-id order: snapshots
+    ///    predate anything the user queued during the rebuild window, which is already staged
+    ///    behind the drain gate.
+    /// 2. The snapshot's [`OpSend`] is re-inserted at the FRONT of `pending` with `waker: None`.
+    ///    The user's send future re-registers on the next `poll` after the wake-up. The
+    ///    sequence-id index is rebuilt wholesale afterwards.
     ///
     /// Counter side-effects (`total_msgs_sent`, `total_bytes_sent`) are NOT incremented
     /// — the original emit already counted them; a re-send is not "new" traffic from a
@@ -1440,35 +1478,52 @@ impl ProducerState {
     /// the highest sent id and is left untouched here. Mirrors Java
     /// `ProducerImpl#resendMessages`'s `pendingMessages` walk.
     pub fn replay_snapshots(&mut self, snapshots: Vec<OpSend>) {
-        for snapshot in snapshots {
-            for frame in &snapshot.replay_frames {
-                self.outbound.push_back(frame.clone());
+        for snapshot in snapshots.iter().rev() {
+            for frame in snapshot.replay_frames.iter().rev() {
+                self.outbound.push_front(frame.clone());
             }
-            self.pending_index
-                .insert(snapshot.sequence_id, self.pending.len());
-            self.pending.push_back(snapshot);
+        }
+        for snapshot in snapshots.into_iter().rev() {
+            self.pending.push_front(snapshot);
+        }
+        self.pending_index.clear();
+        for (i, op) in self.pending.iter().enumerate() {
+            self.pending_index.insert(op.sequence_id, i);
         }
     }
 
-    /// Re-push the wire frames for every currently-pending `OpSend` back onto the outbound
+    /// Re-push the wire frames for currently-pending `OpSend`s back onto the outbound
     /// queue WITHOUT re-adding the ops to `pending` (they're already there). Used by the
-    /// transient-retry path: after `retry_producer_open` re-attaches the producer, any
-    /// `OpSend`s that the user enqueued during the transient window had their original
-    /// frames silently dropped by the broker (Pulsar drops `CommandSend` for unknown
-    /// `producer_id` without sending an error). Re-emitting the cached `replay_frames`
-    /// re-runs the publish on the freshly-attached producer; the user-facing `SendFut`
-    /// then resolves on the eventual `CommandSendReceipt`. Distinct from
-    /// [`Self::replay_snapshots`], which is the reset-path counterpart that pushes the
-    /// `OpSend`s into `pending` from scratch.
+    /// transient-retry path, and called from the `ProducerSuccess` handler — i.e. only
+    /// AFTER the broker acked the re-attachment (replaying earlier makes the broker close
+    /// the connection with "producer is not ready"): any `OpSend`s whose frames went out
+    /// before the transient failure had them silently dropped by the broker (Pulsar drops
+    /// `CommandSend` for an unknown `producer_id` without sending an error). Re-emitting
+    /// the cached `replay_frames` re-runs the publish on the freshly-attached producer;
+    /// the user-facing `SendFut` then resolves on the eventual `CommandSendReceipt`.
+    /// Distinct from [`Self::replay_snapshots`], which is the reset-path counterpart that
+    /// pushes the `OpSend`s into `pending` from scratch.
     ///
-    /// `OpSend`s with empty `replay_frames` (in-progress batched sends from
-    /// `add_to_batch`) are skipped: their wire bytes only materialise at `flush_batch`
-    /// time.
+    /// Two skip rules:
+    /// - `OpSend`s with empty `replay_frames` (in-progress batched sends from
+    ///   `add_to_batch`) — their wire bytes only materialise at `flush_batch` time.
+    /// - `OpSend`s whose frames are STILL STAGED in `outbound` (queued behind the
+    ///   `broker_ready` drain gate during the not-ready window) — re-emitting those
+    ///   would double-publish once the gate opens.
+    ///
+    /// Re-emitted frames go to the FRONT of `outbound` (they are older than anything
+    /// staged during the not-ready window), preserving sequence-id order on the wire.
     pub fn replay_pending_outbound(&mut self) {
-        for op in &self.pending {
-            for frame in &op.replay_frames {
-                self.outbound.push_back(frame.clone());
-            }
+        let staged: rustc_hash::FxHashSet<SequenceId> =
+            self.outbound.iter().map(|f| f.sequence_id).collect();
+        let frames: Vec<OutboundFrame> = self
+            .pending
+            .iter()
+            .filter(|op| !staged.contains(&op.sequence_id))
+            .flat_map(|op| op.replay_frames.iter().cloned())
+            .collect();
+        for frame in frames.into_iter().rev() {
+            self.outbound.push_front(frame);
         }
     }
 

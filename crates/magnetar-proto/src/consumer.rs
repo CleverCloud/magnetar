@@ -116,6 +116,12 @@ pub struct ShadowTopicMetadata {
 }
 
 /// Per-consumer state.
+// reason: `closed` / `paused` / `reached_end_of_topic` /
+// `flow_on_subscribe_ack` are orthogonal protocol axes (user latch, user
+// toggle, broker signal, re-attach flow gate), not an encodable state
+// machine — collapsing them into enums would invent product states that
+// cannot occur.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct ConsumerState {
     /// Consumer id assigned by [`Connection`](crate::Connection).
@@ -156,6 +162,16 @@ pub struct ConsumerState {
     pub receive_wakers: Slab<Waker>,
     /// Closed flag.
     pub closed: bool,
+    /// Re-attach flow gate: set by `rebuild_consumers` /
+    /// `retry_consumer_subscribe` so the connection emits the initial
+    /// `CommandFlow` only when the broker ACKS the re-subscribe (`Success`
+    /// arm). Pulsar silently drops `CommandFlow` for a consumer id whose
+    /// subscribe is still being processed (post-restart cursor recovery
+    /// makes that window seconds long) — flow-alongside-subscribe left the
+    /// re-attached consumer with zero broker-side permits and starved
+    /// `receive()` forever. Java parity: `ConsumerImpl#reconnectLater`
+    /// ordering (documented in `ARCHITECTURE.md` §Supervised reconnect).
+    pub flow_on_subscribe_ack: bool,
     /// Configured max redelivery before DLQ routing kicks in (`0` disables DLQ routing).
     pub max_redeliver_count: u32,
     /// Messages flagged for DLQ routing. The runtime crate drains this and republishes.
@@ -399,6 +415,7 @@ impl ConsumerState {
             pending_seek: None,
             receive_wakers: Slab::new(),
             closed: false,
+            flow_on_subscribe_ack: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
             paused: false,
