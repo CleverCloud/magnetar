@@ -26,15 +26,42 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use magnetar_proto::producer::OutgoingMessage;
-use magnetar_proto::{OpOutcome, PendingOpKey, SequenceId, pb};
+use magnetar_proto::{OpOutcome, PendingOpKey, SequenceId, encode_command, pb};
+use magnetar_runtime_moonpool::ConnectionShared;
 
 use crate::common::{handshake_complete_shared, open_producer_ready, send_receipt_bytes};
 
 const INFLIGHT_COUNT: u64 = 10;
+
+/// Feed the broker's `CommandProducerSuccess` for `request_id` — the ack
+/// that opens the producer-not-ready drain gate and triggers the snapshot
+/// replay (Java `handleProducerSuccess` parity). Every rebuild/retry leg in
+/// these tests needs this step before replayed SEND frames may reach the
+/// wire.
+fn ack_producer_open(shared: &Arc<ConnectionShared>, request_id: u64, at: Instant) {
+    let success = pb::BaseCommand {
+        r#type: pb::base_command::Type::ProducerSuccess as i32,
+        producer_success: Some(pb::CommandProducerSuccess {
+            request_id,
+            producer_name: "magnetar-test-reattach".to_owned(),
+            last_sequence_id: Some(-1),
+            schema_version: None,
+            topic_epoch: None,
+            producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &success).expect("encode CommandProducerSuccess");
+    let mut conn = shared.inner.lock();
+    conn.handle_bytes(at, &buf).expect("apply ProducerSuccess");
+    while conn.poll_event().is_some() {}
+}
 
 // End-to-end snapshot-and-replay scenario. Linear by design — wire-trace
 // readability beats artificial sharding. Silence the per-function line cap.
@@ -131,7 +158,7 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     );
 
     // Walk through a synthetic re-handshake and rebuild.
-    {
+    let rebuild_rid = {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("re-handshake");
         let frame = common::handshake_response_bytes();
@@ -143,21 +170,36 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
             1,
             "the surviving producer must be rebuilt on the new session"
         );
-    }
+        rebuilt[0]
+    };
 
-    // Post-rebuild: the snapshot is drained into the producer's `pending` queue, and
+    // Producer-not-ready gate: until the broker acks the re-attachment, the
+    // snapshots stay parked and no SEND may reach the wire — only the
+    // rebuild's CommandProducer goes out.
+    {
+        let conn = shared.inner.lock();
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(handle),
+            INFLIGHT_COUNT as usize,
+            "snapshots stay parked until the broker acks the re-attachment"
+        );
+        assert_eq!(conn.producer_pending_count(handle), 0);
+    }
+    ack_producer_open(&shared, rebuild_rid.0, t0);
+
+    // Post-ack: the snapshot is drained into the producer's `pending` queue, and
     // the wire-frame queue has been re-emitted into the connection's outbound buffer.
     {
         let conn = shared.inner.lock();
         assert_eq!(
             conn.in_flight_publish_snapshot_len(handle),
             0,
-            "rebuild_producers must consume the snapshot"
+            "the re-attach ack consumes the snapshot"
         );
         assert_eq!(
             conn.producer_pending_count(handle),
             INFLIGHT_COUNT as usize,
-            "rebuild_producers must reinstall every snapshotted OpSend into pending"
+            "the ack reinstalls every snapshotted OpSend into pending"
         );
     }
 
@@ -235,14 +277,17 @@ fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
     );
 
     // Re-handshake + rebuild on the new session.
-    {
+    let rebuild_rids = {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("re-handshake");
         conn.handle_bytes(t0, &common::handshake_response_bytes())
             .expect("Connected on retry");
         let _ = conn.poll_event();
-        let _ = conn.rebuild_producers();
-    }
+        conn.rebuild_producers()
+    };
+    // The replay materialises on the broker's re-attach ack
+    // (producer-not-ready gate).
+    ack_producer_open(&shared, rebuild_rids[0].0, t0);
 
     // Drain the post-rebuild wire frames so the publish is "on the wire" of the new
     // session.
@@ -318,14 +363,17 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
 
     // Reset + rebuild.
     shared.inner.lock().reset();
-    {
+    let rebuild_rids = {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("re-handshake");
         conn.handle_bytes(t0, &common::handshake_response_bytes())
             .expect("Connected on retry");
         let _ = conn.poll_event();
-        let _ = conn.rebuild_producers();
-    }
+        conn.rebuild_producers()
+    };
+    // The replay materialises on the broker's re-attach ack
+    // (producer-not-ready gate).
+    ack_producer_open(&shared, rebuild_rids[0].0, t0);
 
     // Drain post-rebuild wire frames and inspect the CommandSend ordering.
     let mut cursor = {
@@ -391,14 +439,20 @@ fn session_epoch_bumps_exactly_once_per_reset_in_replay_cycle() {
 
     for _ in 0..2 {
         shared.inner.lock().reset();
-        let mut conn = shared.inner.lock();
-        conn.begin_handshake().expect("re-handshake");
-        conn.handle_bytes(t0, &common::handshake_response_bytes())
-            .expect("Connected on retry");
-        let _ = conn.poll_event();
-        let _ = conn.rebuild_producers();
+        let rebuild_rids = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("re-handshake");
+            conn.handle_bytes(t0, &common::handshake_response_bytes())
+                .expect("Connected on retry");
+            let _ = conn.poll_event();
+            conn.rebuild_producers()
+        };
+        // Ack each cycle's re-attachment (producer-not-ready gate) so the
+        // snapshot drains back into `pending` before the next reset
+        // re-snapshots it.
+        ack_producer_open(&shared, rebuild_rids[0].0, t0);
         // Drain the wire frames so the next reset's snapshot is the only OpSend in flight.
-        let _ = conn.poll_transmit();
+        let _ = shared.inner.lock().poll_transmit();
     }
 
     let epoch_after = shared.inner.lock().session_epoch();
@@ -417,6 +471,6 @@ fn session_epoch_bumps_exactly_once_per_reset_in_replay_cycle() {
     assert_eq!(
         shared.inner.lock().in_flight_publish_snapshot_len(handle),
         0,
-        "the snapshot bucket is empty after both rebuild_producers calls"
+        "the snapshot bucket is empty after both acked rebuild cycles"
     );
 }

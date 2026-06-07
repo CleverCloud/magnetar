@@ -45,6 +45,31 @@ fn handshake_complete(at: Instant) -> Arc<ConnectionShared> {
     shared
 }
 
+/// Feed the broker's `CommandProducerSuccess` for `request_id` — the ack
+/// that opens the producer-not-ready drain gate and triggers the snapshot
+/// replay (Java `handleProducerSuccess` parity). Every rebuild/retry leg in
+/// these tests needs this step before replayed SEND frames may reach the
+/// wire.
+fn ack_producer_open(shared: &Arc<ConnectionShared>, request_id: u64, at: Instant) {
+    let success = pb::BaseCommand {
+        r#type: pb::base_command::Type::ProducerSuccess as i32,
+        producer_success: Some(pb::CommandProducerSuccess {
+            request_id,
+            producer_name: "magnetar-test-reattach".to_owned(),
+            last_sequence_id: Some(-1),
+            schema_version: None,
+            topic_epoch: None,
+            producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &success).expect("encode CommandProducerSuccess");
+    let mut conn = shared.inner.lock();
+    conn.handle_bytes(at, &buf).expect("apply ProducerSuccess");
+    while conn.poll_event().is_some() {}
+}
+
 fn open_producer_ready(shared: &Arc<ConnectionShared>, topic: &str, at: Instant) -> ProducerHandle {
     let req = CreateProducerRequest {
         topic: topic.to_owned(),
@@ -177,7 +202,7 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
     }
 
     // Walk a synthetic re-handshake + rebuild on the new session.
-    {
+    let rebuild_rid = {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("re-handshake");
         conn.handle_bytes(t0, &handshake_response_bytes())
@@ -185,22 +210,36 @@ fn reset_snapshots_inflight_publishes_for_transparent_replay() {
         let _ = conn.poll_event();
         let rebuilt = conn.rebuild_producers();
         assert_eq!(rebuilt.len(), 1, "the surviving producer must be rebuilt");
+        rebuilt[0]
+    };
+    // Producer-not-ready gate: until the broker acks the re-attachment, the
+    // snapshots stay parked and no SEND may reach the wire — only the
+    // rebuild's CommandProducer goes out.
+    {
+        let conn = shared.inner.lock();
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(handle),
+            INFLIGHT_COUNT as usize,
+            "snapshots stay parked until the broker acks the re-attachment"
+        );
+        assert_eq!(conn.producer_pending_count(handle), 0);
     }
+    ack_producer_open(&shared, rebuild_rid.0, t0);
     {
         let conn = shared.inner.lock();
         assert_eq!(
             conn.in_flight_publish_snapshot_len(handle),
             0,
-            "rebuild_producers consumes the snapshot"
+            "the re-attach ack consumes the snapshot"
         );
         assert_eq!(
             conn.producer_pending_count(handle),
             INFLIGHT_COUNT as usize,
-            "rebuild reinstalls every snapshotted OpSend"
+            "the ack reinstalls every snapshotted OpSend"
         );
     }
 
-    // Drain the post-rebuild wire frames — must include one CommandProducer (the
+    // Drain the post-ack wire frames — must include one CommandProducer (the
     // re-attach) + INFLIGHT_COUNT CommandSends in original sequence-id order.
     let mut cursor = {
         let mut conn = shared.inner.lock();
@@ -291,14 +330,17 @@ fn replayed_send_resolves_when_receipt_arrives_on_new_session() {
         "transparent replay: no SessionLost outcome installed"
     );
 
-    {
+    let rebuild_rids = {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("re-handshake");
         conn.handle_bytes(t0, &handshake_response_bytes())
             .expect("Connected on retry");
         let _ = conn.poll_event();
-        let _ = conn.rebuild_producers();
-    }
+        conn.rebuild_producers()
+    };
+    // The replay materialises on the broker's re-attach ack
+    // (producer-not-ready gate).
+    ack_producer_open(&shared, rebuild_rids[0].0, t0);
     {
         let mut conn = shared.inner.lock();
         let _ = conn.poll_transmit();
@@ -363,14 +405,17 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
     }
 
     shared.inner.lock().reset();
-    {
+    let rebuild_rids = {
         let mut conn = shared.inner.lock();
         conn.begin_handshake().expect("re-handshake");
         conn.handle_bytes(t0, &handshake_response_bytes())
             .expect("Connected on retry");
         let _ = conn.poll_event();
-        let _ = conn.rebuild_producers();
-    }
+        conn.rebuild_producers()
+    };
+    // The replay materialises on the broker's re-attach ack
+    // (producer-not-ready gate).
+    ack_producer_open(&shared, rebuild_rids[0].0, t0);
 
     let mut cursor = {
         let mut conn = shared.inner.lock();
