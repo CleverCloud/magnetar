@@ -552,6 +552,7 @@ impl Producer {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -571,6 +572,7 @@ async fn wait_request(
     match outcome {
         OpOutcome::Success { .. } => Ok(()),
         OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+        OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
         // Any other shape means the connection layer corrupted the request-id space — surface as
         // a protocol violation rather than silently succeeding.
         other => Err(ClientError::Other(format!(
@@ -738,6 +740,7 @@ fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> 
         OpOutcome::SendError { code, message, .. } => {
             Err(ClientError::SendRejected { code, message })
         }
+        OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
         other => Err(ClientError::Other(format!(
             "unexpected send outcome: {other:?}"
         ))),

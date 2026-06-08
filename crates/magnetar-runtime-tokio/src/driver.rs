@@ -504,7 +504,25 @@ where
     // the wire deterministic regardless.
     let join = tokio::spawn(async move {
         let mut socket = socket;
-        driver_loop_inner(&shared, &mut socket, true).await
+        let outcome = driver_loop_inner(&shared, &mut socket, true).await;
+        // Plain (non-supervised) driver: TERMINAL exit, no reconnect. Fail
+        // every pending op so parked subscribe / send / receive futures resolve
+        // with a terminal error instead of hanging on a connection that is gone
+        // (the no-progress stall). `driver_loop_inner` already ran
+        // `mark_disconnected()` on its Err paths / `close()` snapped the state
+        // on graceful close, so `is_connected()` is already false. Mirror of
+        // the moonpool engine's plain spawn. ADR-0055.
+        {
+            let reason = match &outcome {
+                Ok(()) => "connection closed".to_owned(),
+                Err(err) => err.to_string(),
+            };
+            shared.inner.lock().fail_all_pending(&reason);
+        }
+        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
+        // park on `driver_waker` rather than the waker slab.
+        shared.driver_waker.notify_waiters();
+        outcome
     });
     DriverHandle { join }
 }
@@ -519,7 +537,29 @@ pub(crate) fn spawn_supervised(
     socket: Transport,
     reconnect_ctx: ReconnectContext,
 ) -> DriverHandle {
-    let join = tokio::spawn(supervised_driver_loop(shared, socket, reconnect_ctx));
+    let driver_shared = shared.clone();
+    let join = tokio::spawn(async move {
+        let outcome = supervised_driver_loop(shared, socket, reconnect_ctx).await;
+        // `supervised_driver_loop` only returns on a GENUINELY-terminal exit
+        // (user-requested close, or the supervisor exhausted its reconnect
+        // attempt budget) — the per-attempt drop is handled inside the loop
+        // via `reset()` + replay. Fail every still-pending op so parked
+        // subscribe / send / receive / ack futures resolve with a terminal
+        // error instead of hanging forever (the no-progress stall). ADR-0055
+        // §1: `fail_all_pending` fires on a supervisor that has exhausted its
+        // attempts, never on the per-attempt reconnect.
+        {
+            let reason = match &outcome {
+                Ok(()) => "connection closed".to_owned(),
+                Err(err) => err.to_string(),
+            };
+            driver_shared.inner.lock().fail_all_pending(&reason);
+        }
+        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
+        // park on `driver_waker` rather than the waker slab.
+        driver_shared.driver_waker.notify_waiters();
+        outcome
+    });
     DriverHandle { join }
 }
 

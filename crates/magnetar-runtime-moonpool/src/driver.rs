@@ -449,7 +449,28 @@ where
     let result_for_task = result.clone();
     let shared_for_handle = shared.clone();
     let join = task.spawn_task("magnetar-moonpool-driver", async move {
+        let driver_shared = shared.clone();
         let outcome = driver_loop_inner::<P>(shared, transport, time).await;
+        // Plain (non-supervised) driver: this is a TERMINAL exit — there is no
+        // reconnect to replay against. Fail every pending op so parked
+        // subscribe / send / receive futures resolve with a terminal error
+        // instead of hanging forever on a connection that is gone (the
+        // no-progress stall). `driver_loop_inner` already ran
+        // `mark_disconnected()` on its Err paths and `close()` snapped the
+        // state on the graceful-close path, so `is_connected()` is already
+        // false; `fail_all_pending` only installs the terminal outcomes +
+        // `Closed` event and wakes the futures. ADR-0055.
+        {
+            let reason = match &outcome {
+                Ok(()) => "connection closed".to_owned(),
+                Err(err) => err.to_string(),
+            };
+            driver_shared.inner.lock().fail_all_pending(&reason);
+        }
+        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
+        // park on `driver_waker`, not the waker slab, so they observe the
+        // freshly-queued `Closed` event and stop waiting.
+        driver_shared.driver_waker.notify_waiters();
         *result_for_task.result.lock() = Some(outcome);
         // `notify_one` (not `notify_waiters`) so a `join()` that registers
         // *after* the task finishes still observes completion via the stored
@@ -487,8 +508,28 @@ where
     let time = providers.time().clone();
     let task = providers.task().clone();
     let join = task.spawn_task("magnetar-moonpool-driver-supervised", async move {
+        let driver_shared = shared.clone();
         let outcome =
             supervised_driver_loop::<P>(shared, transport, reconnect_ctx, providers, time).await;
+        // `supervised_driver_loop` only returns on a GENUINELY-terminal exit
+        // (user-requested close, or the supervisor exhausted its reconnect
+        // attempt budget) — the per-attempt drop is handled inside the loop via
+        // `reset()` + replay. Fail every still-pending op so parked subscribe /
+        // send / receive / ack futures resolve with a terminal error instead of
+        // hanging forever (the no-progress stall). Mirror of the plain `spawn`
+        // above and the tokio runtime. ADR-0055 §1: `fail_all_pending` fires on
+        // a supervisor that has exhausted its attempts, never on the
+        // per-attempt reconnect.
+        {
+            let reason = match &outcome {
+                Ok(()) => "connection closed".to_owned(),
+                Err(err) => err.to_string(),
+            };
+            driver_shared.inner.lock().fail_all_pending(&reason);
+        }
+        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
+        // park on `driver_waker`, not the waker slab.
+        driver_shared.driver_waker.notify_waiters();
         *result_for_task.result.lock() = Some(outcome);
         result_for_task.done.notify_one();
     });

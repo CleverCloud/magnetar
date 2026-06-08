@@ -582,6 +582,7 @@ impl Client {
                 }
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected lookup outcome: {other:?}"
             ))),
@@ -707,6 +708,7 @@ impl Client {
             magnetar_proto::OpOutcome::NewTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected new_txn outcome: {other:?}"
             ))),
@@ -762,6 +764,9 @@ impl Client {
             OpOutcome::Error { code, message, .. } => {
                 return Err(ClientError::Broker { code, message });
             }
+            OpOutcome::Terminal { .. } => {
+                return Err(ClientError::PeerClosed);
+            }
             other => {
                 return Err(ClientError::Other(format!(
                     "unexpected tc_client_connect outcome: {other:?}"
@@ -793,6 +798,7 @@ impl Client {
             magnetar_proto::OpOutcome::AddPartitionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected add_partition_to_txn outcome: {other:?}"
             ))),
@@ -821,6 +827,7 @@ impl Client {
             magnetar_proto::OpOutcome::AddSubscriptionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected add_subscription_to_txn outcome: {other:?}"
             ))),
@@ -848,6 +855,7 @@ impl Client {
             magnetar_proto::OpOutcome::EndTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected end_txn outcome: {other:?}"
             ))),
@@ -878,6 +886,7 @@ impl Client {
             magnetar_proto::OpOutcome::Error { code, message, .. } => {
                 Err(ClientError::Broker { code, message })
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected topic-list snapshot outcome: {other:?}"
             ))),
@@ -973,6 +982,7 @@ impl Client {
                     Ok(partitions)
                 }
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected partitioned metadata outcome: {other:?}"
             ))),

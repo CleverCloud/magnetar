@@ -838,6 +838,135 @@ impl Connection {
         }
     }
 
+    /// Resolve **every** pending operation with a terminal
+    /// [`OpOutcome::Terminal`] outcome, wake its future, and queue a
+    /// [`ConnectionEvent::Closed`] so event-stream waiters
+    /// (`ProducerReady` / `SubscribeAcked`) unblock.
+    ///
+    /// Called by a **plain** (non-supervised) driver on terminal exit — a
+    /// fatal decode, a peer close, or an I/O error — where there is no
+    /// reconnect to replay against. Unlike [`Self::reset`], which deliberately
+    /// keeps `Send` keys pending for the supervisor's transparent
+    /// at-least-once replay, this terminates `Send` keys too: with no session
+    /// to come back to, a parked `send()` / `subscribe()` / `receive()`
+    /// future must observe a terminal error promptly instead of hanging
+    /// forever (the no-progress stall this method exists to kill).
+    ///
+    /// Does NOT change the handshake state — the driver pairs this with
+    /// [`Self::mark_disconnected`]. Idempotent: a later [`Self::close`] only
+    /// overwrites identical terminal outcomes and re-queues a `Closed` event.
+    ///
+    /// Lock-ordering (ADR-0038): runs under the global connection mutex and
+    /// takes each per-slot mutex *below* it, never above; every slot guard is
+    /// dropped BEFORE the user wakers fire, so a waker that re-enters the
+    /// connection cannot deadlock.
+    pub fn fail_all_pending(&mut self, reason: &str) {
+        // (1) Terminate every pending request and wake its waiter.
+        let pending_request_keys: Vec<PendingOpKey> = self
+            .pending_requests
+            .keys()
+            .copied()
+            .map(PendingOpKey::Request)
+            .collect();
+        for key in pending_request_keys {
+            self.outcomes.insert(
+                key,
+                OpOutcome::Terminal {
+                    key,
+                    reason: reason.to_owned(),
+                },
+            );
+            if let Some(w) = self.wakers.remove(&key) {
+                w.wake();
+            }
+        }
+        self.pending_requests.clear();
+
+        // (2) Terminate every in-flight publish. Drain each producer's pending
+        // `OpSend`s WITHOUT a replay snapshot (there is no session to replay
+        // onto), install a `Terminal` outcome on each `Send` key, and wake the
+        // future. Take the per-slot lock, drain, DROP it, then wake.
+        let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
+        for handle in producer_handles {
+            let drained = self
+                .producers
+                .get(&handle)
+                .map(|slot| slot.state.lock().drain_pending_sends());
+            let Some(drained) = drained else { continue };
+            for (seq, waker_opt) in drained {
+                let key = PendingOpKey::Send(handle, seq);
+                self.outcomes.insert(
+                    key,
+                    OpOutcome::Terminal {
+                        key,
+                        reason: reason.to_owned(),
+                    },
+                );
+                // Prefer the producer-stored waker; drop any connection-level
+                // slab waker for this key too so it is not double-fired below.
+                if let Some(w) = waker_opt {
+                    let _ = self.wakers.remove(&key);
+                    w.wake();
+                } else if let Some(w) = self.wakers.remove(&key) {
+                    w.wake();
+                }
+            }
+        }
+
+        // (3) Sweep any leftover slab wakers — BOTH `Request` and `Send` keys
+        // get a `Terminal` outcome (no replay carve-out here, unlike `reset`).
+        let leftover_keys: Vec<PendingOpKey> = self.wakers.keys().copied().collect();
+        for key in leftover_keys {
+            self.outcomes.insert(
+                key,
+                OpOutcome::Terminal {
+                    key,
+                    reason: reason.to_owned(),
+                },
+            );
+            if let Some(w) = self.wakers.remove(&key) {
+                w.wake();
+            }
+        }
+
+        // (4) Wake every in-flight receive so it observes the terminal drop and
+        // returns an error (the engine's receive future re-polls, sees
+        // `!is_connected()` after the paired `mark_disconnected`, and errors).
+        // Drop the slot lock BEFORE waking.
+        for slot in self.consumers.values() {
+            let wakers: Vec<std::task::Waker> = {
+                let mut consumer = slot.state.lock();
+                consumer.receive_wakers.drain().collect()
+            };
+            for w in wakers {
+                w.wake();
+            }
+        }
+
+        // (5) Terminate any stranded lookup requests not already keyed in
+        // `pending_requests` (belt-and-suspenders, mirrors `reset`).
+        let stranded_lookup_ids = self.lookup.pending_request_ids();
+        for rid in stranded_lookup_ids {
+            let key = PendingOpKey::Request(rid);
+            self.outcomes.insert(
+                key,
+                OpOutcome::Terminal {
+                    key,
+                    reason: reason.to_owned(),
+                },
+            );
+            self.wake_for_request(rid);
+        }
+
+        // (6) Queue a `Closed` event. Event-stream waiters
+        // (`ProducerReadyFut` / `SubscribeAckedFut`) park on the event queue +
+        // `driver_waker`, NOT the waker slab, so the `Closed` event is the only
+        // thing that unblocks them on a terminal drop.
+        self.events.push_back(ConnectionEvent::Closed {
+            reason: Some(reason.to_owned()),
+        });
+    }
+
     /// Reason the last handshake attempt failed, if the broker sent a
     /// `CommandError` while in `ConnectSent` / `AuthChallenging` state.
     /// Engines surface this in the user-facing connect error so
@@ -5248,6 +5377,116 @@ mod conn_state_tests {
             HandshakeState::Uninitialized,
             "reset snaps state back to Uninitialized so begin_handshake can fire on a new socket"
         );
+    }
+
+    /// `fail_all_pending` is the terminal counterpart of `reset`: it resolves
+    /// EVERY pending op — including `Send` keys — with `OpOutcome::Terminal`
+    /// (not the replay-oriented `SessionLost`), wakes each waiter exactly once,
+    /// queues a `Closed` event for the event-stream waiters, installs NO replay
+    /// snapshot, and leaves the handshake state untouched (the driver pairs it
+    /// with `mark_disconnected`). ADR-0055.
+    #[test]
+    fn fail_all_pending_terminalizes_every_pending_op() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        assert!(conn.is_connected());
+        // Drain the `Connected` event so the only event left after
+        // `fail_all_pending` is the `Closed` we assert on.
+        while conn.poll_event().is_some() {}
+
+        // A request-bound op + an in-flight publish, each with a registered
+        // user-future waker.
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&counter).into();
+
+        let request_id = conn.get_partitioned_topic_metadata("persistent://public/default/t");
+        let req_key = PendingOpKey::Request(request_id);
+        conn.register_waker(req_key, waker.clone());
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/p".to_owned(),
+            ..Default::default()
+        });
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"hi"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 2,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("send queues");
+        let send_key = PendingOpKey::Send(producer, seq);
+        conn.register_waker(send_key, waker);
+        assert_eq!(conn.producer_pending_count(producer), 1);
+
+        conn.fail_all_pending("peer closed");
+
+        // (1) BOTH keys — including the Send key — surface `Terminal`.
+        assert!(
+            matches!(
+                conn.take_outcome(req_key),
+                Some(OpOutcome::Terminal { key: k, .. }) if k == req_key
+            ),
+            "request-bound op fails with Terminal"
+        );
+        assert!(
+            matches!(
+                conn.take_outcome(send_key),
+                Some(OpOutcome::Terminal { key: k, .. }) if k == send_key
+            ),
+            "in-flight publish fails with Terminal (no replay, unlike reset)"
+        );
+        // (2) Each future was woken exactly once.
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            2,
+            "both wakers fired once"
+        );
+        // (3) A `Closed` event carries the reason for the event-stream waiters.
+        assert!(
+            matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::Closed { reason: Some(r) }) if r == "peer closed"
+            ),
+            "a Closed event is queued so ProducerReady/SubscribeAcked unblock"
+        );
+        // (4) NO replay snapshot — terminal means terminal.
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            0,
+            "fail_all_pending installs no replay snapshot"
+        );
+        // (5) State is untouched — the driver pairs this with `mark_disconnected`.
+        assert_eq!(conn.state(), HandshakeState::Connected);
+
+        // (6) Idempotent: a second call (e.g. a later `close()`) must not panic.
+        conn.fail_all_pending("peer closed");
     }
 
     #[test]

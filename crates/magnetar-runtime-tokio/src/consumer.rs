@@ -387,6 +387,7 @@ impl Consumer {
                 OpOutcome::Error { code, message, .. } => {
                     Err(ClientError::Broker { code, message })
                 }
+                OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
                 other => Err(ClientError::Other(format!(
                     "unexpected ack outcome: {other:?}"
                 ))),
@@ -470,6 +471,7 @@ impl Consumer {
                 last_message_id, ..
             } => Ok(last_message_id),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected last_message_id outcome: {other:?}"
             ))),
@@ -534,6 +536,7 @@ impl Consumer {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -637,6 +640,7 @@ impl Consumer {
                 Ok(())
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected seek outcome: {other:?}"
             ))),
@@ -676,6 +680,7 @@ impl Consumer {
                 Ok(())
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected unsubscribe outcome: {other:?}"
             ))),
@@ -706,6 +711,7 @@ impl Consumer {
                 Ok(())
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected close outcome: {other:?}"
             ))),

@@ -557,6 +557,7 @@ impl<P: Providers> Producer<P> {
                 Ok(())
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected outcome for close request {request_id}: {other:?}"
             ))),
@@ -610,6 +611,7 @@ impl<P: Providers> Producer<P> {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -878,6 +880,7 @@ fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> 
     match outcome {
         OpOutcome::SendReceipt { message_id, .. } => Ok(message_id),
         OpOutcome::SendError { code, message, .. } => Err(ClientError::Broker { code, message }),
+        OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
         other => Err(ClientError::Other(format!(
             "unexpected send outcome: {other:?}"
         ))),
