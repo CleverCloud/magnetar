@@ -13,12 +13,12 @@
 //! identical to its sibling capture tests). The scenario:
 //!
 //! 1. connect → producer open (acked) → one send → receipt — healthy session;
-//! 2. the broker DROPS the connection; the client queues a second send whose
-//!    future stays pending across the reconnect (transparent replay);
+//! 2. the broker DROPS the connection; the client queues a second send whose future stays pending
+//!    across the reconnect (transparent replay);
 //! 3. the supervisor redials; the rebuild's `CommandProducer` is acked with
 //!    `CommandProducerSuccess`;
-//! 4. the queued send must reach the wire ONLY AFTER that ack, exactly
-//!    once; the receipt resolves the user-facing future.
+//! 4. the queued send must reach the wire ONLY AFTER that ack, exactly once; the receipt resolves
+//!    the user-facing future.
 //!
 //! Twin asymmetry (documented engine gap, mirrors the
 //! `logging_no_secrets` precedent): the tokio twin additionally exercises
@@ -116,7 +116,6 @@ fn emit_producer_success(out: &mut BytesMut, request_id: u64) {
     };
     let _ = encode_command(out, &cmd);
 }
-
 
 fn emit_send_receipt(out: &mut BytesMut, producer_id: u64, sequence_id: u64) {
     let cmd = pb::BaseCommand {

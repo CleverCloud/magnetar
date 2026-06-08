@@ -197,7 +197,9 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     let send_outcome: Result<(), Box<dyn std::error::Error>> = loop {
         attempts += 1;
         if attempts > 30 {
-            break Err("send did not complete within 30 bounded attempts after broker restart".into());
+            break Err(
+                "send did not complete within 30 bounded attempts after broker restart".into(),
+            );
         }
         match tokio::time::timeout(
             Duration::from_secs(10),

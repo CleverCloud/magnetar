@@ -1459,14 +1459,13 @@ impl ProducerState {
     /// parity; replaying earlier makes the broker close the connection
     /// with "producer is not ready"). For each snapshot:
     ///
-    /// 1. Every cached [`OutboundFrame`] is pushed onto the FRONT of the producer's outbound
-    ///    queue (preserving wire order; a chunked publish replays N frames in the same relative
-    ///    order as the original emit). Front insertion keeps sequence-id order: snapshots
-    ///    predate anything the user queued during the rebuild window, which is already staged
-    ///    behind the drain gate.
+    /// 1. Every cached [`OutboundFrame`] is pushed onto the FRONT of the producer's outbound queue
+    ///    (preserving wire order; a chunked publish replays N frames in the same relative order as
+    ///    the original emit). Front insertion keeps sequence-id order: snapshots predate anything
+    ///    the user queued during the rebuild window, which is already staged behind the drain gate.
     /// 2. The snapshot's [`OpSend`] is re-inserted at the FRONT of `pending` with `waker: None`.
-    ///    The user's send future re-registers on the next `poll` after the wake-up. The
-    ///    sequence-id index is rebuilt wholesale afterwards.
+    ///    The user's send future re-registers on the next `poll` after the wake-up. The sequence-id
+    ///    index is rebuilt wholesale afterwards.
     ///
     /// Counter side-effects (`total_msgs_sent`, `total_bytes_sent`) are NOT incremented
     /// — the original emit already counted them; a re-send is not "new" traffic from a
@@ -1505,11 +1504,11 @@ impl ProducerState {
     /// pushes the `OpSend`s into `pending` from scratch.
     ///
     /// Two skip rules:
-    /// - `OpSend`s with empty `replay_frames` (in-progress batched sends from
-    ///   `add_to_batch`) — their wire bytes only materialise at `flush_batch` time.
-    /// - `OpSend`s whose frames are STILL STAGED in `outbound` (queued behind the
-    ///   `broker_ready` drain gate during the not-ready window) — re-emitting those
-    ///   would double-publish once the gate opens.
+    /// - `OpSend`s with empty `replay_frames` (in-progress batched sends from `add_to_batch`) —
+    ///   their wire bytes only materialise at `flush_batch` time.
+    /// - `OpSend`s whose frames are STILL STAGED in `outbound` (queued behind the `broker_ready`
+    ///   drain gate during the not-ready window) — re-emitting those would double-publish once the
+    ///   gate opens.
     ///
     /// Re-emitted frames go to the FRONT of `outbound` (they are older than anything
     /// staged during the not-ready window), preserving sequence-id order on the wire.

@@ -7231,7 +7231,10 @@ mod conn_state_tests {
             "exactly one replayed send after the retry ack; got commands: {:?}",
             post_ack.iter().map(|c| c.r#type).collect::<Vec<_>>()
         );
-        assert_eq!(sends[0].sequence_id, seq.0, "original sequence id preserved");
+        assert_eq!(
+            sends[0].sequence_id, seq.0,
+            "original sequence id preserved"
+        );
     }
 
     /// Batch cleared on reset: messages buffered in the producer's batch container (i.e.

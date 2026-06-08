@@ -10,15 +10,15 @@
 //! cannot see driver-loop ordering):
 //!
 //! 1. connect → producer open (acked) → one send → receipt — healthy session;
-//! 2. the broker DROPS the connection; the client queues a second send whose
-//!    future stays pending across the reconnect (transparent replay);
-//! 3. the supervisor redials; the rebuild's `CommandProducer` is answered
-//!    with a TRANSIENT `ServiceNotReady` ("Please redo the lookup" — the
-//!    post-restart bundle-not-served case), forcing the lookup + retry leg;
+//! 2. the broker DROPS the connection; the client queues a second send whose future stays pending
+//!    across the reconnect (transparent replay);
+//! 3. the supervisor redials; the rebuild's `CommandProducer` is answered with a TRANSIENT
+//!    `ServiceNotReady` ("Please redo the lookup" — the post-restart bundle-not-served case),
+//!    forcing the lookup + retry leg;
 //! 4. the retry's `CommandProducer` is acked with `CommandProducerSuccess`;
-//! 5. the queued send must reach the wire ONLY AFTER that ack (a premature
-//!    send makes a real broker close the whole connection — the livelock),
-//!    and exactly once; the receipt resolves the user-facing future.
+//! 5. the queued send must reach the wire ONLY AFTER that ack (a premature send makes a real broker
+//!    close the whole connection — the livelock), and exactly once; the receipt resolves the
+//!    user-facing future.
 
 #![forbid(unsafe_code)]
 
@@ -316,8 +316,10 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let receipt = tokio::time::timeout(Duration::from_secs(20), producer.send_bytes(&b"two"[..]))
         .await
-        .expect("replayed send must resolve after the retry ack — the \
-                 producer-not-ready gate must not starve it")
+        .expect(
+            "replayed send must resolve after the retry ack — the \
+                 producer-not-ready gate must not starve it",
+        )
         .expect("replayed send must succeed");
     let _ = receipt;
 
