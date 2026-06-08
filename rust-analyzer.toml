@@ -1,0 +1,42 @@
+# rust-analyzer workspace configuration (editor-agnostic).
+#
+# rust-analyzer reads this file from the workspace root regardless of the
+# editor in front of it (VS Code, Neovim, Helix, Zed, Emacs/eglot, …), so
+# it ships the right analysis defaults to every contributor without a
+# per-editor `settings.json`.
+#
+# Why an explicit feature list instead of `cargo.features = "all"`:
+#
+#   The e2e tests in `crates/magnetar/tests/e2e_*.rs` use optional, feature-
+#   gated dependencies unconditionally — `magnetar_admin` (behind `admin`),
+#   the moonpool engine, the auth crates, etc. (ADR-0046: e2e tests are plain
+#   tests, run under `cargo test --workspace --all-features`). With the
+#   default feature set rust-analyzer cannot see those crates and reports
+#   false E0432/E0433 "cannot find crate `magnetar_admin`" errors.
+#
+#   `cargo.features = "all"` would fix the imports but also enables the
+#   `crypto-fips` feature, which builds `aws-lc-fips-sys`. Its `delocate`
+#   step fails under gcc 16 on Fedora (it rejects `.data.rel.ro.local`
+#   sections), so rust-analyzer's own background `cargo check` would break.
+#   The clang toolchain override that the CLI uses
+#   (`CC=clang CXX=clang++ ASM=clang AR=llvm-ar RANLIB=llvm-ranlib`) can
+#   only be injected via a client-specific `extraEnv` setting, which is NOT
+#   editor-agnostic and cannot live in this file.
+#
+#   So we enable every feature the tests actually need EXCEPT `crypto-fips`,
+#   keeping the default rustls crypto provider `crypto-aws-lc-rs`. This
+#   resolves the false errors with no toolchain env juggling and works in
+#   any editor. The CI gate (`cargo test --workspace --all-features`) still
+#   exercises `crypto-fips`; rust-analyzer just does not need it to type-check.
+
+[cargo]
+features = [
+    "tokio",
+    "moonpool",
+    "admin",
+    "auth-oauth2",
+    "auth-sasl",
+    "auth-athenz",
+    "encryption",
+    "crypto-aws-lc-rs",
+]
