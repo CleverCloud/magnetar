@@ -1215,7 +1215,8 @@ impl<P: Providers + Send + Sync> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
-    /// - [`ClientError::Other`] on connection close before the subscribe acked.
+    /// - [`ClientError::PeerClosed`] on a TERMINAL connection drop before the subscribe acked
+    ///   (ADR-0055 §1); a user-requested graceful close surfaces [`ClientError::Closed`].
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer<P>, ClientError> {
         self.subscribe_with(req, None).await
     }
@@ -1225,7 +1226,8 @@ impl<P: Providers + Send + Sync> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
-    /// - [`ClientError::Other`] on connection close before the subscribe acked.
+    /// - [`ClientError::PeerClosed`] on a TERMINAL connection drop before the subscribe acked
+    ///   (ADR-0055 §1); a user-requested graceful close surfaces [`ClientError::Closed`].
     pub async fn subscribe_with(
         &self,
         req: SubscribeRequest,
@@ -1572,17 +1574,25 @@ impl Future for SubscribeAckedFut {
                         this.shared.topic_list_notify.notify_waiters();
                     }
                     Some(ConnectionEvent::Closed { reason }) => {
-                        // Broker/connection-level forced close — warn! per
-                        // ADR-0054 §2.1. `reason` is broker-controlled text.
+                        // Connection-level close while a subscribe future was
+                        // parked. ADR-0055 §1: a TERMINAL drop
+                        // (`fail_all_pending`, which carries a `reason`) must
+                        // unblock the waiter with the terminal `PeerClosed`,
+                        // mirroring the tokio engine and the request / send /
+                        // receive surfaces — not a generic `Other`. A
+                        // user-requested graceful `close()` (reason `None`)
+                        // keeps the `Closed` mapping. warn! per ADR-0054 §2.1;
+                        // `reason` is broker-controlled text.
                         tracing::warn!(
                             reason = reason
                                 .as_deref()
                                 .map(crate::log_fields::truncate_broker_str),
                             "connection closed while waiting for consumer readiness"
                         );
-                        return Poll::Ready(Err(ClientError::Other(
-                            reason.unwrap_or_else(|| "connection closed".to_owned()),
-                        )));
+                        return Poll::Ready(Err(match reason {
+                            Some(_) => ClientError::PeerClosed,
+                            None => ClientError::Closed,
+                        }));
                     }
                     Some(_) => {} // ignore unrelated events
                     None => break,

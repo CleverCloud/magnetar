@@ -1586,17 +1586,26 @@ impl Future for EventWaitFut {
                     }
                 }
                 Some(ConnectionEvent::Closed { reason }) => {
-                    // Broker/connection-level forced close — warn! per
-                    // ADR-0054 §2.1. `reason` is broker-controlled text.
+                    // Connection-level close while a producer-open / subscribe
+                    // future was parked. ADR-0055 §1: a TERMINAL drop
+                    // (`fail_all_pending`, which carries a `reason`) must
+                    // unblock the waiter with the terminal `PeerClosed`, the
+                    // same outcome the request / send / receive surfaces — not
+                    // a generic `Other`. A user-requested graceful `close()`
+                    // (reason `None`) keeps the existing `Closed` mapping so
+                    // "user wants out" stays distinguishable from "peer went
+                    // away". warn! per ADR-0054 §2.1; `reason` is
+                    // broker-controlled text.
                     tracing::warn!(
                         reason = reason
                             .as_deref()
                             .map(crate::log_fields::truncate_broker_str),
                         "connection closed while waiting for producer/consumer readiness"
                     );
-                    return Poll::Ready(Err(ClientError::Other(
-                        reason.unwrap_or_else(|| "connection closed".into()),
-                    )));
+                    return Poll::Ready(Err(match reason {
+                        Some(_) => ClientError::PeerClosed,
+                        None => ClientError::Closed,
+                    }));
                 }
                 Some(_) => {} // ignore unrelated events
                 None => break,

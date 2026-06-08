@@ -47,6 +47,9 @@ Add a terminal outcome `OpOutcome::Terminal { key, reason }`, distinct from the 
 On a **plain** driver's terminal exit — fatal decode, peer close, or I/O error — the engine resolves **every** pending op (`Request` keys, `Send` keys, and the consumer receive-waker slab) with `Terminal`, queues a `ConnectionEvent::Closed { reason }` so the event-stream waiters (`ProducerReady` / `SubscribeAcked`) unblock, and wakes all waiters.
 Each engine maps `OpOutcome::Terminal` to `ClientError::PeerClosed`, so an in-flight `subscribe()` / `send()` / `receive()` returns promptly instead of stalling.
 
+The event-stream waiters (`ProducerReady` / `SubscribeAcked` futures) park on `ConnectionEvent::Closed`, not on the op-outcome slab, so their `Closed` arm distinguishes the two producers of that event by `reason`: a `Closed { reason: Some(_) }` (the terminal drop `fail_all_pending` queues) surfaces `ClientError::PeerClosed` — the same terminal outcome the request / send / receive paths give — while a `Closed { reason: None }` (a user-requested graceful `close()`) keeps the pre-existing `ClientError::Closed`.
+Before this amendment those waiters surfaced a generic `ClientError::Other(reason)` on either, which a caller could not tell apart from an unrelated engine error.
+
 The supervised path is unchanged: a transient drop still routes through `reset()` for transparent at-least-once replay (ADR-0038).
 `fail_all_pending` fires **only** on a genuinely-terminal exit — the plain spawn, a supervisor that has exhausted its attempts, or a user-requested close — never on the per-attempt reconnect.
 
@@ -59,8 +62,14 @@ No corruption-specific recovery path is added; corruption simply joins the set o
 ### §3 `sim_chaos` workload tests run supervised over a persistent broker
 
 Every bit-flip-exposed `sim_chaos` workload test that uses a plain client with delivery assertions is converted to a **supervised** client.
-The in-sim broker persists its ledger + per-subscription cursor in shared state that survives the per-session reset, resumes a re-subscribe from the acked cursor (`resume_from = last_acked_message_id`, redelivering only un-acked messages), and dedups replayed publishes by `(producer, sequence_id)`.
+The in-sim broker persists its ledger + per-subscription cursor in an `Arc<Mutex<SharedBroker>>` keyed by **stable identity** — topic for the ledger + next-entry-id, subscription **name** for the cursor — that survives the per-session reset, resumes a re-subscribe from the acked cursor (`start_message_id = last_acked_message_id`, redelivering only un-acked messages), and dedups replayed publishes by `(topic, sequence_id)` (re-emitting the existing receipt, and recording the `SENDS_TRAIL` correctness fact only on the *first* acceptance so the monotonic-sequence-id invariant still holds).
+The shared state is cleared per iteration in the broker workload's `Workload::setup` (one workload instance is reused across a seed sweep).
 The consumer drain loops dedup received message ids by `(ledger_id, entry_id)` to absorb legitimate at-least-once redelivery.
+
+Two test-harness mechanics fall out of the supervised conversion:
+
+- the in-sim broker session loop races its socket read against a short injected-clock **dispatch tick** (`TimeProvider::sleep`, ADR-0011 — no host clock), so a redelivery that becomes available with no inbound traffic (a clog lifting after the producer is done, or a reconnect's replayed publish while a consumer sits in `receive()`) is still pushed; previously the broker only re-evaluated delivery when an inbound frame arrived;
+- the workloads retry the setup-phase `subscribe` / `open_producer` across a transient drop. A bit-flip on the in-flight LOOKUP behind those calls surfaces as a transient `SessionLost` (the supervisor is reconnecting) that the engine does not transparently re-issue, so the workload re-issues the op against the freshly-handshaked session — mirroring the Java client's lookup-after-reset retry. This is setup-phase resilience only; it weakens no delivery / dedup assertion.
 
 ## Consequences
 
