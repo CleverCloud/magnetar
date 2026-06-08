@@ -61,14 +61,16 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 1. **Moonpool transient-retry arms are missing**: the moonpool driver never consumes `ProducerOpenFailedTransient` / `SubscribeFailedTransient` (the tokio driver runs the lookup-then-retry leg; moonpool has zero `Transient` matches).
    A post-restart broker answering a rebuild with `ServiceNotReady` dead-ends the re-attach on the moonpool engine.
    The `reconnect_replay_gating` twins document the asymmetry in-file.
-2. **Differential harness has no connection-drop knob**: `ScriptedBroker` accepts multiple sessions but cannot script a mid-scenario drop + redial, so the re-attach replay fix carries proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out in the commit message.
-   Add a `drop_connection_after(...)` injection and a reconnect equivalence scenario.
-3. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
+2. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
    Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
+
+(Closed residual: the differential harness had no connection-drop knob — `ScriptedBroker` accepted multiple sessions but could not script a mid-scenario drop + redial, so the re-attach replay fix carried proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out.
+Closed by `ScriptedBroker::drop_connection_after`, a cross-session ledger + durable per-subscription cursor that survives the redial, supervised runner entry points, and the `reconnect_replay_gating_equivalence` differential scenario asserting tokio ↔ moonpool `EventStream` parity in event order with resume-from-acked-cursor — see the `test(differential)` commit.
+The harness reset is `ScriptedBroker::clear_cross_session_state`, with a `broker_smoke` guard that two back-to-back legs each start from an empty ledger.)
 
 (Closed residual: the `e2e_reconnect` send-loop hygiene gap — unbounded `send().await` turning environmental broker death into an infinite hang — was fixed in the same series after a crashed standalone container hung the validation chain for 20 hours; each send attempt is now timeout-bounded.)
 
-**Why it stays open.** 1 + 2 are engine/harness features with their own ADR-0024 test obligations; 3 changes user-visible supervision semantics (needs a small design pass against Java parity).
+**Why it stays open.** 1 is an engine feature with its own ADR-0024 test obligations; 2 changes user-visible supervision semantics (needs a small design pass against Java parity).
 
 **Why it stays open.** Needs a design decision on where the mechanism lives (subscriber vs library) before any guidance is written; picking the library side adds per-callsite state and an API surface that the subscriber side gets for free.
 
@@ -108,8 +110,9 @@ Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
 - **`check-sim-coverage` reports ~77 uncovered lines.** The diff is computed vs `origin/main`, so it bundles the prior terminal-outcome commit plus line-number-shift artifacts of pre-existing code; the behavioral lines this change adds (the `Closed → PeerClosed` waiter mappings, the decode-fatal broker hook, the fatal-on-send arm) are exercised by the new differential + integration tests.
   The gate is local-first / scheduled-CI (it short-circuits on `main`); dispatch it from a feature branch for true patch gating once `feat/logging` lands on `main`.
 
-**Partial progress on [§3.2](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).** This change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
-The mid-scenario **drop + redial** knob §3.2 asks for is still open.
+**Progress on [§3 reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).**
+The ADR-0055 change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
+The mid-scenario **drop + redial** knob that residual asked for has since landed: `ScriptedBroker::drop_connection_after` + a cross-session ledger / durable cursor + the `reconnect_replay_gating_equivalence` differential scenario (see the `test(differential)` commit and the closed-residual note under §3).
 
 **Why it stays open.** §4.1 + §4.2 are engine features with their own ADR-0024 test obligations and a small Java-parity design pass; the test-state caveats are pre-existing suite issues / gate mechanics, not survivability work.
 
