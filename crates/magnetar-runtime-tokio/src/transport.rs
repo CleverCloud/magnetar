@@ -60,6 +60,15 @@ impl Transport {
         resolver: Option<&dyn DnsResolver>,
         connect_timeout: std::time::Duration,
     ) -> Result<Self, ClientError> {
+        // Per-operation dial record — `debug!` per ADR-0054 §2.1; failures
+        // are logged by the callers (supervisor / connect retry).
+        tracing::debug!(
+            host = %url.host,
+            port = url.port,
+            tls = matches!(url.scheme, Scheme::Tls),
+            connect_timeout_ms = u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX),
+            "dialling broker"
+        );
         match tokio::time::timeout(
             connect_timeout,
             Self::connect_with_resolver_inner(url, tls_config, resolver),

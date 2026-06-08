@@ -325,14 +325,29 @@ impl Client {
         // Park until the state machine emits `ConnectionEvent::Connected`. We do this with a
         // local future that polls the event queue.
         match wait_connected(shared.clone()).await {
-            Ok(()) => Ok(Self {
-                shared,
-                driver: Mutex::new(Some(driver)),
-                // `from_socket` has no URL to dial back through, so the proxy pool is
-                // disabled. A lookup that returns `proxy_through_service_url = true`
-                // surfaces `ClientError::ProxyUnsupportedOnSocketClient`.
-                pool: None,
-            }),
+            Ok(()) => {
+                // Lifecycle record (ADR-0054). The generic-socket path has no
+                // URL, so the dial target is reported as the transport kind.
+                // `auth_method` is the provider's method name — NEVER
+                // `auth_data` (ADR-0054 no-secrets rule).
+                let auth_method = shared
+                    .auth_provider
+                    .as_deref()
+                    .map_or("none", |p| p.method());
+                tracing::info!(
+                    auth_method,
+                    transport = "generic-socket",
+                    "connection established"
+                );
+                Ok(Self {
+                    shared,
+                    driver: Mutex::new(Some(driver)),
+                    // `from_socket` has no URL to dial back through, so the proxy pool is
+                    // disabled. A lookup that returns `proxy_through_service_url = true`
+                    // surfaces `ClientError::ProxyUnsupportedOnSocketClient`.
+                    pool: None,
+                })
+            }
             Err(e) => {
                 driver.abort();
                 Err(e)
@@ -366,6 +381,12 @@ impl Client {
         shared.inner.lock().begin_handshake()?;
         shared.driver_waker.notify_one();
 
+        // Snapshot the dial identity for the lifecycle record below — `url`
+        // and `tls_config` move into the reconnect context.
+        let host = url.host.clone();
+        let port = url.port;
+        let tls = tls_config.is_some();
+
         let ctx = ReconnectContext {
             url,
             tls_config,
@@ -375,11 +396,21 @@ impl Client {
         let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
 
         match wait_connected(shared.clone()).await {
-            Ok(()) => Ok(Self {
-                shared,
-                driver: Mutex::new(Some(driver)),
-                pool: Some(ProxyConnectionPool::new(factory)),
-            }),
+            Ok(()) => {
+                // Lifecycle record (ADR-0054). `auth_method` is the
+                // provider's method name — NEVER `auth_data` (no-secrets
+                // rule).
+                let auth_method = shared
+                    .auth_provider
+                    .as_deref()
+                    .map_or("none", |p| p.method());
+                tracing::info!(host = %host, port, tls, auth_method, "connection established");
+                Ok(Self {
+                    shared,
+                    driver: Mutex::new(Some(driver)),
+                    pool: Some(ProxyConnectionPool::new(factory)),
+                })
+            }
             Err(e) => {
                 driver.abort();
                 Err(e)
@@ -435,6 +466,16 @@ impl Client {
         };
         target_shared.driver_waker.notify_one();
         wait_producer_ready(&target_shared, handle).await?;
+        // Lifecycle record (ADR-0054): the broker-assigned producer name is
+        // available once `ProducerReady` has landed. Per-slot read only.
+        let producer_name = slot.state.lock().name.clone().unwrap_or_default();
+        tracing::info!(
+            topic = %slot.identity.topic,
+            producer_name = %producer_name,
+            handle = ?handle,
+            access_mode = ?slot.identity.access_mode,
+            "producer created"
+        );
         Ok(Producer {
             shared: target_shared,
             handle,
@@ -541,6 +582,7 @@ impl Client {
                 }
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected lookup outcome: {other:?}"
             ))),
@@ -666,6 +708,7 @@ impl Client {
             magnetar_proto::OpOutcome::NewTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected new_txn outcome: {other:?}"
             ))),
@@ -721,6 +764,9 @@ impl Client {
             OpOutcome::Error { code, message, .. } => {
                 return Err(ClientError::Broker { code, message });
             }
+            OpOutcome::Terminal { .. } => {
+                return Err(ClientError::PeerClosed);
+            }
             other => {
                 return Err(ClientError::Other(format!(
                     "unexpected tc_client_connect outcome: {other:?}"
@@ -752,6 +798,7 @@ impl Client {
             magnetar_proto::OpOutcome::AddPartitionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected add_partition_to_txn outcome: {other:?}"
             ))),
@@ -780,6 +827,7 @@ impl Client {
             magnetar_proto::OpOutcome::AddSubscriptionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected add_subscription_to_txn outcome: {other:?}"
             ))),
@@ -807,6 +855,7 @@ impl Client {
             magnetar_proto::OpOutcome::EndTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected end_txn outcome: {other:?}"
             ))),
@@ -837,6 +886,7 @@ impl Client {
             magnetar_proto::OpOutcome::Error { code, message, .. } => {
                 Err(ClientError::Broker { code, message })
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected topic-list snapshot outcome: {other:?}"
             ))),
@@ -932,6 +982,7 @@ impl Client {
                     Ok(partitions)
                 }
             }
+            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected partitioned metadata outcome: {other:?}"
             ))),
@@ -1089,6 +1140,14 @@ impl Client {
         }
         target_shared.driver_waker.notify_one();
 
+        // Lifecycle record (ADR-0054).
+        tracing::info!(
+            topic = %slot.identity.topic,
+            subscription = %slot.identity.subscription,
+            handle = ?handle,
+            "consumer subscribed"
+        );
+
         Ok(Consumer {
             shared: target_shared,
             handle,
@@ -1191,7 +1250,7 @@ fn preferred_broker_url(
         Some(format!("{}:{}", parsed.host, parsed.port))
     } else {
         tracing::warn!(
-            broker_url = %raw,
+            broker_url = %crate::log_fields::truncate_broker_str(&raw),
             "lookup advertised broker URL with unparseable scheme; \
              forwarding unchanged — proxy may reject handshake",
         );
@@ -1453,9 +1512,27 @@ impl Future for EventWaitFut {
                         }
                     }
                 }
-                Some(ConnectionEvent::ProducerClosedByBroker { handle, .. }) => {
+                Some(ConnectionEvent::ProducerClosedByBroker {
+                    handle,
+                    assigned_broker_service_url,
+                }) => {
                     if let EventMatcher::ProducerReady(h) = this.matcher {
                         if h == handle {
+                            // Broker-forced close — degraded-but-recovering
+                            // (warn! per ADR-0054 §2.1); the open future
+                            // surfaces `Closed` and the caller decides.
+                            let topic = conn
+                                .producer(handle)
+                                .map(|s| s.identity.topic.clone())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                handle = ?handle,
+                                topic = %topic,
+                                assigned_broker_service_url = assigned_broker_service_url
+                                    .as_deref()
+                                    .map(crate::log_fields::truncate_broker_str),
+                                "broker closed producer while waiting for ProducerReady"
+                            );
                             return Poll::Ready(Err(ClientError::Closed));
                         }
                     }
@@ -1471,9 +1548,28 @@ impl Future for EventWaitFut {
                         }
                     }
                 }
-                Some(ConnectionEvent::ConsumerClosedByBroker { handle, .. }) => {
+                Some(ConnectionEvent::ConsumerClosedByBroker {
+                    handle,
+                    assigned_broker_service_url,
+                }) => {
                     if let EventMatcher::SubscribeAcked(h) = this.matcher {
                         if h == handle {
+                            // Broker-forced close — warn! per ADR-0054 §2.1.
+                            let (topic, subscription) = conn
+                                .consumer(handle)
+                                .map(|s| {
+                                    (s.identity.topic.clone(), s.identity.subscription.clone())
+                                })
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                handle = ?handle,
+                                topic = %topic,
+                                subscription = %subscription,
+                                assigned_broker_service_url = assigned_broker_service_url
+                                    .as_deref()
+                                    .map(crate::log_fields::truncate_broker_str),
+                                "broker closed consumer while waiting for SubscribeAcked"
+                            );
                             return Poll::Ready(Err(ClientError::Closed));
                         }
                     }
@@ -1490,9 +1586,26 @@ impl Future for EventWaitFut {
                     }
                 }
                 Some(ConnectionEvent::Closed { reason }) => {
-                    return Poll::Ready(Err(ClientError::Other(
-                        reason.unwrap_or_else(|| "connection closed".into()),
-                    )));
+                    // Connection-level close while a producer-open / subscribe
+                    // future was parked. ADR-0055 §1: a TERMINAL drop
+                    // (`fail_all_pending`, which carries a `reason`) must
+                    // unblock the waiter with the terminal `PeerClosed`, the
+                    // same outcome the request / send / receive surfaces — not
+                    // a generic `Other`. A user-requested graceful `close()`
+                    // (reason `None`) keeps the existing `Closed` mapping so
+                    // "user wants out" stays distinguishable from "peer went
+                    // away". warn! per ADR-0054 §2.1; `reason` is
+                    // broker-controlled text.
+                    tracing::warn!(
+                        reason = reason
+                            .as_deref()
+                            .map(crate::log_fields::truncate_broker_str),
+                        "connection closed while waiting for producer/consumer readiness"
+                    );
+                    return Poll::Ready(Err(match reason {
+                        Some(_) => ClientError::PeerClosed,
+                        None => ClientError::Closed,
+                    }));
                 }
                 Some(_) => {} // ignore unrelated events
                 None => break,

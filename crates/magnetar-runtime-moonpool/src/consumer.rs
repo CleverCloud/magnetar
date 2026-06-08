@@ -353,6 +353,13 @@ impl<P: Providers> Consumer<P> {
                 .consumer_topic(self.handle)
                 .unwrap_or("")
                 .to_owned();
+            // Per-message DLQ detail — `debug!` per ADR-0054 §2.1; payload
+            // bytes are never logged.
+            tracing::debug!(
+                message_id = %msg.message_id,
+                topic = %real_topic,
+                "republishing dead-letter message"
+            );
             Self::apply_property_overrides(
                 &mut metadata.properties,
                 vec![
@@ -372,6 +379,11 @@ impl<P: Providers> Consumer<P> {
             dlq_producer.send(outgoing).await?;
             self.ack(msg.message_id).await?;
             count += 1;
+        }
+        if count > 0 {
+            // One success record per unit of work — `info!` per ADR-0054
+            // §2.1 (silent when nothing was drained to avoid no-op noise).
+            tracing::info!(count, "dead-letter republish complete");
         }
         Ok(count)
     }
@@ -434,6 +446,12 @@ impl<P: Providers> Consumer<P> {
         custom_properties: Vec<(String, String)>,
         delay: std::time::Duration,
     ) -> Result<(), ClientError> {
+        // Per-message retry-letter detail — `debug!` per ADR-0054 §2.1.
+        tracing::debug!(
+            message_id = %msg.message_id,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "scheduling reconsume"
+        );
         let mut metadata = magnetar_proto::pb::MessageMetadata {
             partition_key: msg.metadata.partition_key.clone(),
             partition_key_b64_encoded: msg.metadata.partition_key_b64_encoded,
@@ -770,6 +788,8 @@ impl<P: Providers> Consumer<P> {
     /// `CommandAck` so the message is never silently dropped. Mirrors
     /// Java's `acknowledgmentGroupTime` path.
     pub fn ack_grouped(&self, message_id: MessageId) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(handle = ?self.handle, message_id = %message_id, "grouped ack staged");
         // ADR-0011: route the sans-io monotonic input through the
         // engine-supplied clock so deterministic-sim runs feed virtual
         // Instants into `ack_grouped_individual`. Production TokioProviders
@@ -785,6 +805,12 @@ impl<P: Providers> Consumer<P> {
     /// Stage a cumulative ack into this consumer's ack-grouping tracker.
     /// See [`Self::ack_grouped`] for the semantics.
     pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(
+            handle = ?self.handle,
+            message_id = %message_id,
+            "grouped cumulative ack staged"
+        );
         // ADR-0011: engine-supplied clock; see `ack_grouped`.
         let now = self.shared.now_instant();
         {
@@ -801,6 +827,13 @@ impl<P: Providers> Consumer<P> {
         properties: Vec<(String, i64)>,
         txn_id: Option<magnetar_proto::TxnId>,
     ) -> Result<(), ClientError> {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(
+            handle = ?self.handle,
+            count = message_ids.len(),
+            ack_type = ?ack_type,
+            "ack enqueued"
+        );
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.ack(
@@ -822,6 +855,7 @@ impl<P: Providers> Consumer<P> {
         match outcome {
             OpOutcome::Success { .. } => Ok(()),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected ack outcome: {other:?}"
             ))),
@@ -841,6 +875,13 @@ impl<P: Providers> Consumer<P> {
     /// `message_ids` vector matches Pulsar's "all unacked" semantics
     /// used by [`Self::redeliver_unacked`].
     pub fn negative_ack_many(&self, message_ids: Vec<MessageId>) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1. An
+        // empty list is Pulsar's "redeliver all unacked" wildcard.
+        tracing::trace!(
+            handle = ?self.handle,
+            count = message_ids.len(),
+            "negative ack enqueued"
+        );
         // ADR-0011: engine-supplied clock; see `ack_grouped`.
         let now = self.shared.now_instant();
         {
@@ -854,6 +895,13 @@ impl<P: Providers> Consumer<P> {
     /// per-message redelivery delay. Mirrors Java's PIP-37 backoff
     /// path.
     pub fn negative_ack_with_delay(&self, message_id: MessageId, delay: std::time::Duration) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(
+            handle = ?self.handle,
+            message_id = %message_id,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "negative ack with delay enqueued"
+        );
         // ADR-0011: engine-supplied clock; see `ack_grouped`.
         let now = self.shared.now_instant();
         {
@@ -898,8 +946,19 @@ impl<P: Providers> Consumer<P> {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Lifecycle record (ADR-0054).
+                tracing::info!(
+                    topic = %self.slot.identity.topic,
+                    subscription = %self.slot.identity.subscription,
+                    handle = ?self.handle,
+                    force,
+                    "consumer unsubscribed"
+                );
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected unsubscribe outcome: {other:?}"
             ))),
@@ -962,6 +1021,8 @@ impl<P: Providers> Consumer<P> {
                     self.handle
                 ))
             })?;
+        // Per-operation internals — `debug!` per ADR-0054 §2.1.
+        tracing::debug!(topic = %topic, "schema lookup");
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.get_schema(&topic, version)
@@ -978,6 +1039,7 @@ impl<P: Providers> Consumer<P> {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -1006,6 +1068,7 @@ impl<P: Providers> Consumer<P> {
                 last_message_id, ..
             } => Ok(last_message_id),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected last_message_id outcome: {other:?}"
             ))),
@@ -1058,6 +1121,12 @@ impl<P: Providers> Consumer<P> {
     }
 
     async fn seek_inner(&self, target: SeekTarget) -> Result<(), ClientError> {
+        // Snapshot the seek target for the lifecycle record below (`target`
+        // moves into `conn.seek`).
+        let (seek_message_id, seek_timestamp) = match &target {
+            SeekTarget::MessageId(id) => (Some(id.to_string()), None),
+            SeekTarget::PublishTime(ts) => (None, Some(*ts)),
+        };
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.seek(self.handle, target)
@@ -1069,8 +1138,25 @@ impl<P: Providers> Consumer<P> {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Lifecycle record (ADR-0054). Unlike the tokio engine, the
+                // moonpool seek path has no implicit re-subscribe step
+                // (pre-existing engine asymmetry), so the resubscribe
+                // context fields are constant `false` here.
+                tracing::info!(
+                    topic = %self.slot.identity.topic,
+                    subscription = %self.slot.identity.subscription,
+                    handle = ?self.handle,
+                    message_id = seek_message_id.as_deref(),
+                    timestamp = seek_timestamp,
+                    resubscribe = false,
+                    redeliver_unacked_all = false,
+                    "consumer seek completed"
+                );
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected seek outcome: {other:?}"
             ))),
@@ -1099,8 +1185,18 @@ impl<P: Providers> Consumer<P> {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Lifecycle record (ADR-0054).
+                tracing::info!(
+                    topic = %self.slot.identity.topic,
+                    subscription = %self.slot.identity.subscription,
+                    handle = ?self.handle,
+                    "consumer closed"
+                );
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected close outcome: {other:?}"
             ))),
@@ -1119,7 +1215,8 @@ impl<P: Providers + Send + Sync> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
-    /// - [`ClientError::Other`] on connection close before the subscribe acked.
+    /// - [`ClientError::PeerClosed`] on a TERMINAL connection drop before the subscribe acked
+    ///   (ADR-0055 §1); a user-requested graceful close surfaces [`ClientError::Closed`].
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer<P>, ClientError> {
         self.subscribe_with(req, None).await
     }
@@ -1129,7 +1226,8 @@ impl<P: Providers + Send + Sync> Client<P> {
     ///
     /// # Errors
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
-    /// - [`ClientError::Other`] on connection close before the subscribe acked.
+    /// - [`ClientError::PeerClosed`] on a TERMINAL connection drop before the subscribe acked
+    ///   (ADR-0055 §1); a user-requested graceful close surfaces [`ClientError::Closed`].
     pub async fn subscribe_with(
         &self,
         req: SubscribeRequest,
@@ -1170,6 +1268,14 @@ impl<P: Providers + Send + Sync> Client<P> {
             }
         }
         shared.driver_waker.notify_one();
+
+        // Lifecycle record (ADR-0054).
+        tracing::info!(
+            topic = %slot.identity.topic,
+            subscription = %slot.identity.subscription,
+            handle = ?handle,
+            "consumer subscribed"
+        );
 
         Ok(Consumer {
             shared,
@@ -1429,9 +1535,25 @@ impl Future for SubscribeAckedFut {
                     Some(ConnectionEvent::SubscribeAcked { handle }) if handle == this.handle => {
                         return Poll::Ready(Ok(()));
                     }
-                    Some(ConnectionEvent::ConsumerClosedByBroker { handle, .. })
-                        if handle == this.handle =>
-                    {
+                    Some(ConnectionEvent::ConsumerClosedByBroker {
+                        handle,
+                        assigned_broker_service_url,
+                    }) if handle == this.handle => {
+                        // Broker-forced close — warn! per ADR-0054 §2.1.
+                        // Mirror of the tokio engine's `EventWaitFut` arm.
+                        let (topic, subscription) = conn
+                            .consumer(handle)
+                            .map(|s| (s.identity.topic.clone(), s.identity.subscription.clone()))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            handle = ?handle,
+                            topic = %topic,
+                            subscription = %subscription,
+                            assigned_broker_service_url = assigned_broker_service_url
+                                .as_deref()
+                                .map(crate::log_fields::truncate_broker_str),
+                            "broker closed consumer while waiting for SubscribeAcked"
+                        );
                         return Poll::Ready(Err(ClientError::Closed));
                     }
                     Some(ConnectionEvent::SubscribeFailed {
@@ -1452,9 +1574,25 @@ impl Future for SubscribeAckedFut {
                         this.shared.topic_list_notify.notify_waiters();
                     }
                     Some(ConnectionEvent::Closed { reason }) => {
-                        return Poll::Ready(Err(ClientError::Other(
-                            reason.unwrap_or_else(|| "connection closed".to_owned()),
-                        )));
+                        // Connection-level close while a subscribe future was
+                        // parked. ADR-0055 §1: a TERMINAL drop
+                        // (`fail_all_pending`, which carries a `reason`) must
+                        // unblock the waiter with the terminal `PeerClosed`,
+                        // mirroring the tokio engine and the request / send /
+                        // receive surfaces — not a generic `Other`. A
+                        // user-requested graceful `close()` (reason `None`)
+                        // keeps the `Closed` mapping. warn! per ADR-0054 §2.1;
+                        // `reason` is broker-controlled text.
+                        tracing::warn!(
+                            reason = reason
+                                .as_deref()
+                                .map(crate::log_fields::truncate_broker_str),
+                            "connection closed while waiting for consumer readiness"
+                        );
+                        return Poll::Ready(Err(match reason {
+                            Some(_) => ClientError::PeerClosed,
+                            None => ClientError::Closed,
+                        }));
                     }
                     Some(_) => {} // ignore unrelated events
                     None => break,

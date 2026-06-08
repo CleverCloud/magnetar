@@ -84,3 +84,7 @@ tempfile = { workspace = true }
 magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"] }
 wiremock = { workspace = true }
 serde_json = { workspace = true }
+# Global capturing subscriber for the ADR-0054 secret-scan test
+# (tests/logging_no_secrets.rs). Dev-only — the library itself never
+# installs a subscriber.
+tracing-subscriber = { workspace = true }

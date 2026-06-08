@@ -302,6 +302,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-no-internal-clock
 
+  log-fields:
+    name: log-fields (structured logging)
+    # Asserts every `error!` / `warn!` / `info!` tracing event in non-test
+    # workspace code carries at least one structured field (`debug!` /
+    # `trace!` exempt). Macro invocations are parsed parenthesis-balanced so
+    # multi-line invocations are classified whole. Mirrors ADR-0054.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --manifest-path xtask/Cargo.toml -- check-log-fields
+
   msrv:
     name: msrv (1.88)
     # Pin-check against the workspace MSRV declared in `Cargo.toml`

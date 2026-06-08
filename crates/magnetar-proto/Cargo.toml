@@ -71,3 +71,7 @@ rustc-hash   = { workspace = true }
 proptest  = { workspace = true }
 rstest    = { workspace = true }
 tempfile  = { workspace = true }
+# Capturing subscriber for the ADR-0054 log-emission unit tests
+# (`tests/log_capture.rs`). Dev-only — the production dependency graph
+# stays I/O-free (`cargo run -p xtask -- check-no-io-deps`).
+tracing-subscriber = { workspace = true }

@@ -57,9 +57,11 @@ fn open_producer(conn: &mut Connection, topic: &str, at: Instant) -> ProducerHan
         topic: topic.to_owned(),
         ..Default::default()
     };
-    let handle = conn.create_producer(req);
-    // Ack the producer-open round trip so the producer is in the "ready" state.
+    // Peek BEFORE create — `create_producer` consumes the next request id,
+    // and the ack must correlate with it (the producer-not-ready drain gate
+    // only opens on a matching `ProducerSuccess`).
     let request_id = next_unacked_request_id(conn);
+    let handle = conn.create_producer(req);
     let success = pb::BaseCommand {
         r#type: pb::base_command::Type::ProducerSuccess as i32,
         producer_success: Some(pb::CommandProducerSuccess {

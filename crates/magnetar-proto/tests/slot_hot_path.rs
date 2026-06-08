@@ -57,6 +57,29 @@ fn outgoing_message(payload: &'static [u8]) -> OutgoingMessage {
     }
 }
 
+/// Feed the `CommandProducerSuccess` for `request_id` — the broker ack that
+/// opens the producer-not-ready drain gate. Without it, staged SEND frames
+/// rightly never reach the connection buffer (a premature send makes the
+/// real broker close the whole connection).
+fn ack_producer_success(conn: &mut Connection, request_id: u64, now: Instant) {
+    let ack = pb::BaseCommand {
+        r#type: pb::base_command::Type::ProducerSuccess as i32,
+        producer_success: Some(pb::CommandProducerSuccess {
+            request_id,
+            producer_name: "p-hotpath".to_owned(),
+            last_sequence_id: Some(-1),
+            schema_version: None,
+            topic_epoch: None,
+            producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let mut buf = bytes::BytesMut::new();
+    magnetar_proto::encode_command(&mut buf, &ack).expect("encode ProducerSuccess");
+    conn.handle_bytes(now, &buf).expect("apply ProducerSuccess");
+    while let Some(_e) = conn.poll_event() {}
+}
+
 /// `ProducerSlot::queue_send` advances the per-producer sequence-id
 /// counter and stages a frame on the slot's outbound queue without ever
 /// needing a `Connection` borrow. Direct callers can drive the producer
@@ -108,13 +131,16 @@ fn producer_slot_queue_send_advances_sequence_without_connection() {
 fn drain_producer_outbound_lifts_per_slot_frames_to_connection_buffer() {
     let now = Instant::now();
     let mut conn = handshake_complete(now);
+    let create_rid = conn.peek_next_request_id_for_test();
     let handle = conn.create_producer(CreateProducerRequest {
         topic: "persistent://public/default/drain".to_owned(),
         ..Default::default()
     });
     // Drain the CommandProducer bytes from the open so we only see the
-    // SEND we're about to enqueue.
+    // SEND we're about to enqueue, then ack the attachment so the drain
+    // gate is open (producer-not-ready fix).
     let _ = conn.poll_transmit();
+    ack_producer_success(&mut conn, create_rid, now);
 
     let slot: Arc<ProducerSlot> = conn.producer(handle).expect("slot exists").clone();
     // Hot path: queue without `&mut conn`.

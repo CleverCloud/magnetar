@@ -592,6 +592,24 @@ pub enum OpOutcome {
         /// whose future is being woken up with this outcome.
         key: PendingOpKey,
     },
+    /// Synthetic *terminal* outcome surfaced to every waiter when the
+    /// connection drops with no recovery path — a plain (non-supervised)
+    /// driver hitting a fatal decode, a peer close, or an I/O error.
+    ///
+    /// Distinct from [`OpOutcome::SessionLost`], which is load-bearing for the
+    /// supervisor's transparent at-least-once replay (it deliberately keeps
+    /// `Send` keys pending for re-issue). `Terminal` instead resolves *every*
+    /// pending op — including `Send` keys — so the user-facing future returns a
+    /// terminal error (`PeerClosed`) promptly instead of hanging forever.
+    /// Installed by [`Connection::fail_all_pending`](crate::conn::Connection::fail_all_pending).
+    Terminal {
+        /// The original op key (request id or `(producer, sequence_id)`) whose
+        /// future is being woken up with this terminal outcome.
+        key: PendingOpKey,
+        /// Human-readable reason for the terminal drop (peer close, decode
+        /// error, I/O error). Never carries secret material (ADR-0054).
+        reason: String,
+    },
 }
 
 /// Parameters for opening a producer.

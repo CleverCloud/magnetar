@@ -63,3 +63,8 @@ magnetar-auth-athenz = { workspace = true, features = ["zts", "crypto-aws-lc-rs"
 async-trait = { workspace = true }
 # PIP-33 marker encoding in tests/replicated_subscriptions_equivalence.rs.
 prost = { workspace = true }
+# Capturing fmt subscriber for `tests/corrupted_frame_equivalence.rs` — the
+# proto point-of-detection `error!` is the witness that the injected
+# CRC32C-corrupted frame actually hit each engine (ADR-0054 / decision Q2).
+# Dev-only; never compiled into the harness library itself.
+tracing-subscriber = { workspace = true }

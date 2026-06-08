@@ -254,6 +254,12 @@ impl<P: Providers> Producer<P> {
         // bytes. Mirrors the tokio engine's ordering — compression goes
         // first, before the sans-io enqueue.
         if self.compression != CompressionKind::None {
+            // Pre-enqueue rejection — expected anomaly surfaced as `Err` to
+            // the caller, so `debug!` per ADR-0054 §2.1.
+            tracing::debug!(
+                compression = ?self.compression,
+                "send rejected: compression not yet wired on the moonpool engine"
+            );
             return SendFut {
                 shared: self.shared.clone(),
                 handle: self.handle,
@@ -278,6 +284,9 @@ impl<P: Providers> Producer<P> {
             match encryptor.encrypt(&msg.payload, &mut msg.metadata) {
                 Ok(ciphertext) => msg.payload = ciphertext,
                 Err(err) => {
+                    // Pre-enqueue rejection — `debug!` per ADR-0054 §2.1.
+                    // Payload and key material are never logged.
+                    tracing::debug!(error = %err, "send rejected: encryption failed");
                     return SendFut {
                         shared: self.shared.clone(),
                         handle: self.handle,
@@ -305,6 +314,13 @@ impl<P: Providers> Producer<P> {
         match self.shared.memory_limit_policy {
             magnetar_proto::MemoryLimitPolicy::FailImmediately => {
                 if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
+                    // Caller-visible rejection whose rate scales with send
+                    // throughput under overload — `debug!` per ADR-0054
+                    // §2.1 (never `warn!` on a per-message path).
+                    tracing::debug!(
+                        payload_len = reserved_bytes,
+                        "send rejected: memory limit exceeded"
+                    );
                     return SendFut {
                         shared: self.shared.clone(),
                         handle: self.handle,
@@ -417,20 +433,22 @@ impl<P: Providers> Producer<P> {
 
         match result {
             Ok(seq) => {
-                // Postcondition: `ProducerSlot::queue_send` returns
-                // `SequenceId(last_sequence_id_pushed.max(0))`, so the pushed
-                // sequence id is now non-negative and equals the returned seq.
-                // The proto helper has already dropped its per-slot guard, so
-                // re-locking here is a fresh scoped acquisition (no
-                // re-entrancy, ADR-0038-safe). 1:1 with the tokio engine.
-                debug_assert!(
-                    {
-                        let pushed = self.slot.state.lock().last_sequence_id_pushed;
-                        pushed >= 0 && seq.0 == pushed as u64
-                    },
-                    "queue_send postcondition: returned seq {} must match the \
-                     non-negative pushed sequence id",
-                    seq.0,
+                // NOTE: no cross-lock postcondition assert here (1:1 with the
+                // tokio engine). The returned seq is computed under the
+                // per-slot guard INSIDE `ProducerSlot::queue_send`; re-locking
+                // afterwards to compare against `last_sequence_id_pushed`
+                // raced the driver's reset/replay machinery during supervised
+                // reconnects and panicked debug builds on a legal schedule.
+                // The contract is pinned in the proto unit tests, under a
+                // single guard.
+                // ADR-0054 hot-path record: no lock is held here (the
+                // per-slot guard inside `ProducerSlot::queue_send` has been
+                // released), two integer fields, and the disabled-level cost
+                // is a cached callsite check (ADR-0038 stays intact).
+                tracing::trace!(
+                    sequence_id = seq.0,
+                    payload_len = reserved_bytes,
+                    "send queued"
                 );
                 SendFut {
                     shared: self.shared.clone(),
@@ -444,6 +462,9 @@ impl<P: Providers> Producer<P> {
                 // yet open). Release the reservation so the budget
                 // reflects only actually-in-flight bytes.
                 self.shared.release_memory(reserved_bytes);
+                // Expected anomaly surfaced as `Err` to the caller —
+                // `debug!` per ADR-0054 §2.1.
+                tracing::debug!(error = %err, "send rejected by producer state machine");
                 SendFut {
                     shared: self.shared.clone(),
                     handle: self.handle,
@@ -510,6 +531,9 @@ impl<P: Providers> Producer<P> {
     /// - [`ClientError::Broker`] if the broker returns an error correlated with the close.
     /// - [`ClientError::Other`] if an unexpected outcome arrives on the close request id.
     pub async fn close(self) -> Result<(), ClientError> {
+        // Snapshot identity for the lifecycle record before the round-trip.
+        let topic = self.slot.identity.topic.clone();
+        let producer_name = self.slot.state.lock().name.clone().unwrap_or_default();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.close_producer(self.handle)
@@ -521,8 +545,19 @@ impl<P: Providers> Producer<P> {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Lifecycle record (ADR-0054).
+                tracing::info!(
+                    topic = %topic,
+                    producer_name = %producer_name,
+                    handle = ?self.handle,
+                    access_mode = ?self.slot.identity.access_mode,
+                    "producer closed"
+                );
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected outcome for close request {request_id}: {other:?}"
             ))),
@@ -558,6 +593,8 @@ impl<P: Providers> Producer<P> {
                     self.handle
                 ))
             })?;
+        // Per-operation internals — `debug!` per ADR-0054 §2.1.
+        tracing::debug!(topic = %topic, "schema lookup");
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.get_schema(&topic, version)
@@ -574,6 +611,7 @@ impl<P: Providers> Producer<P> {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -638,6 +676,16 @@ impl<P: Providers + Send + Sync> Client<P> {
         };
         target_shared.driver_waker.notify_one();
         wait_producer_ready(&target_shared, handle).await?;
+        // Lifecycle record (ADR-0054): the broker-assigned producer name is
+        // available once `ProducerReady` has landed. Per-slot read only.
+        let producer_name = slot.state.lock().name.clone().unwrap_or_default();
+        tracing::info!(
+            topic = %slot.identity.topic,
+            producer_name = %producer_name,
+            handle = ?handle,
+            access_mode = ?slot.identity.access_mode,
+            "producer created"
+        );
         Ok(Producer {
             shared: target_shared,
             handle,
@@ -832,6 +880,7 @@ fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> 
     match outcome {
         OpOutcome::SendReceipt { message_id, .. } => Ok(message_id),
         OpOutcome::SendError { code, message, .. } => Err(ClientError::Broker { code, message }),
+        OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
         other => Err(ClientError::Other(format!(
             "unexpected send outcome: {other:?}"
         ))),
@@ -915,8 +964,27 @@ impl Future for ProducerReadyFut {
                         return Poll::Ready(Ok(()));
                     }
                 }
-                Some(ConnectionEvent::ProducerClosedByBroker { handle, .. }) => {
+                Some(ConnectionEvent::ProducerClosedByBroker {
+                    handle,
+                    assigned_broker_service_url,
+                }) => {
                     if handle == this.handle {
+                        // Broker-forced close — degraded-but-recovering
+                        // (warn! per ADR-0054 §2.1); the open future
+                        // surfaces `Closed` and the caller decides. Mirror
+                        // of the tokio engine's `EventWaitFut` arm.
+                        let topic = conn
+                            .producer(handle)
+                            .map(|s| s.identity.topic.clone())
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            handle = ?handle,
+                            topic = %topic,
+                            assigned_broker_service_url = assigned_broker_service_url
+                                .as_deref()
+                                .map(crate::log_fields::truncate_broker_str),
+                            "broker closed producer while waiting for ProducerReady"
+                        );
                         return Poll::Ready(Err(ClientError::Closed));
                     }
                 }
@@ -930,9 +998,24 @@ impl Future for ProducerReadyFut {
                     }
                 }
                 Some(ConnectionEvent::Closed { reason }) => {
-                    return Poll::Ready(Err(ClientError::Other(
-                        reason.unwrap_or_else(|| "connection closed".into()),
-                    )));
+                    // Connection-level close while a producer-open future was
+                    // parked. ADR-0055 §1: a TERMINAL drop (`fail_all_pending`,
+                    // which carries a `reason`) must unblock the waiter with
+                    // the terminal `PeerClosed`, mirroring the tokio engine and
+                    // the request / send / receive surfaces — not a generic
+                    // `Other`. A user-requested graceful `close()` (reason
+                    // `None`) keeps the `Closed` mapping. warn! per ADR-0054
+                    // §2.1; `reason` is broker-controlled text.
+                    tracing::warn!(
+                        reason = reason
+                            .as_deref()
+                            .map(crate::log_fields::truncate_broker_str),
+                        "connection closed while waiting for producer readiness"
+                    );
+                    return Poll::Ready(Err(match reason {
+                        Some(_) => ClientError::PeerClosed,
+                        None => ClientError::Closed,
+                    }));
                 }
                 Some(_) => {} // ignore unrelated events
                 None => break,

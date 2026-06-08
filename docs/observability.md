@@ -2,6 +2,7 @@
 
 Magnetar can propagate W3C Trace Context across the producer → broker → consumer hop through Pulsar message properties.
 The feature is opt-in behind the `opentelemetry` Cargo feature (default off) and is specified by [ADR-0053](../specs/adr/0053-otel-context-propagation.md).
+For the structured `tracing` logs the driver emits — and how they correlate with the propagated context — see [`logging.md`](logging.md) (ADR-0054).
 
 ## What it does
 
@@ -69,7 +70,8 @@ Two paths do **not** auto-inject and need manual injection (consistent with the 
   consumer.reconsume_later_with_properties(&retry_producer, msg, props, delay).await?;
   ```
 
-- `MultiTopicsConsumer::reconsume_later*` — engine-generic (it must stay deterministic for the moonpool engine), so it does not read ambient OTel state. Inject into the custom properties yourself.
+- `MultiTopicsConsumer::reconsume_later*` — engine-generic (it must stay deterministic for the moonpool engine), so it does not read ambient OTel state.
+  Inject into the custom properties yourself.
 
 The moonpool engine never injects on any path, preserving simulation determinism.
 

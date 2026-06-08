@@ -61,6 +61,12 @@ pub enum ClientError {
     /// The connection has been locally closed before the request completed.
     #[error("connection is closed")]
     Closed,
+    /// The peer closed the connection with no recovery path: a plain
+    /// (non-supervised) driver hit a terminal drop and resolved every pending
+    /// op with [`magnetar_proto::OpOutcome::Terminal`]. Mirrors the tokio
+    /// engine's `ClientError::PeerClosed`.
+    #[error("peer closed the connection")]
+    PeerClosed,
     /// A lookup answered `proxy_through_service_url = true` but the client has no proxy
     /// connection pool because it was built via [`Client::connect_plain`] or
     /// [`Client::from_parts`] (no supervisor → no pool — each pool entry needs its own
@@ -525,6 +531,7 @@ impl<P: Providers> Client<P> {
                 other => Ok(other),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected lookup outcome: {other:?}"
             ))),
@@ -560,6 +567,7 @@ impl<P: Providers> Client<P> {
                 }
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected partitioned metadata outcome: {other:?}"
             ))),
@@ -591,6 +599,7 @@ impl<P: Providers> Client<P> {
         match outcome {
             OpOutcome::TopicListSnapshot { topics, .. } => Ok(topics),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected topic-list snapshot outcome: {other:?}"
             ))),
@@ -794,6 +803,7 @@ impl<P: Providers> Client<P> {
                 result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected new_txn outcome: {other:?}"
             ))),
@@ -826,6 +836,7 @@ impl<P: Providers> Client<P> {
                 result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected add_partition_to_txn outcome: {other:?}"
             ))),
@@ -864,6 +875,7 @@ impl<P: Providers> Client<P> {
                 result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected add_subscription_to_txn outcome: {other:?}"
             ))),
@@ -897,6 +909,7 @@ impl<P: Providers> Client<P> {
                 result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected end_txn outcome: {other:?}"
             ))),

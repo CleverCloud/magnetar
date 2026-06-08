@@ -129,6 +129,58 @@ const BROKER_PORT: u16 = 6650;
 /// (ADR-0011, ADR-0036).
 const CHAOS_RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
 
+/// A [`ConnectionConfig`] with the auto-reconnect supervisor enabled —
+/// the supervised shape the delivery-asserting chaos workloads need so a
+/// bit-flip-induced terminal drop is recovered via reconnect + replay
+/// (ADR-0055 §2/§3) instead of killing the plain driver and stranding the
+/// un-acked tail. Same backoff envelope as the proxy / anti-thrash workloads
+/// already use (`ProxyClientWorkload`); kept in one helper so the three
+/// converted workloads stay in lock-step.
+fn supervised_config() -> ConnectionConfig {
+    ConnectionConfig {
+        supervisor: Some(magnetar_proto::SupervisorConfig {
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_secs(1),
+            mandatory_stop: Duration::from_secs(30),
+            max_attempts: Some(8),
+            ..magnetar_proto::SupervisorConfig::default()
+        }),
+        ..ConnectionConfig::default()
+    }
+}
+
+/// Retry a setup-phase operation (`subscribe` / `open_producer`) across a
+/// transient chaos drop. A bit-flip that lands on the in-flight LOOKUP behind a
+/// `subscribe` / `open_producer` surfaces as a transient error while the
+/// supervisor reconnects (`SessionLost`, which the moonpool engine maps to
+/// `Other` — the lookup is NOT transparently re-issued by the engine). The
+/// real Pulsar client retries a lookup after a connection reset; the chaos
+/// workloads do the same here, re-issuing the op against the freshly-handshaked
+/// session. Bounded so a genuinely-broken setup still fails the iteration.
+///
+/// Sans-io / ADR-0011: the inter-attempt pause goes through the injected
+/// [`TimeProvider`], not the host wall clock, so replay stays deterministic.
+async fn retry_setup<T, F, Fut, R, E>(time: &T, mut op: F) -> Result<R, E>
+where
+    T: TimeProvider,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    const MAX_ATTEMPTS: usize = 16;
+    let mut last_err = None;
+    for _ in 0..MAX_ATTEMPTS {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last_err = Some(e);
+                let _ = time.sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    // Exhausted — surface the final error so a genuinely-broken setup fails.
+    Err(last_err.expect("loop ran at least once"))
+}
+
 /// Workload that runs an in-simulator Pulsar broker speaking the minimum
 /// wire subset needed to complete the client handshake and a handful of
 /// follow-up commands.
@@ -226,12 +278,15 @@ impl Workload for ClientWorkload {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
 
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        // Supervised connect (ADR-0055 §3): the handshake rides out a
+        // bit-flip-induced terminal drop via reconnect instead of failing the
+        // post-handshake `is_connected()` gate on the plain driver's exit.
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+            Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
         )
         .await
-        .map_err(|_| SimulationError::InvalidState("connect_plain timed out".into()))?;
+        .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?;
 
         let outcome = match result {
             Ok(client) => {
@@ -573,15 +628,67 @@ fn classify_send_outcome(
     }
 }
 
-/// Per-session state held by the stateful broker.
-struct SessionState {
-    /// Per-topic append-only ledger. Each producer pushes onto the
-    /// ledger keyed by the topic it was opened against; consumers on
-    /// the same topic draw from it.
+/// Cross-reconnect broker state, shared by every session of one broker
+/// workload (ADR-0055 §3).
+///
+/// The plain `sim_chaos` clients re-allocate their producer / consumer ids on
+/// every reconnect, so the old per-session `SessionState` lost the ledger and
+/// cursor the instant a bit-flip terminally dropped the connection — the
+/// consumer could then never redeliver the un-acked tail (the swizzle-clog
+/// seed-replay failure). `SharedBroker` persists that state keyed by **stable
+/// identity**:
+///
+/// - the **ledger** + **next entry id** are keyed by **topic** (a producer re-opened on the same
+///   topic resumes the same entry-id sequence);
+/// - the per-subscription **cursor** is keyed by **subscription NAME** (a consumer re-subscribed
+///   under the same name resumes from the durable cursor);
+/// - the **send dedup** map is keyed by `(topic, sequence_id)` so an at-least-once replay of an
+///   in-flight publish (a02f401) re-emits the *existing* receipt instead of double-appending.
+///
+/// `ledger_id` is always `1` in this broker (mirrors the differential broker);
+/// the cursor is a per-subscription "next entry id to deliver".
+#[derive(Default)]
+struct SharedBroker {
+    /// Per-topic append-only ledger. Keyed by topic so it survives the
+    /// client's per-reconnect producer-id churn.
     ledger: HashMap<String, Vec<StoredMessage>>,
-    /// Producer-id → (topic, next entry id).
-    producers: HashMap<u64, (String, u64)>,
-    /// Consumer-id → consumer state.
+    /// Next entry id to assign per topic. Survives reconnect (the producer
+    /// resumes its entry-id sequence on the same topic).
+    next_entry_id: HashMap<String, u64>,
+    /// Durable per-subscription cursor: the next entry id to deliver on this
+    /// subscription. Keyed by subscription NAME (NOT the per-session
+    /// consumer id), so a re-subscribe resumes from the acked position.
+    cursors: HashMap<String, u64>,
+    /// Send dedup: `(topic, sequence_id)` → the `(ledger_id, entry_id)` the
+    /// broker already assigned. A replayed in-flight publish re-emits the
+    /// existing receipt rather than appending a duplicate ledger entry.
+    dedup: HashMap<(String, u64), (u64, u64)>,
+}
+
+impl SharedBroker {
+    fn new_shared() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self::default()))
+    }
+
+    /// Drop all durable state. The broker workloads call this from
+    /// `Workload::setup` so each seed in a sweep starts from an empty ledger /
+    /// cursor / dedup map (the same instance is reused across iterations).
+    fn clear(&mut self) {
+        self.ledger.clear();
+        self.next_entry_id.clear();
+        self.cursors.clear();
+        self.dedup.clear();
+    }
+}
+
+/// Per-session routing state held by one broker connection. Volatile by
+/// design: the producer / consumer ids here are re-allocated by the client on
+/// every reconnect, so nothing durable lives in this struct — the ledger and
+/// cursors live in the cross-session [`SharedBroker`].
+struct SessionState {
+    /// Producer-id → topic (this session's view; re-populated on reconnect).
+    producers: HashMap<u64, String>,
+    /// Consumer-id → per-session consumer routing.
     consumers: HashMap<u64, ConsumerSlot>,
 }
 
@@ -592,16 +699,31 @@ struct StoredMessage {
     payload: Bytes,
 }
 
+/// Per-session consumer routing. The DURABLE ack cursor lives in
+/// [`SharedBroker::cursors`] keyed by `subscription` (stable across
+/// reconnects); this slot carries the routing identity, the live flow permits
+/// (which a real broker resets per session), and the per-session **delivery
+/// position** — how far this session has *pushed*, distinct from how far the
+/// consumer has *acked*.
+///
+/// The split is what makes at-least-once redelivery work across a terminal
+/// drop: on (re-)subscribe the delivery position is seeded from the durable
+/// ack cursor, so the un-acked tail is redelivered; the ack cursor only ever
+/// advances on a real `CommandAck`.
 struct ConsumerSlot {
     topic: String,
+    /// Stable subscription name — the key into [`SharedBroker::cursors`].
+    subscription: String,
     permits: u32,
-    cursor: usize,
+    /// Next entry id THIS session will deliver. Seeded from the durable ack
+    /// cursor at subscribe time; advanced as messages are pushed. Resets to
+    /// the ack cursor on every re-subscribe (redelivering the un-acked tail).
+    delivery_pos: u64,
 }
 
 impl SessionState {
     fn new() -> Self {
         Self {
-            ledger: HashMap::new(),
             producers: HashMap::new(),
             consumers: HashMap::new(),
         }
@@ -610,11 +732,18 @@ impl SessionState {
 
 /// Stateful broker workload. Extends [`BrokerWorkload`] with full
 /// PIP-31-adjacent producer / consumer dispatch.
-struct StatefulBrokerWorkload;
+///
+/// Owns the cross-session [`SharedBroker`] so the ledger + per-subscription
+/// cursors survive the client's per-reconnect id churn (ADR-0055 §3).
+struct StatefulBrokerWorkload {
+    shared: Arc<Mutex<SharedBroker>>,
+}
 
 impl StatefulBrokerWorkload {
     fn new() -> Self {
-        Self
+        Self {
+            shared: SharedBroker::new_shared(),
+        }
     }
 }
 
@@ -622,6 +751,14 @@ impl StatefulBrokerWorkload {
 impl Workload for StatefulBrokerWorkload {
     fn name(&self) -> &str {
         "broker"
+    }
+
+    async fn setup(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
+        // Reset the durable broker state per iteration — the same workload
+        // instance is reused across every seed in a sweep, so a stale ledger /
+        // cursor / dedup map from the previous seed would corrupt the next.
+        self.shared.lock().clear();
+        Ok(())
     }
 
     async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
@@ -638,6 +775,7 @@ impl Workload for StatefulBrokerWorkload {
         let source = ctx.my_ip().to_owned();
         let shutdown = ctx.shutdown().clone();
         let task = ctx.providers().task().clone();
+        let time = ctx.providers().time().clone();
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
@@ -645,8 +783,13 @@ impl Workload for StatefulBrokerWorkload {
                     match accepted {
                         Ok((stream, _peer)) => {
                             let session_source = source.clone();
+                            let session_shared = self.shared.clone();
+                            let session_time = time.clone();
                             let _handle = task.spawn_task("broker-stateful-session", async move {
-                                let _ = handle_stateful_session(stream, session_source).await;
+                                let _ = handle_stateful_session(
+                                    stream, session_source, session_shared, session_time,
+                                )
+                                .await;
                             });
                         }
                         Err(_) => return Ok(()),
@@ -657,9 +800,15 @@ impl Workload for StatefulBrokerWorkload {
     }
 }
 
-async fn handle_stateful_session<S>(mut stream: S, source: String) -> SimulationResult<()>
+async fn handle_stateful_session<S, T>(
+    mut stream: S,
+    source: String,
+    shared: Arc<Mutex<SharedBroker>>,
+    time: T,
+) -> SimulationResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
+    T: TimeProvider,
 {
     let mut session = SessionState::new();
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
@@ -675,12 +824,12 @@ where
             };
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
-            handle_stateful_frame(&mut session, &source, &frame, &mut out_buf);
+            handle_stateful_frame(&mut session, &shared, &source, &frame, &mut out_buf);
         }
 
         // After processing inbound frames, push any pending messages
         // to consumers that have available flow permits.
-        push_pending_messages(&mut session, &source, &mut out_buf);
+        push_pending_messages(&mut session, &shared, &source, &mut out_buf);
 
         if !out_buf.is_empty() {
             if stream.write_all(&out_buf).await.is_err() {
@@ -692,9 +841,22 @@ where
             out_buf.clear();
         }
 
-        match read_into(&mut stream, &mut read_buf).await {
-            Ok(0) | Err(_) => return Ok(()),
-            Ok(_) => {}
+        // Race the next read against a short dispatch tick so a redelivery that
+        // becomes available with no inbound traffic (e.g. a supervised
+        // reconnect's replayed publish while the consumer sits in `receive()`)
+        // still gets pushed. Same injected-clock heartbeat the swizzle session
+        // uses (ADR-0011 — no host wall-clock read).
+        let tick = time.sleep(Duration::from_millis(5));
+        tokio::pin!(tick);
+        tokio::select! {
+            biased;
+            read = read_into(&mut stream, &mut read_buf) => {
+                match read {
+                    Ok(0) | Err(_) => return Ok(()),
+                    Ok(_) => {}
+                }
+            }
+            _ = &mut tick => {}
         }
     }
 }
@@ -702,6 +864,7 @@ where
 #[allow(clippy::too_many_lines)]
 fn handle_stateful_frame(
     session: &mut SessionState,
+    shared: &Arc<Mutex<SharedBroker>>,
     source: &str,
     frame: &magnetar_proto::Frame,
     out: &mut BytesMut,
@@ -719,23 +882,32 @@ fn handle_stateful_frame(
         }
         pb::base_command::Type::Producer => {
             if let Some(p) = &frame.command.producer {
-                session
-                    .producers
-                    .insert(p.producer_id, (p.topic.clone(), 0));
+                // Per-session routing only — the durable next-entry-id lives in
+                // `SharedBroker.next_entry_id` keyed by topic, so a re-opened
+                // producer resumes the same entry-id sequence after a reconnect.
+                session.producers.insert(p.producer_id, p.topic.clone());
                 emit_producer_success(out, p.request_id);
             }
         }
         pb::base_command::Type::Send => {
             if let (Some(s), Some(payload)) = (&frame.command.send, &frame.payload) {
-                let topic_and_eid = {
-                    let entry = session.producers.get_mut(&s.producer_id).map(|(t, n)| {
-                        let eid = *n;
-                        *n = n.saturating_add(1);
-                        (t.clone(), eid)
-                    });
-                    if let Some((topic, eid)) = entry {
-                        session
-                            .ledger
+                let Some(topic) = session.producers.get(&s.producer_id).cloned() else {
+                    return;
+                };
+                let (entry_id, is_new) = {
+                    let mut b = shared.lock();
+                    // At-least-once dedup (ADR-0055 §3): an in-flight publish
+                    // replayed across a reconnect (a02f401) re-arrives with the
+                    // SAME `(topic, sequence_id)`. Re-emit the existing receipt
+                    // and do NOT append a second ledger entry, or the consumer
+                    // would see a genuine duplicate (not just an at-least-once
+                    // redelivery) and the dedup invariants would trip.
+                    if let Some(&(_ledger, eid)) = b.dedup.get(&(topic.clone(), s.sequence_id)) {
+                        (eid, false)
+                    } else {
+                        let eid = *b.next_entry_id.get(&topic).unwrap_or(&0);
+                        b.next_entry_id.insert(topic.clone(), eid.saturating_add(1));
+                        b.ledger
                             .entry(topic.clone())
                             .or_default()
                             .push(StoredMessage {
@@ -743,12 +915,18 @@ fn handle_stateful_frame(
                                 entry_id: eid,
                                 payload: payload.body.clone(),
                             });
-                        Some((topic, eid))
-                    } else {
-                        None
+                        b.dedup.insert((topic.clone(), s.sequence_id), (1, eid));
+                        (eid, true)
                     }
                 };
-                if let Some((_topic, entry_id)) = topic_and_eid {
+                // Record the SENDS_TRAIL fact only for a genuinely-NEW
+                // acceptance. A replayed publish carries the same
+                // `sequence_id` the broker already accepted; re-emitting the
+                // trail event would make `MonotonicMsgIdInvariant` see a
+                // non-strictly-increasing sequence id (`prev == got`). The
+                // receipt below still goes out on both paths — the client's
+                // replayed SendFut must resolve.
+                if is_new {
                     emit_event(
                         SENDS_TRAIL,
                         source,
@@ -759,18 +937,33 @@ fn handle_stateful_frame(
                             entry_id,
                         },
                     );
-                    emit_send_receipt(out, s.producer_id, s.sequence_id, 1, entry_id);
                 }
+                emit_send_receipt(out, s.producer_id, s.sequence_id, 1, entry_id);
             }
         }
         pb::base_command::Type::Subscribe => {
             if let Some(s) = &frame.command.subscribe {
+                // Resume policy (ADR-0055 §3): the per-session DELIVERY position
+                // is seeded from an explicit `start_message_id` (resume = that
+                // entry_id + 1), else the durable per-subscription ACK cursor,
+                // else 0. The durable ack cursor lives in `SharedBroker.cursors`
+                // keyed by subscription NAME and is only advanced by `Ack`, so a
+                // re-subscribe under the same name redelivers the un-acked tail.
+                let delivery_pos = {
+                    let mut b = shared.lock();
+                    let ack_cursor = *b.cursors.entry(s.subscription.clone()).or_insert(0);
+                    match &s.start_message_id {
+                        Some(start) => start.entry_id.saturating_add(1),
+                        None => ack_cursor,
+                    }
+                };
                 session.consumers.insert(
                     s.consumer_id,
                     ConsumerSlot {
                         topic: s.topic.clone(),
+                        subscription: s.subscription.clone(),
                         permits: 0,
-                        cursor: 0,
+                        delivery_pos,
                     },
                 );
                 emit_success(out, s.request_id);
@@ -785,6 +978,21 @@ fn handle_stateful_frame(
         }
         pb::base_command::Type::Ack => {
             if let Some(a) = &frame.command.ack {
+                // Advance the DURABLE per-subscription cursor past every acked
+                // entry so a re-subscribe resumes from the un-acked tail
+                // (ADR-0055 §3). `ledger_id` is always 1 here, so the entry id
+                // alone orders the cursor.
+                let subscription = session
+                    .consumers
+                    .get(&a.consumer_id)
+                    .map(|c| c.subscription.clone());
+                if let Some(subscription) = subscription {
+                    let mut b = shared.lock();
+                    let cursor = b.cursors.entry(subscription).or_insert(0);
+                    for mid in &a.message_id {
+                        *cursor = (*cursor).max(mid.entry_id.saturating_add(1));
+                    }
+                }
                 for mid in &a.message_id {
                     emit_event(
                         ACKS_TRAIL,
@@ -815,27 +1023,13 @@ fn handle_stateful_frame(
     }
 }
 
-fn push_pending_messages(session: &mut SessionState, source: &str, out: &mut BytesMut) {
-    let to_push: Vec<(u64, Vec<StoredMessage>)> = {
-        let mut batch = Vec::new();
-        // Snapshot ledgers up front to avoid borrow conflicts.
-        let ledger_snapshot: HashMap<String, Vec<StoredMessage>> = session.ledger.clone();
-        for (cid, slot) in &mut session.consumers {
-            let Some(ledger) = ledger_snapshot.get(&slot.topic) else {
-                continue;
-            };
-            let mut pushed = Vec::new();
-            while slot.permits > 0 && slot.cursor < ledger.len() {
-                pushed.push(ledger[slot.cursor].clone());
-                slot.cursor += 1;
-                slot.permits -= 1;
-            }
-            if !pushed.is_empty() {
-                batch.push((*cid, pushed));
-            }
-        }
-        batch
-    };
+fn push_pending_messages(
+    session: &mut SessionState,
+    shared: &Arc<Mutex<SharedBroker>>,
+    source: &str,
+    out: &mut BytesMut,
+) {
+    let to_push = drain_pending(session, shared, &HashSet::new());
     for (cid, msgs) in to_push {
         for m in msgs {
             emit_event(
@@ -850,6 +1044,45 @@ fn push_pending_messages(session: &mut SessionState, source: &str, out: &mut Byt
             emit_message(out, cid, m.ledger_id, m.entry_id, &m.payload);
         }
     }
+}
+
+/// Shared delivery walk for [`push_pending_messages`] /
+/// [`push_pending_messages_excluding`]: for every consumer not in `clogged`,
+/// deliver from the per-session `delivery_pos` forward over the SHARED ledger
+/// while the consumer has flow permits, advancing `delivery_pos` as it goes.
+/// The durable ACK cursor in [`SharedBroker`] is untouched here — it only moves
+/// on a real `CommandAck`. Walking the shared ledger from a delivery position
+/// that was seeded from the durable ack cursor at subscribe time is what lets a
+/// re-subscribed consumer drain the un-acked tail after a terminal drop
+/// (ADR-0055 §3).
+fn drain_pending(
+    session: &mut SessionState,
+    shared: &Arc<Mutex<SharedBroker>>,
+    clogged: &HashSet<u64>,
+) -> Vec<(u64, Vec<StoredMessage>)> {
+    let mut batch = Vec::new();
+    let b = shared.lock();
+    for (cid, slot) in &mut session.consumers {
+        if clogged.contains(cid) {
+            continue;
+        }
+        // Snapshot the topic ledger; entry ids are dense from 0, so
+        // `delivery_pos` indexes the next entry to deliver directly.
+        let ledger = b.ledger.get(&slot.topic).cloned().unwrap_or_default();
+        let mut pushed = Vec::new();
+        while slot.permits > 0 {
+            let Some(m) = ledger.iter().find(|m| m.entry_id == slot.delivery_pos) else {
+                break;
+            };
+            pushed.push(m.clone());
+            slot.delivery_pos = slot.delivery_pos.saturating_add(1);
+            slot.permits -= 1;
+        }
+        if !pushed.is_empty() {
+            batch.push((*cid, pushed));
+        }
+    }
+    batch
 }
 
 fn emit_send_receipt(
@@ -1224,31 +1457,40 @@ impl Workload for ProducerConsumerWorkload {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
 
+        // Supervised connect (ADR-0055 §3): a bit-flip-induced terminal drop is
+        // recovered by reconnect + replay against the persistent broker, rather
+        // than killing the plain driver and stranding the un-acked tail.
         let client = tokio::time::timeout(
             Duration::from_secs(30),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+            Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
         )
         .await
-        .map_err(|_| SimulationError::InvalidState("connect_plain timed out".into()))?
-        .map_err(|e| SimulationError::InvalidState(format!("connect_plain: {e:?}")))?;
+        .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?
+        .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
+
+        let time_provider_setup = ctx.providers().time().clone();
 
         // Open consumer first so it's ready to receive before we publish.
-        let consumer = client
-            .subscribe(SubscribeRequest {
+        // `retry_setup` re-issues the op across a transient chaos drop (a
+        // bit-flip on the in-flight lookup) — setup-phase resilience only.
+        let consumer = retry_setup(&time_provider_setup, || {
+            client.subscribe(SubscribeRequest {
                 topic: "persistent://public/default/sim-chaos-pc".to_owned(),
                 subscription: "sim-chaos-pc-sub".to_owned(),
                 ..Default::default()
             })
-            .await
-            .map_err(|e| SimulationError::InvalidState(format!("subscribe: {e:?}")))?;
+        })
+        .await
+        .map_err(|e| SimulationError::InvalidState(format!("subscribe: {e:?}")))?;
 
-        let producer = client
-            .open_producer(CreateProducerRequest {
+        let producer = retry_setup(&time_provider_setup, || {
+            client.open_producer(CreateProducerRequest {
                 topic: "persistent://public/default/sim-chaos-pc".to_owned(),
                 ..Default::default()
             })
-            .await
-            .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
+        })
+        .await
+        .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
 
         // Publish PRODUCE_COUNT messages with payloads carrying a small
         // counter so the consumer-side check can verify each payload
@@ -1289,14 +1531,25 @@ impl Workload for ProducerConsumerWorkload {
             self.sent.lock().push(i);
         }
 
-        // Receive PRODUCE_COUNT messages with a bounded budget — the
-        // sim time-limit guards against this hanging forever on bugs.
-        for _ in 0..PRODUCE_COUNT {
+        // Receive until every distinct payload is in hand, with a bounded
+        // iteration budget — the sim time-limit guards against a true hang.
+        // Dedup by `(ledger_id, entry_id)` (ADR-0055 §2): a supervised
+        // reconnect legitimately REDELIVERS the un-acked tail at-least-once, so
+        // the same broker message id can arrive twice; counting it once keeps
+        // the at-least-once set honest and stops a duplicate from consuming the
+        // budget meant for a not-yet-seen message. The extra slack
+        // (`2 * PRODUCE_COUNT`) covers the redelivered duplicates.
+        let mut seen_ids: HashSet<(u64, u64)> = HashSet::new();
+        for _ in 0..(2 * PRODUCE_COUNT) {
+            if self.received.lock().len() >= PRODUCE_COUNT as usize {
+                break;
+            }
             let recv = tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await;
             let Ok(Ok(msg)) = recv else {
                 break;
             };
-            if msg.payload.len() == 4 {
+            let id = (msg.message_id.ledger_id, msg.message_id.entry_id);
+            if seen_ids.insert(id) && msg.payload.len() == 4 {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&msg.payload[..4]);
                 self.received.lock().push(u32::from_le_bytes(bytes));
@@ -2157,6 +2410,9 @@ struct SwizzleClogBrokerWorkload {
     n_clogged: usize,
     /// Shared with the controller task and the session handler.
     state: Arc<Mutex<SwizzleState>>,
+    /// Cross-session ledger + per-subscription cursors (ADR-0055 §3) so a
+    /// terminally-dropped consumer redelivers its un-acked tail on reconnect.
+    shared: Arc<Mutex<SharedBroker>>,
 }
 
 impl SwizzleClogBrokerWorkload {
@@ -2165,6 +2421,7 @@ impl SwizzleClogBrokerWorkload {
             clog_duration_ms,
             n_clogged,
             state: Arc::new(Mutex::new(SwizzleState::default())),
+            shared: SharedBroker::new_shared(),
         }
     }
 }
@@ -2173,6 +2430,16 @@ impl SwizzleClogBrokerWorkload {
 impl Workload for SwizzleClogBrokerWorkload {
     fn name(&self) -> &str {
         "broker"
+    }
+
+    async fn setup(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
+        // Reset the durable broker state per iteration — the same workload
+        // instance is reused across every seed in the sweep, so a stale ledger
+        // / cursor / dedup map from the previous seed would corrupt the next.
+        // (The `SwizzleState` clog plan is reset by the MirroringClient's
+        // `check()`; this resets the ledger/cursor half.)
+        self.shared.lock().clear();
+        Ok(())
     }
 
     async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
@@ -2203,6 +2470,9 @@ impl Workload for SwizzleClogBrokerWorkload {
 
         let source = ctx.my_ip().to_owned();
         let task_for_sessions = ctx.providers().task().clone();
+        // Separate clock handle for the per-session dispatch heartbeat (the
+        // controller moved its own `time` into its task above).
+        let time_for_sessions = ctx.providers().time().clone();
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
@@ -2211,6 +2481,8 @@ impl Workload for SwizzleClogBrokerWorkload {
                         Ok((stream, _peer)) => {
                             let session_source = source.clone();
                             let state_for_session = self.state.clone();
+                            let shared_for_session = self.shared.clone();
+                            let time_for_session = time_for_sessions.clone();
                             let _handle = task_for_sessions.spawn_task(
                                 "swizzle-broker-session",
                                 async move {
@@ -2218,6 +2490,8 @@ impl Workload for SwizzleClogBrokerWorkload {
                                         stream,
                                         session_source,
                                         state_for_session,
+                                        shared_for_session,
+                                        time_for_session,
                                     )
                                     .await;
                                 },
@@ -2343,13 +2617,27 @@ fn fisher_yates_shuffle<R: RandomProvider>(slice: &mut [u64], random: &R) {
 /// skips ids currently in `clogged_set`. SEND from producers is
 /// always accepted: the ledger keeps growing during the clog, so when
 /// the controller releases an id the consumer drains the queued tail.
-async fn handle_swizzle_session<S>(
+///
+/// The session loop races the socket read against a short
+/// [`TimeProvider::sleep`] tick so it re-evaluates delivery on a timer, not
+/// only when an inbound frame arrives. A real broker dispatches whenever
+/// messages + permits are available; the swizzle workload publishes ALL its
+/// messages up front and then the consumers sit in `receive()` with no further
+/// inbound traffic, so a clog that lifts AFTER the producer is done would
+/// otherwise never trigger a push (the queued tail would strand). The tick is
+/// the broker's dispatch heartbeat, keyed off the injected clock (ADR-0011 —
+/// no host wall-clock read; same `TimeProvider` the controller and drain tasks
+/// already arm).
+async fn handle_swizzle_session<S, T>(
     mut stream: S,
     source: String,
     state: Arc<Mutex<SwizzleState>>,
+    shared: Arc<Mutex<SharedBroker>>,
+    time: T,
 ) -> SimulationResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
+    T: TimeProvider,
 {
     let mut session = SessionState::new();
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
@@ -2365,7 +2653,7 @@ where
             };
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
-            handle_stateful_frame(&mut session, &source, &frame, &mut out_buf);
+            handle_stateful_frame(&mut session, &shared, &source, &frame, &mut out_buf);
             // Subscribe registers the consumer id with the shared
             // swizzle state so the controller can see how many
             // consumers exist.
@@ -2380,10 +2668,10 @@ where
 
         // Push pending messages but skip any consumer currently in
         // the clogged_set. The ledger keeps appending under producer
-        // SEND so once the consumer is restored, its cursor walks
-        // forward and the queued tail drains.
+        // SEND so once the consumer is restored, its delivery position
+        // walks forward and the queued tail drains.
         let clogged = state.lock().clogged_set.clone();
-        push_pending_messages_excluding(&mut session, &source, &mut out_buf, &clogged);
+        push_pending_messages_excluding(&mut session, &shared, &source, &mut out_buf, &clogged);
 
         if !out_buf.is_empty() {
             if stream.write_all(&out_buf).await.is_err() {
@@ -2395,45 +2683,36 @@ where
             out_buf.clear();
         }
 
-        match read_into(&mut stream, &mut read_buf).await {
-            Ok(0) | Err(_) => return Ok(()),
-            Ok(_) => {}
+        // Race the next read against a short dispatch tick. If the tick wins,
+        // loop back to re-run `push_pending_messages_excluding` — this is what
+        // delivers the queued tail after a clog lifts with no inbound traffic.
+        let tick = time.sleep(Duration::from_millis(5));
+        tokio::pin!(tick);
+        tokio::select! {
+            biased;
+            read = read_into(&mut stream, &mut read_buf) => {
+                match read {
+                    Ok(0) | Err(_) => return Ok(()),
+                    Ok(_) => {}
+                }
+            }
+            _ = &mut tick => {}
         }
     }
 }
 
 /// Variant of [`push_pending_messages`] that honours a clogged set.
-/// Consumers whose ids appear in `clogged` keep their cursor frozen
+/// Consumers whose ids appear in `clogged` keep their `delivery_pos` frozen
 /// (so when the clog lifts they pick up where they left off, just
 /// like a real broker after a permit-stall resume).
 fn push_pending_messages_excluding(
     session: &mut SessionState,
+    shared: &Arc<Mutex<SharedBroker>>,
     source: &str,
     out: &mut BytesMut,
     clogged: &HashSet<u64>,
 ) {
-    let to_push: Vec<(u64, Vec<StoredMessage>)> = {
-        let mut batch = Vec::new();
-        let ledger_snapshot: HashMap<String, Vec<StoredMessage>> = session.ledger.clone();
-        for (cid, slot) in &mut session.consumers {
-            if clogged.contains(cid) {
-                continue;
-            }
-            let Some(ledger) = ledger_snapshot.get(&slot.topic) else {
-                continue;
-            };
-            let mut pushed = Vec::new();
-            while slot.permits > 0 && slot.cursor < ledger.len() {
-                pushed.push(ledger[slot.cursor].clone());
-                slot.cursor += 1;
-                slot.permits -= 1;
-            }
-            if !pushed.is_empty() {
-                batch.push((*cid, pushed));
-            }
-        }
-        batch
-    };
+    let to_push = drain_pending(session, shared, clogged);
     for (cid, msgs) in to_push {
         for m in msgs {
             emit_event(
@@ -2531,6 +2810,7 @@ impl Workload for SwizzleClogClientWorkload {
         "client"
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run(&mut self, ctx: &SimContext) -> SimulationResult<()> {
         let broker_ip = ctx
             .peer("broker")
@@ -2538,36 +2818,52 @@ impl Workload for SwizzleClogClientWorkload {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
 
+        // Supervised connect (ADR-0055 §3): a bit-flip-induced terminal drop is
+        // recovered by reconnect + replay against the persistent swizzle broker
+        // (ledger + per-subscription cursor survive), so the un-acked tail is
+        // redelivered instead of the plain driver dying and stranding it.
         let client = tokio::time::timeout(
             Duration::from_secs(30),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+            Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
         )
         .await
-        .map_err(|_| SimulationError::InvalidState("connect_plain timed out".into()))?
-        .map_err(|e| SimulationError::InvalidState(format!("connect_plain: {e:?}")))?;
+        .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?
+        .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
+
+        let time_provider_setup = ctx.providers().time().clone();
 
         // Subscribe every consumer up front so their ids are visible
         // to the broker's swizzle controller before any SEND lands.
+        //
+        // Each setup op is retried (ADR-0055 §2): a bit-flip that drops the
+        // connection mid-`subscribe` surfaces the in-flight LOOKUP as a
+        // transient `SessionLost` (the supervisor is reconnecting); the engine
+        // does not transparently re-issue the lookup, so the workload re-tries
+        // the op against the freshly-handshaked session — exactly how the Java
+        // client retries a lookup after a connection reset. This is setup-phase
+        // resilience only; it weakens no delivery / dedup assertion below.
         let mut consumers = Vec::with_capacity(SWIZZLE_CONSUMERS as usize);
         for i in 0..SWIZZLE_CONSUMERS {
-            let consumer = client
-                .subscribe(SubscribeRequest {
+            let consumer = retry_setup(&time_provider_setup, || {
+                client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/sim-swizzle-clog".to_owned(),
                     subscription: format!("sim-swizzle-clog-sub-{i}"),
                     ..Default::default()
                 })
-                .await
-                .map_err(|e| SimulationError::InvalidState(format!("subscribe[{i}]: {e:?}")))?;
+            })
+            .await
+            .map_err(|e| SimulationError::InvalidState(format!("subscribe[{i}]: {e:?}")))?;
             consumers.push(consumer);
         }
 
-        let producer = client
-            .open_producer(CreateProducerRequest {
+        let producer = retry_setup(&time_provider_setup, || {
+            client.open_producer(CreateProducerRequest {
                 topic: "persistent://public/default/sim-swizzle-clog".to_owned(),
                 ..Default::default()
             })
-            .await
-            .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
+        })
+        .await
+        .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
 
         // Publish first so the ledger grows while the swizzle window
         // is still open. Emit started/resolved trail events so the
@@ -2626,7 +2922,18 @@ impl Workload for SwizzleClogClientWorkload {
             let handle = tokio::spawn(async move {
                 let cid = idx as u64;
                 let mut got = Vec::new();
-                for _ in 0..SWIZZLE_PRODUCE_COUNT {
+                // Dedup by `(ledger_id, entry_id)` (ADR-0055 §2): a supervised
+                // reconnect redelivers the un-acked tail at-least-once, so the
+                // same broker message id can arrive twice. Recording each id
+                // once keeps the swizzle no-duplicate-on-unaffected-consumer
+                // property meaningful under legitimate redelivery, and stops a
+                // duplicate from eating the receive budget. The widened budget
+                // (`2 * SWIZZLE_PRODUCE_COUNT`) absorbs the redelivered copies.
+                let mut seen: HashSet<(u64, u64)> = HashSet::new();
+                for _ in 0..(2 * SWIZZLE_PRODUCE_COUNT) {
+                    if got.len() >= SWIZZLE_PRODUCE_COUNT as usize {
+                        break;
+                    }
                     let timer = time_for_task.sleep(drain_budget);
                     tokio::pin!(timer);
                     let msg = tokio::select! {
@@ -2637,7 +2944,10 @@ impl Workload for SwizzleClogClientWorkload {
                     let Ok(msg) = msg else {
                         break;
                     };
-                    got.push((msg.message_id.ledger_id, msg.message_id.entry_id));
+                    let id = (msg.message_id.ledger_id, msg.message_id.entry_id);
+                    if seen.insert(id) {
+                        got.push(id);
+                    }
                     let _ = consumer.ack(msg.message_id).await;
                 }
                 received_for_task.lock().insert(cid, got);

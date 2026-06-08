@@ -212,8 +212,8 @@ async fn e2e_otel_reconsume_reinjects_traceparent() -> Result<(), Box<dyn std::e
         .create()
         .await?;
     {
-        let cx_a =
-            opentelemetry::Context::current().with_remote_span_context(span_ctx(TRACE_A, "a1a1a1a1a1a1a1a1"));
+        let cx_a = opentelemetry::Context::current()
+            .with_remote_span_context(span_ctx(TRACE_A, "a1a1a1a1a1a1a1a1"));
         let _guard = cx_a.attach();
         producer.send(&"retry-me".to_owned(), None).await?;
     }
@@ -247,8 +247,8 @@ async fn e2e_otel_reconsume_reinjects_traceparent() -> Result<(), Box<dyn std::e
 
     let retry_producer = client.producer(retry_topic.clone()).create().await?;
     {
-        let cx_b =
-            opentelemetry::Context::current().with_remote_span_context(span_ctx(TRACE_B, "b2b2b2b2b2b2b2b2"));
+        let cx_b = opentelemetry::Context::current()
+            .with_remote_span_context(span_ctx(TRACE_B, "b2b2b2b2b2b2b2b2"));
         let _guard = cx_b.attach();
         consumer
             .reconsume_later(&retry_producer, received.raw, Duration::from_secs(1))

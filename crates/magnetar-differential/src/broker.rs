@@ -198,6 +198,29 @@ pub struct ScriptedBroker {
     /// count. Surfaces the per-txn ack ledger's drain/drop side-effect
     /// to the golden-trace assertion path.
     txn_drain_log: TxnDrainLog,
+    /// When `true`, every session writes ONE CRC32C-corrupted frame
+    /// immediately after answering `CommandConnect` with
+    /// `CommandConnected`. Armed by
+    /// [`Self::inject_corrupted_frame_after_connected`] for the
+    /// corrupted-frame differential scenario (ADR-0054 / decision Q2):
+    /// the receiving proto layer must log + drop the frame and both
+    /// engines must keep the connection alive.
+    corrupt_after_connected: Arc<Mutex<bool>>,
+    /// When `true`, the session answers the first `CommandSend` with ONE
+    /// **decode-fatal** command frame (a corrupt length prefix whose
+    /// command bytes are not valid protobuf) *instead of* a
+    /// `CommandSendReceipt`, then closes the session. Armed by
+    /// [`Self::inject_decode_fatal_frame_on_send`] for the terminal-error
+    /// differential scenario (ADR-0055 §1).
+    ///
+    /// Unlike [`Self::corrupt_after_connected`] (a CRC32C payload mismatch
+    /// the proto layer drops and recovers from), a decode-fatal command
+    /// frame is unparseable from that byte on: the proto decode loop
+    /// surfaces a fatal `Frame(Decode(..))` error, the plain driver exits,
+    /// and `fail_all_pending` resolves the in-flight send future with
+    /// `OpOutcome::Terminal` → `ClientError::PeerClosed`. Both engines must
+    /// surface that terminal outcome identically.
+    decode_fatal_on_send: Arc<Mutex<bool>>,
 }
 
 impl std::fmt::Debug for ScriptedBroker {
@@ -225,6 +248,10 @@ impl ScriptedBroker {
         let seeked_partitions_clone = seeked_partitions.clone();
         let txn_drain_log: TxnDrainLog = Arc::new(Mutex::new(Vec::new()));
         let txn_drain_log_clone = txn_drain_log.clone();
+        let corrupt_after_connected = Arc::new(Mutex::new(false));
+        let corrupt_after_connected_clone = corrupt_after_connected.clone();
+        let decode_fatal_on_send = Arc::new(Mutex::new(false));
+        let decode_fatal_on_send_clone = decode_fatal_on_send.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let accept = listener.accept();
@@ -235,7 +262,11 @@ impl ScriptedBroker {
                                 let log = frame_log_clone.clone();
                                 let seeks = seeked_partitions_clone.clone();
                                 let drains = txn_drain_log_clone.clone();
-                                tokio::spawn(handle_session(stream, log, seeks, drains));
+                                let corrupt = corrupt_after_connected_clone.clone();
+                                let fatal = decode_fatal_on_send_clone.clone();
+                                tokio::spawn(handle_session(
+                                    stream, log, seeks, drains, corrupt, fatal,
+                                ));
                             }
                             Err(_) => break,
                         }
@@ -251,7 +282,37 @@ impl ScriptedBroker {
             frame_log,
             seeked_partitions,
             txn_drain_log,
+            corrupt_after_connected,
+            decode_fatal_on_send,
         })
+    }
+
+    /// Arm the corrupted-frame injection: every subsequent session writes
+    /// ONE CRC32C-corrupted frame immediately after answering
+    /// `CommandConnect` with `CommandConnected` (construction mirrors the
+    /// proto unit test `frame::tests::detects_crc32c_mismatch`). Used by
+    /// the corrupted-frame differential scenario (ADR-0054 / decision Q2)
+    /// to prove both engines drop the frame at the proto layer and keep
+    /// the connection — and the subsequent trace traffic — flowing.
+    pub fn inject_corrupted_frame_after_connected(&self) {
+        *self.corrupt_after_connected.lock() = true;
+    }
+
+    /// Arm the decode-fatal injection: the session answers the first
+    /// `CommandSend` with ONE **decode-fatal** command frame (a corrupt
+    /// length prefix whose command bytes are not valid protobuf) instead of
+    /// a `CommandSendReceipt`, then ends the session. Used by the
+    /// terminal-error differential scenario (ADR-0055 §1) to prove both
+    /// engines surface the same terminal outcome
+    /// (`OpOutcome::Terminal` → `ClientError::PeerClosed`) on the in-flight
+    /// send rather than hanging on a connection that is gone.
+    ///
+    /// Contrast with [`Self::inject_corrupted_frame_after_connected`], whose
+    /// CRC32C payload mismatch is *recoverable* (the proto layer drops the
+    /// frame and the connection survives). A decode-fatal command frame is
+    /// terminal: the byte stream is unparseable from that point on.
+    pub fn inject_decode_fatal_frame_on_send(&self) {
+        *self.decode_fatal_on_send.lock() = true;
     }
 
     /// Snapshot the frame log: every `BaseCommand` kind seen so far,
@@ -357,10 +418,16 @@ async fn handle_session(
     frame_log: FrameLog,
     seeked_partitions: SeekedPartitionLog,
     txn_drain_log: TxnDrainLog,
+    corrupt_after_connected: Arc<Mutex<bool>>,
+    decode_fatal_on_send: Arc<Mutex<bool>>,
 ) {
     let state = Arc::new(Mutex::new(SessionState::default()));
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    // Set by the Send arm once it has written the decode-fatal frame: the
+    // session must flush that frame and then close (the byte stream is
+    // unparseable from there on, so there is nothing more to do).
+    let mut terminate_after_flush = false;
     eprintln!("[broker] session opened");
 
     loop {
@@ -386,13 +453,23 @@ async fn handle_session(
             let _ = read_buf.split_to(consumed);
             eprintln!("[broker] decoded frame type={}", frame.command.r#type);
             frame_log.lock().push(frame.command.r#type);
-            handle_frame(
+            let corrupt = *corrupt_after_connected.lock();
+            let fatal_on_send = *decode_fatal_on_send.lock();
+            let keep_going = handle_frame(
                 &state,
                 &frame,
                 &mut out_buf,
                 &seeked_partitions,
                 &txn_drain_log,
+                corrupt,
+                fatal_on_send,
             );
+            if !keep_going {
+                // The decode-fatal frame is already staged in `out_buf`;
+                // flush it below, then close the session.
+                terminate_after_flush = true;
+                break;
+            }
         }
 
         // Push any queued messages to consumers with outstanding permits.
@@ -411,6 +488,11 @@ async fn handle_session(
             out_buf.clear();
         }
 
+        if terminate_after_flush {
+            eprintln!("[broker] decode-fatal frame flushed; closing session");
+            return;
+        }
+
         // Read more bytes.
         eprintln!("[broker] about to read; buf has {} bytes", read_buf.len());
         match stream.read_buf(&mut read_buf).await {
@@ -423,18 +505,37 @@ async fn handle_session(
     }
 }
 
+/// Handle one decoded frame, writing any replies into `out`.
+///
+/// Returns `false` when the session must close after the current `out`
+/// buffer is flushed — used by the decode-fatal-on-send injection
+/// (ADR-0055 §1), which writes ONE unparseable command frame in place of a
+/// `CommandSendReceipt` and then ends the session. Every other arm returns
+/// `true` (keep serving).
 fn handle_frame(
     state: &Arc<Mutex<SessionState>>,
     frame: &magnetar_proto::Frame,
     out: &mut BytesMut,
     seeked_partitions: &SeekedPartitionLog,
     txn_drain_log: &TxnDrainLog,
-) {
+    corrupt_after_connected: bool,
+    decode_fatal_on_send: bool,
+) -> bool {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
-        return;
+        return true;
     };
     match kind {
-        pb::base_command::Type::Connect => emit_connected(out),
+        pb::base_command::Type::Connect => {
+            emit_connected(out);
+            // Corrupted-frame differential scenario (ADR-0054 / decision
+            // Q2): when armed, follow the handshake reply with ONE
+            // CRC32C-corrupted frame so both engine legs observe the
+            // corruption at the same wire position — right behind
+            // `CommandConnected`, ahead of any lookup traffic.
+            if corrupt_after_connected {
+                emit_corrupted_frame(out);
+            }
+        }
         pb::base_command::Type::Ping => emit_pong(out),
         pb::base_command::Type::Lookup => {
             if let Some(l) = &frame.command.lookup_topic {
@@ -450,6 +551,17 @@ fn handle_frame(
             }
         }
         pb::base_command::Type::Send => {
+            // Terminal-error differential scenario (ADR-0055 §1): when armed,
+            // answer the in-flight send with ONE decode-fatal command frame
+            // instead of a `CommandSendReceipt`, then close the session. The
+            // proto decode loop surfaces a fatal `Frame(Decode(..))`, the
+            // plain driver exits, and `fail_all_pending` resolves the
+            // pending `SendFut` with `OpOutcome::Terminal` →
+            // `ClientError::PeerClosed`. Both engines must behave identically.
+            if decode_fatal_on_send {
+                emit_decode_fatal_frame(out);
+                return false;
+            }
             if let (Some(s), Some(payload)) = (&frame.command.send, &frame.payload) {
                 let topic = state
                     .lock()
@@ -694,6 +806,10 @@ fn handle_frame(
         }
         _ => {}
     }
+    // Default: keep serving. The decode-fatal-on-send arm is the only one
+    // that returns `false` (above), to close the session after writing its
+    // unparseable frame.
+    true
 }
 
 fn push_pending(state: &Arc<Mutex<SessionState>>, out: &mut BytesMut) {
@@ -751,6 +867,78 @@ fn emit_connected(out: &mut BytesMut) {
         ..Default::default()
     };
     let _ = encode_command(out, &cmd);
+}
+
+/// Encode one deliberately CRC32C-corrupted payload frame: a broker-push
+/// `CommandMessage` whose last payload byte is flipped after encoding so the
+/// CRC32C in the frame no longer matches the carried bytes (construction
+/// mirrors the proto unit test `frame::tests::detects_crc32c_mismatch`).
+///
+/// The receiving proto layer must log the mismatch at the point of
+/// detection, push `ConnectionEvent::ChecksumMismatch`, drop the frame, and
+/// keep the connection alive (workspace invariant 4, "CRC32C verify or
+/// drop") — the corrupted-frame differential trace asserts both engines do
+/// so identically.
+fn emit_corrupted_frame(out: &mut BytesMut) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Message as i32,
+        message: Some(pb::CommandMessage {
+            consumer_id: u64::MAX,
+            message_id: pb::MessageIdData {
+                ledger_id: u64::MAX,
+                entry_id: u64::MAX,
+                partition: Some(-1),
+                batch_index: Some(-1),
+                ack_set: Vec::new(),
+                batch_size: Some(0),
+                first_chunk_message_id: None,
+            },
+            redelivery_count: Some(0),
+            ack_set: Vec::new(),
+            consumer_epoch: None,
+        }),
+        ..Default::default()
+    };
+    let meta = pb::MessageMetadata {
+        producer_name: "diff-broker-corrupt".to_owned(),
+        sequence_id: 0,
+        publish_time: 1_700_000_000,
+        ..Default::default()
+    };
+    let mut frame = BytesMut::new();
+    encode_payload(&mut frame, &cmd, &meta, b"corrupt-me")
+        .expect("static corrupted-frame fixture must encode");
+    let last = frame.len() - 1;
+    frame[last] ^= 0xff;
+    out.extend_from_slice(&frame);
+}
+
+/// Encode one deliberately **decode-fatal** command frame: a plausible
+/// length prefix (`total_size` within `MAX_FRAME_SIZE`, fully present in the
+/// buffer) wrapping a command region whose bytes are NOT valid protobuf, so
+/// the receiving proto decode loop surfaces a fatal `Frame(Decode(..))` and
+/// terminates the connection.
+///
+/// Wire layout written here:
+///
+/// ```text
+/// [total_size = 5 u32 BE][cmd_size = 1 u32 BE][0xFF]
+/// ```
+///
+/// `0xFF` is protobuf wire-type 7 (reserved / invalid), so
+/// `pb::BaseCommand::decode` rejects it. The frame passes
+/// `peek_full_frame_len` (a valid, in-bounds `total_size`) but fails inside
+/// `decode_one`, exercising the fatal-decode arm of
+/// `Connection::handle_bytes_decode_loop`. Used by the terminal-error
+/// differential scenario (ADR-0055 §1).
+fn emit_decode_fatal_frame(out: &mut BytesMut) {
+    use bytes::BufMut;
+    // total_size = cmd_size field (4) + 1 command byte = 5.
+    out.put_u32(5);
+    // cmd_size = 1: exactly one command byte follows.
+    out.put_u32(1);
+    // 0xFF: protobuf wire-type 7 (reserved) — guarantees a decode error.
+    out.put_u8(0xFF);
 }
 
 fn emit_pong(out: &mut BytesMut) {

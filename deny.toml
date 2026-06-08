@@ -80,4 +80,9 @@ allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
 # futures-io `TcpStream` + `write_vectored` breaking change that is not yet on
 # crates.io. Remove this allowance when ADR-0043's re-pin trigger fires (the
 # first moonpool release carrying PR #113).
-allow-git        = ["https://github.com/PierreZ/moonpool"]
+# The FlorentinDUBOIS fork mirrors the TEMPORARY `[patch]` in Cargo.toml
+# (moonpool PR #116 validation); remove both together when that PR lands.
+allow-git        = [
+    "https://github.com/PierreZ/moonpool",
+    "https://github.com/FlorentinDUBOIS/moonpool",
+]

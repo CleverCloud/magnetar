@@ -16,7 +16,7 @@
 > magnetar dropped `B` and opened the producer / consumer on the
 > bootstrap connection. Against a multi-broker non-proxy Pulsar cluster
 > this manifested as `ServerError::NotConnected "not served by this
-> instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
+instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
 > review). This amendment generalises the existing
 > `ProxyConnectionPool` to also cover the DIRECT case: the pool key
 > stays `(logical_broker_url, physical_dial_addr)` and a new
@@ -177,7 +177,7 @@ The moonpool side mirrors the tokio side 1:1 in
   `addr`, template `ConnectionConfig`, providers bundle, optional
   `ServiceUrlProvider`, optional `DnsResolver`).
 - `ProxyConnectionPool<P>` holds the `Mutex<HashMap<(logical, physical),
-  Arc<EntryState>>>`. `EntryState` is `Pending(PendingDial)` while a dial
+Arc<EntryState>>>`. `EntryState` is `Pending(PendingDial)` while a dial
   task is in flight and `Ready { shared, driver }` once the supervised
   driver loop is up.
 - `pool::get_or_open(Arc<Self>, logical)` is the entry point; takes the
@@ -241,7 +241,7 @@ exactly. Determinism considerations:
 
 - **Race resolution**: tokio races by always running `build_entry` and
   discarding the loser's half-built entry post-dial. The moonpool side
-  uses a `Pending` slot installed under the entries-lock *before*
+  uses a `Pending` slot installed under the entries-lock _before_
   spawning the dial; subsequent callers join the existing dial instead
   of opening a parallel connection. This is cleaner under the
   spawn-task pattern (no `DriverHandle::abort` dance on the losing path)
@@ -354,10 +354,10 @@ async fn get_or_open(
 ) -> Result<Arc<ConnectionShared>, ClientError>;
 ```
 
-* Proxy entries: `logical = broker_url`, `physical = proxy address`,
+- Proxy entries: `logical = broker_url`, `physical = proxy address`,
   `proxy_to_broker_url = Some(logical)` — unchanged from the original
   ADR.
-* Direct entries: `logical = broker_url`, `physical = parsed broker_url`,
+- Direct entries: `logical = broker_url`, `physical = parsed broker_url`,
   `proxy_to_broker_url = None` — dials the resolved broker directly,
   no proxy in the middle, `CommandConnect` carries no
   `proxy_to_broker_url`.
@@ -395,22 +395,22 @@ redirect chains internally; the surfaced URL is the terminal hop).
 
 `Client::resolve_target` dispatches:
 
-* `Direct { broker_url: None }` → `self.shared.clone()` (bootstrap).
-* `Direct { broker_url: Some(url) }` → `resolve_direct_broker(url,
-  topic)`:
+- `Direct { broker_url: None }` → `self.shared.clone()` (bootstrap).
+- `Direct { broker_url: Some(url) }` → `resolve_direct_broker(url,
+topic)`:
   1. Parse `url` into a `ParsedUrl`. The synthetic-scheme fallback
      (`parse_direct_broker_url`) tolerates the bare `host:port` form
      in case a broker advertises that (matches `preferred_broker_url`
      output too).
   2. **Bootstrap-equality fast path**: if `parsed.host == bootstrap.host
-     && parsed.port == bootstrap.port`, return the bootstrap
+&& parsed.port == bootstrap.port`, return the bootstrap
      connection. Saves one TCP/TLS handshake on every same-broker
      lookup; mirrors Java's pool-identity check.
   3. Otherwise call
      `pool.get_or_open(url, &parsed, /* proxy_to_broker_url = */ None)`
      — opens (or reuses) a pool entry that dials `parsed` directly with
      no proxy.
-* `Proxy { broker_url }` → unchanged.
+- `Proxy { broker_url }` → unchanged.
 
 ### TLS posture
 
@@ -433,13 +433,13 @@ proxy path strips to `host:port` per ADR-0045).
 
 ### Auth reuse, anti-thrash, supervised reconnect
 
-* Auth: every pool entry shares the same `Auth` trait object (already
+- Auth: every pool entry shares the same `Auth` trait object (already
   the original ADR's contract; in-band tokens refresh once and
   propagate to every pinned broker).
-* Anti-thrash (ADR-0028): each pool entry carries its own
+- Anti-thrash (ADR-0028): each pool entry carries its own
   `AntiThrashState` (same supervisor config as the bootstrap). A
   broker rolling restart only hits its own pool entry.
-* Supervised reconnect: each pool entry has its own supervised driver
+- Supervised reconnect: each pool entry has its own supervised driver
   loop, reconnect target is the pool entry's `physical` URL. For
   DIRECT entries that means reconnects re-dial the broker directly —
   the supervisor does not consult `service_url_provider` on the
@@ -495,7 +495,7 @@ pool — both engines pick their entries via identical keys.
   `crates/magnetar-differential/tests/lookup_direct_multi_broker_equivalence.rs`:
   both engines decode the same DIRECT-with-broker-URL LOOKUP response
   to the same `OpOutcome::LookupResponse { LookupOutcome::Connect { … }
-  }` (the proto-level invariant the runtime decision rides on).
+}` (the proto-level invariant the runtime decision rides on).
 - **E2E** —
   `crates/magnetar/tests/e2e_lookup_direct_multi_broker.rs`: drives
   `PulsarClient::open_producer` + `subscribe` against a real Pulsar 4
@@ -519,7 +519,7 @@ pool — both engines pick their entries via identical keys.
   fast path).
 - `crates/magnetar-runtime-moonpool/src/pool.rs` — generalised
   `get_or_open` (matching tokio surface, `(logical, physical,
-  proxy_to_broker_url: Option<String>)`).
+proxy_to_broker_url: Option<String>)`).
 - Upstream:
   [`BinaryProtoLookupService.findBroker`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/BinaryProtoLookupService.java),
   [`ConnectionPool.getConnection`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java),

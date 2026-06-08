@@ -183,20 +183,38 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     // The broker takes a few seconds to come back. The supervisor
     // handles retries; we poll send() until it succeeds or the budget
     // runs out so the test fails fast if the supervisor gave up.
+    //
+    // Each attempt is TIMEOUT-BOUNDED: a send future stays pending across
+    // reconnects by design (transparent replay), so an environmental broker
+    // death here would otherwise hang the binary forever instead of failing
+    // the test (observed: a crashed standalone container under full-suite
+    // load turned this loop into a 20-hour hang). Dropping a timed-out
+    // `SendFut` is safe — its waker unregisters on drop, and the retry
+    // publishes a fresh copy of the same payload (at-least-once; the
+    // receive below tolerates duplicates by asserting payload equality).
     let payload = b"after-restart".to_vec();
     let mut attempts = 0u32;
-    let send_outcome = loop {
+    let send_outcome: Result<(), Box<dyn std::error::Error>> = loop {
         attempts += 1;
-        match producer
-            .send(OutgoingMessage::with_payload(payload.clone()).into())
-            .await
+        if attempts > 30 {
+            break Err(
+                "send did not complete within 30 bounded attempts after broker restart".into(),
+            );
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            producer.send(OutgoingMessage::with_payload(payload.clone()).into()),
+        )
+        .await
         {
-            Ok(_message_id) => break Ok(()),
-            Err(e) if attempts < 30 => {
+            Ok(Ok(_message_id)) => break Ok(()),
+            Ok(Err(e)) => {
                 tracing::info!(?e, attempts, "producer send retry after broker restart");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            Err(e) => break Err(e),
+            Err(_elapsed) => {
+                tracing::info!(attempts, "producer send attempt timed out; retrying");
+            }
         }
     };
     send_outcome?;

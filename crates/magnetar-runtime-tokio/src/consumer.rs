@@ -283,6 +283,8 @@ impl Consumer {
     /// consumers. With no tracker configured, falls back to a synchronous immediate
     /// `CommandAck` so the message is never silently dropped.
     pub fn ack_grouped(&self, message_id: MessageId) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(handle = ?self.handle, message_id = %message_id, "grouped ack staged");
         let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
         conn.ack_grouped_individual(self.handle, message_id, now);
@@ -293,6 +295,12 @@ impl Consumer {
     /// Stage a cumulative ack into the consumer's ack-grouping tracker. See
     /// [`Self::ack_grouped`] for the semantics.
     pub fn ack_grouped_cumulative(&self, message_id: MessageId) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(
+            handle = ?self.handle,
+            message_id = %message_id,
+            "grouped cumulative ack staged"
+        );
         let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
         conn.ack_grouped_cumulative(self.handle, message_id, now);
@@ -347,6 +355,13 @@ impl Consumer {
         properties: Vec<(String, i64)>,
         txn_id: Option<magnetar_proto::TxnId>,
     ) -> impl Future<Output = Result<(), ClientError>> {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(
+            handle = ?self.handle,
+            count = message_ids.len(),
+            ack_type = ?ack_type,
+            "ack enqueued"
+        );
         let shared = self.shared.clone();
         let request_id = {
             let mut conn = shared.inner.lock();
@@ -372,6 +387,7 @@ impl Consumer {
                 OpOutcome::Error { code, message, .. } => {
                     Err(ClientError::Broker { code, message })
                 }
+                OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
                 other => Err(ClientError::Other(format!(
                     "unexpected ack outcome: {other:?}"
                 ))),
@@ -381,6 +397,8 @@ impl Consumer {
 
     /// Issue an explicit FLOW (permit refill) for this consumer.
     pub fn flow(&self, permits: u32) {
+        // Flow-permit accounting — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(handle = ?self.handle, permits, "flow permits issued");
         let mut conn = self.shared.inner.lock();
         conn.flow(self.handle, permits);
         drop(conn);
@@ -395,6 +413,13 @@ impl Consumer {
 
     /// Negatively acknowledge a batch of messages.
     pub fn negative_ack_many(&self, message_ids: Vec<MessageId>) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1. An
+        // empty list is Pulsar's "redeliver all unacked" wildcard.
+        tracing::trace!(
+            handle = ?self.handle,
+            count = message_ids.len(),
+            "negative ack enqueued"
+        );
         let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
         conn.negative_ack(self.handle, message_ids, now);
@@ -407,6 +432,13 @@ impl Consumer {
     /// `magnetar_proto::trackers::nack::MultiplierRedeliveryBackoff::delay_for` to compute
     /// the delay from the broker-reported redelivery count.
     pub fn negative_ack_with_delay(&self, message_id: MessageId, delay: std::time::Duration) {
+        // Per-message hot-path record — `trace!` per ADR-0054 §2.1.
+        tracing::trace!(
+            handle = ?self.handle,
+            message_id = %message_id,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "negative ack with delay enqueued"
+        );
         let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
         conn.negative_ack_with_delay(self.handle, message_id, delay, now);
@@ -439,6 +471,7 @@ impl Consumer {
                 last_message_id, ..
             } => Ok(last_message_id),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected last_message_id outcome: {other:?}"
             ))),
@@ -485,6 +518,8 @@ impl Consumer {
                     self.handle
                 ))
             })?;
+        // Per-operation internals — `debug!` per ADR-0054 §2.1.
+        tracing::debug!(topic = %topic, "schema lookup");
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.get_schema(&topic, version)
@@ -501,6 +536,7 @@ impl Consumer {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -534,6 +570,12 @@ impl Consumer {
     }
 
     async fn seek_inner(&self, target: SeekTarget) -> Result<(), ClientError> {
+        // Snapshot the seek target for the lifecycle record below (`target`
+        // moves into `conn.seek`).
+        let (seek_message_id, seek_timestamp) = match &target {
+            SeekTarget::MessageId(id) => (Some(id.to_string()), None),
+            SeekTarget::PublishTime(ts) => (None, Some(*ts)),
+        };
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.seek(self.handle, target)
@@ -577,9 +619,28 @@ impl Consumer {
                     }
                     self.shared.driver_waker.notify_one();
                 }
+                // Lifecycle record (ADR-0054) — carries the implicit
+                // resubscribe context: the broker quiesces the subscription
+                // on seek without a `CommandCloseConsumer`, so the engine
+                // re-subscribes, replays the initial flow permits, and asks
+                // for full redelivery.
+                let resubscribed = resub_request_id.is_some();
+                let initial_flow_permits = self.slot.state.lock().receiver_queue_size as u64;
+                tracing::info!(
+                    topic = %self.slot.identity.topic,
+                    subscription = %self.slot.identity.subscription,
+                    handle = ?self.handle,
+                    message_id = seek_message_id.as_deref(),
+                    timestamp = seek_timestamp,
+                    resubscribe = resubscribed,
+                    initial_flow_permits,
+                    redeliver_unacked_all = resubscribed,
+                    "consumer seek completed"
+                );
                 Ok(())
             }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected seek outcome: {other:?}"
             ))),
@@ -607,8 +668,19 @@ impl Consumer {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Lifecycle record (ADR-0054).
+                tracing::info!(
+                    topic = %self.slot.identity.topic,
+                    subscription = %self.slot.identity.subscription,
+                    handle = ?self.handle,
+                    force,
+                    "consumer unsubscribed"
+                );
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected unsubscribe outcome: {other:?}"
             ))),
@@ -628,8 +700,18 @@ impl Consumer {
         }
         .await;
         match outcome {
-            OpOutcome::Success { .. } => Ok(()),
+            OpOutcome::Success { .. } => {
+                // Lifecycle record (ADR-0054).
+                tracing::info!(
+                    topic = %self.slot.identity.topic,
+                    subscription = %self.slot.identity.subscription,
+                    handle = ?self.handle,
+                    "consumer closed"
+                );
+                Ok(())
+            }
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected close outcome: {other:?}"
             ))),
@@ -799,6 +881,13 @@ impl Consumer {
                 .consumer_topic(self.handle)
                 .unwrap_or("")
                 .to_owned();
+            // Per-message DLQ detail — `debug!` per ADR-0054 §2.1; payload
+            // bytes are never logged.
+            tracing::debug!(
+                message_id = %msg.message_id,
+                topic = %real_topic,
+                "republishing dead-letter message"
+            );
             Self::apply_property_overrides(
                 &mut metadata.properties,
                 vec![
@@ -818,6 +907,11 @@ impl Consumer {
             dlq_producer.send(outgoing).await?;
             self.ack(msg.message_id).await?;
             count += 1;
+        }
+        if count > 0 {
+            // One success record per unit of work — `info!` per ADR-0054
+            // §2.1 (silent when nothing was drained to avoid no-op noise).
+            tracing::info!(count, "dead-letter republish complete");
         }
         Ok(count)
     }
@@ -871,6 +965,12 @@ impl Consumer {
         custom_properties: Vec<(String, String)>,
         delay: std::time::Duration,
     ) -> Result<(), ClientError> {
+        // Per-message retry-letter detail — `debug!` per ADR-0054 §2.1.
+        tracing::debug!(
+            message_id = %msg.message_id,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "scheduling reconsume"
+        );
         let mut metadata = magnetar_proto::pb::MessageMetadata {
             partition_key: msg.metadata.partition_key.clone(),
             partition_key_b64_encoded: msg.metadata.partition_key_b64_encoded,

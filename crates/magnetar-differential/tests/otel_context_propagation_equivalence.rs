@@ -15,7 +15,7 @@
 //! and the underlying runtime merge (`Consumer::apply_property_overrides`) is
 //! byte-identical code in both engines, unit-tested 1:1 on each side. The
 //! differential `EventStream` also cannot observe message properties
-//! (`Event::Received` carries only payload + id), so property-level OTel
+//! (`Event::Received` carries only payload + id), so property-level `OTel`
 //! equivalence is asserted in the proto / runtime-unit / e2e layers rather than
 //! here; this equivalence test guards the determinism property D2 relies on —
 //! that neither runtime injects on its own.

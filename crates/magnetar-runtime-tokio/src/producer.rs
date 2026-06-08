@@ -198,6 +198,13 @@ impl Producer {
                     msg.payload = compressed;
                 }
                 Err(err) => {
+                    // Pre-enqueue rejection — expected anomaly surfaced as
+                    // `Err` to the caller, so `debug!` per ADR-0054 §2.1.
+                    tracing::debug!(
+                        compression = ?self.compression,
+                        error = %err,
+                        "send rejected: compression failed"
+                    );
                     return SendFut {
                         shared: self.shared.clone(),
                         handle: self.handle,
@@ -217,6 +224,9 @@ impl Producer {
             match encryptor.encrypt(&msg.payload, &mut msg.metadata) {
                 Ok(ciphertext) => msg.payload = ciphertext,
                 Err(err) => {
+                    // Pre-enqueue rejection — `debug!` per ADR-0054 §2.1.
+                    // Payload and key material are never logged.
+                    tracing::debug!(error = %err, "send rejected: encryption failed");
                     return SendFut {
                         shared: self.shared.clone(),
                         handle: self.handle,
@@ -241,6 +251,13 @@ impl Producer {
         match self.shared.memory_limit_policy {
             magnetar_proto::MemoryLimitPolicy::FailImmediately => {
                 if let Err(err) = self.shared.try_reserve_memory(reserved_bytes) {
+                    // Caller-visible rejection whose rate scales with send
+                    // throughput under overload — `debug!` per ADR-0054
+                    // §2.1 (never `warn!` on a per-message path).
+                    tracing::debug!(
+                        payload_len = reserved_bytes,
+                        "send rejected: memory limit exceeded"
+                    );
                     return SendFut {
                         shared: self.shared.clone(),
                         handle: self.handle,
@@ -312,20 +329,23 @@ impl Producer {
 
         match result {
             Ok(seq) => {
-                // Postcondition: `ProducerSlot::queue_send` returns
-                // `SequenceId(last_sequence_id_pushed.max(0))`, so the pushed
-                // sequence id is now non-negative and equals the returned seq.
-                // The proto helper has already dropped its per-slot guard, so
-                // re-locking here is a fresh scoped acquisition (no
-                // re-entrancy, ADR-0038-safe).
-                debug_assert!(
-                    {
-                        let pushed = self.slot.state.lock().last_sequence_id_pushed;
-                        pushed >= 0 && seq.0 == pushed as u64
-                    },
-                    "queue_send postcondition: returned seq {} must match the \
-                     non-negative pushed sequence id",
-                    seq.0,
+                // NOTE: no cross-lock postcondition assert here. The returned
+                // seq is computed under the per-slot guard INSIDE
+                // `ProducerSlot::queue_send`; re-locking afterwards to compare
+                // against `last_sequence_id_pushed` raced the driver's
+                // reset/replay machinery (snapshot + ack-gated re-emit can
+                // interleave between the two acquisitions during a supervised
+                // reconnect) and panicked debug builds on a perfectly legal
+                // schedule. The contract is pinned where it is sound — in the
+                // proto unit tests, under a single guard.
+                // ADR-0054 hot-path record: no lock is held here (the
+                // per-slot guard inside `ProducerSlot::queue_send` has been
+                // released), two integer fields, and the disabled-level cost
+                // is a cached callsite check (ADR-0038 stays intact).
+                tracing::trace!(
+                    sequence_id = seq.0,
+                    payload_len = reserved_bytes,
+                    "send queued"
                 );
                 SendFut {
                     shared: self.shared.clone(),
@@ -338,6 +358,9 @@ impl Producer {
                 // The state machine rejected the send (e.g. producer not yet open); release
                 // the reservation so the budget reflects only actually-in-flight bytes.
                 self.shared.release_memory(reserved_bytes);
+                // Expected anomaly surfaced as `Err` to the caller —
+                // `debug!` per ADR-0054 §2.1.
+                tracing::debug!(error = %err, "send rejected by producer state machine");
                 SendFut {
                     shared: self.shared.clone(),
                     handle: self.handle,
@@ -417,12 +440,26 @@ impl Producer {
     ///
     /// - [`ClientError::Broker`] if the broker returns an error correlating to the close.
     pub async fn close(self) -> Result<(), ClientError> {
+        // Snapshot identity for the lifecycle record before the round-trip.
+        let topic = self.slot.identity.topic.clone();
+        let producer_name = self.slot.state.lock().name.clone().unwrap_or_default();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.close_producer(self.handle)
         };
         self.shared.driver_waker.notify_one();
-        wait_request(&self.shared, request_id).await
+        let result = wait_request(&self.shared, request_id).await;
+        if result.is_ok() {
+            // Lifecycle record (ADR-0054).
+            tracing::info!(
+                topic = %topic,
+                producer_name = %producer_name,
+                handle = ?self.handle,
+                access_mode = ?self.slot.identity.access_mode,
+                "producer closed"
+            );
+        }
+        result
     }
 
     /// Mirrors `org.apache.pulsar.client.api.Producer#isConnected`. Returns `true` while the
@@ -497,6 +534,8 @@ impl Producer {
     ) -> Result<pb::Schema, ClientError> {
         // ADR-0038: identity-only read, no global lock.
         let topic = self.slot.identity.topic.clone();
+        // Per-operation internals — `debug!` per ADR-0054 §2.1.
+        tracing::debug!(topic = %topic, "schema lookup");
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.get_schema(&topic, version)
@@ -513,6 +552,7 @@ impl Producer {
                 Err((code, message)) => Err(ClientError::Broker { code, message }),
             },
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
             other => Err(ClientError::Other(format!(
                 "unexpected get_schema outcome: {other:?}"
             ))),
@@ -532,6 +572,7 @@ async fn wait_request(
     match outcome {
         OpOutcome::Success { .. } => Ok(()),
         OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+        OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
         // Any other shape means the connection layer corrupted the request-id space — surface as
         // a protocol violation rather than silently succeeding.
         other => Err(ClientError::Other(format!(
@@ -699,6 +740,7 @@ fn translate_send_outcome(outcome: OpOutcome) -> Result<MessageId, ClientError> 
         OpOutcome::SendError { code, message, .. } => {
             Err(ClientError::SendRejected { code, message })
         }
+        OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
         other => Err(ClientError::Other(format!(
             "unexpected send outcome: {other:?}"
         ))),

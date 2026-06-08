@@ -307,6 +307,22 @@ impl ProxyConnectionPool {
             return Err(err);
         }
 
+        // Lifecycle record (ADR-0054) — pool-entry flavour of the bootstrap
+        // "connection established" in `client::start_supervised_handshake`.
+        {
+            let auth_method = shared
+                .auth_provider
+                .as_deref()
+                .map_or("none", |p| p.method());
+            tracing::info!(
+                host = %physical.host,
+                port = physical.port,
+                tls = self.factory.tls_config.is_some(),
+                auth_method,
+                "connection established"
+            );
+        }
+
         Ok(Arc::new(Entry {
             shared,
             driver: Mutex::new(Some(driver)),

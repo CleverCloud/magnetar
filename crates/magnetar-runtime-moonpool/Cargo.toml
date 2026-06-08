@@ -105,3 +105,7 @@ prost          = { workspace = true }
 # into the published crate's surface.
 rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio-rustls   = { workspace = true, features = ["aws_lc_rs"] }
+# Global capturing subscriber for the ADR-0054 secret-scan test
+# (tests/logging_no_secrets.rs). Dev-only — the library itself never
+# installs a subscriber.
+tracing-subscriber = { workspace = true }
