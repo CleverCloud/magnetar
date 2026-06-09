@@ -100,3 +100,61 @@ fn stable_socket_resets_persisted_backoff_to_initial() {
         "schedule must collapse back to initial after a stable socket, got {post_reset:?}"
     );
 }
+
+#[test]
+fn give_up_budget_fires_behind_tcp_accepting_endpoint() {
+    // ADR-0061 / follow-ups §3.2: 1:1 twin of the tokio test
+    // (`crates/magnetar-runtime-tokio/tests/supervisor_backoff_persistence.rs`).
+    // Behind a TCP-accepting proxy whose backend is down, every dial succeeds
+    // but the Pulsar handshake never completes, so each post-dial
+    // `driver_loop_inner` returns and the socket dies inside `drop_grace`. The
+    // hoisted give-up counter must therefore NOT reset across cycles and must
+    // fire at `max_attempts` — the previously-unbounded retry storm. Drives the
+    // exact counter sequence the moonpool supervised driver runs (hoisted
+    // `give_up_attempts`, reset only on `should_reset_backoff`, give up on
+    // `should_give_up`).
+    let cfg = SupervisorConfig {
+        max_attempts: Some(3),
+        ..supervisor_with_grace(Duration::from_millis(500))
+    };
+
+    // Confirm the engine sees the same config through the `ConnectionShared`
+    // round-trip the supervised driver reads from.
+    let shared = ConnectionShared::new(ConnectionConfig {
+        supervisor: Some(cfg.clone()),
+        ..ConnectionConfig::default()
+    });
+    assert_eq!(
+        shared
+            .inner
+            .lock()
+            .supervisor_config()
+            .expect("supervisor config present")
+            .max_attempts,
+        Some(3)
+    );
+
+    let mut give_up_attempts: u32 = 0;
+    let mut gave_up_after = None;
+    for cycle in 0..20 {
+        let prev_socket_alive = Duration::from_millis(5);
+        if cfg.should_reset_backoff(prev_socket_alive) {
+            give_up_attempts = 0;
+        }
+        give_up_attempts = give_up_attempts.saturating_add(1);
+        if cfg.should_give_up(give_up_attempts) {
+            gave_up_after = Some(cycle);
+            break;
+        }
+    }
+    assert_eq!(
+        gave_up_after,
+        Some(3),
+        "the supervisor must give up at max_attempts behind a TCP-accept endpoint \
+         (previously it looped forever)"
+    );
+    assert_eq!(
+        give_up_attempts, 4,
+        "counter spans the full dial+handshake cycle"
+    );
+}

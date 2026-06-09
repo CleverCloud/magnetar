@@ -19,13 +19,13 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                | Status                                                                                           |
-| --- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                         |
-| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🧠 engine/harness features + a supervision-semantics design pass                                 |
-| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain        |
-| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                      |
+| #   | Item                                                                                                                | Status                                                                                                                     |
+| --- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460                           |
+| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                                                   |
+| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🟢 all four residuals closed (ADR-0061 give-up budget; moonpool transient arms; differential drop knob; send-loop hygiene) |
+| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain                                  |
+| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                                                |
 
 ---
 
@@ -56,10 +56,13 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 
 ## 3. Reconnect parity residuals (surfaced by the re-attach replay fix)
 
-**Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix:
+**Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix. All four are now closed.
 
-1. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
-   Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
+(Closed residual: supervisor give-up semantics behind TCP-accepting proxies — the dial-loop `max_attempts` budget only counted TCP-dial failures; the `attempt` counter was declared per OUTER supervisor iteration and checked only inside the inner TCP-dial loop, so a post-dial handshake failure returned up to the outer loop, which reset `attempt` to 0. Behind a docker-proxy / LB that accepts TCP while the backend is down — the exact storm class the anti-thrash supervision was built for — the dial always succeeded and the handshake never completed, so the budget NEVER fired and a finite `max_attempts` retried forever.
+Closed by [ADR-0061](../specs/adr/0061-supervisor-give-up-counts-handshake-failures.md): the give-up counter is hoisted to span the FULL dial+handshake cycle via the new sans-io `SupervisorConfig::should_give_up(attempts)` policy gate (zero-I/O, ADR-0004), and resets to 0 ONLY on `should_reset_backoff` (a socket surviving `drop_grace`) — so give-up-reset and backoff-reset share ONE stability definition; every post-dial failure counts uniformly (Java parity).
+The pre-handshake `"supervisor: reconnected to broker"` info log is relabelled `"supervisor: TCP connected; handshaking"`, with a TRUE reconnect-success info log after the handshake actually completes. **Breaking** for callers with a finite `max_attempts` (default `None`/infinite is unaffected; flagged `BREAKING CHANGE:` in the commit).
+The four-layer + e2e coverage lands in the same changeset: proto unit `give_up_{fires_at_budget_behind_tcp_accept,counter_resets_on_socket_surviving_drop_grace,never_fires_with_default_infinite_max_attempts,boundary_is_strict_greater_than}`, the tokio + moonpool 1:1 `give_up_budget_fires_behind_tcp_accepting_endpoint` (extending `supervisor_backoff_persistence.rs`), the differential `tokio_and_moonpool_engines_agree_on_give_up_sequence`, and the e2e `e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint` (a localhost handshake-failing stub-acceptor, since a real broker always completes the handshake).
+See the `feat(proto,runtime)!` commit.)
 
 (Closed residual: the moonpool transient-retry arms were missing — the moonpool driver never consumed `ProducerOpenFailedTransient` / `SubscribeFailedTransient`, so a post-restart broker answering a rebuild with `ServiceNotReady` dead-ended the re-attach on the moonpool engine while the tokio driver recovered via its lookup-then-retry leg.
 Closed by wiring the matching arms into the moonpool driver: `handle_pending_events` drains each transient event into a `RetryRequest`, and the generic `driver_loop_inner` dispatches each one as a detached task through the engine's `TaskProvider` + `TimeProvider` — the delayed lookup + `retry_producer_open` / `retry_consumer_subscribe` sleeps on the INJECTED clock, never a host `tokio::time::sleep`, so the leg stays deterministic under `SimProviders` (ADR-0011) and its detached-spawn serialization matches the tokio engine's `tokio::spawn` so the differential `EventStream` order is identical (ADR-0024).
@@ -73,7 +76,8 @@ The harness reset is `ScriptedBroker::clear_cross_session_state`, with a `broker
 
 (Closed residual: the `e2e_reconnect` send-loop hygiene gap — unbounded `send().await` turning environmental broker death into an infinite hang — was fixed in the same series after a crashed standalone container hung the validation chain for 20 hours; each send attempt is now timeout-bounded.)
 
-**Why it stays open.** The remaining residual (1) changes user-visible supervision semantics (needs a small design pass against Java parity).
+**Status.** All four §3 residuals are now closed (see the closed-residual notes above): supervisor give-up semantics (ADR-0061), the moonpool transient-retry arms, the differential connection-drop knob, and the `e2e_reconnect` send-loop hygiene gap.
+No reconnect-parity work remains here.
 
 **Why it stays open.** Needs a design decision on where the mechanism lives (subscriber vs library) before any guidance is written; picking the library side adds per-callsite state and an API surface that the subscriber side gets for free.
 

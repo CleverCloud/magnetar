@@ -36,6 +36,7 @@ use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
@@ -651,6 +652,133 @@ async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
     consumer.close().await?;
     producer.close().await?;
     let _ = warmup.close().await;
+    client.close().await;
+    Ok(())
+}
+
+/// Spawn a loopback "handshake-failing" stub that models a docker-proxy / LB
+/// whose backend is down: it ACCEPTS the TCP connection (so the supervisor's
+/// `Transport::connect` dial succeeds) but immediately CLOSES it without ever
+/// speaking the Pulsar `CONNECTED` reply, so the post-dial handshake fails on
+/// every reconnect cycle. Returns the `pulsar://host:port` URL to point the
+/// supervisor's `ServiceUrlProvider` at.
+///
+/// A real broker always completes the handshake, so this stub is the only way
+/// to exercise the ADR-0061 budget end-to-end: counting EVERY post-dial failure
+/// (here: TCP-accept-then-close) against `max_attempts`, the supervisor gives up
+/// at the budget instead of retrying forever (the pre-ADR-0061 livelock behind a
+/// TCP-accepting proxy).
+async fn spawn_handshake_failing_stub() -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        // Accept-then-drop forever: each accepted socket is closed the instant
+        // it leaves scope, so the client's CONNECT is met with a peer close.
+        while let Ok((stream, _peer)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    Ok(format!("pulsar://{}:{}", addr.ip(), addr.port()))
+}
+
+/// ADR-0061 / follow-ups §3.2: the supervisor's `max_attempts` budget
+/// must count POST-DIAL handshake failures, not just TCP-dial failures. Behind a
+/// TCP-accepting proxy whose backend is down — the storm class the anti-thrash
+/// supervision was built for — the dial always succeeds while the Pulsar
+/// handshake never completes; pre-ADR-0061 the per-cycle counter reset to 0 each
+/// outer iteration, so the budget never fired and the driver retried forever.
+///
+/// Strategy: establish a healthy session against the real broker (so the
+/// supervised driver is running), then redirect the supervisor at a loopback
+/// stub that accepts TCP and immediately closes (handshake fails every cycle),
+/// drop the real connection by restarting the broker, and assert the client's
+/// operations TERMINALLY fail PROMPTLY (the supervisor gave up at `max_attempts`,
+/// latched `no_driver`, and `fail_all_pending` fired) rather than hanging. With
+/// `max_attempts = None` (the default) this loop would never terminate.
+///
+/// Runs as a regular test under `cargo test` (ADR-0046; no `#[ignore]`, no
+/// feature gate). Needs Docker + `apachepulsar/pulsar`. A localhost stub-acceptor
+/// stands in for the unavailable "TCP-accept-but-handshake-fail" real broker
+/// (documented above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, container) = start_pulsar().await?;
+
+    let failover = ControlledClusterFailover::new(service_url);
+    let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
+    // Finite, small budget so the give-up fires fast. Tight backoff so the
+    // five exhausting cycles complete well within the test timeout.
+    let supervisor = SupervisorConfig {
+        initial_backoff: Duration::from_millis(50),
+        max_backoff: Duration::from_millis(200),
+        mandatory_stop: Duration::from_secs(30),
+        max_attempts: Some(3),
+        ..SupervisorConfig::default()
+    };
+    let client = PulsarClient::builder()
+        .service_url_provider(provider)
+        .enable_reconnect(supervisor)
+        .operation_timeout(Duration::from_secs(30))
+        .build()
+        .await?;
+
+    // Warm up a healthy session so the supervised driver is running before we
+    // perturb it.
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-giveup-{}",
+        Uuid::new_v4()
+    );
+    let producer = client.producer(&topic).create().await?;
+    producer
+        .send(OutgoingMessage::with_payload(b"before-giveup".to_vec()).into())
+        .await?;
+
+    // Redirect the supervisor at the handshake-failing stub: every future
+    // redial dials the stub (TCP accepts) and is met with a peer close (no
+    // CONNECTED), so each reconnect cycle is a post-dial handshake failure that
+    // counts against the budget.
+    let stub_url = spawn_handshake_failing_stub().await?;
+    tracing::info!(%stub_url, "redirecting supervisor at the handshake-failing stub");
+    failover.set_url(stub_url);
+
+    // Drop the real connection so the supervisor enters its reconnect loop and
+    // starts dialing the stub. `docker stop` (not restart) keeps the broker
+    // down so the only reachable endpoint is the stub.
+    let container_id = container.id().to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(["stop", "--time", "5", &container_id])
+            .status()
+    })
+    .await??;
+    assert!(status.success(), "docker stop failed: {status:?}");
+
+    // The supervisor now dials the stub: TCP accept + immediate close = a
+    // post-dial handshake failure on every cycle. With `max_attempts = 3` it
+    // gives up by the 4th cycle, latches `no_driver`, and `fail_all_pending`
+    // terminalizes pending ops. A `send()` issued after give-up must therefore
+    // resolve with a TERMINAL ERROR PROMPTLY — the timeout is the no-hang guard,
+    // the regression this test exists to catch (pre-ADR-0061 it looped forever).
+    let send_res = tokio::time::timeout(
+        Duration::from_secs(20),
+        producer.send(OutgoingMessage::with_payload(b"after-giveup".to_vec()).into()),
+    )
+    .await
+    .expect("send must resolve PROMPTLY once the supervisor gives up, not hang forever");
+    assert!(
+        send_res.is_err(),
+        "send must surface a terminal error once the supervisor exhausts max_attempts \
+         behind a TCP-accepting handshake-failing endpoint, got Ok({:?})",
+        send_res.ok(),
+    );
+
+    // The client reports the connection as down after the give-up.
+    assert!(
+        !client.is_connected(),
+        "connection must be down after the supervisor gives up"
+    );
+
     client.close().await;
     Ok(())
 }

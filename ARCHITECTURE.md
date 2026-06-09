@@ -585,6 +585,10 @@ The supervisor:
    User-facing futures stay registered; they get woken when the broker re-issues the producer/consumer IDs.
 
 The supervisor never retries past `ReconnectConfig::max_attempts`; on exhaustion it propagates the last `EngineError::Io` upward and the `Client` is closed.
+The give-up budget counts the FULL dial+handshake cycle, not just TCP-dial failures ([ADR-0061](specs/adr/0061-supervisor-give-up-counts-handshake-failures.md)): the `give_up_attempts` counter is hoisted OUTSIDE the outer supervisor loop and gated by the sans-io `SupervisorConfig::should_give_up(attempts)` helper, so a connection that dials successfully (TCP accept) but then fails the Pulsar handshake — the docker-proxy / LB storm where the backend is down — counts against `max_attempts` instead of resetting it.
+The counter resets to 0 only when `should_reset_backoff(socket_alive)` is true (a socket that survived `drop_grace`), the SAME stability gate the `Backoff` schedule resets on — so give-up-reset and backoff-reset share one definition of a stable reconnect.
+The default `max_attempts = None` keeps retrying forever (Java parity).
+On a successful dial the supervisor logs `"supervisor: TCP connected; handshaking"` at `info!`; the TRUE reconnect-success `info!` (`"supervisor: reconnected to broker; handshake complete, …"`) fires only after the handshake completes, so a TCP accept behind a down backend is never mislabelled as a reconnect.
 
 #### Transient-error retry (per-handle)
 
