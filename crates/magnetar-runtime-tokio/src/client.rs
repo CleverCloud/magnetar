@@ -535,16 +535,73 @@ impl Client {
         // reconnect (transiently `Failed`, `no_driver == false`) still issues
         // the lookup and recovers transparently.
         self.shared.fail_if_no_driver()?;
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.lookup(topic, false)
-        };
-        self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
+
+        // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
+        // `Connection::reset` (supervised reconnect) fails every pending
+        // request — including this in-flight `CommandLookupTopic` — with
+        // `OpOutcome::SessionLost`, but (unlike an in-flight publish) does NOT
+        // re-issue the lookup. We close that asymmetry here: on `SessionLost`,
+        // park until the connection is live again (or terminal), then re-issue
+        // against the fresh session. The reissue budget is only spent when a
+        // lookup was actually submitted against a connected session, so a
+        // connection flapping in its not-yet-reconnected window cannot burn the
+        // budget without a real broker round-trip. Mirrors Java's
+        // lookup-after-reset retry.
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        loop {
+            let request_id = {
+                let mut conn = self.shared.inner.lock();
+                conn.lookup(topic, false)
+            };
+            self.shared.driver_waker.notify_one();
+            let outcome = RequestFut {
+                shared: self.shared.clone(),
+                request_id,
+            }
+            .await;
+
+            // The session was severed mid-lookup by a supervised reconnect.
+            // Park until the connection recovers (re-issue) or goes terminal
+            // (PeerClosed, composing with §5.1), bounded by the reissue budget.
+            if matches!(outcome, OpOutcome::SessionLost { .. }) {
+                match self.shared.await_reconnect_or_terminal().await {
+                    crate::LookupReissueReadiness::Reconnected => {
+                        if reissues_remaining == 0 {
+                            tracing::warn!(
+                                topic,
+                                max_reissues = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES,
+                                "lookup session-reissue cap exceeded; surfacing PeerClosed"
+                            );
+                            return Err(ClientError::PeerClosed);
+                        }
+                        reissues_remaining -= 1;
+                        tracing::debug!(
+                            topic,
+                            reissues_remaining,
+                            "lookup severed by reconnect; re-issuing against fresh session"
+                        );
+                        continue;
+                    }
+                    crate::LookupReissueReadiness::Terminal => {
+                        return Err(ClientError::PeerClosed);
+                    }
+                }
+            }
+
+            return Self::map_lookup_outcome(topic, outcome, self.bootstrap_scheme());
         }
-        .await;
+    }
+
+    /// Translate a terminal lookup [`OpOutcome`] into a [`LookupTarget`] or a
+    /// [`ClientError`]. Split out of [`Self::lookup_topic`] so the
+    /// bounded-retry loop (ADR-0060 / follow-ups §4.1) only re-runs the
+    /// issue-await steps; the `SessionLost` arm is handled by the loop before
+    /// this is reached, so it never appears here.
+    fn map_lookup_outcome(
+        topic: &str,
+        outcome: OpOutcome,
+        bootstrap_scheme: Scheme,
+    ) -> Result<LookupTarget, ClientError> {
         match outcome {
             OpOutcome::LookupResponse { outcome, .. } => {
                 match outcome {
@@ -569,7 +626,7 @@ impl Client {
                             let broker_url = preferred_broker_url(
                             broker_service_url,
                             broker_service_url_tls,
-                            self.bootstrap_scheme(),
+                            bootstrap_scheme,
                         )
                         .ok_or_else(|| ClientError::Other(format!(
                             "lookup of '{topic}' set proxy_through_service_url=true but did \
@@ -586,7 +643,7 @@ impl Client {
                             let broker_url = direct_broker_url(
                                 broker_service_url,
                                 broker_service_url_tls,
-                                self.bootstrap_scheme(),
+                                bootstrap_scheme,
                             );
                             Ok(LookupTarget::Direct { broker_url })
                         }

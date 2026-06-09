@@ -8391,6 +8391,108 @@ mod conn_state_tests {
             "a live peer is never failed; the watchdog re-arms cleanly",
         );
     }
+
+    /// ADR-0060 / follow-ups §4.1 (layer a): the proto-level surface the
+    /// engine-side bounded lookup-retry loop consults. An in-flight lookup
+    /// severed by `reset()` surfaces `OpOutcome::SessionLost` (the signal to
+    /// re-issue, NOT a terminal error), and after a fresh handshake the
+    /// connection is `is_connected()` again so a re-issued lookup lands a NEW,
+    /// resolvable request-id on the new session. This is what lets the engine
+    /// loop TERMINATE on the next reconnect instead of spinning: one
+    /// `SessionLost` → one re-issue → a real broker round-trip on the fresh
+    /// session. The bound [`crate::lookup::MAX_LOOKUP_SESSION_REISSUES`] caps the
+    /// number of such re-issues; this test proves the happy-path re-issue is
+    /// resolvable (so the bound is a ceiling, not the steady state).
+    #[test]
+    fn reissued_lookup_after_reset_resolves_on_fresh_session() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        assert!(conn.is_connected(), "connected after the first handshake");
+
+        // First lookup goes in flight, then the supervised reconnect severs it.
+        let first_rid = conn.lookup("persistent://public/default/foo", false);
+        conn.reset();
+
+        // The engine loop's `matches!(outcome, OpOutcome::SessionLost { .. })`
+        // arm fires on exactly this outcome — the re-issue signal.
+        match conn.take_outcome(PendingOpKey::Request(first_rid)) {
+            Some(OpOutcome::SessionLost { key }) => {
+                assert_eq!(key, PendingOpKey::Request(first_rid));
+            }
+            other => panic!("expected SessionLost on the severed lookup, got {other:?}"),
+        }
+
+        // `reset()` snapped the state machine back to `Uninitialized`; the
+        // engine loop parks on readiness (`await_reconnect_or_terminal`) until
+        // the supervisor re-handshakes the socket.
+        assert!(
+            !conn.is_connected(),
+            "post-reset the connection is not yet live — the loop must park, not re-issue"
+        );
+
+        // Supervisor re-handshakes the new socket → back to Connected. This is
+        // the `Reconnected` branch the engine loop waits for.
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle re-handshake");
+        let _ = conn.poll_event();
+        assert!(
+            conn.is_connected(),
+            "connection is live again after the supervised re-handshake"
+        );
+
+        // The re-issued lookup lands a fresh request-id resolvable on the new
+        // session — distinct from the severed one, and present in the registry
+        // so a `LookupResponse` on the new socket correlates against it.
+        let reissued_rid = conn.lookup("persistent://public/default/foo", false);
+        assert_ne!(
+            reissued_rid, first_rid,
+            "the re-issued lookup uses a fresh request-id on the new session"
+        );
+        assert!(
+            conn.lookup.lookups.contains_key(&reissued_rid),
+            "the re-issued lookup is registered against the fresh session, so its \
+             broker response will resolve it — the loop terminates",
+        );
+    }
+
+    /// ADR-0060 / follow-ups §4.1 (layer a): the terminal short-circuit the
+    /// engine loop's `await_reconnect_or_terminal` returns. When the connection
+    /// has gone `is_closed()` (here: a transport `Failed`) and the runtime's
+    /// `no_driver` latch is set, the engine maps a severed lookup to a clean
+    /// `PeerClosed` instead of re-issuing — composing with ADR-0059. The proto layer
+    /// owns the `is_closed()` half of that decision; this pins it.
+    #[test]
+    fn failed_connection_is_closed_so_lookup_loop_short_circuits() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        // A transport drop with NO supervisor reconnect → `Failed`, which
+        // `is_closed()` reports `true`. Paired with the runtime `no_driver`
+        // latch (ADR-0059), the engine loop returns `Terminal` → `PeerClosed`.
+        conn.mark_disconnected();
+        assert!(
+            conn.is_closed(),
+            "a Failed connection reports is_closed(); the engine pairs this with \
+             no_driver to short-circuit the lookup loop to PeerClosed"
+        );
+        assert!(
+            !conn.is_connected(),
+            "a Failed connection is not connected — the loop never re-issues"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "scalable-topics"))]

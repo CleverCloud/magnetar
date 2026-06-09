@@ -1325,7 +1325,8 @@ rebuild_producers() / rebuild_consumers() -> re-emit every still-open
 ```
 
 User futures stay live across the migration.
-In-flight publishes severed by the reset surface `OpOutcome::SessionLost` and the user retries (the planned Stage 3 follow-up is transparent at-least-once replay).
+`Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost`, but treats in-flight **publishes** specially: it snapshots them and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
+A lookup behind `subscribe` / `open_producer` severed by the reset is likewise re-issued transparently — the engine's `lookup_topic` parks on `ConnectionShared::await_reconnect_or_terminal` and re-runs the `CommandLookupTopic` against the fresh session, bounded by `MAX_LOOKUP_SESSION_REISSUES`, surfacing `PeerClosed` only if the supervisor gives up (`no_driver` latched). See [ADR-0060](specs/adr/0060-lookup-retry-on-session-lost.md) (lookup) and [ADR-0059](specs/adr/0059-terminal-fast-fail-new-ops.md) (the `no_driver` terminal latch).
 
 ---
 

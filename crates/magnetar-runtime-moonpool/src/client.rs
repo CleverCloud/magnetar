@@ -522,28 +522,75 @@ impl<P: Providers> Client<P> {
         // reconnect (transiently `Failed`, `no_driver == false`) still issues
         // the lookup and recovers transparently. 1:1 with the tokio engine.
         self.shared.fail_if_no_driver()?;
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.lookup(topic, authoritative)
-        };
-        self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
-        match outcome {
-            OpOutcome::LookupResponse { outcome, .. } => match outcome {
-                LookupOutcome::Failed { code, message } => {
+
+        // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
+        // `Connection::reset` (supervised reconnect) fails every pending
+        // request — including this in-flight `CommandLookupTopic` — with
+        // `OpOutcome::SessionLost`, but (unlike an in-flight publish) does NOT
+        // re-issue the lookup. We close that asymmetry here: on `SessionLost`,
+        // park until the connection is live again (or terminal), then re-issue
+        // against the fresh session. The reissue budget is only spent when a
+        // lookup was actually submitted against a connected session, so a
+        // connection flapping in its not-yet-reconnected window cannot burn the
+        // budget without a real broker round-trip. 1:1 with the tokio engine
+        // (ADR-0024) — the loop is expressed against this engine's own
+        // readiness primitive, not by textual copy.
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        loop {
+            let request_id = {
+                let mut conn = self.shared.inner.lock();
+                conn.lookup(topic, authoritative)
+            };
+            self.shared.driver_waker.notify_one();
+            let outcome = RequestFut {
+                shared: self.shared.clone(),
+                request_id,
+            }
+            .await;
+
+            // The session was severed mid-lookup by a supervised reconnect.
+            // Park until the connection recovers (re-issue) or goes terminal
+            // (PeerClosed, composing with §5.1), bounded by the reissue budget.
+            if matches!(outcome, OpOutcome::SessionLost { .. }) {
+                match self.shared.await_reconnect_or_terminal().await {
+                    crate::LookupReissueReadiness::Reconnected => {
+                        if reissues_remaining == 0 {
+                            tracing::warn!(
+                                topic,
+                                max_reissues = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES,
+                                "lookup session-reissue cap exceeded; surfacing PeerClosed"
+                            );
+                            return Err(ClientError::PeerClosed);
+                        }
+                        reissues_remaining -= 1;
+                        tracing::debug!(
+                            topic,
+                            reissues_remaining,
+                            "lookup severed by reconnect; re-issuing against fresh session"
+                        );
+                        continue;
+                    }
+                    crate::LookupReissueReadiness::Terminal => {
+                        return Err(ClientError::PeerClosed);
+                    }
+                }
+            }
+
+            return match outcome {
+                OpOutcome::LookupResponse { outcome, .. } => match outcome {
+                    LookupOutcome::Failed { code, message } => {
+                        Err(ClientError::Broker { code, message })
+                    }
+                    other => Ok(other),
+                },
+                OpOutcome::Error { code, message, .. } => {
                     Err(ClientError::Broker { code, message })
                 }
-                other => Ok(other),
-            },
-            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
-            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected lookup outcome: {other:?}"
-            ))),
+                OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
+                other => Err(ClientError::Other(format!(
+                    "unexpected lookup outcome: {other:?}"
+                ))),
+            };
         }
     }
 

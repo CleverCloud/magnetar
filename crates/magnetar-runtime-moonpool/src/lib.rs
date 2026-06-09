@@ -342,6 +342,22 @@ impl std::fmt::Debug for ConnectionShared {
     }
 }
 
+/// Outcome of [`ConnectionShared::await_reconnect_or_terminal`], the
+/// wake-or-terminal park the engine-side lookup-retry loop consults after an
+/// in-flight lookup was severed by a supervised reconnect (ADR-0060 /
+/// follow-ups ADR-0060). 1:1 mirror of the tokio engine's same-named enum
+/// (ADR-0024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupReissueReadiness {
+    /// The connection is back in `Connected` on a fresh session — re-issue the
+    /// lookup.
+    Reconnected,
+    /// The connection is terminal (`is_closed()`) AND `no_driver` is latched —
+    /// no driver will recover it. Short-circuit to `PeerClosed` (composes with
+    /// §5.1's terminal fast-fail).
+    Terminal,
+}
+
 impl ConnectionShared {
     /// Construct shared state from the given protocol-layer config.
     ///
@@ -375,6 +391,52 @@ impl ConnectionShared {
             return Err(crate::client::ClientError::PeerClosed);
         }
         Ok(())
+    }
+
+    /// Park until this connection is live again on a fresh session, or has gone
+    /// genuinely terminal — whichever happens first. Used by the engine-side
+    /// lookup-retry-on-`SessionLost` loop (ADR-0060 / follow-ups §4.1): when an
+    /// in-flight `CommandLookupTopic` is severed by a supervised reconnect
+    /// ([`magnetar_proto::Connection::reset`] publishes
+    /// [`magnetar_proto::OpOutcome::SessionLost`] on its request-id), the
+    /// caller waits here before re-issuing the lookup against the new session.
+    ///
+    /// Returns [`LookupReissueReadiness::Reconnected`] once the state machine is
+    /// back in [`magnetar_proto::HandshakeState::Connected`] (re-issue the
+    /// lookup), or [`LookupReissueReadiness::Terminal`] once the connection
+    /// `is_closed()` AND [`Self::no_driver`] is latched (short-circuit to
+    /// [`crate::client::ClientError::PeerClosed`], composing with §5.1).
+    ///
+    /// Park-on-readiness, NOT a timer: waits on [`Self::driver_waker`], which the
+    /// driver pulses via `notify_waiters()` on every state transition
+    /// (post-`CommandConnected` included). A bare wake that leaves the connection
+    /// still not-connected and not-terminal loops back to park again — it never
+    /// proceeds to re-issue. The `Notified` future is created and `enable()`d
+    /// *before* the state re-check so a transition racing between the check and
+    /// the await is not lost — no virtual-clock read either (ADR-0011). 1:1
+    /// mirror of the tokio engine.
+    pub async fn await_reconnect_or_terminal(&self) -> LookupReissueReadiness {
+        loop {
+            // Arm the wakeup BEFORE inspecting state so a transition that lands
+            // between the check and the await is captured by this `Notified`.
+            let notified = self.driver_waker.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            {
+                let conn = self.inner.lock();
+                if conn.is_connected() {
+                    return LookupReissueReadiness::Reconnected;
+                }
+                if conn.is_closed() && self.no_driver.load(Ordering::SeqCst) {
+                    return LookupReissueReadiness::Terminal;
+                }
+            }
+
+            // Neither live nor terminal yet — park until the next driver pulse,
+            // then re-check. A spurious wake just re-loops; it does NOT proceed.
+            notified.await;
+        }
     }
 
     /// Construct with an auth provider for in-band challenge refresh.

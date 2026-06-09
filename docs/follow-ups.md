@@ -24,7 +24,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
 | 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                         |
 | 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🧠 engine/harness features + a supervision-semantics design pass                                 |
-| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟡 1 engine residual (lookup-retry) + 3 pre-existing test-state caveats                          |
+| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain        |
 | 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                      |
 
 ---
@@ -89,11 +89,12 @@ It was moonpool's default-on FoundationDB bit-flip chaos corrupting a Pulsar _co
 [ADR-0055](../specs/adr/0055-bit-flip-survivability-model.md) makes corruption _survivable_ instead of disabling the chaos: a plain connection fails its in-flight ops fast (`PeerClosed`) instead of hanging, and the chaos workloads run supervised over a broker that persists its ledger + per-subscription cursor across reconnects.
 Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
 
-**Gap.** One engine residual, not blocking the fix:
+**Gap.** Both engine residuals are now closed; no survivability work remains here.
 
-1. **Lookup `SessionLost` is not transparently re-issued.** A transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaces to the caller as `ClientError::Other` — the engine does not auto-reissue the lookup the way it transparently replays producer sends and re-subscribes.
-   The `sim_chaos` workloads retry around it at setup, but a production caller subscribing/opening _during_ a reconnect could see this `Other`.
-   Fix: engine-side lookup-retry-on-`SessionLost` (mirrors Java's lookup-after-reset), with its own ADR-0024 layers.
+(Closed residual: lookup `SessionLost` was not transparently re-issued — a transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaced to the caller as `ClientError::Other("unexpected lookup outcome: SessionLost…")`, because `Connection::reset` re-issues in-flight publishes and re-subscribes consumers but does **not** re-issue the lookup.
+Closed by [ADR-0060](../specs/adr/0060-lookup-retry-on-session-lost.md): both engines' `lookup_topic` now park on `ConnectionShared::await_reconnect_or_terminal` — a `driver_waker` wake-or-terminal readiness check, no clock read — and re-issue the lookup against the freshly-handshaked session, bounded by the new proto const `MAX_LOOKUP_SESSION_REISSUES` (next to `MAX_LOOKUP_REDIRECTS`); a terminal `SessionLost` (supervisor gave up → `no_driver` latched, composing with ADR-0059) short-circuits to `PeerClosed`.
+`reset`'s `SessionLost` emission is untouched; mirrors Java's lookup-after-reset.
+See the `feat(proto,runtime)` commit and the extended `e2e_reconnect.rs` subscribe-during-reconnect assertion.)
 
 (Closed residual: terminal-state fast-fail for NEW ops — a `producer.send()` / `subscribe()` / `producer.close()` / `lookup` issued AFTER a plain connection was already terminal used to register a doomed pending op that hung, since `fail_all_pending` terminalized only the ops pending AT the drop.
 Closed by [ADR-0059](../specs/adr/0059-terminal-fast-fail-new-ops.md): `fail_all_pending` now flips each producer slot's `closed` flag inside its existing per-slot lock scope so a post-terminal `queue_send` fast-fails through the existing `if self.closed` guard; a runtime `ConnectionShared::no_driver` `AtomicBool` latch — set on both the plain driver's terminal exit and the supervisor give-up path, 1:1 across engines — drives synchronous `fail_if_no_driver()` guards at `open_producer` / `subscribe` / `lookup` / `producer.close()` returning `PeerClosed` only when `is_closed()` AND `no_driver`, so a supervised connection's transient `Failed` reconnect window is never wrongly `PeerClosed`d — see the `feat(proto,runtime)` commit and the `e2e_terminal_exit.rs` scope-note removal.)
@@ -113,13 +114,8 @@ Closed by [ADR-0059](../specs/adr/0059-terminal-fast-fail-new-ops.md): `fail_all
 The ADR-0055 change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
 The mid-scenario **drop + redial** knob that residual asked for has since landed: `ScriptedBroker::drop_connection_after` + a cross-session ledger / durable cursor + the `reconnect_replay_gating_equivalence` differential scenario (see the `test(differential)` commit and the closed-residual note under §3).
 
-**Why it stays open.** The remaining lookup-retry residual is an engine feature with its own ADR-0024 test obligations and a small Java-parity design pass; the test-state caveats are pre-existing suite issues / gate mechanics, not survivability work.
-
-**`/goal` (lookup-retry-on-`SessionLost` residual §4.1).**
-
-```text
-/goal implement engine-side lookup-retry-on-SessionLost per docs/follow-ups.md §4.1. A transient SessionLost on the in-flight CommandLookupTopic behind subscribe / open_producer during a supervised reconnect must be transparently re-issued against the freshly-handshaked session (mirroring Java's lookup-after-reset), not surfaced to the caller as ClientError::Other. Mirror across both engines (ADR-0024 1:1) with proto unit + tokio/moonpool integration twins + a differential layer. Validation chain per CLAUDE.md.
-```
+**Why it stays open.** It does not — both engine survivability residuals (terminal fast-fail for new ops; lookup-retry-on-`SessionLost`) are closed by ADR-0059 and ADR-0060.
+What remains under §4 is the three pre-existing test-state caveats above, which are suite issues / gate mechanics, not survivability work.
 
 ---
 

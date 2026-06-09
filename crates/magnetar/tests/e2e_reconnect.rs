@@ -376,3 +376,152 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     client.close().await;
     Ok(())
 }
+
+/// ADR-0060 regression guard: a transient `SessionLost` on a lookup behind
+/// `subscribe` / `producer.create()` must NOT leak to the caller as
+/// `ClientError::Other("unexpected lookup outcome: SessionLost…")`. Asserts the
+/// error string carries neither marker — the engine must have re-issued the
+/// lookup transparently instead.
+fn assert_no_session_lost_leak<E: std::fmt::Debug>(e: &E, op: &str) {
+    let msg = format!("{e:?}");
+    assert!(
+        !msg.contains("unexpected lookup outcome") && !msg.contains("SessionLost"),
+        "{op} during reconnect leaked a SessionLost-derived error (ADR-0060 regression): {e:?}",
+    );
+}
+
+/// ADR-0060 / follow-ups §4.1: a `subscribe()` / `producer.create()` issued
+/// DURING a supervised reconnect — so its in-flight `CommandLookupTopic` races
+/// the supervisor's `reset()` and is severed with `OpOutcome::SessionLost` —
+/// must SUCCEED transparently once the broker is back, NOT surface
+/// `ClientError::Other("unexpected lookup outcome: SessionLost…")`. The engine
+/// re-issues the severed lookup against the fresh session (bounded by
+/// `MAX_LOOKUP_SESSION_REISSUES`), mirroring Java's lookup-after-reset.
+///
+/// Strategy: warm up a healthy session, restart the broker, then immediately —
+/// while the supervisor is mid-reconnect — open a NEW producer and subscribe a
+/// NEW consumer on a fresh topic. The open/subscribe future stays pending
+/// across the reconnect and resolves `Ok` via the re-issued lookup; a regression
+/// (the pre-ADR-0060 catch-all) would surface `ClientError::Other` instead. A
+/// round-trip on the new handles confirms they are genuinely live.
+///
+/// Runs as a regular test under `cargo test` (ADR-0046; no `#[ignore]`, no
+/// feature gate). Needs Docker + `apachepulsar/pulsar`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, container) = start_pulsar().await?;
+
+    let failover = ControlledClusterFailover::new(service_url);
+    let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
+    let client = PulsarClient::builder()
+        .service_url_provider(provider)
+        .enable_reconnect(supervisor_for_e2e())
+        .operation_timeout(Duration::from_secs(120))
+        .build()
+        .await?;
+
+    // Warm up a healthy session so the supervised driver is running before we
+    // perturb it (a fresh-topic lookup is what we want to race against reset).
+    let warmup_topic = format!(
+        "persistent://public/default/magnetar-e2e-reconnect-warmup-{}",
+        Uuid::new_v4()
+    );
+    let warmup = client.producer(&warmup_topic).create().await?;
+    warmup
+        .send(OutgoingMessage::with_payload(b"warmup".to_vec()).into())
+        .await?;
+
+    // Restart the broker to open the reconnect window.
+    tracing::info!("restarting pulsar container to race a fresh lookup against reset");
+    let container_id = container.id().to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(["restart", "--time", "5", &container_id])
+            .status()
+    })
+    .await??;
+    assert!(status.success(), "docker restart failed: {status:?}");
+    let new_host = container.get_host().await?;
+    let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+    failover.set_url(format!("pulsar://{new_host}:{new_port}"));
+
+    // Open a NEW producer + subscribe a NEW consumer on a fresh topic right now,
+    // while the supervisor is reconnecting. Their in-flight lookups race the
+    // reset; ADR-0060 must re-issue them transparently. Each attempt is
+    // timeout-bounded (a lookup parks across the reconnect by design); we retry
+    // until the broker is fully back, then assert SUCCESS — and crucially, that
+    // no attempt ever surfaced a `SessionLost`-derived `Other` error.
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-reconnect-newtopic-{}",
+        Uuid::new_v4()
+    );
+    let subscription = format!("magnetar-e2e-reconnect-newsub-{}", Uuid::new_v4());
+
+    let mut attempts = 0u32;
+    let consumer = loop {
+        attempts += 1;
+        assert!(
+            attempts <= 30,
+            "subscribe during reconnect did not complete within 30 bounded attempts"
+        );
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            client
+                .consumer(&topic)
+                .subscription(&subscription)
+                .subscription_type(SubType::Exclusive)
+                .initial_position(InitialPosition::Earliest)
+                .subscribe(),
+        )
+        .await
+        {
+            Ok(Ok(c)) => break c,
+            Ok(Err(e)) => {
+                // ADR-0060 contract: a transient SessionLost must NOT leak as
+                // `Other("unexpected lookup outcome: SessionLost…")`.
+                assert_no_session_lost_leak(&e, "subscribe");
+                tracing::info!(?e, attempts, "subscribe retry while broker comes back");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(_elapsed) => {
+                tracing::info!(attempts, "subscribe attempt timed out; retrying");
+            }
+        }
+    };
+
+    let producer = loop {
+        attempts += 1;
+        assert!(
+            attempts <= 60,
+            "producer create during reconnect did not complete within the attempt budget"
+        );
+        match tokio::time::timeout(Duration::from_secs(10), client.producer(&topic).create()).await
+        {
+            Ok(Ok(p)) => break p,
+            Ok(Err(e)) => {
+                assert_no_session_lost_leak(&e, "producer create");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(_elapsed) => {}
+        }
+    };
+
+    // The new handles are genuinely live: a round-trip succeeds.
+    producer
+        .send(OutgoingMessage::with_payload(b"after-reconnect-newtopic".to_vec()).into())
+        .await?;
+    let got = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    assert_eq!(
+        got.payload.as_ref(),
+        b"after-reconnect-newtopic",
+        "the new consumer subscribed during reconnect must receive on the fresh topic",
+    );
+    consumer.ack(got.message_id).await?;
+
+    consumer.close().await?;
+    producer.close().await?;
+    let _ = warmup.close().await;
+    client.close().await;
+    Ok(())
+}
