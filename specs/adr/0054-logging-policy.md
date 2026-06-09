@@ -74,6 +74,8 @@ Everywhere else `error = %err` (`Display`) applies per §2.
 
 **Broker-controlled string sanitization.** Broker-supplied strings (server error messages, advertised redirect URLs) are truncated to 256 bytes (cut at a `char` boundary) in log fields — log-injection and cardinality defense, mirroring sozu's render-time sanitization (`doc/observability.md:276-279`).
 
+> Amendment (broker-error/connect-error sinks added by ADR-0062, 2026-06-09): this rule originally bounded broker text only in `tracing` log fields. The mid-handshake `CommandError.message` stored in `Connection::handshake_failure_reason` — and the `ClientError::Other` / `EngineError::HandshakeFailed` connect errors that inherit it — were the one broker-text sink that escaped it. [ADR-0062](0062-broker-error-field-truncation.md) closes that gap by applying the same 256-byte `char`-boundary bound at the proto capture site, before the reason is stored.
+
 **Tenant-metadata classification.** `topic`, `subscription`, `producer_name`, and broker URLs are classified as operational metadata, not secrets — they appear in log fields by design.
 Privacy-sensitive deployments that consider topic names confidential filter them subscriber-side (field-level filtering or per-target suppression); the library does not pre-redact them.
 

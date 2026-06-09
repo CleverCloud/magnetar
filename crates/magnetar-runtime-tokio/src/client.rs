@@ -1431,6 +1431,16 @@ pub(crate) async fn bounded_wait_connected(
     }
 }
 
+/// Render the captured mid-handshake broker reason as the user-facing
+/// `"handshake failed: …"` envelope, or `None` when no broker `CommandError`
+/// was captured (a raw transport drop with no protocol frame). The proto layer
+/// already length-bounds the broker text at the capture site (ADR-0062), so the
+/// envelope here is safe to surface verbatim.
+fn handshake_failure_message(conn: &magnetar_proto::Connection) -> Option<String> {
+    conn.handshake_failure_reason()
+        .map(|reason| format!("handshake failed: {reason}"))
+}
+
 /// Future that resolves once the state machine reports `HandshakeState::Connected` (or fails if
 /// it transitions to `Failed`/`Closed` before that).
 struct ConnectedFut {
@@ -1457,9 +1467,20 @@ impl Future for ConnectedFut {
             match ev {
                 ConnectionEvent::Connected { .. } => return Poll::Ready(Ok(())),
                 ConnectionEvent::Closed { reason } => {
-                    return Poll::Ready(Err(ClientError::Other(
-                        reason.unwrap_or_else(|| "connection closed during handshake".into()),
-                    )));
+                    // A mid-handshake broker `CommandError` populates
+                    // `handshake_failure_reason`, but the terminal drop that
+                    // follows surfaces here as a `Closed` event whose `reason`
+                    // is the generic transport string ("peer closed the
+                    // connection"). Prefer the captured handshake reason — and
+                    // wrap it in the SAME "handshake failed: …" envelope as the
+                    // `Failed`-state branch below — so the broker's explanation
+                    // surfaces regardless of which terminalization path won the
+                    // capture-vs-drop race. The reason is already length-bounded
+                    // at the proto capture site (ADR-0062).
+                    let msg = handshake_failure_message(&conn).unwrap_or_else(|| {
+                        reason.unwrap_or_else(|| "connection closed during handshake".into())
+                    });
+                    return Poll::Ready(Err(ClientError::Other(msg)));
                 }
                 _ => {
                     // Tolerate other events that may sneak in (none expected pre-handshake).
@@ -1474,10 +1495,8 @@ impl Future for ConnectedFut {
                 // namespace not found via proxy_to_broker_url, etc.). Falls
                 // back to the opaque message for raw transport drops where no
                 // protocol frame ever arrived (TLS error, ECONNREFUSED).
-                let msg = conn.handshake_failure_reason().map_or_else(
-                    || "handshake failed".to_owned(),
-                    |reason| format!("handshake failed: {reason}"),
-                );
+                let msg = handshake_failure_message(&conn)
+                    .unwrap_or_else(|| "handshake failed".to_owned());
                 Poll::Ready(Err(ClientError::Other(msg)))
             }
             HandshakeState::Closed => Poll::Ready(Err(ClientError::Closed)),

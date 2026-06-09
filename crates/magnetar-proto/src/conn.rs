@@ -1849,15 +1849,22 @@ impl Connection {
                     let server_error_name = pb::ServerError::try_from(err.error)
                         .map(|v| format!("{v:?}"))
                         .unwrap_or_else(|_| format!("Unknown({})", err.error));
+                    // The broker `message` is hostile-peer-controlled input
+                    // (ADR-0054 §3 broker-string sanitisation). Bound it ONCE
+                    // here at the capture site — before it is owned into
+                    // `handshake_failure_reason` — so every downstream sink
+                    // (tokio `ClientError`, moonpool `EngineError::HandshakeFailed`)
+                    // inherits the bound. This is the broker-text sink that
+                    // escaped ADR-0054 §3; ADR-0062 closes it.
+                    let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
                     let reason = format!(
-                        "broker rejected handshake (server_error={server_error_name}): {}",
-                        err.message
+                        "broker rejected handshake (server_error={server_error_name}): {bounded_message}"
                     );
                     tracing::warn!(
                         target: "magnetar_proto::conn",
                         state = ?self.state,
                         server_error = %server_error_name,
-                        message = %err.message,
+                        message = %bounded_message,
                         "captured CommandError during handshake — surfacing as handshake_failure_reason",
                     );
                     self.handshake_failure_reason = Some(reason);
@@ -8801,6 +8808,89 @@ mod handshake_failure_reason_tests {
         assert!(
             conn.handshake_failure_reason().is_none(),
             "post-handshake CommandError must not leak into handshake_failure_reason",
+        );
+    }
+
+    /// ADR-0062: a hostile broker can return an arbitrarily long `message`
+    /// in its mid-handshake `CommandError`. The capture site must bound the
+    /// broker text to [`MAX_BROKER_STR`] bytes at a char boundary BEFORE it
+    /// is stored in `handshake_failure_reason`, so every downstream sink
+    /// (tokio `ClientError`, moonpool `EngineError::HandshakeFailed`) inherits
+    /// the bound. Mirrors the `truncation_respects_char_boundaries` unit test
+    /// in `log_fields`.
+    #[test]
+    fn handshake_failure_reason_bounds_oversized_broker_message() {
+        let mut conn = fresh_conn();
+        conn.begin_handshake().expect("begin");
+        assert_eq!(conn.state(), HandshakeState::ConnectSent);
+
+        // 'é' is 2 bytes; 400 of them = 800 bytes, with the 256-byte cut
+        // falling mid-char so the boundary back-off is exercised too.
+        let oversized = "é".repeat(400);
+        assert!(oversized.len() > crate::log_fields::MAX_BROKER_STR);
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: 0,
+                error: pb::ServerError::AuthenticationError as i32,
+                message: oversized.clone(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        let reason = conn
+            .handshake_failure_reason()
+            .expect("oversized broker message must still populate the reason");
+        // The stored reason is "broker rejected handshake (server_error=…): <bounded>".
+        // The bounded broker-text slice it embeds must be ≤ MAX_BROKER_STR bytes
+        // at a valid char boundary — the fixed prefix is the only extra length.
+        let prefix = "broker rejected handshake (server_error=AuthenticationError): ";
+        let embedded = reason
+            .strip_prefix(prefix)
+            .expect("reason must carry the fixed envelope prefix");
+        assert!(
+            embedded.len() <= crate::log_fields::MAX_BROKER_STR,
+            "embedded broker text must be bounded to MAX_BROKER_STR (got {} bytes)",
+            embedded.len(),
+        );
+        assert!(
+            oversized.starts_with(embedded),
+            "the bounded text must be a verbatim char-boundary prefix of the broker message",
+        );
+        // The bound is the char-boundary back-off, so the embedded slice is
+        // strictly shorter than the budget when byte 256 split a 2-byte char.
+        assert!(embedded.len() <= crate::log_fields::MAX_BROKER_STR);
+        assert!(oversized.is_char_boundary(embedded.len()));
+    }
+
+    /// ADR-0062 companion: a SHORT broker message still round-trips verbatim
+    /// (the bound only ever fires above the budget) — pins that the
+    /// truncation is a ceiling, not a fixed-width truncation.
+    #[test]
+    fn handshake_failure_reason_preserves_short_broker_message() {
+        let mut conn = fresh_conn();
+        conn.begin_handshake().expect("begin");
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: 0,
+                error: pb::ServerError::AuthenticationError as i32,
+                message: "token expired".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+        let reason = conn.handshake_failure_reason().expect("reason");
+        assert!(
+            reason.contains("token expired"),
+            "short broker message must round-trip verbatim: {reason}",
         );
     }
 

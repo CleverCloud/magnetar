@@ -490,6 +490,31 @@ impl std::fmt::Debug for ReconnectContext {
     }
 }
 
+/// Compute the terminal-exit reason string fed to
+/// [`magnetar_proto::Connection::fail_all_pending`] when a driver task exits
+/// for good (plain-driver drop, or a supervisor that exhausted its budget).
+///
+/// A broker `CommandError` arriving mid-handshake populates
+/// [`magnetar_proto::Connection::handshake_failure_reason`] in the proto layer,
+/// but that reason survives the socket drop only as a stored field — the
+/// driver's inner-loop `Err` is the generic `PeerClosed` (the read just
+/// returned 0). Surfacing that generic string would discard the broker's
+/// explanation, so when a handshake-failure reason is captured we PREFER it.
+/// This is what lets `ConnectedFut`'s `ConnectionEvent::Closed` arm surface the
+/// broker's "broker rejected handshake (server_error=…): …" text instead of the
+/// opaque "peer closed the connection" — the capture-vs-terminal-drop race that
+/// left the reason stranded. The reason is already length-bounded at the proto
+/// capture site (ADR-0062); no further truncation here.
+fn terminal_reason(conn: &magnetar_proto::Connection, outcome: &Result<(), ClientError>) -> String {
+    if let Some(reason) = conn.handshake_failure_reason() {
+        return reason.to_owned();
+    }
+    match outcome {
+        Ok(()) => "connection closed".to_owned(),
+        Err(err) => err.to_string(),
+    }
+}
+
 /// Spawn the driver loop on the current tokio runtime — generic-socket flavour for
 /// tests / `Client::from_socket`. The auto-reconnect supervisor is **not** active on this
 /// spawn path: a generic socket has no notion of "reconnect", so the driver exits on the
@@ -513,11 +538,9 @@ where
         // on graceful close, so `is_connected()` is already false. Mirror of
         // the moonpool engine's plain spawn. ADR-0055.
         {
-            let reason = match &outcome {
-                Ok(()) => "connection closed".to_owned(),
-                Err(err) => err.to_string(),
-            };
-            shared.inner.lock().fail_all_pending(&reason);
+            let mut conn = shared.inner.lock();
+            let reason = terminal_reason(&conn, &outcome);
+            conn.fail_all_pending(&reason);
         }
         // ADR-0059 / follow-ups §4.1: the plain driver is gone for good — latch
         // the no-driver signal so a NEW op issued after this point fast-fails
@@ -556,11 +579,9 @@ pub(crate) fn spawn_supervised(
         // §1: `fail_all_pending` fires on a supervisor that has exhausted its
         // attempts, never on the per-attempt reconnect.
         {
-            let reason = match &outcome {
-                Ok(()) => "connection closed".to_owned(),
-                Err(err) => err.to_string(),
-            };
-            driver_shared.inner.lock().fail_all_pending(&reason);
+            let mut conn = driver_shared.inner.lock();
+            let reason = terminal_reason(&conn, &outcome);
+            conn.fail_all_pending(&reason);
         }
         // ADR-0059 / follow-ups §4.1: `supervised_driver_loop` only returns on
         // a GENUINELY-terminal exit (user close, or the supervisor exhausted

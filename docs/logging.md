@@ -79,6 +79,7 @@ At every level, including `trace!`, magnetar never logs:
 
 Auth-path errors log the `auth_method` plus a stable error class — never the full provider error chain, which could embed credentials.
 Broker-supplied strings (server error messages, redirect URLs) are truncated to 256 bytes (cut at a char boundary) as a log-injection and cardinality defense.
+This bound also covers **error and connect-error fields**, not just log fields: a mid-handshake broker `CommandError.message` is truncated at the proto capture site before it is stored in `handshake_failure_reason`, so the `ClientError::Other("handshake failed: …")` (tokio) / `EngineError::HandshakeFailed` (moonpool) connect errors that inherit it — and the adjacent `warn!` field — are length-bounded too ([ADR-0062](../specs/adr/0062-broker-error-field-truncation.md), completing [ADR-0054 §3](../specs/adr/0054-logging-policy.md)). A short broker message still round-trips verbatim.
 These guarantees are pinned by paired secret-scan capture tests in both runtime engines and an end-to-end assertion against a real broker.
 
 Note that `topic`, `subscription`, `producer_name`, and broker URLs are classified as operational metadata, not secrets ([ADR-0054 §3](../specs/adr/0054-logging-policy.md)).
