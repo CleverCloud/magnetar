@@ -468,6 +468,11 @@ impl Client {
         let target = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
         let target_shared = self.resolve_target(target, &topic).await?;
+        // ADR-0059 / follow-ups §4.1: the resolved data-plane connection may be
+        // a pool entry distinct from the bootstrap; fast-fail if it has already
+        // gone terminal with no driver, before registering a doomed
+        // `CommandProducer`.
+        target_shared.fail_if_no_driver()?;
         let (handle, slot) = {
             let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);
@@ -521,6 +526,15 @@ impl Client {
     /// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] surfaces as `LookupOutcome::Failed`
     /// → [`ClientError::Broker`] when a hostile broker exhausts the budget.
     async fn lookup_topic(&self, topic: &str) -> Result<LookupTarget, ClientError> {
+        // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
+        // request when the bootstrap connection is already terminal with no
+        // driver to recover it. Without this, a `CommandLookupTopic` issued on
+        // a dead plain connection registers a pending request that no driver is
+        // left to resolve — the caller hangs forever. The guard fires only when
+        // `is_closed()` AND `no_driver`, so a supervised connection mid
+        // reconnect (transiently `Failed`, `no_driver == false`) still issues
+        // the lookup and recovers transparently.
+        self.shared.fail_if_no_driver()?;
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.lookup(topic, false)
@@ -1128,6 +1142,10 @@ impl Client {
         let target = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
         let target_shared = self.resolve_target(target, &topic).await?;
+        // ADR-0059 / follow-ups §4.1: fast-fail if the resolved data-plane
+        // connection is already terminal with no driver, before registering a
+        // doomed `CommandSubscribe`.
+        target_shared.fail_if_no_driver()?;
         let (handle, slot) = {
             let mut conn = target_shared.inner.lock();
             let handle = conn.subscribe(req);

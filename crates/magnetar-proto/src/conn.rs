@@ -917,12 +917,24 @@ impl Connection {
         // `OpSend`s WITHOUT a replay snapshot (there is no session to replay
         // onto), install a `Terminal` outcome on each `Send` key, and wake the
         // future. Take the per-slot lock, drain, DROP it, then wake.
+        //
+        // We ALSO flip the slot's `closed` flag inside this same per-slot lock
+        // scope (ADR-0059, follow-ups §4.1): a terminal drop is final, so a
+        // `queue_send` issued AFTER it must fast-fail synchronously with
+        // `ProducerError::Closed` via the existing `if self.closed` guard
+        // (`producer.rs`) instead of registering a doomed pending op that no
+        // driver is left to resolve. Setting `closed` here keeps the ADR-0038
+        // lock order intact — the global connection mutex is already held
+        // above, the per-slot mutex is taken below it in ONE acquisition (no
+        // second slot loop, no connection-mutex read on the send hot path),
+        // and the guard is dropped before the user wakers fire.
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
-            let drained = self
-                .producers
-                .get(&handle)
-                .map(|slot| slot.state.lock().drain_pending_sends());
+            let drained = self.producers.get(&handle).map(|slot| {
+                let mut slot_state = slot.state.lock();
+                slot_state.closed = true;
+                slot_state.drain_pending_sends()
+            });
             let Some(drained) = drained else { continue };
             for (seq, waker_opt) in drained {
                 let key = PendingOpKey::Send(handle, seq);
@@ -5607,6 +5619,123 @@ mod conn_state_tests {
 
         // (6) Idempotent: a second call (e.g. a later `close()`) must not panic.
         conn.fail_all_pending("peer closed");
+    }
+
+    /// ADR-0059 / follow-ups §4.1: `fail_all_pending` must ALSO mark every
+    /// producer slot `closed` so a NEW `queue_send` issued AFTER the terminal
+    /// drop fast-fails synchronously with `ProducerError::Closed` (via the
+    /// existing per-slot `if self.closed` guard) instead of registering a
+    /// doomed pending op no driver is left to resolve. The original
+    /// `fail_all_pending` only terminalized ops that were ALREADY pending at
+    /// the drop; this asserts the slot-close extension.
+    ///
+    /// Also pins the ADR-0038 lock order: the slot-close happens INSIDE the
+    /// per-slot lock taken below the global connection mutex (`fail_all_pending`
+    /// runs `&mut self`), never the reverse. We prove the order holds by taking
+    /// the per-slot lock here AFTER `fail_all_pending` has returned (so the
+    /// global mutex is conceptually released) and reading `closed` — a reverse
+    /// acquisition inside `fail_all_pending` would have deadlocked the call
+    /// above, so reaching this assertion at all is the no-reverse-order witness.
+    #[test]
+    fn fail_all_pending_closes_slots_so_new_sends_fast_fail() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        assert!(conn.is_connected());
+        while conn.poll_event().is_some() {}
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/p".to_owned(),
+            ..Default::default()
+        });
+        // A baseline send BEFORE the drop must succeed — the producer is open
+        // and the slot is not closed yet.
+        conn.send(
+            producer,
+            crate::producer::OutgoingMessage {
+                payload: bytes::Bytes::from_static(b"pre-drop"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 8,
+                num_messages: 1,
+                txn_id: None,
+                source_message_id: None,
+            },
+            0,
+            Instant::now(),
+        )
+        .expect("pre-drop send queues");
+
+        // Terminal drop.
+        conn.fail_all_pending("peer closed");
+
+        // (1) The slot is now marked `closed`. Reaching this `producer()`
+        // accessor — which takes the per-slot lock AFTER `fail_all_pending`
+        // returned — is the witness that `fail_all_pending` did NOT hold the
+        // per-slot lock across a re-acquisition of the global mutex (ADR-0038
+        // global → per-slot order preserved; a reverse path would have
+        // deadlocked the call above).
+        let slot = conn
+            .producer(producer)
+            .cloned()
+            .expect("producer slot still registered after fail_all_pending");
+        assert!(
+            slot.state.lock().closed,
+            "fail_all_pending must flip the per-slot closed flag (ADR-0059)"
+        );
+
+        // (2) A NEW send issued AFTER the terminal drop fast-fails. At the
+        // proto layer the slot's `queue_send` returns `ProducerError::Closed`
+        // via the existing `if self.closed` guard — this is the cheap signal
+        // the engines map to `ClientError::PeerClosed`.
+        let err = slot
+            .state
+            .lock()
+            .queue_send(
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"post-drop"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 9,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect_err("a post-terminal send must be rejected, not registered");
+        assert!(
+            matches!(err, crate::error::ProducerError::Closed),
+            "post-terminal queue_send must fast-fail with ProducerError::Closed, got {err:?}"
+        );
+
+        // (3) The `Connection::send` entry collapses the same rejection into
+        // the opaque `InvariantViolation` it uses for every slot rejection —
+        // the engines do not rely on the inner variant, they read the
+        // `no_driver` latch, but the send must still be REJECTED (never
+        // silently queued onto a dead connection).
+        let send_err = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"post-drop-via-conn"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 18,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect_err("Connection::send must reject a post-terminal send");
+        assert!(
+            matches!(send_err, ProtocolError::InvariantViolation(_)),
+            "Connection::send rejection surfaces as InvariantViolation, got {send_err:?}"
+        );
     }
 
     #[test]

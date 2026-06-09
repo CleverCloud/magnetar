@@ -513,6 +513,15 @@ impl<P: Providers> Client<P> {
         topic: &str,
         authoritative: bool,
     ) -> Result<LookupTopicResult, ClientError> {
+        // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
+        // request when the bootstrap connection is already terminal with no
+        // driver to recover it. Without this, a `CommandLookupTopic` issued on
+        // a dead plain connection registers a pending request no driver is left
+        // to resolve — the caller hangs forever. The guard fires only when
+        // `is_closed()` AND `no_driver`, so a supervised connection mid
+        // reconnect (transiently `Failed`, `no_driver == false`) still issues
+        // the lookup and recovers transparently. 1:1 with the tokio engine.
+        self.shared.fail_if_no_driver()?;
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.lookup(topic, authoritative)

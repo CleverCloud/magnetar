@@ -27,6 +27,13 @@
 //!
 //! No supervisor is configured (default `ConnectionConfig`), so the driver
 //! takes the plain terminal-exit path rather than reconnecting.
+//!
+//! A second test (`new_ops_after_terminal_drop_fail_fast`) extends the
+//! scenario to ADR-0059: a `send()` / `subscribe()` / `producer.close()`
+//! issued AFTER the plain connection is already terminal must fast-fail
+//! SYNCHRONOUSLY with `PeerClosed` (via the `no_driver` latch + slot-close)
+//! rather than register a doomed pending op that no driver is left to resolve.
+//! 1:1 twin of the moonpool engine's same-named test.
 
 #![forbid(unsafe_code)]
 
@@ -250,5 +257,115 @@ async fn plain_connection_in_flight_ops_fail_fast_on_terminal_drop() {
     assert!(
         !client.is_connected(),
         "connection must be down after the terminal drop"
+    );
+}
+
+/// ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the plain connection has
+/// gone terminal must fast-fail SYNCHRONOUSLY with `PeerClosed`, not register a
+/// doomed pending op no driver is left to resolve. This is the new-op companion
+/// to the in-flight contract above (ADR-0055 §1).
+///
+/// Script: drive the connection terminal exactly as the test above (one
+/// in-flight send the broker drops on), wait for the in-flight send to resolve
+/// (so the plain driver has run `fail_all_pending` + latched `no_driver`), then
+/// issue a fresh `send()` on the same producer, a fresh `subscribe()`, and a
+/// fresh `producer.close()`. Each must return `PeerClosed` — and PROMPTLY: the
+/// tight `timeout` wrappers are the no-hang guard, since the regression is that
+/// a post-terminal op registers and never resolves. 1:1 twin of the moonpool
+/// engine's `new_ops_after_terminal_drop_fail_fast`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_ops_after_terminal_drop_fail_fast() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("pulsar://{addr}");
+    let data_plane_seen = Arc::new(AtomicBool::new(false));
+    tokio::spawn(run_terminal_broker(listener, Arc::clone(&data_plane_seen)));
+
+    let config = ConnectionConfig::default();
+    assert!(
+        config.supervisor.is_none(),
+        "this test pins the UNSUPERVISED plain path",
+    );
+
+    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, config))
+        .await
+        .expect("connect did not time out")
+        .expect("connect must succeed");
+
+    let producer = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/terminal-exit-newop".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("producer open did not time out")
+    .expect("producer open must succeed");
+
+    // One in-flight send drives the terminal drop; await it so the plain driver
+    // has run `fail_all_pending` (slot closed) and latched `no_driver` before we
+    // issue the fresh ops.
+    let drop_res = tokio::time::timeout(
+        Duration::from_secs(10),
+        producer.send(outgoing(b"in-flight-trigger")),
+    )
+    .await
+    .expect("the in-flight send must resolve promptly on the terminal drop, not hang");
+    assert!(
+        data_plane_seen.load(Ordering::SeqCst),
+        "the broker must have dropped on the in-flight data-plane op",
+    );
+    assert!(
+        matches!(drop_res, Err(ClientError::PeerClosed)),
+        "the in-flight send surfaces the terminal PeerClosed, got {drop_res:?}",
+    );
+    assert!(
+        !client.is_connected(),
+        "connection must be terminal before the new-op assertions",
+    );
+
+    // (1) A FRESH send on the same producer fast-fails with PeerClosed: the
+    // slot is `closed` and `no_driver` is latched, so the producer-send arm maps
+    // the proto-layer rejection to PeerClosed without registering anything.
+    let send_after = tokio::time::timeout(
+        Duration::from_secs(5),
+        producer.send(outgoing(b"after-terminal")),
+    )
+    .await
+    .expect("a post-terminal send must fast-fail synchronously, not hang");
+    assert!(
+        matches!(send_after, Err(ClientError::PeerClosed)),
+        "post-terminal send must fast-fail with PeerClosed, got {send_after:?}",
+    );
+
+    // (2) A FRESH subscribe fast-fails at the entry-point guard
+    // (`fail_if_no_driver`: is_closed() AND no_driver), never parking a doomed
+    // `CommandSubscribe`.
+    let subscribe_after = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/terminal-exit-newop".to_owned(),
+            subscription: "sub-after-terminal".to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("a post-terminal subscribe must fast-fail synchronously, not hang");
+    assert!(
+        matches!(subscribe_after, Err(ClientError::PeerClosed)),
+        "post-terminal subscribe must fast-fail with PeerClosed, got {subscribe_after:?}",
+    );
+
+    // (3) A FRESH producer.close() fast-fails at its `fail_if_no_driver` guard
+    // instead of registering a `CommandCloseProducer` no driver can resolve.
+    let close_after = tokio::time::timeout(Duration::from_secs(5), producer.close())
+        .await
+        .expect("a post-terminal producer.close() must fast-fail synchronously, not hang");
+    assert!(
+        matches!(close_after, Err(ClientError::PeerClosed)),
+        "post-terminal producer.close() must fast-fail with PeerClosed, got {close_after:?}",
     );
 }

@@ -519,6 +519,13 @@ where
             };
             shared.inner.lock().fail_all_pending(&reason);
         }
+        // ADR-0059 / follow-ups §4.1: the plain driver is gone for good — latch
+        // the no-driver signal so a NEW op issued after this point fast-fails
+        // synchronously with `PeerClosed` at the entry-point guards instead of
+        // registering a doomed pending op no driver is left to resolve. Set it
+        // AFTER `fail_all_pending` so the slot `closed` flags + terminal
+        // outcomes are already in place when a fresh op observes the latch.
+        shared.mark_no_driver();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on `driver_waker` rather than the waker slab.
         shared.driver_waker.notify_waiters();
@@ -555,6 +562,13 @@ pub(crate) fn spawn_supervised(
             };
             driver_shared.inner.lock().fail_all_pending(&reason);
         }
+        // ADR-0059 / follow-ups §4.1: `supervised_driver_loop` only returns on
+        // a GENUINELY-terminal exit (user close, or the supervisor exhausted
+        // its attempt budget) — never on a per-attempt reconnect — so latching
+        // the no-driver signal here is safe: a transient `Failed` window mid
+        // reconnect never reaches this point. New ops issued after this fast
+        // fail at the entry-point guards. Set AFTER `fail_all_pending`.
+        driver_shared.mark_no_driver();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on `driver_waker` rather than the waker slab.
         driver_shared.driver_waker.notify_waiters();

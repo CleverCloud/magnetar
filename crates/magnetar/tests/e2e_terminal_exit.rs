@@ -6,9 +6,11 @@
 //! Pins the production contract that a PLAIN (non-reconnecting) client whose
 //! broker connection drops mid-flight surfaces a terminal error on the
 //! in-flight op PROMPTLY — instead of parking it forever (the no-progress
-//! stall ADR-0055 §1 kills). This is the e2e analogue of the tokio + moonpool
-//! `terminal_exit.rs` integration tests and the `magnetar-differential`
-//! terminal-error equivalence test.
+//! stall ADR-0055 §1 kills) — AND that a NEW op issued AFTER the connection is
+//! already terminal also fast-fails synchronously rather than registering a
+//! doomed pending op (ADR-0059 / follow-ups §4.1). This is the e2e analogue of
+//! the tokio + moonpool `terminal_exit.rs` integration tests and the
+//! `magnetar-differential` terminal-error equivalence test.
 //!
 //! ## How a mid-flight outage is forced against a real broker
 //!
@@ -211,14 +213,28 @@ async fn e2e_plain_client_in_flight_op_fails_fast_on_outage()
     );
 
     // The client reports the connection as down after the terminal drop.
-    // (Scope note: this test pins the IN-FLIGHT-op contract of ADR-0055 §1 —
-    // ops parked when the peer vanishes resolve terminally. Failing a *fresh*
-    // op issued AFTER the connection is already dead is a separate gap not
-    // covered by `fail_all_pending`, which terminalizes only the ops pending
-    // at the drop; it is intentionally out of scope here.)
     assert!(
         !client.is_connected(),
         "connection must be down after the outage"
+    );
+
+    // ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the connection is
+    // already terminal must fast-fail SYNCHRONOUSLY rather than register a
+    // doomed pending op. `fail_all_pending` flipped the producer slot `closed`
+    // and the plain driver latched `no_driver` on its terminal exit, so a fresh
+    // `producer.send()` resolves with a terminal error PROMPTLY — the timeout is
+    // the no-hang guard. (The earlier in-flight contract covered the op parked
+    // AT the drop; this covers the op issued AFTER it.)
+    let send_after = tokio::time::timeout(
+        Duration::from_secs(15),
+        producer.send(OutgoingMessage::with_payload(b"after-outage".to_vec()).into()),
+    )
+    .await
+    .expect("a post-terminal send must fast-fail PROMPTLY, not hang");
+    assert!(
+        send_after.is_err(),
+        "a send issued after the terminal drop must surface a terminal error, got Ok({:?})",
+        send_after.ok(),
     );
 
     Ok(())

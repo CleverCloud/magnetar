@@ -164,6 +164,28 @@ pub struct ConnectionShared {
     /// the flag so the rebuild fires exactly once per reconnect. Stage 3 of the supervisor
     /// work: transparent producer / consumer replay on session loss.
     pub pending_rebuild: AtomicBool,
+    /// Set to `true` the moment this connection reaches a GENUINELY-terminal
+    /// state with NO driver left to recover it: the plain (non-supervised)
+    /// driver's terminal exit, or the supervisor give-up after exhausting its
+    /// reconnect-attempt budget (both call sites pair this with
+    /// [`magnetar_proto::Connection::fail_all_pending`]). ADR-0059 / follow-ups
+    /// §5.1.
+    ///
+    /// This is the load-bearing "no driver will recover this" signal the
+    /// synchronous fast-fail guards read at the request-issue / subscribe /
+    /// lookup entry points. It is DISTINCT from
+    /// [`magnetar_proto::Connection::is_closed`]: a SUPERVISED connection is
+    /// transiently `Failed` between `mark_disconnected()` and the supervisor's
+    /// `reset()` while it WILL recover, so `is_closed()` alone cannot tell a
+    /// recoverable-`Failed` apart from a terminal-`Failed`. An entry-point
+    /// guard fast-fails only when `is_closed()` AND `no_driver` are BOTH true,
+    /// so a recoverable supervised connection in its transient `Failed` window
+    /// is never `PeerClosed` (transparent reconnect is preserved).
+    ///
+    /// Mirrored 1:1 on the moonpool engine's `ConnectionShared` (ADR-0024).
+    /// `AtomicBool` (not a channel) is the right primitive for this one-way
+    /// latch ([ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
+    pub no_driver: AtomicBool,
     /// Configured global publish memory budget in bytes. `0` disables the limit
     /// (matches `ConnectionConfig::memory_limit_bytes` default). Mirrors Java's
     /// `ClientBuilder#memoryLimit`. Reservations against this budget happen in
@@ -261,6 +283,34 @@ impl ConnectionShared {
     /// Construct shared state from the given protocol-layer config.
     pub fn new(config: magnetar_proto::ConnectionConfig) -> Arc<Self> {
         Self::with_auth(config, None)
+    }
+
+    /// Latch the [`Self::no_driver`] signal: this connection has reached a
+    /// genuinely-terminal state and no driver task will recover it. Set by the
+    /// plain driver's terminal-exit path and the supervisor give-up path,
+    /// alongside [`magnetar_proto::Connection::fail_all_pending`]. ADR-0059.
+    pub fn mark_no_driver(&self) {
+        self.no_driver.store(true, Ordering::SeqCst);
+    }
+
+    /// Fast-fail guard for the request-issue / subscribe / lookup entry points
+    /// (ADR-0059 / follow-ups §4.1). Returns `Err(ClientError::PeerClosed)`
+    /// when the connection is terminal AND no driver will recover it — i.e.
+    /// `is_closed()` AND [`Self::no_driver`] are BOTH set. Returns `Ok(())`
+    /// otherwise, INCLUDING the transient `Failed` window of a SUPERVISED
+    /// connection mid-reconnect (where `no_driver` is still `false`), so
+    /// transparent reconnect is never regressed.
+    ///
+    /// Gating on `no_driver` alone (without `is_closed()`) would be unsound on
+    /// a freshly-constructed connection whose driver has not yet started;
+    /// gating on `is_closed()` alone would `PeerClosed` a recoverable
+    /// supervised connection. Both conditions together pin exactly the
+    /// "doomed new op" case.
+    pub fn fail_if_no_driver(&self) -> Result<(), ClientError> {
+        if self.no_driver.load(Ordering::SeqCst) && self.inner.lock().is_closed() {
+            return Err(ClientError::PeerClosed);
+        }
+        Ok(())
     }
 
     /// Try to reserve `bytes` against the configured memory budget. Returns
@@ -449,6 +499,7 @@ impl ConnectionShared {
             replicated_subscription_markers: Mutex::new(std::collections::VecDeque::new()),
             replicated_subscription_marker_notify: Notify::new(),
             pending_rebuild: AtomicBool::new(false),
+            no_driver: AtomicBool::new(false),
             memory_limit_bytes,
             memory_used: AtomicU64::new(0),
             memory_limit_policy,
@@ -528,6 +579,76 @@ mod tests {
         let _g = s.inner.lock();
         // Topic-list buffer starts empty.
         assert!(s.topic_list_changes.lock().is_empty());
+    }
+
+    /// ADR-0059 / follow-ups §4.1 regression: `fail_if_no_driver()` must NOT
+    /// fast-fail a connection that is `is_closed()` (here: `Failed`) while a
+    /// supervisor is still able to recover it — i.e. while `no_driver` is unset.
+    /// This pins the exact window a SUPERVISED connection lives in between
+    /// `mark_disconnected()` (→ `Failed`, so `is_closed()` is true) and the
+    /// supervisor's `reset()` (→ `Uninitialized`): an op issued there must reach
+    /// the live driver and recover, NOT be wrongly `PeerClosed`d (which would
+    /// regress transparent reconnect, ADR-0038). Gating on `is_closed()` alone —
+    /// the naive guard — would fail this test. 1:1 twin of the moonpool engine.
+    #[test]
+    fn fail_if_no_driver_does_not_fire_on_recoverable_failed_window() {
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        // Drive the connection to `Failed` (a transient drop), exactly as a
+        // supervised driver would on `PeerClosed` before its next `reset()`.
+        s.inner.lock().mark_disconnected();
+        assert!(
+            s.inner.lock().is_closed(),
+            "mark_disconnected must put the connection in a terminal handshake state",
+        );
+        assert!(
+            !s.no_driver.load(super::Ordering::SeqCst),
+            "no_driver must still be UNSET in the recoverable-Failed window",
+        );
+        // The guard must return Ok — the supervised driver is still alive and
+        // will recover this connection. A `PeerClosed` here is the regression.
+        assert!(
+            s.fail_if_no_driver().is_ok(),
+            "fail_if_no_driver must NOT fire while the connection is recoverable \
+             (is_closed but no_driver unset) — regressing this breaks transparent reconnect",
+        );
+    }
+
+    /// ADR-0059 / follow-ups §4.1: `fail_if_no_driver()` DOES fast-fail with
+    /// `PeerClosed` once BOTH conditions hold — `is_closed()` AND the `no_driver`
+    /// latch (set by the plain driver's terminal exit / supervisor give-up). 1:1
+    /// twin of the moonpool engine.
+    #[test]
+    fn fail_if_no_driver_fires_when_closed_and_no_driver_latched() {
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        s.inner.lock().mark_disconnected();
+        // The terminal-exit / give-up paths latch this alongside
+        // `fail_all_pending`.
+        s.mark_no_driver();
+        assert!(s.inner.lock().is_closed());
+        assert!(s.no_driver.load(super::Ordering::SeqCst));
+        assert!(
+            matches!(s.fail_if_no_driver(), Err(super::ClientError::PeerClosed)),
+            "fail_if_no_driver must return PeerClosed once the connection is terminal \
+             AND no driver is left to recover it",
+        );
+    }
+
+    /// ADR-0059: the `no_driver` latch is unsound as a sole gate — on a
+    /// freshly-constructed connection whose driver has not started,
+    /// `fail_if_no_driver` must return Ok because the connection is not yet
+    /// `is_closed()`. Pins the second half of the two-condition gate. 1:1 twin
+    /// of the moonpool engine.
+    #[test]
+    fn fail_if_no_driver_does_not_fire_before_any_terminal_state() {
+        let s = ConnectionShared::new(ConnectionConfig::default());
+        assert!(
+            !s.inner.lock().is_closed(),
+            "a fresh connection is not terminal",
+        );
+        assert!(
+            s.fail_if_no_driver().is_ok(),
+            "fail_if_no_driver must not fire on a non-terminal connection",
+        );
     }
 
     #[test]
