@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use magnetar_proto::ConnectionEvent;
+use magnetar_proto::{ConnectionEvent, ConsumerHandle, OpOutcome, PendingOpKey, ProducerHandle};
 use moonpool_core::{Providers, TaskProvider, TimeProvider};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -68,6 +68,30 @@ use crate::{ConnectionShared, EngineError, ObservedReplicatedSubscriptionMarker,
 /// grows.
 const READ_BUFFER_CAPACITY: usize = 64 * 1024;
 
+/// Delay before a transient producer-open / subscribe retry leg re-issues its
+/// lookup, mirroring the tokio engine's `tokio::time::sleep` of the same
+/// duration (`magnetar-runtime-tokio/src/driver.rs`). Scheduled through the
+/// injected [`TimeProvider`] — never a host clock — so under `SimProviders`
+/// the retry fires at a deterministic point in virtual time (ADR-0011).
+const TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// A transient broker rejection that the driver must answer with a delayed
+/// lookup-then-retry leg. Drained out of [`handle_pending_events`] (which is
+/// non-generic and has no provider access) so the generic
+/// [`driver_loop_inner`] can dispatch each one as a detached task through the
+/// engine's [`TaskProvider`] + [`TimeProvider`] — matching the tokio engine's
+/// `tokio::spawn` + `tokio::time::sleep` serialization so the differential
+/// event order stays identical (ADR-0024).
+#[derive(Debug, Clone, Copy)]
+enum RetryRequest {
+    /// The broker bounced a `CommandProducer` with a transient code; re-run
+    /// lookup, then [`magnetar_proto::Connection::retry_producer_open`].
+    Producer(ProducerHandle),
+    /// The broker bounced a `CommandSubscribe` with a transient code; re-run
+    /// lookup, then [`magnetar_proto::Connection::retry_consumer_subscribe`].
+    Consumer(ConsumerHandle),
+}
+
 /// Drain the connection's semantic event queue of events the *driver* must
 /// react to, leaving every other event (`Connected`, `SendReceipt`,
 /// `Message`, `ProducerReady`, `SubscribeAcked`, …) in the queue for
@@ -79,7 +103,19 @@ const READ_BUFFER_CAPACITY: usize = 64 * 1024;
 /// `SubscribeAcked` events that user futures (`ProducerReadyFut`, the
 /// moonpool consumer's subscribe wait) are parked on and stall every
 /// open-producer / subscribe round-trip.
-fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineError> {
+///
+/// Transient producer-open / subscribe rejections are NOT actioned inline:
+/// this function is non-generic and has no provider access, and the retry
+/// leg must sleep on the injected [`TimeProvider`] (never a host clock) to
+/// stay deterministic under `SimProviders` (ADR-0011). Each such event is
+/// drained into a [`RetryRequest`] appended to `retries`; the generic
+/// [`driver_loop_inner`] dispatches them as detached tasks (1:1 with the
+/// tokio engine's `tokio::spawn` shape, so the differential event order
+/// stays identical — ADR-0024).
+fn handle_pending_events(
+    shared: &Arc<ConnectionShared>,
+    retries: &mut Vec<RetryRequest>,
+) -> Result<(), EngineError> {
     loop {
         let event = shared.inner.lock().poll_event_if(|ev| {
             #[cfg(feature = "scalable-topics")]
@@ -98,6 +134,8 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     | ConnectionEvent::TopicListChanged { .. }
                     | ConnectionEvent::TopicMigrated { .. }
                     | ConnectionEvent::RedirectUrlRejected { .. }
+                    | ConnectionEvent::ProducerOpenFailedTransient { .. }
+                    | ConnectionEvent::SubscribeFailedTransient { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
                     | ConnectionEvent::ChecksumMismatch { .. }
                     | ConnectionEvent::LookupResponse {
@@ -230,6 +268,52 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
                     "PIP-188: broker requested topic migration; resetting connection".to_owned(),
                 ));
             }
+            ConnectionEvent::ProducerOpenFailedTransient {
+                handle,
+                code,
+                message,
+            } => {
+                // Broker bounced the `CommandProducer` with a transient code
+                // (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) — the
+                // typical post-`docker restart` window where the namespace
+                // bundle hasn't been re-acquired yet. Pulsar's recommended
+                // recovery is "Please redo the lookup": a fresh
+                // `CommandLookupTopic` makes the broker (re)acquire bundle
+                // ownership, after which the `CommandProducer` retry succeeds.
+                // The producer state is RETAINED by the proto layer, so the
+                // user's open / send futures stay pending across the retry.
+                // Mirror of the tokio driver.
+                //
+                // `warn!` per ADR-0054 §2.1: degraded-but-recovering background
+                // retry, not surfaced as `Err` to any caller while it retries.
+                // The broker `message` is hostile-peer-controlled, so it is
+                // truncated before landing in the field (ADR-0054 broker-string
+                // sanitisation).
+                tracing::warn!(
+                    ?handle,
+                    code,
+                    message = crate::log_fields::truncate_broker_str(&message),
+                    "producer-open transient error; scheduling lookup + retry"
+                );
+                retries.push(RetryRequest::Producer(handle));
+            }
+            ConnectionEvent::SubscribeFailedTransient {
+                handle,
+                code,
+                message,
+            } => {
+                // Consumer-side companion to the producer-open transient arm
+                // above. `warn!` per ADR-0054 §2.1 (same level rule); the
+                // broker `message` is truncated (ADR-0054). Mirror of the tokio
+                // driver.
+                tracing::warn!(
+                    ?handle,
+                    code,
+                    message = crate::log_fields::truncate_broker_str(&message),
+                    "consumer-subscribe transient error; scheduling lookup + retry"
+                );
+                retries.push(RetryRequest::Consumer(handle));
+            }
             // PIP-460 (ADR-0031): mirror the tokio driver's scalable-event
             // drain into the per-client buffer + wake `next_scalable_event`.
             #[cfg(feature = "scalable-topics")]
@@ -307,6 +391,127 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), EngineErr
             ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }
+    }
+}
+
+/// Dispatch one [`RetryRequest`] as a detached task on the engine's
+/// [`TaskProvider`]. The task sleeps `TRANSIENT_RETRY_DELAY` on the injected
+/// [`TimeProvider`] (NEVER a host clock — the whole point of routing through
+/// the provider is determinism under `SimProviders`, ADR-0011), re-runs
+/// lookup so the broker re-acquires bundle ownership, then calls the proto
+/// targeted-retry API (`retry_producer_open` / `retry_consumer_subscribe`).
+///
+/// Detached + spawned to mirror the tokio driver's `tokio::spawn` shape: the
+/// retry leg must run concurrently with the driver loop (which keeps pumping
+/// the socket), and its serialization must match the tokio engine so the
+/// differential `EventStream` order stays identical (ADR-0024).
+fn spawn_retry_leg<P>(
+    shared: &Arc<ConnectionShared>,
+    time: &P::Time,
+    task: &P::Task,
+    req: RetryRequest,
+) where
+    P: Providers,
+{
+    let shared = shared.clone();
+    let time = time.clone();
+    let _detached = task.spawn_task("magnetar-moonpool-transient-retry", async move {
+        let _ = time.sleep(TRANSIENT_RETRY_DELAY).await;
+        let topic = {
+            let conn = shared.inner.lock();
+            match req {
+                RetryRequest::Producer(handle) => conn.producer_topic(handle).map(str::to_owned),
+                RetryRequest::Consumer(handle) => conn.consumer_topic(handle).map(str::to_owned),
+            }
+        };
+        // The handle was closed / removed between the broker error and this
+        // retry — nothing to re-attach.
+        let Some(topic) = topic else { return };
+        if !lookup_then(&shared, &topic).await {
+            return;
+        }
+        let request_id = {
+            let mut conn = shared.inner.lock();
+            match req {
+                RetryRequest::Producer(handle) => conn.retry_producer_open(handle),
+                RetryRequest::Consumer(handle) => conn.retry_consumer_subscribe(handle),
+            }
+        };
+        if request_id.is_some() {
+            shared.driver_waker.notify_one();
+        }
+    });
+}
+
+/// Issue a `CommandLookupTopic` and await the broker's
+/// `CommandLookupTopicResponse` / `CommandError`. Returns `true` when the
+/// lookup landed any outcome (the actual broker disposition is logged but
+/// ignored — the caller's next step is a `retry_*` that re-fails if the
+/// bundle is still not served). Used by the transient-error retry leg
+/// ([`spawn_retry_leg`]) to force the broker to (re)acquire namespace bundle
+/// ownership before re-attaching the producer / consumer. Mirror of the tokio
+/// engine's `lookup_then`.
+///
+/// Self-contained `OpOutcome` await (rather than reaching for the
+/// module-private `client::RequestFut`): the lookup request id is registered
+/// against the proto waker slab, parked on the driver waker, and unregistered
+/// on drop so a severed session leaves no dangling `Waker`.
+async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
+    let request_id = {
+        let mut conn = shared.inner.lock();
+        conn.lookup(topic, false)
+    };
+    shared.driver_waker.notify_one();
+    let outcome = LookupRetryFut {
+        shared: shared.clone(),
+        key: PendingOpKey::Request(request_id),
+    }
+    .await;
+    if matches!(
+        &outcome,
+        OpOutcome::LookupResponse { .. } | OpOutcome::Error { .. }
+    ) {
+        tracing::debug!(?outcome, %topic, "retry-path lookup completed");
+        true
+    } else {
+        tracing::warn!(?outcome, %topic, "retry-path lookup landed unexpected outcome");
+        false
+    }
+}
+
+/// Future resolving the [`OpOutcome`] correlated with a single request id.
+/// Local to the driver's transient-retry leg; a thin twin of
+/// [`crate::client`]'s module-private `RequestFut` (the canonical
+/// request-id-correlated outcome future) so the driver does not have to widen
+/// that type's visibility.
+struct LookupRetryFut {
+    shared: Arc<ConnectionShared>,
+    key: PendingOpKey,
+}
+
+impl core::future::Future for LookupRetryFut {
+    type Output = OpOutcome;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        let mut conn = self.shared.inner.lock();
+        if let Some(outcome) = conn.take_outcome(self.key) {
+            return core::task::Poll::Ready(outcome);
+        }
+        conn.register_waker(self.key, cx.waker().clone());
+        core::task::Poll::Pending
+    }
+}
+
+impl Drop for LookupRetryFut {
+    /// Clear our entry from the connection's waker slab so a lookup severed by
+    /// a supervised reconnect (the `OpOutcome::SessionLost` published by
+    /// [`magnetar_proto::Connection::reset`]) does not leave a dangling
+    /// [`core::task::Waker`] behind. Mirrors the engine's `RequestFut::drop`.
+    fn drop(&mut self) {
+        self.shared.inner.lock().unregister_waker(self.key);
     }
 }
 
@@ -448,9 +653,10 @@ where
     });
     let result_for_task = result.clone();
     let shared_for_handle = shared.clone();
+    let task_for_loop = task.clone();
     let join = task.spawn_task("magnetar-moonpool-driver", async move {
         let driver_shared = shared.clone();
-        let outcome = driver_loop_inner::<P>(shared, transport, time).await;
+        let outcome = driver_loop_inner::<P>(shared, transport, time, task_for_loop).await;
         // Plain (non-supervised) driver: this is a TERMINAL exit — there is no
         // reconnect to replay against. Fail every pending op so parked
         // subscribe / send / receive futures resolve with a terminal error
@@ -597,9 +803,15 @@ where
     // boundary; moonpool plugs in virtual clocks". Elapsed durations below use the same
     // provider via `now_instant().saturating_duration_since(...)` rather than the host
     // `Instant::elapsed()`.
+    // The transient-retry leg dispatched from inside `driver_loop_inner` needs
+    // the engine's `TaskProvider`; snapshot it once here (cloned per inner
+    // call) so each reconnect cycle's loop can spawn retries on the same
+    // provider.
+    let task = providers.task().clone();
+
     let mut socket_alive_since = shared.now_instant();
     let mut last_inner_result =
-        driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
+        driver_loop_inner::<P>(shared.clone(), transport, time.clone(), task.clone()).await;
 
     loop {
         // User-requested close beats reconnect. `Failed` (transport drop, from
@@ -781,7 +993,8 @@ where
         // ADR-0011: virtual-clock-anchored timestamp; pairs with the
         // `should_reset_backoff` gate above.
         socket_alive_since = shared.now_instant();
-        last_inner_result = driver_loop_inner::<P>(shared.clone(), transport, time.clone()).await;
+        last_inner_result =
+            driver_loop_inner::<P>(shared.clone(), transport, time.clone(), task.clone()).await;
     }
 }
 
@@ -836,6 +1049,7 @@ pub(crate) async fn driver_loop_inner<P>(
     shared: Arc<ConnectionShared>,
     mut transport: Transport<P>,
     time: P::Time,
+    task: P::Task,
 ) -> Result<(), EngineError>
 where
     P: Providers,
@@ -1035,7 +1249,17 @@ where
                         shared.driver_waker.notify_one();
                     }
                 }
-                handle_pending_events(&shared)?;
+                let mut retries: Vec<RetryRequest> = Vec::new();
+                handle_pending_events(&shared, &mut retries)?;
+                // Dispatch any transient producer-open / subscribe retries as
+                // detached tasks on the engine providers — the delayed lookup +
+                // re-attach sleeps on the INJECTED clock (`time`), so the leg
+                // stays deterministic under `SimProviders` and matches the
+                // tokio engine's detached `tokio::spawn` serialization
+                // (ADR-0011 / ADR-0024).
+                for req in retries {
+                    spawn_retry_leg::<P>(&shared, &time, &task, req);
+                }
                 // Wake event-stream-watching futures (e.g. `ProducerReadyFut`)
                 // that parked on `driver_waker.notified()` so they re-poll and
                 // observe the freshly-pushed event.
@@ -1133,7 +1357,12 @@ mod tests {
         // The driver's event handler must surface a recoverable Config error so
         // the supervised loop catches it, calls reset+begin_handshake, and
         // reopens. The resource handle should map onto the producer slot.
-        let err = handle_pending_events(&shared).expect_err("migration must error");
+        let mut retries = Vec::new();
+        let err = handle_pending_events(&shared, &mut retries).expect_err("migration must error");
+        assert!(
+            retries.is_empty(),
+            "a topic-migration event must not enqueue a transient retry"
+        );
         let msg = format!("{err}");
         assert!(
             matches!(err, EngineError::Config(_)) && msg.contains("PIP-188"),

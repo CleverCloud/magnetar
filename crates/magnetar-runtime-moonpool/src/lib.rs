@@ -225,7 +225,7 @@ pub struct ConnectionShared {
     /// driver's terminal exit, or the supervisor give-up after exhausting its
     /// reconnect-attempt budget (both paired with
     /// [`magnetar_proto::Connection::fail_all_pending`]). ADR-0059 /
-    /// follow-ups §4.1.
+    /// follow-ups §3.1.
     ///
     /// The load-bearing "no driver will recover this" signal the synchronous
     /// fast-fail guards read at the request-issue / subscribe / lookup entry

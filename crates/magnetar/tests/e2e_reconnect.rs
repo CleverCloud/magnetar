@@ -377,6 +377,135 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     Ok(())
 }
 
+/// follow-ups §3.1 end-to-end: the MOONPOOL engine's transient
+/// producer-open retry arm, exercised against a real restarting broker.
+///
+/// The other reconnect e2e tests drive the tokio façade
+/// (`PulsarClient::builder()`), whose transient-retry arms have always been
+/// wired. This one drives a `PulsarClient<MoonpoolEngine<TokioProviders>>`
+/// (the moonpool engine over real host sockets) so the NEW moonpool arms run
+/// against a real broker. The post-`docker restart` window is the natural
+/// trigger: the broker answers the rebuild's `CommandProducer` with
+/// `ServiceNotReady` ("Please redo the lookup") while the namespace bundle is
+/// being re-acquired, the proto layer emits `ProducerOpenFailedTransient`, and
+/// the moonpool driver's §3.1 leg re-looks-up + retries until the open is
+/// served. A post-restart send round-trip succeeding proves the arm recovers
+/// the connection rather than dead-ending the re-attach.
+///
+/// Gated on `feature = "moonpool"` because a moonpool-engine client cannot
+/// compile without it (engine selection, not test-hiding — every other
+/// `PulsarClient<MoonpoolEngine>` item in the façade carries the same gate; the
+/// e2e suite always runs under `cargo test --all-features` per ADR-0046, so the
+/// gate never hides the test from a normal run). No `#[ignore]`.
+#[cfg(feature = "moonpool")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The runtime engine (`runtime_moonpool::MoonpoolEngine`, with `::new`) is
+    // the one `Client::connect_plain_supervised` consumes; `magnetar::MoonpoolEngine`
+    // is the façade's engine MARKER, a different type.
+    use magnetar::runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
+    use moonpool_core::TokioProviders;
+
+    let (service_url, _admin_url, container) = start_pulsar().await?;
+
+    // Strip the `pulsar://` scheme: the moonpool engine dials a raw
+    // `host:port` authority. The failover provider keeps the scheme — the
+    // supervised reconnect path strips it on every redial.
+    let host_port = service_url
+        .strip_prefix("pulsar://")
+        .unwrap_or(&service_url)
+        .to_owned();
+    let failover = ControlledClusterFailover::new(service_url);
+    let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
+
+    let config = magnetar_proto::ConnectionConfig {
+        supervisor: Some(supervisor_for_e2e()),
+        operation_timeout: Duration::from_secs(120),
+        ..Default::default()
+    };
+    let runtime_client = MoonpoolClient::connect_plain_supervised(
+        &MoonpoolEngine::new(TokioProviders::new()),
+        &host_port,
+        config,
+        Some(provider),
+        None,
+    )
+    .await?;
+    let client = PulsarClient::from_runtime_client(runtime_client);
+
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-mp-transient-{}",
+        Uuid::new_v4()
+    );
+    let producer = client.producer(&topic).create().await?;
+
+    // Sanity round-trip before the restart so we know the session is healthy.
+    producer
+        .send(OutgoingMessage::with_payload(b"before-restart".to_vec()).into())
+        .await?;
+
+    // `docker restart` re-runs `bin/pulsar standalone`; the post-restart
+    // bundle-not-served window is what drives the broker to answer the
+    // rebuild's `CommandProducer` with a transient `ServiceNotReady`.
+    tracing::info!("restarting pulsar container to drive the moonpool transient-retry arm");
+    let container_id = container.id().to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(["restart", "--time", "5", &container_id])
+            .status()
+    })
+    .await??;
+    assert!(status.success(), "docker restart failed: {status:?}");
+    let new_host = container.get_host().await?;
+    let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+    failover.set_url(format!("pulsar://{new_host}:{new_port}"));
+
+    // Poll send() until it succeeds: the supervised driver redials, rebuilds
+    // the producer, hits the transient `ServiceNotReady` on the rebuild open,
+    // and the §3.1 leg re-looks-up + retries until the broker serves the
+    // attach. Each attempt is timeout-bounded so an environmental broker death
+    // fails the test fast instead of hanging.
+    let payload = b"after-restart".to_vec();
+    let mut attempts = 0u32;
+    let send_outcome: Result<(), Box<dyn std::error::Error>> = loop {
+        attempts += 1;
+        if attempts > 30 {
+            break Err(
+                "moonpool send did not complete within 30 bounded attempts after broker restart"
+                    .into(),
+            );
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            producer.send(OutgoingMessage::with_payload(payload.clone()).into()),
+        )
+        .await
+        {
+            Ok(Ok(_message_id)) => break Ok(()),
+            Ok(Err(e)) => {
+                tracing::info!(
+                    ?e,
+                    attempts,
+                    "moonpool producer send retry after broker restart"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(_elapsed) => {
+                tracing::info!(
+                    attempts,
+                    "moonpool producer send attempt timed out; retrying"
+                );
+            }
+        }
+    };
+    send_outcome?;
+
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
 /// ADR-0060 regression guard: a transient `SessionLost` on a lookup behind
 /// `subscribe` / `producer.create()` must NOT leak to the caller as
 /// `ClientError::Other("unexpected lookup outcome: SessionLost…")`. Asserts the

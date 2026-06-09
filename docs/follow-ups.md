@@ -58,11 +58,14 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 
 **Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix:
 
-1. **Moonpool transient-retry arms are missing**: the moonpool driver never consumes `ProducerOpenFailedTransient` / `SubscribeFailedTransient` (the tokio driver runs the lookup-then-retry leg; moonpool has zero `Transient` matches).
-   A post-restart broker answering a rebuild with `ServiceNotReady` dead-ends the re-attach on the moonpool engine.
-   The `reconnect_replay_gating` twins document the asymmetry in-file.
-2. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
+1. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
    Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
+
+(Closed residual: the moonpool transient-retry arms were missing — the moonpool driver never consumed `ProducerOpenFailedTransient` / `SubscribeFailedTransient`, so a post-restart broker answering a rebuild with `ServiceNotReady` dead-ended the re-attach on the moonpool engine while the tokio driver recovered via its lookup-then-retry leg.
+Closed by wiring the matching arms into the moonpool driver: `handle_pending_events` drains each transient event into a `RetryRequest`, and the generic `driver_loop_inner` dispatches each one as a detached task through the engine's `TaskProvider` + `TimeProvider` — the delayed lookup + `retry_producer_open` / `retry_consumer_subscribe` sleeps on the INJECTED clock, never a host `tokio::time::sleep`, so the leg stays deterministic under `SimProviders` (ADR-0011) and its detached-spawn serialization matches the tokio engine's `tokio::spawn` so the differential `EventStream` order is identical (ADR-0024).
+The broker `message` field is truncated via `truncate_broker_str` on the new `warn!` arms.
+The four-layer + e2e coverage lands in the same changeset: proto unit `command_error_on_{producer_open,subscribe}_emits_*_transient` (pre-existing), the dedicated tokio `producer_open_recovers_after_transient_reject`, the moonpool virtual-time `transient_producer_open_retry_fires_under_virtual_time` (advances the sim clock and observes the retry fire — the structural determinism proof `check-no-internal-clock` cannot give), the differential `drop_redial_with_transient_reject_is_equivalent_across_engines` (event-ORDER parity via `ScriptedBroker::transient_reject_first_redial_producer_open`), and the moonpool-engine e2e `e2e_moonpool_transient_producer_open_retry_across_broker_restart`.
+See the `feat(runtime-moonpool)` commit.)
 
 (Closed residual: the differential harness had no connection-drop knob — `ScriptedBroker` accepted multiple sessions but could not script a mid-scenario drop + redial, so the re-attach replay fix carried proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out.
 Closed by `ScriptedBroker::drop_connection_after`, a cross-session ledger + durable per-subscription cursor that survives the redial, supervised runner entry points, and the `reconnect_replay_gating_equivalence` differential scenario asserting tokio ↔ moonpool `EventStream` parity in event order with resume-from-acked-cursor — see the `test(differential)` commit.
@@ -70,7 +73,7 @@ The harness reset is `ScriptedBroker::clear_cross_session_state`, with a `broker
 
 (Closed residual: the `e2e_reconnect` send-loop hygiene gap — unbounded `send().await` turning environmental broker death into an infinite hang — was fixed in the same series after a crashed standalone container hung the validation chain for 20 hours; each send attempt is now timeout-bounded.)
 
-**Why it stays open.** 1 is an engine feature with its own ADR-0024 test obligations; 2 changes user-visible supervision semantics (needs a small design pass against Java parity).
+**Why it stays open.** The remaining residual (1) changes user-visible supervision semantics (needs a small design pass against Java parity).
 
 **Why it stays open.** Needs a design decision on where the mechanism lives (subscriber vs library) before any guidance is written; picking the library side adds per-callsite state and an API surface that the subscriber side gets for free.
 

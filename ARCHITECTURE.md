@@ -596,11 +596,15 @@ For these codes the supervisor:
 
 1. **Retains state.** `Connection::handle_command_error` emits `ProducerOpenFailedTransient` / `SubscribeFailedTransient` events; the producer / consumer state is NOT removed.
    Permanent codes (e.g. `AuthorizationError`) still drop state and surface `ProducerOpenFailed` / `SubscribeFailed` to the user.
-2. **Looks up first, then retries.** The driver's `handle_pending_events` runs `lookup_then(topic)` before `Connection::retry_producer_open(handle)` / `retry_consumer_subscribe(handle)`.
-   `lookup_then` issues a `CommandLookupTopic`, waits for the `CommandLookupTopicResponse` via a `poll_fn` future bound to the existing `PendingOpKey::Request` slot, and only then signals the per-handle retry.
+2. **Looks up first, then retries.** The driver's `handle_pending_events` schedules a delayed `lookup_then(topic)` before `Connection::retry_producer_open(handle)` / `retry_consumer_subscribe(handle)`.
+   `lookup_then` issues a `CommandLookupTopic`, waits for the `CommandLookupTopicResponse` via a future bound to the existing `PendingOpKey::Request` slot, and only then signals the per-handle retry.
    This is what re-acquires bundle ownership on the broker side.
 3. **Re-emits a single command.** `retry_producer_open` bumps the handle's `epoch`, emits a fresh `CommandProducer`, and calls `ProducerState::replay_pending_outbound` so any `OpSend`s enqueued during the transient window get their cached wire frames re-pushed onto outbound after the targeted re-attach.
    `retry_consumer_subscribe` resumes from `last_acked_message_id` when one exists.
+
+Both engines run this leg.
+The tokio driver detaches it on `tokio::spawn` + `tokio::time::sleep`; the moonpool driver's non-generic `handle_pending_events` drains each transient event into a `RetryRequest` that the generic `driver_loop_inner` dispatches as a detached task through the engine's `TaskProvider`, with the pre-lookup delay sleeping on the injected `TimeProvider`.
+Routing the delay through the provider (never a host `tokio::time::sleep`) is load-bearing: under `SimProviders` the retry fires at a deterministic point in virtual time ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md)), and the detached-spawn shape matches the tokio engine so the two engines' `EventStream`s stay identical in order ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md)).
 
 The transient path is independent of the full Stage 2 reset cycle: it keeps the existing connection alive and only rebuilds the specific handle that errored.
 

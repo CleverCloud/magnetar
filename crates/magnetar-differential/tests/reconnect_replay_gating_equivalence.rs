@@ -188,3 +188,112 @@ async fn drop_redial_replay_is_equivalent_across_engines() {
         events[6]
     );
 }
+
+/// Drop + redial WITH a transient producer-open rejection on the redial
+/// (docs/follow-ups.md §3.1 — ADR-0024 layer d for the transient-retry
+/// wiring).
+///
+/// On top of the drop + redial above, the broker is also armed with
+/// [`ScriptedBroker::transient_reject_first_redial_producer_open`]: the FIRST
+/// `CommandProducer` on the redialled session is answered with a transient
+/// `ServiceNotReady` ("Please redo the lookup"), forcing BOTH engines through
+/// the §3.1 lookup-then-retry leg (re-lookup → `retry_producer_open` → ack)
+/// before the replayed publish can land. The tokio engine has always consumed
+/// `ProducerOpenFailedTransient`; §3.1 wired the matching arms into the
+/// moonpool driver (through the injected `TimeProvider` + `TaskProvider`, so
+/// the retry's detached-task serialization MATCHES tokio's `tokio::spawn`).
+///
+/// The equivalence claim is the strongest the harness offers: the two
+/// [`EventStream`]s must compare equal **in order**, not merely as a set. A
+/// moonpool retry leg that perturbed the schedule (e.g. an inline sleep
+/// serializing differently from tokio's detached spawn) would reorder an event
+/// and the streams would diverge. The user-facing event sequence is IDENTICAL
+/// to the no-transient drop + redial case — the transient reject + retry are
+/// transparent to the caller — so this also pins that §3.1 adds no
+/// user-visible event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_redial_with_transient_reject_is_equivalent_across_engines() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-drop-redial-transient",
+        "sub-drop-redial-transient",
+        vec![
+            Op::Send {
+                payload: b"before-drop".to_vec(),
+            },
+            Op::Recv {
+                timeout: Duration::from_secs(5),
+            },
+            Op::Ack {
+                message_id: mid(1, 0),
+            },
+            Op::Send {
+                payload: b"after-redial".to_vec(),
+            },
+            Op::Recv {
+                timeout: Duration::from_secs(5),
+            },
+            Op::Ack {
+                message_id: mid(1, 1),
+            },
+            Op::Close,
+        ],
+    );
+
+    // ── Tokio leg ──
+    let broker_t = ScriptedBroker::bind().await.expect("broker bind");
+    broker_t.drop_connection_after(DROP_AFTER_FRAMES);
+    broker_t.transient_reject_first_redial_producer_open();
+    let tokio_stream = tokio::time::timeout(
+        Duration::from_secs(30),
+        runner_tokio::run_supervised(&broker_t.pulsar_url(), &trace, supervisor()),
+    )
+    .await
+    .expect("tokio leg must not hang across the drop + redial + transient retry")
+    .expect("tokio runner");
+    broker_t.shutdown().await;
+
+    // ── Moonpool leg ──
+    let broker_m = ScriptedBroker::bind().await.expect("broker bind");
+    broker_m.drop_connection_after(DROP_AFTER_FRAMES);
+    broker_m.transient_reject_first_redial_producer_open();
+    let moonpool_stream = tokio::time::timeout(
+        Duration::from_secs(30),
+        runner_moonpool::run_supervised(&broker_m.host_port(), &trace, supervisor()),
+    )
+    .await
+    .expect("moonpool leg must not hang across the drop + redial + transient retry")
+    .expect("moonpool runner");
+    broker_m.shutdown().await;
+
+    // ── Equivalence claim: identical event ORDER across engines. ──
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged for the drop + redial + transient-reject trace {trace:?}",
+    );
+
+    // The transient reject + retry are transparent: the user-facing event
+    // sequence is byte-for-byte the no-transient drop + redial sequence.
+    let events = &tokio_stream.events;
+    assert_eq!(
+        events.len(),
+        7,
+        "one event per op (transient retry is transparent)"
+    );
+    assert!(
+        matches!(&events[3], Event::Sent { message_id } if *message_id == mid(1, 1)),
+        "second send resumes the entry-id sequence → (1, 1) on the redialled session AFTER the \
+         transient reject + retry attach; got {:?}",
+        events[3]
+    );
+    assert!(
+        matches!(&events[4], Event::Received { message_id, payload }
+            if *message_id == mid(1, 1) && payload == b"after-redial"),
+        "second recv resumes from the durable cursor (1) once the retry attach lands; got {:?}",
+        events[4]
+    );
+    assert!(
+        matches!(events[6], Event::Closed),
+        "close; got {:?}",
+        events[6]
+    );
+}
