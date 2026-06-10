@@ -179,7 +179,7 @@ impl<P: Providers> Producer<P> {
             slot,
             compression,
             encryptor,
-            close_guard: close_guard,
+            close_guard,
             _providers: std::marker::PhantomData,
         }
     }

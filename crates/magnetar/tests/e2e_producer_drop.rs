@@ -97,13 +97,13 @@ fn unique_topic(prefix: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_dropped_named_producer_allows_same_name_recreate()
 -> Result<(), Box<dyn std::error::Error>> {
+    const PRODUCER_NAME: &str = "drop-guard-hostname";
     let (service_url, _admin_url, _container) = start_pulsar().await?;
     let client = PulsarClient::builder()
         .service_url(service_url)
         .build()
         .await?;
     let topic = unique_topic("magnetar-e2e-producer-drop");
-    const PRODUCER_NAME: &str = "drop-guard-hostname";
 
     let producer = client.producer(&topic).name(PRODUCER_NAME).create().await?;
     producer.send_bytes(b"before-drop".to_vec()).await?;
@@ -128,13 +128,13 @@ async fn e2e_dropped_named_producer_allows_same_name_recreate()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_explicit_close_then_drop_allows_same_name_recreate()
 -> Result<(), Box<dyn std::error::Error>> {
+    const PRODUCER_NAME: &str = "close-then-drop-hostname";
     let (service_url, _admin_url, _container) = start_pulsar().await?;
     let client = PulsarClient::builder()
         .service_url(service_url)
         .build()
         .await?;
     let topic = unique_topic("magnetar-e2e-producer-close-drop");
-    const PRODUCER_NAME: &str = "close-then-drop-hostname";
 
     let producer = client.producer(&topic).name(PRODUCER_NAME).create().await?;
     producer.send_bytes(b"payload".to_vec()).await?;
