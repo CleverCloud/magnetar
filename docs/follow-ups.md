@@ -19,13 +19,12 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                | Status                                                                                                      |
-| --- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460            |
-| 2   | [Re-pin moonpool off git `branch = "main"`](#2-re-pin-moonpool-off-git-branch-main)                                 | ⏳ blocked on a moonpool crates.io release carrying [PR #113](https://github.com/PierreZ/moonpool/pull/113) |
-| 3   | [Log rate-limiting / sampling guidance](#3-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                                    |
-| 4   | [Reconnect parity residuals](#4-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🧠 engine/harness features + a supervision-semantics design pass                                            |
-| 5   | [Survivability residuals (ADR-0055 bit-flip fix)](#5-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟡 2 engine residuals (fast-fail, lookup-retry) + 3 pre-existing test-state caveats                         |
+| #   | Item                                                                                                                | Status                                                                                           |
+| --- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                         |
+| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🧠 engine/harness features + a supervision-semantics design pass                                 |
+| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟡 2 engine residuals (fast-fail, lookup-retry) + 3 pre-existing test-state caveats              |
 
 ---
 
@@ -46,24 +45,7 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 
 ---
 
-## 2. Re-pin moonpool off git `branch = "main"`
-
-**Gap.** `Cargo.toml`'s `[workspace.dependencies]` tracks `moonpool-core` / `moonpool-sim` on `{ version = "0.6.0", git = "…", branch = "main" }` to consume the futures-io `TcpStream` + segment-granular `write_vectored` change ahead of a crates.io release.
-This is a **documented, time-boxed exception** to ADR-0036's exact-pin reproducibility discipline ([ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
-While it stands, `cargo update -p moonpool-core` can advance the rev to an arbitrary later `main` commit; `Cargo.lock`'s concrete rev is the only reproducibility anchor.
-(The `version = "0.6.0"` constraint trips resolution if `main` crosses to 0.7, surfacing the trigger automatically.)
-
-**Why it stays open.** Blocked on upstream cutting a **moonpool crates.io release that contains [PR #113](https://github.com/PierreZ/moonpool/pull/113)**. The last published release is `0.6.0`, which predates both the futures-io migration and the vectored entry.
-
-**`/goal` (post-release).**
-
-```text
-/goal re-pin moonpool off the git `branch = "main"` floating dependency per docs/follow-ups.md §2, once a moonpool crates.io release ships PR #113 (futures-io `NetworkProvider::TcpStream` + `SimTcpStream::poll_write_vectored`). In Cargo.toml `[workspace.dependencies]`, replace the two `{ version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }` entries for `moonpool-core` / `moonpool-sim` with exact `=x.y.z` version pins matching the release that carries PR #113. Run `cargo update -p moonpool-core -p moonpool-sim` to refresh Cargo.lock to the released artefact. Confirm the transport still compiles against the `futures::io` ext traits (the release keeps the same surface). Remove the `[sources].allow-git` entry in deny.toml. Flip specs/adr/0043-temporary-floating-moonpool-git-dep.md Status to `Superseded by ADR-NNNN` and write the re-pin ADR (restores ADR-0036 exact-pin in full); flip the ADR-0036 amendment pointer + index status accordingly; update specs/README.md index. Update docs/moonpool-engine.md and any other version statement. Validation chain per CLAUDE.md (incl. `cargo deny check` — the release re-enables the version/advisory gates the git dep bypassed).
-```
-
----
-
-## 3. Log rate-limiting / sampling guidance
+## 2. Log rate-limiting / sampling guidance
 
 **Gap.** [ADR-0054](../specs/adr/0054-logging-policy.md) §7 bounds log volume structurally — per-message records are confined to `trace!`/`debug!`, and `warn!` and above are bounded by churn, never by send throughput — but defines no rate-limiting or sampling story for when the churn itself storms (e.g. a broker-restart cascade emitting one `warn!` per reconnect attempt across many connections). sozu solves this with render-time sanitization in its own logger; `tracing` has no built-in per-callsite rate limit, so the options are subscriber-side sampling (application-owned, zero library change), a documented filtering recipe, or library-side per-callsite rate limiting (which carries state per call site — exactly the "state not worth carrying for a log line" trade-off ADR-0054 leans against).
 
@@ -71,13 +53,17 @@ While it stands, `cargo update -p moonpool-core` can advance the rev to an arbit
 
 (Related residual, waived in the ADR-0054 changeset as pre-existing in degree: error-`Display` fields that can embed peer-supplied text — e.g. the supervisor reconnect-failed `error = %err`, which may wrap a broker-supplied handshake reason — are not yet length-bounded; fold a normalization/truncation decision for error fields into this follow-up.)
 
-## 4. Reconnect parity residuals (surfaced by the re-attach replay fix)
+## 3. Reconnect parity residuals (surfaced by the re-attach replay fix)
 
 **Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix:
 
-1. **Moonpool transient-retry arms are missing**: the moonpool driver never consumes `ProducerOpenFailedTransient` / `SubscribeFailedTransient` (the tokio driver runs the lookup-then-retry leg; moonpool has zero `Transient` matches). A post-restart broker answering a rebuild with `ServiceNotReady` dead-ends the re-attach on the moonpool engine. The `reconnect_replay_gating` twins document the asymmetry in-file.
-2. **Differential harness has no connection-drop knob**: `ScriptedBroker` accepts multiple sessions but cannot script a mid-scenario drop + redial, so the re-attach replay fix carries proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out in the commit message. Add a `drop_connection_after(...)` injection and a reconnect equivalence scenario.
-3. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires. Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
+1. **Moonpool transient-retry arms are missing**: the moonpool driver never consumes `ProducerOpenFailedTransient` / `SubscribeFailedTransient` (the tokio driver runs the lookup-then-retry leg; moonpool has zero `Transient` matches).
+   A post-restart broker answering a rebuild with `ServiceNotReady` dead-ends the re-attach on the moonpool engine.
+   The `reconnect_replay_gating` twins document the asymmetry in-file.
+2. **Differential harness has no connection-drop knob**: `ScriptedBroker` accepts multiple sessions but cannot script a mid-scenario drop + redial, so the re-attach replay fix carries proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out in the commit message.
+   Add a `drop_connection_after(...)` injection and a reconnect equivalence scenario.
+3. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
+   Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
 
 (Closed residual: the `e2e_reconnect` send-loop hygiene gap — unbounded `send().await` turning environmental broker death into an infinite hang — was fixed in the same series after a crashed standalone container hung the validation chain for 20 hours; each send attempt is now timeout-bounded.)
 
@@ -88,12 +74,12 @@ While it stands, `cargo update -p moonpool-core` can advance the rev to an arbit
 **`/goal` (once the design question is settled).**
 
 ```text
-/goal design and document rate-limiting / sampling guidance for magnetar log output per docs/follow-ups.md §3. Decide subscriber-side (document a tracing-subscriber filtering/sampling recipe in docs/logging.md, zero library change) vs library-side (per-callsite rate limiting — justify the added state against ADR-0054 §7). Land the guidance in docs/logging.md and, if the decision is binding, a short ADR-0054 amendment per specs/README.md procedure. Validation chain per CLAUDE.md (docs-only exemption applies if no code changes).
+/goal design and document rate-limiting / sampling guidance for magnetar log output per docs/follow-ups.md §2. Decide subscriber-side (document a tracing-subscriber filtering/sampling recipe in docs/logging.md, zero library change) vs library-side (per-callsite rate limiting — justify the added state against ADR-0054 §7). Land the guidance in docs/logging.md and, if the decision is binding, a short ADR-0054 amendment per specs/README.md procedure. Validation chain per CLAUDE.md (docs-only exemption applies if no code changes).
 ```
 
 ---
 
-## 5. Survivability residuals (surfaced by the ADR-0055 bit-flip fix)
+## 4. Survivability residuals (surfaced by the ADR-0055 bit-flip fix)
 
 **Finding.** PR #218's `seed-replay` failure was not `a02f401`'s logic and not a moonpool delivery bug.
 It was moonpool's default-on FoundationDB bit-flip chaos corrupting a Pulsar _command_ frame — which TCP would never deliver in production, since only message payloads carry CRC32C — and `a02f401`'s write-schedule shift happened to land that flip on the two ADR-0038 anchor seeds.
@@ -102,25 +88,33 @@ Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
 
 **Gap.** Two engine residuals, neither blocking the fix:
 
-1. **Terminal-state fast-fail for NEW ops.** `Connection::fail_all_pending` only terminalizes ops that were already pending AT the drop. A `producer.send()` / `subscribe()` / `producer.close()` issued AFTER a plain connection is already terminal (`Failed` / `Closed`) still registers a doomed pending op that hangs — there is no driver left to resolve it. ADR-0055 §1 is scoped to the in-flight contract, so the terminal-exit / differential / e2e tests deliberately do not assert on this. Fix: a synchronous fast-fail in the send / request-issue / subscribe paths that returns `PeerClosed` immediately when the handshake state is `Failed` / `Closed`.
-2. **Lookup `SessionLost` is not transparently re-issued.** A transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaces to the caller as `ClientError::Other` — the engine does not auto-reissue the lookup the way it transparently replays producer sends and re-subscribes. The `sim_chaos` workloads retry around it at setup, but a production caller subscribing/opening _during_ a reconnect could see this `Other`. Fix: engine-side lookup-retry-on-`SessionLost` (mirrors Java's lookup-after-reset), with its own ADR-0024 layers.
+1. **Terminal-state fast-fail for NEW ops.** `Connection::fail_all_pending` only terminalizes ops that were already pending AT the drop.
+   A `producer.send()` / `subscribe()` / `producer.close()` issued AFTER a plain connection is already terminal (`Failed` / `Closed`) still registers a doomed pending op that hangs — there is no driver left to resolve it.
+   ADR-0055 §1 is scoped to the in-flight contract, so the terminal-exit / differential / e2e tests deliberately do not assert on this.
+   Fix: a synchronous fast-fail in the send / request-issue / subscribe paths that returns `PeerClosed` immediately when the handshake state is `Failed` / `Closed`.
+2. **Lookup `SessionLost` is not transparently re-issued.** A transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaces to the caller as `ClientError::Other` — the engine does not auto-reissue the lookup the way it transparently replays producer sends and re-subscribes.
+   The `sim_chaos` workloads retry around it at setup, but a production caller subscribing/opening _during_ a reconnect could see this `Other`.
+   Fix: engine-side lookup-retry-on-`SessionLost` (mirrors Java's lookup-after-reset), with its own ADR-0024 layers.
 
 **Test-state caveats** — NOT caused by this change (the diff touches no `magnetar-admin` or replicated-subscription code), flagged so the next reader is not surprised that a full `--all-features` run is not 100% green:
 
-- **`e2e_admin_topic_policies_breadth` fails on `apachepulsar/pulsar:4.0.4`** (a `retention = -1` round-trip). Pre-existing — reproduces on the base branch, unrelated to ADR-0055. It keeps the full `cargo test --workspace --all-features` run (and the per-PR `test` CI job) red until addressed separately; this is a `magnetar-admin` / Pulsar-version concern, not a survivability one.
-- **Seed-13 `replicated_subscriptions::consumer_emits_marker_observation_in_order` flake.** Pre-existing seed-flakiness (passes on re-run and in isolation). The deterministic `sim_chaos` surface this change edits is clean on every seed `1..32`.
-- **`check-sim-coverage` reports ~77 uncovered lines.** The diff is computed vs `origin/main`, so it bundles the prior terminal-outcome commit plus line-number-shift artifacts of pre-existing code; the behavioral lines this change adds (the `Closed → PeerClosed` waiter mappings, the decode-fatal broker hook, the fatal-on-send arm) are exercised by the new differential + integration tests. The gate is local-first / scheduled-CI (it short-circuits on `main`); dispatch it from a feature branch for true patch gating once `feat/logging` lands on `main`.
+- **`e2e_admin_topic_policies_breadth` fails on `apachepulsar/pulsar:4.0.4`** (a `retention = -1` round-trip).
+  Pre-existing — reproduces on the base branch, unrelated to ADR-0055.
+  It keeps the full `cargo test --workspace --all-features` run (and the per-PR `test` CI job) red until addressed separately; this is a `magnetar-admin` / Pulsar-version concern, not a survivability one.
+- **Seed-13 `replicated_subscriptions::consumer_emits_marker_observation_in_order` flake.** Pre-existing seed-flakiness (passes on re-run and in isolation).
+  The deterministic `sim_chaos` surface this change edits is clean on every seed `1..32`.
+- **`check-sim-coverage` reports ~77 uncovered lines.** The diff is computed vs `origin/main`, so it bundles the prior terminal-outcome commit plus line-number-shift artifacts of pre-existing code; the behavioral lines this change adds (the `Closed → PeerClosed` waiter mappings, the decode-fatal broker hook, the fatal-on-send arm) are exercised by the new differential + integration tests.
+  The gate is local-first / scheduled-CI (it short-circuits on `main`); dispatch it from a feature branch for true patch gating once `feat/logging` lands on `main`.
 
-**Partial progress on [§4.2](#4-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).**
-This change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
-The mid-scenario **drop + redial** knob §4.2 asks for is still open.
+**Partial progress on [§3.2](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).** This change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
+The mid-scenario **drop + redial** knob §3.2 asks for is still open.
 
-**Why it stays open.** §5.1 + §5.2 are engine features with their own ADR-0024 test obligations and a small Java-parity design pass; the test-state caveats are pre-existing suite issues / gate mechanics, not survivability work.
+**Why it stays open.** §4.1 + §4.2 are engine features with their own ADR-0024 test obligations and a small Java-parity design pass; the test-state caveats are pre-existing suite issues / gate mechanics, not survivability work.
 
-**`/goal` (engine fast-fail residual §5.1).**
+**`/goal` (engine fast-fail residual §4.1).**
 
 ```text
-/goal implement terminal-state fast-fail for NEW operations per docs/follow-ups.md §5.1. When a plain connection is already terminal (handshake state Failed/Closed), the send / request-issue / subscribe paths must return ClientError::PeerClosed synchronously instead of registering a pending op that never resolves. Mirror across both engines (ADR-0024 1:1) with proto unit + tokio/moonpool integration twins + a differential layer. Validation chain per CLAUDE.md.
+/goal implement terminal-state fast-fail for NEW operations per docs/follow-ups.md §4.1. When a plain connection is already terminal (handshake state Failed/Closed), the send / request-issue / subscribe paths must return ClientError::PeerClosed synchronously instead of registering a pending op that never resolves. Mirror across both engines (ADR-0024 1:1) with proto unit + tokio/moonpool integration twins + a differential layer. Validation chain per CLAUDE.md.
 ```
 
 ---
@@ -134,5 +128,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-Two items are fully external blockers: the PIP-460 e2e flesh-out ([§1](#1-pip-460-scalable-topics-e2e)) waits on a Pulsar 5.0 RC carrying PIP-460, and the moonpool re-pin ([§2](#2-re-pin-moonpool-off-git-branch-main)) waits on a moonpool crates.io release shipping PR #113.
-The logging rate-limit guidance ([§3](#3-log-rate-limiting--sampling-guidance)) waits on an internal design decision, not an external dependency.
+One item is a fully external blocker: the PIP-460 e2e flesh-out ([§1](#1-pip-460-scalable-topics-e2e)) waits on a Pulsar 5.0 RC carrying PIP-460.
+The logging rate-limit guidance ([§2](#2-log-rate-limiting--sampling-guidance)) waits on an internal design decision, not an external dependency.

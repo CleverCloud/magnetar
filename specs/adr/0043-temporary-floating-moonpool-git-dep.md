@@ -1,13 +1,13 @@
 # ADR-0043 — Temporarily float `moonpool-core` / `moonpool-sim` on git `branch = "main"`
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR-0056](0056-moonpool-0-7-crates-io-repin.md)
 - **Date**: 2026-05-29
 - **Decider**: Florentin Dubois
 - **Tags**: dependencies, moonpool, supply-chain, process, network
 
 ## Context
 
-[ADR-0040](0040-vectored-io-transmit-enum.md) wave 2 needs the moonpool simulator to model vectored writes at segment granularity so the chaos pack can drop / re-order individual `IoSlice`s.
+[ADR-0040](0040-vectored-io-transmit-enum.md) needs the moonpool simulator to model vectored writes at segment granularity so the chaos pack can drop / re-order individual `IoSlice`s.
 The matching follow-up ([ADR-0040](0040-vectored-io-transmit-enum.md), [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111)) was blocked until upstream grew that surface.
 
 Upstream has now merged the work on `main` ([PR #113](https://github.com/PierreZ/moonpool/pull/113)).
@@ -16,7 +16,7 @@ Two changes ship together and both are **breaking**:
 1. **`NetworkProvider::TcpStream` migrated from `tokio::io` to `futures::io`.** The associated stream type now bounds on `futures::io::{AsyncRead, AsyncWrite}` instead of `tokio::io::{AsyncRead, AsyncWrite}`; `TokioNetworkProvider` wraps its `tokio::net::TcpStream` in `tokio_util::compat::Compat` to bridge the two ecosystems.
 2. **`SimTcpStream` gained `poll_write_vectored(&[IoSlice])` + `is_write_vectored() -> true`.** Each `IoSlice` is recorded as its own ordered delivery event (segment-granular chaos), with `writev`-style partial-accept semantics.
 
-This is exactly the substrate ADR-0040 wave 2 specified.
+This is exactly the moonpool network substrate ADR-0040 specified.
 The wrinkle: **neither change is on crates.io.** The last published release is `moonpool-core` / `moonpool-sim` `0.6.0`, which still exposes the `tokio::io` stream and has no vectored entry.
 The only way to consume the merged work today is a **git dependency** tracking the branch that carries it.
 
@@ -36,22 +36,22 @@ moonpool-sim  = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool"
   `deny.toml` separately allow-lists the moonpool git source under `[sources].allow-git`.
 - Both crates track the **same git ref** so they stay version-compatible (they are published in lockstep upstream).
 - `Cargo.lock` continues to record a **concrete resolved rev** — the float is in the _manifest constraint_, not the _locked artefact_. CI and local builds run `--locked`, so a given commit of magnetar resolves to one fixed moonpool rev until someone deliberately runs `cargo update -p moonpool-core`.
-- The moonpool engine's transport is ported from the `tokio::io` ext traits to the `futures::io` ext traits accordingly, and dispatches `TransmitOwned::Vectored` through real `write_vectored` on the plaintext arm (ADR-0040 wave 2 — see Consequences).
+- The moonpool engine's transport is ported from the `tokio::io` ext traits to the `futures::io` ext traits accordingly, and dispatches `TransmitOwned::Vectored` through real `write_vectored` on the plaintext arm (ADR-0040 — see Consequences).
 
-**Re-pin trigger.** The **first moonpool crates.io release that contains [PR #113](https://github.com/PierreZ/moonpool/pull/113)** flips this back to an exact released version:
+**Re-pin trigger.** The **first moonpool crates.io release that contains [PR #113](https://github.com/PierreZ/moonpool/pull/113)** flips this back to a crates.io version requirement:
 
 ```toml
-moonpool-core = "=x.y.z"   # the release carrying PR #113
-moonpool-sim  = "=x.y.z"
+moonpool-core = "^x.y.z"   # the release carrying PR #113
+moonpool-sim  = "^x.y.z"
 ```
 
-At that point this ADR's status changes to `Superseded by ADR-NNNN` (the re-pin ADR), restoring ADR-0036's exact-pin discipline in full.
+At that point this ADR's status changes to `Superseded by ADR-NNNN` (the re-pin ADR), restoring crates.io source checks while `Cargo.lock` remains the deterministic replay anchor.
 
 ## Consequences
 
 **Easier**
 
-- Unblocks [ADR-0040](0040-vectored-io-transmit-enum.md) wave 2: the moonpool engine can dispatch real segment-granular vectored writes under `SimProviders` instead of the placeholder coalesce.
+- Unblocks [ADR-0040](0040-vectored-io-transmit-enum.md): the moonpool engine can dispatch real segment-granular vectored writes under `SimProviders` instead of the placeholder coalesce.
 - Closes [ADR-0040](0040-vectored-io-transmit-enum.md) / [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) — the chaos pack now sees per-`IoSlice` delivery events.
 
 **Harder / cost**
@@ -75,12 +75,11 @@ At that point this ADR's status changes to `Superseded by ADR-NNNN` (the re-pin 
 
 ## References
 
-- [ADR-0040](0040-vectored-io-transmit-enum.md) — vectored `Transmit` descriptor; wave 2 is what this git dep unblocks.
+- [ADR-0040](0040-vectored-io-transmit-enum.md) — vectored `Transmit` descriptor; moonpool vectored network support is what this git dep unblocks.
 - [ADR-0036](0036-moonpool-seed-sweep-daily-random.md) — the exact-pin reproducibility discipline this ADR carves a temporary exception out of; the daily seed sweep is one of the mitigations.
 - [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — the four-layer + 1:1 parity gates that guard the futures-io transport port.
 - `Cargo.toml` — `[workspace.dependencies]` `moonpool-core` / `moonpool-sim` git entries (the floating constraint this ADR records).
 - `Cargo.lock` — the concrete resolved moonpool rev (the reproducibility anchor while the constraint floats).
 - [ADR-0040](0040-vectored-io-transmit-enum.md) / [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111), [PR #113](https://github.com/PierreZ/moonpool/pull/113) — the upstream work and the re-pin trigger.
 - [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md) §"Transport
-  - vectored writes" — the engine-side description of the futures-io port
-    and segment-granular dispatch.
+  - vectored writes" — the engine-side description of the futures-io port and segment-granular dispatch.

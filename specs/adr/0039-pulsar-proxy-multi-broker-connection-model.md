@@ -9,25 +9,13 @@
 > Magnetar previously stuffed the broker's advertised `pulsar://host:port` value verbatim, which made the proxy reject the handshake with `ServerError.ServiceNotReady "Target broker cannot be validated"`.
 > See [ADR-0045](0045-proxy-to-broker-url-host-port-format.md) for the scheme-strip helpers and their tests.
 
-> **Amendment (2026-06-01, multi-broker DIRECT routing).**
-> The "Consequences" section originally framed multi-broker DIRECT
-> routing as follow-up work: when a lookup returns
-> `LookupOutcome::Connect { broker_service_url: Some(B), proxy_through_service_url: false }`
-> magnetar dropped `B` and opened the producer / consumer on the
-> bootstrap connection. Against a multi-broker non-proxy Pulsar cluster
-> this manifested as `ServerError::NotConnected "not served by this
+> **Amendment (2026-06-01, multi-broker DIRECT routing).** The "Consequences" section originally framed multi-broker DIRECT routing as follow-up work: when a lookup returns `LookupOutcome::Connect { broker_service_url: Some(B), proxy_through_service_url: false }` magnetar dropped `B` and opened the producer / consumer on the bootstrap connection.
+> Against a multi-broker non-proxy Pulsar cluster this manifested as `ServerError::NotConnected "not served by this
 instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
-> review). This amendment generalises the existing
-> `ProxyConnectionPool` to also cover the DIRECT case: the pool key
-> stays `(logical_broker_url, physical_dial_addr)` and a new
-> `proxy_to_broker_url: Option<String>` parameter on
-> `get_or_open` distinguishes the two routing shapes — `Some(host_port)`
-> for proxy entries, `None` for direct entries. The tokio engine wires
-> this end-to-end; the moonpool engine captures the routing decision at
-> the proto level and falls back to the bootstrap until the moonpool
-> flavour of `ProxyConnectionPool` lands (`docs/follow-ups.md §3`). See
-> the "Multi-broker DIRECT routing (2026-06-01)" section below for the
-> full design rationale.
+> review).
+> This amendment generalises the existing `ProxyConnectionPool` to also cover the DIRECT case: the pool key stays `(logical_broker_url, physical_dial_addr)` and a new `proxy_to_broker_url: Option<String>` parameter on `get_or_open` distinguishes the two routing shapes — `Some(host_port)` for proxy entries, `None` for direct entries.
+> The tokio engine wires this end-to-end; the moonpool engine captures the routing decision at the proto level and falls back to the bootstrap until the moonpool flavour of `ProxyConnectionPool` lands (`docs/follow-ups.md §3`).
+> See the "Multi-broker DIRECT routing (2026-06-01)" section below for the full design rationale.
 
 ## Context
 
@@ -160,127 +148,64 @@ Mechanics:
 
 ## Moonpool engine parity (2026-06-01)
 
-The original landing of this ADR shipped the
-[`ProxyConnectionPool`](../../crates/magnetar-runtime-tokio/src/pool.rs)
-on the **tokio engine** only. The moonpool engine surfaced a
-`ClientError::ProxyUnsupportedOnUnsupervisedClient` error on the proxy
-branch and was tracked as
-[follow-up §3 in `docs/follow-ups.md`](../../docs/follow-ups.md#3-moonpool-proxyconnectionpool-parity).
+The original landing of this ADR shipped the [`ProxyConnectionPool`](../../crates/magnetar-runtime-tokio/src/pool.rs) on the **tokio engine** only.
+The moonpool engine surfaced a `ClientError::ProxyUnsupportedOnUnsupervisedClient` error on the proxy branch and was tracked as [follow-up §3 in `docs/follow-ups.md`](../../docs/follow-ups.md#3-moonpool-proxyconnectionpool-parity).
 This amendment lands the moonpool flavour and flips the parity row.
 
 ### Shape
 
-The moonpool side mirrors the tokio side 1:1 in
-[`crates/magnetar-runtime-moonpool/src/pool.rs`](../../crates/magnetar-runtime-moonpool/src/pool.rs):
+The moonpool side mirrors the tokio side 1:1 in [`crates/magnetar-runtime-moonpool/src/pool.rs`](../../crates/magnetar-runtime-moonpool/src/pool.rs):
 
-- `ConnectionFactory<P: Providers>` captures the bootstrap inputs (proxy
-  `addr`, template `ConnectionConfig`, providers bundle, optional
-  `ServiceUrlProvider`, optional `DnsResolver`).
+- `ConnectionFactory<P: Providers>` captures the bootstrap inputs (proxy `addr`, template `ConnectionConfig`, providers bundle, optional `ServiceUrlProvider`, optional `DnsResolver`).
 - `ProxyConnectionPool<P>` holds the `Mutex<HashMap<(logical, physical),
-Arc<EntryState>>>`. `EntryState` is `Pending(PendingDial)` while a dial
-  task is in flight and `Ready { shared, driver }` once the supervised
-  driver loop is up.
-- `pool::get_or_open(Arc<Self>, logical)` is the entry point; takes the
-  pool by `Arc` so the spawned dial task can outlive the caller's
-  `&self`.
+Arc<EntryState>>>`.
+  `EntryState` is `Pending(PendingDial)` while a dial task is in flight and `Ready { shared, driver }` once the supervised driver loop is up.
+- `pool::get_or_open(Arc<Self>, logical)` is the entry point; takes the pool by `Arc` so the spawned dial task can outlive the caller's `&self`.
 
-The pool is constructed when (and only when) `Client::connect_plain_supervised`
-is the construction path — the `from_parts` / `connect_plain` paths leave
-`pool: None`, which keeps the historic single-connection behaviour
-intact for tests and unsupervised callers.
+The pool is constructed when (and only when) `Client::connect_plain_supervised` is the construction path — the `from_parts` / `connect_plain` paths leave `pool: None`, which keeps the historic single-connection behaviour intact for tests and unsupervised callers.
 
 ### `Send` propagation — the load-bearing detail
 
-`moonpool_core::NetworkProvider` is declared `#[async_trait(?Send)]` on
-the published 0.6.0 release (the workspace currently floats `branch =
-"main"` per ADR-0043, which has since lifted that restriction; both
-shapes are accommodated). A naïve `network.connect(...).await` inside
-the producer / consumer open path would break `Send` propagation up to
-the facade's
-[`CreateProducerApi`](../../crates/magnetar/src/engine/mod.rs) /
-[`SubscribeApi`](../../crates/magnetar/src/engine/mod.rs) traits, which
-pin their returns as `Pin<Box<dyn Future + Send + '_>>`.
+`moonpool_core::NetworkProvider` previously exposed a `?Send` connect future on the published 0.6.0 release.
+As of moonpool `0.7.0` (consumed from crates.io per [ADR-0056](0056-moonpool-0-7-crates-io-repin.md)), that restriction is lifted.
+The pool still keeps the dial + handshake out of the producer / consumer open path so `Send` propagation remains explicit up to the facade's [`CreateProducerApi`](../../crates/magnetar/src/engine/mod.rs) / [`SubscribeApi`](../../crates/magnetar/src/engine/mod.rs) traits, which pin their returns as `Pin<Box<dyn Future + Send + '_>>`.
 
-The pool side-steps that by hoisting the dial + handshake + supervised
-driver spawn into a task created via
-[`moonpool_core::TaskProvider::spawn_task`](https://docs.rs/moonpool-core/0.6.0/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task).
-`spawn_task` uses `spawn_local` (registry) / `tokio::task::Builder::spawn`
-(main rev); either way the spawned future is **not required to be
-`Send`**. The outer `get_or_open` future only `.await`s a
-[`tokio::sync::Notify`] plus reads an `Arc<Mutex<Option<Arc<DialOutcome>>>>`
-slot — both `Send` regardless of `P`'s flavour. Multiple racing waiters
-clone the published `Arc<DialOutcome>` out of the slot and unwrap the
-result locally; `EngineError` isn't `Clone`, so a `clone_engine_error`
-helper hand-rolls a shallow copy for the rare `Err` arm.
+The pool side-steps that by hoisting the dial + handshake + supervised driver spawn into a task created via [`moonpool_core::TaskProvider::spawn_task`](https://docs.rs/moonpool-core/0.7.0/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task).
+The outer `get_or_open` future only `.await`s a [`tokio::sync::Notify`] plus reads an `Arc<Mutex<Option<Arc<DialOutcome>>>>` slot — both `Send` regardless of `P`'s flavour.
+Multiple racing waiters clone the published `Arc<DialOutcome>` out of the slot and unwrap the result locally; `EngineError` isn't `Clone`, so a `clone_engine_error` helper hand-rolls a shallow copy for the rare `Err` arm.
 
 ### Determinism
 
-The pool keys, dial path, and lock discipline match the tokio side
-exactly. Determinism considerations:
+The pool keys, dial path, and lock discipline match the tokio side exactly.
+Determinism considerations:
 
-- Pool entries are built with
-  [`make_shared_with_providers`](../../crates/magnetar-runtime-moonpool/src/lib.rs)
-  — the same helper the bootstrap connection uses. The deterministic
-  monotonic-clock closure (ADR-0011) flows through, so producer / consumer
-  state machine `Instant` reads on a pinned pool entry observe the same
-  virtual time as the bootstrap.
-- The `spawn_task`-detached dial task runs through the moonpool
-  `TaskProvider` — under `SimProviders` (`moonpool-sim`) the scheduler
-  pumps it deterministically; under `TokioProviders` it's a plain
-  `tokio::spawn`.
-- `PendingDial`'s `Notify::notify_waiters()` plus the slot publication
-  happen under the same critical section ordering as the tokio engine's
-  race-resolution path (`build_entry` → entries-lock → race check). The
-  result is observationally equivalent: at most one dial per
-  `(logical, physical)`; waiters all get the same `Arc<DialOutcome>`.
-- No host-time reads, no out-of-band randomness, no I/O outside the
-  spawned dial task. The pool itself is purely a `HashMap` + `Notify`
-  bookkeeping layer.
+- Pool entries are built with [`make_shared_with_providers`](../../crates/magnetar-runtime-moonpool/src/lib.rs) — the same helper the bootstrap connection uses.
+  The deterministic monotonic-clock closure (ADR-0011) flows through, so producer / consumer state machine `Instant` reads on a pinned pool entry observe the same virtual time as the bootstrap.
+- The `spawn_task`-detached dial task runs through the moonpool `TaskProvider` — under `SimProviders` (`moonpool-sim`) the scheduler pumps it deterministically; under `TokioProviders` it's a plain `tokio::spawn`.
+- `PendingDial`'s `Notify::notify_waiters()` plus the slot publication happen under the same critical section ordering as the tokio engine's race-resolution path (`build_entry` → entries-lock → race check).
+  The result is observationally equivalent: at most one dial per `(logical, physical)`; waiters all get the same `Arc<DialOutcome>`.
+- No host-time reads, no out-of-band randomness, no I/O outside the spawned dial task.
+  The pool itself is purely a `HashMap` + `Notify` bookkeeping layer.
 
 ### Deviations from tokio
 
-- **Race resolution**: tokio races by always running `build_entry` and
-  discarding the loser's half-built entry post-dial. The moonpool side
-  uses a `Pending` slot installed under the entries-lock _before_
-  spawning the dial; subsequent callers join the existing dial instead
-  of opening a parallel connection. This is cleaner under the
-  spawn-task pattern (no `DriverHandle::abort` dance on the losing path)
-  and produces the same observable end state (one connection per
-  `(logical, physical)`).
-- **Pool teardown**: `Pending` entries are dropped without explicit
-  abort on `close`. The dial task either completes and inserts a
-  `Ready` entry that the close path immediately re-drains, or fails (in
-  which case the entry was already evicted) — both paths converge on a
-  cleanly-shut-down pool.
-- **Pool unit-test count**: moonpool's `pool.rs` ships **two** unit
-  tests (`fresh_pool_is_empty`, `debug_includes_pool_state`) matching
-  tokio's count. The end-to-end pool behaviour is covered by the
-  integration test (`tests/proxy_multi_conn.rs`) and the differential
-  equivalence test (`magnetar-differential::proxy_routing_equivalence`).
+- **Race resolution**: tokio races by always running `build_entry` and discarding the loser's half-built entry post-dial. The moonpool side uses a `Pending` slot installed under the entries-lock _before_ spawning the dial; subsequent callers join the existing dial instead of opening a parallel connection.
+  This is cleaner under the spawn-task pattern (no `DriverHandle::abort` dance on the losing path) and produces the same observable end state (one connection per `(logical, physical)`).
+- **Pool teardown**: `Pending` entries are dropped without explicit abort on `close`.
+  The dial task either completes and inserts a `Ready` entry that the close path immediately re-drains, or fails (in which case the entry was already evicted) — both paths converge on a cleanly-shut-down pool.
+- **Pool unit-test count**: moonpool's `pool.rs` ships **two** unit tests (`fresh_pool_is_empty`, `debug_includes_pool_state`) matching tokio's count.
+  The end-to-end pool behaviour is covered by the integration test (`tests/proxy_multi_conn.rs`) and the differential equivalence test (`magnetar-differential::proxy_routing_equivalence`).
 
 ### Tests (ADR-0024 four-layer matrix)
 
-- **`magnetar-proto`** — unchanged. The proto-layer `LookupOutcome` /
-  `ConnectionConfig.proxy_to_broker_url` plumbing was already in place
-  from the tokio landing.
-- **`magnetar-runtime-tokio`** — unchanged; the existing
-  [`tests/proxy_multi_conn.rs`](../../crates/magnetar-runtime-tokio/tests/proxy_multi_conn.rs)
-  remains the reference.
-- **`magnetar-runtime-moonpool`** — new mirror in
-  [`tests/proxy_multi_conn.rs`](../../crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs).
+- **`magnetar-proto`** — unchanged.
+  The proto-layer `LookupOutcome` / `ConnectionConfig.proxy_to_broker_url` plumbing was already in place from the tokio landing.
+- **`magnetar-runtime-tokio`** — unchanged; the existing [`tests/proxy_multi_conn.rs`](../../crates/magnetar-runtime-tokio/tests/proxy_multi_conn.rs) remains the reference.
+- **`magnetar-runtime-moonpool`** — new mirror in [`tests/proxy_multi_conn.rs`](../../crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs).
   Three tests cover open-producer, subscribe, and pool-entry reuse.
-- **`magnetar-differential`** — new
-  [`tests/proxy_routing_equivalence.rs`](../../crates/magnetar-differential/tests/proxy_routing_equivalence.rs)
-  asserts the tokio + moonpool engines produce equivalent
-  `ProxyObservation`s (session count, CONNECT flags, per-session command
-  kinds) against an identical proxy fake.
-- **e2e** — the existing
-  [`crates/magnetar/tests/e2e_pulsar_proxy.rs`](../../crates/magnetar/tests/e2e_pulsar_proxy.rs)
-  exercises the proxy path end-to-end via the facade (tokio engine).
-  A moonpool facade e2e mirror is out of scope for this amendment
-  (the facade-builder surface for moonpool is reqwest-free but the
-  testcontainers harness piggybacks the tokio builder); a follow-up
-  PR can add it once the `MoonpoolEngine` builder wiring lands.
+- **`magnetar-differential`** — new [`tests/proxy_routing_equivalence.rs`](../../crates/magnetar-differential/tests/proxy_routing_equivalence.rs) asserts the tokio + moonpool engines produce equivalent `ProxyObservation`s (session count, CONNECT flags, per-session command kinds) against an identical proxy fake.
+- **e2e** — the existing [`crates/magnetar/tests/e2e_pulsar_proxy.rs`](../../crates/magnetar/tests/e2e_pulsar_proxy.rs) exercises the proxy path end-to-end via the facade (tokio engine).
+  A moonpool facade e2e mirror is out of scope for this amendment (the facade-builder surface for moonpool is reqwest-free but the testcontainers harness piggybacks the tokio builder); a follow-up PR can add it once the `MoonpoolEngine` builder wiring lands.
 
 ## References
 
@@ -309,26 +234,18 @@ enum LookupTarget {
 }
 ```
 
-The `Direct` arm dropped the lookup's `broker_service_url` on the
-floor. The original ADR-0039 §"Consequences" called this out:
+The `Direct` arm dropped the lookup's `broker_service_url` on the floor.
+The original ADR-0039 §"Consequences" called this out:
 
-> [Direct] The lookup's `broker_service_url` may name a different
-> broker than the one currently connected; multi-broker direct routing
-> is follow-up work tracked in ADR-0039 §"Consequences".
+> [Direct] The lookup's `broker_service_url` may name a different broker than the one currently connected; multi-broker direct routing is follow-up work tracked in ADR-0039 §"Consequences".
 
-Against a multi-broker non-proxy Pulsar cluster (e.g. a 3-broker
-cluster, no proxy in front), every lookup answers with the broker that
-owns the namespace bundle. If that broker is not the bootstrap, magnetar
-issues `CommandProducer` / `CommandSubscribe` on the bootstrap anyway,
-the broker replies `ServerError::NotConnected "not served by this
-instance, please redo the lookup"`, and the producer / subscribe bounces
-through reconnect retries. This is HIGH-1 from the 2026-06-01 lookup
-multi-agent review.
+Against a multi-broker non-proxy Pulsar cluster (e.g. a 3-broker cluster, no proxy in front), every lookup answers with the broker that owns the namespace bundle.
+If that broker is not the bootstrap, magnetar issues `CommandProducer` / `CommandSubscribe` on the bootstrap anyway, the broker replies `ServerError::NotConnected "not served by this instance, please redo the lookup"`, and the producer / subscribe bounces through reconnect retries.
+This is HIGH-1 from the 2026-06-01 lookup multi-agent review.
 
 ### Design alternatives considered
 
-**Option A — extend `LookupTarget::Direct` with an inline `Option<String>`,
-add a hand-rolled per-broker dial path:**
+**Option A — extend `LookupTarget::Direct` with an inline `Option<String>`, add a hand-rolled per-broker dial path:**
 
 ```rust
 enum LookupTarget {
@@ -337,13 +254,10 @@ enum LookupTarget {
 }
 ```
 
-Smallest surface change but duplicates the supervised-dial / handshake
-/ TLS plumbing that already lives inside `ProxyConnectionPool`. Two
-near-identical code paths inevitably drift.
+Smallest surface change but duplicates the supervised-dial / handshake / TLS plumbing that already lives inside `ProxyConnectionPool`.
+Two near-identical code paths inevitably drift.
 
-**Option B (CHOSEN) — generalise the existing `ProxyConnectionPool` to
-handle both routing shapes by parameterising
-`CommandConnect.proxy_to_broker_url`:**
+**Option B (CHOSEN) — generalise the existing `ProxyConnectionPool` to handle both routing shapes by parameterising `CommandConnect.proxy_to_broker_url`:**
 
 ```rust
 async fn get_or_open(
@@ -354,25 +268,14 @@ async fn get_or_open(
 ) -> Result<Arc<ConnectionShared>, ClientError>;
 ```
 
-- Proxy entries: `logical = broker_url`, `physical = proxy address`,
-  `proxy_to_broker_url = Some(logical)` — unchanged from the original
-  ADR.
-- Direct entries: `logical = broker_url`, `physical = parsed broker_url`,
-  `proxy_to_broker_url = None` — dials the resolved broker directly,
-  no proxy in the middle, `CommandConnect` carries no
-  `proxy_to_broker_url`.
+- Proxy entries: `logical = broker_url`, `physical = proxy address`, `proxy_to_broker_url = Some(logical)` — unchanged from the original ADR.
+- Direct entries: `logical = broker_url`, `physical = parsed broker_url`, `proxy_to_broker_url = None` — dials the resolved broker directly, no proxy in the middle, `CommandConnect` carries no `proxy_to_broker_url`.
 
-The pool key shape `(logical, physical)` stays identical to Java's
-`ConnectionPool` key (sans `randomKey`) and faithfully captures the
-two routing topologies in one map. Java does exactly this — the same
-`ConnectionPool.getConnection(logicalAddress, physicalAddress)` entry
-point covers both proxy and direct routing.
+The pool key shape `(logical, physical)` stays identical to Java's `ConnectionPool` key (sans `randomKey`) and faithfully captures the two routing topologies in one map.
+Java does exactly this — the same `ConnectionPool.getConnection(logicalAddress, physicalAddress)` entry point covers both proxy and direct routing.
 
-Option A was rejected because it would have duplicated the supervised
-driver-spawn, the handshake `wait_connected`, the race-resolution
-logic, and the close-time teardown — all of which the pool already
-encapsulates. The B-option diff to the pool is a single new parameter
-and a one-line change in `build_entry`.
+Option A was rejected because it would have duplicated the supervised driver-spawn, the handshake `wait_connected`, the race-resolution logic, and the close-time teardown — all of which the pool already encapsulates.
+The B-option diff to the pool is a single new parameter and a one-line change in `build_entry`.
 
 ### Tokio engine: end-to-end
 
@@ -388,139 +291,70 @@ enum LookupTarget {
 }
 ```
 
-`Client::lookup_topic` captures the resolved broker URL on both the
-`LookupOutcome::Connect { proxy_through_service_url: false, … }` and
-`LookupOutcome::Redirected { … }` branches (the proto layer chases
-redirect chains internally; the surfaced URL is the terminal hop).
+`Client::lookup_topic` captures the resolved broker URL on both the `LookupOutcome::Connect { proxy_through_service_url: false, … }` and `LookupOutcome::Redirected { … }` branches (the proto layer chases redirect chains internally; the surfaced URL is the terminal hop).
 
 `Client::resolve_target` dispatches:
 
 - `Direct { broker_url: None }` → `self.shared.clone()` (bootstrap).
 - `Direct { broker_url: Some(url) }` → `resolve_direct_broker(url,
 topic)`:
-  1. Parse `url` into a `ParsedUrl`. The synthetic-scheme fallback
-     (`parse_direct_broker_url`) tolerates the bare `host:port` form
-     in case a broker advertises that (matches `preferred_broker_url`
-     output too).
+  1. Parse `url` into a `ParsedUrl`.
+     The synthetic-scheme fallback (`parse_direct_broker_url`) tolerates the bare `host:port` form in case a broker advertises that (matches `preferred_broker_url` output too).
   2. **Bootstrap-equality fast path**: if `parsed.host == bootstrap.host
-&& parsed.port == bootstrap.port`, return the bootstrap
-     connection. Saves one TCP/TLS handshake on every same-broker
-     lookup; mirrors Java's pool-identity check.
-  3. Otherwise call
-     `pool.get_or_open(url, &parsed, /* proxy_to_broker_url = */ None)`
-     — opens (or reuses) a pool entry that dials `parsed` directly with
-     no proxy.
+&& parsed.port == bootstrap.port`, return the bootstrap connection.
+     Saves one TCP/TLS handshake on every same-broker lookup; mirrors Java's pool-identity check.
+  3. Otherwise call `pool.get_or_open(url, &parsed, /* proxy_to_broker_url = */ None)` — opens (or reuses) a pool entry that dials `parsed` directly with no proxy.
 - `Proxy { broker_url }` → unchanged.
 
 ### TLS posture
 
-The bootstrap's `tls_config: Option<Arc<rustls::ClientConfig>>` is
-shared across every pool entry (trust anchors are cluster-wide;
-brokers in the same cluster typically run the same TLS posture). The
-DIRECT-path dial uses `Transport::connect_with_resolver(parsed,
-self.factory.tls_config.clone(), …)`; `Transport` dispatches on
-`parsed.scheme`, so a `pulsar+ssl://broker-N:6651` resolved URL gets a
-TLS dial and a `pulsar://broker-N:6650` resolved URL gets a plain
-dial, even on a TLS-bootstrap connection (rare but happens during
-broker rolling upgrades).
+The bootstrap's `tls_config: Option<Arc<rustls::ClientConfig>>` is shared across every pool entry (trust anchors are cluster-wide; brokers in the same cluster typically run the same TLS posture).
+The DIRECT-path dial uses `Transport::connect_with_resolver(parsed, self.factory.tls_config.clone(), …)`; `Transport` dispatches on `parsed.scheme`, so a `pulsar+ssl://broker-N:6651` resolved URL gets a TLS dial and a `pulsar://broker-N:6650` resolved URL gets a plain dial, even on a TLS-bootstrap connection (rare but happens during broker rolling upgrades).
 
-Picking between `broker_service_url` and `broker_service_url_tls` on
-the DIRECT path mirrors `preferred_broker_url`: prefer the URL that
-matches the bootstrap's scheme, fall back to whichever is advertised.
-The helper is `direct_broker_url` — same logic, but preserves the full
-Pulsar URL (DIRECT path needs to recover the dial target, whereas the
-proxy path strips to `host:port` per ADR-0045).
+Picking between `broker_service_url` and `broker_service_url_tls` on the DIRECT path mirrors `preferred_broker_url`: prefer the URL that matches the bootstrap's scheme, fall back to whichever is advertised.
+The helper is `direct_broker_url` — same logic, but preserves the full Pulsar URL (DIRECT path needs to recover the dial target, whereas the proxy path strips to `host:port` per ADR-0045).
 
 ### Auth reuse, anti-thrash, supervised reconnect
 
-- Auth: every pool entry shares the same `Auth` trait object (already
-  the original ADR's contract; in-band tokens refresh once and
-  propagate to every pinned broker).
-- Anti-thrash (ADR-0028): each pool entry carries its own
-  `AntiThrashState` (same supervisor config as the bootstrap). A
-  broker rolling restart only hits its own pool entry.
-- Supervised reconnect: each pool entry has its own supervised driver
-  loop, reconnect target is the pool entry's `physical` URL. For
-  DIRECT entries that means reconnects re-dial the broker directly —
-  the supervisor does not consult `service_url_provider` on the
-  per-broker entry because the broker URL is what the lookup resolved
-  to, not what the failover provider would emit. This matches Java's
-  behaviour: cluster failover replaces the **bootstrap** URL only, not
-  the per-broker pool entries (which are torn down with the client).
+- Auth: every pool entry shares the same `Auth` trait object (already the original ADR's contract; in-band tokens refresh once and propagate to every pinned broker).
+- Anti-thrash (ADR-0028): each pool entry carries its own `AntiThrashState` (same supervisor config as the bootstrap).
+  A broker rolling restart only hits its own pool entry.
+- Supervised reconnect: each pool entry has its own supervised driver loop, reconnect target is the pool entry's `physical` URL.
+  For DIRECT entries that means reconnects re-dial the broker directly — the supervisor does not consult `service_url_provider` on the per-broker entry because the broker URL is what the lookup resolved to, not what the failover provider would emit.
+  This matches Java's behaviour: cluster failover replaces the **bootstrap** URL only, not the per-broker pool entries (which are torn down with the client).
 
 ### Moonpool engine
 
-Moonpool's `LookupTarget` mirror grows the same `Option<String>` field
-on the `Direct` arm. `lookup_topic_target` captures the broker URL
-identically. The async `resolve_target` (its `Send`-safety is hoisted
-into a `spawn_task`-detached dial — see the moonpool pool docs) routes
-DIRECT-with-a-broker-URL through the same
-[`pool::get_or_open(logical, physical, /* proxy_to_broker_url = */ None)`](../../crates/magnetar-runtime-moonpool/src/pool.rs)
-surface used by the proxy path. The bootstrap-equality fast path
-mirrors the tokio engine: if the resolved `host:port` matches the
-bootstrap's, the bootstrap connection is reused (no extra dial). For
-unsupervised clients (`Client::connect_plain` / `Client::from_parts`)
-the pool is absent so DIRECT degrades to bootstrap-only with a
-`tracing::warn!`. Same `(logical, physical)` +
-`proxy_to_broker_url: Option<String>` parameterisation as the tokio
-pool — both engines pick their entries via identical keys.
+Moonpool's `LookupTarget` mirror grows the same `Option<String>` field on the `Direct` arm.
+`lookup_topic_target` captures the broker URL identically.
+The async `resolve_target` (its `Send`-safety is hoisted into a `spawn_task`-detached dial — see the moonpool pool docs) routes DIRECT-with-a-broker-URL through the same [`pool::get_or_open(logical, physical, /* proxy_to_broker_url = */ None)`](../../crates/magnetar-runtime-moonpool/src/pool.rs) surface used by the proxy path.
+The bootstrap-equality fast path mirrors the tokio engine: if the resolved `host:port` matches the bootstrap's, the bootstrap connection is reused (no extra dial).
+For unsupervised clients (`Client::connect_plain` / `Client::from_parts`) the pool is absent so DIRECT degrades to bootstrap-only with a `tracing::warn!`.
+Same `(logical, physical)` + `proxy_to_broker_url: Option<String>` parameterisation as the tokio pool — both engines pick their entries via identical keys.
 
 ### Tests (ADR-0024 four-layer matrix)
 
-- **Proto unit** — the proto layer already correlates LOOKUP requests
-  with their responses and surfaces `broker_service_url` /
-  `proxy_through_service_url` verbatim. No new unit test added on the
-  proto side; the existing `lookup.rs` tests cover the response decode.
+- **Proto unit** — the proto layer already correlates LOOKUP requests with their responses and surfaces `broker_service_url` / `proxy_through_service_url` verbatim.
+  No new unit test added on the proto side; the existing `lookup.rs` tests cover the response decode.
   Justified in the commit body.
-- **Tokio integration** —
-  `crates/magnetar-runtime-tokio/tests/lookup_direct_multi_broker.rs`:
-  two-broker in-process fake (broker A redirects, broker B serves),
-  asserts:
-  1. Producer / subscribe land on broker B's pinned pool entry, not on
-     the bootstrap A.
+- **Tokio integration** — `crates/magnetar-runtime-tokio/tests/lookup_direct_multi_broker.rs`: two-broker in-process fake (broker A redirects, broker B serves), asserts:
+  1. Producer / subscribe land on broker B's pinned pool entry, not on the bootstrap A.
   2. Pinned CONNECT to B carries **no** `proxy_to_broker_url`.
-  3. Second producer to the same topic reuses the pool entry (single B
-     session for both).
-  4. When the lookup resolves to the bootstrap broker itself, the
-     bootstrap-equality fast path bypasses the pool (single session).
-- **Moonpool integration** —
-  `crates/magnetar-runtime-moonpool/tests/lookup_direct_multi_broker.rs`:
-  1:1 mirror of the tokio integration test (two in-process brokers,
-  bootstrap A redirects to broker B). Asserts the moonpool runtime opens
-  the second TCP session to B with no `proxy_to_broker_url`, that two
-  producers reuse one pinned pool entry, and that the bootstrap-equality
-  fast path bypasses the pool when the lookup resolves to the bootstrap
-  broker itself.
-- **Differential** —
-  `crates/magnetar-differential/tests/lookup_direct_multi_broker_equivalence.rs`:
-  both engines decode the same DIRECT-with-broker-URL LOOKUP response
-  to the same `OpOutcome::LookupResponse { LookupOutcome::Connect { … }
+  3. Second producer to the same topic reuses the pool entry (single B session for both).
+  4. When the lookup resolves to the bootstrap broker itself, the bootstrap-equality fast path bypasses the pool (single session).
+- **Moonpool integration** — `crates/magnetar-runtime-moonpool/tests/lookup_direct_multi_broker.rs`: 1:1 mirror of the tokio integration test (two in-process brokers, bootstrap A redirects to broker B).
+  Asserts the moonpool runtime opens the second TCP session to B with no `proxy_to_broker_url`, that two producers reuse one pinned pool entry, and that the bootstrap-equality fast path bypasses the pool when the lookup resolves to the bootstrap broker itself.
+- **Differential** — `crates/magnetar-differential/tests/lookup_direct_multi_broker_equivalence.rs`: both engines decode the same DIRECT-with-broker-URL LOOKUP response to the same `OpOutcome::LookupResponse { LookupOutcome::Connect { … }
 }` (the proto-level invariant the runtime decision rides on).
-- **E2E** —
-  `crates/magnetar/tests/e2e_lookup_direct_multi_broker.rs`: drives
-  `PulsarClient::open_producer` + `subscribe` against a real Pulsar 4
-  standalone broker. Pulsar 4 standalone is single-broker but its
-  lookups advertise `broker_service_url`, so this exercises the
-  bootstrap-equality fast path on the real broker code path. A
-  multi-broker cluster fixture is out of scope for the per-PR e2e
-  budget; the in-process broker pair in the tokio integration test
-  reproduces the cross-broker wire behaviour Pulsar 3+ cluster mode
-  exhibits.
+- **E2E** — `crates/magnetar/tests/e2e_lookup_direct_multi_broker.rs`: drives `PulsarClient::open_producer` + `subscribe` against a real Pulsar 4 standalone broker.
+  Pulsar 4 standalone is single-broker but its lookups advertise `broker_service_url`, so this exercises the bootstrap-equality fast path on the real broker code path.
+  A multi-broker cluster fixture is out of scope for the per-PR e2e budget; the in-process broker pair in the tokio integration test reproduces the cross-broker wire behaviour Pulsar 3+ cluster mode exhibits.
 
 ### References
 
-- `crates/magnetar-runtime-tokio/src/client.rs` — `LookupTarget`,
-  `lookup_topic`, `resolve_target`, `resolve_direct_broker`,
-  `direct_broker_url`, `parse_direct_broker_url`.
-- `crates/magnetar-runtime-tokio/src/pool.rs` — generalised
-  `get_or_open` accepting `proxy_to_broker_url: Option<String>`.
-- `crates/magnetar-runtime-moonpool/src/client.rs` — mirror
-  `LookupTarget` shape + `resolve_direct_broker` (bootstrap-equality
-  fast path).
-- `crates/magnetar-runtime-moonpool/src/pool.rs` — generalised
-  `get_or_open` (matching tokio surface, `(logical, physical,
+- `crates/magnetar-runtime-tokio/src/client.rs` — `LookupTarget`, `lookup_topic`, `resolve_target`, `resolve_direct_broker`, `direct_broker_url`, `parse_direct_broker_url`.
+- `crates/magnetar-runtime-tokio/src/pool.rs` — generalised `get_or_open` accepting `proxy_to_broker_url: Option<String>`.
+- `crates/magnetar-runtime-moonpool/src/client.rs` — mirror `LookupTarget` shape + `resolve_direct_broker` (bootstrap-equality fast path).
+- `crates/magnetar-runtime-moonpool/src/pool.rs` — generalised `get_or_open` (matching tokio surface, `(logical, physical,
 proxy_to_broker_url: Option<String>)`).
-- Upstream:
-  [`BinaryProtoLookupService.findBroker`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/BinaryProtoLookupService.java),
-  [`ConnectionPool.getConnection`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java),
-  [`ConnectionHandler.connectionOpened`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionHandler.java).
+- Upstream: [`BinaryProtoLookupService.findBroker`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/BinaryProtoLookupService.java), [`ConnectionPool.getConnection`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java), [`ConnectionHandler.connectionOpened`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionHandler.java).
