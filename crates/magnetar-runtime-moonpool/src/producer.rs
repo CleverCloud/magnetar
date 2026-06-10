@@ -80,8 +80,8 @@ pub struct Producer<P: Providers> {
     /// Last-clone close guard. `Producer` is cheap-clone, so the broker-side
     /// best-effort close must fire exactly once — when the **last** clone
     /// drops. See [`ProducerCloseGuard`]. 1:1 mirror of
-    /// `magnetar_runtime_tokio::Producer::_close_guard`.
-    pub(crate) _close_guard: Arc<ProducerCloseGuard>,
+    /// `magnetar_runtime_tokio::Producer::close_guard`.
+    pub(crate) close_guard: Arc<ProducerCloseGuard>,
     /// Held only so `Producer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -140,7 +140,7 @@ impl<P: Providers> Clone for Producer<P> {
             slot: self.slot.clone(),
             compression: self.compression,
             encryptor: self.encryptor.clone(),
-            _close_guard: self._close_guard.clone(),
+            close_guard: self.close_guard.clone(),
             _providers: std::marker::PhantomData,
         }
     }
@@ -179,7 +179,7 @@ impl<P: Providers> Producer<P> {
             slot,
             compression,
             encryptor,
-            _close_guard: close_guard,
+            close_guard: close_guard,
             _providers: std::marker::PhantomData,
         }
     }

@@ -47,8 +47,11 @@ pub struct Producer {
     pub(crate) encryptor: Option<Arc<dyn MessageEncryptor>>,
     /// Last-clone close guard. `Producer` is cheap-clone, so the broker-side
     /// best-effort close must fire exactly once — when the **last** clone
-    /// drops. See [`ProducerCloseGuard`].
-    pub(crate) _close_guard: Arc<ProducerCloseGuard>,
+    /// drops. See [`ProducerCloseGuard`]. Held for its `Drop` impl only
+    /// (the derived `Clone` shares it across clones), hence the
+    /// `dead_code` allow.
+    #[allow(dead_code)]
+    pub(crate) close_guard: Arc<ProducerCloseGuard>,
 }
 
 /// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop.
@@ -117,7 +120,7 @@ impl Producer {
             slot,
             compression,
             encryptor,
-            _close_guard: close_guard,
+            close_guard: close_guard,
         }
     }
 
