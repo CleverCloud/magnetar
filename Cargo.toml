@@ -48,7 +48,7 @@ magnetar-runtime-moonpool = { version = "^0.1.0-dev.0", path = "crates/magnetar-
 magnetar-runtime-tokio   = { version = "^0.1.0-dev.0", path = "crates/magnetar-runtime-tokio" }
 
 # Codec
-prost           = "^0.14.3"
+prost           = "^0.14.4"
 prost-build     = "^0.14.3"
 prost-types     = "^0.14.3"
 bytes           = "^1.11.1"
