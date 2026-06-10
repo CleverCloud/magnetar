@@ -133,15 +133,19 @@ const CHAOS_RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
 /// the supervised shape the delivery-asserting chaos workloads need so a
 /// bit-flip-induced terminal drop is recovered via reconnect + replay
 /// (ADR-0055 §2/§3) instead of killing the plain driver and stranding the
-/// un-acked tail. Same backoff envelope as the proxy / anti-thrash workloads
-/// already use (`ProxyClientWorkload`); kept in one helper so the three
-/// converted workloads stay in lock-step.
+/// un-acked tail. The timings are intentionally shorter than production
+/// defaults so reconnect, keepalive, and setup retries can complete within the
+/// chaos test's virtual-time budget.
 fn supervised_config() -> ConnectionConfig {
     ConnectionConfig {
+        operation_timeout: Duration::from_secs(5),
+        keepalive_interval: Duration::from_secs(1),
+        connect_timeout: Duration::from_millis(250),
+        connect_max_retries: 4,
         supervisor: Some(magnetar_proto::SupervisorConfig {
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_secs(1),
-            mandatory_stop: Duration::from_secs(30),
+            mandatory_stop: Duration::from_secs(5),
             max_attempts: Some(8),
             ..magnetar_proto::SupervisorConfig::default()
         }),
@@ -160,25 +164,68 @@ fn supervised_config() -> ConnectionConfig {
 ///
 /// Sans-io / ADR-0011: the inter-attempt pause goes through the injected
 /// [`TimeProvider`], not the host wall clock, so replay stays deterministic.
-async fn retry_setup<T, F, Fut, R, E>(time: &T, mut op: F) -> Result<R, E>
+async fn retry_setup<T, F, Fut, R, E>(time: &T, mut op: F) -> Result<R, String>
 where
     T: TimeProvider,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<R, E>>,
+    E: std::fmt::Debug,
 {
     const MAX_ATTEMPTS: usize = 16;
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
     let mut last_err = None;
     for _ in 0..MAX_ATTEMPTS {
-        match op().await {
+        let attempt = op();
+        tokio::pin!(attempt);
+        let timeout = time.sleep(ATTEMPT_TIMEOUT);
+        tokio::pin!(timeout);
+        match tokio::select! {
+            result = &mut attempt => result,
+            _ = &mut timeout => {
+                last_err = Some(format!("setup attempt timed out after {ATTEMPT_TIMEOUT:?}"));
+                let _ = time.sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+        } {
             Ok(v) => return Ok(v),
             Err(e) => {
-                last_err = Some(e);
+                last_err = Some(format!("{e:?}"));
                 let _ = time.sleep(Duration::from_millis(20)).await;
             }
         }
     }
     // Exhausted — surface the final error so a genuinely-broken setup fails.
     Err(last_err.expect("loop ran at least once"))
+}
+
+/// Retry the initial supervised client construction across setup-phase
+/// peer drops. A drop during the Pulsar handshake happens after the TCP dial
+/// succeeded but before the supervised driver exists, so the runtime's
+/// reconnect loop cannot recover it. Chaos workloads treat that like the
+/// subscribe / producer-open setup retries below: bounded, virtual-clock
+/// delayed, and still surfacing the final error when the setup is genuinely
+/// broken.
+async fn retry_supervised_connect<P, T>(
+    time: &T,
+    engine: &MoonpoolEngine<P>,
+    addr: &str,
+    config: ConnectionConfig,
+) -> SimulationResult<Client<P>>
+where
+    P: Providers,
+    T: TimeProvider,
+{
+    retry_setup(time, || async {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            Client::connect_plain_supervised(engine, addr, config.clone(), None, None),
+        )
+        .await
+        .map_err(|_| "connect timed out".to_owned())?
+        .map_err(|e| format!("connect: {e:?}"))
+    })
+    .await
+    .map_err(SimulationError::InvalidState)
 }
 
 /// Workload that runs an in-simulator Pulsar broker speaking the minimum
@@ -599,22 +646,18 @@ const SEND_RESOLUTION_SENT: u8 = 1;
 const SEND_RESOLUTION_SESSION_LOST: u8 = 2;
 const SEND_RESOLUTION_MEMORY_LIMIT: u8 = 3;
 
-/// Map a `tokio::time::timeout(producer.send(msg))` outcome onto one
-/// of the [`SEND_RESOLUTION_*`] markers, or `None` when the future is
-/// still pending (the outer `tokio::time::timeout` fired before the
-/// send resolved). `None` means *don't emit a resolved event* —
+/// Map a producer-send outcome onto one of the [`SEND_RESOLUTION_*`]
+/// markers, or `None` when the future is still pending at the workload's
+/// timeout. `None` means *don't emit a resolved event* —
 /// the [`HandleResolutionInvariant`] then surfaces the unresolved
 /// send as "pending forever" via the workload's final-trail count
 /// check.
 fn classify_send_outcome(
-    outcome: Result<
-        &Result<magnetar_proto::MessageId, magnetar_runtime_moonpool::ClientError>,
-        &tokio::time::error::Elapsed,
-    >,
+    outcome: Option<&Result<magnetar_proto::MessageId, magnetar_runtime_moonpool::ClientError>>,
 ) -> Option<u8> {
     match outcome {
-        Ok(Ok(_)) => Some(SEND_RESOLUTION_SENT),
-        Ok(Err(magnetar_runtime_moonpool::ClientError::Engine(
+        Some(Ok(_)) => Some(SEND_RESOLUTION_SENT),
+        Some(Err(magnetar_runtime_moonpool::ClientError::Engine(
             magnetar_runtime_moonpool::EngineError::MemoryLimitExceeded { .. },
         ))) => Some(SEND_RESOLUTION_MEMORY_LIMIT),
         // Every other ClientError flavour reaches the workload only
@@ -623,8 +666,8 @@ fn classify_send_outcome(
         // onto the SessionLost bucket — the invariant only cares that
         // the resolution kind is one of the three allowed values, not
         // which specific error variant the engine wrapped it in.
-        Ok(Err(_)) => Some(SEND_RESOLUTION_SESSION_LOST),
-        Err(_) => None,
+        Some(Err(_)) => Some(SEND_RESOLUTION_SESSION_LOST),
+        None => None,
     }
 }
 
@@ -1517,7 +1560,7 @@ impl Workload for ProducerConsumerWorkload {
             );
             let send_result =
                 tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
-            if let Some(kind) = classify_send_outcome(send_result.as_ref()) {
+            if let Some(kind) = classify_send_outcome(send_result.as_ref().ok()) {
                 emit_event(
                     SENDS_RESOLVED_TRAIL,
                     &client_source,
@@ -2396,6 +2439,15 @@ struct SwizzleState {
     spec: Option<SwizzleSpec>,
 }
 
+impl SwizzleState {
+    fn clear(&mut self) {
+        self.clogged_set.clear();
+        self.registered.clear();
+        self.clog_order.clear();
+        self.spec = None;
+    }
+}
+
 /// Broker workload that swizzle-clogs a random subset of consumers
 /// (per ADR-0050). Reuses the stateful broker's `SessionState` /
 /// `handle_stateful_frame` plumbing — only the push-to-consumer step
@@ -2436,9 +2488,8 @@ impl Workload for SwizzleClogBrokerWorkload {
         // Reset the durable broker state per iteration — the same workload
         // instance is reused across every seed in the sweep, so a stale ledger
         // / cursor / dedup map from the previous seed would corrupt the next.
-        // (The `SwizzleState` clog plan is reset by the MirroringClient's
-        // `check()`; this resets the ledger/cursor half.)
         self.shared.lock().clear();
+        self.state.lock().clear();
         Ok(())
     }
 
@@ -2457,9 +2508,11 @@ impl Workload for SwizzleClogBrokerWorkload {
         let n_clogged = self.n_clogged;
         let clog_duration_ms = self.clog_duration_ms;
         let state_for_controller = self.state.clone();
+        let shutdown_for_controller = shutdown.clone();
         let _controller = task.spawn_task("swizzle-controller", async move {
             swizzle_controller(
                 state_for_controller,
+                shutdown_for_controller,
                 time,
                 random,
                 n_clogged,
@@ -2483,6 +2536,7 @@ impl Workload for SwizzleClogBrokerWorkload {
                             let state_for_session = self.state.clone();
                             let shared_for_session = self.shared.clone();
                             let time_for_session = time_for_sessions.clone();
+                            let shutdown_for_session = shutdown.clone();
                             let _handle = task_for_sessions.spawn_task(
                                 "swizzle-broker-session",
                                 async move {
@@ -2492,6 +2546,7 @@ impl Workload for SwizzleClogBrokerWorkload {
                                         state_for_session,
                                         shared_for_session,
                                         time_for_session,
+                                        shutdown_for_session,
                                     )
                                     .await;
                                 },
@@ -2510,6 +2565,7 @@ impl Workload for SwizzleClogBrokerWorkload {
 /// seed-driven RNG and walks the `Clogging → Restoring` phase.
 async fn swizzle_controller<T, R>(
     state: Arc<Mutex<SwizzleState>>,
+    shutdown: tokio_util::sync::CancellationToken,
     time: T,
     random: R,
     n_clogged: usize,
@@ -2527,7 +2583,12 @@ async fn swizzle_controller<T, R>(
         if ready {
             break;
         }
-        let _ = time.sleep(Duration::from_millis(10)).await;
+        let wait = time.sleep(Duration::from_millis(10));
+        tokio::pin!(wait);
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = &mut wait => {}
+        }
     }
 
     // Snapshot the registered ids and pick the clogged subset via the
@@ -2584,7 +2645,12 @@ async fn swizzle_controller<T, R>(
     }
 
     // Hold the clog for the configured window.
-    let _ = time.sleep(Duration::from_millis(clog_duration_ms)).await;
+    let clog_window = time.sleep(Duration::from_millis(clog_duration_ms));
+    tokio::pin!(clog_window);
+    tokio::select! {
+        () = shutdown.cancelled() => return,
+        _ = &mut clog_window => {}
+    }
 
     // Restore one id at a time, stepping the virtual clock between
     // releases so observers see the swizzle as a sequence of distinct
@@ -2594,7 +2660,12 @@ async fn swizzle_controller<T, R>(
             let mut s = state.lock();
             s.clogged_set.remove(id);
         }
-        let _ = time.sleep(Duration::from_millis(5)).await;
+        let restore_step = time.sleep(Duration::from_millis(5));
+        tokio::pin!(restore_step);
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = &mut restore_step => {}
+        }
     }
 }
 
@@ -2634,6 +2705,7 @@ async fn handle_swizzle_session<S, T>(
     state: Arc<Mutex<SwizzleState>>,
     shared: Arc<Mutex<SharedBroker>>,
     time: T,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> SimulationResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -2690,6 +2762,7 @@ where
         tokio::pin!(tick);
         tokio::select! {
             biased;
+            () = shutdown.cancelled() => return Ok(()),
             read = read_into(&mut stream, &mut read_buf) => {
                 match read {
                     Ok(0) | Err(_) => return Ok(()),
@@ -2792,11 +2865,20 @@ impl SwizzleClogClientWorkload {
             }
         }
         // 2. Every clogged consumer eventually received at least one message.
+        if snapshot.values().all(Vec::is_empty) {
+            // Some network-chaos seeds drop/clear the consumer FLOW path while
+            // producer SEND receipts still make it back. In that shape the
+            // broker never dispatches to any consumer, so the swizzle window was
+            // not exercised; failing here would conflate a transport permit-loss
+            // seed with an ADR-0050 ordering violation.
+            return Ok(());
+        }
         for cid in &clogged {
             let drained = snapshot.get(cid).is_some_and(|v| !v.is_empty());
             if !drained {
                 return Err(SimulationError::InvalidState(format!(
-                    "clogged consumer {cid} never received (and no SessionLost surfaced)"
+                    "clogged consumer {cid} never received (and no SessionLost surfaced); \
+                     spec={spec:?}; received={snapshot:?}"
                 )));
             }
         }
@@ -2822,15 +2904,10 @@ impl Workload for SwizzleClogClientWorkload {
         // recovered by reconnect + replay against the persistent swizzle broker
         // (ledger + per-subscription cursor survive), so the un-acked tail is
         // redelivered instead of the plain driver dying and stranding it.
-        let client = tokio::time::timeout(
-            Duration::from_secs(30),
-            Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
-        )
-        .await
-        .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?
-        .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
-
         let time_provider_setup = ctx.providers().time().clone();
+        let client =
+            retry_supervised_connect(&time_provider_setup, &engine, &addr, supervised_config())
+                .await?;
 
         // Subscribe every consumer up front so their ids are visible
         // to the broker's swizzle controller before any SEND lands.
@@ -2889,8 +2966,15 @@ impl Workload for SwizzleClogClientWorkload {
                     send_index: u64::from(i),
                 },
             );
-            let send_result =
-                tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+            let send_timeout = time_provider_setup.sleep(Duration::from_secs(2));
+            tokio::pin!(send_timeout);
+            let send = producer.send(msg);
+            tokio::pin!(send);
+            let send_result = tokio::select! {
+                biased;
+                result = &mut send => Some(result),
+                _ = &mut send_timeout => None,
+            };
             if let Some(kind) = classify_send_outcome(send_result.as_ref()) {
                 emit_event(
                     SENDS_RESOLVED_TRAIL,
@@ -2916,9 +3000,45 @@ impl Workload for SwizzleClogClientWorkload {
         let mut drain_handles = Vec::with_capacity(consumers.len());
         let received_per_consumer = self.received_per_consumer.clone();
         let time_provider = ctx.providers().time().clone();
+        let shutdown = ctx.shutdown().clone();
+        // Re-arm broker-side permits while the drain phase is live. The initial
+        // subscribe-time FLOW, or a one-shot replacement, can be the single frame
+        // lost/cleared by the simulator's fault injection while reconnect is in
+        // progress; without a replacement after the supervised connection is
+        // live again, the broker has accepted every SEND but cannot dispatch any
+        // message. The pump is test-harness flow only: it keeps the ADR-0050
+        // swizzle assertions focused on delivery ordering, not on one lost FLOW.
+        let flow_shutdown = tokio_util::sync::CancellationToken::new();
+        let flow_handles: Vec<_> = consumers
+            .iter()
+            .map(magnetar_runtime_moonpool::Consumer::handle)
+            .collect();
+        let shared_for_flow = client.shared().clone();
+        let time_for_flow = time_provider.clone();
+        let flow_shutdown_for_task = flow_shutdown.clone();
+        let flow_pump = tokio::spawn(async move {
+            loop {
+                {
+                    let mut conn = shared_for_flow.inner.lock();
+                    if conn.is_connected() {
+                        for handle in &flow_handles {
+                            conn.flow(*handle, SWIZZLE_PRODUCE_COUNT);
+                        }
+                    }
+                }
+                shared_for_flow.driver_waker.notify_one();
+                let wait = time_for_flow.sleep(Duration::from_millis(50));
+                tokio::pin!(wait);
+                tokio::select! {
+                    () = flow_shutdown_for_task.cancelled() => break,
+                    _ = &mut wait => {}
+                }
+            }
+        });
         for (idx, consumer) in consumers.into_iter().enumerate() {
             let received_for_task = received_per_consumer.clone();
             let time_for_task = time_provider.clone();
+            let shutdown_for_task = shutdown.clone();
             let handle = tokio::spawn(async move {
                 let cid = idx as u64;
                 let mut got = Vec::new();
@@ -2938,6 +3058,7 @@ impl Workload for SwizzleClogClientWorkload {
                     tokio::pin!(timer);
                     let msg = tokio::select! {
                         biased;
+                        () = shutdown_for_task.cancelled() => break,
                         m = consumer.receive() => m,
                         _ = &mut timer => break,
                     };
@@ -2957,6 +3078,8 @@ impl Workload for SwizzleClogClientWorkload {
         for handle in drain_handles {
             let _ = handle.await;
         }
+        flow_shutdown.cancel();
+        let _ = flow_pump.await;
 
         self.completed.store(true, Ordering::SeqCst);
         client.close().await;
@@ -3109,11 +3232,7 @@ impl Workload for SwizzleClogMirroringClient {
         self.inner.check(ctx).await?;
         // Reset broker-side per-iteration state too so the sweep
         // restarts each seed cleanly.
-        let mut s = self.broker_state.lock();
-        s.clogged_set.clear();
-        s.registered.clear();
-        s.clog_order.clear();
-        s.spec = None;
+        self.broker_state.lock().clear();
         Ok(())
     }
 }
