@@ -68,6 +68,7 @@ thiserror      = { workspace = true }
 # wall-clock, no Docker. tokio's paused-time runtime supplies the virtual
 # clock for `send_timeout` / `ack_timeout` / OAuth refresh-edge scenarios.
 tokio          = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "io-util", "net", "test-util"] }
+tokio-util     = { workspace = true }
 # `tests/sim_chaos.rs` runs the moonpool engine under moonpool-sim's
 # deterministic scheduler with an in-simulator broker workload speaking the
 # minimum Pulsar wire subset. See ADR-0026 §D2.
