@@ -476,13 +476,13 @@ impl Client {
             access_mode = ?slot.identity.access_mode,
             "producer created"
         );
-        Ok(Producer {
-            shared: target_shared,
+        Ok(Producer::assemble(
+            target_shared,
             handle,
             slot,
             compression,
             encryptor,
-        })
+        ))
     }
 
     /// Issue a `CommandLookupTopic` for `topic` and decide where the topic's data ops should
