@@ -98,7 +98,7 @@ apache-avro = "^0.21.0"
 schemars    = { version = "^1.2.1", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.23.1", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.23.3", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
