@@ -120,7 +120,7 @@ impl Producer {
             slot,
             compression,
             encryptor,
-            close_guard: close_guard,
+            close_guard,
         }
     }
 

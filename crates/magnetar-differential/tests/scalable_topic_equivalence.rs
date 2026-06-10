@@ -5,7 +5,7 @@
 //! scalable-topic surface.
 //!
 //! **Experimental.** The scalable-topic state machine lives entirely in the
-//! shared sans-io `magnetar_proto::Connection` (lookup registry, DagWatch
+//! shared sans-io `magnetar_proto::Connection` (lookup registry, `DagWatch`
 //! session, event emission). Both engines drive the *same* `Connection`; the
 //! only engine-varying input is the injected wall-clock provider (tokio plugs
 //! in host `SystemTime::now`; moonpool plugs in a fixed-base atomic clock).

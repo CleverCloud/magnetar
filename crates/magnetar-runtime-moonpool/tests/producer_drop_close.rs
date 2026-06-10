@@ -175,7 +175,7 @@ fn close_producer_count(log: &FrameLog) -> usize {
         .count()
 }
 
-/// Poll until the broker has seen `expected` CloseProducer frames, or
+/// Poll until the broker has seen `expected` `CloseProducer` frames, or
 /// panic after `deadline`. The drop guard is fire-and-forget so the
 /// frame lands asynchronously — bounded polling keeps the test honest
 /// without an arbitrary fixed sleep.
