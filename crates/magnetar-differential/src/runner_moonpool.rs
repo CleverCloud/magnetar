@@ -58,12 +58,16 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
     let engine = MoonpoolEngine::new(TokioProviders::new());
     let client = Client::connect_plain(&engine, host_port, ConnectionConfig::default()).await?;
 
-    let producer = client
-        .open_producer(CreateProducerRequest {
-            topic: trace.topic.clone(),
-            ..Default::default()
-        })
-        .await?;
+    // `Option` so `Op::DropProducer` can release every clone mid-trace
+    // (issue #241 last-clone drop guard). Mirrors `runner_tokio.rs`.
+    let mut producer = Some(
+        client
+            .open_producer(CreateProducerRequest {
+                topic: trace.topic.clone(),
+                ..Default::default()
+            })
+            .await?,
+    );
 
     let mut consumer: Option<Consumer<TokioProviders>> = None;
 
@@ -80,7 +84,12 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
         match op {
             Op::Send { payload } => {
                 let bytes = Bytes::from(payload.clone());
-                let event = run_send(&producer, bytes).await;
+                let event = match producer.as_ref() {
+                    Some(p) => run_send(p, bytes).await,
+                    None => Event::SendError {
+                        kind: "producer-dropped".to_owned(),
+                    },
+                };
                 stream.push(event);
             }
             Op::SendWithSourceId {
@@ -88,7 +97,12 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
                 payload,
             } => {
                 let bytes = Bytes::from(payload.clone());
-                let event = run_send_with_source_id(&producer, *source_msg_id, bytes).await;
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_with_source_id(p, *source_msg_id, bytes).await,
+                    None => Event::SendError {
+                        kind: "producer-dropped".to_owned(),
+                    },
+                };
                 stream.push(event);
             }
             Op::Recv { timeout } => {
@@ -232,7 +246,13 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
                     continue;
                 };
                 let bytes = Bytes::from(payload.clone());
-                stream.push(run_send_in_txn(&producer, txn_id, bytes).await);
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_in_txn(p, txn_id, bytes).await,
+                    None => Event::SendInTxnError {
+                        kind: "producer-dropped".to_owned(),
+                    },
+                };
+                stream.push(event);
             }
             Op::AckInTxn { message_id } => {
                 let Some(txn_id) = current_txn else {
@@ -250,11 +270,23 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
                     }),
                 }
             }
+            Op::DropProducer => {
+                // Release every clone WITHOUT close().await — exercises
+                // the engines' last-clone drop guard (issue #241). The
+                // broker-side CloseProducer is asserted out-of-band via
+                // `ScriptedBroker::frame_log_snapshot`.
+                if let Some(p) = producer.take() {
+                    drop(p);
+                }
+                stream.push(Event::ProducerDropped);
+            }
             Op::Close => {
                 if let Some(c) = consumer.take() {
                     let _ = c.close().await;
                 }
-                let _ = producer.clone().close().await;
+                if let Some(p) = producer.take() {
+                    let _ = p.close().await;
+                }
                 for (_, c) in part_consumers.drain() {
                     let _ = c.close().await;
                 }

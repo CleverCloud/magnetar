@@ -41,15 +41,20 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
 
     let client = Client::connect(pulsar_url, magnetar_proto::ConnectionConfig::default()).await?;
 
-    let producer = client
-        .open_producer_with(
-            CreateProducerRequest {
-                topic: trace.topic.clone(),
-                ..Default::default()
-            },
-            None,
-        )
-        .await?;
+    // `Option` so `Op::DropProducer` can release every clone mid-trace
+    // (issue #241 last-clone drop guard). `None` afterwards makes
+    // subsequent sends resolve to `SendError { kind: "producer-dropped" }`.
+    let mut producer = Some(
+        client
+            .open_producer_with(
+                CreateProducerRequest {
+                    topic: trace.topic.clone(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?,
+    );
 
     // Open the consumer lazily on first need (Recv / Ack / Nack / Seek).
     let mut consumer: Option<Consumer> = None;
@@ -74,7 +79,12 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
         match op {
             Op::Send { payload } => {
                 let bytes = Bytes::from(payload.clone());
-                let event = run_send(&producer, bytes).await;
+                let event = match producer.as_ref() {
+                    Some(p) => run_send(p, bytes).await,
+                    None => Event::SendError {
+                        kind: "producer-dropped".to_owned(),
+                    },
+                };
                 stream.push(event);
             }
             Op::SendWithSourceId {
@@ -82,7 +92,12 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                 payload,
             } => {
                 let bytes = Bytes::from(payload.clone());
-                let event = run_send_with_source_id(&producer, *source_msg_id, bytes).await;
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_with_source_id(p, *source_msg_id, bytes).await,
+                    None => Event::SendError {
+                        kind: "producer-dropped".to_owned(),
+                    },
+                };
                 stream.push(event);
             }
             Op::Recv { timeout } => {
@@ -226,7 +241,13 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                     continue;
                 };
                 let bytes = Bytes::from(payload.clone());
-                stream.push(run_send_in_txn(&producer, txn_id, bytes).await);
+                let event = match producer.as_ref() {
+                    Some(p) => run_send_in_txn(p, txn_id, bytes).await,
+                    None => Event::SendInTxnError {
+                        kind: "producer-dropped".to_owned(),
+                    },
+                };
+                stream.push(event);
             }
             Op::AckInTxn { message_id } => {
                 let Some(txn_id) = current_txn else {
@@ -244,15 +265,24 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
                     }),
                 }
             }
+            Op::DropProducer => {
+                // Release every clone WITHOUT close().await — exercises
+                // the engines' last-clone drop guard (issue #241). The
+                // broker-side CloseProducer is asserted out-of-band via
+                // `ScriptedBroker::frame_log_snapshot`.
+                if let Some(p) = producer.take() {
+                    drop(p);
+                }
+                stream.push(Event::ProducerDropped);
+            }
             Op::Close => {
                 // Drain by closing producer and (if open) consumer.
-                // Producer/Consumer expose `close(self)`; clone the
-                // handle so the original variable stays valid for the
-                // borrow checker (consume the clone).
                 if let Some(c) = consumer.take() {
                     let _ = c.close().await;
                 }
-                let _ = producer.clone().close().await;
+                if let Some(p) = producer.take() {
+                    let _ = p.close().await;
+                }
                 for (_, c) in part_consumers.drain() {
                     let _ = c.close().await;
                 }
