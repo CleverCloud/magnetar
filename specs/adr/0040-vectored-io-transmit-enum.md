@@ -5,7 +5,7 @@
 - **Decider**: Florentin Dubois
 - **Tags**: performance, sans-io, runtime, network, zero-copy
 
-> **Wave-2 prerequisite resolved (2026-05-29, [ADR-0043](0043-temporary-floating-moonpool-git-dep.md)).** The wave-2 dependency below — "`moonpool_core::Providers::Network` grows a `write_vectored` method" — has landed upstream ([PR #113](https://github.com/PierreZ/moonpool/pull/113), [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111)). magnetar consumes it via a temporary git `branch = "main"` dependency ([ADR-0043](0043-temporary-floating-moonpool-git-dep.md)) until a crates.io release ships it.
+> **Moonpool vectored I/O prerequisite resolved (2026-06-10, [ADR-0056](0056-moonpool-0-7-crates-io-repin.md)).** The dependency below — "`moonpool_core::Providers::Network` grows a `write_vectored` method" — has landed upstream ([PR #113](https://github.com/PierreZ/moonpool/pull/113), [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111)) and is consumed through moonpool `0.7.0` on crates.io.
 > The moonpool engine now dispatches `TransmitOwned::Vectored` through real `write_vectored` on the plaintext arm (segment-granular delivery events under `SimProviders`; single-write fallback under `TokioProviders`, whose `Compat` stream does not forward vectored writes; TLS stays contiguous).
 > The original decision text below is unchanged.
 > See [`docs/moonpool-engine.md`](../../docs/moonpool-engine.md) §"Transport + vectored writes".
@@ -41,9 +41,9 @@ Adding vectored I/O means either:
 ## Decision
 
 **Proposed**: adopt option (A).
-Add a `Transmit` enum on the sans-io side and a vectored `Providers::Network` entry, in three landings:
+Add a `Transmit` enum on the sans-io side and a vectored `Providers::Network` entry, across the following concrete changes:
 
-1. **Wave 1 — `Transmit` enum + plaintext write-vectored**. Sans-io: `Connection::poll_transmit` returns a `Transmit` enum:
+1. **`Transmit` enum + plaintext write-vectored**. Sans-io: `Connection::poll_transmit` returns a `Transmit` enum:
 
    ```rust
    pub enum Transmit<'a> {
@@ -60,17 +60,17 @@ Add a `Transmit` enum on the sans-io side and a vectored `Providers::Network` en
    }
    ```
 
-   `frame.rs::encode_payload` returns `{head: BytesMut, payload: Bytes}` instead of a single coalesced `BytesMut`.
-   The producer state machine accumulates segments into `self.outbound_segments: Vec<Bytes>` and `poll_transmit` flips between `Contiguous` (handshake / TLS) and `Vectored` (plaintext producer batches) at call time.
-   No moonpool change in wave 1 — moonpool's tokio backend already speaks the same vectored shape.
+`frame.rs::encode_payload` returns `{head: BytesMut, payload: Bytes}` instead of a single coalesced `BytesMut`.
+The producer state machine accumulates segments into `self.outbound_segments: Vec<Bytes>` and `poll_transmit` flips between `Contiguous` (handshake / TLS) and `Vectored` (plaintext producer batches) at call time.
+No moonpool change is required for this chunk — moonpool's tokio backend already speaks the same vectored shape.
 
-2. **Wave 2 — moonpool `Providers::Network` vectored entry**. `moonpool_core::Providers::Network` grows a `write_vectored` method.
+2. **moonpool `Providers::Network` vectored entry**. `moonpool_core::Providers::Network` grows a `write_vectored` method.
    The chaos pack can drop / re-order individual segments (today it can only drop the whole batch).
    Stays backwards-compatible: single-slice `Contiguous` callers go through the existing path.
    Bumps `moonpool-core` minor version.
 
-3. **Wave 3 — `BytesMut` ownership pass-through on read**. The audit's "read path double-copy" note (already closed at the proto-side `split_to` refactor in commit `bf66a5b`) becomes the dual: the driver passes owned `BytesMut` to `handle_bytes`, the proto layer keeps a refcount, and `take_decoded_payload` hands `Bytes` slices that share the same buffer all the way down to user-facing `IncomingMessage::payload`.
-   This wave is independent of (1) / (2) and can land separately.
+3. **`BytesMut` ownership pass-through on read**. The audit's "read path double-copy" note (already closed at the proto-side `split_to` refactor in commit `bf66a5b`) becomes the dual: the driver passes owned `BytesMut` to `handle_bytes`, the proto layer keeps a refcount, and `take_decoded_payload` hands `Bytes` slices that share the same buffer all the way down to user-facing `IncomingMessage::payload`.
+   This read-path ownership change is independent of the transmit enum and moonpool vectored write support, so it can land separately.
 
 ## Consequences
 
@@ -80,11 +80,11 @@ Add a `Transmit` enum on the sans-io side and a vectored `Providers::Network` en
   Plaintext path drops one full memcpy per payload (proportional to batch payload size).
   For high-throughput compressed batches (1 MiB+ aggregate) this is the hot path.
 - The frame descriptor `{head, payload}` makes the producer's compression-step / encryption-step / metadata-stamp pipeline more composable — each step can mutate one segment without touching the others.
-- moonpool's chaos pack gets segment-granular drop / reorder for free once wave 2 lands.
+- moonpool's chaos pack gets segment-granular drop / reorder once `Providers::Network::write_vectored` is available.
 
 **Harder**:
 
-- Cross-runtime test parity (ADR-0024) requires the wave-2 moonpool changes to land before the production tokio engine flips to the `Vectored` path — otherwise the differential harness sees per-batch byte streams diverging by segment boundary.
+- Cross-runtime test parity (ADR-0024) requires the moonpool vectored-write support before the production tokio engine flips to the `Vectored` path — otherwise the differential harness sees per-batch byte streams diverging by segment boundary.
 - The `Transmit::Vectored` lifetime borrows from `Connection`'s internal `Vec<Bytes>`; care needed in the driver loop to not hold the lock across the `.await` on `write_vectored`.
   The existing pattern of "drain to owned `Vec<u8>` then drop the lock" needs an equivalent — drain to `Vec<Bytes>` (cheap Arc clones) then drop the lock.
 - TLS coalesces — there's no benefit on `pulsar+ssl://` URLs.
@@ -93,16 +93,16 @@ Add a `Transmit` enum on the sans-io side and a vectored `Providers::Network` en
 
 **Cost**:
 
-- Wave 1: ~300 LOC across `magnetar-proto/src/{conn.rs, frame.rs, producer.rs}` + `magnetar-runtime-tokio/src/driver.rs` + the matching moonpool adapter.
-- Wave 2: ~200 LOC + a `moonpool-core` minor version bump + the differential harness chaos-pack update.
-- Wave 3: ~150 LOC in proto + 50 LOC in each runtime.
-- Test layers per ADR-0024 across all three waves.
+- `Transmit` enum + plaintext write-vectored: ~300 LOC across `magnetar-proto/src/{conn.rs, frame.rs, producer.rs}` + `magnetar-runtime-tokio/src/driver.rs` + the matching moonpool adapter.
+- moonpool vectored network entry: ~200 LOC + a `moonpool-core` minor version bump + the differential harness chaos-pack update.
+- read-path `BytesMut` ownership pass-through: ~150 LOC in proto + 50 LOC in each runtime.
+- Test layers per ADR-0024 across all three change sets.
 
 **Incompatible with**:
 
 - `BytesMut`-only callers downstream that assume contiguous wire layout.
   The frame-decoder side is already segment-aware (it `split_to` against `inbound: BytesMut`), so no change there.
-  The audit's "read path double-copy" closure (wave 3) is the symmetric follow-on.
+  The audit's "read path double-copy" closure is the symmetric follow-on.
 
 ## References
 
@@ -111,5 +111,5 @@ Add a `Transmit` enum on the sans-io side and a vectored `Providers::Network` en
 - `crates/magnetar-proto/src/conn.rs::Connection::poll_transmit` — current single-slice transmit surface.
 - `crates/magnetar-runtime-tokio/src/driver.rs::driver_loop_inner` — current `write_all` site that will branch on the new `Transmit` shape.
 - [ADR-0004](0004-sans-io-protocol-core.md) — sans-io contract that the `Transmit` enum has to honour (no I/O types leak into proto).
-- [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — the test layers and parity check the three waves have to satisfy.
+- [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) — the test layers and parity check the change sets have to satisfy.
 - [ADR-0038](0038-split-connection-mutex.md) — per-slot mutex lift that already established the "drain under lock, write outside lock" pattern this ADR extends.

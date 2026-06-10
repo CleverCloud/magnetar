@@ -1,16 +1,16 @@
 # ADR-0036 — Moonpool seed sweep: daily random, not fixed per-PR
 
-- **Status**: Accepted (amended by [ADR-0043](0043-temporary-floating-moonpool-git-dep.md), exact-pin discipline scoped exception; **partially superseded by [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** for end-to-end tests, which now run per-PR rather than on a weekly cost-shifted cadence — the moonpool seed sweep + the diff-shaped xtask gates still follow this ADR; **amended by [ADR-0047](0047-failing-seed-registry-per-pr-replay.md)** which adds the persistent failing-seed registry + per-PR replay layer on top of the daily discovery cadence this ADR established — the discovery rhythm is unchanged)
+- **Status**: Accepted (**partially superseded by [ADR-0046](0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)** for end-to-end tests, which now run per-PR rather than on a weekly cost-shifted cadence — the moonpool seed sweep + the diff-shaped xtask gates still follow this ADR; **amended by [ADR-0047](0047-failing-seed-registry-per-pr-replay.md)** which adds the persistent failing-seed registry + per-PR replay layer on top of the daily discovery cadence this ADR established — the discovery rhythm is unchanged; **amended by [ADR-0056](0056-moonpool-0-7-crates-io-repin.md)** which removes the temporary moonpool git-source exception introduced by ADR-0043)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: testing, moonpool, ci, process
 
 > **Amendment (2026-06-01, this commit).** The daily random-seed count moves from **16 → 128**. Runtime evidence: each moonpool test runs in ~50ms; a full per-runner build+test cycle finishes in ~6 minutes on cache-warm `ubuntu-latest`. 128 × ~6 min ≈ 12.8 runner-hours/night, comfortable inside GH Actions' default concurrency cap.
 > Coverage grows from ~5,840 seeds/year to ~46,720 seeds/year.
-> The rest of this ADR (cadence, failure handling, exempt local validation, mitigation under ADR-0043 float) is unchanged.
+> The rest of this ADR (cadence, failure handling, exempt local validation) is unchanged.
 
-> **Amendment (2026-05-29, [ADR-0043](0043-temporary-floating-moonpool-git-dep.md)).** The exact-pin reproducibility discipline this ADR relies on is temporarily relaxed for **two named crates only** — `moonpool-core` and `moonpool-sim` now track git `branch = "main"` to consume the futures-io `TcpStream` + segment-granular `write_vectored` change ([ADR-0040](0040-vectored-io-transmit-enum.md) wave 2) ahead of a crates.io release.
-> `Cargo.lock` still records a concrete rev, the daily seed sweep below is one of the mitigations, and the float is re-pinned to an exact `=x.y.z` once [PR #113](https://github.com/PierreZ/moonpool/pull/113) ships.
+> **Amendment (2026-06-10, [ADR-0056](0056-moonpool-0-7-crates-io-repin.md)).** The temporary moonpool git-source exception introduced by [ADR-0043](0043-temporary-floating-moonpool-git-dep.md) is closed.
+> `moonpool-core` and `moonpool-sim` now use crates.io caret requirements at `^0.7.0`; `Cargo.lock` plus the `--locked` validation chain is the reproducibility anchor for `(commit, seed)` replay.
 > Nothing else in this ADR changes.
 
 ## Context

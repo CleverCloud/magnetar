@@ -48,54 +48,22 @@ See [`../README.md#engine-by-engine-surface-coverage`](../README.md#engine-by-en
 
 ## Apache Pulsar Proxy connection pool
 
-[ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md)
-(amended 2026-06-01) lands the per-broker connection pool on the
-moonpool engine. The pool lives at
-[`crates/magnetar-runtime-moonpool/src/pool.rs`](../crates/magnetar-runtime-moonpool/src/pool.rs)
-and mirrors
-[`crates/magnetar-runtime-tokio/src/pool.rs`](../crates/magnetar-runtime-tokio/src/pool.rs)
-1:1.
+[ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md) (amended 2026-06-01) lands the per-broker connection pool on the moonpool engine.
+The pool lives at [`crates/magnetar-runtime-moonpool/src/pool.rs`](../crates/magnetar-runtime-moonpool/src/pool.rs) and mirrors [`crates/magnetar-runtime-tokio/src/pool.rs`](../crates/magnetar-runtime-tokio/src/pool.rs) 1:1.
 
-The pool is populated only when the client is built via
-[`Client::connect_plain_supervised`](../crates/magnetar-runtime-moonpool/src/client.rs)
-— that constructor wraps the bootstrap connect inputs (proxy address,
-`ConnectionConfig` template, `Providers` bundle, optional
-`ServiceUrlProvider` + `DnsResolver`) into a `ConnectionFactory<P>` and
-hands it to a fresh `ProxyConnectionPool<P>`. The
-[`Client::resolve_target`](../crates/magnetar-runtime-moonpool/src/client.rs)
-hook then routes any `LookupOutcome::Connect { proxy_through_service_url
-= true, .. }` to the pool via the
-`pool::get_or_open(Arc<Self>, logical_broker_url)` async free function,
-which:
+The pool is populated only when the client is built via [`Client::connect_plain_supervised`](../crates/magnetar-runtime-moonpool/src/client.rs) — that constructor wraps the bootstrap connect inputs (proxy address, `ConnectionConfig` template, `Providers` bundle, optional `ServiceUrlProvider` + `DnsResolver`) into a `ConnectionFactory<P>` and hands it to a fresh `ProxyConnectionPool<P>`.
+The [`Client::resolve_target`](../crates/magnetar-runtime-moonpool/src/client.rs) hook then routes any `LookupOutcome::Connect { proxy_through_service_url = true, .. }` to the pool via the `pool::get_or_open(Arc<Self>, logical_broker_url)` async free function, which:
 
 1. Probes the entries map; on a hit, returns the cached `Ready` entry.
-2. On a miss, installs a `Pending(PendingDial)` slot and spawns the dial
-   work via
-   [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task)
-   — necessary because `NetworkProvider::connect` can be `?Send` on some
-   moonpool-core releases and the producer / consumer open path needs to
-   stay `Send` for the facade's
-   `CreateProducerApi` / `SubscribeApi` traits.
-3. The spawned dial task runs `network.connect` →
-   `handshake_plain` → `spawn_supervised`, then publishes the
-   `Arc<Result<Arc<ConnectionShared>, EngineError>>` into the
-   `PendingDial::result` slot and fans the result out via
-   `Notify::notify_waiters`. Racing waiters all `Arc::clone` the same
-   outcome.
-4. The dial task promotes the entry from `Pending` to
-   `Ready { shared, driver }` on success, or evicts it on failure so the
-   next caller redials.
+2. On a miss, installs a `Pending(PendingDial)` slot and spawns the dial work via [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task) — necessary because `NetworkProvider::connect` can be `?Send` on some moonpool-core releases and the producer / consumer open path needs to stay `Send` for the facade's `CreateProducerApi` / `SubscribeApi` traits.
+3. The spawned dial task runs `network.connect` → `handshake_plain` → `spawn_supervised`, then publishes the `Arc<Result<Arc<ConnectionShared>, EngineError>>` into the `PendingDial::result` slot and fans the result out via `Notify::notify_waiters`.
+   Racing waiters all `Arc::clone` the same outcome.
+4. The dial task promotes the entry from `Pending` to `Ready { shared, driver }` on success, or evicts it on failure so the next caller redials.
 
-`Client::close` drains every `Ready` pool entry's supervised driver in
-addition to the bootstrap. `Pending` entries are dropped without
-explicit abort — the close path tears down the bootstrap first, the
-proxy fails any in-flight handshake, and the dial task's error path
-evicts the slot.
+`Client::close` drains every `Ready` pool entry's supervised driver in addition to the bootstrap.
+`Pending` entries are dropped without explicit abort — the close path tears down the bootstrap first, the proxy fails any in-flight handshake, and the dial task's error path evicts the slot.
 
-Per-broker `ConnectionConfig.proxy_to_broker_url` is set on the
-**cloned** config inside `build_entry_async`; the bootstrap config
-itself stays untouched, so the bootstrap connection's `CommandConnect`
-omits the field (matching the Java client + Pulsar Proxy contract).
+Per-broker `ConnectionConfig.proxy_to_broker_url` is set on the **cloned** config inside `build_entry_async`; the bootstrap config itself stays untouched, so the bootstrap connection's `CommandConnect` omits the field (matching the Java client + Pulsar Proxy contract).
 
 ## Producer + consumer façades
 
@@ -120,7 +88,7 @@ Equivalence is asserted through the differential harness per [ADR-0024](../specs
 ## Transport + vectored writes
 
 The engine's transport adapter ([`crates/magnetar-runtime-moonpool/src/transport.rs`](../crates/magnetar-runtime-moonpool/src/transport.rs)) drives the `moonpool_core::NetworkProvider::TcpStream` directly.
-As of moonpool `main` (consumed via the temporary git dependency in [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)) that stream bounds on the **`futures::io::{AsyncRead, AsyncWrite}`** ext traits rather than `tokio::io` — `TokioNetworkProvider` wraps its `tokio::net::TcpStream` in [`tokio_util::compat::Compat`](https://docs.rs/tokio-util/latest/tokio_util/compat/struct.Compat.html) to bridge the two ecosystems.
+As of moonpool `0.7.0` (consumed from crates.io per [ADR-0056](../specs/adr/0056-moonpool-0-7-crates-io-repin.md)) that stream bounds on the **`futures::io::{AsyncRead, AsyncWrite}`** ext traits rather than `tokio::io` — `TokioNetworkProvider` wraps its `tokio::net::TcpStream` in [`tokio_util::compat::Compat`](https://docs.rs/tokio-util/latest/tokio_util/compat/struct.Compat.html) to bridge the two ecosystems.
 The transport adapter therefore imports the `futures::io` ext traits (`AsyncReadExt` / `AsyncWriteExt`) accordingly.
 
 The read side carries a **reusable heap-backed scratch** (`read_scratch`, a `Box<[u8]>` of `TLS_WIRE_BUFFER` bytes allocated once per `Transport` via `new_read_scratch()`): `read_into` lands wire bytes into it / the caller's spare capacity instead of heap-allocating a fresh 16 KiB buffer on every read.
@@ -136,7 +104,7 @@ The driver dispatches the sans-io `TransmitOwned` descriptor ([ADR-0040](../spec
 | `Contiguous` (handshake, small frames)                      | single-buffer `write_all`                                         | unchanged.                                                                                                                                                                                                                                                                                    |
 | `Vectored` on the **TLS** path                              | `Transport::write_all_vectored` coalesces, then writes ciphertext | **Always contiguous.** The TLS arm still _receives_ the segment list, but pushes each segment's plaintext through rustls in order and ships one ciphertext stream — rustls owns its own record buffering, so segment boundaries cannot survive encryption. See the TLS adapter section below. |
 
-This replaces the earlier placeholder that coalesced the `Vectored` segment list into one contiguous `write_all` "until moonpool-core adds vectored support" — that prerequisite is now satisfied (ADR-0040 wave 2, [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) / [PR #113](https://github.com/PierreZ/moonpool/pull/113)).
+This replaces the earlier placeholder that coalesced the `Vectored` segment list into one contiguous `write_all` "until moonpool-core adds vectored support" — that prerequisite is now satisfied ([ADR-0040](../specs/adr/0040-vectored-io-transmit-enum.md), [PierreZ/moonpool#111](https://github.com/PierreZ/moonpool/issues/111) / [PR #113](https://github.com/PierreZ/moonpool/pull/113)).
 
 ## Supervised reconnect
 
@@ -253,7 +221,7 @@ The harness components:
 | [`tests/crypto_failure_action_equivalence.rs`](../crates/magnetar-differential/tests/crypto_failure_action_equivalence.rs) | The 3-arm `cryptoFailureAction` matrix (Fail / Discard / Consume), pinned by golden trace [`tests/golden/crypto_failure_action.json`](../crates/magnetar-differential/tests/golden/crypto_failure_action.json).                                                                                                                                                |
 
 The moonpool runner uses `TokioProviders` rather than `SimProviders`.
-`moonpool-sim` is now a workspace dependency (pulled in for the chaos pack via the git `main` float — [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
+`moonpool-sim` is now a workspace dependency (pulled in for the chaos pack from crates.io `0.7.0` — [ADR-0056](../specs/adr/0056-moonpool-0-7-crates-io-repin.md)).
 The harness still exercises the engine surface that diverges between tokio and moonpool (memory-limit policy plumbing, future shapes, generic bounds) which is the load-bearing part for equivalence.
 
 Equivalence holds across the vectored-write change because the comparison is on wire bytes + user-visible events, not syscall shape: under `TokioProviders` the moonpool transport's `Compat` stream does not forward vectored writes (it collapses the `Vectored` segment list to a single buffer write — see [Transport + vectored writes](#transport--vectored-writes)), so it emits byte-identical wire output to the tokio engine's `write_all`.
@@ -261,8 +229,8 @@ The segment-granular delivery events are a `SimProviders`-only refinement and do
 
 The harness ships per [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md) M8.
 The moonpool runner awaits the engine work directly — no `tokio::task::LocalSet` wrapper and no periodic pump.
-The pinned moonpool `main` ships a `Send`-bound `TaskProvider::spawn_task` (`TokioProviders` wires `TokioTaskProvider`, which spawns via `tokio::task::Builder::new().spawn(...)`, **not** `spawn_local`), so the driver task runs on the ambient runtime and a parked `consumer.receive()` is woken normally through its `Notify`/`Waker` slab.
-The earlier `LocalSet` + 25 ms `Kicker` pump were tied to a stale `spawn_local` premise and have been removed (the floating-`main` dependency is recorded in [ADR-0043](../specs/adr/0043-temporary-floating-moonpool-git-dep.md)).
+Moonpool `0.7.0` ships a `Send`-bound `TaskProvider::spawn_task` (`TokioProviders` wires `TokioTaskProvider`, which spawns via `tokio::task::Builder::new().spawn(...)`, **not** `spawn_local`), so the driver task runs on the ambient runtime and a parked `consumer.receive()` is woken normally through its `Notify`/`Waker` slab.
+The earlier `LocalSet` + 25 ms `Kicker` pump were tied to a stale `spawn_local` premise and have been removed.
 
 ## What is _not_ yet exercised under simulation
 
@@ -280,7 +248,7 @@ When one of these items moves from "known gap" to "ready to dispatch", it is add
 > This appendix is a research note, not a binding spec — for binding decisions see [`../specs/adr/`](../specs/adr/).
 
 Magnetar's simulation strategy is informed by two reference systems: Apple FoundationDB's simulator and TigerBeetle's VOPR.
-The current surface (chaos pack, differential harness, daily seed sweep) is documented above; this appendix captures the patterns that drove it and the ones that motivated the recent ADR-0047/0048/0049/0050 wave.
+The current surface (chaos pack, differential harness, daily seed sweep) is documented above; this appendix captures the patterns that drove it and the ones that motivated ADR-0047, ADR-0048, ADR-0049, and ADR-0050.
 
 ### FoundationDB simulator (the reference implementation)
 
@@ -289,8 +257,7 @@ Source: [apple.github.io/foundationdb/testing.html](https://apple.github.io/foun
 
 **Determinism architecture**
 
-- **Single-threaded Flow execution.** FoundationDB is written in _Flow_, an actor-based language atop C++.
-  The simulator runs the full cluster (all servers + all clients) in a single OS thread.
+- **Single-threaded Flow execution.** FoundationDB is written in _Flow_, an actor-based language atop C++. The simulator runs the full cluster (all servers + all clients) in a single OS thread.
   No threading primitives, no preemption — every interleaving is a deterministic function of the seed.
 - **Synchronized time stepping.** The simulator advances a virtual clock and dispatches actor wake-ups in deterministic order.
   Real durations are compressed (~10×) so a "one-day" outage in simulation completes in a few minutes of wall time.

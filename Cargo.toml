@@ -48,9 +48,9 @@ magnetar-runtime-moonpool = { version = "^0.1.0-dev.0", path = "crates/magnetar-
 magnetar-runtime-tokio   = { version = "^0.1.0-dev.0", path = "crates/magnetar-runtime-tokio" }
 
 # Codec
-prost           = "^0.14.3"
-prost-build     = "^0.14.3"
-prost-types     = "^0.14.3"
+prost           = "^0.14.4"
+prost-build     = "^0.14.4"
+prost-types     = "^0.14.4"
 bytes           = "^1.11.1"
 crc32c          = "^0.6.8"
 
@@ -98,7 +98,7 @@ apache-avro = "^0.21.0"
 schemars    = { version = "^1.2.1", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.23.1", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.23.3", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
@@ -121,21 +121,16 @@ base64     = { version = "^0.22.1", default-features = false, features = ["std"]
 # requirements on hosts that don't enable Kerberos. See ADR-0029.
 libgssapi  = { version = "^0.11.0", default-features = false }
 
-# moonpool engine — temporarily floating on git `main` (per ADR-0043) to
-# pick up the futures-io `TcpStream` + segment-granular `write_vectored`
-# breaking change ahead of the next crates.io release. The explicit
-# `version` is not redundant with `branch`: it keeps the dep off cargo-deny's
-# wildcard ban AND guards against a silent moonpool major bump — when main
-# crosses 0.7 the build fails resolution, which is exactly the ADR-0043
-# re-pin trigger. Both crates track the same rev so they stay
-# version-compatible; see ADR-0024 + ADR-0036.
-moonpool-core = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }
+# moonpool engine — `0.7.0` is the first crates.io release that carries the
+# futures-io `TcpStream`, segment-granular `write_vectored`, and simulation-run
+# no-progress detector work previously consumed from git (ADR-0056). The
+# lockfile stays the reproducibility anchor for deterministic `(commit, seed)`
+# replay under `--locked` validation (ADR-0036).
+moonpool-core = "^0.7.0"
 # moonpool-sim provides the deterministic SimProviders used by the
-# differential harness chaos pack (ADR-0024). Tracks the same git rev as
-# moonpool-core so the two crates stay version-compatible. Vendored as a
-# workspace dep but opted into per-crate (currently only the differential
-# harness needs it).
-moonpool-sim = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool", branch = "main" }
+# differential harness chaos pack (ADR-0024). It is pinned in lockstep with
+# moonpool-core because moonpool publishes the crates as one compatible set.
+moonpool-sim = "^0.7.0"
 
 # Admin REST + CLI. The TLS sub-feature (`rustls` vs `rustls-no-provider`,
 # renamed from `rustls-tls` / `rustls-tls-no-provider` in reqwest 0.13) is
@@ -151,7 +146,7 @@ moonpool-sim = { version = "0.6.0", git = "https://github.com/PierreZ/moonpool",
 # `sourceConfig` / `sinkConfig`), even when no file is uploaded.
 reqwest = { version = "^0.13.4", default-features = false, features = ["json", "form", "multipart"] }
 url     = "^2.5.8"
-http    = "^1.4.1"
+http    = "^1.4.2"
 clap    = { version = "^4.6.1", features = ["derive", "env"] }
 
 # Telemetry + errors
@@ -170,7 +165,7 @@ proptest       = "^1.11.0"
 tempfile       = "^3.27.0"
 wiremock       = "^0.6.5"
 # `async-trait` is needed by moonpool-sim's `Workload` trait, which uses
-# `#[async_trait(?Send)]`. Pinned to the major version moonpool-sim 0.6
+# `#[async_trait(?Send)]`. Pinned to the major version moonpool-sim 0.7
 # transitively depends on.
 async-trait    = "^0.1.89"
 
@@ -214,14 +209,3 @@ opt-level = 0
 
 [profile.test]
 opt-level = 1   # tests still need to be quick under the sans-io harness
-
-# TEMPORARY: validate magnetar against the moonpool no-progress-detector fix
-# (ADR-0052 pivot — orchestrator `run_time_budget` catches the busy-peer
-# keepalive storm as a DEADLOCK without magnetar-side timers). Points at the
-# PR #116 branch on the fork (https://github.com/PierreZ/moonpool/pull/116).
-# MUST be removed once the moonpool PR lands, and replaced by bumping the
-# moonpool git pin to PierreZ/moonpool `main`.
-[patch."https://github.com/PierreZ/moonpool"]
-moonpool-core = { git = "https://github.com/FlorentinDUBOIS/moonpool", branch = "fix/no-progress-detector-busy-peer" }
-moonpool-sim = { git = "https://github.com/FlorentinDUBOIS/moonpool", branch = "fix/no-progress-detector-busy-peer" }
-moonpool-explorer = { git = "https://github.com/FlorentinDUBOIS/moonpool", branch = "fix/no-progress-detector-busy-peer" }
