@@ -33,7 +33,7 @@ use crate::error::ClientError;
 /// `get_schema`) still take `shared.inner.lock()` because they mutate the
 /// connection-wide state machine. Acquisition order is always **global →
 /// per-slot, never the reverse**.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Producer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ProducerHandle,
@@ -47,12 +47,29 @@ pub struct Producer {
     pub(crate) encryptor: Option<Arc<dyn MessageEncryptor>>,
     /// Last-clone close guard. `Producer` is cheap-clone, so the broker-side
     /// best-effort close must fire exactly once — when the **last** clone
-    /// drops. See [`ProducerCloseGuard`]. Held for its `Drop` impl only:
-    /// this side derives `Clone` (L36), so the field is never read by name
-    /// and needs the `dead_code` allow — the moonpool mirror hand-writes
-    /// `Clone` and reads `self.close_guard.clone()`, so it carries none.
-    #[allow(dead_code)]
+    /// drops. See [`ProducerCloseGuard`]. The hand-written [`Clone`] below
+    /// reads this `Arc` by name to share it across clones, so the field needs
+    /// no `#[allow(dead_code)]` — 1:1 with the moonpool engine, which also
+    /// hand-writes `Clone` and reads `self.close_guard.clone()`.
     pub(crate) close_guard: Arc<ProducerCloseGuard>,
+}
+
+impl Clone for Producer {
+    /// Hand-written (rather than `#[derive(Clone)]`) so the `close_guard`
+    /// field is read by name — keeping it free of an `#[allow(dead_code)]` and
+    /// symmetric with the moonpool engine's manual `Clone`. Every clone shares
+    /// the one `Arc<ProducerCloseGuard>`, so the guard's `Drop` fires exactly
+    /// once, on the last clone.
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            slot: self.slot.clone(),
+            compression: self.compression,
+            encryptor: self.encryptor.clone(),
+            close_guard: self.close_guard.clone(),
+        }
+    }
 }
 
 /// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop
