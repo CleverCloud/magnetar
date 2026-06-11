@@ -77,10 +77,70 @@ pub struct Producer<P: Providers> {
     /// outbound payload after compression but before handing it to the sans-io
     /// layer. 1:1 mirror of `magnetar_runtime_tokio::Producer::encryptor`.
     pub(crate) encryptor: Option<Arc<dyn MessageEncryptor>>,
+    /// Last-clone close guard. `Producer` is cheap-clone, so the broker-side
+    /// best-effort close must fire exactly once — when the **last** clone
+    /// drops. See [`ProducerCloseGuard`]. 1:1 mirror of
+    /// `magnetar_runtime_tokio::Producer::close_guard`.
+    pub(crate) close_guard: Arc<ProducerCloseGuard>,
     /// Held only so `Producer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
     pub(crate) _providers: std::marker::PhantomData<fn() -> P>,
+}
+
+/// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop
+/// (ADR-0057).
+///
+/// Every [`Producer`] clone shares one guard behind an `Arc`; the `Drop`
+/// below therefore runs exactly once, when the last clone goes away.
+/// Without it, dropping a producer without an explicit [`Producer::close`]
+/// leaks the broker-side registration for as long as the shared TCP
+/// connection stays open — recreating a producer with the same
+/// user-provided name then fails forever with `NamingException`
+/// (broker error code 16).
+///
+/// The explicit-close path stays the reliable one: [`Producer::close`]
+/// awaits the broker ack. This guard fires
+/// [`magnetar_proto::Connection::close_producer_forget`] — encode the frame
+/// and wake the driver, never await. The proto layer consumes the broker
+/// ack in-place (no orphaned `OpOutcome` entry) and surfaces a rejection as
+/// a `warn!`.
+///
+/// Dedup is best-effort, not a hard invariant: the slot's `closed` flag
+/// (set synchronously by `Connection::close_producer`) dedups a *preceding
+/// completed* client-initiated close as observed here. It does NOT cover
+/// broker-initiated detach — `handle_close_producer` deliberately keeps
+/// `closed = false` so `rebuild_producers` can re-attach on PIP-188
+/// migration / failover — and the check+act below is non-atomic against a
+/// concurrent `close()` on another clone. Both residual cases emit one
+/// redundant `CloseProducer` frame, which the broker tolerates. 1:1 mirror
+/// of `magnetar_runtime_tokio::producer::ProducerCloseGuard`.
+#[derive(Debug)]
+pub(crate) struct ProducerCloseGuard {
+    shared: Arc<ConnectionShared>,
+    handle: ProducerHandle,
+    slot: Arc<magnetar_proto::ProducerSlot>,
+}
+
+impl Drop for ProducerCloseGuard {
+    fn drop(&mut self) {
+        // ADR-0038 lock order: the per-slot probe drops its guard before the
+        // global Connection mutex is taken (sequential, never nested).
+        let already_closed = self.slot.state.lock().closed;
+        if already_closed {
+            return;
+        }
+        {
+            let mut conn = self.shared.inner.lock();
+            let _ = conn.close_producer_forget(self.handle);
+        }
+        self.shared.driver_waker.notify_one();
+        tracing::debug!(
+            topic = %self.slot.identity.topic,
+            handle = ?self.handle,
+            "producer dropped without explicit close — best-effort CloseProducer enqueued"
+        );
+    }
 }
 
 impl<P: Providers> Clone for Producer<P> {
@@ -91,6 +151,7 @@ impl<P: Providers> Clone for Producer<P> {
             slot: self.slot.clone(),
             compression: self.compression,
             encryptor: self.encryptor.clone(),
+            close_guard: self.close_guard.clone(),
             _providers: std::marker::PhantomData,
         }
     }
@@ -106,6 +167,34 @@ impl<P: Providers> std::fmt::Debug for Producer<P> {
 }
 
 impl<P: Providers> Producer<P> {
+    /// Assemble a producer handle and arm its last-clone close guard.
+    ///
+    /// Single construction point — keeps the [`ProducerCloseGuard`] wiring
+    /// in one place for every producer the engine hands out. 1:1 mirror of
+    /// `magnetar_runtime_tokio::Producer::assemble`.
+    pub(crate) fn assemble(
+        shared: Arc<ConnectionShared>,
+        handle: ProducerHandle,
+        slot: Arc<magnetar_proto::ProducerSlot>,
+        compression: CompressionKind,
+        encryptor: Option<Arc<dyn MessageEncryptor>>,
+    ) -> Self {
+        let close_guard = Arc::new(ProducerCloseGuard {
+            shared: shared.clone(),
+            handle,
+            slot: slot.clone(),
+        });
+        Self {
+            shared,
+            handle,
+            slot,
+            compression,
+            encryptor,
+            close_guard,
+            _providers: std::marker::PhantomData,
+        }
+    }
+
     /// The protocol-layer producer handle this façade wraps.
     #[must_use]
     pub fn handle(&self) -> ProducerHandle {
@@ -686,14 +775,13 @@ impl<P: Providers + Send + Sync> Client<P> {
             access_mode = ?slot.identity.access_mode,
             "producer created"
         );
-        Ok(Producer {
-            shared: target_shared,
+        Ok(Producer::assemble(
+            target_shared,
             handle,
             slot,
             compression,
             encryptor,
-            _providers: std::marker::PhantomData,
-        })
+        ))
     }
 }
 
@@ -1176,14 +1264,13 @@ mod tests {
             })
         };
         let encryptor = Arc::new(XorEncryptor::default());
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: Some(encryptor.clone()),
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            Some(encryptor.clone()),
+        );
         let _fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"plain-secret"),
             metadata: pb::MessageMetadata::default(),
@@ -1235,14 +1322,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: Some(Arc::new(FailingEncryptor)),
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            Some(Arc::new(FailingEncryptor)),
+        );
         let res = producer
             .send(OutgoingMessage {
                 payload: Bytes::from_static(b"plain"),
@@ -1277,14 +1363,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         assert_eq!(producer.pending_count(), 0);
         assert_eq!(producer.last_sequence_id(), -1);
         assert!(!producer.is_closed());
@@ -1310,14 +1395,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::None, None);
         let _fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"hello"),
             metadata: pb::MessageMetadata::default(),
@@ -1348,14 +1427,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::Zstd,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::Zstd, None);
         let res = producer
             .send(OutgoingMessage {
                 payload: Bytes::from_static(b"hello"),
@@ -1387,14 +1460,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::None, None);
         assert_eq!(producer.pending_count(), 0);
         tokio::time::timeout(Duration::from_secs(1), producer.flush())
             .await
@@ -1415,14 +1482,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::None, None);
         let clone = producer.clone();
         assert_eq!(producer.handle(), clone.handle());
         assert_eq!(producer.compression(), clone.compression());
@@ -1478,14 +1539,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         let fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"abcdef"),
             metadata: pb::MessageMetadata::default(),
@@ -1535,14 +1595,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         let res = producer
             .send(OutgoingMessage {
                 payload: Bytes::from_static(b"too-big-payload"),
@@ -1662,14 +1721,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         let mut fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"overflow"),
             metadata: pb::MessageMetadata::default(),
@@ -1735,14 +1793,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         let mut fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"AB"),
             metadata: pb::MessageMetadata::default(),
@@ -1801,14 +1858,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         let mut fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"ab"),
             metadata: pb::MessageMetadata::default(),
@@ -1874,14 +1930,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         // Budget has 1024 free bytes; the 4-byte payload reserves
         // synchronously and takes the fast-path `queue_send` return.
         let _fut = producer.send(OutgoingMessage {
@@ -1938,14 +1993,13 @@ mod tests {
         // about. `ProducerHandle` is a transparent wrapper around `u64`; we
         // pick an id that the `create_producer` path won't have allocated.
         let bogus_handle = ProducerHandle(u64::MAX);
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
-            handle: bogus_handle,
-            slot: stub_slot_for_test(bogus_handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
+            bogus_handle,
+            stub_slot_for_test(bogus_handle),
+            CompressionKind::None,
+            None,
+        );
         let mut fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"err"),
             metadata: pb::MessageMetadata::default(),
@@ -2016,14 +2070,13 @@ mod tests {
                 ..Default::default()
             })
         };
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
             handle,
-            slot: slot_for(&shared, handle),
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            slot_for(&shared, handle),
+            CompressionKind::None,
+            None,
+        );
         let mut fut = producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"hi"),
             metadata: pb::MessageMetadata::default(),
@@ -2074,14 +2127,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::None, None);
         assert_eq!(
             producer.last_sequence_id_published(),
             -1,
@@ -2102,14 +2149,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::None, None);
         assert_eq!(
             producer.batch_len(),
             0,
@@ -2130,14 +2171,8 @@ mod tests {
             })
         };
         let slot = slot_for(&shared, handle);
-        let producer: Producer<TokioProviders> = Producer {
-            shared,
-            handle,
-            slot,
-            compression: CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> =
+            Producer::assemble(shared, handle, slot, CompressionKind::None, None);
         assert_eq!(
             producer.batch_bytes(),
             0,

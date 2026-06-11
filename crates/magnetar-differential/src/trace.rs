@@ -59,6 +59,14 @@ pub enum Op {
     /// is a no-op on the consumer side) and the consumer if open.
     /// Resolves the producer/consumer close round-trip.
     Close,
+    /// Drop every clone of the trace's producer WITHOUT an explicit
+    /// `close().await`. Exercises the engines' last-clone drop guard
+    /// (issue #241): the guard enqueues a best-effort
+    /// `CommandCloseProducer`, observable on the scripted broker's
+    /// frame log. Subsequent `Send` ops resolve to
+    /// [`Event::SendError`] with kind `producer-dropped` on both
+    /// engines.
+    DropProducer,
     /// Send to a specific partition of [`Trace::topic`]. Internally the
     /// runner opens (or reuses) a producer bound to
     /// `<trace.topic>-partition-N`, mirroring Java's
@@ -197,6 +205,11 @@ pub enum Event {
     },
     /// `Close` completed for the producer and (if open) consumer.
     Closed,
+    /// `DropProducer` released every clone of the producer. The
+    /// broker-side `CloseProducer` is asynchronous (fire-and-forget
+    /// drop guard) — assert it via
+    /// [`crate::broker::ScriptedBroker::frame_log_snapshot`].
+    ProducerDropped,
     /// `SendPartition` succeeded; broker assigned [`MessageId`] on the
     /// given partition.
     SentPartition {

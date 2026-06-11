@@ -2982,14 +2982,13 @@ mod tests {
             .producer(producer_handle)
             .cloned()
             .expect("test producer slot must exist");
-        let producer: Producer<TokioProviders> = Producer {
+        let producer: Producer<TokioProviders> = Producer::assemble(
             shared,
-            handle: producer_handle,
-            slot: producer_slot,
-            compression: magnetar_proto::types::CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+            producer_handle,
+            producer_slot,
+            magnetar_proto::types::CompressionKind::None,
+            None,
+        );
         let count = consumer
             .republish_dead_letters(&producer)
             .await
@@ -3034,14 +3033,13 @@ mod tests {
             .producer(producer_handle)
             .cloned()
             .expect("test producer slot must exist");
-        let producer: Producer<TokioProviders> = Producer {
-            shared: shared.clone(),
-            handle: producer_handle,
-            slot: producer_slot,
-            compression: magnetar_proto::types::CompressionKind::None,
-            encryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let producer: Producer<TokioProviders> = Producer::assemble(
+            shared.clone(),
+            producer_handle,
+            producer_slot,
+            magnetar_proto::types::CompressionKind::None,
+            None,
+        );
         // Drive the helper with a synthetic IncomingMessage; we don't
         // await the inner ack to completion — once `.send()` has been
         // called, the outbox should hold the framed publish bytes with

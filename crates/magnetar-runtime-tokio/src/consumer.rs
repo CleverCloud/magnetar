@@ -2929,13 +2929,13 @@ mod tests {
             .producer(producer_handle)
             .cloned()
             .expect("producer slot must exist");
-        let producer = Producer {
+        let producer = Producer::assemble(
             shared,
-            handle: producer_handle,
-            slot: producer_slot,
-            compression: magnetar_proto::types::CompressionKind::None,
-            encryptor: None,
-        };
+            producer_handle,
+            producer_slot,
+            magnetar_proto::types::CompressionKind::None,
+            None,
+        );
         let count = consumer
             .republish_dead_letters(&producer)
             .await
@@ -2983,13 +2983,13 @@ mod tests {
             .producer(producer_handle)
             .cloned()
             .expect("producer slot must exist");
-        let producer = Producer {
-            shared: shared.clone(),
-            handle: producer_handle,
-            slot: producer_slot,
-            compression: magnetar_proto::types::CompressionKind::None,
-            encryptor: None,
-        };
+        let producer = Producer::assemble(
+            shared.clone(),
+            producer_handle,
+            producer_slot,
+            magnetar_proto::types::CompressionKind::None,
+            None,
+        );
         let msg = magnetar_proto::IncomingMessage {
             message_id: MessageId {
                 ledger_id: 7,

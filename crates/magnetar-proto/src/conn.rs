@@ -266,6 +266,15 @@ enum PendingRequestKind {
     ProducerClose {
         handle: ProducerHandle,
     },
+    /// Fire-and-forget close issued by the engines' last-clone drop guard
+    /// ([`Connection::close_producer_forget`]). No `RequestFut` will ever
+    /// drain the broker's ack, so the `Success`/`Error` handlers consume it
+    /// in-place instead of recording an [`OpOutcome`] — recording one would
+    /// leak a permanent `outcomes` entry per dropped producer on a
+    /// long-lived connection.
+    ProducerCloseForgotten {
+        handle: ProducerHandle,
+    },
     ConsumerClose {
         handle: ConsumerHandle,
     },
@@ -1713,11 +1722,24 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation("missing CommandSuccess"))?;
                 let request_id = RequestId(ok.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                self.outcomes.insert(
-                    PendingOpKey::Request(request_id),
-                    OpOutcome::Success { request_id },
-                );
-                self.wake_for_request(request_id);
+                if let Some(PendingRequestKind::ProducerCloseForgotten { handle }) = kind {
+                    // Fire-and-forget drop-close: no waiter will ever drain
+                    // this outcome — recording it would leak one permanent
+                    // `outcomes` entry per dropped producer (issue #241's
+                    // continuous-eviction workload). Consume the ack here.
+                    tracing::debug!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        request_id = ?request_id,
+                        "fire-and-forget producer close acked by broker"
+                    );
+                } else {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(request_id),
+                        OpOutcome::Success { request_id },
+                    );
+                    self.wake_for_request(request_id);
+                }
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
                     self.events
                         .push_back(ConnectionEvent::SubscribeAcked { handle });
@@ -1787,15 +1809,31 @@ impl Connection {
                 }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                self.outcomes.insert(
-                    PendingOpKey::Request(request_id),
-                    OpOutcome::Error {
-                        request_id,
-                        code: err.error,
-                        message: err.message.clone(),
-                    },
-                );
-                self.wake_for_request(request_id);
+                if let Some(PendingRequestKind::ProducerCloseForgotten { handle }) = kind {
+                    // Fire-and-forget drop-close: no waiter exists, so an
+                    // `OpOutcome::Error` would leak (see the `Success` arm).
+                    // Surface the rejection to operators instead — a broker
+                    // rejecting a close storm (overload, fencing) must stay
+                    // diagnosable (issue #241).
+                    tracing::warn!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        request_id = ?request_id,
+                        code = err.error,
+                        message = %err.message,
+                        "broker rejected fire-and-forget producer close (producer dropped without explicit close)"
+                    );
+                } else {
+                    self.outcomes.insert(
+                        PendingOpKey::Request(request_id),
+                        OpOutcome::Error {
+                            request_id,
+                            code: err.error,
+                            message: err.message.clone(),
+                        },
+                    );
+                    self.wake_for_request(request_id);
+                }
                 // When the failing request id correlates with a pending producer-open /
                 // consumer-subscribe, surface a typed failure event so event-stream waiters
                 // (`EventWaitFut::ProducerReady` / `EventWaitFut::SubscribeAcked` in the
@@ -4096,8 +4134,26 @@ impl Connection {
         request_id
     }
 
-    /// Close a producer.
+    /// Close a producer. The caller is expected to await the broker ack via
+    /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
+    /// with [`Self::take_outcome`].
     pub fn close_producer(&mut self, handle: ProducerHandle) -> RequestId {
+        self.close_producer_inner(handle, false)
+    }
+
+    /// Fire-and-forget variant of [`Self::close_producer`] for the engines'
+    /// last-clone drop guard: no waiter will ever drain the broker ack, so
+    /// the request is registered as
+    /// `PendingRequestKind::ProducerCloseForgotten` and the
+    /// `Success`/`Error` handlers consume the ack in-place instead of
+    /// recording an [`OpOutcome`] (which would leak one permanent entry per
+    /// dropped producer). A broker rejection is surfaced as a `warn!`
+    /// (ADR-0054) rather than silently swallowed.
+    pub fn close_producer_forget(&mut self, handle: ProducerHandle) -> RequestId {
+        self.close_producer_inner(handle, true)
+    }
+
+    fn close_producer_inner(&mut self, handle: ProducerHandle, forget: bool) -> RequestId {
         let request_id = self.alloc_request_id();
         let cmd = pb::CommandCloseProducer {
             producer_id: handle.0,
@@ -4114,8 +4170,12 @@ impl Connection {
         if let Some(slot) = self.producers.get(&handle) {
             slot.state.lock().close();
         }
-        self.pending_requests
-            .insert(request_id, PendingRequestKind::ProducerClose { handle });
+        let kind = if forget {
+            PendingRequestKind::ProducerCloseForgotten { handle }
+        } else {
+            PendingRequestKind::ProducerClose { handle }
+        };
+        self.pending_requests.insert(request_id, kind);
         request_id
     }
 
