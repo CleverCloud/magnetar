@@ -88,7 +88,8 @@ pub struct Producer<P: Providers> {
     pub(crate) _providers: std::marker::PhantomData<fn() -> P>,
 }
 
-/// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop.
+/// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop
+/// (ADR-0057).
 ///
 /// Every [`Producer`] clone shares one guard behind an `Arc`; the `Drop`
 /// below therefore runs exactly once, when the last clone goes away.
@@ -99,11 +100,21 @@ pub struct Producer<P: Providers> {
 /// (broker error code 16).
 ///
 /// The explicit-close path stays the reliable one: [`Producer::close`]
-/// awaits the broker ack. This guard only enqueues the close frame and
-/// wakes the driver — it cannot await in `Drop`. Double close is prevented
-/// by the slot's `closed` flag, which `Connection::close_producer` sets
-/// synchronously. 1:1 mirror of
-/// `magnetar_runtime_tokio::producer::ProducerCloseGuard`.
+/// awaits the broker ack. This guard fires
+/// [`magnetar_proto::Connection::close_producer_forget`] — encode the frame
+/// and wake the driver, never await. The proto layer consumes the broker
+/// ack in-place (no orphaned `OpOutcome` entry) and surfaces a rejection as
+/// a `warn!`.
+///
+/// Dedup is best-effort, not a hard invariant: the slot's `closed` flag
+/// (set synchronously by `Connection::close_producer`) dedups a *preceding
+/// completed* client-initiated close as observed here. It does NOT cover
+/// broker-initiated detach — `handle_close_producer` deliberately keeps
+/// `closed = false` so `rebuild_producers` can re-attach on PIP-188
+/// migration / failover — and the check+act below is non-atomic against a
+/// concurrent `close()` on another clone. Both residual cases emit one
+/// redundant `CloseProducer` frame, which the broker tolerates. 1:1 mirror
+/// of `magnetar_runtime_tokio::producer::ProducerCloseGuard`.
 #[derive(Debug)]
 pub(crate) struct ProducerCloseGuard {
     shared: Arc<ConnectionShared>,
@@ -121,7 +132,7 @@ impl Drop for ProducerCloseGuard {
         }
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_producer(self.handle);
+            let _ = conn.close_producer_forget(self.handle);
         }
         self.shared.driver_waker.notify_one();
         tracing::debug!(

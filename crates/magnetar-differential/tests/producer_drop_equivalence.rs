@@ -92,5 +92,17 @@ async fn producer_drop_event_stream_parity_and_single_close() {
         "moonpool leg: drop guard must push exactly one CloseProducer, frames: {moonpool_frames:?}",
     );
 
+    // The EventStream equality above proves the two *runners* agree; the
+    // engine drop-guards are compared on the wire. The frame log is the
+    // ordered sequence of every command kind the broker received, so this
+    // asserts the engines flush the guarded close at the same point
+    // relative to the surrounding Producer / Send / Subscribe traffic —
+    // an engine that deferred (or never flushed) its close on one leg
+    // diverges here even when both event streams agree.
+    assert_eq!(
+        tokio_frames, moonpool_frames,
+        "engine frame sequences diverged for the producer-drop trace",
+    );
+
     broker.shutdown().await;
 }

@@ -47,14 +47,16 @@ pub struct Producer {
     pub(crate) encryptor: Option<Arc<dyn MessageEncryptor>>,
     /// Last-clone close guard. `Producer` is cheap-clone, so the broker-side
     /// best-effort close must fire exactly once — when the **last** clone
-    /// drops. See [`ProducerCloseGuard`]. Held for its `Drop` impl only
-    /// (the derived `Clone` shares it across clones), hence the
-    /// `dead_code` allow.
+    /// drops. See [`ProducerCloseGuard`]. Held for its `Drop` impl only:
+    /// this side derives `Clone` (L36), so the field is never read by name
+    /// and needs the `dead_code` allow — the moonpool mirror hand-writes
+    /// `Clone` and reads `self.close_guard.clone()`, so it carries none.
     #[allow(dead_code)]
     pub(crate) close_guard: Arc<ProducerCloseGuard>,
 }
 
-/// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop.
+/// RAII guard arming a best-effort `CommandCloseProducer` on last-clone drop
+/// (ADR-0057).
 ///
 /// Every [`Producer`] clone shares one guard behind an `Arc`; the `Drop`
 /// below therefore runs exactly once, when the last clone goes away.
@@ -65,10 +67,20 @@ pub struct Producer {
 /// (broker error code 16).
 ///
 /// The explicit-close path stays the reliable one: [`Producer::close`]
-/// awaits the broker ack. This guard only enqueues the close frame and
-/// wakes the driver — it cannot await in `Drop`. Double close is prevented
-/// by the slot's `closed` flag, which `Connection::close_producer` sets
-/// synchronously.
+/// awaits the broker ack. This guard fires
+/// [`magnetar_proto::Connection::close_producer_forget`] — encode the frame
+/// and wake the driver, never await. The proto layer consumes the broker
+/// ack in-place (no orphaned `OpOutcome` entry) and surfaces a rejection as
+/// a `warn!`.
+///
+/// Dedup is best-effort, not a hard invariant: the slot's `closed` flag
+/// (set synchronously by `Connection::close_producer`) dedups a *preceding
+/// completed* client-initiated close as observed here. It does NOT cover
+/// broker-initiated detach — `handle_close_producer` deliberately keeps
+/// `closed = false` so `rebuild_producers` can re-attach on PIP-188
+/// migration / failover — and the check+act below is non-atomic against a
+/// concurrent `close()` on another clone. Both residual cases emit one
+/// redundant `CloseProducer` frame, which the broker tolerates.
 #[derive(Debug)]
 pub(crate) struct ProducerCloseGuard {
     shared: Arc<ConnectionShared>,
@@ -86,7 +98,7 @@ impl Drop for ProducerCloseGuard {
         }
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_producer(self.handle);
+            let _ = conn.close_producer_forget(self.handle);
         }
         self.shared.driver_waker.notify_one();
         tracing::debug!(

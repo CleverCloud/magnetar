@@ -86,9 +86,7 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
                 let bytes = Bytes::from(payload.clone());
                 let event = match producer.as_ref() {
                     Some(p) => run_send(p, bytes).await,
-                    None => Event::SendError {
-                        kind: "producer-dropped".to_owned(),
-                    },
+                    None => producer_dropped_send_error(),
                 };
                 stream.push(event);
             }
@@ -99,9 +97,7 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
                 let bytes = Bytes::from(payload.clone());
                 let event = match producer.as_ref() {
                     Some(p) => run_send_with_source_id(p, *source_msg_id, bytes).await,
-                    None => Event::SendError {
-                        kind: "producer-dropped".to_owned(),
-                    },
+                    None => producer_dropped_send_error(),
                 };
                 stream.push(event);
             }
@@ -248,9 +244,7 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
                 let bytes = Bytes::from(payload.clone());
                 let event = match producer.as_ref() {
                     Some(p) => run_send_in_txn(p, txn_id, bytes).await,
-                    None => Event::SendInTxnError {
-                        kind: "producer-dropped".to_owned(),
-                    },
+                    None => producer_dropped_send_in_txn_error(),
                 };
                 stream.push(event);
             }
@@ -356,6 +350,21 @@ async fn ensure_part_consumer<'a>(
         map.insert(partition, c);
     }
     Ok(map.get(&partition).expect("inserted above"))
+}
+
+/// Stable bucket for a send op replayed after [`Op::DropProducer`]
+/// released the producer — both runners must collapse to the same kind.
+fn producer_dropped_send_error() -> Event {
+    Event::SendError {
+        kind: "producer-dropped".to_owned(),
+    }
+}
+
+/// [`Op::SendInTxn`] sibling of [`producer_dropped_send_error`].
+fn producer_dropped_send_in_txn_error() -> Event {
+    Event::SendInTxnError {
+        kind: "producer-dropped".to_owned(),
+    }
 }
 
 async fn run_send_partition(

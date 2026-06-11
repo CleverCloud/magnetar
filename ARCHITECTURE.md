@@ -475,6 +475,20 @@ drop(state);                             // Wrong-order acquisition under
 
 The contract is enforced by code review + the `lock_ordering_global_then_per_slot_does_not_deadlock` smoke test in [`crates/magnetar-proto/tests/slot_hot_path.rs`](crates/magnetar-proto/tests/slot_hot_path.rs).
 
+### Producer close semantics (ADR-0057)
+
+Two close paths exist, with different reliability contracts.
+
+- **Explicit `Producer::close().await`** — the reliable path.
+  Enqueues `CommandCloseProducer` via `Connection::close_producer`, wakes the driver, and awaits the broker ack through a `RequestFut` that drains the recorded `OpOutcome` with `take_outcome`.
+- **Last-clone drop (RAII)** — the safety net.
+  Every `Producer` clone shares one `Arc<ProducerCloseGuard>`; when the last clone drops, the guard fires `Connection::close_producer_forget` — encode + wake, never await.
+  The proto layer registers the request as `ProducerCloseForgotten` and consumes the broker ack in-place: recording an `OpOutcome` would leak one permanent entry per dropped producer, since no future will ever drain it.
+  A broker rejection surfaces as a structured `warn!` (ADR-0054) instead of being silently swallowed.
+
+The guard is the one `Drop` impl that touches both lock tiers: it probes `slot.state.lock().closed`, **releases** that guard, then takes the global connection mutex — sequential acquisition, never nested, so the ADR-0038 global→per-slot order is respected.
+The `closed`-flag dedup covers only a preceding completed client-initiated close; broker-initiated detach keeps `closed = false` on purpose (re-attach on PIP-188 migration / failover), so a drop after broker detach emits one redundant — and broker-tolerated — `CloseProducer`.
+
 ---
 
 ## The driver loop
