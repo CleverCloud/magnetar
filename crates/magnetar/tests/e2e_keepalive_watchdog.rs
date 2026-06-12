@@ -31,7 +31,7 @@
 //! the post-black-hole `send()` would hang until the test budget expired —
 //! the regression this test guards.
 //!
-//! Pairs with the proto unit tests, the runtime keepalive_watchdog
+//! Pairs with the proto unit tests, the runtime `keepalive_watchdog`
 //! integration tests, and the differential equivalence test (ADR-0024).
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046, no `#[ignore]`, no
