@@ -43,6 +43,7 @@ const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
+static BROKER_RESTART_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
@@ -120,6 +121,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn std::error::Error>>
 {
+    let _restart_guard = BROKER_RESTART_LOCK.lock().await;
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
     // testcontainers maps the broker's 6650 to a random host port and reuses
@@ -254,6 +256,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _restart_guard = BROKER_RESTART_LOCK.lock().await;
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
     // See the producer-restart test for why we wrap in
@@ -408,6 +411,8 @@ async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
     use magnetar::runtime_moonpool::{Client as MoonpoolClient, MoonpoolEngine};
     use moonpool_core::TokioProviders;
 
+    let _restart_guard = BROKER_RESTART_LOCK.lock().await;
+
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
     // Strip the `pulsar://` scheme: the moonpool engine dials a raw
@@ -540,6 +545,7 @@ fn assert_no_session_lost_leak<E: std::fmt::Debug>(e: &E, op: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _restart_guard = BROKER_RESTART_LOCK.lock().await;
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
     let failover = ControlledClusterFailover::new(service_url);
@@ -703,6 +709,7 @@ async fn spawn_handshake_failing_stub() -> Result<String, Box<dyn std::error::Er
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint()
 -> Result<(), Box<dyn std::error::Error>> {
+    let _restart_guard = BROKER_RESTART_LOCK.lock().await;
     let (service_url, _admin_url, container) = start_pulsar().await?;
 
     let failover = ControlledClusterFailover::new(service_url);
