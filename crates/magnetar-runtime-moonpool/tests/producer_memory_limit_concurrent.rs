@@ -494,10 +494,20 @@ impl Workload for ClientWorkload {
     }
 }
 
+/// Pinned smoke seed — verified to reach a live connection under the
+/// default chaos network, so the memory-limit contract actually runs
+/// (not connect-blocked). Pinning is load-bearing: an unpinned builder
+/// derives its iteration seed from the wall clock (`SystemTime::now()`
+/// nanos in moonpool-sim's `IterationManager`), which `MOONPOOL_SEED`
+/// does not control, so an unlucky run could be connect-blocked by the
+/// always-on probabilistic dial chaos (ADR-0052) and trip the
+/// non-vacuity assert below with no way to replay the failure (#160).
+const SMOKE_SEED: u64 = 0x4242_4242_4242_4242;
+
 /// Single-seed smoke: connect, open a producer against a 64-byte budget,
 /// and assert the under-limit send succeeds while the over-limit send is
 /// rejected with `MemoryLimitExceeded`. Cheap; runs on every push. The
-/// default builder seed reaches a live connection, so the memory-limit
+/// pinned `SMOKE_SEED` reaches a live connection, so the memory-limit
 /// contract is actually exercised here (asserted via `contract_runs`).
 #[test]
 fn moonpool_producer_memory_limit_fail_immediately_smoke() {
@@ -507,6 +517,7 @@ fn moonpool_producer_memory_limit_fail_immediately_smoke() {
         .run_time_budget(RUN_TIME_BUDGET)
         .workload(BrokerWorkload)
         .workload(client)
+        .set_debug_seeds(vec![SMOKE_SEED])
         .set_iterations(1)
         .run();
     // `run()` returning, with `check()` rejecting any non-(Ok, rejected)
