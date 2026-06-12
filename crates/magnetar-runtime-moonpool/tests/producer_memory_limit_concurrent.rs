@@ -32,6 +32,35 @@
 //! never perturbs the simulated schedule. Every seed is bit-for-bit
 //! reproducible.
 //!
+//! ## Connect chaos is in scope — the memory-limit contract is gated on a live connection (ADR-0052)
+//!
+//! `SimulationBuilder::new()` runs every iteration under the default
+//! `moonpool_sim` network, whose `ConnectFailureMode::Probabilistic`
+//! (a `FoundationDB` `SIM_CONNECT_ERROR_MODE = 2` port) makes each initial
+//! dial either fail fast or **hang forever**, by design "to test timeout
+//! handling in connection retry logic" — and there is **no** moonpool API
+//! to disable it from the builder or a workload (`with_network_config` is
+//! read-only). On a fraction of seeds the `connect → open_producer`
+//! handshake therefore never completes within magnetar's dual-cap dial
+//! budget (`connect_timeout` × `connect_max_retries`, bounded by
+//! `operation_timeout`; [ADR-0052](../../../specs/adr/0052-initial-connect-timeout-retry.md)).
+//! That is a *bounded connect outcome*, not a memory-limit-contract
+//! violation: the reservation CAS lives entirely client-side and is never
+//! reached when the dial is blocked.
+//!
+//! So the contract this test pins is **conditional on a live connection**:
+//! when the dial + `open_producer` succeed (the common case, and every seed
+//! across the broader seed space), the under-limit / over-limit contract
+//! above MUST hold; when the chaos network bounds the dial before a
+//! producer exists, that seed records a non-failing `connect_blocked`
+//! outcome (mirroring `connect_resilience.rs`, the ADR-0052 reference
+//! pattern). The silent-park case — a dial that neither connects nor
+//! surfaces a bounded error — is still a hard failure (it trips the
+//! orchestrator's `run_time_budget` detector). This matches the
+//! `sim_chaos_*` and `connect_resilience` sweeps, which assert bounded
+//! termination rather than unconditional connect success under the same
+//! default chaos.
+//!
 //! ## Runtime-test-parity
 //!
 //! Two `#[test]` functions live here; the mirrored
@@ -103,11 +132,20 @@ fn outgoing(len: usize) -> OutgoingMessage {
     }
 }
 
-/// Outcome the client workload records. Both fields are asserted in
-/// `check()`: the under-limit send must have resolved `Ok`, the over-limit
-/// send must have surfaced `MemoryLimitExceeded`.
+/// Outcome the client workload records. The memory-limit contract fields
+/// (`under_limit_ok`, `over_limit_rejected`) are asserted in `check()` /
+/// the in-`run()` gate **only when a connection was established**: the
+/// under-limit send must have resolved `Ok`, the over-limit send must have
+/// surfaced `MemoryLimitExceeded`. When `connect_blocked` is set, the chaos
+/// network bounded the dial before a producer existed (ADR-0052) — a valid,
+/// non-failing outcome with no memory-limit assertion to make.
 #[derive(Clone, Debug, Default)]
 struct SendOutcome {
+    /// `Some(reason)` when `connect` / `open_producer` surfaced a bounded
+    /// failure under the default `ConnectFailureMode::Probabilistic` chaos
+    /// (ADR-0052), so the workload never reached the reservation path.
+    /// `None` when a producer was opened and the contract below applies.
+    connect_blocked: Option<String>,
     /// `Some(true)` when the under-limit send resolved `Ok(MessageId)`;
     /// `Some(false)` if it errored; `None` if the workload never reached it.
     under_limit_ok: Option<bool>,
@@ -290,16 +328,32 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
 
 /// Client workload: connect, open a non-batching producer against a tiny
 /// memory budget, then issue one under-limit and one over-limit send.
-/// Records both outcomes for `check()`.
+/// Records both outcomes for `check()`. Under the default
+/// `ConnectFailureMode::Probabilistic` chaos (ADR-0052) some iterations
+/// bound the dial before a producer exists; those record `connect_blocked`
+/// and exercise no memory-limit assertion.
 struct ClientWorkload {
     outcome: Arc<Mutex<SendOutcome>>,
+    /// Cumulative count of iterations that reached a live connection and
+    /// satisfied the memory-limit contract. Shared across the reused
+    /// workload instance so the sweep test can assert non-vacuity (at least
+    /// one seed actually exercised the reservation, rather than every seed
+    /// having been connect-blocked by chaos).
+    contract_runs: Arc<Mutex<usize>>,
 }
 
 impl ClientWorkload {
     fn new() -> Self {
         Self {
             outcome: Arc::new(Mutex::new(SendOutcome::default())),
+            contract_runs: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Handle to the cumulative contract-exercised counter for the
+    /// non-vacuity assertion in the sweep test.
+    fn contract_runs(&self) -> Arc<Mutex<usize>> {
+        self.contract_runs.clone()
     }
 }
 
@@ -325,22 +379,63 @@ impl Workload for ClientWorkload {
             ..ConnectionConfig::default()
         };
 
-        let client = Client::connect_plain(&engine, &addr, cfg)
-            .await
-            .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
+        // The initial dial runs under the default
+        // `ConnectFailureMode::Probabilistic` chaos (ADR-0052): a fraction
+        // of seeds bound the dial (fail-fast or hang-then-timeout) before a
+        // connection exists. magnetar's dual cap guarantees that surfaces as
+        // a bounded `Err` here — never a silent park (the silent-park case
+        // would trip the orchestrator's `run_time_budget` detector instead).
+        // A bounded dial failure is NOT a memory-limit violation: the
+        // reservation CAS is never reached. Record it and return `Ok` so the
+        // iteration does not land in `failed_runs`.
+        let client = match Client::connect_plain(&engine, &addr, cfg).await {
+            Ok(client) => client,
+            Err(e) => {
+                self.outcome.lock().connect_blocked = Some(format!("connect: {e:?}"));
+                return Ok(());
+            }
+        };
 
-        let producer = client
+        let producer = match client
             .open_producer(CreateProducerRequest {
                 topic: "persistent://public/default/mem-limit".to_owned(),
                 enable_batching: false,
                 ..Default::default()
             })
             .await
-            .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
+        {
+            Ok(producer) => producer,
+            Err(e) => {
+                self.outcome.lock().connect_blocked = Some(format!("open_producer: {e:?}"));
+                client.close().await;
+                return Ok(());
+            }
+        };
 
-        // (1) Under-limit send — must reserve, ride the wire, and resolve
-        // Ok(MessageId) once the broker's SendReceipt lands.
-        let under = producer.send(outgoing(UNDER_LIMIT_PAYLOAD)).await.is_ok();
+        // Connection is live — the memory-limit contract now applies.
+        // (1) Under-limit send — reserves (16 B < 64 B budget, CAS succeeds),
+        // rides the wire, and resolves `Ok(MessageId)` once the broker's
+        // `SendReceipt` lands. But the wire round-trip runs over the default
+        // chaos network (ADR-0052), which can tear the connection down
+        // mid-flight: an unsupervised `connect_plain` driver then resolves
+        // the pending send with `OpOutcome::Terminal` → `PeerClosed` (or
+        // `Closed` on a local close race). That is a *transport* outcome, not
+        // a memory-limit violation — the reservation CAS already succeeded —
+        // so treat it like a connect-blocked seed: record it and return `Ok`
+        // without asserting the contract. Any other error (a genuine send
+        // failure on a live wire) flows through to the contract gate below.
+        let under_res = producer.send(outgoing(UNDER_LIMIT_PAYLOAD)).await;
+        if matches!(
+            under_res,
+            Err(magnetar_runtime_moonpool::ClientError::PeerClosed
+                | magnetar_runtime_moonpool::ClientError::Closed)
+        ) {
+            self.outcome.lock().connect_blocked =
+                Some(format!("under-limit send: {:?}", under_res.err()));
+            client.close().await;
+            return Ok(());
+        }
+        let under = under_res.is_ok();
         self.outcome.lock().under_limit_ok = Some(under);
 
         // (2) Over-limit send — a single payload larger than the whole
@@ -361,17 +456,33 @@ impl Workload for ClientWorkload {
         // memory-limit contract HERE in `run()`, whose `Err` DOES land the
         // iteration in `failed_runs` and fail the test. (The `check()` below
         // stays as belt-and-suspenders documentation but is not the gate.)
+        // Only reached on the live-connection path, so `under` /
+        // `over_rejected` are the actual reservation outcomes.
         if !under || !over_rejected {
             return Err(SimulationError::InvalidState(format!(
                 "memory-limit contract violated: under_limit_ok={under} (expected true), \
                  over_limit_rejected={over_rejected} (expected true)"
             )));
         }
+        // The reservation contract was actually exercised this iteration —
+        // count it for the sweep's non-vacuity guard.
+        *self.contract_runs.lock() += 1;
         Ok(())
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
         let outcome = self.outcome.lock().clone();
+        // Chaos bounded the dial before a producer existed (ADR-0052):
+        // surface it for diagnostics, but it is a valid non-failing outcome
+        // with no memory-limit assertion to make.
+        if let Some(reason) = outcome.connect_blocked {
+            tracing::info!(
+                capture = true,
+                trail = "memory_limit_connect_blocked",
+                reason = %reason,
+            );
+            return Ok(());
+        }
         match (outcome.under_limit_ok, outcome.over_limit_rejected) {
             (Some(true), Some(true)) => Ok(()),
             (under, over) => Err(SimulationError::InvalidState(format!(
@@ -385,13 +496,17 @@ impl Workload for ClientWorkload {
 
 /// Single-seed smoke: connect, open a producer against a 64-byte budget,
 /// and assert the under-limit send succeeds while the over-limit send is
-/// rejected with `MemoryLimitExceeded`. Cheap; runs on every push.
+/// rejected with `MemoryLimitExceeded`. Cheap; runs on every push. The
+/// default builder seed reaches a live connection, so the memory-limit
+/// contract is actually exercised here (asserted via `contract_runs`).
 #[test]
 fn moonpool_producer_memory_limit_fail_immediately_smoke() {
+    let client = ClientWorkload::new();
+    let contract_runs = client.contract_runs();
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
         .workload(BrokerWorkload)
-        .workload(ClientWorkload::new())
+        .workload(client)
         .set_iterations(1)
         .run();
     // `run()` returning, with `check()` rejecting any non-(Ok, rejected)
@@ -406,18 +521,31 @@ fn moonpool_producer_memory_limit_fail_immediately_smoke() {
         report.failed_runs, 0,
         "the memory-limit contract must hold on the smoke seed: {report:?}",
     );
+    assert_eq!(
+        *contract_runs.lock(),
+        1,
+        "the smoke seed must reach a live connection and exercise the \
+         memory-limit contract (not connect-blocked): {report:?}",
+    );
 }
 
-/// 8-seed sweep — the reservation outcome is a deterministic function of
-/// the payload sizes, so it must hold on every seed regardless of the
-/// simulated I/O interleaving the seed selects. A regression in the
-/// reservation CAS or the policy dispatch would flip `failed_runs`.
+/// 8-seed sweep — wherever the chaos network lets the connection through,
+/// the reservation outcome is a deterministic function of the payload sizes,
+/// so the under-limit-Ok / over-limit-rejected contract must hold; a
+/// regression in the reservation CAS or the policy dispatch would flip
+/// `failed_runs`. Seeds whose dial is bounded by the default
+/// `ConnectFailureMode::Probabilistic` chaos before a producer exists
+/// (ADR-0052) record a non-failing `connect_blocked` outcome — they exercise
+/// no reservation, so they cannot fail the contract, but the non-vacuity
+/// guard below requires at least one seed to have actually exercised it.
 #[test]
 fn moonpool_producer_memory_limit_fail_immediately_sweep_8_seeds() {
+    let client = ClientWorkload::new();
+    let contract_runs = client.contract_runs();
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
         .workload(BrokerWorkload)
-        .workload(ClientWorkload::new())
+        .workload(client)
         .set_debug_seeds(sweep_seeds(8))
         .set_iterations(8)
         .run();
@@ -427,7 +555,14 @@ fn moonpool_producer_memory_limit_fail_immediately_sweep_8_seeds() {
     );
     assert_eq!(
         report.failed_runs, 0,
-        "every seed must satisfy the memory-limit contract \
-         (under-limit Ok, over-limit MemoryLimitExceeded): {report:?}",
+        "no live-connection seed may violate the memory-limit contract \
+         (under-limit Ok, over-limit MemoryLimitExceeded); connect-blocked \
+         seeds are bounded chaos outcomes, not failures: {report:?}",
+    );
+    assert!(
+        *contract_runs.lock() >= 1,
+        "non-vacuity: at least one seed must reach a live connection and \
+         exercise the memory-limit reservation — every seed was \
+         connect-blocked by chaos (contract never tested): {report:?}",
     );
 }
