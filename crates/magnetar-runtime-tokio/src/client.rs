@@ -312,6 +312,9 @@ impl Client {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // Snapshot the post-dial handshake budget before `config` is moved
+        // into `ConnectionShared` (ADR-0052, extended to the handshake).
+        let operation_timeout = config.operation_timeout;
         let shared = ConnectionShared::with_auth(config, auth_provider);
 
         // Queue the CONNECT frame BEFORE spawning the driver — otherwise the driver might block
@@ -322,9 +325,14 @@ impl Client {
 
         let driver = spawn_driver(shared.clone(), socket);
 
-        // Park until the state machine emits `ConnectionEvent::Connected`. We do this with a
-        // local future that polls the event queue.
-        match wait_connected(shared.clone()).await {
+        // Park until the state machine emits `ConnectionEvent::Connected`,
+        // bounded by `operation_timeout`. A peer that accepts the socket but
+        // never replies to CONNECT (ADR-0052 — the dual cap scopes only to
+        // the dial) would otherwise park `wait_connected` forever; the
+        // timeout surfaces a bounded `Io(TimedOut)` instead (Java
+        // `operationTimeoutMs` parity). Mirrors the pool path's existing
+        // `tokio::time::timeout(operation_timeout, wait_connected)`.
+        match bounded_wait_connected(shared.clone(), operation_timeout).await {
             Ok(()) => {
                 // Lifecycle record (ADR-0054). The generic-socket path has no
                 // URL, so the dial target is reported as the transport kind.
@@ -376,6 +384,9 @@ impl Client {
             dns_resolver: dns_resolver.clone(),
         };
 
+        // Snapshot the post-dial handshake budget before `config` is moved
+        // into `ConnectionShared` (ADR-0052, extended to the handshake).
+        let operation_timeout = config.operation_timeout;
         let shared = ConnectionShared::with_auth(config, auth_provider);
 
         shared.inner.lock().begin_handshake()?;
@@ -395,7 +406,9 @@ impl Client {
         };
         let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
 
-        match wait_connected(shared.clone()).await {
+        // Bounded by `operation_timeout` — see `start_handshake` for the
+        // rationale (ADR-0052, extended to the post-dial handshake).
+        match bounded_wait_connected(shared.clone(), operation_timeout).await {
             Ok(()) => {
                 // Lifecycle record (ADR-0054). `auth_method` is the
                 // provider's method name — NEVER `auth_data` (no-secrets
@@ -1319,6 +1332,28 @@ pub(crate) async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), 
         helper: None,
     }
     .await
+}
+
+/// [`wait_connected`] bounded by `operation_timeout` (ADR-0052, extended to
+/// the post-dial handshake). A broker that accepts the socket but never
+/// replies to `CommandConnect` would park `wait_connected` forever; the
+/// timeout abandons the handshake with a bounded `Io(TimedOut)` instead
+/// (Java `operationTimeoutMs` parity). Mirrors the pool path's existing
+/// `tokio::time::timeout(operation_timeout, wait_connected)` (`pool.rs`).
+pub(crate) async fn bounded_wait_connected(
+    shared: Arc<ConnectionShared>,
+    operation_timeout: std::time::Duration,
+) -> Result<(), ClientError> {
+    match tokio::time::timeout(operation_timeout, wait_connected(shared)).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "handshake exceeded operation_timeout ({operation_timeout:?}): broker accepted \
+                 the connection but never completed CONNECT -> CONNECTED"
+            ),
+        ))),
+    }
 }
 
 /// Future that resolves once the state machine reports `HandshakeState::Connected` (or fails if

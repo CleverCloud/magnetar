@@ -147,8 +147,24 @@ pub struct Connection {
     next_consumer_id: u64,
     /// Next watcher id.
     next_watcher_id: u64,
-    /// Time of last outbound or inbound traffic (for keepalive).
+    /// Time the keepalive watchdog last observed **forward progress** — a
+    /// fully decoded inbound frame or a freshly sent keepalive ping. Refreshed
+    /// per *decoded frame*, never per raw inbound chunk: a desynced-but-chatty
+    /// socket (e.g. a bit-flip on the un-checksummed outer `total_size` prefix
+    /// that yields a plausible-but-never-satisfied length, so
+    /// [`crate::frame::peek_full_frame_len`] returns `Incomplete` forever) must
+    /// NOT keep resetting this baseline by dribbling bytes that never frame.
+    /// ([ADR-0058](../specs/adr/0058-keepalive-watchdog-progress-based.md))
     last_activity: Option<Instant>,
+    /// Whether a keepalive `CommandPing` has been emitted but not yet answered
+    /// by any inbound frame. Armed when [`Self::handle_timeout`] sends a ping;
+    /// cleared the moment a decoded frame proves the peer is still talking. If a
+    /// second consecutive keepalive interval elapses with the flag still armed,
+    /// the watchdog escalates to [`Self::mark_disconnected`] (→
+    /// [`HandshakeState::Failed`], which the driver treats as `should_close` →
+    /// supervised reconnect) instead of dead-pinging a wedged socket forever.
+    /// ([ADR-0058](../specs/adr/0058-keepalive-watchdog-progress-based.md))
+    keepalive_ping_outstanding: bool,
     /// Wall-clock time of the most recent transition to [`HandshakeState::Connected`].
     /// Mirrors Java's `Producer/Consumer#getLastDisconnectedTimestamp` companion: useful
     /// for application-level health probes and reconnect diagnostics.
@@ -341,6 +357,7 @@ impl Connection {
             next_consumer_id: 0,
             next_watcher_id: 0,
             last_activity: None,
+            keepalive_ping_outstanding: false,
             last_connected_at: None,
             last_disconnected_at: None,
             session_epoch: 0,
@@ -845,6 +862,11 @@ impl Connection {
         {
             self.last_activity = None;
         }
+        // A fresh session starts with a clean keepalive watchdog: no ping is in
+        // flight against the new socket (ADR-0058). Cleared unconditionally — the
+        // `connection.reset.delay` buggify only ages `last_activity`, it must not
+        // carry a stale outstanding-ping flag across the reconnect.
+        self.keepalive_ping_outstanding = false;
     }
 
     /// Resolve **every** pending operation with a terminal
@@ -1271,7 +1293,10 @@ impl Connection {
         now: Instant,
         chunk: BytesMut,
     ) -> Result<(), ProtocolError> {
-        self.last_activity = Some(now);
+        // NB: the keepalive baseline (`last_activity`) is refreshed per *decoded
+        // frame* inside `handle_bytes_decode_loop`, NOT here per raw chunk. A
+        // desynced socket that keeps dribbling bytes which never satisfy the
+        // announced `total_size` must not reset the watchdog (ADR-0058).
         if self.inbound.is_empty() {
             // Common case: the previous call drained a full frame and
             // left `inbound` empty. Replace the empty staging buffer
@@ -1287,7 +1312,9 @@ impl Connection {
 
     /// Feed inbound bytes to the state machine.
     pub fn handle_bytes(&mut self, now: Instant, bytes: &[u8]) -> Result<(), ProtocolError> {
-        self.last_activity = Some(now);
+        // The keepalive baseline is refreshed per *decoded frame* in
+        // `handle_bytes_decode_loop`, not here per raw chunk — see the note on
+        // [`Self::handle_bytes_owned`] and ADR-0058.
         self.inbound.extend_from_slice(bytes);
         self.handle_bytes_decode_loop(now)
     }
@@ -1327,6 +1354,18 @@ impl Connection {
             // count. Now we know the exact frame length up front and
             // never copy.
             let mut frame_bytes = self.inbound.split_to(frame_len).freeze();
+
+            // Forward progress: a complete frame was carved off the wire. Refresh
+            // the keepalive watchdog baseline and clear any outstanding ping —
+            // the peer is demonstrably still framing. This is the ONLY
+            // `last_activity` refresh on the read path (ADR-0058); doing it here
+            // rather than per raw chunk means a desynced-but-chatty socket whose
+            // bytes never satisfy the announced `total_size` cannot keep the
+            // watchdog alive. Covers every decode outcome below (v4 frame,
+            // scalable command, even a CRC-mismatch drop): all three consumed a
+            // real, fully-framed unit off the stream.
+            self.last_activity = Some(now);
+            self.keepalive_ping_outstanding = false;
 
             // PIP-460 (ADR-0031): the scalable-topic commands (`BaseCommand`
             // types 80-85) are hand-encoded and NOT present in the generated
@@ -1422,7 +1461,11 @@ impl Connection {
                 self.encode_command(&pong)?;
             }
             pb::base_command::Type::Pong => {
-                // Nothing to do — last_activity already updated above.
+                // Nothing to do — the keepalive baseline was refreshed and any
+                // outstanding ping cleared by the per-decoded-frame progress
+                // update in `handle_bytes_decode_loop` (ADR-0058). A pong is the
+                // direct answer to our ping, but ANY decoded frame proves the
+                // peer is alive, so the watchdog reset is not pong-specific.
             }
             pb::base_command::Type::AuthChallenge => {
                 let challenge = command
@@ -2676,13 +2719,30 @@ impl Connection {
             _ => false,
         };
         if due && self.is_connected() {
-            let ping = pb::BaseCommand {
-                r#type: pb::base_command::Type::Ping as i32,
-                ping: Some(pb::CommandPing {}),
-                ..Default::default()
-            };
-            let _ = self.encode_command(&ping);
-            self.last_activity = Some(now);
+            if self.keepalive_ping_outstanding {
+                // Second consecutive keepalive interval elapsed without a single
+                // decoded inbound frame to clear the prior ping — the socket is
+                // wedged (desynced framing, half-open TCP, or a black-holing
+                // peer). Escalate instead of dead-pinging forever: flip to
+                // `Failed`, which the driver reads as `should_close` and hands to
+                // the supervisor for a reconnect (ADR-0058). `mark_disconnected`
+                // records the disconnect timestamp and snaps the handshake state.
+                tracing::warn!(
+                    target: "magnetar_proto::conn",
+                    keepalive_interval_ms = self.config.keepalive_interval.as_millis() as u64,
+                    "keepalive ping unanswered for two intervals; failing connection",
+                );
+                self.mark_disconnected();
+            } else {
+                let ping = pb::BaseCommand {
+                    r#type: pb::base_command::Type::Ping as i32,
+                    ping: Some(pb::CommandPing {}),
+                    ..Default::default()
+                };
+                let _ = self.encode_command(&ping);
+                self.keepalive_ping_outstanding = true;
+                self.last_activity = Some(now);
+            }
         }
 
         // Tracker-driven redeliveries — both negative-ack delay and unacked-message timeout
@@ -8045,6 +8105,161 @@ mod conn_state_tests {
         assert_eq!(
             conn.lookup.max_pending, 4,
             "max_pending_lookups cap MUST be re-applied to the freshly-allocated lookup registry"
+        );
+    }
+
+    /// Drive a connection through the handshake and return it Connected with a
+    /// known `keepalive_interval`, the outbound buffer drained. Shared setup for
+    /// the ADR-0058 keepalive-watchdog tests below.
+    fn connected_conn(keepalive: Duration) -> Connection {
+        let cfg = ConnectionConfig {
+            keepalive_interval: keepalive,
+            ..ConnectionConfig::default()
+        };
+        let mut conn = Connection::new(cfg, std::sync::Arc::new(std::time::SystemTime::now));
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes_owned(Instant::now(), handshake_response_bytes())
+            .expect("handshake completes");
+        assert!(conn.is_connected(), "fixture must reach Connected");
+        let _ = conn.poll_transmit(); // drain Connect frame + any pong
+        conn
+    }
+
+    /// A `ping` is a self-contained no-payload frame; a fresh decode of one
+    /// proves "the peer is still framing" without any session state.
+    fn ping_frame_bytes() -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Ping as i32,
+            ping: Some(pb::CommandPing {}),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandPing");
+        buf
+    }
+
+    #[test]
+    fn keepalive_baseline_refreshes_per_decoded_frame_not_per_raw_chunk() {
+        // ADR-0058: the keepalive watchdog baseline (`last_activity`) must be
+        // refreshed by a *decoded frame*, never by a raw inbound chunk. A
+        // desynced-but-chatty socket — bytes whose announced `total_size`
+        // (4-byte big-endian prefix, NOT checksummed) is plausible
+        // (0 < N < MAX_FRAME_SIZE) but whose promised bytes never arrive — makes
+        // `peek_full_frame_len` return `Incomplete` forever. Feeding such bytes
+        // must NOT reset the baseline, otherwise the watchdog never fires on a
+        // wedged-but-noisy connection (issues #187, #221).
+        let keepalive = Duration::from_secs(30);
+        let mut conn = connected_conn(keepalive);
+
+        let t0 = Instant::now();
+        // A complete ping frame at t0 sets the baseline.
+        conn.handle_bytes_owned(t0, ping_frame_bytes())
+            .expect("decode ping");
+        let _ = conn.poll_transmit(); // drain the auto-pong
+        assert_eq!(
+            conn.last_activity,
+            Some(t0),
+            "a decoded frame refreshes the keepalive baseline",
+        );
+
+        // Now feed a desynced chunk: total_size = 1024 (plausible) but only a
+        // few bytes of the promised 1024 follow. `peek_full_frame_len` parks
+        // (Incomplete) — no frame decodes.
+        let mut desync = bytes::BytesMut::new();
+        desync.extend_from_slice(&1024u32.to_be_bytes()); // announced total_size
+        desync.extend_from_slice(b"only-a-handful-of-bytes"); // far short of 1024
+        let t1 = t0 + Duration::from_secs(5);
+        conn.handle_bytes_owned(t1, desync)
+            .expect("desync chunk parks, not an error");
+
+        // The baseline must still be t0 — the chatty-but-frameless chunk did NOT
+        // reset it. The pre-ADR-0058 code refreshed per raw chunk and this would
+        // be `Some(t1)`, wedging the watchdog.
+        assert_eq!(
+            conn.last_activity,
+            Some(t0),
+            "a desynced chunk that decodes no frame must NOT refresh the baseline",
+        );
+    }
+
+    #[test]
+    fn keepalive_watchdog_escalates_to_failed_on_second_missed_interval() {
+        // ADR-0058: when a keepalive ping goes unanswered for a second
+        // consecutive interval, the watchdog escalates to `Failed` (via
+        // `mark_disconnected`) instead of dead-pinging a wedged socket forever.
+        // The driver reads `Failed` as `should_close` → supervised reconnect.
+        let keepalive = Duration::from_secs(30);
+        let mut conn = connected_conn(keepalive);
+
+        let t0 = Instant::now();
+        // Seed a baseline with a decoded frame so the first deadline is t0 + 30s.
+        conn.handle_bytes_owned(t0, ping_frame_bytes())
+            .expect("decode ping");
+        let _ = conn.poll_transmit();
+        assert_eq!(conn.last_activity, Some(t0));
+
+        // First interval elapses with no inbound frame → emit a ping, arm the
+        // outstanding flag, stay Connected.
+        let t1 = t0 + keepalive;
+        conn.handle_timeout(t1);
+        assert!(conn.is_connected(), "first missed interval only pings");
+        let out = conn.poll_transmit();
+        assert!(
+            !out.is_empty(),
+            "first missed interval emits a keepalive ping",
+        );
+
+        // Second interval elapses still with no inbound frame → escalate to
+        // Failed. The driver treats Failed as should_close.
+        let t2 = t1 + keepalive;
+        conn.handle_timeout(t2);
+        assert!(
+            !conn.is_connected(),
+            "second consecutive unanswered interval must fail the connection",
+        );
+        assert_eq!(
+            conn.state(),
+            HandshakeState::Failed,
+            "watchdog escalates to Failed, not another ping",
+        );
+    }
+
+    #[test]
+    fn keepalive_inbound_frame_clears_outstanding_ping() {
+        // ADR-0058: a single decoded inbound frame between two keepalive
+        // intervals clears the outstanding ping, so the watchdog re-arms from
+        // scratch rather than escalating — a live-but-slow peer is never failed.
+        let keepalive = Duration::from_secs(30);
+        let mut conn = connected_conn(keepalive);
+
+        let t0 = Instant::now();
+        conn.handle_bytes_owned(t0, ping_frame_bytes())
+            .expect("decode ping");
+        let _ = conn.poll_transmit();
+
+        // First interval: ping goes out, outstanding flag armed.
+        let t1 = t0 + keepalive;
+        conn.handle_timeout(t1);
+        assert!(conn.keepalive_ping_outstanding, "ping is now outstanding");
+        let _ = conn.poll_transmit();
+
+        // The peer answers (any decoded frame counts) before the next interval.
+        let t_reply = t1 + Duration::from_secs(1);
+        conn.handle_bytes_owned(t_reply, ping_frame_bytes())
+            .expect("decode peer frame");
+        let _ = conn.poll_transmit();
+        assert!(
+            !conn.keepalive_ping_outstanding,
+            "a decoded inbound frame clears the outstanding ping",
+        );
+
+        // Next interval: because the flag was cleared, this only pings again —
+        // it does NOT escalate.
+        let t2 = t_reply + keepalive;
+        conn.handle_timeout(t2);
+        assert!(
+            conn.is_connected(),
+            "a live peer is never failed; the watchdog re-arms cleanly",
         );
     }
 }

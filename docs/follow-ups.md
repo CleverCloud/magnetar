@@ -25,6 +25,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                         |
 | 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🧠 engine/harness features + a supervision-semantics design pass                                 |
 | 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟡 2 engine residuals (fast-fail, lookup-retry) + 3 pre-existing test-state caveats              |
+| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                      |
 
 ---
 
@@ -103,6 +104,7 @@ Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
   It keeps the full `cargo test --workspace --all-features` run (and the per-PR `test` CI job) red until addressed separately; this is a `magnetar-admin` / Pulsar-version concern, not a survivability one.
 - **Seed-13 `replicated_subscriptions::consumer_emits_marker_observation_in_order` flake.** Pre-existing seed-flakiness (passes on re-run and in isolation).
   The deterministic `sim_chaos` surface this change edits is clean on every seed `1..32`.
+  See [§5.1](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes) — this flake is plausibly the latent lost-wakeup race in the marker accessor, surfaced by the seed-sweep work.
 - **`check-sim-coverage` reports ~77 uncovered lines.** The diff is computed vs `origin/main`, so it bundles the prior terminal-outcome commit plus line-number-shift artifacts of pre-existing code; the behavioral lines this change adds (the `Closed → PeerClosed` waiter mappings, the decode-fatal broker hook, the fatal-on-send arm) are exercised by the new differential + integration tests.
   The gate is local-first / scheduled-CI (it short-circuits on `main`); dispatch it from a feature branch for true patch gating once `feat/logging` lands on `main`.
 
@@ -115,6 +117,35 @@ The mid-scenario **drop + redial** knob §3.2 asks for is still open.
 
 ```text
 /goal implement terminal-state fast-fail for NEW operations per docs/follow-ups.md §4.1. When a plain connection is already terminal (handshake state Failed/Closed), the send / request-issue / subscribe paths must return ClientError::PeerClosed synchronously instead of registering a pending op that never resolves. Mirror across both engines (ADR-0024 1:1) with proto unit + tokio/moonpool integration twins + a differential layer. Validation chain per CLAUDE.md.
+```
+
+---
+
+## 5. Residuals surfaced by the moonpool seed-sweep fixes
+
+Found while reproducing and fixing the daily-sweep `seed-failure` issues (the `fix/moonpool-seed-sweep-fixes` series: post-dial handshake timeout, progress-based keepalive watchdog [ADR-0058](../specs/adr/0058-keepalive-watchdog-progress-based.md), anti-thrash cooldown gating, memory-limit live-connection gating).
+Neither residual blocks that series.
+
+1. **Replicated-subscription marker accessor lost-wakeup race (latent).**
+   `Client::next_replicated_subscription_marker` (tokio `crates/magnetar-runtime-tokio/src/client.rs`, moonpool `crates/magnetar-runtime-moonpool/src/client.rs`) loops `pop_front()` → `is_closed()` → `notified().await`, enrolling the `Notify` waiter _after_ the empty check; the driver pushes the observation then calls `notify_waiters()`, which stores no permit, so a marker delivered in that gap is lost and the future hangs.
+   This is the exact shape already fixed for `SubscribeAckedFut` at `crates/magnetar-runtime-moonpool/src/consumer.rs:1494-1505`.
+   It is real by inspection but not currently seed-reproducible: the `replicated_subscriptions` suite runs over real-TCP `TokioProviders`, not `SimProviders`, so it is non-deterministic and never drives the parked-waiter gap — which is why issue #157's seed passes on `main` and the [§4](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) "seed-13 marker flake" caveat only manifests intermittently.
+   Fix: the enroll-before-drain idiom already used at `producer.rs:510-513`, mirrored 1:1 across both engines; a deterministic regression test needs a new `SimulationBuilder` / `SimProviders`-driven `replicated_subscriptions` harness with a delayed-marker broker.
+
+2. **`tls_handshake_chaos.rs` hardcodes the ring crypto provider (build gap).**
+   `crates/magnetar-runtime-tokio/tests/tls_handshake_chaos.rs:23` calls `rustls::crypto::ring::default_provider()` with no `#[cfg(feature = "crypto-ring")]` gate, so `cargo build` / `test` / `clippy -p magnetar-runtime-tokio --no-default-features --features crypto-aws-lc-rs` fails to compile (`E0433`) — the single-provider feature set the moonpool sweep and the per-PR `seed-replay` job use.
+   Pre-existing (reproduces on the base branch); it blocks a single-provider tokio test build but is unrelated to any seed fix.
+   Fix: gate the test on `crypto-ring`, or derive the provider from the active feature like the rest of the tokio TLS surface.
+
+**Partial progress on [§3.3](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).**
+The handshake-timeout fix bounds the post-dial CONNECT→CONNECTED handshake by `operation_timeout` (surfacing `Io(TimedOut)` instead of hanging when a broker accepts TCP but never answers `CommandConnect`), so a wedged handshake now fails fast; the §3.3 budget-counting residual (handshake failures restart the dial cycle with `attempt = 1`) is unchanged.
+
+**Why it stays open.** §5.1 is an engine concurrency fix with its own ADR-0024 obligations plus a new SimProviders harness; §5.2 is a one-line test feature-gate.
+
+**`/goal` (marker lost-wakeup §5.1).**
+
+```text
+/goal fix the replicated-subscription marker accessor lost-wakeup race per docs/follow-ups.md §5.1. Move the replicated_subscription_marker_notify.notified() enrollment BEFORE the pop_front()/is_closed() drain in next_replicated_subscription_marker in both engines (the producer.rs:510-513 enroll-before-drain idiom), keeping tokio and moonpool at 1:1. Ship the four ADR-0024 layers INCLUDING a new SimProviders/SimulationBuilder-driven replicated_subscriptions harness with a delayed-marker broker that deterministically parks the waiter before the marker arrives. Validation chain per CLAUDE.md.
 ```
 
 ---
