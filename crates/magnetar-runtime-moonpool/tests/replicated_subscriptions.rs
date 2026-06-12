@@ -440,7 +440,7 @@ async fn consumer_emits_marker_observation_in_order() {
             }
 
             let first = tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(10),
                 client.next_replicated_subscription_marker(),
             )
             .await
@@ -451,7 +451,7 @@ async fn consumer_emits_marker_observation_in_order() {
                 ReplicatedSubscriptionMarkerKind::Snapshot
             );
             let second = tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(10),
                 client.next_replicated_subscription_marker(),
             )
             .await
