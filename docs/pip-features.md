@@ -539,7 +539,8 @@ These are the two explicit non-goals locked in [ADR-0034](../specs/adr/0034-pip-
   Run via `cargo test -p magnetar-proto`.
 - **Runtime parity (ADR-0024)**: 5 tokio + 5 moonpool integration tests under `crates/magnetar-runtime-{tokio,moonpool}/tests/replicated_subscriptions.rs` with identical names — verified by `cargo run -p xtask -- check-runtime-test-parity`.
 - **Differential**: 2 equivalence tests at `crates/magnetar-differential/tests/replicated_subscriptions_equivalence.rs` assert tokio ↔ moonpool produce the same `EventStream` + byte-identical `CommandSubscribe`.
-- **End-to-end**: 2 tests at `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the two-cluster Docker fixture.
+- **End-to-end**: 2 tests at `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the two-cluster Docker fixture: cursor-resume across a cluster failover, and remote materialization of the replicated subscription once the acked position crosses a snapshot window.
+  The client-side marker observation channel is exercised by the scripted sim suites only — real Pulsar dispatchers filter `REPLICATED_SUBSCRIPTION_*` marker entries off consumer delivery, so an e2e can never observe one.
   Runs as a regular `cargo test` per ADR-0046; CI runs them **weekly only** in [`.github/workflows/e2e-replicated-subs.yml`](../.github/workflows/e2e-replicated-subs.yml) per the ADR-0036 cost-shifting precedent.
 
 ### Replicated subscriptions references

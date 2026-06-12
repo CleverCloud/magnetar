@@ -2,11 +2,35 @@
 #
 # Two-cluster Apache Pulsar 4.0 fixture used by
 # crates/magnetar/tests/e2e_replicated_subscriptions.rs to exercise PIP-33
-# (replicated subscriptions). Each cluster runs as a single standalone-style
-# broker against a shared ZooKeeper / Configuration Store; PIP-33 requires the
-# clusters to know about each other via `pulsar-admin clusters create` and the
-# target namespace to have `replicated_subscription_status=true`. See
+# (replicated subscriptions). Each cluster runs a single broker + bookie with
+# its OWN local metadata ZK chroot (`/cluster-a`, `/cluster-b`) over one
+# ZooKeeper process; only the configuration store (`/config-store`) is shared
+# — the real geo-replication topology. Sharing one metadata root merges the
+# two clusters' load managers: broker-a then "redirects" cluster-a lookups to
+# broker-b and no cross-cluster replication (PIP-33 markers) ever happens.
+# PIP-33 requires the clusters to know about each other via `pulsar-admin
+# clusters create` and the consumer to subscribe with
+# `replicate_subscription_state(true)`. See
 # fixtures/configure_replicated_subs.sh for the post-up setup.
+#
+# NETWORKING: every service runs with `network_mode: host` and the brokers
+# advertise `localhost` on their (distinct) host ports. A bridge network
+# cannot work here: the broker's `advertisedAddress` travels in every topic
+# lookup response, and there is only ONE value — a compose-internal hostname
+# (`broker-a`) is unresolvable from the host (the e2e client dies with
+# "failed to lookup address information"), while a host-resolvable name with
+# bridge port-mapping breaks cross-cluster replication (the peer broker's
+# replicator resolves the same advertised address from INSIDE its container,
+# where the host mapping does not exist). Host networking gives both sides
+# the same answer: `localhost:<host-port>` is correct for the host-side e2e
+# client AND for the peer broker's replicator. Ports stay off the default
+# 6650/8080 so the fixture never collides with the `testcontainers`-spawned
+# brokers of the other e2e tests (which advertise `localhost` on their own
+# mapped ports):
+#   cluster-a broker: pulsar://localhost:16650, admin http://localhost:18080
+#   cluster-b broker: pulsar://localhost:16651, admin http://localhost:18081
+#   zookeeper: localhost:2181 — bookies: 127.0.0.1:3181 / 127.0.0.1:3182
+#   bookie stats: 3191 / 3192 (default 8000 collides in the shared netns)
 #
 # Usage (manual):
 #   docker compose -f docker-compose.replicated-subs.yml up -d
@@ -22,6 +46,7 @@ services:
     image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-zookeeper
     restart: unless-stopped
+    network_mode: host
     environment:
       - PULSAR_MEM=-Xms256m -Xmx512m
     command: >
@@ -37,34 +62,42 @@ services:
   pulsar-init:
     image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-init
+    network_mode: host
     depends_on:
       zookeeper:
         condition: service_healthy
     command: >
       bash -c "bin/pulsar initialize-cluster-metadata
                  --cluster cluster-a
-                 --zookeeper zookeeper:2181
-                 --configuration-store zookeeper:2181
-                 --web-service-url http://broker-a:8080
-                 --broker-service-url pulsar://broker-a:6650 &&
+                 --zookeeper localhost:2181/cluster-a
+                 --configuration-store localhost:2181/config-store
+                 --web-service-url http://localhost:18080
+                 --broker-service-url pulsar://localhost:16650 &&
                bin/pulsar initialize-cluster-metadata
                  --cluster cluster-b
-                 --zookeeper zookeeper:2181
-                 --configuration-store zookeeper:2181
-                 --web-service-url http://broker-b:8080
-                 --broker-service-url pulsar://broker-b:6650 || true"
+                 --zookeeper localhost:2181/cluster-b
+                 --configuration-store localhost:2181/config-store
+                 --web-service-url http://localhost:18081
+                 --broker-service-url pulsar://localhost:16651 || true"
 
   bookkeeper-a:
     image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-bk-a
     restart: unless-stopped
+    network_mode: host
     depends_on:
       pulsar-init:
         condition: service_completed_successfully
     environment:
       - clusterName=cluster-a
-      - zkServers=zookeeper:2181
-      - metadataServiceUri=metadata-store:zk:zookeeper:2181
+      - zkServers=localhost:2181/cluster-a
+      - metadataServiceUri=metadata-store:zk:localhost:2181/cluster-a
+      - bookiePort=3181
+      # Distinct per-bookie stats port: under network_mode:host both
+      # bookies would otherwise race to bind the default 0.0.0.0:8000
+      # Prometheus stats listener and one of them dies on BindException.
+      - prometheusStatsHttpPort=3191
+      - advertisedAddress=127.0.0.1
       - PULSAR_MEM=-Xms256m -Xmx512m
     command: >
       bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf &&
@@ -75,32 +108,43 @@ services:
     image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-bk-b
     restart: unless-stopped
+    network_mode: host
     depends_on:
       pulsar-init:
         condition: service_completed_successfully
     environment:
       - clusterName=cluster-b
-      - zkServers=zookeeper:2181
-      - metadataServiceUri=metadata-store:zk:zookeeper:2181
+      - zkServers=localhost:2181/cluster-b
+      - metadataServiceUri=metadata-store:zk:localhost:2181/cluster-b
+      - bookiePort=3182
+      - prometheusStatsHttpPort=3192
+      - advertisedAddress=127.0.0.1
       - PULSAR_MEM=-Xms256m -Xmx512m
     command: >
       bash -c "bin/apply-config-from-env.py conf/bookkeeper.conf &&
+               bin/bookkeeper shell metaformat -nonInteractive -force || true &&
                exec bin/pulsar bookie"
 
   broker-a:
     image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-broker-a
     restart: unless-stopped
+    network_mode: host
     depends_on:
       bookkeeper-a:
         condition: service_started
     environment:
       - clusterName=cluster-a
-      - zookeeperServers=zookeeper:2181
-      - configurationStoreServers=zookeeper:2181
-      - advertisedAddress=broker-a
-      - brokerServicePort=6650
-      - webServicePort=8080
+      - zookeeperServers=localhost:2181/cluster-a
+      - configurationStoreServers=localhost:2181/config-store
+      - advertisedAddress=localhost
+      - brokerServicePort=16650
+      - webServicePort=18080
+      # One bookie per cluster: quorums must be 1 (full-broker defaults
+      # are 2/2/2 and would starve ledger creation).
+      - managedLedgerDefaultEnsembleSize=1
+      - managedLedgerDefaultWriteQuorum=1
+      - managedLedgerDefaultAckQuorum=1
       # PIP-33 snapshot interval — pin to 1s so the e2e cursor-resume
       # tolerance assertion is deterministic.
       - replicatedSubscriptionsSnapshotFrequencyMillis=1000
@@ -108,21 +152,8 @@ services:
     command: >
       bash -c "bin/apply-config-from-env.py conf/broker.conf &&
                exec bin/pulsar broker"
-    # Host ports moved off the default Pulsar 6650 / 8080 so this
-    # fixture doesn't collide with `testcontainers`-spawned brokers
-    # in other e2e tests (`e2e_cluster_failover.rs` etc.), which
-    # internally advertise themselves as `localhost:8080` — any
-    # lookup response routing the client back to host:8080 hits
-    # this fixture's broker-a instead of the testcontainers broker,
-    # producing a "Namespace bundle not served by this instance"
-    # error. ADR-0046 surfaced the conflict by folding the per-PR
-    # `test` job and the (former weekly) PIP-33 fixture into the
-    # same workflow run.
-    ports:
-      - "16650:6650"
-      - "18080:8080"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18080/admin/v2/brokers/health"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -131,26 +162,27 @@ services:
     image: apachepulsar/pulsar:latest
     container_name: magnetar-pip33-broker-b
     restart: unless-stopped
+    network_mode: host
     depends_on:
       bookkeeper-b:
         condition: service_started
     environment:
       - clusterName=cluster-b
-      - zookeeperServers=zookeeper:2181
-      - configurationStoreServers=zookeeper:2181
-      - advertisedAddress=broker-b
-      - brokerServicePort=6650
-      - webServicePort=8080
+      - zookeeperServers=localhost:2181/cluster-b
+      - configurationStoreServers=localhost:2181/config-store
+      - advertisedAddress=localhost
+      - brokerServicePort=16651
+      - webServicePort=18081
+      - managedLedgerDefaultEnsembleSize=1
+      - managedLedgerDefaultWriteQuorum=1
+      - managedLedgerDefaultAckQuorum=1
       - replicatedSubscriptionsSnapshotFrequencyMillis=1000
       - PULSAR_MEM=-Xms512m -Xmx1g
     command: >
       bash -c "bin/apply-config-from-env.py conf/broker.conf &&
                exec bin/pulsar broker"
-    ports:
-      - "16651:6650"
-      - "18081:8080"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:18081/admin/v2/brokers/health"]
       interval: 5s
       timeout: 5s
       retries: 30
