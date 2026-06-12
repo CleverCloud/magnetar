@@ -100,8 +100,16 @@ async fn e2e_shadow_topic_full_cycle() -> Result<(), Box<dyn std::error::Error>>
     // 2. Create the shadow topic via the admin REST.
     admin.create_shadow_topic(source, shadow).await?;
 
-    // 3. List the shadow topics on the source — must include the created shadow.
-    let shadows = admin.get_shadow_topics(source).await?;
+    // 3. List the shadow topics on the source — must include the created shadow. Topic-policy
+    //    propagation is asynchronous, so poll briefly instead of asserting on the first read.
+    let mut shadows = Vec::new();
+    for _ in 0..20 {
+        shadows = admin.get_shadow_topics(source).await?;
+        if shadows.iter().any(|s| s == shadow) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert!(
         shadows.iter().any(|s| s == shadow),
         "expected {shadow:?} in shadow list, got {shadows:?}",

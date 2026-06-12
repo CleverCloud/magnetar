@@ -402,15 +402,10 @@ async fn e2e_v4_replicator_role_can_assert_source_message_id()
 
     // Create the shadow topic over the source via the in-container
     // `pulsar-admin`, keeping this replicator-contract test independent of
-    // the magnetar `AdminClient` surface. Historical note: this route was
-    // originally a workaround for an `AdminClient::create_shadow_topic`
-    // wire-shape bug — it sent a `{"shadowTopics":[...]}` JSON object where
-    // Pulsar 4.0.4's `PUT .../{source}/shadowTopics` endpoint expects a bare
-    // `List<String>` (the broker rejected with HTTP 400 "Cannot deserialize
-    // value of type java.util.ArrayList<...> from Object value"). That bug
-    // has since been fixed (the admin client now sends a bare JSON array),
-    // so the CLI route is a deliberate simplification rather than a
-    // necessity.
+    // the magnetar `AdminClient` surface. `AdminClient::create_shadow_topic`
+    // mirrors the Java admin client by creating the shadow topic with the
+    // `PULSAR.SHADOW_SOURCE` property; this test uses the CLI route so it
+    // exercises only the broker-side replicator gate below.
     let create_shadow = container
         .exec(
             ExecCommand::new([
