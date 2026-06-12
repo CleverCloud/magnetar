@@ -34,6 +34,27 @@ const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "latest";
 const BROKER_BINARY_PORT: u16 = 6650;
 const BROKER_HTTP_PORT: u16 = 8080;
+static OTEL_PROPAGATOR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct TraceContextPropagatorGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TraceContextPropagatorGuard {
+    fn drop(&mut self) {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry::trace::noop::NoopTextMapPropagator::new(),
+        );
+    }
+}
+
+async fn install_trace_context_propagator() -> TraceContextPropagatorGuard {
+    let guard = OTEL_PROPAGATOR_LOCK.lock().await;
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+    TraceContextPropagatorGuard { _guard: guard }
+}
 
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
@@ -92,9 +113,7 @@ async fn e2e_otel_traceparent_round_trip() -> Result<(), Box<dyn std::error::Err
     let topic = unique_topic("magnetar-e2e-otel");
 
     // Install W3C propagator for the duration of this test.
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-    );
+    let _propagator = install_trace_context_propagator().await;
 
     let client = PulsarClient::builder()
         .service_url(&service_url)
@@ -157,11 +176,6 @@ async fn e2e_otel_traceparent_round_trip() -> Result<(), Box<dyn std::error::Err
     producer.close().await?;
     client.close().await;
 
-    // Reset propagator.
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry::trace::noop::NoopTextMapPropagator::new(),
-    );
-
     Ok(())
 }
 
@@ -187,9 +201,7 @@ async fn e2e_otel_reconsume_reinjects_traceparent() -> Result<(), Box<dyn std::e
     let topic = format!("persistent://public/default/magnetar-e2e-otel-retry-{id}");
     let retry_topic = format!("{topic}-RETRY");
 
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-    );
+    let _propagator = install_trace_context_propagator().await;
 
     let span_ctx = |trace: &str, span: &str| {
         SpanContext::new(
@@ -296,10 +308,6 @@ async fn e2e_otel_reconsume_reinjects_traceparent() -> Result<(), Box<dyn std::e
     retry_producer.close().await?;
     consumer.close().await?;
     client.close().await;
-
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry::trace::noop::NoopTextMapPropagator::new(),
-    );
 
     Ok(())
 }
