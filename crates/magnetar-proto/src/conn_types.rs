@@ -183,6 +183,15 @@ pub struct ConnectionConfig {
     /// Keepalive (ping) interval. Default `30 s`.
     pub keepalive_interval: Duration,
     /// Operation timeout (e.g. lookup + send). Default `30 s`.
+    ///
+    /// Also bounds the post-dial `CONNECT` → `CONNECTED` handshake: once the
+    /// dial succeeds, the engines arm a single `operation_timeout` deadline
+    /// over the handshake read loop so a broker that accepts the TCP SYN but
+    /// never replies to `CommandConnect` surfaces a bounded `Io(TimedOut)`
+    /// instead of parking forever. ADR-0052's dual cap scopes to the *dial*;
+    /// this extends the same total budget to the handshake (Java
+    /// `operationTimeoutMs` parity).
+    /// ([ADR-0052](../../specs/adr/0052-initial-connect-timeout-retry.md))
     pub operation_timeout: Duration,
     /// Per-attempt timeout for the *initial* TCP/TLS dial. A dial that does not
     /// complete within this budget is abandoned and retried (see
@@ -457,6 +466,33 @@ mod connect_resilience_config_tests {
         assert_eq!(cloned.connect_timeout, Duration::from_millis(1_234));
         assert_eq!(cloned.connect_max_retries, 3);
         assert_eq!(cloned.operation_timeout, Duration::from_millis(7_777));
+    }
+
+    #[test]
+    fn operation_timeout_is_the_post_dial_handshake_budget() {
+        // ADR-0052 (extended): `operation_timeout` is the single total
+        // budget the engines arm over the post-dial CONNECT -> CONNECTED
+        // handshake read loop. A broker that accepts the SYN but never
+        // replies to `CommandConnect` must surface a bounded
+        // `Io(TimedOut)` within this budget, not park forever. The proto
+        // layer owns the field's semantics; the engines (moonpool
+        // `handshake_plain`, tokio `wait_connected`) consume it. Pin that
+        // an explicit, tight handshake budget round-trips independently of
+        // the dial caps so the engines can dial it down for the resilience
+        // sweep without disturbing `connect_timeout` / `connect_max_retries`.
+        let cfg = ConnectionConfig {
+            operation_timeout: Duration::from_secs(2),
+            ..ConnectionConfig::default()
+        };
+        assert_eq!(
+            cfg.operation_timeout,
+            Duration::from_secs(2),
+            "operation_timeout must carry the caller's post-dial handshake budget verbatim",
+        );
+        // The handshake budget is independent of the dial caps — extending
+        // the cap to the handshake must not couple it to either dial field.
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.connect_max_retries, 8);
     }
 
     #[test]

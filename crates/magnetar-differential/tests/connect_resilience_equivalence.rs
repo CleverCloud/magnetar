@@ -20,6 +20,20 @@
 //! `connect_max_retries=8`, `operation_timeout=30s` — pinned by the proto
 //! unit test), so this test transitively exercises the production default
 //! config through the new `dial_with_retry` on both engines.
+//!
+//! ## Also covers the post-dial handshake bound (ADR-0052, extended)
+//!
+//! The handshake bound that extends `operation_timeout` to the post-dial
+//! `CONNECT` → `CONNECTED` round-trip (moonpool `handshake_plain` arms a
+//! single `TimeProvider::sleep` deadline; tokio wraps `wait_connected` in
+//! `tokio::time::timeout`) sits directly on the connect path both runners
+//! take. On the fault-free path the scripted broker answers CONNECT
+//! immediately, so the deadline is armed but never fires — it must be a
+//! transparent pass-through, leaving the two engines' event streams
+//! byte-identical. This test is therefore the differential (layer-d)
+//! coverage for the handshake bound as well as the dial cap: a regression
+//! that perturbed the handshake path on either engine (an extra event, a
+//! spurious timeout, a reordered frame) would diverge the streams here.
 
 use magnetar_differential::broker::ScriptedBroker;
 use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};

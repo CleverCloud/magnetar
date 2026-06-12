@@ -438,7 +438,24 @@ async fn build_entry_async<P: Providers>(
     .await?;
 
     let shared = make_shared_with_providers::<P>(&factory.providers, cfg);
-    handshake_plain::<P>(&shared, &mut transport, physical, false).await?;
+    // `None` — do NOT arm a second handshake deadline here. The pool dial's
+    // post-handshake wait is already bounded by `await_ready`'s
+    // `time.sleep(operation_timeout)` deadline (this same module), so a
+    // broker that accepts the SYN and never replies to CONNECT already
+    // surfaces a bounded timeout to the waiter. Arming a second
+    // `TimeProvider::sleep` inside `handshake_plain` would add a redundant
+    // timer event to the deterministic moonpool schedule on every pooled
+    // dial — the exact schedule-perturbation ADR-0052 warns against — so the
+    // pool path leans on the single `await_ready` deadline already in place.
+    handshake_plain::<P>(
+        &shared,
+        &mut transport,
+        factory.providers.time(),
+        None,
+        physical,
+        false,
+    )
+    .await?;
 
     let ctx = ReconnectContext {
         host_port: physical.to_owned(),

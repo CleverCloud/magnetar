@@ -887,8 +887,19 @@ impl<P: Providers> MoonpoolEngine<P> {
 
         // Drive the handshake inline. Once `Connected` lands we hand the
         // transport over to the long-running driver task so user-facing
-        // futures can start enqueueing producer/consumer commands.
-        handshake_plain::<P>(&shared, &mut transport, addr, false).await?;
+        // futures can start enqueueing producer/consumer commands. The
+        // post-dial CONNECT round-trip is bounded by `operation_timeout`
+        // (ADR-0052) — a broker that accepts the SYN but never replies to
+        // CONNECT surfaces `Io(TimedOut)` instead of parking forever.
+        handshake_plain::<P>(
+            &shared,
+            &mut transport,
+            self.providers.time(),
+            Some(operation_timeout),
+            addr,
+            false,
+        )
+        .await?;
         let driver = driver::spawn::<P>(
             shared.clone(),
             transport,
@@ -945,7 +956,15 @@ impl<P: Providers> MoonpoolEngine<P> {
         )
         .await?;
         let shared = self.make_shared(config);
-        handshake_plain::<P>(&shared, &mut transport, addr, true).await?;
+        handshake_plain::<P>(
+            &shared,
+            &mut transport,
+            self.providers.time(),
+            Some(operation_timeout),
+            addr,
+            true,
+        )
+        .await?;
         let driver = driver::spawn::<P>(
             shared.clone(),
             transport,
@@ -997,7 +1016,15 @@ impl<P: Providers> MoonpoolEngine<P> {
         .await?;
         let shared = self.make_shared(config);
 
-        handshake_plain::<P>(&shared, &mut transport, addr, false).await?;
+        handshake_plain::<P>(
+            &shared,
+            &mut transport,
+            self.providers.time(),
+            Some(operation_timeout),
+            addr,
+            false,
+        )
+        .await?;
         let ctx = driver::ReconnectContext {
             host_port: addr.to_owned(),
             service_url_provider,
@@ -1104,9 +1131,35 @@ fn connect_backoff(attempt: u32) -> Duration {
 /// `addr` (the dialled `host:port`) and `tls` are threaded in for the
 /// ADR-0054 "connection established" lifecycle record — the moonpool twin
 /// of the tokio engine's post-`wait_connected` log sites.
+///
+/// # Bounded by `operation_timeout` (ADR-0052)
+///
+/// `bound` is `Some(operation_timeout)` on the **direct** dial paths
+/// (`connect_plain*`), where `handshake_plain` is the *only* thing standing
+/// between a silent broker and an infinite park: ADR-0052's dual cap scopes
+/// to the *dial*, so a broker that accepts the TCP SYN but never replies to
+/// `CommandConnect` (moonpool-sim's connect-hang fault, or a wedged real
+/// broker) would otherwise park the `read_buf` loop below forever. When
+/// `Some`, we arm **one** `TimeProvider::sleep` deadline before the loop and
+/// poll it via `select!` across iterations — mirroring the pool's
+/// `await_ready` shape (`pool.rs`). Arming a fresh `sleep` per iteration
+/// would schedule a `Timer` event every handshake and perturb the
+/// deterministic moonpool schedule (the ADR-0052 footgun); the
+/// single-deadline shape leaves replay bit-for-bit. The cap surfaces as
+/// `EngineError::Io(TimedOut)` — Java `operationTimeoutMs` parity.
+///
+/// `bound` is `None` on the **pool** path (`build_entry_async`), where the
+/// caller's wait is *already* bounded by `await_ready`'s
+/// `time.sleep(operation_timeout)` deadline (`pool.rs`). Arming a *second*
+/// `TimeProvider::sleep` here would add a redundant timer event to the
+/// deterministic schedule on every pooled dial — exactly the
+/// schedule-perturbation ADR-0052 warns against — so the pool path passes
+/// `None` and leans on the single `await_ready` deadline already in place.
 pub(crate) async fn handshake_plain<P: Providers>(
     shared: &Arc<ConnectionShared>,
     transport: &mut Transport<P>,
+    time: &P::Time,
+    bound: Option<Duration>,
     addr: &str,
     tls: bool,
 ) -> Result<(), EngineError> {
@@ -1119,6 +1172,15 @@ pub(crate) async fn handshake_plain<P: Providers>(
                 .map_err(|err| EngineError::Config(format!("begin_handshake failed: {err}")))?;
         }
     }
+
+    // Arm AT MOST ONE handshake deadline before entering the read loop.
+    // Driven by the engine `TimeProvider` (virtual time under moonpool,
+    // ADR-0011), so it fires deterministically and never reads wall time.
+    // Polled via `select!` below so a single timer covers every iteration —
+    // see the doc comment for why a per-iteration `sleep` is forbidden, and
+    // why the pool path passes `None` (it is already bounded by
+    // `await_ready`, so a second timer would perturb the schedule).
+    let mut deadline = bound.map(|d| Box::pin(time.sleep(d)));
 
     loop {
         // 1. Drain outbound bytes the state machine has queued.
@@ -1187,8 +1249,30 @@ pub(crate) async fn handshake_plain<P: Providers>(
             }
         }
 
-        // 3. Read more bytes from the wire.
-        let n = transport.read_buf(&mut read_buf).await?;
+        // 3. Read more bytes from the wire. When a handshake deadline was
+        // armed (the direct dial paths), bound the read by it (ADR-0052):
+        // `biased` polls the read first so a ready frame is never starved by
+        // the timer; the deadline arm only wins once the broker has genuinely
+        // stalled past `operation_timeout`. When no deadline was armed (the
+        // pool path, already bounded by `await_ready`), read without a second
+        // timer so the deterministic schedule is left untouched.
+        let n = if let Some(deadline) = deadline.as_mut() {
+            tokio::select! {
+                biased;
+                r = transport.read_buf(&mut read_buf) => r?,
+                _ = deadline => {
+                    return Err(EngineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "handshake to {addr} exceeded operation_timeout: broker accepted \
+                             the connection but never completed CONNECT -> CONNECTED"
+                        ),
+                    )));
+                }
+            }
+        } else {
+            transport.read_buf(&mut read_buf).await?
+        };
         if n == 0 {
             // Peer closed. Flip the proto state to `Failed` so the
             // handshake-failure-reason check below (and any subsequent

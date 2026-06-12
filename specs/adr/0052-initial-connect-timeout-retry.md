@@ -1,6 +1,6 @@
 # ADR-0052 — Initial-connect timeout + bounded retry
 
-- **Status**: Accepted
+- **Status**: Accepted (amended 2026-06-12 — post-dial handshake bound)
 - **Date**: 2026-06-03
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, connection, resilience, moonpool, java-parity, determinism
@@ -85,6 +85,31 @@ The moonpool pool parks on `TimeProvider::sleep(operation_timeout)`; the tokio p
 
 The Pulsar handshake that follows a successful dial is **not** retried here; surviving mid-stream transport drops remains the supervisor's job (`ConnectionConfig::supervisor`, the reconnect path).
 
+### Amendment (2026-06-12): the post-dial handshake is bounded too
+
+The dual cap above scopes to the **dial** — the TCP/TLS establishment.
+A separate gap remained downstream of a successful dial: once `dial_with_retry` returns `Ok`, the engines drive the `CONNECT` → `CONNECTED` handshake (moonpool `handshake_plain`, tokio `wait_connected`) in an **unbounded** read loop.
+A broker that accepts the SYN but never replies to `CommandConnect` — moonpool-sim's connect-hang fault landing _after_ accept rather than during it, or a wedged real broker — parked that loop forever.
+The bootstrap tokio path (`Client::start_handshake` / `start_supervised_handshake`) and every moonpool `handshake_plain` caller had no timeout; only the multi-broker **pool** path already bounded its handshake wait (the `operation_timeout` deadline added for the pool-dial wait above).
+GitHub #177 reproduced this on moonpool seed `0x269b4b0a1c962f41`: the dial succeeded, the silent broker never answered, and the run went quiescent until the `run_time_budget` detector tripped a DEADLOCK.
+
+The fix extends the **same `operation_timeout` total budget** to the post-dial handshake (Java `operationTimeoutMs` parity — `operationTimeoutMs` bounds the whole connect operation, not just the socket open):
+
+- **moonpool** (`handshake_plain`): `handshake_plain` takes a `bound: Option<Duration>`.
+  When `Some(operation_timeout)`, it arms **exactly one** `TimeProvider::sleep(operation_timeout)` deadline _before_ the read loop, `Box::pin`s it, and polls it via `select! { biased; r = read => …, _ = deadline => Err(Io(TimedOut)) }` across every iteration.
+  This is the single-deadline shape the pool's `await_ready` already uses.
+  A fresh `sleep` armed **per read-loop iteration** would schedule a `Timer` event on every green-seed handshake and perturb the deterministic schedule — the exact whack-a-mole footgun this ADR warns about — so the single armed deadline is load-bearing for determinism, not just tidiness.
+- **moonpool determinism: `None` on the pool path.** The **direct** dial paths (`connect_plain` / `connect_plain_with_resolver` / `connect_tls` / `connect_plain_supervised`) pass `Some(operation_timeout)` — there `handshake_plain` is the _only_ bound on the read loop.
+  The **pool** path (`build_entry_async`) passes **`None`**: its waiter is already bounded by `await_ready`'s `time.sleep(operation_timeout)` deadline, so a silent broker already surfaces a bounded timeout to the caller.
+  Arming a _second_ `TimeProvider::sleep` inside the pool's `handshake_plain` adds a redundant timer event to the deterministic schedule on every pooled dial, and that extra event reorders the schedule enough to intermittently break the pinned-pool lifecycle seed under load — a fresh instance of the very whack-a-mole this ADR documents.
+  Passing `None` keeps the pool path at exactly one handshake timer (the `await_ready` one), which the 16-seed sweep confirms is determinism-stable.
+- **tokio** (`bounded_wait_connected`): wrap `wait_connected` in `tokio::time::timeout(operation_timeout, …)`, mirroring what the tokio pool path already does.
+  (The tokio engine is on wall time, not a deterministic virtual schedule, so the redundant-timer concern is moonpool-specific; the tokio pool path keeps its own `tokio::time::timeout`, and the two bootstrap call sites gain one.)
+
+Both engines surface a bounded `Io(TimedOut)` when the budget is spent.
+The handshake bound is a **transparent pass-through on the happy path** (the broker answers CONNECT before the deadline, which is then dropped un-fired), so it does not change observable behaviour for a healthy broker — the differential equivalence test pins that.
+Like the dial cap, the moonpool direct path never arms a per-iteration timer; the one deadline is a single scheduled event, identical across replays of a given seed, and the pool path arms no new timer at all.
+
 `connect_max_retries = 8` is a production default sized for transient-failure recovery without unbounded re-dialling: nine attempts under an independent ~75 %-success draw drive the residual to `0.25^9 ≈ 4·10⁻⁶` per connect.
 It is **not** the lever that greens the seed sweep — the moonpool `run_time_budget` detector is — but it gives production clients the same multi-attempt headroom the Java client has.
 
@@ -108,9 +133,12 @@ It is **not** the lever that greens the seed sweep — the moonpool `run_time_bu
 ## Test coverage (ADR-0024)
 
 - **`magnetar-proto`**: `conn_types.rs::connect_resilience_config_tests` — asserts the `ConnectionConfig` defaults (`connect_timeout = 10 s`, `connect_max_retries = 8`, `operation_timeout = 30 s`), that the dual-cap fields round-trip through `Clone`, and that `connect_max_retries = 0` is a valid fail-fast config.
+  The 2026-06-12 amendment adds `operation_timeout_is_the_post_dial_handshake_budget`, pinning that `operation_timeout` is the single total budget the engines arm over the post-dial handshake and that it stays independent of the two dial caps.
 - **`magnetar-runtime-moonpool`**: `tests/connect_resilience.rs` — `moonpool_connect_hang_is_bounded_smoke` + `moonpool_connect_hang_is_bounded_sweep_16_seeds` keep the default `ConnectFailureMode::Probabilistic` connect-fault active and assert a connect-hang on the supervised / pool dial is recovered, surfaces a bounded `operation_timeout` error within the dual cap, or terminates as a deterministic DEADLOCK once the tight `run_time_budget` trips — never a silent park.
   Both that suite and the `sim_chaos_*` suite set a tight `run_time_budget` (`30 s` virtual, the `RUN_TIME_BUDGET` / `CHAOS_RUN_TIME_BUDGET` constants) so a storming seed terminates fast instead of pegging a core; the previously-deadlocking seeds now terminate deterministically.
+  The 2026-06-12 amendment adds `moonpool_silent_broker_handshake_is_bounded` + `moonpool_silent_broker_error_is_timed_out_io`: a broker that accepts the TCP connection but never replies to `CommandConnect` makes the dial succeed yet the handshake stall, and the client must surface a bounded `Io(TimedOut)` (the seed-`0x269b4b0a1c962f41` / #177 gap), not park.
 - **`magnetar-runtime-tokio`**: `tests/connect_resilience.rs` — `tokio_connect_retries_until_broker_listens` (a connect against an initially-closed port retries and resolves once the broker binds) + `tokio_connect_zero_retries_fails_fast` (`connect_max_retries = 0` fails fast with a bounded `Io` error).
-  Mirrors the moonpool shape, keeping the tokio ↔ moonpool 1:1 test count.
-- **`magnetar-differential`**: `tests/connect_resilience_equivalence.rs::fault_free_connect_event_stream_parity` — a fault-free connect → producer-open → close leaves the tokio and moonpool `EventStream`s byte-identical (the dual-cap retry is a transparent pass-through on the happy path).
+  The 2026-06-12 amendment adds `tokio_silent_broker_handshake_times_out` + `tokio_silent_broker_error_is_timed_out_io`, the silent-broker mirror of the moonpool pair.
+  Mirrors the moonpool shape, keeping the tokio ↔ moonpool 1:1 test count (four each).
+- **`magnetar-differential`**: `tests/connect_resilience_equivalence.rs::fault_free_connect_event_stream_parity` — a fault-free connect → producer-open → close leaves the tokio and moonpool `EventStream`s byte-identical (the dual-cap retry **and** the post-dial handshake bound are transparent pass-throughs on the happy path: the handshake deadline is armed but never fires).
 - **e2e**: `crates/magnetar/tests/e2e_connect_resilience.rs::e2e_client_retries_until_broker_reachable` — a client started before its gate (a delayed loopback proxy to the real broker) is reachable rides out the `ConnectionRefused` window under the default dual cap, connects, and completes a produce/consume round-trip.
