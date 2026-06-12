@@ -490,6 +490,31 @@ impl std::fmt::Debug for ReconnectContext {
     }
 }
 
+/// Compute the terminal-exit reason string fed to
+/// [`magnetar_proto::Connection::fail_all_pending`] when a driver task exits
+/// for good (plain-driver drop, or a supervisor that exhausted its budget).
+///
+/// A broker `CommandError` arriving mid-handshake populates
+/// [`magnetar_proto::Connection::handshake_failure_reason`] in the proto layer,
+/// but that reason survives the socket drop only as a stored field — the
+/// driver's inner-loop `Err` is the generic `PeerClosed` (the read just
+/// returned 0). Surfacing that generic string would discard the broker's
+/// explanation, so when a handshake-failure reason is captured we PREFER it.
+/// This is what lets `ConnectedFut`'s `ConnectionEvent::Closed` arm surface the
+/// broker's "broker rejected handshake (server_error=…): …" text instead of the
+/// opaque "peer closed the connection" — the capture-vs-terminal-drop race that
+/// left the reason stranded. The reason is already length-bounded at the proto
+/// capture site (ADR-0062); no further truncation here.
+fn terminal_reason(conn: &magnetar_proto::Connection, outcome: &Result<(), ClientError>) -> String {
+    if let Some(reason) = conn.handshake_failure_reason() {
+        return reason.to_owned();
+    }
+    match outcome {
+        Ok(()) => "connection closed".to_owned(),
+        Err(err) => err.to_string(),
+    }
+}
+
 /// Spawn the driver loop on the current tokio runtime — generic-socket flavour for
 /// tests / `Client::from_socket`. The auto-reconnect supervisor is **not** active on this
 /// spawn path: a generic socket has no notion of "reconnect", so the driver exits on the
@@ -513,12 +538,17 @@ where
         // on graceful close, so `is_connected()` is already false. Mirror of
         // the moonpool engine's plain spawn. ADR-0055.
         {
-            let reason = match &outcome {
-                Ok(()) => "connection closed".to_owned(),
-                Err(err) => err.to_string(),
-            };
-            shared.inner.lock().fail_all_pending(&reason);
+            let mut conn = shared.inner.lock();
+            let reason = terminal_reason(&conn, &outcome);
+            conn.fail_all_pending(&reason);
         }
+        // ADR-0059 / follow-ups §4.1: the plain driver is gone for good — latch
+        // the no-driver signal so a NEW op issued after this point fast-fails
+        // synchronously with `PeerClosed` at the entry-point guards instead of
+        // registering a doomed pending op no driver is left to resolve. Set it
+        // AFTER `fail_all_pending` so the slot `closed` flags + terminal
+        // outcomes are already in place when a fresh op observes the latch.
+        shared.mark_no_driver();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on `driver_waker` rather than the waker slab.
         shared.driver_waker.notify_waiters();
@@ -549,12 +579,17 @@ pub(crate) fn spawn_supervised(
         // §1: `fail_all_pending` fires on a supervisor that has exhausted its
         // attempts, never on the per-attempt reconnect.
         {
-            let reason = match &outcome {
-                Ok(()) => "connection closed".to_owned(),
-                Err(err) => err.to_string(),
-            };
-            driver_shared.inner.lock().fail_all_pending(&reason);
+            let mut conn = driver_shared.inner.lock();
+            let reason = terminal_reason(&conn, &outcome);
+            conn.fail_all_pending(&reason);
         }
+        // ADR-0059 / follow-ups §4.1: `supervised_driver_loop` only returns on
+        // a GENUINELY-terminal exit (user close, or the supervisor exhausted
+        // its attempt budget) — never on a per-attempt reconnect — so latching
+        // the no-driver signal here is safe: a transient `Failed` window mid
+        // reconnect never reaches this point. New ops issued after this fast
+        // fail at the entry-point guards. Set AFTER `fail_all_pending`.
+        driver_shared.mark_no_driver();
         // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
         // park on `driver_waker` rather than the waker slab.
         driver_shared.driver_waker.notify_waiters();
@@ -586,6 +621,20 @@ async fn supervised_driver_loop(
     // `initial_backoff` / `max_backoff` / `mandatory_stop` (future work) still take effect
     // before the supervisor has had to redial once.
     let mut backoff: Option<magnetar_proto::Backoff> = None;
+
+    // Give-up budget counter (ADR-0061, follow-ups §3.2). Hoisted
+    // OUTSIDE the outer loop so it spans the FULL dial+handshake cycle: a
+    // post-dial handshake failure (the `driver_loop_inner` return path after
+    // `begin_handshake`) counts against the SAME `max_attempts` budget as a
+    // TCP-dial failure, instead of letting the outer loop reset it to 0. Behind
+    // a docker-proxy / LB that accepts TCP while the backend is down, the dial
+    // always succeeds but the handshake never completes, so the pre-ADR-0061
+    // per-cycle counter never reached the budget and the driver retried forever
+    // — the exact storm class the anti-thrash supervision was built for. Reset
+    // to 0 ONLY when `should_reset_backoff` is true (a socket that survived
+    // `drop_grace`), so give-up-reset and backoff-reset share ONE stability
+    // definition.
+    let mut give_up_attempts: u32 = 0;
 
     // First pass uses the current socket. The inner-loop result is what we propagate to the
     // caller if we exit without a supervisor reconnect. `socket_alive_since` lets us decide,
@@ -671,31 +720,41 @@ async fn supervised_driver_loop(
         // then reuse across cycles. `reset()` is gated on the previous socket surviving past
         // `cfg.drop_grace` — sockets that died inside that window count as thrashes, so the
         // schedule keeps growing and successive ProducerReady-then-drop cycles slow down
-        // geometrically up to `max_backoff`. The attempt counter is per-cycle (it gates
-        // `max_attempts` give-up, not the cadence).
+        // geometrically up to `max_backoff`.
+        //
+        // ADR-0061: the give-up budget counter (`give_up_attempts`, hoisted
+        // above) shares this SAME stability gate — a socket that survived
+        // `drop_grace` resets BOTH the backoff schedule and the give-up budget,
+        // so the two share one definition of "the last reconnect counted as
+        // stable". A socket that died inside `drop_grace` (or never handshaked
+        // at all, behind a TCP-accepting proxy) resets neither.
         let backoff = backoff.get_or_insert_with(|| cfg.build_backoff(seed));
         if cfg.should_reset_backoff(socket_alive_since.elapsed()) {
             backoff.reset();
+            give_up_attempts = 0;
         }
-        let mut attempt: u32 = 0;
 
         // Reconnect loop — keep trying until we land a fresh socket + handshake OR exhaust
-        // `max_attempts`.
+        // `max_attempts`. The give-up counter spans the full dial+handshake
+        // cycle (ADR-0061): each pass through this loop is one dial attempt; a
+        // pass that dials successfully but whose post-handshake
+        // `driver_loop_inner` later returns (handshake / session failure)
+        // re-enters the outer loop without resetting the counter, so the next
+        // dial increments from where this one left off.
         let new_socket = loop {
             let delay = backoff.next();
             tokio::time::sleep(delay).await;
 
-            attempt = attempt.saturating_add(1);
-            if let Some(max) = cfg.max_attempts {
-                if attempt > max {
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = max,
-                        "supervisor: gave up; reconnect attempt budget exhausted"
-                    );
-                    return last_inner_result;
-                }
+            give_up_attempts = give_up_attempts.saturating_add(1);
+            if cfg.should_give_up(give_up_attempts) {
+                tracing::warn!(
+                    attempt = give_up_attempts,
+                    max_attempts = cfg.max_attempts.unwrap_or(0),
+                    "supervisor: gave up; reconnect attempt budget exhausted"
+                );
+                return last_inner_result;
             }
+            let attempt = give_up_attempts;
 
             // Did the user request close while we were sleeping? Same `is_user_closed`
             // gate as the outer loop — `Failed` from `mark_disconnected` must NOT abort
@@ -745,11 +804,18 @@ async fn supervised_driver_loop(
             {
                 Ok(t) => {
                     let (host, port) = target_url.socket_addr();
+                    // ADR-0061: this is a TCP-connect, NOT a confirmed reconnect
+                    // — behind a TCP-accepting proxy the dial succeeds while the
+                    // backend (and hence the Pulsar handshake) is down. The
+                    // TRUE reconnect-success info log fires AFTER the handshake
+                    // completes (the `ProducerReady` / `SubscribeAcked` path);
+                    // mislabelling a TCP accept as a reconnect would tell
+                    // operators the broker is back when it is not.
                     tracing::info!(
                         attempt,
                         host = %host,
                         port,
-                        "supervisor: reconnected to broker"
+                        "supervisor: TCP connected; handshaking"
                     );
                     break t;
                 }
@@ -1064,6 +1130,15 @@ where
                             )
                             .is_ok()
                     {
+                        // ADR-0061: the handshake on the new socket has now
+                        // completed (`is_connected()` is true and the
+                        // once-per-reconnect compare-exchange won) — this, NOT
+                        // the earlier TCP-connect log, is the TRUE
+                        // reconnect-success signal operators rely on. It fires
+                        // even when there are no handles to replay
+                        // (`producers = 0, consumers = 0`), so a TCP accept
+                        // behind a down backend (handshake never completes) never
+                        // reaches here and is never mislabelled as a reconnect.
                         let (n_p, n_c) = {
                             let mut conn = shared.inner.lock();
                             let producers = conn.rebuild_producers();
@@ -1073,7 +1148,8 @@ where
                         tracing::info!(
                             producers = n_p,
                             consumers = n_c,
-                            "supervisor: replayed producer + consumer state on reconnect"
+                            "supervisor: reconnected to broker; handshake complete, replayed \
+                             producer + consumer state"
                         );
                         // Wake the next loop iteration so `poll_transmit` flushes the
                         // re-emitted `CommandProducer` / `CommandSubscribe` / `CommandFlow`

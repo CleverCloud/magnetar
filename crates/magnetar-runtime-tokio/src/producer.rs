@@ -466,12 +466,33 @@ impl Producer {
                 // Expected anomaly surfaced as `Err` to the caller —
                 // `debug!` per ADR-0054 §2.1.
                 tracing::debug!(error = %err, "send rejected by producer state machine");
+                // ADR-0059 / follow-ups §4.1: `fail_all_pending` flips the
+                // per-slot `closed` flag on a terminal drop, so a send issued
+                // AFTER a plain connection went terminal fast-fails here. The
+                // proto-layer `ProducerSlot::queue_send` collapses the inner
+                // `ProducerError::Closed` into an opaque
+                // `ProtocolError::InvariantViolation`, so we cannot pattern
+                // match the cause — but the `no_driver` latch IS the cause
+                // signal: it is set ONLY on a terminal drop (the same event
+                // that closed the slot). When it is set, map the rejection to
+                // `PeerClosed` (the terminal-outcome category); otherwise the
+                // rejection is a genuine protocol-state error (e.g. producer
+                // not yet open) and keeps the `Protocol` mapping. A
+                // user-initiated `producer.close()` consumes the `Producer`, so
+                // no further `send` reaches this arm on that path.
+                let error = if self
+                    .shared
+                    .no_driver
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    ClientError::PeerClosed
+                } else {
+                    ClientError::Protocol(err)
+                };
                 SendFut {
                     shared: self.shared.clone(),
                     handle: self.handle,
-                    state: SendState::Failed {
-                        error: Some(ClientError::Protocol(err)),
-                    },
+                    state: SendState::Failed { error: Some(error) },
                     reserved_bytes: 0,
                 }
             }
@@ -545,6 +566,13 @@ impl Producer {
     ///
     /// - [`ClientError::Broker`] if the broker returns an error correlating to the close.
     pub async fn close(self) -> Result<(), ClientError> {
+        // ADR-0059 / follow-ups §4.1: a `producer.close()` issued after a plain
+        // connection has gone terminal with no driver would register a
+        // `CommandCloseProducer` request that never resolves (no driver left).
+        // Fast-fail synchronously with `PeerClosed` instead. The guard fires
+        // only when `is_closed()` AND `no_driver`, so a supervised connection
+        // mid reconnect still closes the producer transparently.
+        self.shared.fail_if_no_driver()?;
         // Snapshot identity for the lifecycle record before the round-trip.
         let topic = self.slot.identity.topic.clone();
         let producer_name = self.slot.state.lock().name.clone().unwrap_or_default();

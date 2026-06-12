@@ -223,3 +223,159 @@ fn reset_on_in_flight_lookup_pair_yields_identical_outcomes_across_engines() {
         "both engines must wake the partitioned-metadata waker exactly once"
     );
 }
+
+/// ADR-0024 layer (d) for ADR-0060 / follow-ups §4.1: tokio and moonpool must
+/// make the SAME engine-side decision after an in-flight lookup is severed by a
+/// supervised reconnect (`OpOutcome::SessionLost`). The decision is owned by
+/// `ConnectionShared::await_reconnect_or_terminal`, which returns
+/// `Reconnected` (re-issue the lookup) once the connection is live again, or
+/// `Terminal` (→ `PeerClosed`) once it `is_closed()` AND `no_driver` is
+/// latched. A divergence here would mean one engine re-issues where the other
+/// gives up — exactly the asymmetry ADR-0060's `ENGINE SYMMETRY HAZARD` calls out.
+///
+/// We capture the readiness decision for BOTH terminal states (transient
+/// reconnect → `Reconnected`; supervisor-gave-up → `Terminal`) on each engine
+/// and assert the pair is identical. The states are pre-set so the readiness
+/// future returns on its first loop iteration — no driver pump is needed, which
+/// keeps the equivalence claim deterministic.
+#[derive(Debug, PartialEq, Eq)]
+struct ReadinessSnapshot {
+    /// Decision when the connection has re-handshaked back to `Connected` after
+    /// the severing reset — must be `Reconnected` on both engines.
+    after_reconnect_is_reconnected: bool,
+    /// Decision when the connection is terminal (`Failed`) with `no_driver`
+    /// latched — must be `Terminal` on both engines.
+    after_terminal_is_terminal: bool,
+}
+
+async fn run_tokio_readiness_scenario() -> ReadinessSnapshot {
+    use magnetar_runtime_tokio::{ConnectionShared, LookupReissueReadiness};
+
+    // (a) Severed-then-reconnected: handshake → in-flight lookup → reset
+    // (SessionLost) → re-handshake → Connected. Readiness == Reconnected.
+    let reconnected = {
+        let t0 = Instant::now();
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            conn.handle_bytes(t0, &handshake_response_bytes())
+                .expect("connected");
+            let _ = conn.poll_event();
+            let _rid = conn.lookup("persistent://public/default/foo", false);
+            conn.reset();
+            // Supervisor re-handshakes the fresh socket.
+            conn.begin_handshake().expect("re-handshake");
+            conn.handle_bytes(t0, &handshake_response_bytes())
+                .expect("reconnected");
+            let _ = conn.poll_event();
+        }
+        matches!(
+            shared.await_reconnect_or_terminal().await,
+            LookupReissueReadiness::Reconnected
+        )
+    };
+
+    // (b) Severed-then-terminal: handshake → reset (SessionLost) → mark
+    // disconnected (Failed = is_closed()) → latch no_driver (supervisor
+    // gave up). Readiness == Terminal.
+    let terminal = {
+        let t0 = Instant::now();
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            conn.handle_bytes(t0, &handshake_response_bytes())
+                .expect("connected");
+            let _ = conn.poll_event();
+            let _rid = conn.lookup("persistent://public/default/foo", false);
+            conn.reset();
+            conn.mark_disconnected();
+        }
+        shared.mark_no_driver();
+        matches!(
+            shared.await_reconnect_or_terminal().await,
+            LookupReissueReadiness::Terminal
+        )
+    };
+
+    ReadinessSnapshot {
+        after_reconnect_is_reconnected: reconnected,
+        after_terminal_is_terminal: terminal,
+    }
+}
+
+async fn run_moonpool_readiness_scenario() -> ReadinessSnapshot {
+    use magnetar_runtime_moonpool::{ConnectionShared, LookupReissueReadiness};
+
+    let reconnected = {
+        let t0 = Instant::now();
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            conn.handle_bytes(t0, &handshake_response_bytes())
+                .expect("connected");
+            let _ = conn.poll_event();
+            let _rid = conn.lookup("persistent://public/default/foo", false);
+            conn.reset();
+            conn.begin_handshake().expect("re-handshake");
+            conn.handle_bytes(t0, &handshake_response_bytes())
+                .expect("reconnected");
+            let _ = conn.poll_event();
+        }
+        matches!(
+            shared.await_reconnect_or_terminal().await,
+            LookupReissueReadiness::Reconnected
+        )
+    };
+
+    let terminal = {
+        let t0 = Instant::now();
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("handshake");
+            conn.handle_bytes(t0, &handshake_response_bytes())
+                .expect("connected");
+            let _ = conn.poll_event();
+            let _rid = conn.lookup("persistent://public/default/foo", false);
+            conn.reset();
+            conn.mark_disconnected();
+        }
+        shared.mark_no_driver();
+        matches!(
+            shared.await_reconnect_or_terminal().await,
+            LookupReissueReadiness::Terminal
+        )
+    };
+
+    ReadinessSnapshot {
+        after_reconnect_is_reconnected: reconnected,
+        after_terminal_is_terminal: terminal,
+    }
+}
+
+#[tokio::test]
+async fn lookup_reissue_readiness_is_identical_across_engines() {
+    let tokio_snapshot = run_tokio_readiness_scenario().await;
+    let moonpool_snapshot = run_moonpool_readiness_scenario().await;
+
+    assert_eq!(
+        tokio_snapshot, moonpool_snapshot,
+        "engine lookup-reissue readiness decisions diverged (ADR-0060)",
+    );
+
+    // Pin the absolute shape too — both engines must re-issue on a transient
+    // reconnect and short-circuit to terminal once the driver is gone.
+    assert!(
+        tokio_snapshot.after_reconnect_is_reconnected,
+        "both engines must return Reconnected once the session is live again — \
+         the transparent-retry path"
+    );
+    assert!(
+        tokio_snapshot.after_terminal_is_terminal,
+        "both engines must return Terminal once is_closed() AND no_driver — the \
+         PeerClosed short-circuit (composes with §5.1)"
+    );
+}

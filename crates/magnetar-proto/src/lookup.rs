@@ -39,6 +39,32 @@ use crate::types::RequestId;
 /// "redirect-loop DoS" finding from the lookup multi-agent review.
 pub const MAX_LOOKUP_REDIRECTS: u8 = 5;
 
+/// Maximum number of times a runtime engine re-issues a `CommandLookupTopic`
+/// after the in-flight request was severed by a supervised reconnect — i.e.
+/// after [`crate::Connection::reset`] published an
+/// [`crate::OpOutcome::SessionLost`] on the lookup's request-id.
+///
+/// [`crate::Connection::reset`] deliberately fails every pending request
+/// (including an in-flight `CommandLookupTopic`) with
+/// [`crate::OpOutcome::SessionLost`] so a supervised reconnect can rebuild the
+/// session cleanly — but, unlike an in-flight publish (which `reset` snapshots
+/// for transparent replay), a lookup is *not* re-issued by the proto layer.
+/// The engine-side lookup path closes that asymmetry: on `SessionLost` it parks
+/// until the connection is live again (or terminal), then re-issues the lookup
+/// against the fresh session. This const bounds how many such re-issues a
+/// single `lookup_topic` call will attempt before giving up, so a connection
+/// that keeps flapping right as the lookup lands cannot spin forever.
+///
+/// A re-issue counts against this budget **only** when a lookup was actually
+/// submitted against a connected session — spurious driver wakes / repeated
+/// `SessionLost` within the same not-yet-reconnected window do not burn the
+/// budget. Mirrors the lookup-after-reset retry in Java's
+/// `BinaryProtoLookupService` (each reconnect re-drives the pending lookup
+/// future). Lives next to [`MAX_LOOKUP_REDIRECTS`] so the two lookup caps share
+/// a single source of truth; a plain `const` adds no I/O dependency, keeping
+/// `magnetar-proto` zero-I/O (ADR-0004). See ADR-0060.
+pub const MAX_LOOKUP_SESSION_REISSUES: u8 = 5;
+
 /// Return the zero-based partition index iff `topic` is a per-partition
 /// child of a partitioned topic — i.e. its tail matches `-partition-<N>`
 /// where `<N>` is a non-negative decimal integer and the segment before
@@ -361,6 +387,34 @@ mod tests {
         let (out, retry) = translate_lookup_response(&resp, &req);
         assert!(retry.is_none());
         matches!(out, LookupOutcome::Connect { .. });
+    }
+
+    /// ADR-0060 / follow-ups §4.1: the engine-side lookup-retry-on-`SessionLost`
+    /// loop is bounded by [`MAX_LOOKUP_SESSION_REISSUES`]. The const must be
+    /// non-zero (at least one re-issue is allowed — otherwise a single transient
+    /// reconnect would surface `PeerClosed` and defeat the whole point) and
+    /// small enough that a persistently flapping connection cannot spin a
+    /// `lookup_topic` call for long before it gives up. This pins the
+    /// single-source-of-truth bound the two engines share so neither can
+    /// silently re-introduce an unbounded loop.
+    #[test]
+    fn max_lookup_session_reissues_is_bounded_and_nonzero() {
+        // Compile-time const-block assertions: the bound is a `const`, so these
+        // are enforced at build time, not just at test time.
+        const {
+            assert!(
+                MAX_LOOKUP_SESSION_REISSUES >= 1,
+                "at least one re-issue must be allowed so a single transient \
+                 SessionLost recovers transparently",
+            );
+        }
+        const {
+            assert!(
+                MAX_LOOKUP_SESSION_REISSUES <= 16,
+                "the reissue budget must stay small so a flapping connection cannot \
+                 spin a lookup_topic call for long",
+            );
+        }
     }
 
     #[test]

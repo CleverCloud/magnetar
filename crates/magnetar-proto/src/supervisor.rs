@@ -133,6 +133,37 @@ impl SupervisorConfig {
     pub fn should_reset_backoff(&self, socket_alive: Duration) -> bool {
         socket_alive > self.drop_grace
     }
+
+    /// Give-up policy gate for the engine drivers' reconnect budget (ADR-0061,
+    /// follow-ups §3.2).
+    ///
+    /// Returns `true` once `attempts` post-drop dial+handshake attempts have
+    /// been spent without landing a stable session — i.e. when the supervisor
+    /// must stop reconnecting and surface the last error to the caller.
+    /// `max_attempts == None` (the default) never gives up, matching Java's
+    /// infinite reconnect.
+    ///
+    /// `attempts` is the COUNT OF FAILED CYCLES, hoisted so it spans the FULL
+    /// dial+handshake cycle: a TCP-dial failure AND a post-dial handshake
+    /// failure each count as one. Behind a TCP-accepting proxy / LB whose
+    /// backend is down — the storm class the anti-thrash supervision was built
+    /// for — the dial always succeeds but the Pulsar handshake never completes;
+    /// counting only dial failures (the pre-ADR-0061 behaviour) let the budget
+    /// never fire, so the driver retried forever. Counting EVERY post-dial
+    /// failure uniformly (without distinguishing broker-said-no from
+    /// connection-dropped) is the simplest rule and matches Java's bounded
+    /// reconnect.
+    ///
+    /// The counter is reset to `0` by the engine ONLY when
+    /// [`Self::should_reset_backoff`] is true for the previous socket's
+    /// lifetime — so give-up-reset and backoff-reset share ONE stability
+    /// definition (a connection that survived `drop_grace`). A socket that
+    /// merely accepted TCP and handshaked but died inside `drop_grace` does NOT
+    /// reset the budget.
+    #[must_use]
+    pub fn should_give_up(&self, attempts: u32) -> bool {
+        self.max_attempts.is_some_and(|max| attempts > max)
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +291,108 @@ mod tests {
             after_reset <= Duration::from_millis(100),
             "schedule resets to initial after a stable socket, got {after_reset:?}"
         );
+    }
+
+    #[test]
+    fn give_up_fires_at_budget_behind_tcp_accept() {
+        // ADR-0061: drive the exact counter sequence the supervised driver
+        // makes when a TCP-accepting proxy answers every dial but the Pulsar
+        // handshake never completes. The dial succeeds, so the OLD per-cycle
+        // counter reset to 0 each outer iteration and never reached the budget;
+        // the hoisted counter increments on every failed dial+handshake cycle
+        // and gives up at `max_attempts`.
+        let cfg = SupervisorConfig {
+            max_attempts: Some(3),
+            ..SupervisorConfig::default()
+        };
+        // The driver increments BEFORE checking (attempt = attempt + 1; if
+        // attempt > max { give up }). N consecutive handshake failures behind a
+        // TCP-accept reach the budget: attempts 1, 2, 3 keep trying; attempt 4
+        // (> 3) gives up.
+        let mut attempts: u32 = 0;
+        let mut gave_up_at = None;
+        for cycle in 0..10 {
+            attempts = attempts.saturating_add(1);
+            if cfg.should_give_up(attempts) {
+                gave_up_at = Some(cycle);
+                break;
+            }
+            // Each cycle: TCP accepted, handshake failed, socket died inside
+            // drop_grace — so the give-up counter is NOT reset.
+            assert!(!cfg.should_reset_backoff(Duration::from_millis(5)));
+        }
+        assert_eq!(
+            gave_up_at,
+            Some(3),
+            "must give up on the 4th cycle (attempt 4 > max_attempts 3)"
+        );
+        assert_eq!(attempts, 4, "counter spans the full dial+handshake cycle");
+    }
+
+    #[test]
+    fn give_up_counter_resets_on_socket_surviving_drop_grace() {
+        // A single socket surviving past drop_grace resets the counter to 0:
+        // the give-up budget shares ONE stability definition with backoff reset
+        // (should_reset_backoff). After two failed cycles, a stable socket
+        // clears the slate so the next storm starts the budget from scratch.
+        let cfg = SupervisorConfig {
+            max_attempts: Some(3),
+            drop_grace: Duration::from_millis(500),
+            ..SupervisorConfig::default()
+        };
+        let mut attempts: u32 = 0;
+
+        // Two failed dial+handshake cycles (socket died in 5 ms each).
+        for _ in 0..2 {
+            attempts = attempts.saturating_add(1);
+            assert!(!cfg.should_give_up(attempts));
+        }
+        assert_eq!(attempts, 2);
+
+        // A stable socket survived 2 s (> drop_grace): the engine resets the
+        // counter exactly where it resets the backoff schedule.
+        assert!(cfg.should_reset_backoff(Duration::from_secs(2)));
+        attempts = 0;
+
+        // The budget now tolerates a full fresh run of 3 attempts before giving
+        // up — proof the stable socket genuinely cleared the slate.
+        for _ in 0..3 {
+            attempts = attempts.saturating_add(1);
+            assert!(
+                !cfg.should_give_up(attempts),
+                "fresh budget after a stable socket must tolerate max_attempts again"
+            );
+        }
+        attempts = attempts.saturating_add(1);
+        assert!(
+            cfg.should_give_up(attempts),
+            "4th attempt exhausts the reset budget"
+        );
+    }
+
+    #[test]
+    fn give_up_never_fires_with_default_infinite_max_attempts() {
+        // Default max_attempts == None NEVER gives up — Java parity (infinite
+        // reconnect). No finite attempt count, however large, trips the gate.
+        let cfg = SupervisorConfig::default();
+        assert!(cfg.max_attempts.is_none());
+        assert!(!cfg.should_give_up(0));
+        assert!(!cfg.should_give_up(1));
+        assert!(!cfg.should_give_up(1_000));
+        assert!(!cfg.should_give_up(u32::MAX));
+    }
+
+    #[test]
+    fn give_up_boundary_is_strict_greater_than() {
+        // attempt == max keeps trying; attempt > max gives up. Mirrors the
+        // `if attempt > max` guard the drivers run.
+        let cfg = SupervisorConfig {
+            max_attempts: Some(5),
+            ..SupervisorConfig::default()
+        };
+        assert!(!cfg.should_give_up(4));
+        assert!(!cfg.should_give_up(5), "attempt == max must keep trying");
+        assert!(cfg.should_give_up(6), "attempt > max gives up");
     }
 
     #[test]

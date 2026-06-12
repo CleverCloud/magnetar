@@ -468,6 +468,11 @@ impl Client {
         let target = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
         let target_shared = self.resolve_target(target, &topic).await?;
+        // ADR-0059 / follow-ups §4.1: the resolved data-plane connection may be
+        // a pool entry distinct from the bootstrap; fast-fail if it has already
+        // gone terminal with no driver, before registering a doomed
+        // `CommandProducer`.
+        target_shared.fail_if_no_driver()?;
         let (handle, slot) = {
             let mut conn = target_shared.inner.lock();
             let handle = conn.create_producer(req);
@@ -521,16 +526,82 @@ impl Client {
     /// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] surfaces as `LookupOutcome::Failed`
     /// → [`ClientError::Broker`] when a hostile broker exhausts the budget.
     async fn lookup_topic(&self, topic: &str) -> Result<LookupTarget, ClientError> {
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.lookup(topic, false)
-        };
-        self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
+        // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
+        // request when the bootstrap connection is already terminal with no
+        // driver to recover it. Without this, a `CommandLookupTopic` issued on
+        // a dead plain connection registers a pending request that no driver is
+        // left to resolve — the caller hangs forever. The guard fires only when
+        // `is_closed()` AND `no_driver`, so a supervised connection mid
+        // reconnect (transiently `Failed`, `no_driver == false`) still issues
+        // the lookup and recovers transparently.
+        self.shared.fail_if_no_driver()?;
+
+        // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
+        // `Connection::reset` (supervised reconnect) fails every pending
+        // request — including this in-flight `CommandLookupTopic` — with
+        // `OpOutcome::SessionLost`, but (unlike an in-flight publish) does NOT
+        // re-issue the lookup. We close that asymmetry here: on `SessionLost`,
+        // park until the connection is live again (or terminal), then re-issue
+        // against the fresh session. The reissue budget is only spent when a
+        // lookup was actually submitted against a connected session, so a
+        // connection flapping in its not-yet-reconnected window cannot burn the
+        // budget without a real broker round-trip. Mirrors Java's
+        // lookup-after-reset retry.
+        let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        loop {
+            let request_id = {
+                let mut conn = self.shared.inner.lock();
+                conn.lookup(topic, false)
+            };
+            self.shared.driver_waker.notify_one();
+            let outcome = RequestFut {
+                shared: self.shared.clone(),
+                request_id,
+            }
+            .await;
+
+            // The session was severed mid-lookup by a supervised reconnect.
+            // Park until the connection recovers (re-issue) or goes terminal
+            // (PeerClosed, composing with §5.1), bounded by the reissue budget.
+            if matches!(outcome, OpOutcome::SessionLost { .. }) {
+                match self.shared.await_reconnect_or_terminal().await {
+                    crate::LookupReissueReadiness::Reconnected => {
+                        if reissues_remaining == 0 {
+                            tracing::warn!(
+                                topic,
+                                max_reissues = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES,
+                                "lookup session-reissue cap exceeded; surfacing PeerClosed"
+                            );
+                            return Err(ClientError::PeerClosed);
+                        }
+                        reissues_remaining -= 1;
+                        tracing::debug!(
+                            topic,
+                            reissues_remaining,
+                            "lookup severed by reconnect; re-issuing against fresh session"
+                        );
+                        continue;
+                    }
+                    crate::LookupReissueReadiness::Terminal => {
+                        return Err(ClientError::PeerClosed);
+                    }
+                }
+            }
+
+            return Self::map_lookup_outcome(topic, outcome, self.bootstrap_scheme());
         }
-        .await;
+    }
+
+    /// Translate a terminal lookup [`OpOutcome`] into a [`LookupTarget`] or a
+    /// [`ClientError`]. Split out of [`Self::lookup_topic`] so the
+    /// bounded-retry loop (ADR-0060 / follow-ups §4.1) only re-runs the
+    /// issue-await steps; the `SessionLost` arm is handled by the loop before
+    /// this is reached, so it never appears here.
+    fn map_lookup_outcome(
+        topic: &str,
+        outcome: OpOutcome,
+        bootstrap_scheme: Scheme,
+    ) -> Result<LookupTarget, ClientError> {
         match outcome {
             OpOutcome::LookupResponse { outcome, .. } => {
                 match outcome {
@@ -555,7 +626,7 @@ impl Client {
                             let broker_url = preferred_broker_url(
                             broker_service_url,
                             broker_service_url_tls,
-                            self.bootstrap_scheme(),
+                            bootstrap_scheme,
                         )
                         .ok_or_else(|| ClientError::Other(format!(
                             "lookup of '{topic}' set proxy_through_service_url=true but did \
@@ -572,7 +643,7 @@ impl Client {
                             let broker_url = direct_broker_url(
                                 broker_service_url,
                                 broker_service_url_tls,
-                                self.bootstrap_scheme(),
+                                bootstrap_scheme,
                             );
                             Ok(LookupTarget::Direct { broker_url })
                         }
@@ -1128,6 +1199,10 @@ impl Client {
         let target = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
         let target_shared = self.resolve_target(target, &topic).await?;
+        // ADR-0059 / follow-ups §4.1: fast-fail if the resolved data-plane
+        // connection is already terminal with no driver, before registering a
+        // doomed `CommandSubscribe`.
+        target_shared.fail_if_no_driver()?;
         let (handle, slot) = {
             let mut conn = target_shared.inner.lock();
             let handle = conn.subscribe(req);
@@ -1356,6 +1431,16 @@ pub(crate) async fn bounded_wait_connected(
     }
 }
 
+/// Render the captured mid-handshake broker reason as the user-facing
+/// `"handshake failed: …"` envelope, or `None` when no broker `CommandError`
+/// was captured (a raw transport drop with no protocol frame). The proto layer
+/// already length-bounds the broker text at the capture site (ADR-0062), so the
+/// envelope here is safe to surface verbatim.
+fn handshake_failure_message(conn: &magnetar_proto::Connection) -> Option<String> {
+    conn.handshake_failure_reason()
+        .map(|reason| format!("handshake failed: {reason}"))
+}
+
 /// Future that resolves once the state machine reports `HandshakeState::Connected` (or fails if
 /// it transitions to `Failed`/`Closed` before that).
 struct ConnectedFut {
@@ -1382,9 +1467,20 @@ impl Future for ConnectedFut {
             match ev {
                 ConnectionEvent::Connected { .. } => return Poll::Ready(Ok(())),
                 ConnectionEvent::Closed { reason } => {
-                    return Poll::Ready(Err(ClientError::Other(
-                        reason.unwrap_or_else(|| "connection closed during handshake".into()),
-                    )));
+                    // A mid-handshake broker `CommandError` populates
+                    // `handshake_failure_reason`, but the terminal drop that
+                    // follows surfaces here as a `Closed` event whose `reason`
+                    // is the generic transport string ("peer closed the
+                    // connection"). Prefer the captured handshake reason — and
+                    // wrap it in the SAME "handshake failed: …" envelope as the
+                    // `Failed`-state branch below — so the broker's explanation
+                    // surfaces regardless of which terminalization path won the
+                    // capture-vs-drop race. The reason is already length-bounded
+                    // at the proto capture site (ADR-0062).
+                    let msg = handshake_failure_message(&conn).unwrap_or_else(|| {
+                        reason.unwrap_or_else(|| "connection closed during handshake".into())
+                    });
+                    return Poll::Ready(Err(ClientError::Other(msg)));
                 }
                 _ => {
                     // Tolerate other events that may sneak in (none expected pre-handshake).
@@ -1399,10 +1495,8 @@ impl Future for ConnectedFut {
                 // namespace not found via proxy_to_broker_url, etc.). Falls
                 // back to the opaque message for raw transport drops where no
                 // protocol frame ever arrived (TLS error, ECONNREFUSED).
-                let msg = conn.handshake_failure_reason().map_or_else(
-                    || "handshake failed".to_owned(),
-                    |reason| format!("handshake failed: {reason}"),
-                );
+                let msg = handshake_failure_message(&conn)
+                    .unwrap_or_else(|| "handshake failed".to_owned());
                 Poll::Ready(Err(ClientError::Other(msg)))
             }
             HandshakeState::Closed => Poll::Ready(Err(ClientError::Closed)),

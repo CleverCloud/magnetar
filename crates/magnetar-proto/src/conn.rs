@@ -917,12 +917,24 @@ impl Connection {
         // `OpSend`s WITHOUT a replay snapshot (there is no session to replay
         // onto), install a `Terminal` outcome on each `Send` key, and wake the
         // future. Take the per-slot lock, drain, DROP it, then wake.
+        //
+        // We ALSO flip the slot's `closed` flag inside this same per-slot lock
+        // scope (ADR-0059, follow-ups §4.1): a terminal drop is final, so a
+        // `queue_send` issued AFTER it must fast-fail synchronously with
+        // `ProducerError::Closed` via the existing `if self.closed` guard
+        // (`producer.rs`) instead of registering a doomed pending op that no
+        // driver is left to resolve. Setting `closed` here keeps the ADR-0038
+        // lock order intact — the global connection mutex is already held
+        // above, the per-slot mutex is taken below it in ONE acquisition (no
+        // second slot loop, no connection-mutex read on the send hot path),
+        // and the guard is dropped before the user wakers fire.
         let producer_handles: Vec<ProducerHandle> = self.producers.keys().copied().collect();
         for handle in producer_handles {
-            let drained = self
-                .producers
-                .get(&handle)
-                .map(|slot| slot.state.lock().drain_pending_sends());
+            let drained = self.producers.get(&handle).map(|slot| {
+                let mut slot_state = slot.state.lock();
+                slot_state.closed = true;
+                slot_state.drain_pending_sends()
+            });
             let Some(drained) = drained else { continue };
             for (seq, waker_opt) in drained {
                 let key = PendingOpKey::Send(handle, seq);
@@ -1837,15 +1849,22 @@ impl Connection {
                     let server_error_name = pb::ServerError::try_from(err.error)
                         .map(|v| format!("{v:?}"))
                         .unwrap_or_else(|_| format!("Unknown({})", err.error));
+                    // The broker `message` is hostile-peer-controlled input
+                    // (ADR-0054 §3 broker-string sanitisation). Bound it ONCE
+                    // here at the capture site — before it is owned into
+                    // `handshake_failure_reason` — so every downstream sink
+                    // (tokio `ClientError`, moonpool `EngineError::HandshakeFailed`)
+                    // inherits the bound. This is the broker-text sink that
+                    // escaped ADR-0054 §3; ADR-0062 closes it.
+                    let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
                     let reason = format!(
-                        "broker rejected handshake (server_error={server_error_name}): {}",
-                        err.message
+                        "broker rejected handshake (server_error={server_error_name}): {bounded_message}"
                     );
                     tracing::warn!(
                         target: "magnetar_proto::conn",
                         state = ?self.state,
                         server_error = %server_error_name,
-                        message = %err.message,
+                        message = %bounded_message,
                         "captured CommandError during handshake — surfacing as handshake_failure_reason",
                     );
                     self.handshake_failure_reason = Some(reason);
@@ -5609,6 +5628,123 @@ mod conn_state_tests {
         conn.fail_all_pending("peer closed");
     }
 
+    /// ADR-0059 / follow-ups §4.1: `fail_all_pending` must ALSO mark every
+    /// producer slot `closed` so a NEW `queue_send` issued AFTER the terminal
+    /// drop fast-fails synchronously with `ProducerError::Closed` (via the
+    /// existing per-slot `if self.closed` guard) instead of registering a
+    /// doomed pending op no driver is left to resolve. The original
+    /// `fail_all_pending` only terminalized ops that were ALREADY pending at
+    /// the drop; this asserts the slot-close extension.
+    ///
+    /// Also pins the ADR-0038 lock order: the slot-close happens INSIDE the
+    /// per-slot lock taken below the global connection mutex (`fail_all_pending`
+    /// runs `&mut self`), never the reverse. We prove the order holds by taking
+    /// the per-slot lock here AFTER `fail_all_pending` has returned (so the
+    /// global mutex is conceptually released) and reading `closed` — a reverse
+    /// acquisition inside `fail_all_pending` would have deadlocked the call
+    /// above, so reaching this assertion at all is the no-reverse-order witness.
+    #[test]
+    fn fail_all_pending_closes_slots_so_new_sends_fast_fail() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        assert!(conn.is_connected());
+        while conn.poll_event().is_some() {}
+
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/p".to_owned(),
+            ..Default::default()
+        });
+        // A baseline send BEFORE the drop must succeed — the producer is open
+        // and the slot is not closed yet.
+        conn.send(
+            producer,
+            crate::producer::OutgoingMessage {
+                payload: bytes::Bytes::from_static(b"pre-drop"),
+                metadata: pb::MessageMetadata::default(),
+                uncompressed_size: 8,
+                num_messages: 1,
+                txn_id: None,
+                source_message_id: None,
+            },
+            0,
+            Instant::now(),
+        )
+        .expect("pre-drop send queues");
+
+        // Terminal drop.
+        conn.fail_all_pending("peer closed");
+
+        // (1) The slot is now marked `closed`. Reaching this `producer()`
+        // accessor — which takes the per-slot lock AFTER `fail_all_pending`
+        // returned — is the witness that `fail_all_pending` did NOT hold the
+        // per-slot lock across a re-acquisition of the global mutex (ADR-0038
+        // global → per-slot order preserved; a reverse path would have
+        // deadlocked the call above).
+        let slot = conn
+            .producer(producer)
+            .cloned()
+            .expect("producer slot still registered after fail_all_pending");
+        assert!(
+            slot.state.lock().closed,
+            "fail_all_pending must flip the per-slot closed flag (ADR-0059)"
+        );
+
+        // (2) A NEW send issued AFTER the terminal drop fast-fails. At the
+        // proto layer the slot's `queue_send` returns `ProducerError::Closed`
+        // via the existing `if self.closed` guard — this is the cheap signal
+        // the engines map to `ClientError::PeerClosed`.
+        let err = slot
+            .state
+            .lock()
+            .queue_send(
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"post-drop"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 9,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect_err("a post-terminal send must be rejected, not registered");
+        assert!(
+            matches!(err, crate::error::ProducerError::Closed),
+            "post-terminal queue_send must fast-fail with ProducerError::Closed, got {err:?}"
+        );
+
+        // (3) The `Connection::send` entry collapses the same rejection into
+        // the opaque `InvariantViolation` it uses for every slot rejection —
+        // the engines do not rely on the inner variant, they read the
+        // `no_driver` latch, but the send must still be REJECTED (never
+        // silently queued onto a dead connection).
+        let send_err = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"post-drop-via-conn"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 18,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect_err("Connection::send must reject a post-terminal send");
+        assert!(
+            matches!(send_err, ProtocolError::InvariantViolation(_)),
+            "Connection::send rejection surfaces as InvariantViolation, got {send_err:?}"
+        );
+    }
+
     #[test]
     fn op_outcome_session_lost_round_trips_through_outcome_slab() {
         // The slab itself is HashMap<PendingOpKey, OpOutcome>; this test exercises the
@@ -8262,6 +8398,108 @@ mod conn_state_tests {
             "a live peer is never failed; the watchdog re-arms cleanly",
         );
     }
+
+    /// ADR-0060 / follow-ups §4.1 (layer a): the proto-level surface the
+    /// engine-side bounded lookup-retry loop consults. An in-flight lookup
+    /// severed by `reset()` surfaces `OpOutcome::SessionLost` (the signal to
+    /// re-issue, NOT a terminal error), and after a fresh handshake the
+    /// connection is `is_connected()` again so a re-issued lookup lands a NEW,
+    /// resolvable request-id on the new session. This is what lets the engine
+    /// loop TERMINATE on the next reconnect instead of spinning: one
+    /// `SessionLost` → one re-issue → a real broker round-trip on the fresh
+    /// session. The bound [`crate::lookup::MAX_LOOKUP_SESSION_REISSUES`] caps the
+    /// number of such re-issues; this test proves the happy-path re-issue is
+    /// resolvable (so the bound is a ceiling, not the steady state).
+    #[test]
+    fn reissued_lookup_after_reset_resolves_on_fresh_session() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+        assert!(conn.is_connected(), "connected after the first handshake");
+
+        // First lookup goes in flight, then the supervised reconnect severs it.
+        let first_rid = conn.lookup("persistent://public/default/foo", false);
+        conn.reset();
+
+        // The engine loop's `matches!(outcome, OpOutcome::SessionLost { .. })`
+        // arm fires on exactly this outcome — the re-issue signal.
+        match conn.take_outcome(PendingOpKey::Request(first_rid)) {
+            Some(OpOutcome::SessionLost { key }) => {
+                assert_eq!(key, PendingOpKey::Request(first_rid));
+            }
+            other => panic!("expected SessionLost on the severed lookup, got {other:?}"),
+        }
+
+        // `reset()` snapped the state machine back to `Uninitialized`; the
+        // engine loop parks on readiness (`await_reconnect_or_terminal`) until
+        // the supervisor re-handshakes the socket.
+        assert!(
+            !conn.is_connected(),
+            "post-reset the connection is not yet live — the loop must park, not re-issue"
+        );
+
+        // Supervisor re-handshakes the new socket → back to Connected. This is
+        // the `Reconnected` branch the engine loop waits for.
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle re-handshake");
+        let _ = conn.poll_event();
+        assert!(
+            conn.is_connected(),
+            "connection is live again after the supervised re-handshake"
+        );
+
+        // The re-issued lookup lands a fresh request-id resolvable on the new
+        // session — distinct from the severed one, and present in the registry
+        // so a `LookupResponse` on the new socket correlates against it.
+        let reissued_rid = conn.lookup("persistent://public/default/foo", false);
+        assert_ne!(
+            reissued_rid, first_rid,
+            "the re-issued lookup uses a fresh request-id on the new session"
+        );
+        assert!(
+            conn.lookup.lookups.contains_key(&reissued_rid),
+            "the re-issued lookup is registered against the fresh session, so its \
+             broker response will resolve it — the loop terminates",
+        );
+    }
+
+    /// ADR-0060 / follow-ups §4.1 (layer a): the terminal short-circuit the
+    /// engine loop's `await_reconnect_or_terminal` returns. When the connection
+    /// has gone `is_closed()` (here: a transport `Failed`) and the runtime's
+    /// `no_driver` latch is set, the engine maps a severed lookup to a clean
+    /// `PeerClosed` instead of re-issuing — composing with ADR-0059. The proto layer
+    /// owns the `is_closed()` half of that decision; this pins it.
+    #[test]
+    fn failed_connection_is_closed_so_lookup_loop_short_circuits() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        // A transport drop with NO supervisor reconnect → `Failed`, which
+        // `is_closed()` reports `true`. Paired with the runtime `no_driver`
+        // latch (ADR-0059), the engine loop returns `Terminal` → `PeerClosed`.
+        conn.mark_disconnected();
+        assert!(
+            conn.is_closed(),
+            "a Failed connection reports is_closed(); the engine pairs this with \
+             no_driver to short-circuit the lookup loop to PeerClosed"
+        );
+        assert!(
+            !conn.is_connected(),
+            "a Failed connection is not connected — the loop never re-issues"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "scalable-topics"))]
@@ -8570,6 +8808,89 @@ mod handshake_failure_reason_tests {
         assert!(
             conn.handshake_failure_reason().is_none(),
             "post-handshake CommandError must not leak into handshake_failure_reason",
+        );
+    }
+
+    /// ADR-0062: a hostile broker can return an arbitrarily long `message`
+    /// in its mid-handshake `CommandError`. The capture site must bound the
+    /// broker text to [`MAX_BROKER_STR`] bytes at a char boundary BEFORE it
+    /// is stored in `handshake_failure_reason`, so every downstream sink
+    /// (tokio `ClientError`, moonpool `EngineError::HandshakeFailed`) inherits
+    /// the bound. Mirrors the `truncation_respects_char_boundaries` unit test
+    /// in `log_fields`.
+    #[test]
+    fn handshake_failure_reason_bounds_oversized_broker_message() {
+        let mut conn = fresh_conn();
+        conn.begin_handshake().expect("begin");
+        assert_eq!(conn.state(), HandshakeState::ConnectSent);
+
+        // 'é' is 2 bytes; 400 of them = 800 bytes, with the 256-byte cut
+        // falling mid-char so the boundary back-off is exercised too.
+        let oversized = "é".repeat(400);
+        assert!(oversized.len() > crate::log_fields::MAX_BROKER_STR);
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: 0,
+                error: pb::ServerError::AuthenticationError as i32,
+                message: oversized.clone(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+
+        let reason = conn
+            .handshake_failure_reason()
+            .expect("oversized broker message must still populate the reason");
+        // The stored reason is "broker rejected handshake (server_error=…): <bounded>".
+        // The bounded broker-text slice it embeds must be ≤ MAX_BROKER_STR bytes
+        // at a valid char boundary — the fixed prefix is the only extra length.
+        let prefix = "broker rejected handshake (server_error=AuthenticationError): ";
+        let embedded = reason
+            .strip_prefix(prefix)
+            .expect("reason must carry the fixed envelope prefix");
+        assert!(
+            embedded.len() <= crate::log_fields::MAX_BROKER_STR,
+            "embedded broker text must be bounded to MAX_BROKER_STR (got {} bytes)",
+            embedded.len(),
+        );
+        assert!(
+            oversized.starts_with(embedded),
+            "the bounded text must be a verbatim char-boundary prefix of the broker message",
+        );
+        // The bound is the char-boundary back-off, so the embedded slice is
+        // strictly shorter than the budget when byte 256 split a 2-byte char.
+        assert!(embedded.len() <= crate::log_fields::MAX_BROKER_STR);
+        assert!(oversized.is_char_boundary(embedded.len()));
+    }
+
+    /// ADR-0062 companion: a SHORT broker message still round-trips verbatim
+    /// (the bound only ever fires above the budget) — pins that the
+    /// truncation is a ceiling, not a fixed-width truncation.
+    #[test]
+    fn handshake_failure_reason_preserves_short_broker_message() {
+        let mut conn = fresh_conn();
+        conn.begin_handshake().expect("begin");
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: 0,
+                error: pb::ServerError::AuthenticationError as i32,
+                message: "token expired".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+        let reason = conn.handshake_failure_reason().expect("reason");
+        assert!(
+            reason.contains("token expired"),
+            "short broker message must round-trip verbatim: {reason}",
         );
     }
 

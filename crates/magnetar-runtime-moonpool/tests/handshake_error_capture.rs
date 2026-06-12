@@ -37,9 +37,14 @@ use parking_lot::Mutex;
 /// trivial.
 const BROKER_PORT: u16 = 6650;
 
-/// Broker-side message — must round-trip verbatim into the
+/// Broker-side message — a SHORT message must round-trip verbatim into the
 /// engine-surfaced `EngineError::HandshakeFailed` payload.
 const BROKER_MESSAGE: &str = "token expired";
+
+/// Proto-side ceiling for broker-supplied strings (ADR-0054 §3 / ADR-0062).
+/// Kept in sync with `magnetar_proto::log_fields::MAX_BROKER_STR` (a private
+/// const); a broker message above this is truncated at the capture site.
+const MAX_BROKER_STR: usize = 256;
 
 /// Single-`poll_read` helper — appends what was read into `buf`, returns the
 /// count (`0` on EOF).
@@ -54,8 +59,8 @@ async fn read_into<S: AsyncRead + Unpin>(
 }
 
 /// Per-session script: read the inbound `CommandConnect`, reply with a
-/// `CommandError(AuthenticationError, "token expired")` and drop the socket.
-async fn handle_reject_handshake_session<S>(mut stream: S) -> SimulationResult<()>
+/// `CommandError(AuthenticationError, <message>)` and drop the socket.
+async fn handle_reject_handshake_session<S>(mut stream: S, message: String) -> SimulationResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -90,7 +95,7 @@ where
                 error: Some(pb::CommandError {
                     request_id: 0,
                     error: pb::ServerError::AuthenticationError as i32,
-                    message: BROKER_MESSAGE.to_owned(),
+                    message: message.clone(),
                 }),
                 ..Default::default()
             };
@@ -116,12 +121,14 @@ where
 /// counter is the sweep-level proof the script fired.
 struct RejectHandshakeBroker {
     sessions_handled: Arc<Mutex<u32>>,
+    message: String,
 }
 
 impl RejectHandshakeBroker {
-    fn new() -> Self {
+    fn new(message: String) -> Self {
         Self {
             sessions_handled: Arc::new(Mutex::new(0)),
+            message,
         }
     }
 }
@@ -150,10 +157,11 @@ impl Workload for RejectHandshakeBroker {
                     match inbound {
                         Ok((stream, _peer)) => {
                             *handled.lock() += 1;
+                            let message = self.message.clone();
                             let _handle = task.spawn_task(
                                 "reject-handshake-session",
                                 async move {
-                                    let _ = handle_reject_handshake_session(stream).await;
+                                    let _ = handle_reject_handshake_session(stream, message).await;
                                 },
                             );
                         }
@@ -175,6 +183,9 @@ struct HandshakeFailureClient {
     saw_server_error: Arc<Mutex<bool>>,
     saw_broker_message: Arc<Mutex<bool>>,
     last_error: Arc<Mutex<Option<String>>>,
+    /// The `HandshakeFailed` reason from the most recent iteration that
+    /// surfaced one — lets the bound sweep inspect its length (ADR-0062).
+    last_handshake_reason: Arc<Mutex<Option<String>>>,
 }
 
 impl HandshakeFailureClient {
@@ -183,6 +194,7 @@ impl HandshakeFailureClient {
             saw_server_error: Arc::new(Mutex::new(false)),
             saw_broker_message: Arc::new(Mutex::new(false)),
             last_error: Arc::new(Mutex::new(None)),
+            last_handshake_reason: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -231,6 +243,7 @@ impl Workload for HandshakeFailureClient {
             if reason.contains(BROKER_MESSAGE) {
                 *self.saw_broker_message.lock() = true;
             }
+            *self.last_handshake_reason.lock() = Some(reason);
         }
         Ok(())
     }
@@ -244,7 +257,7 @@ impl Workload for HandshakeFailureClient {
 /// of the opaque `EngineError::PeerClosed` a raw drop would produce.
 #[test]
 fn connect_plain_surfaces_handshake_failure_reason_from_broker_command_error() {
-    let broker = RejectHandshakeBroker::new();
+    let broker = RejectHandshakeBroker::new(BROKER_MESSAGE.to_owned());
     let sessions_handled = broker.sessions_handled.clone();
     let client = HandshakeFailureClient::new();
     let saw_server_error = client.saw_server_error.clone();
@@ -270,11 +283,71 @@ fn connect_plain_surfaces_handshake_failure_reason_from_broker_command_error() {
          (\"AuthenticationError\") on at least one iteration \
          (last_error={last:?}, report={report:?})",
     );
+    // A SHORT broker message is below the budget, so it round-trips verbatim —
+    // the bound is a ceiling, not a fixed-width truncation (ADR-0062).
     assert!(
         *saw_broker_message.lock(),
         "HandshakeFailed reason must carry the verbatim broker message \
          (\"{BROKER_MESSAGE}\") on at least one iteration \
          (last_error={last:?}, report={report:?})",
+    );
+}
+
+/// ADR-0062: the moonpool 1:1 twin of
+/// `connect_bounds_oversized_broker_handshake_message`. A hostile broker
+/// returning an arbitrarily long mid-handshake `CommandError.message` must
+/// surface a BOUNDED `EngineError::HandshakeFailed` reason — the proto
+/// capture site truncates the broker text to `MAX_BROKER_STR` bytes at a
+/// char boundary, and the moonpool engine sink inherits the bound.
+#[test]
+fn connect_plain_bounds_oversized_broker_handshake_message() {
+    // 'é' is 2 bytes; 400 of them = 800 bytes, with the 256-byte cut falling
+    // mid-char so the boundary back-off is exercised end-to-end.
+    let oversized = "é".repeat(400);
+    let broker = RejectHandshakeBroker::new(oversized.clone());
+    let sessions_handled = broker.sessions_handled.clone();
+    let client = HandshakeFailureClient::new();
+    let saw_server_error = client.saw_server_error.clone();
+    let last_reason = client.last_handshake_reason.clone();
+    let last_error = client.last_error.clone();
+    let report = SimulationBuilder::new()
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![1, 2, 3, 42])
+        .set_iterations(4)
+        .run();
+
+    let handled = *sessions_handled.lock();
+    assert!(
+        handled >= 1,
+        "broker must have handled at least one inbound handshake \
+         (sessions_handled={handled}, report={report:?})",
+    );
+    let last = last_error.lock().clone();
+    assert!(
+        *saw_server_error.lock(),
+        "HandshakeFailed reason must mention the ServerError variant on at least \
+         one iteration (last_error={last:?}, report={report:?})",
+    );
+    let reason = last_reason
+        .lock()
+        .clone()
+        .expect("at least one iteration must surface a HandshakeFailed reason");
+    // The reason is "broker rejected handshake (server_error=…): <bounded>".
+    // The attacker-controlled broker text must stay within budget; the fixed
+    // envelope prefixes are small and constant.
+    let envelope_budget = MAX_BROKER_STR + 128;
+    assert!(
+        reason.len() <= envelope_budget,
+        "oversized broker handshake message must be bounded \
+         (reason len {} > budget {envelope_budget}): {reason}",
+        reason.len(),
+    );
+    // A bounded char-boundary prefix of the broker message still round-trips.
+    let bounded_prefix: String = oversized.chars().take(64).collect();
+    assert!(
+        reason.contains(&bounded_prefix),
+        "a bounded prefix of the broker message must still surface (got: {reason})",
     );
 }
 

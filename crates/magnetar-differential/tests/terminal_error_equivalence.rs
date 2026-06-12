@@ -101,3 +101,84 @@ async fn terminal_decode_fatal_on_send_is_equivalent_across_engines() {
          not a hang or a mis-classified error",
     );
 }
+
+/// ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the terminal drop must
+/// surface the SAME terminal `peer-closed` outcome on BOTH engines — not a
+/// hang, not a divergence. This is the new-op companion to the in-flight
+/// differential claim above (ADR-0055 §1).
+///
+/// The trace issues TWO sends on the same producer. The first triggers the
+/// broker's decode-fatal terminal drop (resolving as `peer-closed`, exactly as
+/// the single-send test). The second is issued AFTER the plain driver has run
+/// `fail_all_pending` (slot `closed`) and latched `no_driver`: it must fast-fail
+/// SYNCHRONOUSLY via the slot-close + `no_driver` mapping, producing a second
+/// identical `SendError { kind: "peer-closed" }` on each engine. The per-leg
+/// `timeout` is the no-hang guard; the byte-for-byte `EventStream` compare is
+/// the equivalence claim.
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_new_send_after_drop_is_equivalent_across_engines() {
+    let trace = Trace::new(
+        "persistent://public/default/diff-terminal-newop",
+        "sub-terminal-newop",
+        vec![
+            // (1) triggers the decode-fatal terminal drop → peer-closed.
+            Op::Send {
+                payload: b"in-flight-when-peer-dies".to_vec(),
+            },
+            // (2) issued after the connection is terminal → must ALSO be
+            // peer-closed (slot closed + no_driver latched), not a hang.
+            Op::Send {
+                payload: b"after-terminal-drop".to_vec(),
+            },
+        ],
+    );
+
+    // ── Tokio leg ──
+    let broker_t = ScriptedBroker::bind().await.expect("broker bind");
+    broker_t.inject_decode_fatal_frame_on_send();
+    let tokio_stream = tokio::time::timeout(
+        Duration::from_secs(30),
+        runner_tokio::run(&broker_t.pulsar_url(), &trace),
+    )
+    .await
+    .expect("tokio leg must not hang on the post-terminal send")
+    .expect("tokio runner");
+    broker_t.shutdown().await;
+
+    // ── Moonpool leg ──
+    let broker_m = ScriptedBroker::bind().await.expect("broker bind");
+    broker_m.inject_decode_fatal_frame_on_send();
+    let moonpool_stream = tokio::time::timeout(
+        Duration::from_secs(30),
+        runner_moonpool::run(&broker_m.host_port(), &trace),
+    )
+    .await
+    .expect("moonpool leg must not hang on the post-terminal send")
+    .expect("moonpool runner");
+    broker_m.shutdown().await;
+
+    // ── Equivalence claim: both engines surface TWO identical peer-closed
+    // send outcomes (the in-flight one + the post-terminal new op). ──
+    assert_eq!(
+        tokio_stream, moonpool_stream,
+        "engine event streams diverged for the new-op terminal trace {trace:?}",
+    );
+    assert_eq!(
+        tokio_stream.events.len(),
+        2,
+        "both the in-flight and the post-terminal send must surface an event",
+    );
+    assert_eq!(
+        tokio_stream.events,
+        vec![
+            Event::SendError {
+                kind: "peer-closed".to_owned(),
+            },
+            Event::SendError {
+                kind: "peer-closed".to_owned(),
+            },
+        ],
+        "both the in-flight send AND the post-terminal new send must surface \
+         the terminal peer-closed outcome on both engines (ADR-0059)",
+    );
+}

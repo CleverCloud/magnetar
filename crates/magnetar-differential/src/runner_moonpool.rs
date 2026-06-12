@@ -54,9 +54,37 @@ fn partition_topic(base: &str, partition: i32) -> String {
 /// Returns the last engine-level error if the initial connect /
 /// producer / consumer open fails.
 pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientError> {
-    let mut stream = EventStream::empty();
     let engine = MoonpoolEngine::new(TokioProviders::new());
     let client = Client::connect_plain(&engine, host_port, ConnectionConfig::default()).await?;
+    replay(client, trace).await
+}
+
+/// Run `trace` against the moonpool engine with the auto-reconnect supervisor
+/// enabled. The supervised driver transparently redials on a broker-induced
+/// drop and replays the in-flight publish / re-subscribes, so a scenario
+/// armed with [`crate::broker::ScriptedBroker::drop_connection_after`]
+/// resumes from the durable cursor instead of failing the op. Mirrors the
+/// tokio sibling [`crate::runner_tokio::run_supervised`] so the two legs
+/// compare equal.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_supervised(
+    host_port: &str,
+    trace: &Trace,
+    supervisor: magnetar_proto::SupervisorConfig,
+) -> Result<EventStream, ClientError> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let config = ConnectionConfig {
+        supervisor: Some(supervisor),
+        ..Default::default()
+    };
+    let client = Client::connect_plain_supervised(&engine, host_port, config, None, None).await?;
+    replay(client, trace).await
+}
+
+async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventStream, ClientError> {
+    let mut stream = EventStream::empty();
 
     // `Option` so `Op::DropProducer` can release every clone mid-trace
     // (issue #241 last-clone drop guard). Mirrors `runner_tokio.rs`.

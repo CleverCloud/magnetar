@@ -12,8 +12,9 @@
 //! boundary as public API.
 
 /// Maximum length, in bytes, of a broker-supplied string embedded in a log
-/// field (ADR-0054 §broker-controlled string sanitisation).
-const MAX_BROKER_STR: usize = 256;
+/// field (ADR-0054 §broker-controlled string sanitisation) or in a stored
+/// broker reason such as `handshake_failure_reason` (ADR-0062).
+pub(crate) const MAX_BROKER_STR: usize = 256;
 
 /// Truncate a broker-supplied string to [`MAX_BROKER_STR`] bytes for use as
 /// a structured log field, backing off to the previous `char` boundary so

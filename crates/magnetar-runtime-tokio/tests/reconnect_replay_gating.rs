@@ -341,3 +341,109 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
 
     client.close().await;
 }
+
+/// Shared script state for the dedicated transient-retry test.
+#[derive(Default)]
+struct TransientOpenGating {
+    /// `CommandProducer` frames seen (1st → transient reject, 2nd → ack).
+    producer_opens: AtomicU32,
+    /// `CommandLookupTopic` frames seen (the open's lookup, then the retry
+    /// leg's re-lookup) — at least 2 by the time the retry's open is acked.
+    lookups: AtomicU32,
+}
+
+/// Scripted single-session broker for the dedicated transient-retry test:
+/// handshake, answer every lookup, transiently reject the FIRST producer-open
+/// (`ServiceNotReady` "Please redo the lookup"), then ack the SECOND — the one
+/// the §3.1 lookup-then-retry leg issues after its delay. The proto layer
+/// RETAINS the producer state on the transient code, so the user's
+/// `open_producer` future stays pending across the reject + retry and resolves
+/// only on the retry's `ProducerSuccess`.
+async fn run_transient_open_broker(listener: TcpListener, state: Arc<TransientOpenGating>) {
+    let Ok((mut s, _)) = listener.accept().await else {
+        return;
+    };
+    let st = Arc::clone(&state);
+    serve_conn(&mut s, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(l) = &frame.command.lookup_topic {
+                    st.lookups.fetch_add(1, Ordering::SeqCst);
+                    emit_lookup_response(out, l.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Producer) => {
+                if let Some(p) = &frame.command.producer {
+                    let n = st.producer_opens.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        emit_transient_error(out, p.request_id);
+                    } else {
+                        emit_producer_success(out, p.request_id);
+                    }
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+/// Dedicated tokio coverage for the transient producer-open retry arm
+/// (`ProducerOpenFailedTransient` → lookup → `retry_producer_open`), the 1:1
+/// twin of the moonpool engine's
+/// `transient_producer_open_retry_fires_under_virtual_time`
+/// (ADR-0024 runtime-test-parity). The combined
+/// `queued_send_replays_only_after_retry_ack_across_reconnect` exercises this
+/// leg only as one step of a reconnect-replay flow; this isolates it: a single
+/// healthy session whose FIRST producer-open is transiently rejected must still
+/// yield a live producer once the retry's open is acked — never surface the
+/// transient reject as an open error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn producer_open_recovers_after_transient_reject() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(TransientOpenGating::default());
+    tokio::spawn(run_transient_open_broker(listener, Arc::clone(&state)));
+    let url = format!("pulsar://{addr}");
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        Client::connect(&url, ConnectionConfig::default()),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect must succeed");
+
+    // The transient reject must NOT fail the open: the retry leg re-looks-up
+    // and re-opens after its delay, and the open resolves on the retry's ack.
+    let producer = tokio::time::timeout(
+        Duration::from_secs(20),
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/transient-open".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("producer open must resolve after the transient retry — not hang")
+    .expect("producer open must succeed once the retry's open is acked");
+
+    assert_eq!(
+        state.producer_opens.load(Ordering::SeqCst),
+        2,
+        "first open transiently rejected + retry open acked",
+    );
+    assert!(
+        state.lookups.load(Ordering::SeqCst) >= 2,
+        "the retry leg must re-issue a lookup before re-opening (Pulsar 'redo the lookup')",
+    );
+
+    // Drop the producer rather than `close()`-ing it: the scripted broker does
+    // not answer `CommandCloseProducer`, and `client.close()` tears the socket
+    // down without needing a broker close-ack (the recovered-open assertion
+    // above is the contract under test).
+    drop(producer);
+    client.close().await;
+}

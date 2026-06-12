@@ -37,9 +37,48 @@ fn partition_topic(base: &str, partition: i32) -> String {
 /// producer / consumer open fails. A failure mid-trace surfaces as
 /// `Event::SendError`/`AckError`/etc. inside the [`EventStream`].
 pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig::default(),
+    )
+    .await
+}
+
+/// Run `trace` against the tokio engine with the auto-reconnect supervisor
+/// enabled (`config.supervisor = Some(...)`). The driver transparently
+/// redials on a broker-induced drop and replays the in-flight publish /
+/// re-subscribes, so a scenario armed with
+/// [`crate::broker::ScriptedBroker::drop_connection_after`] resumes from the
+/// durable cursor instead of failing the op. Mirrors the moonpool sibling
+/// [`crate::runner_moonpool::run_supervised`] so the two legs compare equal.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_supervised(
+    pulsar_url: &str,
+    trace: &Trace,
+    supervisor: magnetar_proto::SupervisorConfig,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            supervisor: Some(supervisor),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn run_with_config(
+    pulsar_url: &str,
+    trace: &Trace,
+    config: magnetar_proto::ConnectionConfig,
+) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 
-    let client = Client::connect(pulsar_url, magnetar_proto::ConnectionConfig::default()).await?;
+    let client = Client::connect(pulsar_url, config).await?;
 
     // `Option` so `Op::DropProducer` can release every clone mid-trace
     // (issue #241 last-clone drop guard). `None` afterwards makes

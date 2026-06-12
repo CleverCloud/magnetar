@@ -19,13 +19,13 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                | Status                                                                                           |
-| --- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                         |
-| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🧠 engine/harness features + a supervision-semantics design pass                                 |
-| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟡 2 engine residuals (fast-fail, lookup-retry) + 3 pre-existing test-state caveats              |
-| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                      |
+| #   | Item                                                                                                                | Status                                                                                                                     |
+| --- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460                           |
+| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                                                   |
+| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🟢 all four residuals closed (ADR-0061 give-up budget; moonpool transient arms; differential drop knob; send-loop hygiene) |
+| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain                                  |
+| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                                                |
 
 ---
 
@@ -52,23 +52,32 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 
 (Closed residual: the `topic`-field-presence enforcement once parked here is subsumed by the `cargo run -p xtask -- check-log-fields` gate that shipped with ADR-0054.)
 
-(Related residual, waived in the ADR-0054 changeset as pre-existing in degree: error-`Display` fields that can embed peer-supplied text — e.g. the supervisor reconnect-failed `error = %err`, which may wrap a broker-supplied handshake reason — are not yet length-bounded; fold a normalization/truncation decision for error fields into this follow-up.)
+(Closed residual: error/connect-error fields that embed peer-supplied text were not length-bounded. The one broker-text sink was the mid-handshake `CommandError.message`, stored unbounded in `Connection::handshake_failure_reason` and inherited by the tokio `ClientError::Other("handshake failed: …")` / moonpool `EngineError::HandshakeFailed` connect errors plus the adjacent `warn!`. Closed by [ADR-0059](../specs/adr/0059-broker-error-field-truncation.md): the broker text is truncated ONCE at the proto capture site via the existing `truncate_broker_str` (256 bytes, `char` boundary) BEFORE it is stored, so every downstream sink inherits the bound — completing ADR-0054 §3 for the sink its log-field-only phrasing missed; short messages still round-trip verbatim. The audit confirmed the supervisor reconnect-failed `error = %err` sites wrap LOCAL errors (dial / TLS / DNS / URL-parse / `ProtocolError`), not broker text, so they are correctly left unbounded. The same changeset fixed a tokio capture-vs-terminal-drop race where a broker `CommandError`-then-socket-drop surfaced the opaque `"peer closed the connection"` instead of the captured reason. Request-correlated `ClientError::Broker { message }` (a post-handshake error path) is left for a separate decision. See the `fix(proto,runtime)` commit.)
 
 ## 3. Reconnect parity residuals (surfaced by the re-attach replay fix)
 
-**Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix:
+**Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix. All four are now closed.
 
-1. **Moonpool transient-retry arms are missing**: the moonpool driver never consumes `ProducerOpenFailedTransient` / `SubscribeFailedTransient` (the tokio driver runs the lookup-then-retry leg; moonpool has zero `Transient` matches).
-   A post-restart broker answering a rebuild with `ServiceNotReady` dead-ends the re-attach on the moonpool engine.
-   The `reconnect_replay_gating` twins document the asymmetry in-file.
-2. **Differential harness has no connection-drop knob**: `ScriptedBroker` accepts multiple sessions but cannot script a mid-scenario drop + redial, so the re-attach replay fix carries proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out in the commit message.
-   Add a `drop_connection_after(...)` injection and a reconnect equivalence scenario.
-3. **Supervisor give-up semantics behind TCP-accepting proxies**: the dial-loop `max_attempts` budget only counts TCP-dial failures; post-dial handshake failures restart the cycle with `attempt = 1` (docker-proxy and any LB accept TCP while the backend is down), so the budget never fires.
-   Count handshake failures against the same budget, resetting only on a connection that survives `drop_grace`.
+(Closed residual: supervisor give-up semantics behind TCP-accepting proxies — the dial-loop `max_attempts` budget only counted TCP-dial failures; the `attempt` counter was declared per OUTER supervisor iteration and checked only inside the inner TCP-dial loop, so a post-dial handshake failure returned up to the outer loop, which reset `attempt` to 0. Behind a docker-proxy / LB that accepts TCP while the backend is down — the exact storm class the anti-thrash supervision was built for — the dial always succeeded and the handshake never completed, so the budget NEVER fired and a finite `max_attempts` retried forever.
+Closed by [ADR-0061](../specs/adr/0061-supervisor-give-up-counts-handshake-failures.md): the give-up counter is hoisted to span the FULL dial+handshake cycle via the new sans-io `SupervisorConfig::should_give_up(attempts)` policy gate (zero-I/O, ADR-0004), and resets to 0 ONLY on `should_reset_backoff` (a socket surviving `drop_grace`) — so give-up-reset and backoff-reset share ONE stability definition; every post-dial failure counts uniformly (Java parity).
+The pre-handshake `"supervisor: reconnected to broker"` info log is relabelled `"supervisor: TCP connected; handshaking"`, with a TRUE reconnect-success info log after the handshake actually completes. **Breaking** for callers with a finite `max_attempts` (default `None`/infinite is unaffected; flagged `BREAKING CHANGE:` in the commit).
+The four-layer + e2e coverage lands in the same changeset: proto unit `give_up_{fires_at_budget_behind_tcp_accept,counter_resets_on_socket_surviving_drop_grace,never_fires_with_default_infinite_max_attempts,boundary_is_strict_greater_than}`, the tokio + moonpool 1:1 `give_up_budget_fires_behind_tcp_accepting_endpoint` (extending `supervisor_backoff_persistence.rs`), the differential `tokio_and_moonpool_engines_agree_on_give_up_sequence`, and the e2e `e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint` (a localhost handshake-failing stub-acceptor, since a real broker always completes the handshake).
+See the `feat(proto,runtime)!` commit.)
+
+(Closed residual: the moonpool transient-retry arms were missing — the moonpool driver never consumed `ProducerOpenFailedTransient` / `SubscribeFailedTransient`, so a post-restart broker answering a rebuild with `ServiceNotReady` dead-ended the re-attach on the moonpool engine while the tokio driver recovered via its lookup-then-retry leg.
+Closed by wiring the matching arms into the moonpool driver: `handle_pending_events` drains each transient event into a `RetryRequest`, and the generic `driver_loop_inner` dispatches each one as a detached task through the engine's `TaskProvider` + `TimeProvider` — the delayed lookup + `retry_producer_open` / `retry_consumer_subscribe` sleeps on the INJECTED clock, never a host `tokio::time::sleep`, so the leg stays deterministic under `SimProviders` (ADR-0011) and its detached-spawn serialization matches the tokio engine's `tokio::spawn` so the differential `EventStream` order is identical (ADR-0024).
+The broker `message` field is truncated via `truncate_broker_str` on the new `warn!` arms.
+The four-layer + e2e coverage lands in the same changeset: proto unit `command_error_on_{producer_open,subscribe}_emits_*_transient` (pre-existing), the dedicated tokio `producer_open_recovers_after_transient_reject`, the moonpool virtual-time `transient_producer_open_retry_fires_under_virtual_time` (advances the sim clock and observes the retry fire — the structural determinism proof `check-no-internal-clock` cannot give), the differential `drop_redial_with_transient_reject_is_equivalent_across_engines` (event-ORDER parity via `ScriptedBroker::transient_reject_first_redial_producer_open`), and the moonpool-engine e2e `e2e_moonpool_transient_producer_open_retry_across_broker_restart`.
+See the `feat(runtime-moonpool)` commit.)
+
+(Closed residual: the differential harness had no connection-drop knob — `ScriptedBroker` accepted multiple sessions but could not script a mid-scenario drop + redial, so the re-attach replay fix carried proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out.
+Closed by `ScriptedBroker::drop_connection_after`, a cross-session ledger + durable per-subscription cursor that survives the redial, supervised runner entry points, and the `reconnect_replay_gating_equivalence` differential scenario asserting tokio ↔ moonpool `EventStream` parity in event order with resume-from-acked-cursor — see the `test(differential)` commit.
+The harness reset is `ScriptedBroker::clear_cross_session_state`, with a `broker_smoke` guard that two back-to-back legs each start from an empty ledger.)
 
 (Closed residual: the `e2e_reconnect` send-loop hygiene gap — unbounded `send().await` turning environmental broker death into an infinite hang — was fixed in the same series after a crashed standalone container hung the validation chain for 20 hours; each send attempt is now timeout-bounded.)
 
-**Why it stays open.** 1 + 2 are engine/harness features with their own ADR-0024 test obligations; 3 changes user-visible supervision semantics (needs a small design pass against Java parity).
+**Status.** All four §3 residuals are now closed (see the closed-residual notes above): supervisor give-up semantics (ADR-0061), the moonpool transient-retry arms, the differential connection-drop knob, and the `e2e_reconnect` send-loop hygiene gap.
+No reconnect-parity work remains here.
 
 **Why it stays open.** Needs a design decision on where the mechanism lives (subscriber vs library) before any guidance is written; picking the library side adds per-callsite state and an API surface that the subscriber side gets for free.
 
@@ -87,15 +96,15 @@ It was moonpool's default-on FoundationDB bit-flip chaos corrupting a Pulsar _co
 [ADR-0055](../specs/adr/0055-bit-flip-survivability-model.md) makes corruption _survivable_ instead of disabling the chaos: a plain connection fails its in-flight ops fast (`PeerClosed`) instead of hanging, and the chaos workloads run supervised over a broker that persists its ledger + per-subscription cursor across reconnects.
 Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
 
-**Gap.** Two engine residuals, neither blocking the fix:
+**Gap.** Both engine residuals are now closed; no survivability work remains here.
 
-1. **Terminal-state fast-fail for NEW ops.** `Connection::fail_all_pending` only terminalizes ops that were already pending AT the drop.
-   A `producer.send()` / `subscribe()` / `producer.close()` issued AFTER a plain connection is already terminal (`Failed` / `Closed`) still registers a doomed pending op that hangs — there is no driver left to resolve it.
-   ADR-0055 §1 is scoped to the in-flight contract, so the terminal-exit / differential / e2e tests deliberately do not assert on this.
-   Fix: a synchronous fast-fail in the send / request-issue / subscribe paths that returns `PeerClosed` immediately when the handshake state is `Failed` / `Closed`.
-2. **Lookup `SessionLost` is not transparently re-issued.** A transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaces to the caller as `ClientError::Other` — the engine does not auto-reissue the lookup the way it transparently replays producer sends and re-subscribes.
-   The `sim_chaos` workloads retry around it at setup, but a production caller subscribing/opening _during_ a reconnect could see this `Other`.
-   Fix: engine-side lookup-retry-on-`SessionLost` (mirrors Java's lookup-after-reset), with its own ADR-0024 layers.
+(Closed residual: lookup `SessionLost` was not transparently re-issued — a transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaced to the caller as `ClientError::Other("unexpected lookup outcome: SessionLost…")`, because `Connection::reset` re-issues in-flight publishes and re-subscribes consumers but does **not** re-issue the lookup.
+Closed by [ADR-0060](../specs/adr/0060-lookup-retry-on-session-lost.md): both engines' `lookup_topic` now park on `ConnectionShared::await_reconnect_or_terminal` — a `driver_waker` wake-or-terminal readiness check, no clock read — and re-issue the lookup against the freshly-handshaked session, bounded by the new proto const `MAX_LOOKUP_SESSION_REISSUES` (next to `MAX_LOOKUP_REDIRECTS`); a terminal `SessionLost` (supervisor gave up → `no_driver` latched, composing with ADR-0059) short-circuits to `PeerClosed`.
+`reset`'s `SessionLost` emission is untouched; mirrors Java's lookup-after-reset.
+See the `feat(proto,runtime)` commit and the extended `e2e_reconnect.rs` subscribe-during-reconnect assertion.)
+
+(Closed residual: terminal-state fast-fail for NEW ops — a `producer.send()` / `subscribe()` / `producer.close()` / `lookup` issued AFTER a plain connection was already terminal used to register a doomed pending op that hung, since `fail_all_pending` terminalized only the ops pending AT the drop.
+Closed by [ADR-0059](../specs/adr/0059-terminal-fast-fail-new-ops.md): `fail_all_pending` now flips each producer slot's `closed` flag inside its existing per-slot lock scope so a post-terminal `queue_send` fast-fails through the existing `if self.closed` guard; a runtime `ConnectionShared::no_driver` `AtomicBool` latch — set on both the plain driver's terminal exit and the supervisor give-up path, 1:1 across engines — drives synchronous `fail_if_no_driver()` guards at `open_producer` / `subscribe` / `lookup` / `producer.close()` returning `PeerClosed` only when `is_closed()` AND `no_driver`, so a supervised connection's transient `Failed` reconnect window is never wrongly `PeerClosed`d — see the `feat(proto,runtime)` commit and the `e2e_terminal_exit.rs` scope-note removal.)
 
 **Test-state caveats** — NOT caused by this change (the diff touches no `magnetar-admin` or replicated-subscription code), flagged so the next reader is not surprised that a full `--all-features` run is not 100% green:
 
@@ -108,16 +117,12 @@ Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
 - **`check-sim-coverage` reports ~77 uncovered lines.** The diff is computed vs `origin/main`, so it bundles the prior terminal-outcome commit plus line-number-shift artifacts of pre-existing code; the behavioral lines this change adds (the `Closed → PeerClosed` waiter mappings, the decode-fatal broker hook, the fatal-on-send arm) are exercised by the new differential + integration tests.
   The gate is local-first / scheduled-CI (it short-circuits on `main`); dispatch it from a feature branch for true patch gating once `feat/logging` lands on `main`.
 
-**Partial progress on [§3.2](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).** This change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
-The mid-scenario **drop + redial** knob §3.2 asks for is still open.
+**Progress on [§3 reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).**
+The ADR-0055 change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
+The mid-scenario **drop + redial** knob that residual asked for has since landed: `ScriptedBroker::drop_connection_after` + a cross-session ledger / durable cursor + the `reconnect_replay_gating_equivalence` differential scenario (see the `test(differential)` commit and the closed-residual note under §3).
 
-**Why it stays open.** §4.1 + §4.2 are engine features with their own ADR-0024 test obligations and a small Java-parity design pass; the test-state caveats are pre-existing suite issues / gate mechanics, not survivability work.
-
-**`/goal` (engine fast-fail residual §4.1).**
-
-```text
-/goal implement terminal-state fast-fail for NEW operations per docs/follow-ups.md §4.1. When a plain connection is already terminal (handshake state Failed/Closed), the send / request-issue / subscribe paths must return ClientError::PeerClosed synchronously instead of registering a pending op that never resolves. Mirror across both engines (ADR-0024 1:1) with proto unit + tokio/moonpool integration twins + a differential layer. Validation chain per CLAUDE.md.
-```
+**Why it stays open.** It does not — both engine survivability residuals (terminal fast-fail for new ops; lookup-retry-on-`SessionLost`) are closed by ADR-0059 and ADR-0060.
+What remains under §4 is the three pre-existing test-state caveats above, which are suite issues / gate mechanics, not survivability work.
 
 ---
 
