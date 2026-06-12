@@ -26,6 +26,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🟢 all four residuals closed (ADR-0061 give-up budget; moonpool transient arms; differential drop knob; send-loop hygiene) |
 | 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain                                  |
 | 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                                                |
+| 6   | [Lookup redirect chase ignores the redirect target](#6-lookup-redirect-chase-ignores-the-redirect-target)           | 🧠 engine-side redirect-following design pass (Java parity); latent on every multi-broker cluster                          |
 
 ---
 
@@ -151,6 +152,24 @@ The handshake-timeout fix bounds the post-dial CONNECT→CONNECTED handshake by 
 
 ```text
 /goal fix the replicated-subscription marker accessor lost-wakeup race per docs/follow-ups.md §5.1. Move the replicated_subscription_marker_notify.notified() enrollment BEFORE the pop_front()/is_closed() drain in next_replicated_subscription_marker in both engines (the producer.rs:510-513 enroll-before-drain idiom), keeping tokio and moonpool at 1:1. Ship the four ADR-0024 layers INCLUDING a new SimProviders/SimulationBuilder-driven replicated_subscriptions harness with a delayed-marker broker that deterministically parks the waiter before the marker arrives. Validation chain per CLAUDE.md.
+```
+
+---
+
+## 6. Lookup redirect chase ignores the redirect target
+
+**Gap.** Surfaced by the PIP-33 two-cluster fixture work: on `LookupType::Redirect` the proto layer re-issues the lookup **on the same connection** (the `lookup redirected; chasing internally` path in `crates/magnetar-proto/src/conn.rs`), ignoring the redirect's `broker_service_url`.
+Java dials the redirect target and re-issues there (`BinaryProtoLookupService#findBroker`).
+Against any cluster whose broker redirects to a **different** broker, the chase asks the same broker the same question until the `MAX_LOOKUP_REDIRECTS` cap (5 hops) trips — `ClientError::Broker { message: "lookup redirect cap exceeded …" }` within milliseconds.
+Single-broker clusters (the testcontainers e2e brokers, the fixed PIP-33 fixture) only ever self-redirect, where same-connection re-issue is coincidentally correct — which is why nothing else catches this.
+
+**Why it stays open.** The fix is engine-side (the sans-io proto layer cannot dial): `LookupOutcome::Redirected` must surface to the engines, which open/pool a connection to the redirect target and re-issue with the carried `authoritative` flag, 1:1 across both engines with ADR-0024 layers and a multi-broker differential scenario.
+The cap keeps the failure bounded and loud in the meantime.
+
+**`/goal`.**
+
+```text
+/goal implement engine-side lookup redirect following per docs/follow-ups.md §6. On LookupOutcome::Redirected the engine must dial (or reuse from the pool) the redirect's broker_service_url and re-issue the lookup there with the carried authoritative flag (Java BinaryProtoLookupService#findBroker parity), instead of the proto layer re-asking the same connection. Mirror 1:1 across both engines (ADR-0024) with proto unit + tokio/moonpool integration twins + a differential multi-broker redirect scenario; bound by MAX_LOOKUP_REDIRECTS as today. Validation chain per CLAUDE.md.
 ```
 
 ---

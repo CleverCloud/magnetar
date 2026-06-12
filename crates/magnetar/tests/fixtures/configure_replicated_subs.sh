@@ -19,14 +19,12 @@
 
 set -euo pipefail
 
-# Host-port mappings used by the e2e test on the host (advertised back to
-# the caller). Inside `docker exec` we must use each broker's INTERNAL
-# admin port (8080 for both — see docker-compose.replicated-subs.yml's
-# `webServicePort=8080`); the 18081 host port is only the *mapping* for
-# broker-b and is not bound inside the container.
+# The fixture runs under `network_mode: host` (see
+# docker-compose.replicated-subs.yml), so the brokers bind their admin
+# ports DIRECTLY on the host: 18080 (cluster-a) / 18081 (cluster-b).
+# The same URLs are valid from inside `docker exec` (same netns).
 ADMIN_A_HOST="${ADMIN_A_HOST:-http://localhost:18080}"
 ADMIN_B_HOST="${ADMIN_B_HOST:-http://localhost:18081}"
-ADMIN_INTERNAL="http://localhost:8080"
 
 # Wait until both brokers can answer cluster admin queries — the broker
 # health probe goes green before the metadata cache warms, so `clusters
@@ -47,31 +45,31 @@ wait_for_admin_ready "${ADMIN_A_HOST}"
 wait_for_admin_ready "${ADMIN_B_HOST}"
 
 echo "[pip-33] registering peer clusters in both admin stores"
-docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" clusters create cluster-a \
-  --url "http://broker-a:8080" --broker-url pulsar://broker-a:6650 || true
-docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" clusters create cluster-b \
-  --url "http://broker-b:8080" --broker-url pulsar://broker-b:6650 || true
-docker exec magnetar-pip33-broker-b bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" clusters create cluster-a \
-  --url "http://broker-a:8080" --broker-url pulsar://broker-a:6650 || true
-docker exec magnetar-pip33-broker-b bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" clusters create cluster-b \
-  --url "http://broker-b:8080" --broker-url pulsar://broker-b:6650 || true
+docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" clusters create cluster-a \
+  --url "http://localhost:18080" --broker-url pulsar://localhost:16650 || true
+docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" clusters create cluster-b \
+  --url "http://localhost:18081" --broker-url pulsar://localhost:16651 || true
+docker exec magnetar-pip33-broker-b bin/pulsar-admin --admin-url "${ADMIN_B_HOST}" clusters create cluster-a \
+  --url "http://localhost:18080" --broker-url pulsar://localhost:16650 || true
+docker exec magnetar-pip33-broker-b bin/pulsar-admin --admin-url "${ADMIN_B_HOST}" clusters create cluster-b \
+  --url "http://localhost:18081" --broker-url pulsar://localhost:16651 || true
 
 # Pulsar in full-cluster mode (vs. `standalone`) does NOT auto-bootstrap
 # the `public` tenant or the `public/default` namespace — that's a
 # standalone-mode convenience. Create both explicitly so the rest of the
 # script (and the e2e test) finds them.
 echo "[pip-33] creating public tenant + public/default namespace"
-docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" tenants create public \
+docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" tenants create public \
   --allowed-clusters cluster-a,cluster-b --admin-roles '' || true
-docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" namespaces create \
+docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" namespaces create \
   public/default --clusters cluster-a,cluster-b || true
 
 echo "[pip-33] opening public tenant to both clusters"
-docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" tenants update public \
+docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" tenants update public \
   --allowed-clusters cluster-a,cluster-b || true
 
 echo "[pip-33] adding cluster-b to public/default replication clusters"
-docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_INTERNAL}" namespaces set-clusters \
+docker exec magnetar-pip33-broker-a bin/pulsar-admin --admin-url "${ADMIN_A_HOST}" namespaces set-clusters \
   public/default --clusters cluster-a,cluster-b
 
 # Replicated subscription status is set at the *topic* or *subscription*
