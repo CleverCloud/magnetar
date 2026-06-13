@@ -3841,6 +3841,22 @@ impl Connection {
         if !message_ids.is_empty() {
             if let Some(slot) = self.consumers.get(&handle) {
                 let mut consumer = slot.state.lock();
+                // Stop tracking the nacked ids in the ack-timeout (unacked-message)
+                // tracker. Without this, an id that was both nacked and ack-timeout
+                // tracked is redelivered twice — once by the nack tracker and once by
+                // the ack-timeout sweep in [`Self::handle_timeout`] — corrupting
+                // at-least-once-without-duplication. Mirrors Java's unconditional
+                // `unAckedMessageTracker.remove(...)` in `ConsumerImpl#negativeAcknowledge`
+                // (ConsumerImpl.java:859). Kept in its own sequential block so it runs on
+                // BOTH the nack-present and nack-absent paths (the early `return` below
+                // must not skip it) and avoids a second `&mut consumer` borrow conflicting
+                // with the `nack_tracker.as_mut()` scope. Symmetric with the positive-ack
+                // path in [`Self::ack`].
+                if let Some(t) = consumer.unacked_tracker.as_mut() {
+                    for id in &message_ids {
+                        t.remove(id);
+                    }
+                }
                 if let Some(tracker) = consumer.nack_tracker.as_mut() {
                     for id in &message_ids {
                         tracker.add(*id, now);
@@ -3867,6 +3883,14 @@ impl Connection {
     ) {
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
+            // Drop the nacked id from the ack-timeout tracker before deferring it to the
+            // nack tracker — same double-redelivery fix as [`Self::negative_ack`], and
+            // unconditional (runs even when no nack tracker is configured) so the
+            // fall-through to [`Self::emit_redeliver_unacked`] below cannot leave a second
+            // redelivery shape. Mirrors `ConsumerImpl.java:859`.
+            if let Some(t) = consumer.unacked_tracker.as_mut() {
+                t.remove(&message_id);
+            }
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 tracker.add_with_delay(message_id, delay, now);
                 return;
@@ -8498,6 +8522,263 @@ mod conn_state_tests {
         assert!(
             !conn.is_connected(),
             "a Failed connection is not connected — the loop never re-issues"
+        );
+    }
+
+    // --- Negative-ack must remove the nacked id from the ack-timeout tracker ---
+    //
+    // Regression coverage for the double-redelivery bug: a message that is both
+    // ack-timeout tracked and nacked must be redelivered EXACTLY ONCE. Before the
+    // fix, [`Connection::negative_ack`] only added the id to the nack tracker, so
+    // [`Connection::handle_timeout`] redelivered it twice — once from the nack
+    // tracker, once from the unacked (ack-timeout) sweep. Each of these tests FAILS
+    // on `main` (sees TWO redeliveries) and PASSES after the unconditional
+    // `unacked_tracker.remove(...)` lands.
+
+    /// Build a connected connection plus a subscription configured with `ack_timeout`
+    /// and an optional `negative_ack_redelivery_delay`. The unacked-message tracker is
+    /// armed at subscribe time, so deliveries recorded afterward participate in the
+    /// ack-timeout sweep.
+    fn nack_test_conn(
+        ack_timeout: Duration,
+        nack_delay: Option<Duration>,
+    ) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/nack-unacked".to_owned(),
+            subscription: "sub-nack-unacked".to_owned(),
+            ack_timeout: Some(ack_timeout),
+            negative_ack_redelivery_delay: nack_delay,
+            ..Default::default()
+        });
+        // Drain the outbound CommandSubscribe + initial flow so later poll_transmit
+        // calls observe only the redelivery frames the sweep queues.
+        let _ = conn.poll_transmit();
+        (conn, handle)
+    }
+
+    /// Deliver one synthetic non-batched message carrying the `(ledger, entry)` identity
+    /// onto `handle`, then drain its `Message` event and any outbound bytes. The unacked
+    /// tracker keys on the per-index `MessageId` the delivery path produces — for a
+    /// non-batched entry that is `batch_index = -1, batch_size = 0`.
+    fn deliver_one(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        now: Instant,
+        ledger: u64,
+        entry: u64,
+    ) {
+        let meta = pb::MessageMetadata {
+            producer_name: "magnetar-test-prod".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(1),
+            ..Default::default()
+        };
+        let cmd = deliver_cmd(handle, ledger, entry);
+        let mut frame = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut frame, &cmd, &meta, b"nack-unacked-payload")
+            .expect("encode message frame");
+        deliver_frame(conn, now, &frame);
+    }
+
+    /// Deliver one synthetic BATCH of `count` messages on `(ledger, entry)`. Each
+    /// sub-message lands in the unacked tracker keyed on the per-index id
+    /// `batch_index = idx, batch_size = count` (consumer.rs batch-explosion path), so a
+    /// nack of one batch-index id exercises the batched removal.
+    fn deliver_batch(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        now: Instant,
+        ledger: u64,
+        entry: u64,
+        count: i32,
+    ) {
+        let meta = pb::MessageMetadata {
+            producer_name: "magnetar-test-prod".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(count),
+            ..Default::default()
+        };
+        // Batched body: `(u32 single_size)(SingleMessageMetadata)(payload)` per entry,
+        // matching the wire format `ConsumerState::deliver` parses.
+        let mut body = bytes::BytesMut::new();
+        for idx in 0..count {
+            let payload = format!("batch-{idx}").into_bytes();
+            let sm = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            let sm_len = prost::Message::encoded_len(&sm);
+            body.extend_from_slice(&(sm_len as u32).to_be_bytes());
+            prost::Message::encode(&sm, &mut body).expect("encode SingleMessageMetadata");
+            body.extend_from_slice(&payload);
+        }
+        let cmd = deliver_cmd(handle, ledger, entry);
+        let mut frame = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut frame, &cmd, &meta, &body).expect("encode batch frame");
+        deliver_frame(conn, now, &frame);
+    }
+
+    /// Build the `CommandMessage` for a `(ledger, entry)` delivery on `handle`. The
+    /// broker-supplied id carries no batch fields; the consumer fills them per sub-message.
+    fn deliver_cmd(handle: ConsumerHandle, ledger: u64, entry: u64) -> pb::BaseCommand {
+        pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: ledger,
+                    entry_id: entry,
+                    partition: None,
+                    batch_index: None,
+                    ack_set: Vec::new(),
+                    batch_size: None,
+                    first_chunk_message_id: None,
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Feed a synthetic delivery `frame` into the connection, then drain the resulting
+    /// `Message` event(s) and any flow/ack bytes so a later `poll_transmit` observes only
+    /// the redelivery frames the timeout sweep queues.
+    fn deliver_frame(conn: &mut Connection, now: Instant, frame: &[u8]) {
+        conn.handle_bytes(now, frame).expect("deliver message");
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+    }
+
+    /// Count how many `CommandRedeliverUnacknowledgedMessages` frames the connection
+    /// has queued on its outbound buffer (one per redelivery the sweep emitted).
+    fn count_redeliver_frames(conn: &mut Connection) -> usize {
+        let mut bytes = conn.poll_transmit();
+        let mut count = 0;
+        while !bytes.is_empty() {
+            let frame = crate::frame::decode_one(&mut bytes).expect("decode outbound frame");
+            if frame.command.r#type
+                == pb::base_command::Type::RedeliverUnacknowledgedMessages as i32
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn negative_ack_removes_id_from_unacked_tracker_so_redelivery_fires_once() {
+        let t0 = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let nack_delay = Duration::from_secs(2);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, Some(nack_delay));
+        // Deliver a non-batched message; the unacked tracker arms its ack-timeout deadline.
+        deliver_one(&mut conn, handle, t0, 7, 3);
+        // The single-message delivery path normalises a non-batched id to
+        // `batch_index = -1, batch_size = 0` (consumer.rs), so the nacked id the user
+        // would hold (and that the unacked tracker keyed on) carries `batch_size: 0`.
+        let nacked_id = MessageId {
+            ledger_id: 7,
+            entry_id: 3,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        // Nack it. The nack tracker defers the redelivery to t0 + nack_delay; the fix
+        // also drops it from the unacked tracker so the ack-timeout sweep won't fire.
+        conn.negative_ack(handle, vec![nacked_id], t0);
+        // Advance past BOTH the nack delay AND the ack timeout in one sweep. On `main`
+        // this produces TWO redelivery frames (nack + ack-timeout); the fix yields ONE.
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "a nacked + ack-timeout-tracked message must be redelivered exactly once, \
+             not twice (nack tracker + ack-timeout sweep)"
+        );
+    }
+
+    #[test]
+    fn negative_ack_removes_batched_id_from_unacked_tracker_so_redelivery_fires_once() {
+        let t0 = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let nack_delay = Duration::from_secs(2);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, Some(nack_delay));
+        // Deliver a 2-message batch; both sub-messages land in the unacked tracker keyed on
+        // `batch_index = idx, batch_size = 2`. Nack BOTH so no un-nacked id is left to time
+        // out — the nack tracker coalesces them into ONE redelivery frame, and the fix must
+        // drop both from the unacked tracker so the ack-timeout sweep adds none. On `main`
+        // the sweep adds a second frame for the still-tracked batch ids → two frames.
+        deliver_batch(&mut conn, handle, t0, 9, 4, 2);
+        let batched = |idx: i32| MessageId {
+            ledger_id: 9,
+            entry_id: 4,
+            partition: -1,
+            batch_index: idx,
+            batch_size: 2,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        conn.negative_ack(handle, vec![batched(0), batched(1)], t0);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "nacked batch-index messages must be redelivered exactly once (one coalesced \
+             nack frame), not twice (nack tracker + ack-timeout sweep)"
+        );
+    }
+
+    #[test]
+    fn negative_ack_without_nack_tracker_removes_id_from_unacked_tracker() {
+        // NACK-ABSENT path: ack_timeout configured but NO nack tracker. `negative_ack`
+        // emits an immediate redelivery (fall-through to `emit_redeliver_unacked`) AND
+        // must still drop the id from the unacked tracker — otherwise the ack-timeout
+        // sweep adds a SECOND redelivery later. The unconditional removal (not nested in
+        // the `nack_tracker.as_mut()` block, which early-returns) guarantees one redelivery.
+        let t0 = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, None);
+        deliver_one(&mut conn, handle, t0, 5, 1);
+        // Non-batched delivery normalises to `batch_size: 0` (consumer.rs).
+        let nacked_id = MessageId {
+            ledger_id: 5,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        // Immediate redelivery #1 (no nack tracker to defer it).
+        conn.negative_ack(handle, vec![nacked_id], t0);
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "with no nack tracker, negative_ack emits exactly one immediate redelivery"
+        );
+        // The ack-timeout sweep must NOT emit a second redelivery: the id was removed.
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            0,
+            "the ack-timeout sweep must not re-redeliver an id already nacked + removed"
         );
     }
 }

@@ -999,12 +999,18 @@ The PIP-54 ack_set bitset is stamped on per-batch ids so partial-batch acks (one
                 negative_ack(msg_id) or negative_ack_with_delay(msg_id, d)
                     │
                     ▼
-        NegativeAcksTracker::add(msg_id, now + delay)
-                    │
-                    │
+        UnackedMessageTracker::remove(msg_id)   ← unconditional, mirrors the
+                    │                              positive-ack path; drops the id
+                    │                              from the ack-timeout tracker so
+                    │                              the sweep below cannot redeliver
+                    │                              the same id a second time
                     ▼
-              poll_timeout returns
-              the next nack deadline
+        NegativeAcksTracker::add(msg_id, now + delay)
+                    │                              (skipped when no nack tracker is
+                    │                               configured — the removal above
+                    ▼                               still ran, then an immediate
+              poll_timeout returns                  CommandRedeliverUnackedMessages
+              the next nack deadline                is emitted)
                     │
                     ▼
               handle_timeout(now)
@@ -1019,6 +1025,10 @@ The PIP-54 ack_set bitset is stamped on per-batch ids so partial-batch acks (one
                     ▼
               (re-arm if PIP-37 backoff configured)
 ```
+
+`negative_ack` removes the nacked id from the `UnackedMessageTracker` **before** it touches the nack tracker, and does so unconditionally — on both the nack-tracker-present and nack-tracker-absent paths.
+Without that removal a message that is both nacked and ack-timeout tracked is redelivered twice: once when the nack delay elapses, once when the ack-timeout window elapses.
+The removal is symmetric with the positive-ack path, which already drops acked ids from both the unacked tracker and the nack tracker, and mirrors the Java client's `ConsumerImpl#negativeAcknowledge`.
 
 ### DLQ + retry-letter
 
