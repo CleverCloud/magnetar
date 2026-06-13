@@ -278,6 +278,7 @@ assert_eq!(receipt_id, source_id); // round-trip preservation
 
 This entry **bypasses batching** by design — mirrors Java's `org.apache.pulsar.broker.service.persistent.Replicator`, which writes each entry one at a time.
 Chunking still applies for payloads larger than `max_message_size`; in that case the same `source_msg_id` is stamped on every chunk (one logical message, multiple frames).
+On the receive side, chunk reassembly (PIP-37) is bounded to match the Java client — `ConsumerBuilder::max_pending_chunked_message` (default 10) evicts the oldest incomplete message on cap breach and `expire_time_of_incomplete_chunked_message` (default 60s) sweeps stale buffers on the timeout tick, so a hostile/buggy broker streaming distinct-UUID first chunks cannot grow the reassembly map without bound.
 
 The regular `Producer::send(...)` continues to emit `CommandSend.message_id = None` — byte-identical on the wire (no proto bump).
 The new field on `OutgoingMessage` defaults to `None` so callers that don't use the replicator entry see no change.

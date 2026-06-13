@@ -350,6 +350,17 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         }
     }
 
+    /// Read-only snapshot of the [`SubscribeRequest`] this builder has assembled
+    /// so far. Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// lets the builder-surface guard test assert that each of the five consumer
+    /// builders seeds the bounded-chunk-reassembly knobs into the request that
+    /// seeds `ConsumerState`, without opening a real broker connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn request_snapshot(&self) -> &SubscribeRequest {
+        &self.req
+    }
+
     /// Required: set the subscription name.
     #[must_use]
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
@@ -541,6 +552,39 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         action: magnetar_proto::conn::CryptoFailureAction,
     ) -> Self {
         self.req.crypto_failure_action = action;
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#maxPendingChunkedMessage` (default `10`).
+    /// Bounds the number of distinct incomplete chunked messages the consumer
+    /// buffers; on breach the oldest incomplete message is evicted. `0` disables
+    /// the cap. Guards against a hostile/buggy broker streaming distinct-UUID
+    /// first chunks that never complete (unbounded `chunk_reassembly` growth →
+    /// OOM).
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.req.max_pending_chunked_message = max;
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#autoAckOldestChunkedMessageOnQueueFull`
+    /// (default `false`). When `true`, an evicted/expired partial chunked
+    /// message's first-chunk id is acked before drop (the broker treats it as
+    /// consumed); when `false`, it is dropped without acking so the broker
+    /// redelivers the whole message.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.req.auto_ack_oldest_chunked_message_on_queue_full = auto_ack;
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#expireTimeOfIncompleteChunkedMessage`
+    /// (default `60s`). An incomplete chunked message older than this is swept
+    /// on the connection's existing timeout tick and dropped (or acked, per
+    /// [`Self::auto_ack_oldest_chunked_message_on_queue_full`]).
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(mut self, expire: Duration) -> Self {
+        self.req.expire_time_of_incomplete_chunked_message = Some(expire);
         self
     }
 

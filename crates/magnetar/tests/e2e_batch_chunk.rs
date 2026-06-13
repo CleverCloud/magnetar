@@ -249,3 +249,61 @@ async fn e2e_chunked_message_round_trip() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+/// Bounded chunk reassembly (PIP-37 consumer-side hardening). A consumer with
+/// the Java-matching bounds explicitly configured
+/// (`max_pending_chunked_message`, `auto_ack_oldest_chunked_message_on_queue_full`,
+/// `expire_time_of_incomplete_chunked_message`) must still reassemble a normal
+/// oversized chunked message end-to-end — the bounds guard against unbounded
+/// growth without breaking valid chunking. Pins the new builder knobs through
+/// the real subscribe → `ConsumerState` seeding path against a live broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_bounded_chunk_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    let topic = unique_topic("magnetar-e2e-chunk-bounded");
+
+    let producer = client
+        .producer(&topic)
+        .chunking(true)
+        .batching(0, 0)
+        .create()
+        .await?;
+
+    // ~6 MiB payload (above the broker's default 5 MiB max message size).
+    let payload_size: usize = 6 * 1024 * 1024;
+    let payload: Vec<u8> = (0..payload_size).map(|i| (i % 251) as u8).collect();
+
+    let consumer = client
+        .consumer(&topic)
+        .subscription("magnetar-e2e-chunk-bounded")
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        // Java-matching consumer-side chunk bounds, explicitly set.
+        .max_pending_chunked_message(10)
+        .auto_ack_oldest_chunked_message_on_queue_full(false)
+        .expire_time_of_incomplete_chunked_message(Duration::from_secs(60))
+        .subscribe()
+        .await?;
+
+    producer
+        .send(OutgoingMessage::with_payload(payload.clone()).into())
+        .await?;
+    producer.close().await?;
+
+    let msg = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    assert_eq!(
+        msg.payload.len(),
+        payload_size,
+        "a bounded consumer must still reassemble a valid chunked message"
+    );
+    consumer.ack(msg.message_id).await?;
+    consumer.close().await?;
+    client.close().await;
+
+    Ok(())
+}

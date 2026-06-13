@@ -2709,6 +2709,14 @@ impl Connection {
                     consider(d);
                 }
             }
+            // Bounded chunk reassembly: surface the earliest incomplete-chunk
+            // expiry deadline so the driver schedules a deterministic wake for
+            // [`Self::handle_timeout`]'s sweep. Without this the sweep would
+            // only fire opportunistically on an unrelated tick — seed-divergent
+            // under the moonpool engine.
+            if let Some(d) = consumer.next_chunk_expiry_deadline() {
+                consider(d);
+            }
         }
         for slot in self.producers.values() {
             let producer = slot.state.lock();
@@ -2769,6 +2777,7 @@ impl Connection {
         // then emit through the shared helper.
         let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         let mut ack_actions: Vec<crate::trackers::AckAction> = Vec::new();
+        let mut chunk_acks: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
@@ -2787,9 +2796,37 @@ impl Connection {
             if let Some(tracker) = consumer.ack_tracker.as_mut() {
                 ack_actions.extend(tracker.poll(now));
             }
+            // Bounded chunk reassembly: expire incomplete chunked messages
+            // older than `expire_time_of_incomplete_chunked_message`. The
+            // matching deadline is surfaced through `poll_timeout` so the
+            // driver wakes us deterministically (mirrors Java
+            // `removeExpireIncompleteChunkedMessages`). Drain any first-chunk
+            // ids the sweep staged for auto-ack (only populated when
+            // `auto_ack_oldest_chunked_message_on_queue_full` is set; the
+            // default `false` path drops without acking so the broker
+            // redelivers).
+            consumer.sweep_expired_chunks(now);
+            if !consumer.chunk_auto_ack_pending.is_empty() {
+                let ids = std::mem::take(&mut consumer.chunk_auto_ack_pending);
+                chunk_acks.push((*handle, ids));
+            }
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
+        }
+        // Auto-ack the first-chunk ids of partials evicted/expired under the
+        // `auto_ack = true` policy. Individual acks; the broker treats the
+        // partial as consumed and stops redelivering it.
+        for (handle, ids) in chunk_acks {
+            self.ack(
+                handle,
+                AckRequest {
+                    message_ids: ids,
+                    ack_type: pb::command_ack::AckType::Individual,
+                    properties: Vec::new(),
+                    txn_id: None,
+                },
+            );
         }
         // Flush the ack-grouping tracker. The actions go through the shared dispatcher
         // which allocates a `RequestId` per coalesced `CommandAck`; the response is
@@ -3054,6 +3091,11 @@ impl Connection {
             state.ack_tracker = Some(crate::trackers::AckGroupingTracker::new(handle, group_time));
         }
         state.crypto_failure_action = req.crypto_failure_action;
+        state.max_pending_chunked_message = req.max_pending_chunked_message;
+        state.auto_ack_oldest_chunked_message_on_queue_full =
+            req.auto_ack_oldest_chunked_message_on_queue_full;
+        state.expire_time_of_incomplete_chunked_message =
+            req.expire_time_of_incomplete_chunked_message;
         let identity = crate::consumer::ConsumerIdentity {
             handle,
             topic: req.topic.clone(),

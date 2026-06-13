@@ -1140,6 +1140,9 @@ pub struct TypedConsumerBuilder<'a, S: Schema, E: crate::Engine = crate::TokioEn
     ack_timeout: Option<std::time::Duration>,
     ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
+    max_pending_chunked_message: Option<usize>,
+    auto_ack_oldest_chunked_message_on_queue_full: Option<bool>,
+    expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
     key_shared: Option<magnetar_proto::KeySharedConfig>,
     start_message_id: Option<magnetar_proto::MessageId>,
     replicate_subscription_state: Option<bool>,
@@ -1179,6 +1182,9 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             key_shared: None,
             start_message_id: None,
             replicate_subscription_state: None,
@@ -1261,6 +1267,30 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
         self
     }
 
+    /// Mirrors `ConsumerBuilder::max_pending_chunked_message`.
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.max_pending_chunked_message = Some(max);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::auto_ack_oldest_chunked_message_on_queue_full`.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.auto_ack_oldest_chunked_message_on_queue_full = Some(auto_ack);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::expire_time_of_incomplete_chunked_message`.
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(
+        mut self,
+        expire: std::time::Duration,
+    ) -> Self {
+        self.expire_time_of_incomplete_chunked_message = Some(expire);
+        self
+    }
+
     /// Mirrors `ConsumerBuilder::key_shared_policy`. Only meaningful with `Key_Shared`
     /// subscription type.
     #[must_use]
@@ -1303,6 +1333,22 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
         self.subscription = Some(name.into());
         self
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the bounded-chunk-reassembly knobs
+    /// this typed builder delegates to the base [`crate::ConsumerBuilder`]. Lets
+    /// the builder-surface guard test pin the setter → field plumbing without a
+    /// broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn chunk_knobs_for_test(
+        &self,
+    ) -> (Option<usize>, Option<bool>, Option<std::time::Duration>) {
+        (
+            self.max_pending_chunked_message,
+            self.auto_ack_oldest_chunked_message_on_queue_full,
+            self.expire_time_of_incomplete_chunked_message,
+        )
     }
 
     /// Set the subscription type.
@@ -1392,6 +1438,15 @@ where
         }
         if let Some((max, topic_opt)) = self.dlq_policy {
             builder = builder.dead_letter_policy(max, topic_opt);
+        }
+        if let Some(max) = self.max_pending_chunked_message {
+            builder = builder.max_pending_chunked_message(max);
+        }
+        if let Some(auto_ack) = self.auto_ack_oldest_chunked_message_on_queue_full {
+            builder = builder.auto_ack_oldest_chunked_message_on_queue_full(auto_ack);
+        }
+        if let Some(expire) = self.expire_time_of_incomplete_chunked_message {
+            builder = builder.expire_time_of_incomplete_chunked_message(expire);
         }
         if let Some(cfg) = self.key_shared {
             builder = builder.key_shared_policy(cfg);

@@ -458,6 +458,9 @@ pub struct PatternConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     ack_timeout: Option<std::time::Duration>,
     ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
+    max_pending_chunked_message: Option<usize>,
+    auto_ack_oldest_chunked_message_on_queue_full: Option<bool>,
+    expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
     read_compacted: bool,
     priority_level: Option<i32>,
     subscription_properties: Vec<(String, String)>,
@@ -493,6 +496,9 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
@@ -523,6 +529,21 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
         self.subscription = Some(name.into());
         self
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the bounded-chunk-reassembly knobs
+    /// propagated to every per-topic child. Lets the builder-surface guard test
+    /// pin the setter → field plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn chunk_knobs_for_test(
+        &self,
+    ) -> (Option<usize>, Option<bool>, Option<std::time::Duration>) {
+        (
+            self.max_pending_chunked_message,
+            self.auto_ack_oldest_chunked_message_on_queue_full,
+            self.expire_time_of_incomplete_chunked_message,
+        )
     }
 
     /// Set the subscription type applied to every per-topic child.
@@ -595,6 +616,30 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
         dead_letter_topic: Option<String>,
     ) -> Self {
         self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::max_pending_chunked_message`.
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.max_pending_chunked_message = Some(max);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::auto_ack_oldest_chunked_message_on_queue_full`.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.auto_ack_oldest_chunked_message_on_queue_full = Some(auto_ack);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::expire_time_of_incomplete_chunked_message`.
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(
+        mut self,
+        expire: std::time::Duration,
+    ) -> Self {
+        self.expire_time_of_incomplete_chunked_message = Some(expire);
         self
     }
 
@@ -694,6 +739,11 @@ where
             ack_timeout: self.ack_timeout,
             ack_group_time: self.ack_group_time,
             dlq_policy: self.dlq_policy,
+            max_pending_chunked_message: self.max_pending_chunked_message,
+            auto_ack_oldest_chunked_message_on_queue_full: self
+                .auto_ack_oldest_chunked_message_on_queue_full,
+            expire_time_of_incomplete_chunked_message: self
+                .expire_time_of_incomplete_chunked_message,
             read_compacted: self.read_compacted,
             priority_level: self.priority_level,
             subscription_properties: self.subscription_properties,
@@ -780,6 +830,9 @@ mod tests {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
