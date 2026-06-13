@@ -9,9 +9,9 @@
 //!   1. Create a 4-partition topic.
 //!   2. Produce N messages per partition with a `key-<partition>` partition key so the default
 //!      routing maps each key to its own partition.
-//!   3. Capture a `publish_time_ms` mid-point sentinel between halves on partition 0.
+//!   3. Capture the first second-half `MessageId` on partition 0.
 //!   4. Subscribe a fresh `PartitionedConsumer`, then call `seek_per_partition(|topic| if topic
-//!      ends with "-partition-0" then PublishTimeMs(mid) else PublishTimeMs(0))`.
+//!      ends with "-partition-0" then MessageId(second_0_0) else PublishTimeMs(0))`.
 //!   5. Verify that partition 0 yields only the post-seek tail while the other three partitions
 //!      yield their full contents.
 //!
@@ -117,47 +117,46 @@ async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Sentinel boundary between halves — every later message has
-    // `publish_time >= mid_ms`. The sleep gives the broker a clear gap and
-    // dodges clock-skew on slow CI hosts.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let mid_ms = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis(),
-    )?;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    // Second half.
+    // Second half. Capture the first partition-0 message id and seek to it
+    // below. This makes the post-seek boundary exact; publish-time seek is
+    // intentionally left to separate timestamp-focused coverage.
+    let mut partition0_tail_start = None;
     for i in 0..half {
         for p in 0..partitions {
-            producer
+            let message_id = producer
                 .send(
                     OutgoingMessage::with_payload(format!("second-{p}-{i}").into_bytes())
                         .key(format!("key-{p}")),
                 )
                 .await?;
+            if p == 0 && i == 0 {
+                partition0_tail_start = Some(message_id);
+            }
         }
     }
+    let partition0_tail_start =
+        partition0_tail_start.expect("second half should produce at least one partition-0 message");
     producer.close().await?;
 
-    // Subscribe a fresh PartitionedConsumer from the earliest position so the
-    // pre-seek baseline reads every message.
+    // Subscribe at latest so no backlog is pre-dispatched before the seek.
+    // The explicit per-partition seek below defines the full replay set; if
+    // we start at earliest, the broker may already have in-flight messages
+    // when the tokio engine performs its post-seek resubscribe/redelivery.
     let consumer = client
         .partitioned_consumer(topic)
         .subscription("magnetar-e2e-seek-per-partition")
         .subscription_type(SubType::Shared)
-        .initial_position(InitialPosition::Earliest)
+        .initial_position(InitialPosition::Latest)
         .subscribe()
         .await?;
 
-    // Seek per-partition: rewind partition-0 to `mid_ms`, leave the others at
-    // the earliest position (epoch 0 = "start of time").
+    // Seek per-partition: rewind partition-0 to the first second-half message,
+    // leave the others at the earliest position (epoch 0 = "start of time").
     let topic_owned = topic.to_owned();
     consumer
         .seek_per_partition(move |child_topic| {
             if child_topic == format!("{topic_owned}-partition-0") {
-                SeekTarget::PublishTimeMs(mid_ms)
+                SeekTarget::MessageId(partition0_tail_start)
             } else {
                 SeekTarget::PublishTimeMs(0)
             }
@@ -189,7 +188,8 @@ async fn e2e_seek_per_partition_callback() -> Result<(), Box<dyn std::error::Err
             .push(payload);
         consumer.ack(&msg.topic, msg.message.message_id).await?;
     }
-    // Make sure no surprise straggler arrives on partition-0 from before `mid_ms`.
+    // Make sure no surprise straggler arrives after the expected per-partition
+    // backlog has drained.
     let stray = tokio::time::timeout(Duration::from_millis(500), consumer.receive()).await;
     assert!(
         stray.is_err(),
