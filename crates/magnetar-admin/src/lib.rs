@@ -40,6 +40,7 @@
 
 mod tls_crypto;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use magnetar_proto::MessageId;
@@ -1784,6 +1785,29 @@ impl AdminClient {
         json_ok(resp).await
     }
 
+    /// Create a non-partitioned persistent topic.
+    ///
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}`.
+    /// Java: `PersistentTopics.java#createNonPartitionedTopic`
+    /// (`@PUT @Path("/{tenant}/{namespace}/{topic}")`).
+    pub async fn topic_create_non_partitioned(&self, topic: &str) -> Result<(), AdminError> {
+        self.topic_create_non_partitioned_with_properties(topic, &HashMap::new())
+            .await
+    }
+
+    async fn topic_create_non_partitioned_with_properties(
+        &self,
+        topic: &str,
+        properties: &HashMap<String, String>,
+    ) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(topic)?;
+        let url = self.url(&["persistent", tenant, namespace, name])?;
+        let resp = self
+            .send(self.http.request(Method::PUT, url).json(properties))
+            .await?;
+        empty_ok(resp).await
+    }
+
     /// Create a partitioned topic with `partitions` partitions.
     ///
     /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/partitions`
@@ -2707,50 +2731,41 @@ impl AdminClient {
 
     /// Create a shadow topic ([PIP-180](https://github.com/apache/pulsar/blob/master/pip/pip-180.md)).
     ///
-    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{topic}/shadowTopics`
-    /// where `{topic}` is the **source** topic name. The request body is a
-    /// **bare JSON array** `["persistent://tenant/ns/shadow"]` listing the
-    /// shadow topics to set on the source — the broker's
-    /// `@PUT setShadowTopics(List<String> shadowTopics)` handler
-    /// deserialises the body directly into a `List<String>`, NOT an
-    /// envelope object. magnetar takes one shadow at a time for an
-    /// explicit single-call surface; call multiple times for a fan-out.
+    /// Creates the shadow as a regular non-partitioned topic with the broker-reserved
+    /// `PULSAR.SHADOW_SOURCE` topic property pointing at the source topic:
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{shadow}` with body
+    /// `{ "PULSAR.SHADOW_SOURCE": "persistent://tenant/ns/source" }`.
+    /// Then links the created shadow in the source topic policy list via
+    /// `PUT /admin/v2/persistent/{tenant}/{namespace}/{source}/shadowTopics`.
     ///
     /// Java:
-    /// `pulsar-broker/src/main/java/org/apache/pulsar/broker/admin/v2/PersistentTopics.java`
-    /// (`@PUT @Path("/{tenant}/{namespace}/{topic}/shadowTopics")` →
-    /// `setShadowTopics(List<String>)`).
-    ///
-    /// **No per-shadow properties on this endpoint.** The Pulsar
-    /// `setShadowTopics` REST handler carries only the topic-name list.
-    /// To attach metadata to the shadow topic, pre-create it as a normal
-    /// topic with properties (a separate topic-create call) *before*
-    /// linking it to the source here — that's what the Java
-    /// `Topics#createShadowTopic(shadow, source, props)` convenience does
-    /// under the hood (create-with-props, then set-shadow). magnetar keeps
-    /// the two steps explicit. A previous version of this method sent a
-    /// `{ "shadowTopics": [...], "properties": {...} }` envelope that
-    /// Pulsar 4.0.4 rejects with HTTP 400 (caught by the PIP-180
-    /// replicator e2e fixture in
-    /// `crates/magnetar/tests/e2e_shadow_topic_replicator.rs`).
+    /// `pulsar-client-admin/.../TopicsImpl.java#createShadowTopicAsync` builds the same property
+    /// map before calling `createNonPartitionedTopicAsync` for non-partitioned sources.
     ///
     /// Errors mirror the existing `AdminError` taxonomy: 404 → `Status { code:
     /// 404, .. }` (the source topic does not exist), 409 → `Status { code:
     /// 409, .. }` (the shadow topic already exists on this source),
     /// 401/403 → `Status { code: 401|403, .. }` (auth).
     pub async fn create_shadow_topic(&self, source: &str, shadow: &str) -> Result<(), AdminError> {
-        let (tenant, namespace, name) = split_topic(source)?;
+        let (source_tenant, source_namespace, source_name) = split_topic(source)?;
         // Validate the shadow name eagerly so a misformatted argument errors
         // out with `InvalidName` rather than as a broker 4xx after we've
         // already crossed the wire.
-        let _ = split_topic(shadow)?;
+        let (shadow_tenant, shadow_namespace, shadow_name) = split_topic(shadow)?;
+        let source = format!("persistent://{source_tenant}/{source_namespace}/{source_name}");
+        let shadow = format!("persistent://{shadow_tenant}/{shadow_namespace}/{shadow_name}");
+        let mut properties = HashMap::new();
+        properties.insert("PULSAR.SHADOW_SOURCE".to_owned(), source.clone());
+        self.topic_create_non_partitioned_with_properties(&shadow, &properties)
+            .await?;
+        self.set_shadow_topics(&source, &[shadow]).await
+    }
+
+    async fn set_shadow_topics(&self, source: &str, shadows: &[String]) -> Result<(), AdminError> {
+        let (tenant, namespace, name) = split_topic(source)?;
         let url = self.url(&["persistent", tenant, namespace, name, "shadowTopics"])?;
-        // Bare `List<String>` — the broker's `setShadowTopics` handler
-        // deserialises the body directly into a `List<String>`. Any
-        // wrapping object yields HTTP 400.
-        let body = vec![shadow.to_owned()];
         let resp = self
-            .send(self.http.request(Method::PUT, url).json(&body))
+            .send(self.http.request(Method::PUT, url).json(shadows))
             .await?;
         empty_ok(resp).await
     }
@@ -2800,39 +2815,30 @@ impl AdminClient {
         let (tenant, namespace, name) = split_topic(source)?;
         let url = self.url(&["persistent", tenant, namespace, name, "shadowTopics"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        json_ok(resp).await
+        json_ok_or_default(resp).await
     }
 
     /// Resolve the **source** topic of a shadow topic (PIP-180).
     ///
-    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/shadowSource`.
-    /// Returns the source-topic name when the queried topic is a shadow;
-    /// returns `None` when it is a regular topic. Used by the runtime at
-    /// subscribe time to populate
+    /// `GET /admin/v2/persistent/{tenant}/{namespace}/{topic}/properties`.
+    /// Returns the `PULSAR.SHADOW_SOURCE` property when the queried topic is a
+    /// shadow; returns `None` when it is a regular topic. Used by the runtime
+    /// at subscribe time to populate
     /// [`magnetar_proto::ShadowTopicMetadata::source_topic`] on the new
     /// consumer (so the receive path can emit
     /// [`magnetar_proto::ConnectionEvent::MessageReceivedFromShadow`]
     /// without an out-of-band lookup per message).
     ///
     /// Java: `org.apache.pulsar.client.admin.Topics#getShadowSource` —
-    /// `@GET @Path("/{tenant}/{namespace}/{topic}/shadowSource")`.
+    /// `TopicsImpl#getShadowSourceAsync` delegates to `getPropertiesAsync`.
     pub async fn get_shadow_source(&self, shadow: &str) -> Result<Option<String>, AdminError> {
         let (tenant, namespace, name) = split_topic(shadow)?;
-        let url = self.url(&["persistent", tenant, namespace, name, "shadowSource"])?;
+        let url = self.url(&["persistent", tenant, namespace, name, "properties"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
-        // Some broker builds return 204 No Content for non-shadow topics; treat
-        // that as `None`. Otherwise the body is a JSON string (Jackson default
-        // for a `String` response).
-        let resp = ensure_status(resp).await?;
-        if resp.status() == StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        let bytes = resp.bytes().await?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let s: Option<String> = serde_json::from_slice(&bytes)?;
-        Ok(s.filter(|t| !t.is_empty()))
+        let mut properties: HashMap<String, String> = json_ok_or_default(resp).await?;
+        Ok(properties
+            .remove("PULSAR.SHADOW_SOURCE")
+            .filter(|source| !source.is_empty()))
     }
 
     // --- Pulsar IO Sources (/admin/v3/sources/...) ----------------------

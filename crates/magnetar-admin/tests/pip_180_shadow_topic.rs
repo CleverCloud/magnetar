@@ -7,6 +7,7 @@
 //! ([PIP-180](https://github.com/apache/pulsar/blob/master/pip/pip-180.md),
 //! merged in Pulsar 2.11) — `createShadowTopic`, `deleteShadowTopic`,
 //! `getShadowTopics`, `getShadowSource` on
+//! `pulsar-client-admin/.../TopicsImpl.java` and
 //! `pulsar-broker/.../v2/PersistentTopics.java`.
 
 use magnetar_admin::{AdminClient, AdminError};
@@ -21,14 +22,19 @@ fn client(mock: &MockServer) -> AdminClient {
 }
 
 #[tokio::test]
-async fn create_shadow_topic_puts_correct_url_and_bare_array_body() {
+async fn create_shadow_topic_creates_topic_and_links_source_policy() {
     let mock = MockServer::start().await;
-    // PIP-180: `@PUT @Path("/{tenant}/{namespace}/{topic}/shadowTopics")` on
-    // the source topic. The broker's `setShadowTopics(List<String>)` handler
-    // deserialises the body directly into a `List<String>` — the body MUST be
-    // a bare JSON array, NOT a `{ "shadowTopics": [...] }` envelope (Pulsar
-    // 4.0.4 rejects the envelope with HTTP 400; see the PIP-180 replicator
-    // e2e fixture in `crates/magnetar/tests/e2e_shadow_topic_replicator.rs`).
+    // The Java admin client creates a shadow topic by creating the shadow
+    // topic itself with the broker-reserved source property attached.
+    Mock::given(method("PUT"))
+        .and(path("/admin/v2/persistent/public/default/shadow-t"))
+        .and(body_json(serde_json::json!({
+            "PULSAR.SHADOW_SOURCE": "persistent://public/default/source-t"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
     Mock::given(method("PUT"))
         .and(path(
             "/admin/v2/persistent/public/default/source-t/shadowTopics",
@@ -53,13 +59,15 @@ async fn create_shadow_topic_puts_correct_url_and_bare_array_body() {
 
 #[tokio::test]
 async fn create_shadow_topic_propagates_409_conflict() {
-    // PIP-180: 409 = shadow already exists. Must surface as
-    // AdminError::Status { code: 409, .. }.
+    // PIP-180: 409 = shadow topic already exists. Must surface as
+    // AdminError::Status { code: 409, .. }, because an existing topic may be
+    // linked to a different source.
     let mock = MockServer::start().await;
     Mock::given(method("PUT"))
-        .and(path(
-            "/admin/v2/persistent/public/default/source-t/shadowTopics",
-        ))
+        .and(path("/admin/v2/persistent/public/default/shadow-t"))
+        .and(body_json(serde_json::json!({
+            "PULSAR.SHADOW_SOURCE": "persistent://public/default/source-t"
+        })))
         .respond_with(ResponseTemplate::new(409).set_body_string("Shadow topic already exists"))
         .mount(&mock)
         .await;
@@ -157,16 +165,34 @@ async fn get_shadow_topics_returns_empty_for_non_shadow_topic() {
 }
 
 #[tokio::test]
+async fn get_shadow_topics_returns_empty_for_no_content_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/admin/v2/persistent/public/default/regular/shadowTopics",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+    let admin = client(&mock);
+    let shadows = admin
+        .get_shadow_topics("public/default/regular")
+        .await
+        .unwrap();
+    assert!(shadows.is_empty());
+}
+
+#[tokio::test]
 async fn get_shadow_source_resolves_shadow_to_source_topic() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(
-            "/admin/v2/persistent/public/default/shadow-t/shadowSource",
+            "/admin/v2/persistent/public/default/shadow-t/properties",
         ))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!("persistent://public/default/source-t")),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "PULSAR.SHADOW_SOURCE": "persistent://public/default/source-t",
+            "owner": "fixture"
+        })))
         .mount(&mock)
         .await;
     let admin = client(&mock);
@@ -182,14 +208,14 @@ async fn get_shadow_source_resolves_shadow_to_source_topic() {
 
 #[tokio::test]
 async fn get_shadow_source_returns_none_for_non_shadow_topic() {
-    // Pulsar 2.11+ returns 204 No Content for a non-shadow topic; older
-    // builds return 200 with a `null` body. Both must collapse to None.
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(
-            "/admin/v2/persistent/public/default/regular/shadowSource",
+            "/admin/v2/persistent/public/default/regular/properties",
         ))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "owner": "fixture"
+        })))
         .mount(&mock)
         .await;
     let admin = client(&mock);

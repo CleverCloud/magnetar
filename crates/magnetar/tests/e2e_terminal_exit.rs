@@ -41,6 +41,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "latest";
@@ -174,11 +175,13 @@ async fn e2e_plain_client_in_flight_op_fails_fast_on_outage()
     .expect("client build must not exceed the test guard")
     .expect("plain client must connect through the live gate");
 
-    let topic = "persistent://public/default/magnetar-e2e-terminal-exit";
-    let producer = client.producer(topic).create().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let topic = format!("persistent://public/default/magnetar-e2e-terminal-exit-{suffix}");
+    let subscription = format!("magnetar-e2e-terminal-exit-{suffix}");
+    let producer = client.producer(&topic).create().await?;
     let consumer = client
-        .consumer(topic)
-        .subscription("magnetar-e2e-terminal-exit")
+        .consumer(&topic)
+        .subscription(&subscription)
         .subscription_type(SubType::Exclusive)
         .initial_position(InitialPosition::Earliest)
         .subscribe()
@@ -212,11 +215,16 @@ async fn e2e_plain_client_in_flight_op_fails_fast_on_outage()
         recv_res.ok().map(|m| m.message_id),
     );
 
-    // The client reports the connection as down after the terminal drop.
-    assert!(
-        !client.is_connected(),
-        "connection must be down after the outage"
-    );
+    // The public liveness predicate is an observation of the driver-side state;
+    // keep the assertion bounded so the test checks the eventual terminal state
+    // without racing the socket teardown notification across tasks.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.is_connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("connection must be down after the outage");
 
     // ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the connection is
     // already terminal must fast-fail SYNCHRONOUSLY rather than register a
