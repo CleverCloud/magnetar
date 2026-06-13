@@ -19,10 +19,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use magnetar::v5::PulsarClientV5;
+use magnetar::v5::mapping::V5SubscriptionInitialPosition;
 use magnetar::{OutgoingMessage, PulsarClient};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
+use uuid::Uuid;
 
 const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
 const DEFAULT_IMAGE_TAG: &str = "latest";
@@ -79,9 +81,30 @@ async fn e2e_v5_stream_consumer_failover_round_trip() -> Result<(), Box<dyn std:
         .build()
         .await?;
     let client = PulsarClientV5::from_v4(v4);
-    let topic = "persistent://public/default/magnetar-v5-failover";
+    let suffix = Uuid::new_v4().simple().to_string();
+    let topic = format!("persistent://public/default/magnetar-v5-failover-{suffix}");
+    let subscription = format!("magnetar-v5-failover-{suffix}");
 
-    let producer = client.producer(topic).create().await?;
+    // Two failover consumers on the same subscription — only one
+    // becomes active at a time.
+    let consumer_a = client
+        .stream_consumer(&topic)
+        .subscription(&subscription)
+        .failover()
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let consumer_b = client
+        .stream_consumer(&topic)
+        .subscription(&subscription)
+        .failover()
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
+        .subscribe()
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let producer = client.producer(&topic).create().await?;
     let n = 10usize;
     for i in 0..n {
         producer
@@ -89,22 +112,25 @@ async fn e2e_v5_stream_consumer_failover_round_trip() -> Result<(), Box<dyn std:
             .await?;
     }
 
-    // Two failover consumers on the same subscription — only one
-    // becomes active at a time.
-    let active = client
-        .stream_consumer(topic)
-        .subscription("magnetar-v5-failover")
-        .failover()
-        .subscribe()
-        .await?;
-    let _standby = client
-        .stream_consumer(topic)
-        .subscription("magnetar-v5-failover")
-        .failover()
-        .subscribe()
-        .await?;
+    let active_is_a = tokio::select! {
+        first = tokio::time::timeout(Duration::from_secs(20), consumer_a.receive()) => {
+            let msg = first??;
+            consumer_a.ack(msg.id).await?;
+            true
+        }
+        first = tokio::time::timeout(Duration::from_secs(20), consumer_b.receive()) => {
+            let msg = first??;
+            consumer_b.ack(msg.id).await?;
+            false
+        }
+    };
 
-    let mut received = 0usize;
+    let active = if active_is_a {
+        &consumer_a
+    } else {
+        &consumer_b
+    };
+    let mut received = 1usize;
     while received < n {
         let msg = tokio::time::timeout(Duration::from_secs(20), active.receive()).await??;
         received += 1;
@@ -127,26 +153,30 @@ async fn e2e_v5_queue_consumer_shared_distributes_messages()
         .build()
         .await?;
     let client = PulsarClientV5::from_v4(v4);
-    let topic = "persistent://public/default/magnetar-v5-shared";
+    let suffix = Uuid::new_v4().simple().to_string();
+    let topic = format!("persistent://public/default/magnetar-v5-shared-{suffix}");
+    let subscription = format!("magnetar-v5-shared-{suffix}");
 
-    let producer = client.producer(topic).create().await?;
+    let c1 = client
+        .queue_consumer(&topic)
+        .subscription(&subscription)
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let c2 = client
+        .queue_consumer(&topic)
+        .subscription(&subscription)
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
+        .subscribe()
+        .await?;
+
+    let producer = client.producer(&topic).create().await?;
     let n = 20usize;
     for i in 0..n {
         producer
             .send(Bytes::from(format!("msg-{i}").into_bytes()))
             .await?;
     }
-
-    let c1 = client
-        .queue_consumer(topic)
-        .subscription("magnetar-v5-shared")
-        .subscribe()
-        .await?;
-    let c2 = client
-        .queue_consumer(topic)
-        .subscription("magnetar-v5-shared")
-        .subscribe()
-        .await?;
 
     let mut got1 = 0usize;
     let mut got2 = 0usize;
@@ -193,11 +223,28 @@ async fn e2e_v5_queue_consumer_key_shared_per_key_ordering()
         .build()
         .await?;
     let client = PulsarClientV5::from_v4(v4);
-    let topic = "persistent://public/default/magnetar-v5-key-shared";
+    let suffix = Uuid::new_v4().simple().to_string();
+    let topic = format!("persistent://public/default/magnetar-v5-key-shared-{suffix}");
+    let subscription = format!("magnetar-v5-key-shared-{suffix}");
+
+    let c1 = client
+        .queue_consumer(&topic)
+        .subscription(&subscription)
+        .key_shared()
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    let c2 = client
+        .queue_consumer(&topic)
+        .subscription(&subscription)
+        .key_shared()
+        .initial_position(V5SubscriptionInitialPosition::Earliest)
+        .subscribe()
+        .await?;
 
     // Keyed publish via the v4 escape hatch — V5 producer.send takes
     // only Bytes today.
-    let producer = client.v4().producer(topic).create().await?;
+    let producer = client.v4().producer(&topic).create().await?;
     let keys = ["alpha", "beta", "gamma"];
     let per_key = 5;
     for k in &keys {
@@ -211,19 +258,6 @@ async fn e2e_v5_queue_consumer_key_shared_per_key_ordering()
                 .await?;
         }
     }
-
-    let c1 = client
-        .queue_consumer(topic)
-        .subscription("magnetar-v5-key-shared")
-        .key_shared()
-        .subscribe()
-        .await?;
-    let c2 = client
-        .queue_consumer(topic)
-        .subscription("magnetar-v5-key-shared")
-        .key_shared()
-        .subscribe()
-        .await?;
 
     let total = keys.len() * per_key;
     let mut received: Vec<(String, String)> = Vec::with_capacity(total);
