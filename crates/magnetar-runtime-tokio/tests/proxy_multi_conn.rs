@@ -45,6 +45,18 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex as TokioMutex;
+
+/// Keep the test wrapper aligned with `ConnectionConfig::operation_timeout`.
+/// The runtime operation itself owns the bounded-failure contract; this outer
+/// timeout exists only to keep a broken test from hanging forever.
+const TEST_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// These tests build real Tokio runtimes and real loopback listeners. The
+/// Rust test harness otherwise runs them concurrently in one binary, which
+/// can starve one scenario long enough for its operation-level timeout to
+/// fire before the fake proxy has processed the pinned-session handshake.
+static PROXY_TEST_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 
 /// Per-session log: records the `proxy_to_broker_url` we saw on `CommandConnect` and the
 /// kinds of every subsequent frame, in arrival order.
@@ -232,11 +244,12 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, session_idx: 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_producer_through_proxy_opens_second_connection() {
+    let _guard = PROXY_TEST_LOCK.lock().await;
     let (url, sessions) = spawn_proxy().await;
 
     // Bootstrap connect.
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -245,7 +258,7 @@ async fn open_producer_through_proxy_opens_second_connection() {
 
     // Trigger the proxy-routing path.
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/proxy-test-producer".to_owned(),
             ..Default::default()
@@ -311,10 +324,11 @@ async fn open_producer_through_proxy_opens_second_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_through_proxy_opens_second_connection() {
+    let _guard = PROXY_TEST_LOCK.lock().await;
     let (url, sessions) = spawn_proxy().await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -322,7 +336,7 @@ async fn subscribe_through_proxy_opens_second_connection() {
     .expect("connect ok");
 
     let _consumer = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         client.subscribe(SubscribeRequest {
             topic: "persistent://public/default/proxy-test-consumer".to_owned(),
             subscription: "proxy-test-sub".to_owned(),
@@ -341,7 +355,10 @@ async fn subscribe_through_proxy_opens_second_connection() {
     }
     drop(client);
 
-    assert!(snapshot.len() >= 2);
+    assert!(
+        snapshot.len() >= 2,
+        "expected at least 2 TCP sessions (bootstrap + pinned), got {snapshot:?}",
+    );
     let pinned = &snapshot[1];
     assert_eq!(
         pinned.connect_proxy_to_broker_url.as_deref(),
@@ -361,10 +378,11 @@ async fn subscribe_through_proxy_opens_second_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_producer_to_same_broker_reuses_pool_entry() {
+    let _guard = PROXY_TEST_LOCK.lock().await;
     let (url, sessions) = spawn_proxy().await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -372,7 +390,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
     .expect("connect ok");
 
     let _p1 = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/proxy-pool-reuse-a".to_owned(),
             ..Default::default()
@@ -383,7 +401,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
     .expect("p1 ok");
 
     let _p2 = tokio::time::timeout(
-        Duration::from_secs(5),
+        TEST_OPERATION_TIMEOUT,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/proxy-pool-reuse-b".to_owned(),
             ..Default::default()
