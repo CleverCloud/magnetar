@@ -19,15 +19,15 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                | Status                                                                                                                     |
-| --- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                       | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460                           |
-| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                    | 🧠 needs design decision                                                                                                   |
-| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                    | 🟢 all four residuals closed (ADR-0061 give-up budget; moonpool transient arms; differential drop knob; send-loop hygiene) |
-| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain                                  |
-| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                                                |
-| 6   | [Lookup redirect chase ignores the redirect target](#6-lookup-redirect-chase-ignores-the-redirect-target)           | 🟢 closed — engine-side redirect-target dialing (ADR-0039 amendment, 2026-06-14); Java `findBroker` parity                 |
-| 7   | [MessageListener on multi-topic / partitioned / pattern consumers](#7-messagelistener-on-multi-topic--partitioned--pattern-consumers) | 🟡 deferred — push delivery shipped on the single-topic + typed builders (ADR-0064); wrapper surfaces need a wrapper-message poller |
+| #   | Item                                                                                                                                  | Status                                                                                                                                                                    |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                         | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460                                                                          |
+| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                                      | 🧠 needs design decision                                                                                                                                                  |
+| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                                      | 🟢 all four residuals closed (ADR-0061 give-up budget; moonpool transient arms; differential drop knob; send-loop hygiene)                                                |
+| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix)                   | 🟢 closed — 3 test-state caveats resolved (admin-policy deflake; §5 marker fix covers the seed-13 flake; check-sim-coverage is a stale-base artifact that clears on push) |
+| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)                                | 🟢 closed — enroll-before-drain marker-accessor fix (both engines, 1:1) + tls-chaos active-provider build gate                                                            |
+| 6   | [Lookup redirect chase ignores the redirect target](#6-lookup-redirect-chase-ignores-the-redirect-target)                             | 🟢 closed — engine-side redirect-target dialing (ADR-0039 amendment, 2026-06-14); Java `findBroker` parity                                                                |
+| 7   | [MessageListener on multi-topic / partitioned / pattern consumers](#7-messagelistener-on-multi-topic--partitioned--pattern-consumers) | 🟢 closed — wrapper-surface push delivery shipped (ADR-0064 extension); late-discovered pattern children inherit the listener                                             |
 
 ---
 
@@ -93,6 +93,8 @@ No reconnect-parity work remains here.
 
 ## 4. Survivability residuals (surfaced by the ADR-0055 bit-flip fix)
 
+> **✅ Closed 2026-06-14.** All three test-state caveats are resolved: the admin-policy retention round-trip is deflaked (the `test(admin)` commit polls topic-policy reads until they propagate on Pulsar 4.0.4), the seed-13 marker flake gains deterministic coverage from the §5 enroll-before-drain fix, and the `check-sim-coverage` ~77-line report is a stale-base artifact (gate diffs vs `origin/main`, which lags the unpushed stack) that clears on push — per-changeset coverage is verified via `--base main`. The engine residuals were already closed by ADR-0059 / ADR-0060. (Historical detail below.)
+
 **Finding.** PR #218's `seed-replay` failure was not `a02f401`'s logic and not a moonpool delivery bug.
 It was moonpool's default-on FoundationDB bit-flip chaos corrupting a Pulsar _command_ frame — which TCP would never deliver in production, since only message payloads carry CRC32C — and `a02f401`'s write-schedule shift happened to land that flip on the two ADR-0038 anchor seeds.
 [ADR-0055](../specs/adr/0055-bit-flip-survivability-model.md) makes corruption _survivable_ instead of disabling the chaos: a plain connection fails its in-flight ops fast (`PeerClosed`) instead of hanging, and the chaos workloads run supervised over a broker that persists its ledger + per-subscription cursor across reconnects.
@@ -129,6 +131,8 @@ What remains under §4 is the three pre-existing test-state caveats above, which
 ---
 
 ## 5. Residuals surfaced by the moonpool seed-sweep fixes
+
+> **✅ Closed 2026-06-14.** Both residuals shipped in the `fix(runtime)` enroll-before-drain commit. §5.1 arms the marker `Notify` _before_ the `pop_front()`/`is_closed()` drain in both engines (1:1), mirroring `await_reconnect_or_terminal`; the single-threaded cooperative moonpool sim cannot split the sub-poll cross-thread gap, so the deterministic FAIL-on-main discriminator is a Notify-mechanism unit test, with the SimProviders delayed-marker harness as positive coverage. §5.2 derives the active crypto provider in `tls_handshake_chaos.rs` (validated across all 16 `check-crypto-matrix` cells). (Historical detail below.)
 
 Found while reproducing and fixing the daily-sweep `seed-failure` issues (the `fix/moonpool-seed-sweep-fixes` series: post-dial handshake timeout, progress-based keepalive watchdog [ADR-0058](../specs/adr/0058-keepalive-watchdog-progress-based.md), anti-thrash cooldown gating, memory-limit live-connection gating).
 Neither residual blocks that series.
@@ -171,7 +175,9 @@ Single-broker clusters (the testcontainers e2e brokers, the fixed PIP-33 fixture
 
 ## 7. MessageListener on multi-topic / partitioned / pattern consumers
 
-**Status.** 🟡 deferred — not load-bearing for single-topic Java parity.
+> **How it closed.** `MultiTopicsConsumer` / `PartitionedConsumer` / `PatternConsumer` now expose `message_listener(...)` + `subscribe_with_listener()` via a second poller (`spawn_wrapper_message_listener` over the new `WrapperReceiver` trait) with a `Fn(&str, &IncomingMessage)` callback (topic routes the explicit ack); ADR-0064 semantics preserved (sequential, in-order, no-auto-ack, clean shutdown). Late-discovered pattern/partition children inherit the listener via a membership-change `Notify` (Java `MultiTopicsConsumerImpl` parity). (Historical detail below.)
+
+**Status.** ✅ Closed 2026-06-14 — wrapper-surface push delivery shipped (`feat(consumer)`; ADR-0064 wrapper-surface extension).
 
 **Shipped.** Consumer-side push delivery (Java `ConsumerBuilder#messageListener`) landed on the two single-topic builder surfaces ([ADR-0064](../specs/adr/0064-consumer-message-listener-push-delivery.md)): `ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (delivers `IncomingMessage`) and `TypedConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (delivers a decoded `TypedMessage<S>`). Delivery is sequential, in order, no-auto-ack, with clean shutdown on consumer close / handle drop — see the ADR for the full semantics.
 
