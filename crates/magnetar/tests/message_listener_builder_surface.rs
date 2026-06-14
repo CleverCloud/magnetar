@@ -77,11 +77,7 @@ async fn spawn_fake_broker() -> String {
                                 return;
                             }
                         } else if ty == pb::base_command::Type::Subscribe as i32 {
-                            let rid = frame
-                                .command
-                                .subscribe
-                                .as_ref()
-                                .map_or(0, |s| s.request_id);
+                            let rid = frame.command.subscribe.as_ref().map_or(0, |s| s.request_id);
                             let success = pb::BaseCommand {
                                 r#type: pb::base_command::Type::Success as i32,
                                 success: Some(pb::CommandSuccess {

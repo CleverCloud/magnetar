@@ -423,6 +423,42 @@ async fn e2e_admin_namespace_policies_breadth() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// Poll an async topic-policy getter until `pred` holds, or fail after ~10s.
+///
+/// Topic-level policies in Pulsar are applied asynchronously: a `set` writes to the
+/// `__change_events` system topic and the broker applies it a beat later. A `get` issued
+/// immediately after a `set` therefore observes the pre-propagation state — an empty response body
+/// that `json_ok_or_default` reports as the policy default (e.g. retention `0` instead of the `-1`
+/// just set) — so an immediate read-back is racy. This helper re-reads until the policy lands; it
+/// is broker-version-agnostic and does not weaken the assertion (the caller still asserts the exact
+/// value).
+async fn await_topic_policy<T, Fut, G, P>(
+    what: &str,
+    mut get: G,
+    pred: P,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    G: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, magnetar_admin::AdminError>>,
+    P: Fn(&T) -> bool,
+    T: std::fmt::Debug,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = get().await?;
+        if pred(&got) {
+            return Ok(got);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "topic policy `{what}` did not propagate within 10s; last observed: {got:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Per-topic policy overrides (PR #3) — the broker's topic-level
 /// policies override the namespace defaults. Asserts the round-trip
 /// `set → get returns set → remove → get returns None` for retention,
@@ -482,7 +518,12 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
         retention_size_in_mb: -1,
     };
     admin.topic_set_retention(topic, pol).await?;
-    let got = admin.topic_get_retention(topic).await?;
+    let got = await_topic_policy(
+        "retention",
+        || admin.topic_get_retention(topic),
+        |r| r.retention_time_in_minutes == -1 && r.retention_size_in_mb == -1,
+    )
+    .await?;
     assert_eq!(got.retention_time_in_minutes, -1);
     assert_eq!(got.retention_size_in_mb, -1);
     admin.topic_remove_retention(topic).await?;
@@ -496,21 +537,36 @@ async fn e2e_admin_topic_policies_breadth() -> Result<(), Box<dyn std::error::Er
         relative_to_publish_rate: false,
     };
     admin.topic_set_dispatch_rate(topic, rate).await?;
-    let got = admin.topic_get_dispatch_rate(topic).await?;
+    let got = await_topic_policy(
+        "dispatch-rate",
+        || admin.topic_get_dispatch_rate(topic),
+        std::option::Option::is_some,
+    )
+    .await?;
     assert!(got.is_some(), "topic dispatch-rate should round-trip");
     admin.topic_remove_dispatch_rate(topic).await?;
 
     // --- Topic max-producers ------------------------------------------
 
     admin.topic_set_max_producers(topic, 5).await?;
-    let got = admin.topic_get_max_producers(topic).await?;
+    let got = await_topic_policy(
+        "max-producers",
+        || admin.topic_get_max_producers(topic),
+        |r| *r == Some(5),
+    )
+    .await?;
     assert_eq!(got, Some(5));
     admin.topic_remove_max_producers(topic).await?;
 
     // --- Topic message-TTL --------------------------------------------
 
     admin.topic_set_message_ttl(topic, 3600).await?;
-    let got = admin.topic_get_message_ttl(topic).await?;
+    let got = await_topic_policy(
+        "message-ttl",
+        || admin.topic_get_message_ttl(topic),
+        |r| *r == Some(3600),
+    )
+    .await?;
     assert_eq!(got, Some(3600));
     admin.topic_remove_message_ttl(topic).await?;
 
