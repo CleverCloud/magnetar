@@ -781,8 +781,8 @@ impl<P: Providers + Send + Sync> Client<P> {
         // through the per-broker connection pool (`crate::pool`); on `connect_plain` /
         // `from_parts` clients the pool is `None` and the branch surfaces
         // `ProxyUnsupportedOnUnsupervisedClient`.
-        let target = self.lookup_topic_target(&req.topic).await?;
-        let target_shared = self.resolve_target(&target, &req.topic).await?;
+        let (target, landed_on) = self.lookup_topic_target(&req.topic).await?;
+        let target_shared = self.resolve_target(&target, &landed_on, &req.topic).await?;
         // ADR-0059 / follow-ups §4.1: the resolved data-plane connection may be
         // a pool entry distinct from the bootstrap; fast-fail if it has already
         // gone terminal with no driver, before registering a doomed

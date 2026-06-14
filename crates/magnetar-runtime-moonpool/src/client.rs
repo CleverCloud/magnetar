@@ -89,11 +89,12 @@ pub enum ClientError {
 
 /// Outcome of a [`Client::lookup_topic`] call.
 ///
-/// Re-export of [`magnetar_proto::event::LookupOutcome`]. The state machine
-/// has already followed any `Redirect` chain internally; the user **only**
-/// sees a terminal outcome — `Connect` or `Failed`. Intermediate `Redirected`
-/// variants ride the proto events queue for diagnostics only and never
-/// resolve the user-facing future (HIGH-4 from the lookup multi-agent review).
+/// Re-export of [`magnetar_proto::event::LookupOutcome`]. This raw accessor
+/// surfaces the terminal outcome on the bootstrap connection — `Connect`,
+/// `Redirected`, or `Failed`. A `Redirected` is a driveable outcome: the
+/// engine path `Client::lookup_topic_target` dials the redirect target
+/// broker and re-issues the lookup there (ADR-0039). Callers that drive the
+/// dial themselves consume the `Redirected` directly.
 pub type LookupTopicResult = LookupOutcome;
 
 /// Top-level magnetar client, moonpool engine flavour.
@@ -320,66 +321,124 @@ impl<P: Providers> Client<P> {
         }
     }
 
-    /// Resolve a `LookupOutcome::Connect` into a routing decision (ADR-0039). When the proxy
-    /// advertises `proxy_through_service_url = true`, the data ops MUST ride on a pinned
-    /// per-broker pool entry; otherwise the bootstrap connection is the data plane.
+    /// Resolve a lookup into a routing decision (ADR-0039), driving the
+    /// redirect-dial loop end-to-end.
+    ///
+    /// The first lookup rides the bootstrap connection. On `Redirect` the
+    /// broker is not the bundle owner; the proto layer surfaces a driveable
+    /// `LookupOutcome::Redirected` (it does NOT chase the redirect on the
+    /// bootstrap socket — that re-asked the same non-owner and looped to the
+    /// cap). We dial the redirect target broker (reusing the per-broker pool)
+    /// and re-issue the lookup THERE — Java `BinaryProtoLookupService#findBroker`
+    /// recursing on `getConnection(redirectAddress)` — threading the
+    /// decremented hop budget so the chain stays bounded by
+    /// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`].
+    ///
+    /// When the terminal `Connect` advertises `proxy_through_service_url =
+    /// true`, the data ops ride a pinned per-broker pool entry; otherwise the
+    /// resolved broker is the data plane.
     pub(crate) async fn lookup_topic_target(
         &self,
         topic: &str,
-    ) -> Result<LookupTarget, ClientError> {
-        let outcome = self.lookup_topic(topic, false).await?;
-        match outcome {
-            LookupOutcome::Connect {
-                broker_service_url,
-                broker_service_url_tls,
-                proxy_through_service_url,
-            } => {
-                if proxy_through_service_url {
-                    // Lookup-driven reconnects on the moonpool engine ride the plaintext
-                    // bootstrap pipe even when both URLs are advertised — TLS routing on the
-                    // pinned per-broker pool is wired through the engine's `connect_tls`
-                    // entry, not through `lookup_topic_target`. Prefer the plain
-                    // `broker_service_url` here for that reason.
-                    //
-                    // The advertised value is normalised to `host:port` via
-                    // [`proxy_broker_authority`] before being captured in
-                    // [`LookupTarget::Proxy`] so the (currently follow-up) moonpool proxy path
-                    // produces the same `CommandConnect.proxy_to_broker_url` wire bytes as the
-                    // tokio engine (see `magnetar_runtime_tokio::client::preferred_broker_url`
-                    // and ADR-0039).
+    ) -> Result<(LookupTarget, Arc<ConnectionShared>), ClientError>
+    where
+        P: Send + Sync,
+    {
+        let mut current = self.shared.clone();
+        let mut next_hop: Option<(bool, u8)> = None;
+        loop {
+            let outcome = match next_hop {
+                None => self.issue_lookup_on(&current, topic, false, None).await?,
+                Some((authoritative, hops)) => {
+                    self.issue_lookup_on(&current, topic, authoritative, Some(hops))
+                        .await?
+                }
+            };
+
+            let lookup = match outcome {
+                OpOutcome::LookupResponse { outcome, .. } => outcome,
+                OpOutcome::Error { code, message, .. } => {
+                    return Err(ClientError::Broker { code, message });
+                }
+                OpOutcome::Terminal { .. } => return Err(ClientError::PeerClosed),
+                other => {
+                    return Err(ClientError::Other(format!(
+                        "unexpected lookup outcome: {other:?}"
+                    )));
+                }
+            };
+
+            match lookup {
+                LookupOutcome::Connect {
+                    broker_service_url,
+                    broker_service_url_tls,
+                    proxy_through_service_url,
+                } => {
+                    if proxy_through_service_url {
+                        // Lookup-driven reconnects on the moonpool engine ride the plaintext
+                        // bootstrap pipe even when both URLs are advertised — TLS routing on the
+                        // pinned per-broker pool is wired through the engine's `connect_tls`
+                        // entry, not through `lookup_topic_target`. Prefer the plain
+                        // `broker_service_url` here for that reason. The advertised value is
+                        // normalised to `host:port` via [`proxy_broker_authority`] so the wire
+                        // bytes match the tokio engine (ADR-0039).
+                        let raw = broker_service_url.or(broker_service_url_tls).ok_or_else(|| {
+                            ClientError::Other(format!(
+                                "lookup of '{topic}' set proxy_through_service_url=true but did \
+                                 not advertise a broker_service_url"
+                            ))
+                        })?;
+                        let broker_url = proxy_broker_authority(&raw);
+                        return Ok((LookupTarget::Proxy { broker_url }, current));
+                    }
+                    // ADR-0039 §"Multi-broker DIRECT routing": capture the resolved broker URL
+                    // so `resolve_target` routes the data ops to the right broker.
+                    let broker_url = broker_service_url.or(broker_service_url_tls);
+                    return Ok((LookupTarget::Direct { broker_url }, current));
+                }
+                LookupOutcome::Redirected {
+                    broker_service_url,
+                    broker_service_url_tls,
+                    authoritative,
+                    hops_remaining,
+                } => {
+                    // Engine-side cap enforcement — defence in depth alongside the proto
+                    // floor. A `Redirected` with no budget left must surface the SAME
+                    // synthetic Failed the proto layer emits, never dial.
+                    if hops_remaining == 0 {
+                        return Err(ClientError::Broker {
+                            code: 0,
+                            message: format!(
+                                "lookup redirect cap exceeded ({} hops)",
+                                magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS
+                            ),
+                        });
+                    }
                     let raw = broker_service_url
                         .or(broker_service_url_tls)
                         .ok_or_else(|| {
                             ClientError::Other(format!(
-                                "lookup of '{topic}' set proxy_through_service_url=true but did \
-                             not advertise a broker_service_url"
+                                "lookup of '{topic}' was redirected but the broker advertised no \
+                             broker_service_url or broker_service_url_tls to dial"
                             ))
                         })?;
-                    let broker_url = proxy_broker_authority(&raw);
-                    Ok(LookupTarget::Proxy { broker_url })
-                } else {
-                    // ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)": capture the
-                    // resolved broker URL even on the DIRECT branch so the proto-level
-                    // routing decision matches the tokio engine. The synchronous
-                    // [`Self::resolve_target`] handles the rest (bootstrap match → reuse
-                    // bootstrap; other → defer to the moonpool pool follow-up).
-                    let broker_url = broker_service_url.or(broker_service_url_tls);
-                    Ok(LookupTarget::Direct { broker_url })
+                    tracing::debug!(
+                        topic,
+                        redirect_url = %raw,
+                        hops_remaining,
+                        "lookup redirected; dialing redirect target and re-issuing"
+                    );
+                    // Dial the redirect target. The dial awaits OUTSIDE any proto/connection
+                    // lock (ADR-0038) and uses no channel (ADR-0003 — the moonpool pool dial
+                    // rides a `spawn_task` + `Notify` park). `resolve_direct_broker` reuses the
+                    // bootstrap on a host:port match, else pins a pool entry.
+                    current = self.resolve_direct_broker(&raw, topic).await?;
+                    next_hop = Some((authoritative, hops_remaining));
+                }
+                LookupOutcome::Failed { code, message } => {
+                    return Err(ClientError::Broker { code, message });
                 }
             }
-            // HIGH-4 (lookup multi-agent review): `Redirected` is never delivered to the
-            // user-facing future — the proto state machine chases the chain internally and
-            // only publishes terminal outcomes (`Connect` / `Failed`) against the
-            // user-facing request-id. Intermediate `Redirected` outcomes ride the proto
-            // events queue for diagnostics only. This arm exists solely to keep the match
-            // exhaustive (future-proofing) and would only fire on a state-machine bug.
-            LookupOutcome::Redirected { .. } => Err(ClientError::Other(
-                "BUG: intermediate Redirected outcome leaked to the user-facing future — \
-                 proto layer should chase redirects internally and only deliver terminal \
-                 outcomes (HIGH-4)"
-                    .to_owned(),
-            )),
-            LookupOutcome::Failed { code, message } => Err(ClientError::Broker { code, message }),
         }
     }
 
@@ -411,13 +470,17 @@ impl<P: Providers> Client<P> {
     pub(crate) async fn resolve_target(
         &self,
         target: &LookupTarget,
+        landed_on: &Arc<ConnectionShared>,
         topic: &str,
     ) -> Result<Arc<ConnectionShared>, ClientError>
     where
         P: Send + Sync,
     {
         match target {
-            LookupTarget::Direct { broker_url: None } => Ok(self.shared.clone()),
+            // Ride the connection the final lookup resolved on — the bootstrap
+            // for a non-redirected lookup, or the dialed redirect target after
+            // the redirect-dial loop. 1:1 with the tokio engine.
+            LookupTarget::Direct { broker_url: None } => Ok(landed_on.clone()),
             LookupTarget::Direct {
                 broker_url: Some(broker_url),
             } => self.resolve_direct_broker(broker_url, topic).await,
@@ -494,13 +557,15 @@ impl<P: Providers> Client<P> {
         Ok(shared)
     }
 
-    /// Issue a `CommandLookupTopic` and await the broker's response.
+    /// Issue a `CommandLookupTopic` against the bootstrap connection and await
+    /// the broker's response.
     ///
-    /// `authoritative` should be `false` for a fresh lookup; the state
-    /// machine flips it to `true` on any internal redirect retry. The
-    /// returned [`LookupTopicResult`] is the *terminal* outcome after the
-    /// sans-io layer has followed any redirect chain — HIGH-4 (lookup
-    /// multi-agent review) makes this end-to-end user-observable.
+    /// `authoritative` should be `false` for a fresh lookup. The returned
+    /// [`LookupTopicResult`] is the terminal outcome on this connection — one
+    /// of `Connect` / `Redirected` / `Failed`. On `Redirected` the engine
+    /// (via `Self::lookup_topic_target`) dials the redirect target and
+    /// re-issues there; this raw accessor surfaces the `Redirected` as-is for
+    /// callers that route the dial themselves.
     ///
     /// # Errors
     /// - [`ClientError::Broker`] when the broker returns a `Failed` lookup (including the synthetic
@@ -513,46 +578,67 @@ impl<P: Providers> Client<P> {
         topic: &str,
         authoritative: bool,
     ) -> Result<LookupTopicResult, ClientError> {
+        let outcome = self
+            .issue_lookup_on(&self.shared, topic, authoritative, None)
+            .await?;
+
+        match outcome {
+            OpOutcome::LookupResponse { outcome, .. } => match outcome {
+                LookupOutcome::Failed { code, message } => {
+                    Err(ClientError::Broker { code, message })
+                }
+                other => Ok(other),
+            },
+            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
+            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
+            other => Err(ClientError::Other(format!(
+                "unexpected lookup outcome: {other:?}"
+            ))),
+        }
+    }
+
+    /// Issue one `CommandLookupTopic` against `shared` and await its terminal
+    /// [`OpOutcome`], with the bounded `SessionLost` re-issue loop
+    /// (ADR-0060 / follow-ups §4.1). `redirect_budget` is `None` for the
+    /// user's first lookup (proto seeds the full cap) and `Some(hops)` for a
+    /// redirect re-issue on a dialed target (proto clamps + re-checks the cap
+    /// in `Connection::lookup_redirect`). 1:1 with the tokio engine's
+    /// identically-named helper (ADR-0024).
+    async fn issue_lookup_on(
+        &self,
+        shared: &Arc<ConnectionShared>,
+        topic: &str,
+        authoritative: bool,
+        redirect_budget: Option<u8>,
+    ) -> Result<OpOutcome, ClientError> {
         // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
-        // request when the bootstrap connection is already terminal with no
-        // driver to recover it. Without this, a `CommandLookupTopic` issued on
-        // a dead plain connection registers a pending request no driver is left
-        // to resolve — the caller hangs forever. The guard fires only when
-        // `is_closed()` AND `no_driver`, so a supervised connection mid
-        // reconnect (transiently `Failed`, `no_driver == false`) still issues
-        // the lookup and recovers transparently. 1:1 with the tokio engine.
-        self.shared.fail_if_no_driver()?;
+        // when the connection is already terminal with no driver to recover it
+        // — otherwise the caller hangs on a request no driver will resolve.
+        shared.fail_if_no_driver()?;
 
         // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
-        // `Connection::reset` (supervised reconnect) fails every pending
-        // request — including this in-flight `CommandLookupTopic` — with
-        // `OpOutcome::SessionLost`, but (unlike an in-flight publish) does NOT
-        // re-issue the lookup. We close that asymmetry here: on `SessionLost`,
-        // park until the connection is live again (or terminal), then re-issue
-        // against the fresh session. The reissue budget is only spent when a
-        // lookup was actually submitted against a connected session, so a
-        // connection flapping in its not-yet-reconnected window cannot burn the
-        // budget without a real broker round-trip. 1:1 with the tokio engine
-        // (ADR-0024) — the loop is expressed against this engine's own
-        // readiness primitive, not by textual copy.
+        // `Connection::reset` (supervised reconnect) fails the in-flight lookup
+        // with `OpOutcome::SessionLost` but does not re-issue it; on that, park
+        // until the connection is live again (or terminal), then re-issue. The
+        // budget is only spent on a real broker round-trip.
         let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
         loop {
             let request_id = {
-                let mut conn = self.shared.inner.lock();
-                conn.lookup(topic, authoritative)
+                let mut conn = shared.inner.lock();
+                match redirect_budget {
+                    None => conn.lookup(topic, authoritative),
+                    Some(hops) => conn.lookup_redirect(topic, authoritative, hops),
+                }
             };
-            self.shared.driver_waker.notify_one();
+            shared.driver_waker.notify_one();
             let outcome = RequestFut {
-                shared: self.shared.clone(),
+                shared: shared.clone(),
                 request_id,
             }
             .await;
 
-            // The session was severed mid-lookup by a supervised reconnect.
-            // Park until the connection recovers (re-issue) or goes terminal
-            // (PeerClosed, composing with §5.1), bounded by the reissue budget.
             if matches!(outcome, OpOutcome::SessionLost { .. }) {
-                match self.shared.await_reconnect_or_terminal().await {
+                match shared.await_reconnect_or_terminal().await {
                     crate::LookupReissueReadiness::Reconnected => {
                         if reissues_remaining == 0 {
                             tracing::warn!(
@@ -576,21 +662,7 @@ impl<P: Providers> Client<P> {
                 }
             }
 
-            return match outcome {
-                OpOutcome::LookupResponse { outcome, .. } => match outcome {
-                    LookupOutcome::Failed { code, message } => {
-                        Err(ClientError::Broker { code, message })
-                    }
-                    other => Ok(other),
-                },
-                OpOutcome::Error { code, message, .. } => {
-                    Err(ClientError::Broker { code, message })
-                }
-                OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-                other => Err(ClientError::Other(format!(
-                    "unexpected lookup outcome: {other:?}"
-                ))),
-            };
+            return Ok(outcome);
         }
     }
 

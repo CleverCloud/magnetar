@@ -19,10 +19,10 @@
 //!    public `open_producer` surface, since tokio's `lookup_topic` is private) must surface
 //!    [`ClientError::Broker`] with the broker's verbatim code + message — not park the
 //!    producer-open future forever.
-//! 2. **Unbounded redirect loop** — the broker answers *every* LOOKUP with `LookupType::Redirect`.
-//!    The proto layer chases the chain up to [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops,
-//!    then short-circuits to a bounded `ClientError::Broker` carrying the "redirect cap exceeded"
-//!    diagnostic.
+//! 2. **Unbounded redirect loop** — the broker answers *every* LOOKUP with `LookupType::Redirect`
+//!    advertising its own address. The engine's redirect-dial loop re-issues on the bootstrap
+//!    (bootstrap-equality reuse) up to [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops, then
+//!    surfaces a bounded `ClientError::Broker` carrying the "redirect cap exceeded" diagnostic.
 //!
 //! The termination proof is that `open_producer` *resolves* under the
 //! per-call `tokio::time::timeout`: a regression that dropped the `Failed`
@@ -54,28 +54,38 @@ const FAILED_CODE: i32 = pb::ServerError::TopicNotFound as i32;
 const FAILED_MESSAGE: &str = "topic does not exist";
 
 /// How the broker should answer `CommandLookupTopic` frames.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum LookupBehavior {
     /// Answer the LOOKUP with `LookupType::Failed { error, message }`.
     Failed,
-    /// Answer *every* LOOKUP with `LookupType::Redirect`, never resolving —
-    /// drives the proto redirect cap.
-    AlwaysRedirect,
+    /// Answer *every* LOOKUP with `LookupType::Redirect` advertising the
+    /// carried URL (the broker's own address — so the engine's dial loop
+    /// re-issues on the bootstrap via bootstrap-equality and the redirect cap
+    /// trips after `MAX_LOOKUP_REDIRECTS` hops rather than looping forever).
+    AlwaysRedirect { redirect_url: String },
 }
 
 /// Spawn a loopback broker that completes the handshake and answers LOOKUPs
 /// per `behavior`. Returns the dialable `pulsar://` URL. The accept loop and
 /// each session run on detached tasks so the broker keeps servicing the
 /// client until the test drops the connection.
-async fn spawn_lookup_broker(behavior: LookupBehavior) -> String {
+///
+/// For [`LookupBehavior::AlwaysRedirect`] the broker advertises its OWN URL as
+/// the redirect target (the `redirect_url` field is filled in here once the
+/// bound address is known).
+async fn spawn_lookup_broker(mut behavior: LookupBehavior) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
     let addr = listener.local_addr().expect("local_addr");
     let url = format!("pulsar://{addr}");
+    if let LookupBehavior::AlwaysRedirect { redirect_url } = &mut behavior {
+        redirect_url.clone_from(&url);
+    }
     tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
                 return;
             };
+            let behavior = behavior.clone();
             tokio::spawn(async move {
                 let _ = handle_session(stream, behavior).await;
             });
@@ -100,7 +110,7 @@ async fn handle_session(mut stream: TcpStream, behavior: LookupBehavior) -> std:
             };
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
-            handle_frame(&frame, &mut out_buf, behavior);
+            handle_frame(&frame, &mut out_buf, &behavior);
         }
 
         if !out_buf.is_empty() {
@@ -117,7 +127,7 @@ async fn handle_session(mut stream: TcpStream, behavior: LookupBehavior) -> std:
     }
 }
 
-fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: LookupBehavior) {
+fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: &LookupBehavior) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
     };
@@ -158,22 +168,47 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: Loo
                         message: Some(FAILED_MESSAGE.to_owned()),
                         proxy_through_service_url: Some(false),
                     },
-                    LookupBehavior::AlwaysRedirect => pb::CommandLookupTopicResponse {
-                        broker_service_url: Some("pulsar://hostile-redirect:6650".to_owned()),
-                        broker_service_url_tls: None,
-                        response: Some(
-                            pb::command_lookup_topic_response::LookupType::Redirect as i32,
-                        ),
-                        request_id: l.request_id,
-                        authoritative: Some(true),
-                        error: None,
-                        message: None,
-                        proxy_through_service_url: Some(false),
-                    },
+                    LookupBehavior::AlwaysRedirect { redirect_url } => {
+                        pb::CommandLookupTopicResponse {
+                            broker_service_url: Some(redirect_url.clone()),
+                            broker_service_url_tls: None,
+                            response: Some(
+                                pb::command_lookup_topic_response::LookupType::Redirect as i32,
+                            ),
+                            request_id: l.request_id,
+                            authoritative: Some(true),
+                            error: None,
+                            message: None,
+                            proxy_through_service_url: Some(false),
+                        }
+                    }
                 };
                 let cmd = pb::BaseCommand {
                     r#type: pb::base_command::Type::LookupResponse as i32,
                     lookup_topic_response: Some(response),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
+        pb::base_command::Type::PartitionedMetadata => {
+            // `open_producer` issues this before the LOOKUP — answer
+            // non-partitioned so it proceeds to the redirect-driving lookup.
+            if let Some(m) = &frame.command.partition_metadata {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+                    partition_metadata_response: Some(
+                        pb::CommandPartitionedTopicMetadataResponse {
+                            partitions: Some(0),
+                            request_id: m.request_id,
+                            response: Some(
+                                pb::command_partitioned_topic_metadata_response::LookupType::Success
+                                    as i32,
+                            ),
+                            error: None,
+                            message: None,
+                        },
+                    ),
                     ..Default::default()
                 };
                 let _ = encode_command(out, &cmd);
@@ -232,15 +267,19 @@ async fn tokio_lookup_failed_response_surfaces_bounded_broker_error() {
     }
 }
 
-/// A broker that answers *every* LOOKUP with `Redirect` must NOT hang
-/// `open_producer`. The proto state machine chases the chain up to
-/// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops and then
-/// short-circuits to a bounded [`ClientError::Broker`] carrying the
-/// "redirect cap exceeded" diagnostic — the redirect-loop `DoS` is bounded
-/// end-to-end.
+/// A broker that answers *every* LOOKUP with `Redirect` (to its own address)
+/// must NOT hang `open_producer`. The engine's redirect-dial loop re-issues on
+/// the bootstrap (bootstrap-equality reuse) up to
+/// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops and then surfaces a
+/// bounded [`ClientError::Broker`] carrying the "redirect cap exceeded"
+/// diagnostic — the redirect-loop `DoS` is bounded end-to-end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tokio_lookup_redirect_loop_surfaces_bounded_cap_error() {
-    let url = spawn_lookup_broker(LookupBehavior::AlwaysRedirect).await;
+    // `redirect_url` is filled with the broker's own URL in `spawn_lookup_broker`.
+    let url = spawn_lookup_broker(LookupBehavior::AlwaysRedirect {
+        redirect_url: String::new(),
+    })
+    .await;
 
     let client = tokio::time::timeout(
         Duration::from_secs(5),

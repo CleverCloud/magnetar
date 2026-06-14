@@ -465,13 +465,41 @@ pub enum LookupOutcome {
         /// Whether to honour `proxy_through_service_url`.
         proxy_through_service_url: bool,
     },
-    /// Broker redirected the lookup (the state machine has already re-emitted the lookup with
-    /// `authoritative=true`; this variant is surfaced for observability only).
+    /// Broker redirected the lookup to a different broker. This is a
+    /// **driveable** terminal outcome: the sans-io core does **not** chase
+    /// the redirect itself (that would require dialing a socket, forbidden in
+    /// `magnetar-proto` per ADR-0004). Instead it surfaces the redirect
+    /// target and the remaining hop budget to the engine, which dials the
+    /// target broker (reusing its per-broker connection pool) and re-issues
+    /// the lookup **there** via
+    /// [`crate::Connection::lookup_redirect`](crate::Connection::lookup_redirect).
+    /// This mirrors Java `BinaryProtoLookupService#findBroker`, which
+    /// recurses on `client.getCnxPool().getConnection(redirectAddress)`
+    /// (`BinaryProtoLookupService.java:182`, `:207`).
+    ///
+    /// `hops_remaining` is the budget left **after** this hop is accounted
+    /// for; the engine threads it back into
+    /// [`crate::Connection::lookup_redirect`] so the
+    /// [`crate::lookup::MAX_LOOKUP_REDIRECTS`] cap is enforced end-to-end.
+    /// The proto layer applies a floor check on re-entry
+    /// ([`crate::Connection::lookup_redirect`] clamps to the cap and the
+    /// translate layer short-circuits to [`Self::Failed`] at zero), so a
+    /// buggy engine cannot re-open the redirect-loop DoS.
     Redirected {
-        /// New broker URL to retry the lookup against.
+        /// Plaintext broker URL to dial and re-issue the lookup against.
         broker_service_url: Option<String>,
-        /// New TLS broker URL.
+        /// TLS broker URL to dial and re-issue the lookup against.
         broker_service_url_tls: Option<String>,
+        /// Whether the re-issued lookup on the redirect target must be
+        /// marked `authoritative` (Java parity — a redirect defaults the
+        /// next round-trip to authoritative to bound the chain).
+        authoritative: bool,
+        /// Redirect hops left **after** this one. Threaded back into
+        /// [`crate::Connection::lookup_redirect`] on the redirect target so
+        /// the [`crate::lookup::MAX_LOOKUP_REDIRECTS`] cap holds across the
+        /// engine-driven dial loop. `0` means the next redirect must fail
+        /// the chain.
+        hops_remaining: u8,
     },
     /// Lookup failed.
     Failed {
