@@ -355,7 +355,7 @@ struct TransientOpenGating {
 /// Scripted single-session broker for the dedicated transient-retry test:
 /// handshake, answer every lookup, transiently reject the FIRST producer-open
 /// (`ServiceNotReady` "Please redo the lookup"), then ack the SECOND — the one
-/// the §3.1 lookup-then-retry leg issues after its delay. The proto layer
+/// the lookup-then-retry leg issues after its delay. The proto layer
 /// RETAINS the producer state on the transient code, so the user's
 /// `open_producer` future stays pending across the reject + retry and resolves
 /// only on the retry's `ProducerSuccess`.

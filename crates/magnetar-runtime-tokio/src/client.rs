@@ -465,10 +465,10 @@ impl Client {
         // connection (direct, no proxy) or on a per-broker pool entry (proxy-routed). The
         // `Producer` keeps an `Arc<ConnectionShared>` pointing at whichever connection it
         // was opened against, so subsequent sends / closes go to the right socket.
-        let target = self.lookup_topic(&req.topic).await?;
+        let (target, landed_on) = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
-        let target_shared = self.resolve_target(target, &topic).await?;
-        // ADR-0059 / follow-ups §4.1: the resolved data-plane connection may be
+        let target_shared = self.resolve_target(target, &landed_on, &topic).await?;
+        // ADR-0059: the resolved data-plane connection may be
         // a pool entry distinct from the bootstrap; fast-fail if it has already
         // gone terminal with no driver, before registering a doomed
         // `CommandProducer`.
@@ -517,54 +517,151 @@ impl Client {
     ///   `CommandConnect.proxy_to_broker_url = broker_url`; the data ops ride on that pool entry.
     ///   See ADR-0039.
     ///
-    /// **HIGH-4 (lookup multi-agent review)**: the proto-layer state machine chases
-    /// redirect chains internally and only ever delivers terminal outcomes
-    /// (`LookupOutcome::Connect` / `LookupOutcome::Failed`) to the user-facing future.
-    /// Intermediate `LookupOutcome::Redirected` outcomes never reach this function —
-    /// they're pushed to the proto events queue for diagnostics only — so the broker
-    /// URL we observe here is the resolved tail of the chain. The redirect cap from
-    /// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] surfaces as `LookupOutcome::Failed`
-    /// → [`ClientError::Broker`] when a hostile broker exhausts the budget.
-    async fn lookup_topic(&self, topic: &str) -> Result<LookupTarget, ClientError> {
-        // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
-        // request when the bootstrap connection is already terminal with no
-        // driver to recover it. Without this, a `CommandLookupTopic` issued on
-        // a dead plain connection registers a pending request that no driver is
-        // left to resolve — the caller hangs forever. The guard fires only when
-        // `is_closed()` AND `no_driver`, so a supervised connection mid
-        // reconnect (transiently `Failed`, `no_driver == false`) still issues
-        // the lookup and recovers transparently.
-        self.shared.fail_if_no_driver()?;
+    /// **Redirect dialing (ADR-0039)**: when the broker answers `Redirect`,
+    /// the proto layer surfaces a driveable `LookupOutcome::Redirected`
+    /// carrying the redirect target URL + the remaining hop budget (it does
+    /// NOT chase the redirect on the bootstrap socket — that re-asked the same
+    /// non-owner broker and looped to the cap on multi-broker clusters). This
+    /// method's loop dials the redirect target (reusing
+    /// [`Self::resolve_direct_broker`] / the per-broker pool) and re-issues the
+    /// lookup THERE, threading the decremented budget back via
+    /// [`magnetar_proto::Connection::lookup_redirect`], until a terminal
+    /// `Connect` / `Failed` lands. The redirect cap from
+    /// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] is enforced both in
+    /// proto and here (a `Redirected` with no budget left surfaces the same
+    /// synthetic cap `Failed` → [`ClientError::Broker`] and never dials).
+    /// Drive the lookup (including any redirect dial loop) and return the
+    /// terminal [`LookupTarget`] **plus** the connection the final lookup
+    /// landed on. The latter matters for the redirect case: after the engine
+    /// dials a redirect target and re-issues the lookup there, a terminal
+    /// `Connect` that advertises no broker URL means "ride the connection you
+    /// resolved on" (the dialed target), not the bootstrap — so the caller
+    /// routes the data ops there. Mirrors Java `BinaryProtoLookupService`
+    /// returning the `LookupTopicResult` against the connection it recursed on.
+    async fn lookup_topic(
+        &self,
+        topic: &str,
+    ) -> Result<(LookupTarget, Arc<ConnectionShared>), ClientError> {
+        // ADR-0039 redirect dialing: the first lookup rides the bootstrap
+        // connection. If the bootstrap broker is not the bundle owner it
+        // answers `Redirect`; the proto layer no longer chases that on the
+        // bootstrap socket (which re-asked the same non-owner and looped to
+        // the cap). It surfaces a driveable `LookupOutcome::Redirected`, and
+        // we dial the redirect target broker (reusing the per-broker pool) and
+        // re-issue the lookup THERE — Java `BinaryProtoLookupService#findBroker`
+        // recursing on `getConnection(redirectAddress)`. The hop budget the
+        // outcome carries is threaded back into `Connection::lookup_redirect`
+        // and decremented per dialed broker; the proto floor + this engine
+        // guard keep the chain bounded by `MAX_LOOKUP_REDIRECTS`.
+        let mut current = self.shared.clone();
+        // First hop is the user lookup; subsequent hops are redirect re-issues
+        // and carry the budget the previous hop's `Redirected` advertised.
+        let mut next_hop: Option<(bool, u8)> = None;
+        loop {
+            let outcome = match next_hop {
+                None => self.issue_lookup_on(&current, topic, false, None).await?,
+                Some((authoritative, hops)) => {
+                    self.issue_lookup_on(&current, topic, authoritative, Some(hops))
+                        .await?
+                }
+            };
 
-        // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
-        // `Connection::reset` (supervised reconnect) fails every pending
-        // request — including this in-flight `CommandLookupTopic` — with
-        // `OpOutcome::SessionLost`, but (unlike an in-flight publish) does NOT
-        // re-issue the lookup. We close that asymmetry here: on `SessionLost`,
-        // park until the connection is live again (or terminal), then re-issue
-        // against the fresh session. The reissue budget is only spent when a
-        // lookup was actually submitted against a connected session, so a
-        // connection flapping in its not-yet-reconnected window cannot burn the
-        // budget without a real broker round-trip. Mirrors Java's
-        // lookup-after-reset retry.
+            // Inspect the terminal outcome for a redirect before mapping.
+            if let OpOutcome::LookupResponse {
+                outcome:
+                    magnetar_proto::LookupOutcome::Redirected {
+                        broker_service_url,
+                        broker_service_url_tls,
+                        authoritative,
+                        hops_remaining,
+                    },
+                ..
+            } = outcome
+            {
+                // Engine-side cap enforcement — defence in depth alongside the
+                // proto floor. A `Redirected` with no budget left must surface
+                // the SAME synthetic Failed the proto layer emits, never dial.
+                if hops_remaining == 0 {
+                    return Err(ClientError::Broker {
+                        code: 0,
+                        message: format!(
+                            "lookup redirect cap exceeded ({} hops)",
+                            magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS
+                        ),
+                    });
+                }
+                let redirect_url = direct_broker_url(
+                    broker_service_url,
+                    broker_service_url_tls,
+                    self.bootstrap_scheme(),
+                )
+                .ok_or_else(|| {
+                    ClientError::Other(format!(
+                        "lookup of '{topic}' was redirected but the broker advertised no \
+                         broker_service_url or broker_service_url_tls to dial"
+                    ))
+                })?;
+                tracing::debug!(
+                    topic,
+                    redirect_url = %redirect_url,
+                    hops_remaining,
+                    "lookup redirected; dialing redirect target and re-issuing"
+                );
+                // Dial the redirect target (bootstrap-equality reuses the
+                // bootstrap; otherwise a pinned pool entry). The dial awaits
+                // OUTSIDE any proto/connection lock (ADR-0038) and uses no
+                // channel (ADR-0003).
+                current = self.resolve_direct_broker(&redirect_url, topic).await?;
+                next_hop = Some((authoritative, hops_remaining));
+                continue;
+            }
+
+            let target = Self::map_lookup_outcome(topic, outcome, self.bootstrap_scheme())?;
+            return Ok((target, current));
+        }
+    }
+
+    /// Issue one `CommandLookupTopic` against `shared` and await its terminal
+    /// [`OpOutcome`], with the bounded `SessionLost` re-issue loop
+    /// (ADR-0060). `redirect_budget` is `None` for the
+    /// user's first lookup (proto seeds the full cap) and `Some(hops)` for a
+    /// redirect re-issue on a dialed target (proto clamps + re-checks the cap
+    /// in `Connection::lookup_redirect`).
+    async fn issue_lookup_on(
+        &self,
+        shared: &Arc<ConnectionShared>,
+        topic: &str,
+        authoritative: bool,
+        redirect_budget: Option<u8>,
+    ) -> Result<OpOutcome, ClientError> {
+        // ADR-0059: fast-fail BEFORE registering the lookup
+        // when the connection is already terminal with no driver to recover it
+        // — otherwise the caller hangs on a request no driver will resolve.
+        shared.fail_if_no_driver()?;
+
+        // ADR-0060: bounded lookup-retry on `SessionLost`.
+        // `Connection::reset` (supervised reconnect) fails the in-flight lookup
+        // with `OpOutcome::SessionLost` but does not re-issue it; on that, park
+        // until the connection is live again (or terminal), then re-issue. The
+        // budget is only spent on a real broker round-trip.
         let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
         loop {
             let request_id = {
-                let mut conn = self.shared.inner.lock();
-                conn.lookup(topic, false)
+                let mut conn = shared.inner.lock();
+                match redirect_budget {
+                    None => conn.lookup(topic, authoritative),
+                    Some(hops) => conn.lookup_redirect(topic, authoritative, hops),
+                }
             };
-            self.shared.driver_waker.notify_one();
+            shared.driver_waker.notify_one();
             let outcome = RequestFut {
-                shared: self.shared.clone(),
+                shared: shared.clone(),
                 request_id,
             }
             .await;
 
-            // The session was severed mid-lookup by a supervised reconnect.
-            // Park until the connection recovers (re-issue) or goes terminal
-            // (PeerClosed, composing with §5.1), bounded by the reissue budget.
             if matches!(outcome, OpOutcome::SessionLost { .. }) {
-                match self.shared.await_reconnect_or_terminal().await {
+                match shared.await_reconnect_or_terminal().await {
                     crate::LookupReissueReadiness::Reconnected => {
                         if reissues_remaining == 0 {
                             tracing::warn!(
@@ -588,13 +685,13 @@ impl Client {
                 }
             }
 
-            return Self::map_lookup_outcome(topic, outcome, self.bootstrap_scheme());
+            return Ok(outcome);
         }
     }
 
     /// Translate a terminal lookup [`OpOutcome`] into a [`LookupTarget`] or a
     /// [`ClientError`]. Split out of [`Self::lookup_topic`] so the
-    /// bounded-retry loop (ADR-0060 / follow-ups §4.1) only re-runs the
+    /// bounded-retry loop (ADR-0060) only re-runs the
     /// issue-await steps; the `SessionLost` arm is handled by the loop before
     /// this is reached, so it never appears here.
     fn map_lookup_outcome(
@@ -648,16 +745,16 @@ impl Client {
                             Ok(LookupTarget::Direct { broker_url })
                         }
                     }
-                    // HIGH-4: `Redirected` is no longer surfaced to the engine —
-                    // the proto state machine chases the chain internally and only
-                    // publishes terminal outcomes (`Connect` / `Failed`) against the
-                    // user-facing request-id. Intermediate `Redirected` outcomes ride
-                    // the proto events queue for diagnostics only. Keep the match
-                    // exhaustive so a future variant addition is a hard compile error.
+                    // `Redirected` is a driveable outcome consumed by the
+                    // redirect-dial loop in `lookup_topic` (it dials the target
+                    // and re-issues the lookup there). It must never reach this
+                    // mapper — if it does, the loop failed to intercept it.
+                    // Keep the arm exhaustive and surface a clear error rather
+                    // than mis-routing onto the bootstrap.
                     magnetar_proto::LookupOutcome::Redirected { .. } => Err(ClientError::Other(
-                        "BUG: intermediate Redirected outcome leaked to the user-facing \
-                         future — proto layer should chase redirects internally and only \
-                         deliver terminal outcomes (HIGH-4)"
+                        "BUG: Redirected outcome reached map_lookup_outcome — the \
+                         redirect-dial loop in lookup_topic should have consumed it \
+                         (dialed the target and re-issued the lookup there)"
                             .to_owned(),
                     )),
                     magnetar_proto::LookupOutcome::Failed { code, message } => {
@@ -676,8 +773,14 @@ impl Client {
     /// Resolve the [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
     /// CommandProducer / CommandSubscribe on.
     ///
-    /// * [`LookupTarget::Direct { broker_url: None }`] — bootstrap connection (no broker URL was
-    ///   advertised; single-broker behaviour).
+    /// `landed_on` is the connection the final lookup was issued against — the
+    /// bootstrap for a non-redirected lookup, or the dialed redirect target
+    /// after the redirect-dial loop. The `Direct { broker_url: None }` case
+    /// routes to `landed_on` (ride the connection the lookup resolved on),
+    /// which is the bootstrap for single-broker setups but the redirect target
+    /// when a redirected owner answered `Connect` with no advertised URL.
+    ///
+    /// * [`LookupTarget::Direct { broker_url: None }`] — ride `landed_on`.
     /// * [`LookupTarget::Direct { broker_url: Some(url) }`] — multi-broker DIRECT routing. If
     ///   `url`'s `host:port` matches the bootstrap, reuse the bootstrap. Otherwise open (or reuse)
     ///   a pool entry keyed by `(url, url)` and dial the resolved broker directly
@@ -689,10 +792,11 @@ impl Client {
     async fn resolve_target(
         &self,
         target: LookupTarget,
+        landed_on: &Arc<ConnectionShared>,
         topic: &str,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         match target {
-            LookupTarget::Direct { broker_url: None } => Ok(self.shared.clone()),
+            LookupTarget::Direct { broker_url: None } => Ok(landed_on.clone()),
             LookupTarget::Direct {
                 broker_url: Some(broker_url),
             } => self.resolve_direct_broker(&broker_url, topic).await,
@@ -1009,10 +1113,25 @@ impl Client {
     /// when the namespace has `replicated_subscription_status=true`), or `None` if the
     /// connection has closed. Markers are filtered off the regular [`Consumer::receive`]
     /// stream — applications that just want to consume messages don't need this.
+    ///
+    /// Enroll-before-drain (mirror of [`ConnectionShared::await_reconnect_or_terminal`]):
+    /// the `Notified` future is created and `enable()`d *before* the buffer drain +
+    /// `is_closed()` re-check, so a marker the driver pushes (via
+    /// `replicated_subscription_marker_notify.notify_waiters()`, which stores no permit)
+    /// between the drain and the park is captured by this already-armed waiter rather than
+    /// lost. The previous drain-then-`notified().await` shape hung whenever the marker
+    /// landed in that gap (same race fixed for `SubscribeAckedFut`).
+    /// No channel (ADR-0003), no host-clock read (ADR-0011).
     pub async fn next_replicated_subscription_marker(
         &self,
     ) -> Option<crate::ObservedReplicatedSubscriptionMarker> {
         loop {
+            // Arm the wakeup BEFORE inspecting the buffer so a marker pushed
+            // between the drain and the park is captured by this `Notified`.
+            let notified = self.shared.replicated_subscription_marker_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(marker) = self
                 .shared
                 .replicated_subscription_markers
@@ -1024,10 +1143,9 @@ impl Client {
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared
-                .replicated_subscription_marker_notify
-                .notified()
-                .await;
+            // Neither a buffered marker nor closed — park on the pre-armed
+            // waiter, then re-loop and re-arm. A spurious wake just re-drains.
+            notified.await;
         }
     }
 
@@ -1196,10 +1314,10 @@ impl Client {
         let receiver_queue_size = req.receiver_queue_size;
         // See `open_producer_with`: subscribe also needs lookup-driven bundle activation,
         // and ADR-0039 routes proxy-resolved subscribes onto a pinned pool entry.
-        let target = self.lookup_topic(&req.topic).await?;
+        let (target, landed_on) = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
-        let target_shared = self.resolve_target(target, &topic).await?;
-        // ADR-0059 / follow-ups §4.1: fast-fail if the resolved data-plane
+        let target_shared = self.resolve_target(target, &landed_on, &topic).await?;
+        // ADR-0059: fast-fail if the resolved data-plane
         // connection is already terminal with no driver, before registering a
         // doomed `CommandSubscribe`.
         target_shared.fail_if_no_driver()?;

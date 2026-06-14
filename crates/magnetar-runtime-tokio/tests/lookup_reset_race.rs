@@ -159,7 +159,7 @@ fn reset_publishes_outcome_even_when_no_waker_was_registered() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// ADR-0060 / follow-ups §4.1 — engine-side bounded lookup-retry on SessionLost.
+// ADR-0060 — engine-side bounded lookup-retry on SessionLost.
 //
 // These drive the production async `lookup_topic` retry loop through a real
 // loopback broker + the supervised driver: a `CommandLookupTopic` that is

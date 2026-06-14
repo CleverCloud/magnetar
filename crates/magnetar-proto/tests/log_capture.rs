@@ -178,8 +178,9 @@ fn checksum_mismatch_logs_error_at_detection_point() {
     );
 }
 
-/// ADR-0054 §5: each internally-chased lookup redirect hop logs a `debug!`
-/// with the hop count and the broker-advertised URLs.
+/// ADR-0054 §5: a lookup redirect logs a `debug!` at the proto detection
+/// point with the remaining hop budget and the broker-advertised URLs the
+/// engine will dial.
 #[test]
 fn redirect_hop_logs_debug_with_hop_and_urls() {
     let (logs, ()) = capture_logs(|| {
@@ -207,12 +208,13 @@ fn redirect_hop_logs_debug_with_hop_and_urls() {
     });
 
     assert!(
-        logs.contains("lookup redirected; chasing internally"),
-        "redirect-chase hop debug! must fire at the proto detection point; got:\n{logs}"
+        logs.contains("lookup redirected; engine will dial the redirect target"),
+        "redirect debug! must fire at the proto detection point; got:\n{logs}"
     );
     assert!(
-        logs.contains("hop=1") && logs.contains("hops_remaining=4"),
-        "first hop must log hop=1 hops_remaining=4 (MAX_LOOKUP_REDIRECTS=5); got:\n{logs}"
+        logs.contains("hops_remaining=4"),
+        "first redirect must log hops_remaining=4 (MAX_LOOKUP_REDIRECTS=5 minus this hop); \
+         got:\n{logs}"
     );
     // `&str` fields render Debug-quoted in the default fmt layout, so the
     // field name and the value are asserted separately.

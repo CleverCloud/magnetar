@@ -132,6 +132,17 @@ The pattern is uniform:
 
 The schedule API lives on the relevant builder (`PartitionedProducerBuilder::auto_update_partitions_interval`, `MultiTopicsConsumerBuilder::auto_update_partitions_interval`, `TableViewBuilder::auto_update_partitions_interval`, `PatternConsumer::start_auto_reconcile`).
 
+### Push delivery (consumer `MessageListener`)
+
+`ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (and the `TypedConsumerBuilder` twin) flip a consumer from pull to push, mirroring Java `ConsumerBuilder#messageListener` ([ADR-0064](specs/adr/0064-consumer-message-listener-push-delivery.md)).
+The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` background task `TableView::listen` uses (`crates/magnetar/src/table_view.rs` `spawn_drain`), generalised in `crates/magnetar/src/consumer_listener.rs` over `C: ConsumerApi + Clone` so the tokio and moonpool consumers share one poller.
+It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
+Delivery is sequential and in order, the callback acks explicitly (the poller never auto-acks), and the task ends cleanly when `receive()` errors (closed consumer) or the returned `MessageListenerHandle` is dropped.
+
+The same push surface extends to the wrapper consumers — `MultiTopicsConsumer`, `PartitionedConsumer`, `PatternConsumer` — via a second poller (`spawn_wrapper_message_listener`) generic over the `WrapperReceiver` trait, since those are not `ConsumerApi` (their `receive()` yields a topic-tagged message).
+Its callback is `Fn(&str, &IncomingMessage)`: the originating topic is the extra argument so the callback can route an explicit ack to the right child.
+Pattern / partition children discovered **after** subscribe inherit the listener — each poller iteration races the in-flight `receive()` against a membership-change `Notify` the wrapper signals on every child add, so a child that joins while the poller is parked is swept on the next iteration (matching Java's parent-owns-the-listener model, where every child is created with `messageListener` `null`).
+
 ---
 
 ## Layering
@@ -247,7 +258,7 @@ The public surface mirrors [`quinn-proto`]:
 | `poll_timeout() -> Option<Instant>`       | state → engine | Next deadline (keepalive, tracker tick, send timeout).                                                           |
 | `handle_timeout(now)`                     | engine → state | Drive timers that elapsed.                                                                                       |
 
-Diagnostics are two-channel per [ADR-0054](specs/adr/0054-logging-policy.md): semantic events the engine must react to ride `poll_event()`, while proto also emits `tracing` logs at points of detection (checksum mismatch, redirect-chase hops, handshake transitions) under the single-owner rule — each fault logs exactly once, at the layer holding the richest context.
+Diagnostics are two-channel per [ADR-0054](specs/adr/0054-logging-policy.md): semantic events the engine must react to ride `poll_event()`, while proto also emits `tracing` logs at points of detection (checksum mismatch, lookup redirects, handshake transitions) under the single-owner rule — each fault logs exactly once, at the layer holding the richest context.
 
 ### Known non-determinism leaks (documented)
 
@@ -349,6 +360,12 @@ The lock-ordering rule **global → per-slot, never the reverse** is documented 
 The driver-to-driver communication path is _also_ not a channel — it is a single-cell `tokio::sync::Notify` (the driver wakes on `shared.driver_waker.notified()`).
 `Notify` is permitted because it has no queue and no payload — it is an async condvar, not a channel.
 If even `Notify` feels too channel-flavoured, a `parking_lot::Condvar + Mutex<bool>` is the documented fallback.
+
+**Enroll-before-drain wakeup discipline.**
+Every `Notify` the driver pulses with `notify_waiters()` — `driver_waker`, `topic_list_notify`, `replicated_subscription_marker_notify`, `scalable_notify` — stores **no permit**: it only wakes waiters enrolled at the instant it fires.
+So every accessor that parks on one of these (`Client::await_reconnect_or_terminal`, `next_topic_list_change`, `next_replicated_subscription_marker`, `next_scalable_event`) MUST arm its `Notified` future — create it and call `enable()` — **before** it drains the buffer and re-checks `is_closed()`, then `await` the pre-armed future.
+The reverse (drain → check → `notified().await`) leaves a window in which the driver can push an item and `notify_waiters()` between the empty-check and the (too-late) enrollment, losing the wakeup and hanging the accessor forever.
+This is enforced 1:1 across both engines; the marker accessor's missing enrollment was the latent §5.1 lost-wakeup race (the same shape already fixed for `SubscribeAckedFut`).
 
 ### Reference
 
@@ -558,7 +575,8 @@ After the lock drops, the driver pulls semantic events via `poll_event()` and re
 - `ConnectionEvent::TopicListChanged { added, removed }` — driver pushes the delta into `ConnectionShared.topic_list_changes` and wakes `topic_list_notify` (PIP-145).
 - `ConnectionEvent::ReplicatedSubscriptionMarkerObserved { handle, marker }` — driver pushes the observation into `ConnectionShared.replicated_subscription_markers` and wakes `replicated_subscription_marker_notify` (PIP-33 / ADR-0034).
   The marker is filtered off the user-visible message stream upstream in the `magnetar-proto` receive path so it never reaches `Consumer::receive`.
-- `ConnectionEvent::ChecksumMismatch { … }` and `ConnectionEvent::LookupResponse` carrying `LookupOutcome::Redirected` — diagnostic events proto already logs at the point of detection ([ADR-0054](specs/adr/0054-logging-policy.md) single-owner rule); both engines admit them to the drain predicate and consume them **silently**, which stops them accumulating unbounded in the proto event queue.
+- `ConnectionEvent::ChecksumMismatch { … }` and the **diagnostic** `ConnectionEvent::LookupResponse` carrying `LookupOutcome::Redirected` — events proto already logs at the point of detection ([ADR-0054](specs/adr/0054-logging-policy.md) single-owner rule); both engines admit them to the drain predicate and consume them **silently**, which stops them accumulating unbounded in the proto event queue.
+  Note the redirect rides two separate channels: this `poll_event()` event is purely diagnostic, while the **actionable** `Redirected` outcome lands in the `outcomes` slot (keyed `PendingOpKey::Request`) and wakes the lookup future so the engine can dial the redirect target (see "lookup redirect dialing" below).
 
 The `MessageReceivedFromShadow` variant (PIP-180 / ADR-0033) is emitted in place of `Message` for shadow-topic consumers; user-facing futures pick it up directly via the same Waker slab as `Message`, so the driver does not need to special-case it.
 
@@ -999,12 +1017,18 @@ The PIP-54 ack_set bitset is stamped on per-batch ids so partial-batch acks (one
                 negative_ack(msg_id) or negative_ack_with_delay(msg_id, d)
                     │
                     ▼
-        NegativeAcksTracker::add(msg_id, now + delay)
-                    │
-                    │
+        UnackedMessageTracker::remove(msg_id)   ← unconditional, mirrors the
+                    │                              positive-ack path; drops the id
+                    │                              from the ack-timeout tracker so
+                    │                              the sweep below cannot redeliver
+                    │                              the same id a second time
                     ▼
-              poll_timeout returns
-              the next nack deadline
+        NegativeAcksTracker::add(msg_id, now + delay)
+                    │                              (skipped when no nack tracker is
+                    │                               configured — the removal above
+                    ▼                               still ran, then an immediate
+              poll_timeout returns                  CommandRedeliverUnackedMessages
+              the next nack deadline                is emitted)
                     │
                     ▼
               handle_timeout(now)
@@ -1019,6 +1043,10 @@ The PIP-54 ack_set bitset is stamped on per-batch ids so partial-batch acks (one
                     ▼
               (re-arm if PIP-37 backoff configured)
 ```
+
+`negative_ack` removes the nacked id from the `UnackedMessageTracker` **before** it touches the nack tracker, and does so unconditionally — on both the nack-tracker-present and nack-tracker-absent paths.
+Without that removal a message that is both nacked and ack-timeout tracked is redelivered twice: once when the nack delay elapses, once when the ack-timeout window elapses.
+The removal is symmetric with the positive-ack path, which already drops acked ids from both the unacked tracker and the nack tracker, and mirrors the Java client's `ConsumerImpl#negativeAcknowledge`.
 
 ### DLQ + retry-letter
 
@@ -1336,6 +1364,8 @@ User futures stay live across the migration.
 `Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost`, but treats in-flight **publishes** specially: it snapshots them and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
 A lookup behind `subscribe` / `open_producer` severed by the reset is likewise re-issued transparently — the engine's `lookup_topic` parks on `ConnectionShared::await_reconnect_or_terminal` and re-runs the `CommandLookupTopic` against the fresh session, bounded by `MAX_LOOKUP_SESSION_REISSUES`, surfacing `PeerClosed` only if the supervisor gives up (`no_driver` latched). See [ADR-0060](specs/adr/0060-lookup-retry-on-session-lost.md) (lookup) and [ADR-0059](specs/adr/0059-terminal-fast-fail-new-ops.md) (the `no_driver` terminal latch).
 
+**Lookup redirect dialing** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-06-14 amendment). A `CommandLookupTopic` resolves to one of three terminal outcomes on its request-id: `Connect` (route the data ops here), `Failed`, or `Redirected` (this broker is not the bundle owner). The sans-io core never chases a redirect itself — that would mean dialing a socket, forbidden in `magnetar-proto` ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md)). Instead it surfaces a **driveable** `LookupOutcome::Redirected { broker_service_url, broker_service_url_tls, authoritative, hops_remaining }`, and the engine's `lookup_topic` loop dials the redirect-target broker (reusing `resolve_direct_broker` / the per-broker `ProxyConnectionPool`, no new connection machinery; the dial awaits **outside** any proto/connection lock per [ADR-0038](specs/adr/0038-split-connection-mutex.md) and uses no channel per [ADR-0003](specs/adr/0003-no-channels-rule.md)) and re-issues the lookup THERE via `Connection::lookup_redirect`. This mirrors Java `BinaryProtoLookupService#findBroker` recursing on `getConnection(redirectAddress)`. The chase used to run inside `magnetar-proto` (re-encoding `CommandLookupTopic` on the bootstrap socket), which re-asked the same non-owner broker and looped to the cap on a multi-broker cluster. The `MAX_LOOKUP_REDIRECTS` cap is enforced end-to-end: the proto translate-layer floor (`Failed` at zero), a proto-side clamp in `lookup_redirect` (a buggy engine cannot inflate the carried `hops_remaining`), and an engine guard that refuses to dial a `Redirected` with no budget left and surfaces the same synthetic cap `Failed`. When the resolved owner answers `Connect` with no advertised URL, the data ops ride the connection the lookup landed on (the dialed target), not the bootstrap.
+
 ---
 
 ## TLS sites
@@ -1455,7 +1485,7 @@ The schema is advertised on `CommandProducer.schema` / `CommandSubscribe.schema`
 | PIP-22                   | DLQ topic                                | ✅     | `ConsumerBuilder::dead_letter_policy` + `Consumer::drain_dead_letter`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | PIP-30                   | In-band `AUTH_CHALLENGE` refresh         | ✅     | `crates/magnetar-proto/src/auth.rs`; dispatch: `crates/magnetar-runtime-tokio/src/driver.rs:42-66`                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | PIP-31                   | Transactions                             | ✅     | `crates/magnetar-proto/src/txn.rs`; client surface: `Client::new_txn`, `add_partition_to_txn`, `add_subscription_to_txn`, `end_txn`                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| PIP-37                   | Chunking + `AckTimeoutRedeliveryBackoff` | ✅     | Chunked producer path: `crates/magnetar-proto/src/producer.rs`; backoff: `crates/magnetar-proto/src/trackers/nack.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| PIP-37                   | Chunking + `AckTimeoutRedeliveryBackoff` | ✅     | Chunked producer path: `crates/magnetar-proto/src/producer.rs`; backoff: `crates/magnetar-proto/src/trackers/nack.rs`; consumer-side reassembly bounded in `crates/magnetar-proto/src/consumer.rs` (`max_pending_chunked_message` cap 10 with oldest-eviction, `expire_time_of_incomplete_chunked_message` 60s sweep wired through `poll_timeout` + `handle_timeout`, `auto_ack_oldest_chunked_message_on_queue_full` false — Java-matching), guarding against unbounded `chunk_reassembly` growth                                                                        |
 | PIP-54                   | Partial-batch ACK (ack_set bitset)       | ✅     | `crates/magnetar-proto/src/consumer.rs:109-130`; ack stamping: `crates/magnetar-proto/src/conn.rs:1775`                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | PIP-58                   | Retry-letter topic                       | ✅     | `Consumer::reconsume_later` + `reconsume_later_with_properties`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | PIP-68                   | Exclusive producer access mode           | ✅     | `ProducerBuilder::access_mode`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |

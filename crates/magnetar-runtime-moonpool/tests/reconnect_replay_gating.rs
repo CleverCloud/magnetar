@@ -2,7 +2,7 @@
 
 //! Producer-not-ready replay gating across a supervised reconnect —
 //! moonpool engine (ADR-0024 layer c for the proto replay-gating fix +
-//! follow-ups §3.1 transient-retry wiring). 1:1 twin of
+//! transient-retry wiring). 1:1 twin of
 //! `crates/magnetar-runtime-tokio/tests/reconnect_replay_gating.rs`
 //! (ADR-0024 runtime-test-parity).
 //!
@@ -12,8 +12,8 @@
 //!
 //! Runs the moonpool engine over `TokioProviders` against a real loopback
 //! `TcpListener` (the `tests/logging_checksum.rs` harness pattern). The
-//! scenario — now a TRUE 1:1 twin of the tokio test (follow-ups §3.1 wired
-//! the moonpool transient-retry arms, so the documented engine asymmetry is
+//! scenario — now a TRUE 1:1 twin of the tokio test (the moonpool
+//! transient-retry arms are wired, so the documented engine asymmetry is
 //! gone):
 //!
 //! 1. connect → producer open (acked) → one send → receipt — healthy session;
@@ -27,7 +27,7 @@
 //!
 //! ## `transient_producer_open_retry_fires_under_virtual_time`
 //!
-//! The determinism proof for §3.1: drives the SAME transient → lookup →
+//! The determinism proof for the transient-retry leg: drives the SAME transient → lookup →
 //! retry leg under **`SimProviders` virtual time** (the
 //! `driver_mid_session_reject.rs` harness pattern). The retry leg sleeps
 //! `TRANSIENT_RETRY_DELAY` (2 s) through the INJECTED
@@ -218,8 +218,7 @@ where
 
 /// Scripted broker: a healthy first session that drops after the first
 /// receipt, then a second session that exercises the transient-error +
-/// retry + ack-gated-replay leg (now wired on moonpool too — follow-ups
-/// §3.1).
+/// retry + ack-gated-replay leg (now wired on moonpool too).
 async fn run_gating_broker(listener: TcpListener, state: Arc<Gating>) {
     // ── Connection #1: healthy, then dropped after the first receipt. ──
     let Ok((mut s1, _)) = listener.accept().await else {
@@ -388,7 +387,7 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
 }
 
 // ============================================================================
-// Virtual-time determinism proof (follow-ups §3.1)
+// Virtual-time determinism proof
 // ============================================================================
 
 /// Port the in-sim broker binds to (the sim hands every workload its own IP).
@@ -424,7 +423,7 @@ struct SimGating {
 
 /// In-sim broker: session 1 handshakes, acks a producer-open, answers one
 /// send with a receipt, then DROPS; session 2 handshakes, transiently rejects
-/// the rebuild's producer-open (forcing the §3.1 lookup + retry leg), acks the
+/// the rebuild's producer-open (forcing the lookup + retry leg), acks the
 /// retry, and answers the replayed send.
 struct SimBrokerWorkload {
     gating: Arc<Mutex<SimGating>>,
@@ -447,7 +446,7 @@ impl Workload for SimBrokerWorkload {
         let shutdown = ctx.shutdown().clone();
         let task = ctx.providers().task().clone();
         // First fully-handshaked session is #1 (drop after the first receipt);
-        // every later handshaked session runs the §3.1 transient-retry script.
+        // every later handshaked session runs the transient-retry script.
         // A shared counter assigns the role; the sim's probabilistic connect
         // faults mean some dials never reach `CONNECT`, so role assignment is
         // gated on the handshake actually completing inside `sim_session`.
@@ -526,7 +525,7 @@ where
                             g.session2_producer_opens += 1;
                             if g.session2_producer_opens == 1 {
                                 // Rebuild open: transient bundle-not-served →
-                                // forces the §3.1 lookup + retry leg.
+                                // forces the lookup + retry leg.
                                 emit_transient_error(&mut out_buf, p.request_id);
                             } else {
                                 // Retry open (issued only after the virtual
@@ -690,7 +689,7 @@ impl Workload for SimClientWorkload {
     }
 }
 
-/// Virtual-time determinism proof for §3.1: the transient producer-open retry
+/// Virtual-time determinism proof for the transient-retry leg: the transient producer-open retry
 /// leg sleeps `TRANSIENT_RETRY_DELAY` on the INJECTED `TimeProvider`, so under
 /// `SimProviders` the retry fires deterministically in virtual time. The run
 /// terminating (the replayed send resolving after exactly two producer-opens

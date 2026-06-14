@@ -2,25 +2,42 @@
 
 //! Binary-protocol topic lookup state machine.
 //!
-//! Port of `org.apache.pulsar.client.impl.BinaryProtoLookupService`. We model the lookup as a
-//! tiny per-request state machine that handles redirects internally — the user-visible
-//! outcome is either [`LookupOutcome::Connect`] or [`LookupOutcome::Failed`].
+//! Port of `org.apache.pulsar.client.impl.BinaryProtoLookupService`. We model
+//! the lookup as a tiny per-request state machine that translates one
+//! `CommandLookupTopicResponse` into one terminal [`LookupOutcome`].
 //!
-//! [`LookupOutcome::Redirected`] is **diagnostic only**: it is surfaced via
-//! [`crate::event::ConnectionEvent::LookupResponse`] for tracing / observability
-//! but is **never** delivered to the user-facing waker (HIGH-4 fix from the
-//! lookup multi-agent review). The state machine chases each `Redirect` to its
-//! terminal outcome internally, then publishes that terminal outcome on the
-//! *original* user-facing request-id (`chain_origin`) so the engine future
-//! only wakes once with the final answer. This is what makes
-//! [`MAX_LOOKUP_REDIRECTS`] (the redirect cap) and the broker-URL passthrough
-//! end-to-end user-observable instead of being folded into a no-op by the
-//! engine's "first-hop wins" handling.
+//! Each lookup resolves to exactly one of three terminal [`LookupOutcome`]s.
+//!
+//! [`LookupOutcome::Connect`] — the topic resolved to a broker; the engine routes the data ops
+//! there.
+//!
+//! [`LookupOutcome::Redirected`] — the broker is not the bundle owner and redirected us to a
+//! different broker. Per ADR-0004 the sans-io core must not dial a socket, so it does **not** chase
+//! the redirect itself: it surfaces the redirect target plus the next-hop `authoritative` flag plus
+//! the remaining hop budget, and the **engine** dials that target broker (reusing its per-broker
+//! connection pool) and re-issues the lookup there via [`crate::Connection::lookup_redirect`]. This
+//! mirrors Java `BinaryProtoLookupService#findBroker`, which recurses on
+//! `client.getCnxPool().getConnection(redirectAddress)` (`BinaryProtoLookupService.java:182`,
+//! `:207`). The chase used to run inside this crate (re-encoding `CommandLookupTopic` on the same
+//! socket), which silently re-asked a non-owner broker and looped to the cap on a multi-broker
+//! cluster; the engine-driven dial fixes that.
+//!
+//! [`LookupOutcome::Failed`] — the lookup failed, including the synthetic `Failed` raised when a
+//! redirect chain exhausts [`MAX_LOOKUP_REDIRECTS`].
+//!
+//! The redirect cap is enforced in two cooperating places: the translate layer
+//! short-circuits a `Redirect` to [`LookupOutcome::Failed`] once
+//! `hops_remaining == 0` (the hard floor), and
+//! [`crate::Connection::lookup_redirect`] clamps the engine-supplied budget to
+//! [`MAX_LOOKUP_REDIRECTS`] on every re-entry so a buggy engine cannot exceed
+//! the cap.
 //!
 //! # References
 //!
 //! - `BinaryProtoLookupService.java:56` (entry point)
 //! - `BinaryProtoLookupService.java:146` (redirect handling)
+//! - `BinaryProtoLookupService.java:182` (`getConnection(redirectAddress)`)
+//! - `BinaryProtoLookupService.java:207` (recursive re-lookup on the target)
 //! - `BinaryProtoLookupService.java:260` (partitioned-topic metadata)
 
 use std::collections::{HashMap, HashSet};
@@ -135,24 +152,23 @@ pub(crate) struct LookupRequest {
     pub(crate) topic: String,
     /// Whether the next round-trip should be authoritative.
     pub(crate) authoritative: bool,
-    /// Remaining redirect hops before the chain fails. Initialised to
-    /// [`MAX_LOOKUP_REDIRECTS`] by the public entry point; decremented by
-    /// [`translate_lookup_response`] on each `Redirect` retry. When `0`, the
-    /// next `Redirect` short-circuits to `Failed` instead of issuing another
-    /// hop.
+    /// Remaining redirect hops before the chain fails. Seeded to
+    /// [`MAX_LOOKUP_REDIRECTS`] by the public [`crate::Connection::lookup`]
+    /// entry, or to the engine-carried (clamped) budget by
+    /// [`crate::Connection::lookup_redirect`] on a redirect re-issue. When
+    /// `0`, the next `Redirect` short-circuits to `Failed` in
+    /// [`translate_lookup_response`] instead of emitting another driveable
+    /// `Redirected` outcome — the proto-side cap floor.
     pub(crate) hops_remaining: u8,
-    /// The *user-facing* request id this lookup chain is anchored on.
+    /// The request id the user-facing outcome is delivered against.
     ///
-    /// The wire-level request id changes on every redirect hop (each hop
-    /// allocates a fresh id so the broker can correlate its own state) but
-    /// the [`crate::event::OpOutcome::LookupResponse`] surfaced to the user
-    /// is always keyed on `chain_origin` — the request id returned by the
-    /// initial [`crate::Connection::lookup`] call. HIGH-4 (lookup
-    /// multi-agent review): only terminal outcomes (`Connect` / `Failed`)
-    /// are delivered against `chain_origin`; intermediate `Redirected`
-    /// outcomes are pushed to the events queue for diagnostics only and
-    /// never wake the user-facing future. This is what makes the redirect
-    /// cap and the broker-URL passthrough end-to-end user-observable.
+    /// Each redirect hop now runs on its **own** connection (the engine dials
+    /// the redirect target and re-issues the lookup there), so a single
+    /// connection's lookup is single-hop: the wire request id never changes
+    /// within a connection and `chain_origin == request_id` for every entry.
+    /// The field is retained so the
+    /// [`crate::event::OpOutcome::LookupResponse`] publish path and the reset
+    /// drain key on a named anchor rather than re-deriving the request id.
     pub(crate) chain_origin: RequestId,
 }
 
@@ -283,15 +299,28 @@ impl LookupRegistry {
     }
 }
 
-/// Translate a `CommandLookupTopicResponse` into the user-facing outcome and an optional
-/// "retry lookup" decision.
+/// Translate a `CommandLookupTopicResponse` into the user-facing
+/// [`LookupOutcome`].
 ///
-/// Returns `(outcome, Some(LookupRequest))` if the broker asked us to retry with authoritative
-/// (Redirect). The caller is responsible for emitting the retry frame.
+/// The sans-io core never chases a redirect itself — that would mean dialing
+/// a socket, forbidden in `magnetar-proto` (ADR-0004). On a `Redirect` this
+/// returns a **driveable** [`LookupOutcome::Redirected`] carrying the
+/// redirect target, the next-hop `authoritative` flag, and the remaining hop
+/// budget; the engine dials the target broker and re-issues the lookup there
+/// (Java `BinaryProtoLookupService#findBroker` recursion,
+/// `BinaryProtoLookupService.java:182`). All three [`LookupOutcome`] variants
+/// are terminal as far as the proto layer is concerned — exactly one of them
+/// is published to the user-facing request-id per response.
+///
+/// The redirect cap floor lives here: once `request.hops_remaining == 0` the
+/// next `Redirect` short-circuits to [`LookupOutcome::Failed`] instead of
+/// emitting another driveable `Redirected`. Combined with the clamp in
+/// [`crate::Connection::lookup_redirect`], a buggy or hostile engine cannot
+/// exceed [`MAX_LOOKUP_REDIRECTS`] dials.
 pub(crate) fn translate_lookup_response(
     response: &pb::CommandLookupTopicResponse,
     request: &LookupRequest,
-) -> (LookupOutcome, Option<LookupRequest>) {
+) -> LookupOutcome {
     use pb::command_lookup_topic_response::LookupType;
 
     let lookup_type = response
@@ -300,56 +329,38 @@ pub(crate) fn translate_lookup_response(
         .unwrap_or(LookupType::Failed);
 
     match lookup_type {
-        LookupType::Connect => (
-            LookupOutcome::Connect {
+        LookupType::Connect => LookupOutcome::Connect {
+            broker_service_url: response.broker_service_url.clone(),
+            broker_service_url_tls: response.broker_service_url_tls.clone(),
+            proxy_through_service_url: response.proxy_through_service_url.unwrap_or(false),
+        },
+        LookupType::Redirect => {
+            // Cap floor (lookup multi-agent review): short-circuit to `Failed`
+            // once the chain has burnt through `MAX_LOOKUP_REDIRECTS` hops.
+            // Stops a hostile broker from driving an unbounded redirect chain
+            // through the engine's per-broker dial loop.
+            if request.hops_remaining == 0 {
+                return LookupOutcome::Failed {
+                    code: 0,
+                    message: format!("lookup redirect cap exceeded ({MAX_LOOKUP_REDIRECTS} hops)"),
+                };
+            }
+            LookupOutcome::Redirected {
                 broker_service_url: response.broker_service_url.clone(),
                 broker_service_url_tls: response.broker_service_url_tls.clone(),
-                proxy_through_service_url: response.proxy_through_service_url.unwrap_or(false),
-            },
-            None,
-        ),
-        LookupType::Redirect => {
-            // Hardening pass (lookup multi-agent review): short-circuit to
-            // `Failed` once the chain has burnt through `MAX_LOOKUP_REDIRECTS`
-            // hops. Stops a hostile broker from exhausting request-ids and
-            // registry entries via an unbounded redirect chain.
-            if request.hops_remaining == 0 {
-                return (
-                    LookupOutcome::Failed {
-                        code: 0,
-                        message: format!(
-                            "lookup redirect cap exceeded ({MAX_LOOKUP_REDIRECTS} hops)"
-                        ),
-                    },
-                    None,
-                );
-            }
-            let retry = LookupRequest {
-                topic: request.topic.clone(),
-                // Per Java: after a redirect, the next round-trip is marked authoritative
-                // iff the broker said so. Default to `true` to bound the recursion depth.
+                // Per Java: after a redirect, the next round-trip is marked
+                // authoritative iff the broker said so. Default to `true` to
+                // bound the chain depth.
                 authoritative: response.authoritative.unwrap_or(true),
+                // Budget left AFTER this hop — the engine threads it back into
+                // `Connection::lookup_redirect` on the redirect target.
                 hops_remaining: request.hops_remaining - 1,
-                // Carry the user-facing anchor through every hop of the
-                // chain — the terminal outcome is delivered against this
-                // id, not the per-hop wire id.
-                chain_origin: request.chain_origin,
-            };
-            (
-                LookupOutcome::Redirected {
-                    broker_service_url: response.broker_service_url.clone(),
-                    broker_service_url_tls: response.broker_service_url_tls.clone(),
-                },
-                Some(retry),
-            )
+            }
         }
-        LookupType::Failed => (
-            LookupOutcome::Failed {
-                code: response.error.unwrap_or(0),
-                message: response.message.clone().unwrap_or_default(),
-            },
-            None,
-        ),
+        LookupType::Failed => LookupOutcome::Failed {
+            code: response.error.unwrap_or(0),
+            message: response.message.clone().unwrap_or_default(),
+        },
     }
 }
 
@@ -372,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_outcome_does_not_retry() {
+    fn connect_outcome_is_terminal_connect() {
         let resp = pb::CommandLookupTopicResponse {
             broker_service_url: Some("pulsar://broker:6650".to_owned()),
             broker_service_url_tls: None,
@@ -384,12 +395,11 @@ mod tests {
             proxy_through_service_url: Some(false),
         };
         let req = fresh_lookup_request("persistent://public/default/foo", false);
-        let (out, retry) = translate_lookup_response(&resp, &req);
-        assert!(retry.is_none());
-        matches!(out, LookupOutcome::Connect { .. });
+        let out = translate_lookup_response(&resp, &req);
+        assert!(matches!(out, LookupOutcome::Connect { .. }));
     }
 
-    /// ADR-0060 / follow-ups §4.1: the engine-side lookup-retry-on-`SessionLost`
+    /// ADR-0060: the engine-side lookup-retry-on-`SessionLost`
     /// loop is bounded by [`MAX_LOOKUP_SESSION_REISSUES`]. The const must be
     /// non-zero (at least one re-issue is allowed — otherwise a single transient
     /// reconnect would surface `PeerClosed` and defeat the whole point) and
@@ -417,11 +427,16 @@ mod tests {
         }
     }
 
+    /// A `Redirect` resolves to a driveable `LookupOutcome::Redirected`
+    /// carrying the redirect target URL, the next-hop `authoritative` flag,
+    /// and the decremented hop budget the engine threads into the dial loop.
+    /// The proto layer does NOT build a retry / re-issue on self — the engine
+    /// dials the target and re-issues via `Connection::lookup_redirect`.
     #[test]
-    fn redirect_outcome_requests_authoritative_retry() {
+    fn redirect_outcome_surfaces_driveable_target() {
         let resp = pb::CommandLookupTopicResponse {
             broker_service_url: Some("pulsar://other:6650".to_owned()),
-            broker_service_url_tls: None,
+            broker_service_url_tls: Some("pulsar+ssl://other:6651".to_owned()),
             response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
             request_id: 1,
             authoritative: Some(true),
@@ -430,14 +445,25 @@ mod tests {
             proxy_through_service_url: Some(false),
         };
         let req = fresh_lookup_request("persistent://public/default/foo", false);
-        let (out, retry) = translate_lookup_response(&resp, &req);
-        matches!(out, LookupOutcome::Redirected { .. });
-        let retry = retry.expect("redirect should produce a retry");
-        assert!(retry.authoritative);
-        // The fresh request's hop budget decrements by exactly one per
-        // redirect — ensures the cap is enforced via the retry's carried
-        // counter rather than implicit recursion depth.
-        assert_eq!(retry.hops_remaining, MAX_LOOKUP_REDIRECTS - 1);
+        match translate_lookup_response(&resp, &req) {
+            LookupOutcome::Redirected {
+                broker_service_url,
+                broker_service_url_tls,
+                authoritative,
+                hops_remaining,
+            } => {
+                assert_eq!(broker_service_url.as_deref(), Some("pulsar://other:6650"));
+                assert_eq!(
+                    broker_service_url_tls.as_deref(),
+                    Some("pulsar+ssl://other:6651")
+                );
+                assert!(authoritative, "broker said authoritative=true");
+                // The budget surfaced to the engine decrements by exactly one
+                // per redirect — the engine threads it back so the cap holds.
+                assert_eq!(hops_remaining, MAX_LOOKUP_REDIRECTS - 1);
+            }
+            other => panic!("expected Redirected, got {other:?}"),
+        }
     }
 
     #[test]
@@ -453,9 +479,7 @@ mod tests {
             proxy_through_service_url: Some(false),
         };
         let req = fresh_lookup_request("persistent://public/default/foo", false);
-        let (out, retry) = translate_lookup_response(&resp, &req);
-        assert!(retry.is_none());
-        match out {
+        match translate_lookup_response(&resp, &req) {
             LookupOutcome::Failed { message, .. } => assert_eq!(message, "svc not ready"),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -463,8 +487,8 @@ mod tests {
 
     /// Ported from Java `BinaryProtoLookupService` — a `Redirect` response whose
     /// `authoritative` field is absent (older brokers, or a bug in the server path) must
-    /// still default the retry to `authoritative = true`. Without that, the redirect loop
-    /// would never terminate because the broker might keep redirecting in a chain.
+    /// still default the engine's next round-trip to `authoritative = true`. Without that,
+    /// the redirect chain might never terminate because the broker keeps redirecting.
     #[test]
     fn redirect_missing_authoritative_defaults_to_true() {
         let resp = pb::CommandLookupTopicResponse {
@@ -478,14 +502,13 @@ mod tests {
             proxy_through_service_url: None,
         };
         let req = fresh_lookup_request("persistent://public/default/foo", false);
-        let (_out, retry) = translate_lookup_response(&resp, &req);
-        let retry = retry.expect("redirect should produce a retry");
-        assert!(
-            retry.authoritative,
-            "missing authoritative field must default to true to bound the chain"
-        );
-        // Topic is carried verbatim from the original request.
-        assert_eq!(retry.topic, "persistent://public/default/foo");
+        match translate_lookup_response(&resp, &req) {
+            LookupOutcome::Redirected { authoritative, .. } => assert!(
+                authoritative,
+                "missing authoritative field must default to true to bound the chain"
+            ),
+            other => panic!("expected Redirected, got {other:?}"),
+        }
     }
 
     /// Ported from Java `BinaryProtoLookupService#getBroker`. The `Connect` outcome must
@@ -504,9 +527,7 @@ mod tests {
             proxy_through_service_url: Some(true),
         };
         let req = fresh_lookup_request("persistent://public/default/foo", true);
-        let (out, retry) = translate_lookup_response(&resp, &req);
-        assert!(retry.is_none(), "connect never retries");
-        match out {
+        match translate_lookup_response(&resp, &req) {
             LookupOutcome::Connect {
                 broker_service_url,
                 broker_service_url_tls,
@@ -539,8 +560,7 @@ mod tests {
             proxy_through_service_url: None,
         };
         let req = fresh_lookup_request("persistent://public/default/foo", false);
-        let (out, retry) = translate_lookup_response(&resp, &req);
-        assert!(retry.is_none());
+        let out = translate_lookup_response(&resp, &req);
         assert!(matches!(out, LookupOutcome::Failed { .. }));
     }
 
@@ -560,8 +580,7 @@ mod tests {
             proxy_through_service_url: None,
         };
         let req = fresh_lookup_request("persistent://public/default/foo", false);
-        let (out, _) = translate_lookup_response(&resp, &req);
-        match out {
+        match translate_lookup_response(&resp, &req) {
             LookupOutcome::Failed { code, message } => {
                 assert_eq!(code, pb::ServerError::AuthorizationError as i32);
                 assert_eq!(message, "");
@@ -608,9 +627,10 @@ mod tests {
 
     /// HIGH-2 (lookup multi-agent review): once the chain has burnt through
     /// `MAX_LOOKUP_REDIRECTS` hops, the next `Redirect` short-circuits to
-    /// `Failed` rather than producing yet another retry request. This is
-    /// what stops a hostile broker from driving an unbounded redirect loop
-    /// through the client.
+    /// `Failed` rather than producing yet another driveable `Redirected`.
+    /// This is the proto-side cap floor that stops a hostile broker (or a
+    /// buggy engine that keeps dialing) from driving an unbounded redirect
+    /// loop through the client.
     #[test]
     fn redirect_chain_terminates_at_cap() {
         let resp = pb::CommandLookupTopicResponse {
@@ -630,9 +650,7 @@ mod tests {
             hops_remaining: 0,
             chain_origin: RequestId(1),
         };
-        let (out, retry) = translate_lookup_response(&resp, &req);
-        assert!(retry.is_none(), "no retry once cap is hit");
-        match out {
+        match translate_lookup_response(&resp, &req) {
             LookupOutcome::Failed { code, message } => {
                 assert_eq!(code, 0);
                 assert!(
@@ -644,47 +662,12 @@ mod tests {
         }
     }
 
-    /// HIGH-4 (lookup multi-agent review): every retry produced by
-    /// `translate_lookup_response` must carry the *original* user-facing
-    /// `chain_origin` unchanged. The wire-level `request_id` in the
-    /// outbound `CommandLookupTopic` will be allocated fresh by the caller
-    /// (`Connection::send_lookup_internal`), but the user's future only
-    /// ever wakes against `chain_origin` — so losing the anchor between
-    /// hops would either silently drop the terminal outcome or wake the
-    /// wrong future.
-    #[test]
-    fn redirect_retry_carries_chain_origin_unchanged() {
-        let resp = pb::CommandLookupTopicResponse {
-            broker_service_url: Some("pulsar://other:6650".to_owned()),
-            broker_service_url_tls: None,
-            response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
-            request_id: 42, // wire-level id — orthogonal to chain_origin
-            authoritative: Some(true),
-            error: None,
-            message: None,
-            proxy_through_service_url: None,
-        };
-        // Anchor on a deliberately non-trivial id so a "copy the wire id"
-        // bug surfaces as a mismatch instead of a coincidental match.
-        let origin = RequestId(7);
-        let req = LookupRequest {
-            topic: "persistent://public/default/foo".to_owned(),
-            authoritative: false,
-            hops_remaining: MAX_LOOKUP_REDIRECTS,
-            chain_origin: origin,
-        };
-        let (_out, retry) = translate_lookup_response(&resp, &req);
-        let retry = retry.expect("redirect should produce a retry");
-        assert_eq!(
-            retry.chain_origin, origin,
-            "chain_origin must be preserved verbatim across every redirect hop"
-        );
-    }
-
-    /// HIGH-2 follow-up: walk the redirect chain N steps and confirm the
-    /// hop counter monotonically decrements without ever wrapping around.
-    /// Without this guard, a `u8` underflow would silently re-enable an
-    /// unbounded loop.
+    /// The hop budget surfaced on each `Redirected` outcome monotonically
+    /// decrements as the engine drives the chain (feeding the previous hop's
+    /// `hops_remaining` back into the next `LookupRequest`), without ever
+    /// wrapping around. The final hop on a zeroed budget short-circuits to
+    /// `Failed` — the proto floor. This is the translate-layer mirror of the
+    /// engine-driven dial loop's hop accounting.
     #[test]
     fn redirect_hops_monotonically_decrement() {
         let mut req = fresh_lookup_request("persistent://public/default/foo", false);
@@ -699,15 +682,21 @@ mod tests {
             proxy_through_service_url: None,
         };
         for expected_remaining in (0..MAX_LOOKUP_REDIRECTS).rev() {
-            let (_out, retry) = translate_lookup_response(&mk_redirect(), &req);
-            let retry = retry.expect("hops > 0 must produce a retry");
-            assert_eq!(retry.hops_remaining, expected_remaining);
-            req = retry;
+            match translate_lookup_response(&mk_redirect(), &req) {
+                LookupOutcome::Redirected { hops_remaining, .. } => {
+                    assert_eq!(hops_remaining, expected_remaining);
+                    // Simulate the engine threading the budget into the next
+                    // hop's `LookupRequest` on the redirect target.
+                    req.hops_remaining = hops_remaining;
+                }
+                other => panic!("hops > 0 must produce a Redirected, got {other:?}"),
+            }
         }
         // One more redirect on a zeroed budget must short-circuit to Failed.
-        let (out, retry) = translate_lookup_response(&mk_redirect(), &req);
-        assert!(retry.is_none());
-        assert!(matches!(out, LookupOutcome::Failed { .. }));
+        assert!(matches!(
+            translate_lookup_response(&mk_redirect(), &req),
+            LookupOutcome::Failed { .. }
+        ));
     }
 
     /// MEDIUM-2 (lookup multi-agent review): `max_pending = 0` preserves

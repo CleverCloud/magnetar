@@ -126,7 +126,7 @@ fn stable_socket_resets_persisted_backoff_to_initial() {
 
 #[test]
 fn give_up_budget_fires_behind_tcp_accepting_endpoint() {
-    // ADR-0061 / follow-ups §3.2: behind a TCP-accepting proxy whose
+    // ADR-0061: behind a TCP-accepting proxy whose
     // backend is down, every dial succeeds but the Pulsar handshake never
     // completes, so each post-dial `driver_loop_inner` returns and the socket
     // dies inside `drop_grace`. The hoisted give-up counter must therefore NOT

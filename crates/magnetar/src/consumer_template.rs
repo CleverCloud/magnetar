@@ -25,6 +25,9 @@ pub(crate) struct ConsumerTemplate {
     pub(crate) ack_timeout: Option<std::time::Duration>,
     pub(crate) ack_group_time: Option<std::time::Duration>,
     pub(crate) dlq_policy: Option<(u32, Option<String>)>,
+    pub(crate) max_pending_chunked_message: Option<usize>,
+    pub(crate) auto_ack_oldest_chunked_message_on_queue_full: Option<bool>,
+    pub(crate) expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
     pub(crate) read_compacted: bool,
     pub(crate) priority_level: Option<i32>,
     pub(crate) subscription_properties: Vec<(String, String)>,
@@ -61,6 +64,15 @@ impl ConsumerTemplate {
         }
         if let Some((max, topic_opt)) = &self.dlq_policy {
             builder = builder.dead_letter_policy(*max, topic_opt.clone());
+        }
+        if let Some(max) = self.max_pending_chunked_message {
+            builder = builder.max_pending_chunked_message(max);
+        }
+        if let Some(auto_ack) = self.auto_ack_oldest_chunked_message_on_queue_full {
+            builder = builder.auto_ack_oldest_chunked_message_on_queue_full(auto_ack);
+        }
+        if let Some(expire) = self.expire_time_of_incomplete_chunked_message {
+            builder = builder.expire_time_of_incomplete_chunked_message(expire);
         }
         if let Some(level) = self.priority_level {
             builder = builder.priority_level(level);

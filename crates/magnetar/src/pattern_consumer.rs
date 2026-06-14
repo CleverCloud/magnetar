@@ -38,6 +38,7 @@ use std::sync::Arc;
 use futures_util::future::select_all;
 use magnetar_proto::{IncomingMessage, MessageId};
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use crate::client::PulsarError;
 use crate::consumer_template::ConsumerTemplate;
@@ -62,6 +63,14 @@ struct Inner<C: ConsumerApi> {
     /// in the pattern-reconcile loop use `Arc::make_mut` to
     /// copy-on-write.
     consumers: Mutex<Arc<Vec<NamedConsumer<C>>>>,
+    /// Signalled whenever a child consumer is added to the set (an addition in
+    /// [`PatternConsumer::update`] — a topic that newly matched the pattern). The
+    /// push-delivery poller races its in-flight `receive()` against this so a
+    /// pattern child discovered *after* the poller parked is swept on the next
+    /// iteration (pattern-child inheritance, ADR-0064). `Notify` (not a channel)
+    /// keeps ADR-0003 intact; it stores one permit so an add that races a wait is
+    /// not lost.
+    membership_changed: Arc<Notify>,
     /// Namespace + pattern recorded for diagnostics and for re-snapshot operations.
     namespace: String,
     pattern: String,
@@ -206,6 +215,9 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
                 Arc::make_mut(&mut self.inner.consumers.lock())
                     .push(NamedConsumer { topic, consumer });
                 report.added += 1;
+                // A new child joined the set — wake any parked wrapper-listener
+                // poller so it re-snapshots and starts draining the new child.
+                self.inner.membership_changed.notify_one();
             }
         }
         // Discovery-update record (ADR-0054) — only reached when at least
@@ -437,6 +449,34 @@ impl<C: ConsumerApi> Clone for PatternConsumer<C> {
     }
 }
 
+/// Push-delivery support: a [`PatternConsumer`] drives the wrapper listener
+/// poller via its topic-fanning [`Self::receive`]. Children discovered after
+/// subscribe — when a [`Self::update`] reconciliation cycle subscribes a topic
+/// that newly matched the pattern (PIP-145 `TopicListChanged`) — **inherit** the
+/// listener: `receive()` re-snapshots the child set on every call, so a child
+/// added between two `receive()` calls is delivered on the next sweep. This
+/// mirrors Java `PatternMultiTopicsConsumerImpl`, where the parent owns the
+/// single listener executor and routes every child (initial or later-discovered)
+/// through it.
+impl<C> crate::consumer_listener::WrapperReceiver for PatternConsumer<C>
+where
+    C: ConsumerApi + Clone + Send + Sync + 'static,
+{
+    async fn wrapper_receive(&self) -> Result<(String, IncomingMessage), PulsarError> {
+        let m = self.receive().await?;
+        Ok((m.topic, m.message))
+    }
+
+    fn is_empty(&self) -> bool {
+        PatternConsumer::is_empty(self)
+    }
+
+    async fn membership_changed(&self) {
+        let notify = self.inner.membership_changed.clone();
+        notify.notified().await;
+    }
+}
+
 /// Builder for [`PatternConsumer`]. Mirrors Java's
 /// `PulsarClient#newConsumer().topicsPattern(...)`.
 ///
@@ -458,6 +498,9 @@ pub struct PatternConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     ack_timeout: Option<std::time::Duration>,
     ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
+    max_pending_chunked_message: Option<usize>,
+    auto_ack_oldest_chunked_message_on_queue_full: Option<bool>,
+    expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
     read_compacted: bool,
     priority_level: Option<i32>,
     subscription_properties: Vec<(String, String)>,
@@ -465,6 +508,10 @@ pub struct PatternConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     replicate_subscription_state: Option<bool>,
     force_topic_creation: Option<bool>,
     start_message_rollback_duration_sec: Option<u64>,
+    /// Optional push-delivery callback (Java `ConsumerBuilder#messageListener` at
+    /// the pattern scope). Set via [`Self::message_listener`] and subscribe via
+    /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores it.
+    listener: Option<crate::consumer_listener::WrapperMessageListener>,
 }
 
 impl<E: Engine> std::fmt::Debug for PatternConsumerBuilder<'_, E> {
@@ -493,6 +540,9 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
@@ -500,7 +550,35 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
+            listener: None,
         }
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// `true` once a push-delivery listener has been set via
+    /// [`Self::message_listener`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_listener_for_test(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
+    /// at the pattern scope). Once set, subscribe via
+    /// [`Self::subscribe_with_listener`] to start a background poller over the
+    /// matched-topic consumer set, handing every message to `listener`
+    /// sequentially and in order, with no auto-ack. The callback receives the
+    /// originating topic so it can ack against the right child via
+    /// [`PatternConsumer::ack`]. Topics discovered after subscribe (on
+    /// [`PatternConsumer::update`] reconciliation) inherit the listener. The plain
+    /// [`Self::subscribe`] ignores the listener and returns a pull-mode consumer.
+    #[must_use]
+    pub fn message_listener(
+        mut self,
+        listener: crate::consumer_listener::WrapperMessageListener,
+    ) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Required: pulsar namespace to watch, e.g. `public/default`.
@@ -523,6 +601,21 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
         self.subscription = Some(name.into());
         self
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the bounded-chunk-reassembly knobs
+    /// propagated to every per-topic child. Lets the builder-surface guard test
+    /// pin the setter → field plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn chunk_knobs_for_test(
+        &self,
+    ) -> (Option<usize>, Option<bool>, Option<std::time::Duration>) {
+        (
+            self.max_pending_chunked_message,
+            self.auto_ack_oldest_chunked_message_on_queue_full,
+            self.expire_time_of_incomplete_chunked_message,
+        )
     }
 
     /// Set the subscription type applied to every per-topic child.
@@ -595,6 +688,30 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
         dead_letter_topic: Option<String>,
     ) -> Self {
         self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::max_pending_chunked_message`.
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.max_pending_chunked_message = Some(max);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::auto_ack_oldest_chunked_message_on_queue_full`.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.auto_ack_oldest_chunked_message_on_queue_full = Some(auto_ack);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::expire_time_of_incomplete_chunked_message`.
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(
+        mut self,
+        expire: std::time::Duration,
+    ) -> Self {
+        self.expire_time_of_incomplete_chunked_message = Some(expire);
         self
     }
 
@@ -694,6 +811,11 @@ where
             ack_timeout: self.ack_timeout,
             ack_group_time: self.ack_group_time,
             dlq_policy: self.dlq_policy,
+            max_pending_chunked_message: self.max_pending_chunked_message,
+            auto_ack_oldest_chunked_message_on_queue_full: self
+                .auto_ack_oldest_chunked_message_on_queue_full,
+            expire_time_of_incomplete_chunked_message: self
+                .expire_time_of_incomplete_chunked_message,
             read_compacted: self.read_compacted,
             priority_level: self.priority_level,
             subscription_properties: self.subscription_properties,
@@ -729,11 +851,55 @@ where
         Ok(PatternConsumer {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(opened)),
+                membership_changed: Arc::new(Notify::new()),
                 namespace,
                 pattern,
                 template,
             }),
         })
+    }
+}
+
+impl<E> PatternConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi + BrokerMetadataApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone + Send + Sync + 'static,
+{
+    /// Take the initial topic snapshot, subscribe to each match, and start a
+    /// push-delivery poller over the resulting [`PatternConsumer`], returning the
+    /// owning [`crate::MessageListenerHandle`]. Mirrors Java's
+    /// `PatternMultiTopicsConsumerImpl` listener path.
+    ///
+    /// Same semantics as [`crate::MultiTopicsConsumerBuilder::subscribe_with_listener`]:
+    /// sequential, in-order delivery, no auto-ack (the callback acks via
+    /// [`PatternConsumer::ack`]), clean shutdown on consumer-set drain / handle
+    /// drop. **Pattern children discovered after subscribe inherit the listener** —
+    /// call [`PatternConsumer::update`] (or
+    /// [`PatternConsumer::start_auto_reconcile`]) to subscribe newly-matched
+    /// topics; the running poller picks them up on its next `receive()` sweep, since
+    /// it shares the consumer's `Arc<Inner>` and `receive()` re-snapshots the child
+    /// set each call. (Hold an extra [`PatternConsumer`] clone before
+    /// `subscribe_with_listener` if you need to drive `update()` yourself — the
+    /// poller consumes the consumer it is handed.)
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - any subscribe / watch error from [`Self::subscribe`].
+    pub async fn subscribe_with_listener(
+        self,
+    ) -> Result<crate::MessageListenerHandle, PulsarError> {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        Ok(crate::consumer_listener::spawn_wrapper_message_listener(
+            consumer, listener,
+        ))
     }
 }
 
@@ -780,6 +946,9 @@ mod tests {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
@@ -791,6 +960,7 @@ mod tests {
         PatternConsumer {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(Vec::new())),
+                membership_changed: Arc::new(tokio::sync::Notify::new()),
                 namespace: "public/default".to_owned(),
                 pattern: "persistent://public/default/test-.*".to_owned(),
                 template,

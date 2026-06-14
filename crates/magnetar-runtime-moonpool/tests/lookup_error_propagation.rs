@@ -8,32 +8,29 @@
 //! *settles* (terminal `Connect`) and the redirect-cap diagnostic via
 //! `open_producer`. What was *not* covered anywhere is the two ways a
 //! `CommandLookupTopic` round-trip can terminate in a **bounded
-//! `ClientError`** rather than a hang, observed directly on the public
-//! [`Client::lookup_topic`] surface:
+//! `ClientError`** rather than a hang:
 //!
 //! 1. **Broker-originated `Failed`** — the broker answers the LOOKUP with `LookupType::Failed`
 //!    carrying an explicit `ServerError` code + message. The proto state machine translates this to
 //!    `LookupOutcome::Failed { code, message }`, and the moonpool engine must re-emit it verbatim
-//!    as [`magnetar_runtime_moonpool::ClientError::Broker`] — not park the lookup future forever
-//!    waiting for a `Connect` that never comes.
-//! 2. **Unbounded redirect loop** — the broker answers *every* LOOKUP with `LookupType::Redirect`,
-//!    never resolving. The proto layer chases the chain internally up to
-//!    [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops, then short-circuits to
-//!    `LookupOutcome::Failed { code: 0, message: "lookup redirect cap exceeded (..)" }`. The engine
-//!    surfaces a bounded `ClientError::Broker` carrying the cap diagnostic — the proof the
-//!    redirect-loop `DoS` is bounded end-to-end on the lookup surface itself.
+//!    as [`magnetar_runtime_moonpool::ClientError::Broker`] — observed directly on the public
+//!    [`Client::lookup_topic`] surface (a `Failed` is terminal there).
+//! 2. **Unbounded redirect loop** — the broker answers *every* LOOKUP with `LookupType::Redirect`
+//!    advertising its own address. The redirect-dial loop on the public `open_producer` surface
+//!    re-issues on the bootstrap (bootstrap-equality reuse) up to
+//!    [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops, then surfaces a bounded
+//!    `ClientError::Broker` carrying the cap diagnostic — the proof the redirect-loop `DoS` is
+//!    bounded end-to-end on the public producer-open surface.
 //!
-//! The termination proof in both cases is that the in-sim
-//! [`Client::lookup_topic`] future *resolves* under the per-run time
-//! budget: a regression that dropped the `Failed` translation or the
-//! redirect cap would leave the future parked, the sweep-level capture
-//! would stay `false`, and the assertion would fire.
+//! The termination proof in both cases is that the in-sim future *resolves*
+//! under the per-run time budget: a regression that dropped the `Failed`
+//! translation or the redirect cap would leave the future parked, the
+//! sweep-level capture would stay `false`, and the assertion would fire.
 //!
 //! Mirrors `crates/magnetar-runtime-tokio/tests/lookup_error_propagation.rs`
 //! (real loopback) to keep the tokio ↔ moonpool 1:1 test count required by
-//! ADR-0024. The tokio side drives the same two shapes over the public
-//! `open_producer` surface (tokio's `lookup_topic` is private); both engines
-//! surface an identically-shaped bounded `ClientError::Broker`.
+//! ADR-0024. Both engines surface an identically-shaped bounded
+//! `ClientError::Broker`.
 
 #![allow(clippy::expect_used)]
 
@@ -43,7 +40,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
+use magnetar_proto::{
+    ConnectionConfig, CreateProducerRequest, FrameError, SupervisorConfig, decode_one,
+    encode_command, pb,
+};
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait};
 use moonpool_sim::{SimContext, SimulationBuilder, SimulationError, SimulationResult, Workload};
@@ -75,13 +75,15 @@ const FAILED_MESSAGE: &str = "topic does not exist";
 const RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 /// How the broker should answer `CommandLookupTopic` frames.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum LookupBehavior {
     /// Answer the first LOOKUP with `LookupType::Failed { error, message }`.
     Failed,
-    /// Answer *every* LOOKUP with `LookupType::Redirect`, never resolving —
-    /// drives the proto redirect cap.
-    AlwaysRedirect,
+    /// Answer *every* LOOKUP with `LookupType::Redirect` advertising the
+    /// carried URL (the broker's own address — so the engine's dial loop
+    /// re-issues on the bootstrap via bootstrap-equality and the redirect cap
+    /// trips after `MAX_LOOKUP_REDIRECTS` hops rather than looping forever).
+    AlwaysRedirect { redirect_url: String },
 }
 
 /// Single-`poll_read` helper — appends what was read into `buf`, returns the
@@ -102,6 +104,7 @@ async fn handle_session<S>(mut stream: S, behavior: LookupBehavior) -> Simulatio
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let behavior = &behavior;
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let mut out_buf = BytesMut::with_capacity(64 * 1024);
     loop {
@@ -135,7 +138,7 @@ where
     }
 }
 
-fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: LookupBehavior) {
+fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: &LookupBehavior) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
     };
@@ -176,22 +179,47 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: Loo
                         message: Some(FAILED_MESSAGE.to_owned()),
                         proxy_through_service_url: Some(false),
                     },
-                    LookupBehavior::AlwaysRedirect => pb::CommandLookupTopicResponse {
-                        broker_service_url: Some("pulsar://hostile-redirect:6650".to_owned()),
-                        broker_service_url_tls: None,
-                        response: Some(
-                            pb::command_lookup_topic_response::LookupType::Redirect as i32,
-                        ),
-                        request_id: l.request_id,
-                        authoritative: Some(true),
-                        error: None,
-                        message: None,
-                        proxy_through_service_url: Some(false),
-                    },
+                    LookupBehavior::AlwaysRedirect { redirect_url } => {
+                        pb::CommandLookupTopicResponse {
+                            broker_service_url: Some(redirect_url.clone()),
+                            broker_service_url_tls: None,
+                            response: Some(
+                                pb::command_lookup_topic_response::LookupType::Redirect as i32,
+                            ),
+                            request_id: l.request_id,
+                            authoritative: Some(true),
+                            error: None,
+                            message: None,
+                            proxy_through_service_url: Some(false),
+                        }
+                    }
                 };
                 let cmd = pb::BaseCommand {
                     r#type: pb::base_command::Type::LookupResponse as i32,
                     lookup_topic_response: Some(response),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
+        pb::base_command::Type::PartitionedMetadata => {
+            // `open_producer` issues this before the LOOKUP — answer
+            // non-partitioned so it proceeds to the redirect-driving lookup.
+            if let Some(m) = &frame.command.partition_metadata {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+                    partition_metadata_response: Some(
+                        pb::CommandPartitionedTopicMetadataResponse {
+                            partitions: Some(0),
+                            request_id: m.request_id,
+                            response: Some(
+                                pb::command_partitioned_topic_metadata_response::LookupType::Success
+                                    as i32,
+                            ),
+                            error: None,
+                            message: None,
+                        },
+                    ),
                     ..Default::default()
                 };
                 let _ = encode_command(out, &cmd);
@@ -224,13 +252,22 @@ impl Workload for LookupBroker {
 
         let shutdown = ctx.shutdown().clone();
         let task = ctx.providers().task().clone();
-        let behavior = self.behavior;
+        // Fill `AlwaysRedirect` with the broker's OWN address so the engine's
+        // dial loop re-issues on the bootstrap (bootstrap-equality reuse) and
+        // the redirect cap trips after MAX_LOOKUP_REDIRECTS hops.
+        let behavior = match &self.behavior {
+            LookupBehavior::Failed => LookupBehavior::Failed,
+            LookupBehavior::AlwaysRedirect { .. } => LookupBehavior::AlwaysRedirect {
+                redirect_url: format!("pulsar://{}:{BROKER_PORT}", ctx.my_ip()),
+            },
+        };
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _peer)) => {
+                            let behavior = behavior.clone();
                             let _handle = task.spawn_task("broker-session", async move {
                                 let _ = handle_session(stream, behavior).await;
                             });
@@ -253,12 +290,26 @@ struct LookupErrorClient {
     /// a regression surfaces the actual error shape rather than a generic
     /// "nothing was captured".
     captured_error: Arc<Mutex<Option<String>>>,
+    /// How the client drives the lookup surface.
+    drive: ClientDrive,
+}
+
+/// Which public surface the client exercises.
+#[derive(Clone, Copy)]
+enum ClientDrive {
+    /// Raw `lookup_topic` on an unsupervised client — a `Failed` response is
+    /// terminal here and surfaces directly.
+    RawLookup,
+    /// `open_producer` on a supervised client — this drives the redirect-dial
+    /// loop, so an unbounded `Redirect` chain trips the cap end-to-end.
+    OpenProducer,
 }
 
 impl LookupErrorClient {
-    fn new() -> Self {
+    fn new(drive: ClientDrive) -> Self {
         Self {
             captured_error: Arc::new(Mutex::new(None)),
+            drive,
         }
     }
 }
@@ -276,26 +327,54 @@ impl Workload for LookupErrorClient {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
 
-        // A timeout here means the sim budget never delivered the lookup
-        // resolution; the sweep-level assertion is the authoritative gate.
-        // No `tokio::time::timeout` wrapper on the lookup itself — the whole
-        // point is that the proto layer bounds it (Failed translation /
-        // redirect cap). Wrapping it would mask a regression where the bound
+        // A timeout here means the sim budget never delivered the resolution;
+        // the sweep-level assertion is the authoritative gate. No
+        // `tokio::time::timeout` wrapper on the operation itself — the whole
+        // point is that the proto + engine layers bound it (Failed translation
+        // / redirect cap). Wrapping it would mask a regression where the bound
         // stopped firing.
-        let connect = tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
-        )
-        .await;
-        let Ok(Ok(client)) = connect else {
-            return Ok(());
-        };
-
-        let outcome = client.lookup_topic(TOPIC, false).await;
-        if let Err(ref err) = outcome {
-            *self.captured_error.lock() = Some(format!("{err:?}"));
+        match self.drive {
+            ClientDrive::RawLookup => {
+                let connect = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+                )
+                .await;
+                let Ok(Ok(client)) = connect else {
+                    return Ok(());
+                };
+                if let Err(ref err) = client.lookup_topic(TOPIC, false).await {
+                    *self.captured_error.lock() = Some(format!("{err:?}"));
+                }
+                client.close().await;
+            }
+            ClientDrive::OpenProducer => {
+                // The redirect-dial loop lives on the public `open_producer`
+                // path and needs the proxy pool (supervised client).
+                let cfg = ConnectionConfig {
+                    supervisor: Some(SupervisorConfig::default()),
+                    ..ConnectionConfig::default()
+                };
+                let connect = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+                )
+                .await;
+                let Ok(Ok(client)) = connect else {
+                    return Ok(());
+                };
+                let outcome = client
+                    .open_producer(CreateProducerRequest {
+                        topic: TOPIC.to_owned(),
+                        ..Default::default()
+                    })
+                    .await;
+                if let Err(ref err) = outcome {
+                    *self.captured_error.lock() = Some(format!("{err:?}"));
+                }
+                client.close().await;
+            }
         }
-        client.close().await;
         Ok(())
     }
 }
@@ -307,7 +386,7 @@ impl Workload for LookupErrorClient {
 /// `Connect`.
 #[test]
 fn lookup_failed_response_surfaces_bounded_broker_error() {
-    let client = LookupErrorClient::new();
+    let client = LookupErrorClient::new(ClientDrive::RawLookup);
     let captured = client.captured_error.clone();
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
@@ -339,21 +418,24 @@ fn lookup_failed_response_surfaces_bounded_broker_error() {
     );
 }
 
-/// 4-seed sweep: a broker that answers *every* LOOKUP with `Redirect` must
-/// NOT hang the lookup. The proto state machine chases the chain up to
-/// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops and then
-/// short-circuits to a bounded
-/// [`magnetar_runtime_moonpool::ClientError::Broker`] carrying the
+/// 4-seed sweep: a broker that answers *every* LOOKUP with `Redirect` (to its
+/// own address) must NOT hang `open_producer`. The engine's redirect-dial loop
+/// re-issues on the bootstrap (bootstrap-equality reuse) up to
+/// [`magnetar_proto::lookup::MAX_LOOKUP_REDIRECTS`] hops and then surfaces a
+/// bounded [`magnetar_runtime_moonpool::ClientError::Broker`] carrying the
 /// "redirect cap exceeded" diagnostic — proving the redirect-loop `DoS` is
-/// bounded end-to-end on the public lookup surface.
+/// bounded end-to-end on the public producer-open surface.
 #[test]
 fn lookup_redirect_loop_surfaces_bounded_cap_error() {
-    let client = LookupErrorClient::new();
+    let client = LookupErrorClient::new(ClientDrive::OpenProducer);
     let captured = client.captured_error.clone();
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
         .workload(LookupBroker {
-            behavior: LookupBehavior::AlwaysRedirect,
+            behavior: LookupBehavior::AlwaysRedirect {
+                // Replaced with the broker's real address in `LookupBroker::run`.
+                redirect_url: String::new(),
+            },
         })
         .workload(client)
         .set_debug_seeds(vec![1, 2, 3, 42])

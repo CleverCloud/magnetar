@@ -102,7 +102,7 @@ async fn terminal_decode_fatal_on_send_is_equivalent_across_engines() {
     );
 }
 
-/// ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the terminal drop must
+/// ADR-0059: a NEW op issued AFTER the terminal drop must
 /// surface the SAME terminal `peer-closed` outcome on BOTH engines — not a
 /// hang, not a divergence. This is the new-op companion to the in-flight
 /// differential claim above (ADR-0055 §1).

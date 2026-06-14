@@ -224,7 +224,7 @@ fn reset_on_in_flight_lookup_pair_yields_identical_outcomes_across_engines() {
     );
 }
 
-/// ADR-0024 layer (d) for ADR-0060 / follow-ups §4.1: tokio and moonpool must
+/// ADR-0024 layer (d) for ADR-0060: tokio and moonpool must
 /// make the SAME engine-side decision after an in-flight lookup is severed by a
 /// supervised reconnect (`OpOutcome::SessionLost`). The decision is owned by
 /// `ConnectionShared::await_reconnect_or_terminal`, which returns
@@ -376,6 +376,6 @@ async fn lookup_reissue_readiness_is_identical_across_engines() {
     assert!(
         tokio_snapshot.after_terminal_is_terminal,
         "both engines must return Terminal once is_closed() AND no_driver — the \
-         PeerClosed short-circuit (composes with §5.1)"
+         PeerClosed short-circuit"
     );
 }

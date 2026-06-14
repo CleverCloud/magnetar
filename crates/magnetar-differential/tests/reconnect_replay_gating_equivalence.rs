@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Drop + redial reconnect equivalence (docs/follow-ups.md §4.2 — ADR-0024
-//! layer d for the re-attach replay fix).
+//! Drop + redial reconnect equivalence (ADR-0024 layer d for the re-attach
+//! replay fix).
 //!
 //! The scripted broker is armed with
 //! [`ScriptedBroker::drop_connection_after`], so it closes the socket mid
@@ -190,16 +190,15 @@ async fn drop_redial_replay_is_equivalent_across_engines() {
 }
 
 /// Drop + redial WITH a transient producer-open rejection on the redial
-/// (docs/follow-ups.md §3.1 — ADR-0024 layer d for the transient-retry
-/// wiring).
+/// (ADR-0024 layer d for the transient-retry wiring).
 ///
 /// On top of the drop + redial above, the broker is also armed with
 /// [`ScriptedBroker::transient_reject_first_redial_producer_open`]: the FIRST
 /// `CommandProducer` on the redialled session is answered with a transient
 /// `ServiceNotReady` ("Please redo the lookup"), forcing BOTH engines through
-/// the §3.1 lookup-then-retry leg (re-lookup → `retry_producer_open` → ack)
+/// the lookup-then-retry leg (re-lookup → `retry_producer_open` → ack)
 /// before the replayed publish can land. The tokio engine has always consumed
-/// `ProducerOpenFailedTransient`; §3.1 wired the matching arms into the
+/// `ProducerOpenFailedTransient`; the moonpool driver wired the matching arms into the
 /// moonpool driver (through the injected `TimeProvider` + `TaskProvider`, so
 /// the retry's detached-task serialization MATCHES tokio's `tokio::spawn`).
 ///
@@ -209,7 +208,7 @@ async fn drop_redial_replay_is_equivalent_across_engines() {
 /// serializing differently from tokio's detached spawn) would reorder an event
 /// and the streams would diverge. The user-facing event sequence is IDENTICAL
 /// to the no-transient drop + redial case — the transient reject + retry are
-/// transparent to the caller — so this also pins that §3.1 adds no
+/// transparent to the caller — so this also pins that the retry leg adds no
 /// user-visible event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_redial_with_transient_reject_is_equivalent_across_engines() {

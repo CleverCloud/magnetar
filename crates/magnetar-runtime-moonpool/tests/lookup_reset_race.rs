@@ -133,7 +133,7 @@ fn reset_publishes_outcome_even_when_no_waker_was_registered() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// ADR-0060 / follow-ups §4.1 — engine-side bounded lookup-retry on SessionLost.
+// ADR-0060 — engine-side bounded lookup-retry on SessionLost.
 //
 // 1:1 twin of `crates/magnetar-runtime-tokio/tests/lookup_reset_race.rs`'s
 // `lookup_severed_by_reconnect_reissues_and_succeeds` /

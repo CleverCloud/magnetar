@@ -326,6 +326,13 @@ pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     /// only the per-engine `.subscribe_with_decryption()` specialisations
     /// actually open a PIP-4-decrypting consumer.
     decryptor: Option<<E as crate::MessageDecryptorApi>::Decryptor>,
+    /// Optional push-delivery callback (Java `ConsumerBuilder#messageListener`).
+    /// Engine-agnostic — the façade [`crate::MessageListener`] takes the façade
+    /// [`crate::IncomingMessage`], which both engines produce. Set it via
+    /// [`Self::message_listener`] and subscribe via
+    /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores
+    /// it and returns a pull-mode consumer.
+    listener: Option<crate::MessageListener>,
 }
 
 impl<E: crate::Engine> std::fmt::Debug for ConsumerBuilder<'_, E> {
@@ -347,7 +354,29 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
             client,
             req,
             decryptor: None,
+            listener: None,
         }
+    }
+
+    /// Read-only snapshot of the [`SubscribeRequest`] this builder has assembled
+    /// so far. Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// lets the builder-surface guard test assert that each of the five consumer
+    /// builders seeds the bounded-chunk-reassembly knobs into the request that
+    /// seeds `ConsumerState`, without opening a real broker connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn request_snapshot(&self) -> &SubscribeRequest {
+        &self.req
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// `true` once a push-delivery listener has been set via
+    /// [`Self::message_listener`]. Lets the builder-surface guard test pin the
+    /// listener → field wiring without opening a real broker connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_listener_for_test(&self) -> bool {
+        self.listener.is_some()
     }
 
     /// Required: set the subscription name.
@@ -544,6 +573,39 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         self
     }
 
+    /// Mirrors Java `ConsumerBuilder#maxPendingChunkedMessage` (default `10`).
+    /// Bounds the number of distinct incomplete chunked messages the consumer
+    /// buffers; on breach the oldest incomplete message is evicted. `0` disables
+    /// the cap. Guards against a hostile/buggy broker streaming distinct-UUID
+    /// first chunks that never complete (unbounded `chunk_reassembly` growth →
+    /// OOM).
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.req.max_pending_chunked_message = max;
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#autoAckOldestChunkedMessageOnQueueFull`
+    /// (default `false`). When `true`, an evicted/expired partial chunked
+    /// message's first-chunk id is acked before drop (the broker treats it as
+    /// consumed); when `false`, it is dropped without acking so the broker
+    /// redelivers the whole message.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.req.auto_ack_oldest_chunked_message_on_queue_full = auto_ack;
+        self
+    }
+
+    /// Mirrors Java `ConsumerBuilder#expireTimeOfIncompleteChunkedMessage`
+    /// (default `60s`). An incomplete chunked message older than this is swept
+    /// on the connection's existing timeout tick and dropped (or acked, per
+    /// [`Self::auto_ack_oldest_chunked_message_on_queue_full`]).
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(mut self, expire: Duration) -> Self {
+        self.req.expire_time_of_incomplete_chunked_message = Some(expire);
+        self
+    }
+
     /// Mirrors Java `ConsumerBuilder#deadLetterPolicy`. After `max_redeliver_count`
     /// redeliveries, the consumer flags the message as dead-letter — drain via
     /// [`magnetar_runtime_tokio::Consumer::drain_dead_letter`] and republish to
@@ -596,6 +658,58 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         crate::SubscribeApi::subscribe(&self.client.inner, self.req)
             .await
             .map_err(|err| PulsarError::Other(format!("subscribe: {err}")))
+    }
+
+    /// Register a push-delivery callback (Java
+    /// `ConsumerBuilder#messageListener`). Once set, subscribe via
+    /// [`Self::subscribe_with_listener`] to start a background poller that
+    /// drives `receive()` and hands every message to `listener`, sequentially
+    /// and in order.
+    ///
+    /// The plain [`Self::subscribe`] does **not** consult the listener — it
+    /// returns a pull-mode consumer. Pull and push are mutually exclusive
+    /// (Java forbids `receive()` on a listener-backed consumer): use
+    /// `subscribe_with_listener` for push and never call `receive()`, or use
+    /// `subscribe` for pull and call `receive()` yourself.
+    ///
+    /// The callback **must ack explicitly** — the poller never auto-acks (Java
+    /// parity). Hold a clone of your consumer in the closure to ack.
+    #[must_use]
+    pub fn message_listener(mut self, listener: crate::MessageListener) -> Self {
+        self.listener = Some(listener);
+        self
+    }
+
+    /// Subscribe and start a push-delivery poller over the resulting consumer,
+    /// returning the owning [`crate::MessageListenerHandle`]. Mirrors Java's
+    /// `ConsumerBuilder#messageListener(...)` + `subscribe()` flow.
+    ///
+    /// The poller delivers messages sequentially and in order, does **not**
+    /// auto-ack (the callback acks explicitly), and stops cleanly when the
+    /// consumer is closed or the returned handle is dropped. Because the
+    /// consumer is moved into the poller, there is no handle left to call
+    /// `receive()` on — the listener owns delivery (matching Java's
+    /// "no `receive()` with a `messageListener`" rule).
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn subscribe_with_listener(self) -> Result<crate::MessageListenerHandle, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+        <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
+    {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        Ok(crate::consumer_listener::spawn_message_listener(
+            consumer, listener,
+        ))
     }
 }
 

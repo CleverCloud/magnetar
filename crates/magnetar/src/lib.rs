@@ -80,6 +80,8 @@ mod client;
 #[cfg(feature = "tokio")]
 mod client_builder;
 #[cfg(feature = "tokio")]
+mod consumer_listener;
+#[cfg(feature = "tokio")]
 mod consumer_template;
 #[cfg(feature = "moonpool")]
 mod moonpool_client;
@@ -109,6 +111,11 @@ pub use client::{
 #[cfg(feature = "tokio")]
 pub use client_builder::ClientBuilder;
 #[cfg(feature = "tokio")]
+pub use consumer_listener::{
+    MessageListener, MessageListenerHandle, WrapperMessageListener, WrapperReceiver,
+    spawn_message_listener, spawn_wrapper_message_listener,
+};
+#[cfg(feature = "tokio")]
 pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};
 #[cfg(feature = "tokio")]
 pub use partitioned_consumer::{PartitionedConsumer, PartitionedConsumerBuilder};
@@ -130,8 +137,8 @@ pub use table_view::{
 pub use transaction::{Transaction, TxnState};
 #[cfg(feature = "tokio")]
 pub use typed::{
-    TypedConsumer, TypedConsumerBuilder, TypedMessage, TypedMessageBuilder, TypedProducer,
-    TypedProducerBuilder,
+    TypedConsumer, TypedConsumerBuilder, TypedMessage, TypedMessageBuilder, TypedMessageListener,
+    TypedProducer, TypedProducerBuilder,
 };
 
 // PIP-4 encryption bridge: implement the runtime's MessageEncryptor / MessageDecryptor traits

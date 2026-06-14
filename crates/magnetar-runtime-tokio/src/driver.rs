@@ -542,7 +542,7 @@ where
             let reason = terminal_reason(&conn, &outcome);
             conn.fail_all_pending(&reason);
         }
-        // ADR-0059 / follow-ups §4.1: the plain driver is gone for good — latch
+        // ADR-0059: the plain driver is gone for good — latch
         // the no-driver signal so a NEW op issued after this point fast-fails
         // synchronously with `PeerClosed` at the entry-point guards instead of
         // registering a doomed pending op no driver is left to resolve. Set it
@@ -583,7 +583,7 @@ pub(crate) fn spawn_supervised(
             let reason = terminal_reason(&conn, &outcome);
             conn.fail_all_pending(&reason);
         }
-        // ADR-0059 / follow-ups §4.1: `supervised_driver_loop` only returns on
+        // ADR-0059: `supervised_driver_loop` only returns on
         // a GENUINELY-terminal exit (user close, or the supervisor exhausted
         // its attempt budget) — never on a per-attempt reconnect — so latching
         // the no-driver signal here is safe: a transient `Failed` window mid
@@ -622,7 +622,7 @@ async fn supervised_driver_loop(
     // before the supervisor has had to redial once.
     let mut backoff: Option<magnetar_proto::Backoff> = None;
 
-    // Give-up budget counter (ADR-0061, follow-ups §3.2). Hoisted
+    // Give-up budget counter (ADR-0061). Hoisted
     // OUTSIDE the outer loop so it spans the FULL dial+handshake cycle: a
     // post-dial handshake failure (the `driver_loop_inner` return path after
     // `begin_handshake`) counts against the SAME `max_attempts` budget as a

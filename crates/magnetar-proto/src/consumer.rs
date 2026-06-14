@@ -148,6 +148,42 @@ pub struct ConsumerState {
     pub queue: VecDeque<IncomingMessage>,
     /// Per-uuid chunk reassembly state.
     chunk_reassembly: HashMap<String, ChunkBuffer>,
+    /// FIFO insertion-order index over `chunk_reassembly`, mirroring Java
+    /// `ConsumerImpl#pendingChunkedMessageUuidQueue`. The front is the oldest
+    /// incomplete chunked message; eviction (`max_pending_chunked_message`
+    /// breach) and the expiry sweep both pop from the front. Kept in lock-step
+    /// with `chunk_reassembly`: every genuine first-chunk insert pushes the
+    /// uuid here, and every removal (reassembly, eviction, expiry) drops it.
+    chunk_reassembly_order: VecDeque<String>,
+    /// Aggregate buffered chunk-payload bytes across every incomplete buffer.
+    /// Bounded against the depth-axis DoS where a hostile broker advertises a
+    /// huge `num_chunks_from_msg` and streams distinct chunk_ids into one
+    /// buffer (see [`MAX_BUFFERED_CHUNK_BYTES`]).
+    chunk_buffered_bytes: usize,
+    /// Maximum number of distinct incomplete chunked messages buffered at once.
+    /// Mirrors Java `ConsumerConfigurationData#maxPendingChunkedMessage`
+    /// (default `10`). On breach, the oldest incomplete message is evicted
+    /// (`removeOldestPendingChunkedMessage` parity). `0` disables the cap
+    /// (matches Java's `> 0` guard).
+    pub max_pending_chunked_message: usize,
+    /// When the `max_pending_chunked_message` cap is breached, `true` acks the
+    /// oldest partial message's first-chunk id before dropping it (the broker
+    /// treats it as consumed); `false` (the default, matching Java
+    /// `autoAckOldestChunkedMessageOnQueueFull`) drops it without acking so the
+    /// broker eventually redelivers the whole message.
+    pub auto_ack_oldest_chunked_message_on_queue_full: bool,
+    /// Expiry window for an incomplete chunked message. Mirrors Java
+    /// `expireTimeOfIncompleteChunkedMessageMillis` (default `60s`). A buffer
+    /// older than this is swept in [`crate::Connection::handle_timeout`] and
+    /// the wake is scheduled through [`crate::Connection::poll_timeout`].
+    /// `None` disables the sweep (matches Java's `> 0` guard).
+    pub expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
+    /// First-chunk message ids of partial buffers evicted/expired with
+    /// `auto_ack_oldest_chunked_message_on_queue_full = true`. Drained by
+    /// [`crate::Connection`] (mirroring [`Self::dead_letter_pending`]) which
+    /// emits the individual `CommandAck`. Empty in the default `auto_ack =
+    /// false` path.
+    pub chunk_auto_ack_pending: Vec<MessageId>,
     /// In-flight `CommandSeek` request id, if any. While `Some`, the queue is frozen.
     pub pending_seek: Option<RequestId>,
     /// Per-consumer waker slab. Each in-flight `receive()` future registers a
@@ -362,10 +398,51 @@ pub struct ConsumerStats {
     pub bytes_per_sec: f64,
 }
 
+/// Default for [`ConsumerState::max_pending_chunked_message`]. Mirrors Java
+/// `ConsumerConfigurationData#maxPendingChunkedMessage = 10`.
+pub const DEFAULT_MAX_PENDING_CHUNKED_MESSAGE: usize = 10;
+
+/// Default for [`ConsumerState::expire_time_of_incomplete_chunked_message`].
+/// Mirrors Java `expireTimeOfIncompleteChunkedMessageMillis = 60_000` (1 minute).
+pub const DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Depth-axis hard cap on a single chunked message's advertised total chunk
+/// count (`num_chunks_from_msg`). A hostile/buggy broker can advertise a `total`
+/// up to `i32::MAX` and stream distinct chunk_ids into ONE buffer, which the
+/// breadth cap (`max_pending_chunked_message`, a count of *buffers*) does not
+/// constrain. Java leaves `total` unbounded but pre-sizes a `ByteBuf` to
+/// `totalChunkMsgSize`, which the broker's max-message-size bounds in practice;
+/// magnetar grows a `BytesMut` lazily, so we bound the chunk count directly.
+/// `10_000` is far above any legitimate message — at Pulsar's default 5 MiB
+/// per-chunk wire limit that is ~48 GiB reassembled — while still rejecting the
+/// `i32::MAX` attacker before the `chunk_payloads` map or the `0..total`
+/// reassembly loop can blow up. Not user-configurable (Java exposes no knob
+/// either); it is a pure safety floor.
+pub const MAX_CHUNK_TOTAL: i32 = 10_000;
+
+/// Depth-axis hard cap on the AGGREGATE buffered chunk-payload bytes across
+/// EVERY incomplete chunked message on the consumer (`chunk_buffered_bytes`).
+/// This is the tight memory ceiling: total chunk-reassembly memory can never
+/// exceed `MAX_BUFFERED_CHUNK_BYTES` regardless of how the bytes are split
+/// across uuids or chunk_ids, versus today's unbounded growth. A chunk that
+/// would push the aggregate past this ceiling is dropped. `128 MiB` comfortably
+/// admits the largest realistic chunked payloads (Pulsar's `maxMessageSize`
+/// chunking targets tens of MiB) while capping both a distinct-chunk_id flood
+/// within one uuid and fan-out across uuids. Not user-configurable — a pure
+/// safety floor.
+pub const MAX_BUFFERED_CHUNK_BYTES: usize = 128 * 1024 * 1024;
+
 #[derive(Debug)]
 struct ChunkBuffer {
     expected_chunks: i32,
     received_chunks: i32,
+    /// Injected-clock timestamp of the FIRST chunk's arrival (`deliver`'s `now`
+    /// parameter, never `Instant::now()` — ADR-0011). Drives the expiry sweep
+    /// in [`crate::Connection::handle_timeout`]; the earliest `received_at`
+    /// across all buffers is surfaced through
+    /// [`crate::Connection::poll_timeout`] so the driver schedules the wake.
+    received_at: std::time::Instant,
     /// Partial payload accumulator. Chunks may arrive in order; out-of-order chunk arrival is
     /// not expected over a single connection (the broker dispatches in order), but if it does,
     /// the buffer is indexed by `chunk_id` to make reassembly robust.
@@ -378,6 +455,19 @@ struct ChunkBuffer {
     first_chunk_message_id: Option<MessageId>,
     broker_entry_metadata: Option<std::sync::Arc<pb::BrokerEntryMetadata>>,
     redelivery_count: u32,
+}
+
+impl ChunkBuffer {
+    /// Total buffered payload bytes across every chunk this buffer holds. Used
+    /// by [`ConsumerState`] to keep its aggregate `chunk_buffered_bytes`
+    /// accounting in lock-step when the buffer is removed (reassembled, evicted,
+    /// or expired).
+    fn buffered_bytes(&self) -> usize {
+        self.chunk_payloads
+            .values()
+            .map(bytes::Bytes::len)
+            .fold(0usize, usize::saturating_add)
+    }
 }
 
 /// Outcome of feeding one `CommandMessage` to the consumer.
@@ -412,6 +502,14 @@ impl ConsumerState {
             consumed_since_flow: 0,
             queue: VecDeque::new(),
             chunk_reassembly: HashMap::new(),
+            chunk_reassembly_order: VecDeque::new(),
+            chunk_buffered_bytes: 0,
+            max_pending_chunked_message: DEFAULT_MAX_PENDING_CHUNKED_MESSAGE,
+            auto_ack_oldest_chunked_message_on_queue_full: false,
+            expire_time_of_incomplete_chunked_message: Some(
+                DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE,
+            ),
+            chunk_auto_ack_pending: Vec::new(),
             pending_seek: None,
             receive_wakers: Slab::new(),
             closed: false,
@@ -646,6 +744,123 @@ impl ConsumerState {
         self.queue.len()
     }
 
+    /// Number of distinct incomplete chunked messages currently buffered.
+    /// Test-only visibility into the bounded reassembly state.
+    #[cfg(test)]
+    fn pending_chunk_count(&self) -> usize {
+        self.chunk_reassembly.len()
+    }
+
+    /// Remove a uuid from the FIFO insertion-order index. Linear in the queue
+    /// length, which is bounded by `max_pending_chunked_message` (default 10),
+    /// so this is effectively O(1). Keeps the index in lock-step with
+    /// `chunk_reassembly` on every removal (reassembly, eviction, expiry).
+    fn forget_chunk_order(&mut self, uuid: &str) {
+        if let Some(pos) = self.chunk_reassembly_order.iter().position(|u| u == uuid) {
+            self.chunk_reassembly_order.remove(pos);
+        }
+    }
+
+    /// Evict the OLDEST incomplete chunked message when the breadth cap is
+    /// breached. Mirrors Java `ConsumerImpl#removeOldestPendingChunkedMessage`
+    /// → `removeChunkMessage`:
+    ///
+    /// - `auto_ack_oldest_chunked_message_on_queue_full = true`: stage the partial's first-chunk id
+    ///   for an individual `CommandAck` (the broker treats it as consumed) before dropping the
+    ///   buffer.
+    /// - `false` (the default): drop the buffer WITHOUT acking, so the broker eventually redelivers
+    ///   the whole message.
+    ///
+    /// Removes the uuid from BOTH `chunk_reassembly` AND the FIFO order index
+    /// atomically and decrements the aggregate byte accounting.
+    fn remove_oldest_pending_chunked_message(&mut self) {
+        // Skip any stale front entries whose buffer was already removed (the
+        // index can briefly outlive a map entry in pathological replays).
+        while let Some(uuid) = self.chunk_reassembly_order.pop_front() {
+            let Some(entry) = self.chunk_reassembly.remove(&uuid) else {
+                continue;
+            };
+            self.chunk_buffered_bytes = self
+                .chunk_buffered_bytes
+                .saturating_sub(entry.buffered_bytes());
+            if self.auto_ack_oldest_chunked_message_on_queue_full {
+                if let Some(id) = entry.first_chunk_message_id {
+                    self.chunk_auto_ack_pending.push(id);
+                }
+            }
+            tracing::warn!(
+                target: "magnetar_proto::consumer",
+                consumer_id = self.handle.0,
+                received_chunks = entry.received_chunks,
+                total_chunks = entry.expected_chunks,
+                auto_ack = self.auto_ack_oldest_chunked_message_on_queue_full,
+                "evicted oldest incomplete chunked message (max_pending_chunked_message breach)",
+            );
+            return;
+        }
+    }
+
+    /// Earliest moment at which an incomplete chunked message becomes eligible
+    /// for the expiry sweep, or `None` when expiry is disabled or no buffer is
+    /// pending. Surfaced through [`crate::Connection::poll_timeout`] so the
+    /// driver schedules a deterministic wake; without this the sweep would only
+    /// fire opportunistically on an unrelated tick (seed-divergent under the
+    /// moonpool engine). The front of `chunk_reassembly_order` is the oldest
+    /// buffer, so its `received_at + expire_time` is the nearest deadline.
+    pub fn next_chunk_expiry_deadline(&self) -> Option<std::time::Instant> {
+        let expire = self.expire_time_of_incomplete_chunked_message?;
+        let oldest = self.chunk_reassembly_order.front()?;
+        let entry = self.chunk_reassembly.get(oldest)?;
+        Some(crate::time::deadline_with_clamp(entry.received_at, expire))
+    }
+
+    /// Sweep every incomplete chunked message older than
+    /// `expire_time_of_incomplete_chunked_message` relative to the injected
+    /// `now`. Fully removes each expired buffer from BOTH `chunk_reassembly`
+    /// AND the FIFO order index and decrements the aggregate byte accounting.
+    /// Mirrors Java `ConsumerImpl#removeExpireIncompleteChunkedMessages`, which
+    /// acks expired partials unconditionally (`removeChunkMessage(.., true)`);
+    /// we stage the first-chunk id for ack only when
+    /// `auto_ack_oldest_chunked_message_on_queue_full` is set, keeping the
+    /// default broker-redelivers semantics consistent with eviction.
+    /// No-op when expiry is disabled.
+    pub fn sweep_expired_chunks(&mut self, now: std::time::Instant) {
+        let Some(expire) = self.expire_time_of_incomplete_chunked_message else {
+            return;
+        };
+        // The order index is sorted oldest-first, so stop at the first
+        // not-yet-expired buffer (every later one is younger).
+        while let Some(uuid) = self.chunk_reassembly_order.front().cloned() {
+            let Some(entry) = self.chunk_reassembly.get(&uuid) else {
+                // Stale index entry — drop it and continue.
+                self.chunk_reassembly_order.pop_front();
+                continue;
+            };
+            if now < crate::time::deadline_with_clamp(entry.received_at, expire) {
+                break;
+            }
+            self.chunk_reassembly_order.pop_front();
+            // Re-take by value to recover the byte accounting + ack id.
+            if let Some(entry) = self.chunk_reassembly.remove(&uuid) {
+                self.chunk_buffered_bytes = self
+                    .chunk_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes());
+                if self.auto_ack_oldest_chunked_message_on_queue_full {
+                    if let Some(id) = entry.first_chunk_message_id {
+                        self.chunk_auto_ack_pending.push(id);
+                    }
+                }
+                tracing::warn!(
+                    target: "magnetar_proto::consumer",
+                    consumer_id = self.handle.0,
+                    received_chunks = entry.received_chunks,
+                    total_chunks = entry.expected_chunks,
+                    "expired incomplete chunked message (expire_time_of_incomplete_chunked_message)",
+                );
+            }
+        }
+    }
+
     /// Feed one inbound `CommandMessage` + payload region. Handles batch explosion + chunk
     /// reassembly + DLQ flagging.
     ///
@@ -695,18 +910,55 @@ impl ConsumerState {
                     );
                     return Ok(DeliverOutcome::Dropped);
                 }
+                // Depth-axis DoS bound: a hostile broker can advertise `total`
+                // up to `i32::MAX` and stream distinct chunk_ids into ONE
+                // buffer, blowing it up independent of the per-buffer breadth
+                // cap. Reject the chunk before it can pre-size the
+                // `chunk_payloads` map or the `0..total` reassembly loop.
+                if total > MAX_CHUNK_TOTAL {
+                    tracing::warn!(
+                        consumer_id = self.handle.0,
+                        total_chunks = total,
+                        max_chunk_total = MAX_CHUNK_TOTAL,
+                        "drop chunk advertising an out-of-bounds total chunk count",
+                    );
+                    return Ok(DeliverOutcome::Dropped);
+                }
                 let uuid = metadata.uuid.clone().unwrap_or_default();
+                // Breadth-axis bound: only a GENUINE first chunk (`chunk_id ==
+                // 0`) may (re)create a buffer. A straggler non-first chunk for
+                // an unknown/evicted uuid is dropped — never fabricate a
+                // corrupt buffer from non-first metadata (its `first_metadata`
+                // / `first_chunk_message_id` would be wrong). Mirrors Java
+                // `processMessageChunk`'s `chunkId == 0` gate on buffer
+                // creation; the duplicate / out-of-order paths there discard.
+                if chunk_id != 0 && !self.chunk_reassembly.contains_key(&uuid) {
+                    tracing::warn!(
+                        consumer_id = self.handle.0,
+                        chunk_id,
+                        total_chunks = total,
+                        uuid_present = !uuid.is_empty(),
+                        "drop straggler non-first chunk for an unknown/evicted message",
+                    );
+                    return Ok(DeliverOutcome::Dropped);
+                }
                 // Arc-wrap on first-chunk arrival so the ChunkBuffer never
                 // holds a deep-cloned metadata copy across the
                 // pending-chunk window. Re-wrapping `broker_entry_metadata`
                 // is similarly one allocation per chunked message, not per
                 // chunk.
-                let entry = self
+                let is_new = !self.chunk_reassembly.contains_key(&uuid);
+                // Insert the buffer on a genuine first chunk; the returned
+                // `&mut` is unused (we re-borrow after the breadth-cap eviction,
+                // which may mutate the map) — the call is kept for its insert
+                // side effect only.
+                let _ = self
                     .chunk_reassembly
                     .entry(uuid.clone())
                     .or_insert_with(|| ChunkBuffer {
                         expected_chunks: total,
                         received_chunks: 0,
+                        received_at: now,
                         chunk_payloads: HashMap::new(),
                         first_metadata: std::sync::Arc::new(metadata.clone()),
                         first_chunk_message_id: Some(message_id),
@@ -715,14 +967,72 @@ impl ConsumerState {
                             .map(std::sync::Arc::new),
                         redelivery_count: redelivery,
                     });
-                if entry
-                    .chunk_payloads
-                    .insert(chunk_id, body.clone())
-                    .is_some()
-                {
-                    return Ok(DeliverOutcome::Dropped);
+                if is_new {
+                    // Track FIFO insertion order so eviction + the expiry sweep
+                    // can find the oldest buffer in O(1) (Java
+                    // `pendingChunkedMessageUuidQueue`).
+                    self.chunk_reassembly_order.push_back(uuid.clone());
+                    // Breadth cap: once a NEW uuid pushes the map past the cap,
+                    // evict the oldest incomplete message. `0` disables the cap
+                    // (Java's `maxPendingChunkedMessage > 0` guard).
+                    if self.max_pending_chunked_message > 0
+                        && self.chunk_reassembly.len() > self.max_pending_chunked_message
+                    {
+                        self.remove_oldest_pending_chunked_message();
+                    }
+                    // Re-borrow: `remove_oldest_*` may have mutated the map (it
+                    // never evicts the just-inserted uuid — the front is older).
+                    let Some(entry) = self.chunk_reassembly.get_mut(&uuid) else {
+                        return Ok(DeliverOutcome::Dropped);
+                    };
+                    if entry
+                        .chunk_payloads
+                        .insert(chunk_id, body.clone())
+                        .is_none()
+                    {
+                        entry.received_chunks += 1;
+                        self.chunk_buffered_bytes =
+                            self.chunk_buffered_bytes.saturating_add(body.len());
+                    }
+                } else {
+                    let Some(entry) = self.chunk_reassembly.get_mut(&uuid) else {
+                        return Ok(DeliverOutcome::Dropped);
+                    };
+                    // Depth-axis bound: drop a chunk that would push the
+                    // AGGREGATE buffered bytes (across every incomplete buffer)
+                    // past the ceiling. Bounds the distinct-chunk_id flood
+                    // within one uuid as well as fan-out across uuids.
+                    if self.chunk_buffered_bytes.saturating_add(body.len())
+                        > MAX_BUFFERED_CHUNK_BYTES
+                    {
+                        tracing::warn!(
+                            consumer_id = self.handle.0,
+                            chunk_id,
+                            total_chunks = total,
+                            buffered_bytes = self.chunk_buffered_bytes,
+                            max_buffered_chunk_bytes = MAX_BUFFERED_CHUNK_BYTES,
+                            "drop chunk exceeding the per-message buffered-bytes cap",
+                        );
+                        return Ok(DeliverOutcome::Dropped);
+                    }
+                    if entry
+                        .chunk_payloads
+                        .insert(chunk_id, body.clone())
+                        .is_some()
+                    {
+                        // Duplicate chunk_id — drop without advancing progress
+                        // and without growing the byte accounting.
+                        return Ok(DeliverOutcome::Dropped);
+                    }
+                    entry.received_chunks += 1;
+                    self.chunk_buffered_bytes =
+                        self.chunk_buffered_bytes.saturating_add(body.len());
                 }
-                entry.received_chunks += 1;
+                // Re-borrow immutably for the progress check + log; the buffer
+                // is guaranteed present (just inserted/updated above).
+                let Some(entry) = self.chunk_reassembly.get(&uuid) else {
+                    return Ok(DeliverOutcome::Dropped);
+                };
                 // ADR-0054 §5: chunk-reassembly progress has no
                 // `ConnectionEvent`, so proto logs it at the point of
                 // detection. The broker-assigned chunk UUID is logged as a
@@ -739,7 +1049,19 @@ impl ConsumerState {
                 if entry.received_chunks < entry.expected_chunks {
                     return Ok(DeliverOutcome::Buffered);
                 }
-                // All chunks present — assemble.
+                // All chunks present — assemble. Take the buffer out by value
+                // first so the byte accounting + FIFO order index stay in
+                // lock-step with the map. Invariant #6 (no panics in production
+                // code): an `if let Some` drops the chunk gracefully if a
+                // concurrent mutation ever removed it (impossible today —
+                // `&mut self` — but defensive).
+                let Some(mut entry) = self.chunk_reassembly.remove(&uuid) else {
+                    return Ok(DeliverOutcome::Dropped);
+                };
+                self.forget_chunk_order(&uuid);
+                self.chunk_buffered_bytes = self
+                    .chunk_buffered_bytes
+                    .saturating_sub(entry.buffered_bytes());
                 let mut full = bytes::BytesMut::new();
                 for idx in 0..entry.expected_chunks {
                     if let Some(chunk) = entry.chunk_payloads.remove(&idx) {
@@ -753,14 +1075,6 @@ impl ConsumerState {
                 // the chunk-only fields via `Arc::make_mut`.
                 let first_chunk_message_id = entry.first_chunk_message_id;
                 let redelivery_count = entry.redelivery_count;
-                // The `entry` borrow above was a `&mut` into `chunk_reassembly`; the buffer
-                // is guaranteed present (we just inserted/updated it earlier in this scope).
-                // Invariant #6 (no panics in production code): replace `.expect(...)` with
-                // an explicit `if let Some` and drop the chunk gracefully if a concurrent
-                // mutation ever removed it (impossible today — `&mut self` — but defensive).
-                let Some(entry) = self.chunk_reassembly.remove(&uuid) else {
-                    return Ok(DeliverOutcome::Dropped);
-                };
                 let mut final_meta_arc = entry.first_metadata;
                 {
                     let m = std::sync::Arc::make_mut(&mut final_meta_arc);
@@ -1429,17 +1743,24 @@ mod tests {
         assert!(msg.metadata.total_chunk_msg_size.is_none());
     }
 
-    /// Out-of-order chunk arrival (chunk 2 before chunk 1) must still reassemble
-    /// into the correct payload because the buffer is keyed by `chunk_id`.
-    /// Although the broker normally dispatches chunks in order, reconnection
-    /// races and replay can interleave them — the buffer logic is defensive.
+    /// Out-of-order chunk arrival AFTER the first chunk established the buffer
+    /// (chunk 2 before chunk 1) must still reassemble into the correct payload
+    /// because the buffer is keyed by `chunk_id`. Although the broker normally
+    /// dispatches chunks in order, reconnection races and replay can interleave
+    /// them — the buffer logic is defensive.
+    ///
+    /// The bounded-reassembly hardening gates BUFFER CREATION on a genuine
+    /// first chunk (`chunk_id == 0`), so chunk 0 must arrive first to open the
+    /// buffer; the remaining chunks may then interleave. A non-first chunk for
+    /// an unknown uuid is dropped (see
+    /// [`straggler_non_first_chunk_for_unknown_uuid_is_dropped`]).
     #[test]
     fn out_of_order_chunks_are_buffered_correctly() {
         let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
         let _ = c.initial_flow();
 
-        // Deliver chunk 2 first, then chunk 0, then chunk 1.
-        let order: [(i32, &[u8]); 3] = [(2, b"ZZZZ"), (0, b"AAAA"), (1, b"BBBB")];
+        // Chunk 0 first (opens the buffer), then chunk 2, then chunk 1.
+        let order: [(i32, &[u8]); 3] = [(0, b"AAAA"), (2, b"ZZZZ"), (1, b"BBBB")];
         for &(chunk_id, body) in &order {
             let meta = chunk_meta("u-oo", 99, 3, chunk_id);
             let outcome = c
@@ -1548,6 +1869,275 @@ mod tests {
         let b = c.pop_message().expect("B");
         assert_eq!(a.payload.as_ref(), b"A0A1");
         assert_eq!(b.payload.as_ref(), b"B0B1");
+    }
+
+    // ---------------------------------------------------------------------
+    // Bounded chunk reassembly (DoS hardening). A hostile/buggy broker that
+    // streams distinct-UUID first chunks that never complete used to grow
+    // `chunk_reassembly` without bound (OOM). These tests pin the Java-matching
+    // breadth cap (`max_pending_chunked_message`), eviction policy
+    // (`auto_ack_oldest_chunked_message_on_queue_full`), the expiry sweep
+    // (`expire_time_of_incomplete_chunked_message`, wired through BOTH
+    // `poll_timeout` and `handle_timeout`), and the depth-axis `total` bound.
+    // Mirror Java `ConsumerImpl#removeOldestPendingChunkedMessage` /
+    // `removeExpireIncompleteChunkedMessages`. Each asserts a bound that does
+    // NOT hold on main, proving the bug.
+    // ---------------------------------------------------------------------
+
+    /// Deliver a single never-completing FIRST chunk (`chunk_id == 0`) of a
+    /// `total`-chunk message identified by `uuid`. Returns the outcome.
+    fn deliver_first_chunk(
+        c: &mut ConsumerState,
+        uuid: &str,
+        seq: u64,
+        total: i32,
+        now: std::time::Instant,
+    ) -> DeliverOutcome {
+        let meta = chunk_meta(uuid, seq, total, 0);
+        c.deliver(
+            &message_cmd_at(seq, 0),
+            meta,
+            None,
+            Bytes::from_static(b"first-chunk-body"),
+            now,
+        )
+        .unwrap()
+    }
+
+    /// At the cap of 10, an 11th distinct never-completing UUID must EVICT the
+    /// oldest buffer rather than grow the map past the cap. On main the map is
+    /// unbounded, so this fails (`pending_chunk_count()` would be 11).
+    #[test]
+    fn eleventh_incomplete_uuid_evicts_oldest_at_cap_ten() {
+        let now = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(
+            c.max_pending_chunked_message, 10,
+            "Java-matching default cap"
+        );
+
+        for i in 0..10 {
+            let outcome = deliver_first_chunk(&mut c, &format!("u-{i}"), i as u64, 3, now);
+            assert!(matches!(outcome, DeliverOutcome::Buffered));
+        }
+        assert_eq!(c.pending_chunk_count(), 10, "exactly the cap is buffered");
+
+        // The 11th distinct never-completing UUID evicts the oldest (u-0).
+        let outcome = deliver_first_chunk(&mut c, "u-10", 10, 3, now);
+        assert!(matches!(outcome, DeliverOutcome::Buffered));
+        assert_eq!(
+            c.pending_chunk_count(),
+            10,
+            "map must stay bounded at the cap, not grow to 11"
+        );
+        assert!(
+            !c.chunk_reassembly.contains_key("u-0"),
+            "the oldest UUID must be the one evicted"
+        );
+        assert!(
+            c.chunk_reassembly.contains_key("u-10"),
+            "newest is retained"
+        );
+    }
+
+    /// Eviction with `auto_ack = false` (the default) DROPS the partial without
+    /// acking — `chunk_auto_ack_pending` stays empty so the broker redelivers.
+    #[test]
+    fn eviction_auto_ack_false_does_not_ack_partial() {
+        let now = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c.max_pending_chunked_message = 2;
+        assert!(!c.auto_ack_oldest_chunked_message_on_queue_full);
+
+        deliver_first_chunk(&mut c, "u-0", 0, 3, now);
+        deliver_first_chunk(&mut c, "u-1", 1, 3, now);
+        deliver_first_chunk(&mut c, "u-2", 2, 3, now); // evicts u-0
+
+        assert_eq!(c.pending_chunk_count(), 2);
+        assert!(!c.chunk_reassembly.contains_key("u-0"));
+        assert!(
+            c.chunk_auto_ack_pending.is_empty(),
+            "auto_ack=false must NOT stage an ack for the evicted partial"
+        );
+    }
+
+    /// Eviction with `auto_ack = true` ACKS the evicted partial's first-chunk
+    /// id (staged into `chunk_auto_ack_pending`) then drops it.
+    #[test]
+    fn eviction_auto_ack_true_acks_partial() {
+        let now = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c.max_pending_chunked_message = 2;
+        c.auto_ack_oldest_chunked_message_on_queue_full = true;
+
+        // seq 0's first chunk carries entry_id 0 → that is the staged ack id.
+        deliver_first_chunk(&mut c, "u-0", 0, 3, now);
+        deliver_first_chunk(&mut c, "u-1", 1, 3, now);
+        deliver_first_chunk(&mut c, "u-2", 2, 3, now); // evicts u-0, acks it
+
+        assert_eq!(c.pending_chunk_count(), 2);
+        assert!(!c.chunk_reassembly.contains_key("u-0"));
+        assert_eq!(
+            c.chunk_auto_ack_pending.len(),
+            1,
+            "auto_ack=true must stage exactly one ack for the evicted partial"
+        );
+        assert_eq!(c.chunk_auto_ack_pending[0].entry_id, 0);
+    }
+
+    /// A straggler non-first chunk (`chunk_id = 2`) for an unknown/evicted UUID
+    /// must be DROPPED and must NOT fabricate a fresh buffer from non-first
+    /// metadata. On main the `or_insert_with` would create a corrupt buffer.
+    #[test]
+    fn straggler_non_first_chunk_for_unknown_uuid_is_dropped() {
+        let now = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        let meta = chunk_meta("u-orphan", 7, 3, 2); // chunk_id 2, never saw 0/1
+        let outcome = c
+            .deliver(
+                &message_cmd_at(7, 0),
+                meta,
+                None,
+                Bytes::from_static(b"orphan"),
+                now,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, DeliverOutcome::Dropped),
+            "a straggler non-first chunk must be Dropped, got {outcome:?}"
+        );
+        assert_eq!(
+            c.pending_chunk_count(),
+            0,
+            "no fresh buffer may be created from non-first metadata"
+        );
+    }
+
+    /// The expiry sweep removes a buffer older than
+    /// `expire_time_of_incomplete_chunked_message`, AND `next_chunk_expiry_deadline()`
+    /// returns its deadline so `poll_timeout` can schedule the wake. Asserted
+    /// through BOTH accessors (the AUDIT-CRITICAL wiring). On main there is no
+    /// expiry field, no sweep, and no deadline — this fails.
+    #[test]
+    fn expiry_sweep_removes_stale_buffer_and_surfaces_deadline() {
+        let t0 = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(
+            c.expire_time_of_incomplete_chunked_message,
+            Some(std::time::Duration::from_secs(60)),
+            "Java-matching 60s default"
+        );
+
+        deliver_first_chunk(&mut c, "u-stale", 0, 3, t0);
+        assert_eq!(c.pending_chunk_count(), 1);
+
+        // The deadline poll_timeout would surface is t0 + 60s.
+        let deadline = c
+            .next_chunk_expiry_deadline()
+            .expect("an incomplete buffer must expose an expiry deadline");
+        assert_eq!(deadline, t0 + std::time::Duration::from_secs(60));
+
+        // A sweep before the deadline is a no-op.
+        c.sweep_expired_chunks(t0 + std::time::Duration::from_secs(59));
+        assert_eq!(c.pending_chunk_count(), 1, "not yet expired");
+
+        // A sweep past the deadline removes the stale buffer.
+        c.sweep_expired_chunks(t0 + std::time::Duration::from_secs(61));
+        assert_eq!(c.pending_chunk_count(), 0, "stale buffer must be swept");
+        assert!(
+            c.next_chunk_expiry_deadline().is_none(),
+            "no deadline once the map is empty"
+        );
+    }
+
+    /// Depth axis: a chunk advertising an absurd `total` (> MAX_CHUNK_TOTAL)
+    /// must be rejected before it can pre-size the reassembly structures. On
+    /// main `total` is never bounded — this fails (the chunk would buffer).
+    #[test]
+    fn absurd_total_chunk_count_is_rejected() {
+        let now = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        let meta = chunk_meta("u-huge", 1, i32::MAX, 0);
+        let outcome = c
+            .deliver(
+                &message_cmd_at(1, 0),
+                meta,
+                None,
+                Bytes::from_static(b"x"),
+                now,
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, DeliverOutcome::Dropped),
+            "an absurd total chunk count must be Dropped, got {outcome:?}"
+        );
+        assert_eq!(c.pending_chunk_count(), 0, "no buffer for an absurd total");
+
+        // A total exactly at the cap is admitted (boundary check).
+        let meta_ok = chunk_meta("u-okay", 2, MAX_CHUNK_TOTAL, 0);
+        let outcome_ok = c
+            .deliver(
+                &message_cmd_at(2, 0),
+                meta_ok,
+                None,
+                Bytes::from_static(b"x"),
+                now,
+            )
+            .unwrap();
+        assert!(matches!(outcome_ok, DeliverOutcome::Buffered));
+        assert_eq!(c.pending_chunk_count(), 1);
+    }
+
+    /// Public-API regression guard (the same shape proven to FAIL on main).
+    /// Deliver 11 distinct never-completing first chunks of 2-chunk messages,
+    /// then complete the OLDEST (u-0). The cap-10 + eviction fix evicted u-0, so
+    /// its second chunk is a straggler for an unknown uuid → Dropped → the queue
+    /// stays empty. On unbounded main u-0's buffer survives → completes → the
+    /// queue would hold one message.
+    #[test]
+    fn oldest_incomplete_is_evicted_at_cap_ten_public_api() {
+        let now = std::time::Instant::now();
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+
+        for i in 0..11u64 {
+            let meta = chunk_meta(&format!("u-{i}"), i, 2, 0);
+            let _ = c
+                .deliver(
+                    &message_cmd_at(i, 0),
+                    meta,
+                    None,
+                    Bytes::from_static(b"c0"),
+                    now,
+                )
+                .unwrap();
+        }
+
+        let meta = chunk_meta("u-0", 0, 2, 1);
+        let _ = c
+            .deliver(
+                &message_cmd_at(100, 0),
+                meta,
+                None,
+                Bytes::from_static(b"c1"),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            c.queue_len(),
+            0,
+            "the oldest incomplete message must have been evicted at the cap; \
+             on unbounded main it survives and completes (queue == 1)"
+        );
     }
 
     // ---------------------------------------------------------------------

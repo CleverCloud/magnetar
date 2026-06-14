@@ -69,6 +69,14 @@ struct Inner<C: ConsumerApi> {
     /// `Arc::make_mut` to copy-on-write the Vec. The mutex is never held across
     /// `.await` — readers drop the guard immediately after capturing the Arc.
     consumers: Mutex<Arc<Vec<NamedConsumer<C>>>>,
+    /// Signalled whenever a child consumer is added to the set
+    /// ([`MultiTopicsConsumer::add_topic`]). The push-delivery poller
+    /// ([`crate::consumer_listener::spawn_wrapper_message_listener`]) races its
+    /// in-flight `receive()` against this so a child discovered *after* the poller
+    /// parked is swept on the next iteration (pattern-child / partition-growth
+    /// inheritance, ADR-0064). `Notify` (not a channel) keeps ADR-0003 intact; it
+    /// stores one permit, so a signal that arrives between two waits is not lost.
+    membership_changed: Arc<Notify>,
     /// Round-robin cursor used by `receive` to record the index of the topic that produced
     /// the last message. Wrapped in a Mutex because [`MultiTopicsConsumer`] is `&self` —
     /// cloning the handle should not require mutable access.
@@ -191,6 +199,10 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
         };
         if let Some(c) = to_close {
             let _ = ConsumerApi::close_owned(c).await;
+        } else {
+            // A new child joined the set — wake any parked wrapper-listener
+            // poller so it re-snapshots and starts draining the new child.
+            self.inner.membership_changed.notify_one();
         }
         Ok(())
     }
@@ -760,6 +772,32 @@ impl<C: ConsumerApi> Clone for MultiTopicsConsumer<C> {
     }
 }
 
+/// Push-delivery support: a [`MultiTopicsConsumer`] (and therefore a
+/// [`crate::PartitionedConsumer`], a type alias) drives the wrapper listener
+/// poller via its topic-fanning [`Self::receive`]. The `C: Clone` bound +
+/// `Send + 'static` let the poller move a cheap `Arc`-clone of the consumer into
+/// its [`tokio::spawn`]ed task. Topics added later via [`Self::add_topic`] (or by
+/// a [`crate::PartitionedConsumerBuilder`] partition refresh) are picked up
+/// automatically — `receive()` re-snapshots the child set every call.
+impl<C> crate::consumer_listener::WrapperReceiver for MultiTopicsConsumer<C>
+where
+    C: ConsumerApi + Clone + Send + Sync + 'static,
+{
+    async fn wrapper_receive(&self) -> Result<(String, IncomingMessage), PulsarError> {
+        let m = self.receive().await?;
+        Ok((m.topic, m.message))
+    }
+
+    fn is_empty(&self) -> bool {
+        MultiTopicsConsumer::is_empty(self)
+    }
+
+    async fn membership_changed(&self) {
+        let notify = self.inner.membership_changed.clone();
+        notify.notified().await;
+    }
+}
+
 /// Builder for [`MultiTopicsConsumer`]. Mirrors `org.apache.pulsar.client.api.ConsumerBuilder`
 /// at the multi-topic layer.
 ///
@@ -782,6 +820,9 @@ pub struct MultiTopicsConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     ack_timeout: Option<std::time::Duration>,
     ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
+    max_pending_chunked_message: Option<usize>,
+    auto_ack_oldest_chunked_message_on_queue_full: Option<bool>,
+    expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
     read_compacted: bool,
     priority_level: Option<i32>,
     subscription_properties: Vec<(String, String)>,
@@ -795,6 +836,12 @@ pub struct MultiTopicsConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     /// callers there pass the explicit topic list, so there is no single base topic
     /// to watch.
     auto_update_base_topic: Option<String>,
+    /// Optional push-delivery callback (Java `ConsumerBuilder#messageListener` at
+    /// the multi-topic scope). Set via [`Self::message_listener`] and subscribe via
+    /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores it
+    /// and returns a pull-mode [`MultiTopicsConsumer`]. The callback receives the
+    /// originating topic (so it can route an explicit ack to the right child).
+    listener: Option<crate::consumer_listener::WrapperMessageListener>,
 }
 
 impl<E: Engine> std::fmt::Debug for MultiTopicsConsumerBuilder<'_, E> {
@@ -822,6 +869,9 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
@@ -831,7 +881,40 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
             start_message_rollback_duration_sec: None,
             auto_update_partitions_interval: None,
             auto_update_base_topic: None,
+            listener: None,
         }
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// `true` once a push-delivery listener has been set via
+    /// [`Self::message_listener`]. Lets the builder-surface guard test pin the
+    /// listener → field wiring without opening a real broker connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_listener_for_test(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
+    /// at the multi-topic scope). Once set, subscribe via
+    /// [`Self::subscribe_with_listener`] to start a background poller that drives
+    /// [`MultiTopicsConsumer::receive`] and hands every message to `listener`,
+    /// sequentially and in order. The callback receives the originating topic so
+    /// it can ack against the right child via
+    /// [`MultiTopicsConsumer::ack`] / [`MultiTopicsConsumer::ack_grouped`].
+    ///
+    /// The plain [`Self::subscribe`] ignores the listener and returns a pull-mode
+    /// consumer. Pull and push are mutually exclusive (Java parity): use
+    /// `subscribe_with_listener` for push and never call `receive()`, or use
+    /// `subscribe` for pull. The callback **must ack explicitly** — the poller
+    /// never auto-acks.
+    #[must_use]
+    pub fn message_listener(
+        mut self,
+        listener: crate::consumer_listener::WrapperMessageListener,
+    ) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Append a topic. Subscribing to the same topic twice yields two separate
@@ -847,6 +930,22 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
     pub fn topics(mut self, topics: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.topics.extend(topics.into_iter().map(Into::into));
         self
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the bounded-chunk-reassembly knobs
+    /// this builder will propagate to every per-topic child via
+    /// [`crate::consumer_template::ConsumerTemplate`]. Lets the builder-surface
+    /// guard test pin the setter → field plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn chunk_knobs_for_test(
+        &self,
+    ) -> (Option<usize>, Option<bool>, Option<std::time::Duration>) {
+        (
+            self.max_pending_chunked_message,
+            self.auto_ack_oldest_chunked_message_on_queue_full,
+            self.expire_time_of_incomplete_chunked_message,
+        )
     }
 
     /// Required: set the subscription name.
@@ -926,6 +1025,30 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
         dead_letter_topic: Option<String>,
     ) -> Self {
         self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::max_pending_chunked_message`.
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.max_pending_chunked_message = Some(max);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::auto_ack_oldest_chunked_message_on_queue_full`.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.auto_ack_oldest_chunked_message_on_queue_full = Some(auto_ack);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::expire_time_of_incomplete_chunked_message`.
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(
+        mut self,
+        expire: std::time::Duration,
+    ) -> Self {
+        self.expire_time_of_incomplete_chunked_message = Some(expire);
         self
     }
 
@@ -1056,6 +1179,11 @@ where
             ack_timeout: self.ack_timeout,
             ack_group_time: self.ack_group_time,
             dlq_policy: self.dlq_policy,
+            max_pending_chunked_message: self.max_pending_chunked_message,
+            auto_ack_oldest_chunked_message_on_queue_full: self
+                .auto_ack_oldest_chunked_message_on_queue_full,
+            expire_time_of_incomplete_chunked_message: self
+                .expire_time_of_incomplete_chunked_message,
             read_compacted: self.read_compacted,
             priority_level: self.priority_level,
             subscription_properties: self.subscription_properties,
@@ -1104,11 +1232,55 @@ where
         Ok(MultiTopicsConsumer {
             inner: Arc::new(Inner {
                 consumers: Mutex::new(Arc::new(consumers)),
+                membership_changed: Arc::new(Notify::new()),
                 cursor: std::sync::atomic::AtomicUsize::new(0),
                 template,
                 auto_update,
             }),
         })
+    }
+}
+
+impl<E> MultiTopicsConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone + Send + Sync + 'static,
+{
+    /// Subscribe every per-topic child and start a push-delivery poller over the
+    /// resulting [`MultiTopicsConsumer`], returning the owning
+    /// [`crate::MessageListenerHandle`]. Mirrors Java's
+    /// `ConsumerBuilder#messageListener(...)` + `subscribe()` at the multi-topic /
+    /// partitioned scope.
+    ///
+    /// The poller delivers messages sequentially and in order across every
+    /// subscribed topic, handing the callback the originating topic and message,
+    /// and does **not** auto-ack (the callback acks explicitly via
+    /// [`MultiTopicsConsumer::ack`]). It stops cleanly when the consumer set is
+    /// drained or the returned handle is dropped. Topics added later (via
+    /// [`MultiTopicsConsumer::add_topic`]) are picked up automatically.
+    ///
+    /// Because the consumer is moved into the poller, there is no handle left to
+    /// call `receive()` on — the listener owns delivery (Java's "no `receive()`
+    /// with a `messageListener`" rule).
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - any subscribe error from [`Self::subscribe`].
+    pub async fn subscribe_with_listener(
+        self,
+    ) -> Result<crate::MessageListenerHandle, PulsarError> {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        Ok(crate::consumer_listener::spawn_wrapper_message_listener(
+            consumer, listener,
+        ))
     }
 }
 
@@ -1133,6 +1305,9 @@ mod tests {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             read_compacted: false,
             priority_level: None,
             subscription_properties: Vec::new(),
@@ -1151,6 +1326,7 @@ mod tests {
     fn empty_inner_is_consistent() {
         let inner: Arc<Inner<magnetar_runtime_tokio::Consumer>> = Arc::new(Inner {
             consumers: Mutex::new(Arc::new(Vec::new())),
+            membership_changed: Arc::new(Notify::new()),
             cursor: std::sync::atomic::AtomicUsize::new(0),
             template: empty_template(),
             auto_update: None,

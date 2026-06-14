@@ -381,7 +381,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     Ok(())
 }
 
-/// follow-ups §3.1 end-to-end: the MOONPOOL engine's transient
+/// Transient-retry end-to-end: the MOONPOOL engine's transient
 /// producer-open retry arm, exercised against a real restarting broker.
 ///
 /// The other reconnect e2e tests drive the tokio façade
@@ -392,7 +392,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
 /// trigger: the broker answers the rebuild's `CommandProducer` with
 /// `ServiceNotReady` ("Please redo the lookup") while the namespace bundle is
 /// being re-acquired, the proto layer emits `ProducerOpenFailedTransient`, and
-/// the moonpool driver's §3.1 leg re-looks-up + retries until the open is
+/// the moonpool driver's transient-retry leg re-looks-up + retries until the open is
 /// served. A post-restart send round-trip succeeding proves the arm recovers
 /// the connection rather than dead-ending the re-attach.
 ///
@@ -469,7 +469,7 @@ async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
 
     // Poll send() until it succeeds: the supervised driver redials, rebuilds
     // the producer, hits the transient `ServiceNotReady` on the rebuild open,
-    // and the §3.1 leg re-looks-up + retries until the broker serves the
+    // and the transient-retry leg re-looks-up + retries until the broker serves the
     // attach. Each attempt is timeout-bounded so an environmental broker death
     // fails the test fast instead of hanging.
     let payload = b"after-restart".to_vec();
@@ -525,7 +525,7 @@ fn assert_no_session_lost_leak<E: std::fmt::Debug>(e: &E, op: &str) {
     );
 }
 
-/// ADR-0060 / follow-ups §4.1: a `subscribe()` / `producer.create()` issued
+/// ADR-0060: a `subscribe()` / `producer.create()` issued
 /// DURING a supervised reconnect — so its in-flight `CommandLookupTopic` races
 /// the supervisor's `reset()` and is severed with `OpOutcome::SessionLost` —
 /// must SUCCEED transparently once the broker is back, NOT surface
@@ -687,7 +687,7 @@ async fn spawn_handshake_failing_stub() -> Result<String, Box<dyn std::error::Er
     Ok(format!("pulsar://{}:{}", addr.ip(), addr.port()))
 }
 
-/// ADR-0061 / follow-ups §3.2: the supervisor's `max_attempts` budget
+/// ADR-0061: the supervisor's `max_attempts` budget
 /// must count POST-DIAL handshake failures, not just TCP-dial failures. Behind a
 /// TCP-accepting proxy whose backend is down — the storm class the anti-thrash
 /// supervision was built for — the dial always succeeds while the Pulsar

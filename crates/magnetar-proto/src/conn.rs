@@ -919,7 +919,7 @@ impl Connection {
         // future. Take the per-slot lock, drain, DROP it, then wake.
         //
         // We ALSO flip the slot's `closed` flag inside this same per-slot lock
-        // scope (ADR-0059, follow-ups §4.1): a terminal drop is final, so a
+        // scope (ADR-0059): a terminal drop is final, so a
         // `queue_send` issued AFTER it must fast-fail synchronously with
         // `ProducerError::Closed` via the existing `if self.closed` guard
         // (`producer.rs`) instead of registering a doomed pending op that no
@@ -2011,104 +2011,55 @@ impl Connection {
                         ))?;
                 let rid = RequestId(resp.request_id);
                 if let Some(req) = self.lookup.take_lookup(rid) {
+                    // Every lookup response is terminal on THIS connection.
+                    // The sans-io core no longer chases a `Redirect` on the
+                    // same socket (ADR-0004 — that re-asked a non-owner broker
+                    // and looped to the cap on multi-broker clusters). A
+                    // `Redirect` now resolves to a driveable
+                    // `LookupOutcome::Redirected` that the engine acts on by
+                    // dialing the redirect target and re-issuing the lookup
+                    // there via `Connection::lookup_redirect`. So each hop is
+                    // single-hop-per-connection: `chain_origin == rid` and the
+                    // outcome (`Connect` / `Redirected` / `Failed`) is published
+                    // straight to the user-facing request-id.
                     let chain_origin = req.chain_origin;
-                    // The wire-level request-id is always done at this point
-                    // — the broker won't send another response for it. The
-                    // *chain*'s pending_requests entry stays keyed on
-                    // `chain_origin` until the terminal outcome lands; only
-                    // the per-hop wire-id is dropped from pending_requests
-                    // when it differs (the initial hop already shares the
-                    // anchor's id).
-                    if rid != chain_origin {
-                        self.pending_requests.remove(&rid);
+                    let outcome = crate::lookup::translate_lookup_response(&resp, &req);
+                    // ADR-0054 §5 single-owner rule: proto owns the redirect
+                    // detection log; engines drain the companion event silently.
+                    // Broker-advertised URLs are truncated per §3.
+                    if let LookupOutcome::Redirected {
+                        broker_service_url,
+                        broker_service_url_tls,
+                        hops_remaining,
+                        ..
+                    } = &outcome
+                    {
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            topic = %req.topic,
+                            hops_remaining = *hops_remaining,
+                            broker_service_url = broker_service_url
+                                .as_deref()
+                                .map_or("", crate::log_fields::truncate_broker_str),
+                            broker_service_url_tls = broker_service_url_tls
+                                .as_deref()
+                                .map_or("", crate::log_fields::truncate_broker_str),
+                            "lookup redirected; engine will dial the redirect target",
+                        );
                     }
-                    let (outcome, retry) = crate::lookup::translate_lookup_response(&resp, &req);
-                    match retry {
-                        Some(retry) => {
-                            // ADR-0054 §5 single-owner rule: proto owns the
-                            // redirect-chase hop log at the point of
-                            // detection; the engines drain the companion
-                            // `LookupResponse(Redirected)` event silently.
-                            // Broker-advertised URLs are truncated per §3.
-                            if let LookupOutcome::Redirected {
-                                broker_service_url,
-                                broker_service_url_tls,
-                            } = &outcome
-                            {
-                                tracing::debug!(
-                                    target: "magnetar_proto::conn",
-                                    topic = %retry.topic,
-                                    hop = crate::lookup::MAX_LOOKUP_REDIRECTS
-                                        - retry.hops_remaining,
-                                    hops_remaining = retry.hops_remaining,
-                                    broker_service_url = broker_service_url
-                                        .as_deref()
-                                        .map_or("", crate::log_fields::truncate_broker_str),
-                                    broker_service_url_tls = broker_service_url_tls
-                                        .as_deref()
-                                        .map_or("", crate::log_fields::truncate_broker_str),
-                                    "lookup redirected; chasing internally",
-                                );
-                            }
-                            // HIGH-4 (lookup multi-agent review): the
-                            // intermediate `Redirected` outcome is
-                            // diagnostic-only. We push it to the
-                            // `ConnectionEvent` queue for tracing /
-                            // observability (engines that drain the event
-                            // stream can log every redirect hop) but
-                            // **never** publish it to the `outcomes` slot
-                            // and **never** wake the user-facing future.
-                            // Only `Connect` / `Failed` reach the user.
-                            self.events.push_back(ConnectionEvent::LookupResponse {
-                                request_id: chain_origin,
-                                result: outcome,
-                            });
-                            // Issue the retry frame on a fresh wire-level
-                            // request-id. The retry's `chain_origin` field
-                            // (set by `translate_lookup_response`) keeps
-                            // the user-facing anchor stable.
-                            let new_id = self.alloc_request_id();
-                            if let Err(LookupSubmitError::Rejected) =
-                                self.send_lookup_internal(new_id, retry)
-                            {
-                                // Cap-hit on retry — the frame never goes
-                                // out. Deliver a synthetic Failed against
-                                // the chain anchor so the user's future
-                                // terminates cleanly instead of waiting
-                                // on a hop that will never happen.
-                                self.synthesize_lookup_failed(
-                                    chain_origin,
-                                    "lookup retry rejected: max pending \
-                                     (ConnectionConfig::max_pending_lookups)",
-                                );
-                            }
-                            // `LookupSubmitError::Encode` is the historic
-                            // silent-drop path — the registry slot is
-                            // reserved, the future stays parked until the
-                            // operation timeout fires. Behaviour matches
-                            // the pre-HIGH-4 fold path.
-                        }
-                        None => {
-                            // Terminal outcome (`Connect` or `Failed`). The
-                            // anchor's pending_requests entry is consumed
-                            // and the user-facing future is woken with the
-                            // final answer. This is the only path that
-                            // ever publishes a `LookupResponse` outcome.
-                            self.pending_requests.remove(&chain_origin);
-                            self.outcomes.insert(
-                                PendingOpKey::Request(chain_origin),
-                                OpOutcome::LookupResponse {
-                                    request_id: chain_origin,
-                                    outcome: outcome.clone(),
-                                },
-                            );
-                            self.wake_for_request(chain_origin);
-                            self.events.push_back(ConnectionEvent::LookupResponse {
-                                request_id: chain_origin,
-                                result: outcome,
-                            });
-                        }
-                    }
+                    self.pending_requests.remove(&chain_origin);
+                    self.outcomes.insert(
+                        PendingOpKey::Request(chain_origin),
+                        OpOutcome::LookupResponse {
+                            request_id: chain_origin,
+                            outcome: outcome.clone(),
+                        },
+                    );
+                    self.wake_for_request(chain_origin);
+                    self.events.push_back(ConnectionEvent::LookupResponse {
+                        request_id: chain_origin,
+                        result: outcome,
+                    });
                 }
             }
             pb::base_command::Type::PartitionedMetadataResponse => {
@@ -2709,6 +2660,14 @@ impl Connection {
                     consider(d);
                 }
             }
+            // Bounded chunk reassembly: surface the earliest incomplete-chunk
+            // expiry deadline so the driver schedules a deterministic wake for
+            // [`Self::handle_timeout`]'s sweep. Without this the sweep would
+            // only fire opportunistically on an unrelated tick — seed-divergent
+            // under the moonpool engine.
+            if let Some(d) = consumer.next_chunk_expiry_deadline() {
+                consider(d);
+            }
         }
         for slot in self.producers.values() {
             let producer = slot.state.lock();
@@ -2769,6 +2728,7 @@ impl Connection {
         // then emit through the shared helper.
         let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         let mut ack_actions: Vec<crate::trackers::AckAction> = Vec::new();
+        let mut chunk_acks: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
@@ -2787,9 +2747,37 @@ impl Connection {
             if let Some(tracker) = consumer.ack_tracker.as_mut() {
                 ack_actions.extend(tracker.poll(now));
             }
+            // Bounded chunk reassembly: expire incomplete chunked messages
+            // older than `expire_time_of_incomplete_chunked_message`. The
+            // matching deadline is surfaced through `poll_timeout` so the
+            // driver wakes us deterministically (mirrors Java
+            // `removeExpireIncompleteChunkedMessages`). Drain any first-chunk
+            // ids the sweep staged for auto-ack (only populated when
+            // `auto_ack_oldest_chunked_message_on_queue_full` is set; the
+            // default `false` path drops without acking so the broker
+            // redelivers).
+            consumer.sweep_expired_chunks(now);
+            if !consumer.chunk_auto_ack_pending.is_empty() {
+                let ids = std::mem::take(&mut consumer.chunk_auto_ack_pending);
+                chunk_acks.push((*handle, ids));
+            }
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
+        }
+        // Auto-ack the first-chunk ids of partials evicted/expired under the
+        // `auto_ack = true` policy. Individual acks; the broker treats the
+        // partial as consumed and stops redelivering it.
+        for (handle, ids) in chunk_acks {
+            self.ack(
+                handle,
+                AckRequest {
+                    message_ids: ids,
+                    ack_type: pb::command_ack::AckType::Individual,
+                    properties: Vec::new(),
+                    txn_id: None,
+                },
+            );
         }
         // Flush the ack-grouping tracker. The actions go through the shared dispatcher
         // which allocates a `RequestId` per coalesced `CommandAck`; the response is
@@ -3054,6 +3042,11 @@ impl Connection {
             state.ack_tracker = Some(crate::trackers::AckGroupingTracker::new(handle, group_time));
         }
         state.crypto_failure_action = req.crypto_failure_action;
+        state.max_pending_chunked_message = req.max_pending_chunked_message;
+        state.auto_ack_oldest_chunked_message_on_queue_full =
+            req.auto_ack_oldest_chunked_message_on_queue_full;
+        state.expire_time_of_incomplete_chunked_message =
+            req.expire_time_of_incomplete_chunked_message;
         let identity = crate::consumer::ConsumerIdentity {
             handle,
             topic: req.topic.clone(),
@@ -3841,6 +3834,22 @@ impl Connection {
         if !message_ids.is_empty() {
             if let Some(slot) = self.consumers.get(&handle) {
                 let mut consumer = slot.state.lock();
+                // Stop tracking the nacked ids in the ack-timeout (unacked-message)
+                // tracker. Without this, an id that was both nacked and ack-timeout
+                // tracked is redelivered twice — once by the nack tracker and once by
+                // the ack-timeout sweep in [`Self::handle_timeout`] — corrupting
+                // at-least-once-without-duplication. Mirrors Java's unconditional
+                // `unAckedMessageTracker.remove(...)` in `ConsumerImpl#negativeAcknowledge`
+                // (ConsumerImpl.java:859). Kept in its own sequential block so it runs on
+                // BOTH the nack-present and nack-absent paths (the early `return` below
+                // must not skip it) and avoids a second `&mut consumer` borrow conflicting
+                // with the `nack_tracker.as_mut()` scope. Symmetric with the positive-ack
+                // path in [`Self::ack`].
+                if let Some(t) = consumer.unacked_tracker.as_mut() {
+                    for id in &message_ids {
+                        t.remove(id);
+                    }
+                }
                 if let Some(tracker) = consumer.nack_tracker.as_mut() {
                     for id in &message_ids {
                         tracker.add(*id, now);
@@ -3867,6 +3876,14 @@ impl Connection {
     ) {
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
+            // Drop the nacked id from the ack-timeout tracker before deferring it to the
+            // nack tracker — same double-redelivery fix as [`Self::negative_ack`], and
+            // unconditional (runs even when no nack tracker is configured) so the
+            // fall-through to [`Self::emit_redeliver_unacked`] below cannot leave a second
+            // redelivery shape. Mirrors `ConsumerImpl.java:859`.
+            if let Some(t) = consumer.unacked_tracker.as_mut() {
+                t.remove(&message_id);
+            }
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
                 tracker.add_with_delay(message_id, delay, now);
                 return;
@@ -3940,17 +3957,16 @@ impl Connection {
         request_id
     }
 
-    /// Issue a topic lookup. The state machine handles redirects internally;
-    /// the user receives **only the terminal outcome** — either
-    /// `LookupOutcome::Connect` or `LookupOutcome::Failed`.
+    /// Issue a fresh topic lookup against this connection. The response
+    /// resolves to exactly one terminal [`LookupOutcome`] on the returned
+    /// request-id:
     ///
-    /// HIGH-4 (lookup multi-agent review): intermediate
-    /// `LookupOutcome::Redirected` outcomes are surfaced via the
-    /// [`crate::event::ConnectionEvent::LookupResponse`] events queue for
-    /// observability/tracing only — they **never** publish to the outcomes
-    /// slot and **never** wake the user-facing future. This is what makes
-    /// the redirect cap and the broker-URL passthrough end-to-end
-    /// user-observable.
+    /// - `Connect` — the topic resolved here; route the data ops.
+    /// - `Redirected` — this broker is not the bundle owner. The sans-io core does **not** dial the
+    ///   redirect target itself (ADR-0004); the engine dials it and re-issues the lookup there via
+    ///   [`Self::lookup_redirect`]. The outcome carries the target URL, the next-hop
+    ///   `authoritative` flag, and the remaining hop budget.
+    /// - `Failed` — the lookup failed (including the synthetic cap-exhausted `Failed`).
     ///
     /// Redirects are capped at [`crate::lookup::MAX_LOOKUP_REDIRECTS`] hops
     /// (Java parity). If [`ConnectionConfig::max_pending_lookups`] is set
@@ -3959,13 +3975,49 @@ impl Connection {
     /// message: "lookup rejected: max pending" }` against the freshly
     /// allocated request-id — the frame never touches the wire.
     pub fn lookup(&mut self, topic: &str, authoritative: bool) -> RequestId {
+        self.lookup_with_budget(topic, authoritative, crate::lookup::MAX_LOOKUP_REDIRECTS)
+    }
+
+    /// Re-issue a lookup on a **redirect target** connection after the engine
+    /// dialed the broker advertised by a [`LookupOutcome::Redirected`].
+    ///
+    /// `hops_remaining` is the budget the previous hop's `Redirected` outcome
+    /// carried out to the engine. It is clamped to
+    /// [`crate::lookup::MAX_LOOKUP_REDIRECTS`] here — the proto-side floor
+    /// check — so a buggy or hostile engine that inflates the budget cannot
+    /// re-open the redirect-loop DoS the cap closes. The lookup is otherwise
+    /// identical to [`Self::lookup`]: it resolves to one terminal outcome on
+    /// the returned request-id (which, like every lookup, is its own
+    /// `chain_origin`).
+    pub fn lookup_redirect(
+        &mut self,
+        topic: &str,
+        authoritative: bool,
+        hops_remaining: u8,
+    ) -> RequestId {
+        // Proto-side floor: never trust an engine-supplied budget above the
+        // cap. The translate layer still short-circuits to `Failed` at zero,
+        // so the cap holds end-to-end regardless of engine behaviour.
+        let clamped = hops_remaining.min(crate::lookup::MAX_LOOKUP_REDIRECTS);
+        self.lookup_with_budget(topic, authoritative, clamped)
+    }
+
+    /// Shared body of [`Self::lookup`] / [`Self::lookup_redirect`]: allocate a
+    /// request-id, build a [`LookupRequest`] seeded with `hops_remaining`, and
+    /// submit it (or synthesize a `Failed` if the pending-lookup cap is full).
+    fn lookup_with_budget(
+        &mut self,
+        topic: &str,
+        authoritative: bool,
+        hops_remaining: u8,
+    ) -> RequestId {
         let request_id = self.alloc_request_id();
         let req = LookupRequest {
             topic: topic.to_owned(),
             authoritative,
-            hops_remaining: crate::lookup::MAX_LOOKUP_REDIRECTS,
-            // The initial request-id IS the chain origin — every retry on
-            // this lookup chain delivers its terminal outcome here.
+            hops_remaining,
+            // The request-id IS the anchor — each lookup is single-hop on its
+            // connection and delivers its terminal outcome here.
             chain_origin: request_id,
         };
         if matches!(
@@ -5628,7 +5680,7 @@ mod conn_state_tests {
         conn.fail_all_pending("peer closed");
     }
 
-    /// ADR-0059 / follow-ups §4.1: `fail_all_pending` must ALSO mark every
+    /// ADR-0059: `fail_all_pending` must ALSO mark every
     /// producer slot `closed` so a NEW `queue_send` issued AFTER the terminal
     /// drop fast-fails synchronously with `ProducerError::Closed` (via the
     /// existing per-slot `if self.closed` guard) instead of registering a
@@ -6073,15 +6125,19 @@ mod conn_state_tests {
         }
     }
 
-    /// Ported from Java `BinaryProtoLookupService` — a `CommandLookupTopicResponse` whose
-    /// `response = Redirect` must trigger a *fresh* outbound `CommandLookupTopic` with a
-    /// fresh request id. Verifies that the state machine itself drives the retry (no need
-    /// for the user to re-submit). HIGH-4 (lookup multi-agent review): the intermediate
-    /// `Redirected` outcome must NOT publish to the outcomes slot — only the terminal
-    /// outcome at the end of the chain is delivered to the user-facing future. The
-    /// intermediate `Redirected` is pushed to the events queue for diagnostics only.
+    /// fix(proto): a `CommandLookupTopicResponse` with `response = Redirect`
+    /// surfaces a **driveable** terminal `LookupOutcome::Redirected` on the
+    /// lookup's request-id — carrying the redirect target URL, the next-hop
+    /// `authoritative` flag, and the remaining hop budget — and does **NOT**
+    /// re-issue a `CommandLookupTopic` on this (same, non-owner) connection.
+    /// The engine dials the redirect target and re-issues the lookup there.
+    ///
+    /// FAIL-on-main proof: before this change, proto chased the redirect on
+    /// self (`send_lookup_internal`), so a second `CommandLookupTopic` grew
+    /// the outbound buffer and the `Redirected` outcome was diagnostic-only
+    /// (NOT in the outcomes slot). Both of those flip here.
     #[test]
-    fn lookup_redirect_response_triggers_authoritative_retry() {
+    fn lookup_redirect_response_surfaces_driveable_outcome_without_self_chase() {
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
@@ -6092,21 +6148,22 @@ mod conn_state_tests {
             .expect("handle handshake");
         let _ = conn.poll_event();
 
-        // Issue the lookup and capture the outbound size to detect the second emission.
         let request_id = conn.lookup("persistent://public/default/foo", false);
-        let outbound_after_lookup = conn.outbound_len();
-        assert!(
-            outbound_after_lookup > 0,
-            "lookup must enqueue a CommandLookupTopic"
+        // Drain the initial CommandLookupTopic so we can detect any further
+        // outbound frame (a self-chase would write a second one).
+        let initial_ids = drain_outbound_lookup_ids(&mut conn);
+        assert_eq!(
+            initial_ids,
+            vec![request_id],
+            "initial lookup must enqueue exactly one CommandLookupTopic"
         );
 
-        // Feed a Redirect response. The state machine must emit a *second* lookup frame
-        // with a different request id and the `authoritative` flag forced on.
+        // Feed a Redirect response on the lookup's request-id.
         let redirect = pb::BaseCommand {
             r#type: pb::base_command::Type::LookupResponse as i32,
             lookup_topic_response: Some(pb::CommandLookupTopicResponse {
                 broker_service_url: Some("pulsar://other:6650".to_owned()),
-                broker_service_url_tls: None,
+                broker_service_url_tls: Some("pulsar+ssl://other:6651".to_owned()),
                 response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
                 request_id: request_id.0,
                 authoritative: Some(true),
@@ -6121,44 +6178,121 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &buf)
             .expect("handle redirect");
 
-        // The state machine should have emitted a follow-up lookup. Detect it by checking
-        // that the outbound buffer grew.
+        // No self-chase: the proto layer must NOT re-issue a CommandLookupTopic
+        // on this connection. (On main this fails — proto wrote a second frame.)
         assert!(
-            conn.outbound_len() > outbound_after_lookup,
-            "redirect must trigger a retry CommandLookupTopic (outbound={} -> {})",
-            outbound_after_lookup,
-            conn.outbound_len()
+            drain_outbound_lookup_ids(&mut conn).is_empty(),
+            "redirect must NOT trigger a self-chase CommandLookupTopic — \
+             the engine dials the redirect target instead"
         );
 
-        // HIGH-4: the intermediate `Redirected` must NOT publish to the outcomes slot —
-        // only the terminal outcome (Connect / Failed) at the end of the chain does. The
-        // chain anchor's pending_requests / outcomes / waker are still parked; the
-        // user-facing future is correctly NOT woken on the first hop.
-        assert!(
-            conn.take_outcome(PendingOpKey::Request(request_id))
-                .is_none(),
-            "intermediate Redirected must not publish to outcomes (HIGH-4)"
-        );
-
-        // The intermediate Redirected IS pushed to the events queue for diagnostics —
-        // tracing / observability code that drains the event stream sees every hop.
-        let mut saw_redirected = false;
-        while let Some(ev) = conn.poll_event() {
-            if let ConnectionEvent::LookupResponse {
+        // The driveable `Redirected` IS published to the outcomes slot on the
+        // request-id (so the engine's RequestFut wakes with it). (On main this
+        // fails — the Redirected was diagnostic-only, never in outcomes.)
+        match conn.take_outcome(PendingOpKey::Request(request_id)) {
+            Some(OpOutcome::LookupResponse {
                 request_id: rid,
-                result: crate::event::LookupOutcome::Redirected { .. },
-            } = ev
-            {
+                outcome:
+                    crate::event::LookupOutcome::Redirected {
+                        broker_service_url,
+                        broker_service_url_tls,
+                        authoritative,
+                        hops_remaining,
+                    },
+            }) => {
+                assert_eq!(rid, request_id);
+                assert_eq!(broker_service_url.as_deref(), Some("pulsar://other:6650"));
                 assert_eq!(
-                    rid, request_id,
-                    "diagnostic Redirected event must be keyed on the user-facing anchor"
+                    broker_service_url_tls.as_deref(),
+                    Some("pulsar+ssl://other:6651")
                 );
-                saw_redirected = true;
+                assert!(
+                    authoritative,
+                    "next-hop authoritative carried out to engine"
+                );
+                assert_eq!(
+                    hops_remaining,
+                    crate::lookup::MAX_LOOKUP_REDIRECTS - 1,
+                    "remaining hop budget carried out so the engine can re-thread it"
+                );
+            }
+            other => panic!("expected driveable Redirected outcome at the anchor, got {other:?}"),
+        }
+    }
+
+    /// The proto-side floor check: `Connection::lookup_redirect` clamps an
+    /// engine-supplied hop budget to `MAX_LOOKUP_REDIRECTS`. A buggy or
+    /// hostile engine that inflates the budget (e.g. `u8::MAX`) cannot
+    /// re-open the redirect-loop DoS — after the clamp, a chain of redirects
+    /// still terminates in the synthetic cap `Failed` within the bound.
+    #[test]
+    fn lookup_redirect_clamps_inflated_budget_to_cap() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let _ = conn.poll_event();
+
+        // Engine claims a wildly inflated budget. The clamp pins it to the cap.
+        let mut current = conn.lookup_redirect("persistent://public/default/foo", true, u8::MAX);
+        let _ = drain_outbound_lookup_ids(&mut conn);
+
+        // Drive redirects on the SAME connection (simulating a broker that keeps
+        // redirecting). With the clamp, the chain must terminate in the cap
+        // `Failed` within MAX_LOOKUP_REDIRECTS + 1 redirects, NOT u8::MAX.
+        let mut failed = None;
+        for _ in 0..=crate::lookup::MAX_LOOKUP_REDIRECTS {
+            let redirect = pb::BaseCommand {
+                r#type: pb::base_command::Type::LookupResponse as i32,
+                lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                    broker_service_url: Some("pulsar://loop:6650".to_owned()),
+                    broker_service_url_tls: None,
+                    response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+                    request_id: current.0,
+                    authoritative: Some(true),
+                    error: None,
+                    message: None,
+                    proxy_through_service_url: None,
+                }),
+                ..Default::default()
+            };
+            let mut buf = bytes::BytesMut::new();
+            encode_command(&mut buf, &redirect).expect("encode redirect");
+            conn.handle_bytes(Instant::now(), &buf)
+                .expect("handle redirect");
+            let _ = drain_outbound_lookup_ids(&mut conn);
+
+            match conn.take_outcome(PendingOpKey::Request(current)) {
+                Some(OpOutcome::LookupResponse {
+                    outcome: crate::event::LookupOutcome::Redirected { hops_remaining, .. },
+                    ..
+                }) => {
+                    // Re-issue on self via lookup_redirect (engine would dial a
+                    // target; here we keep it on one connection to count hops).
+                    current = conn.lookup_redirect(
+                        "persistent://public/default/foo",
+                        true,
+                        hops_remaining,
+                    );
+                    let _ = drain_outbound_lookup_ids(&mut conn);
+                }
+                Some(OpOutcome::LookupResponse {
+                    outcome: crate::event::LookupOutcome::Failed { message, .. },
+                    ..
+                }) => {
+                    failed = Some(message);
+                    break;
+                }
+                other => panic!("unexpected outcome during clamp walk: {other:?}"),
             }
         }
+        let message = failed.expect("clamped chain must terminate in the cap Failed within bound");
         assert!(
-            saw_redirected,
-            "expected a diagnostic LookupResponse(Redirected) event on the chain anchor"
+            message.contains("redirect cap exceeded"),
+            "expected the cap diagnostic, got: {message}"
         );
     }
 
@@ -6188,37 +6322,29 @@ mod conn_state_tests {
         ids
     }
 
-    /// HIGH-4 (lookup multi-agent review): a redirect chain that
-    /// terminates in `Connect` must deliver the **terminal** outcome
-    /// against the user-facing request-id (the `chain_origin`), not the
-    /// intermediate `Redirected` outcome from the first hop. This is the
-    /// behaviour that makes the broker-URL passthrough and the redirect
-    /// cap end-to-end user-observable.
+    /// fix(proto): driving a redirect chain the engine way — each hop
+    /// re-issued via `lookup_redirect` on a fresh request-id — delivers the
+    /// terminal `Connect` URL on the LAST hop's request-id. This is the
+    /// connection-layer mirror of the engine's dial loop (the engine dials a
+    /// new broker per hop; here we keep it on one in-memory connection and
+    /// re-issue per hop to exercise the hop accounting + terminal delivery).
     #[test]
-    fn lookup_redirect_chain_delivers_terminal_connect_to_origin() {
+    fn lookup_redirect_chain_delivers_terminal_connect_per_hop() {
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
         );
         conn.begin_handshake().expect("handshake");
-        let frame = handshake_response_bytes();
-        conn.handle_bytes(Instant::now(), &frame)
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
         let _ = conn.poll_event();
 
-        // Issue the user-facing lookup. The returned id is the
-        // `chain_origin` — the only id the user's future will ever wake
-        // against.
-        let user_request_id = conn.lookup("persistent://public/default/foo", false);
-        let initial_ids = drain_outbound_lookup_ids(&mut conn);
-        assert_eq!(
-            initial_ids,
-            vec![user_request_id],
-            "initial lookup must be keyed on the user-facing request-id"
-        );
+        // Initial user lookup.
+        let mut current = conn.lookup("persistent://public/default/foo", false);
+        let _ = drain_outbound_lookup_ids(&mut conn);
 
-        // Walk two redirects, then terminate in Connect on the THIRD wire id.
-        let mut current_wire_id = user_request_id;
+        // Two redirects. Each surfaces a driveable Redirected on `current`;
+        // the engine would dial the target — we re-issue via `lookup_redirect`.
         for hop in 0..2 {
             let redirect = pb::BaseCommand {
                 r#type: pb::base_command::Type::LookupResponse as i32,
@@ -6226,7 +6352,7 @@ mod conn_state_tests {
                     broker_service_url: Some(format!("pulsar://hop-{hop}:6650")),
                     broker_service_url_tls: None,
                     response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
-                    request_id: current_wire_id.0,
+                    request_id: current.0,
                     authoritative: Some(true),
                     error: None,
                     message: None,
@@ -6238,49 +6364,38 @@ mod conn_state_tests {
             encode_command(&mut buf, &redirect).expect("encode redirect");
             conn.handle_bytes(Instant::now(), &buf)
                 .expect("handle redirect");
+            let _ = drain_outbound_lookup_ids(&mut conn);
 
-            // Each redirect must NOT publish a terminal outcome to the
-            // user-facing slot — the chain anchor must stay parked.
-            assert!(
-                conn.take_outcome(PendingOpKey::Request(user_request_id))
-                    .is_none(),
-                "hop {hop}: intermediate Redirected must not wake the user"
-            );
-
-            // The state machine must have emitted a retry frame with a NEW
-            // wire request-id. Capture it for the next hop's correlator.
-            let next_ids = drain_outbound_lookup_ids(&mut conn);
-            assert_eq!(
-                next_ids.len(),
-                1,
-                "hop {hop}: exactly one retry frame must be emitted"
-            );
-            assert_ne!(
-                next_ids[0], current_wire_id,
-                "hop {hop}: retry must allocate a fresh wire request-id"
-            );
-            assert_ne!(
-                next_ids[0], user_request_id,
-                "hop {hop}: retry id must differ from the chain anchor too"
-            );
-            current_wire_id = next_ids[0];
+            let hops = match conn.take_outcome(PendingOpKey::Request(current)) {
+                Some(OpOutcome::LookupResponse {
+                    outcome:
+                        crate::event::LookupOutcome::Redirected {
+                            broker_service_url,
+                            hops_remaining,
+                            ..
+                        },
+                    ..
+                }) => {
+                    assert_eq!(
+                        broker_service_url.as_deref(),
+                        Some(&*format!("pulsar://hop-{hop}:6650"))
+                    );
+                    hops_remaining
+                }
+                other => panic!("hop {hop}: expected driveable Redirected, got {other:?}"),
+            };
+            current = conn.lookup_redirect("persistent://public/default/foo", true, hops);
+            let _ = drain_outbound_lookup_ids(&mut conn);
         }
 
-        // Drain the diagnostic Redirected events so the queue is clean for
-        // the terminal assertion below.
-        while conn
-            .poll_event_if(|e| matches!(e, ConnectionEvent::LookupResponse { .. }))
-            .is_some()
-        {}
-
-        // Terminate the chain in Connect on the most recent wire id.
+        // Terminal Connect on the latest request-id.
         let terminal = pb::BaseCommand {
             r#type: pb::base_command::Type::LookupResponse as i32,
             lookup_topic_response: Some(pb::CommandLookupTopicResponse {
                 broker_service_url: Some("pulsar://terminal:6650".to_owned()),
                 broker_service_url_tls: None,
                 response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
-                request_id: current_wire_id.0,
+                request_id: current.0,
                 authoritative: Some(true),
                 error: None,
                 message: None,
@@ -6293,9 +6408,7 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &buf)
             .expect("handle terminal Connect");
 
-        // The user-facing future receives the Connect outcome with the
-        // terminal broker URL — NOT the first-hop redirect URL.
-        match conn.take_outcome(PendingOpKey::Request(user_request_id)) {
+        match conn.take_outcome(PendingOpKey::Request(current)) {
             Some(OpOutcome::LookupResponse {
                 request_id,
                 outcome:
@@ -6303,51 +6416,46 @@ mod conn_state_tests {
                         broker_service_url, ..
                     },
             }) => {
-                assert_eq!(request_id, user_request_id);
+                assert_eq!(request_id, current);
                 assert_eq!(
                     broker_service_url.as_deref(),
                     Some("pulsar://terminal:6650"),
-                    "user must see the TERMINAL broker URL, not the first-hop redirect"
+                    "the engine must see the TERMINAL broker URL on the last hop"
                 );
             }
-            other => panic!("expected terminal Connect outcome at the anchor, got {other:?}"),
+            other => panic!("expected terminal Connect outcome, got {other:?}"),
         }
     }
 
-    /// HIGH-4 + HIGH-2: a hostile broker that drives MAX_LOOKUP_REDIRECTS
-    /// hops must surface a synthetic `Failed { code: 0, message: "lookup
-    /// redirect cap exceeded …" }` to the user-facing future. Without
-    /// the HIGH-4 fix the user would see the FIRST hop's Redirected
-    /// outcome instead and never observe the cap.
+    /// fix(proto): a hostile broker that keeps redirecting must surface a
+    /// synthetic `Failed { code: 0, message: "lookup redirect cap exceeded …"
+    /// }` once the hop budget is exhausted — even when the engine drives the
+    /// chain via `lookup_redirect`. This is the connection-layer cap floor.
     #[test]
-    fn lookup_redirect_chain_cap_exceeded_surfaces_failed_to_origin() {
+    fn lookup_redirect_chain_cap_exceeded_surfaces_failed() {
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
         );
         conn.begin_handshake().expect("handshake");
-        let frame = handshake_response_bytes();
-        conn.handle_bytes(Instant::now(), &frame)
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle handshake");
         let _ = conn.poll_event();
 
-        let user_request_id = conn.lookup("persistent://public/default/foo", false);
-        let initial_ids = drain_outbound_lookup_ids(&mut conn);
-        let mut current_wire_id = initial_ids[0];
+        let mut current = conn.lookup("persistent://public/default/foo", false);
+        let _ = drain_outbound_lookup_ids(&mut conn);
 
-        // Feed `MAX_LOOKUP_REDIRECTS + 1` redirects. The (cap+1)-th one
-        // triggers the cap. The proto-level test
-        // `redirect_chain_terminates_at_cap` already pins the cap
-        // behaviour at the translate layer; here we confirm the
-        // *connection* layer surfaces it against the user's anchor.
-        for hop in 0..=crate::lookup::MAX_LOOKUP_REDIRECTS {
+        // Drive redirects the engine way, threading the budget each hop. The
+        // chain must terminate in the cap `Failed` within the bound.
+        let mut failed_message = None;
+        for _ in 0..=crate::lookup::MAX_LOOKUP_REDIRECTS {
             let redirect = pb::BaseCommand {
                 r#type: pb::base_command::Type::LookupResponse as i32,
                 lookup_topic_response: Some(pb::CommandLookupTopicResponse {
-                    broker_service_url: Some(format!("pulsar://hop-{hop}:6650")),
+                    broker_service_url: Some("pulsar://hostile:6650".to_owned()),
                     broker_service_url_tls: None,
                     response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
-                    request_id: current_wire_id.0,
+                    request_id: current.0,
                     authoritative: Some(true),
                     error: None,
                     message: None,
@@ -6359,26 +6467,37 @@ mod conn_state_tests {
             encode_command(&mut buf, &redirect).expect("encode redirect");
             conn.handle_bytes(Instant::now(), &buf)
                 .expect("handle redirect");
-            if let Some(next) = drain_outbound_lookup_ids(&mut conn).into_iter().next() {
-                current_wire_id = next;
-            }
-        }
+            let _ = drain_outbound_lookup_ids(&mut conn);
 
-        // User-facing outcome: Failed with the cap diagnostic.
-        match conn.take_outcome(PendingOpKey::Request(user_request_id)) {
-            Some(OpOutcome::LookupResponse {
-                request_id,
-                outcome: crate::event::LookupOutcome::Failed { code, message },
-            }) => {
-                assert_eq!(request_id, user_request_id);
-                assert_eq!(code, 0);
-                assert!(
-                    message.contains("redirect cap exceeded"),
-                    "expected cap diagnostic, got: {message}"
-                );
+            match conn.take_outcome(PendingOpKey::Request(current)) {
+                Some(OpOutcome::LookupResponse {
+                    outcome: crate::event::LookupOutcome::Redirected { hops_remaining, .. },
+                    ..
+                }) => {
+                    current = conn.lookup_redirect(
+                        "persistent://public/default/foo",
+                        true,
+                        hops_remaining,
+                    );
+                    let _ = drain_outbound_lookup_ids(&mut conn);
+                }
+                Some(OpOutcome::LookupResponse {
+                    request_id,
+                    outcome: crate::event::LookupOutcome::Failed { code, message },
+                }) => {
+                    assert_eq!(request_id, current);
+                    assert_eq!(code, 0);
+                    failed_message = Some(message);
+                    break;
+                }
+                other => panic!("unexpected outcome during cap walk: {other:?}"),
             }
-            other => panic!("expected cap-exceeded Failed at the anchor, got {other:?}"),
         }
+        let message = failed_message.expect("chain must hit the cap Failed within the bound");
+        assert!(
+            message.contains("redirect cap exceeded"),
+            "expected cap diagnostic, got: {message}"
+        );
     }
 
     /// Local `close()` from a state that was never connected (still `Uninitialized` or
@@ -8399,7 +8518,7 @@ mod conn_state_tests {
         );
     }
 
-    /// ADR-0060 / follow-ups §4.1 (layer a): the proto-level surface the
+    /// ADR-0060 (layer a): the proto-level surface the
     /// engine-side bounded lookup-retry loop consults. An in-flight lookup
     /// severed by `reset()` surfaces `OpOutcome::SessionLost` (the signal to
     /// re-issue, NOT a terminal error), and after a fresh handshake the
@@ -8469,7 +8588,7 @@ mod conn_state_tests {
         );
     }
 
-    /// ADR-0060 / follow-ups §4.1 (layer a): the terminal short-circuit the
+    /// ADR-0060 (layer a): the terminal short-circuit the
     /// engine loop's `await_reconnect_or_terminal` returns. When the connection
     /// has gone `is_closed()` (here: a transport `Failed`) and the runtime's
     /// `no_driver` latch is set, the engine maps a severed lookup to a clean
@@ -8498,6 +8617,263 @@ mod conn_state_tests {
         assert!(
             !conn.is_connected(),
             "a Failed connection is not connected — the loop never re-issues"
+        );
+    }
+
+    // --- Negative-ack must remove the nacked id from the ack-timeout tracker ---
+    //
+    // Regression coverage for the double-redelivery bug: a message that is both
+    // ack-timeout tracked and nacked must be redelivered EXACTLY ONCE. Before the
+    // fix, [`Connection::negative_ack`] only added the id to the nack tracker, so
+    // [`Connection::handle_timeout`] redelivered it twice — once from the nack
+    // tracker, once from the unacked (ack-timeout) sweep. Each of these tests FAILS
+    // on `main` (sees TWO redeliveries) and PASSES after the unconditional
+    // `unacked_tracker.remove(...)` lands.
+
+    /// Build a connected connection plus a subscription configured with `ack_timeout`
+    /// and an optional `negative_ack_redelivery_delay`. The unacked-message tracker is
+    /// armed at subscribe time, so deliveries recorded afterward participate in the
+    /// ack-timeout sweep.
+    fn nack_test_conn(
+        ack_timeout: Duration,
+        nack_delay: Option<Duration>,
+    ) -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/nack-unacked".to_owned(),
+            subscription: "sub-nack-unacked".to_owned(),
+            ack_timeout: Some(ack_timeout),
+            negative_ack_redelivery_delay: nack_delay,
+            ..Default::default()
+        });
+        // Drain the outbound CommandSubscribe + initial flow so later poll_transmit
+        // calls observe only the redelivery frames the sweep queues.
+        let _ = conn.poll_transmit();
+        (conn, handle)
+    }
+
+    /// Deliver one synthetic non-batched message carrying the `(ledger, entry)` identity
+    /// onto `handle`, then drain its `Message` event and any outbound bytes. The unacked
+    /// tracker keys on the per-index `MessageId` the delivery path produces — for a
+    /// non-batched entry that is `batch_index = -1, batch_size = 0`.
+    fn deliver_one(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        now: Instant,
+        ledger: u64,
+        entry: u64,
+    ) {
+        let meta = pb::MessageMetadata {
+            producer_name: "magnetar-test-prod".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(1),
+            ..Default::default()
+        };
+        let cmd = deliver_cmd(handle, ledger, entry);
+        let mut frame = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut frame, &cmd, &meta, b"nack-unacked-payload")
+            .expect("encode message frame");
+        deliver_frame(conn, now, &frame);
+    }
+
+    /// Deliver one synthetic BATCH of `count` messages on `(ledger, entry)`. Each
+    /// sub-message lands in the unacked tracker keyed on the per-index id
+    /// `batch_index = idx, batch_size = count` (consumer.rs batch-explosion path), so a
+    /// nack of one batch-index id exercises the batched removal.
+    fn deliver_batch(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+        now: Instant,
+        ledger: u64,
+        entry: u64,
+        count: i32,
+    ) {
+        let meta = pb::MessageMetadata {
+            producer_name: "magnetar-test-prod".to_owned(),
+            sequence_id: 1,
+            publish_time: 1_700_000_000_000,
+            num_messages_in_batch: Some(count),
+            ..Default::default()
+        };
+        // Batched body: `(u32 single_size)(SingleMessageMetadata)(payload)` per entry,
+        // matching the wire format `ConsumerState::deliver` parses.
+        let mut body = bytes::BytesMut::new();
+        for idx in 0..count {
+            let payload = format!("batch-{idx}").into_bytes();
+            let sm = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            let sm_len = prost::Message::encoded_len(&sm);
+            body.extend_from_slice(&(sm_len as u32).to_be_bytes());
+            prost::Message::encode(&sm, &mut body).expect("encode SingleMessageMetadata");
+            body.extend_from_slice(&payload);
+        }
+        let cmd = deliver_cmd(handle, ledger, entry);
+        let mut frame = bytes::BytesMut::new();
+        crate::frame::encode_payload(&mut frame, &cmd, &meta, &body).expect("encode batch frame");
+        deliver_frame(conn, now, &frame);
+    }
+
+    /// Build the `CommandMessage` for a `(ledger, entry)` delivery on `handle`. The
+    /// broker-supplied id carries no batch fields; the consumer fills them per sub-message.
+    fn deliver_cmd(handle: ConsumerHandle, ledger: u64, entry: u64) -> pb::BaseCommand {
+        pb::BaseCommand {
+            r#type: pb::base_command::Type::Message as i32,
+            message: Some(pb::CommandMessage {
+                consumer_id: handle.0,
+                message_id: pb::MessageIdData {
+                    ledger_id: ledger,
+                    entry_id: entry,
+                    partition: None,
+                    batch_index: None,
+                    ack_set: Vec::new(),
+                    batch_size: None,
+                    first_chunk_message_id: None,
+                },
+                redelivery_count: Some(0),
+                ack_set: Vec::new(),
+                consumer_epoch: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Feed a synthetic delivery `frame` into the connection, then drain the resulting
+    /// `Message` event(s) and any flow/ack bytes so a later `poll_transmit` observes only
+    /// the redelivery frames the timeout sweep queues.
+    fn deliver_frame(conn: &mut Connection, now: Instant, frame: &[u8]) {
+        conn.handle_bytes(now, frame).expect("deliver message");
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+    }
+
+    /// Count how many `CommandRedeliverUnacknowledgedMessages` frames the connection
+    /// has queued on its outbound buffer (one per redelivery the sweep emitted).
+    fn count_redeliver_frames(conn: &mut Connection) -> usize {
+        let mut bytes = conn.poll_transmit();
+        let mut count = 0;
+        while !bytes.is_empty() {
+            let frame = crate::frame::decode_one(&mut bytes).expect("decode outbound frame");
+            if frame.command.r#type
+                == pb::base_command::Type::RedeliverUnacknowledgedMessages as i32
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn negative_ack_removes_id_from_unacked_tracker_so_redelivery_fires_once() {
+        let t0 = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let nack_delay = Duration::from_secs(2);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, Some(nack_delay));
+        // Deliver a non-batched message; the unacked tracker arms its ack-timeout deadline.
+        deliver_one(&mut conn, handle, t0, 7, 3);
+        // The single-message delivery path normalises a non-batched id to
+        // `batch_index = -1, batch_size = 0` (consumer.rs), so the nacked id the user
+        // would hold (and that the unacked tracker keyed on) carries `batch_size: 0`.
+        let nacked_id = MessageId {
+            ledger_id: 7,
+            entry_id: 3,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        // Nack it. The nack tracker defers the redelivery to t0 + nack_delay; the fix
+        // also drops it from the unacked tracker so the ack-timeout sweep won't fire.
+        conn.negative_ack(handle, vec![nacked_id], t0);
+        // Advance past BOTH the nack delay AND the ack timeout in one sweep. On `main`
+        // this produces TWO redelivery frames (nack + ack-timeout); the fix yields ONE.
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "a nacked + ack-timeout-tracked message must be redelivered exactly once, \
+             not twice (nack tracker + ack-timeout sweep)"
+        );
+    }
+
+    #[test]
+    fn negative_ack_removes_batched_id_from_unacked_tracker_so_redelivery_fires_once() {
+        let t0 = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let nack_delay = Duration::from_secs(2);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, Some(nack_delay));
+        // Deliver a 2-message batch; both sub-messages land in the unacked tracker keyed on
+        // `batch_index = idx, batch_size = 2`. Nack BOTH so no un-nacked id is left to time
+        // out — the nack tracker coalesces them into ONE redelivery frame, and the fix must
+        // drop both from the unacked tracker so the ack-timeout sweep adds none. On `main`
+        // the sweep adds a second frame for the still-tracked batch ids → two frames.
+        deliver_batch(&mut conn, handle, t0, 9, 4, 2);
+        let batched = |idx: i32| MessageId {
+            ledger_id: 9,
+            entry_id: 4,
+            partition: -1,
+            batch_index: idx,
+            batch_size: 2,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        conn.negative_ack(handle, vec![batched(0), batched(1)], t0);
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "nacked batch-index messages must be redelivered exactly once (one coalesced \
+             nack frame), not twice (nack tracker + ack-timeout sweep)"
+        );
+    }
+
+    #[test]
+    fn negative_ack_without_nack_tracker_removes_id_from_unacked_tracker() {
+        // NACK-ABSENT path: ack_timeout configured but NO nack tracker. `negative_ack`
+        // emits an immediate redelivery (fall-through to `emit_redeliver_unacked`) AND
+        // must still drop the id from the unacked tracker — otherwise the ack-timeout
+        // sweep adds a SECOND redelivery later. The unconditional removal (not nested in
+        // the `nack_tracker.as_mut()` block, which early-returns) guarantees one redelivery.
+        let t0 = Instant::now();
+        let ack_timeout = Duration::from_secs(10);
+        let (mut conn, handle) = nack_test_conn(ack_timeout, None);
+        deliver_one(&mut conn, handle, t0, 5, 1);
+        // Non-batched delivery normalises to `batch_size: 0` (consumer.rs).
+        let nacked_id = MessageId {
+            ledger_id: 5,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        // Immediate redelivery #1 (no nack tracker to defer it).
+        conn.negative_ack(handle, vec![nacked_id], t0);
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            1,
+            "with no nack tracker, negative_ack emits exactly one immediate redelivery"
+        );
+        // The ack-timeout sweep must NOT emit a second redelivery: the id was removed.
+        conn.handle_timeout(t0 + Duration::from_secs(11));
+        assert_eq!(
+            count_redeliver_frames(&mut conn),
+            0,
+            "the ack-timeout sweep must not re-redeliver an id already nacked + removed"
         );
     }
 }

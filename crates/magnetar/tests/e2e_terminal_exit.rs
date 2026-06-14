@@ -8,7 +8,7 @@
 //! in-flight op PROMPTLY — instead of parking it forever (the no-progress
 //! stall ADR-0055 §1 kills) — AND that a NEW op issued AFTER the connection is
 //! already terminal also fast-fails synchronously rather than registering a
-//! doomed pending op (ADR-0059 / follow-ups §4.1). This is the e2e analogue of
+//! doomed pending op (ADR-0059). This is the e2e analogue of
 //! the tokio + moonpool `terminal_exit.rs` integration tests and the
 //! `magnetar-differential` terminal-error equivalence test.
 //!
@@ -226,7 +226,7 @@ async fn e2e_plain_client_in_flight_op_fails_fast_on_outage()
     .await
     .expect("connection must be down after the outage");
 
-    // ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the connection is
+    // ADR-0059: a NEW op issued AFTER the connection is
     // already terminal must fast-fail SYNCHRONOUSLY rather than register a
     // doomed pending op. `fail_all_pending` flipped the producer slot `closed`
     // and the plain driver latched `no_driver` on its terminal exit, so a fresh

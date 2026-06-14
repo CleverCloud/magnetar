@@ -260,7 +260,7 @@ async fn plain_connection_in_flight_ops_fail_fast_on_terminal_drop() {
     );
 }
 
-/// ADR-0059 / follow-ups §4.1: a NEW op issued AFTER the plain connection has
+/// ADR-0059: a NEW op issued AFTER the plain connection has
 /// gone terminal must fast-fail SYNCHRONOUSLY with `PeerClosed`, not register a
 /// doomed pending op no driver is left to resolve. This is the new-op companion
 /// to the in-flight contract above (ADR-0055 §1).

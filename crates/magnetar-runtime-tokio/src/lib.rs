@@ -168,8 +168,7 @@ pub struct ConnectionShared {
     /// state with NO driver left to recover it: the plain (non-supervised)
     /// driver's terminal exit, or the supervisor give-up after exhausting its
     /// reconnect-attempt budget (both call sites pair this with
-    /// [`magnetar_proto::Connection::fail_all_pending`]). ADR-0059 / follow-ups
-    /// §5.1.
+    /// [`magnetar_proto::Connection::fail_all_pending`]). ADR-0059.
     ///
     /// This is the load-bearing "no driver will recover this" signal the
     /// synchronous fast-fail guards read at the request-issue / subscribe /
@@ -290,7 +289,7 @@ pub enum LookupReissueReadiness {
     Reconnected,
     /// The connection is terminal (`is_closed()`) AND `no_driver` is latched —
     /// no driver will recover it. Short-circuit to `PeerClosed` (composes with
-    /// §5.1's terminal fast-fail).
+    /// the terminal fast-fail).
     Terminal,
 }
 
@@ -309,7 +308,7 @@ impl ConnectionShared {
     }
 
     /// Fast-fail guard for the request-issue / subscribe / lookup entry points
-    /// (ADR-0059 / follow-ups §4.1). Returns `Err(ClientError::PeerClosed)`
+    /// (ADR-0059). Returns `Err(ClientError::PeerClosed)`
     /// when the connection is terminal AND no driver will recover it — i.e.
     /// `is_closed()` AND [`Self::no_driver`] are BOTH set. Returns `Ok(())`
     /// otherwise, INCLUDING the transient `Failed` window of a SUPERVISED
@@ -330,7 +329,7 @@ impl ConnectionShared {
 
     /// Park until this connection is live again on a fresh session, or has gone
     /// genuinely terminal — whichever happens first. Used by the engine-side
-    /// lookup-retry-on-`SessionLost` loop (ADR-0060 / follow-ups §4.1): when an
+    /// lookup-retry-on-`SessionLost` loop (ADR-0060): when an
     /// in-flight `CommandLookupTopic` is severed by a supervised reconnect
     /// ([`magnetar_proto::Connection::reset`] publishes
     /// [`magnetar_proto::OpOutcome::SessionLost`] on its request-id), the
@@ -341,8 +340,9 @@ impl ConnectionShared {
     ///   [`magnetar_proto::HandshakeState::Connected`] — the caller may re-issue the lookup.
     /// * [`LookupReissueReadiness::Terminal`] once the connection `is_closed()` AND
     ///   [`Self::no_driver`] is latched — no driver will recover it, so the caller short-circuits
-    ///   to [`ClientError::PeerClosed`]. This composes with §5.1: a terminal `SessionLost` surfaces
-    ///   a clean `PeerClosed` rather than re-hanging or spinning to the re-issue bound.
+    ///   to [`ClientError::PeerClosed`]. This composes with the terminal fast-fail: a terminal
+    ///   `SessionLost` surfaces a clean `PeerClosed` rather than re-hanging or spinning to the
+    ///   re-issue bound.
     ///
     /// Park-on-readiness, NOT a timer: we wait on
     /// [`Self::driver_waker`], which both engines pulse via
@@ -365,7 +365,7 @@ impl ConnectionShared {
                 if conn.is_connected() {
                     return LookupReissueReadiness::Reconnected;
                 }
-                // Terminal AND no driver will recover it — compose with §5.1.
+                // Terminal AND no driver will recover it — compose with the terminal fast-fail.
                 if conn.is_closed() && self.no_driver.load(Ordering::SeqCst) {
                     return LookupReissueReadiness::Terminal;
                 }
@@ -645,7 +645,7 @@ mod tests {
         assert!(s.topic_list_changes.lock().is_empty());
     }
 
-    /// ADR-0059 / follow-ups §4.1 regression: `fail_if_no_driver()` must NOT
+    /// ADR-0059 regression: `fail_if_no_driver()` must NOT
     /// fast-fail a connection that is `is_closed()` (here: `Failed`) while a
     /// supervisor is still able to recover it — i.e. while `no_driver` is unset.
     /// This pins the exact window a SUPERVISED connection lives in between
@@ -677,7 +677,7 @@ mod tests {
         );
     }
 
-    /// ADR-0059 / follow-ups §4.1: `fail_if_no_driver()` DOES fast-fail with
+    /// ADR-0059: `fail_if_no_driver()` DOES fast-fail with
     /// `PeerClosed` once BOTH conditions hold — `is_closed()` AND the `no_driver`
     /// latch (set by the plain driver's terminal exit / supervisor give-up). 1:1
     /// twin of the moonpool engine.

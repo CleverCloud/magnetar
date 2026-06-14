@@ -47,11 +47,19 @@ pub struct PartitionedConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     ack_timeout: Option<std::time::Duration>,
     ack_group_time: Option<std::time::Duration>,
     dlq_policy: Option<(u32, Option<String>)>,
+    max_pending_chunked_message: Option<usize>,
+    auto_ack_oldest_chunked_message_on_queue_full: Option<bool>,
+    expire_time_of_incomplete_chunked_message: Option<std::time::Duration>,
     key_shared: Option<magnetar_proto::KeySharedConfig>,
     replicate_subscription_state: Option<bool>,
     force_topic_creation: Option<bool>,
     start_message_rollback_duration_sec: Option<u64>,
     auto_update_partitions_interval: Option<std::time::Duration>,
+    /// Optional push-delivery callback (Java `ConsumerBuilder#messageListener` at
+    /// the partitioned scope). Set via [`Self::message_listener`] and subscribe via
+    /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores it.
+    /// Forwarded onto the underlying [`crate::MultiTopicsConsumerBuilder`].
+    listener: Option<crate::consumer_listener::WrapperMessageListener>,
 }
 
 impl<E: Engine> std::fmt::Debug for PartitionedConsumerBuilder<'_, E> {
@@ -82,12 +90,42 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
             ack_timeout: None,
             ack_group_time: None,
             dlq_policy: None,
+            max_pending_chunked_message: None,
+            auto_ack_oldest_chunked_message_on_queue_full: None,
+            expire_time_of_incomplete_chunked_message: None,
             key_shared: None,
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
             auto_update_partitions_interval: None,
+            listener: None,
         }
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// `true` once a push-delivery listener has been set via
+    /// [`Self::message_listener`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_listener_for_test(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
+    /// at the partitioned scope). Once set, subscribe via
+    /// [`Self::subscribe_with_listener`] to start a background poller over the
+    /// per-partition consumer set, handing every message to `listener`
+    /// sequentially and in order, with no auto-ack. The callback receives the
+    /// originating partition topic so it can ack against the right child. The
+    /// plain [`Self::subscribe`] ignores the listener and returns a pull-mode
+    /// consumer.
+    #[must_use]
+    pub fn message_listener(
+        mut self,
+        listener: crate::consumer_listener::WrapperMessageListener,
+    ) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Required: set the subscription name (shared across every per-partition child consumer).
@@ -95,6 +133,21 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
         self.subscription = Some(name.into());
         self
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the bounded-chunk-reassembly knobs
+    /// propagated to every per-partition child consumer. Lets the builder-surface
+    /// guard test pin the setter → field plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn chunk_knobs_for_test(
+        &self,
+    ) -> (Option<usize>, Option<bool>, Option<std::time::Duration>) {
+        (
+            self.max_pending_chunked_message,
+            self.auto_ack_oldest_chunked_message_on_queue_full,
+            self.expire_time_of_incomplete_chunked_message,
+        )
     }
 
     /// Set the subscription type for every per-partition child consumer.
@@ -193,6 +246,30 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
         dead_letter_topic: Option<String>,
     ) -> Self {
         self.dlq_policy = Some((max_redeliver_count, dead_letter_topic));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::max_pending_chunked_message`.
+    #[must_use]
+    pub fn max_pending_chunked_message(mut self, max: usize) -> Self {
+        self.max_pending_chunked_message = Some(max);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::auto_ack_oldest_chunked_message_on_queue_full`.
+    #[must_use]
+    pub fn auto_ack_oldest_chunked_message_on_queue_full(mut self, auto_ack: bool) -> Self {
+        self.auto_ack_oldest_chunked_message_on_queue_full = Some(auto_ack);
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::expire_time_of_incomplete_chunked_message`.
+    #[must_use]
+    pub fn expire_time_of_incomplete_chunked_message(
+        mut self,
+        expire: std::time::Duration,
+    ) -> Self {
+        self.expire_time_of_incomplete_chunked_message = Some(expire);
         self
     }
 
@@ -303,6 +380,15 @@ where
         if let Some((max, topic_opt)) = self.dlq_policy {
             builder = builder.dead_letter_policy(max, topic_opt);
         }
+        if let Some(max) = self.max_pending_chunked_message {
+            builder = builder.max_pending_chunked_message(max);
+        }
+        if let Some(auto_ack) = self.auto_ack_oldest_chunked_message_on_queue_full {
+            builder = builder.auto_ack_oldest_chunked_message_on_queue_full(auto_ack);
+        }
+        if let Some(expire) = self.expire_time_of_incomplete_chunked_message {
+            builder = builder.expire_time_of_incomplete_chunked_message(expire);
+        }
         if let Some(cfg) = self.key_shared {
             builder = builder.key_shared_policy(cfg);
         }
@@ -320,6 +406,46 @@ where
                 .auto_update_partitions_interval(interval)
                 .auto_update_base_topic(self.topic.clone());
         }
+        if let Some(listener) = self.listener {
+            builder = builder.message_listener(listener);
+        }
         builder.subscribe().await
+    }
+}
+
+impl<E> PartitionedConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi + crate::BrokerMetadataApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone + Send + Sync + 'static,
+{
+    /// Query the partition count, open one consumer per partition, and start a
+    /// push-delivery poller over the resulting [`PartitionedConsumer`], returning
+    /// the owning [`crate::MessageListenerHandle`]. Mirrors Java's
+    /// `ConsumerBuilder#messageListener(...)` + `subscribe()` against a
+    /// partitioned topic.
+    ///
+    /// Same semantics as [`crate::MultiTopicsConsumerBuilder::subscribe_with_listener`]:
+    /// sequential, in-order delivery across every partition, no auto-ack (the
+    /// callback acks via the topic-routed [`PartitionedConsumer::ack`]), clean
+    /// shutdown on consumer-set drain / handle drop.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - any subscribe / metadata-lookup error from [`Self::subscribe`].
+    pub async fn subscribe_with_listener(
+        self,
+    ) -> Result<crate::MessageListenerHandle, PulsarError> {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        Ok(crate::consumer_listener::spawn_wrapper_message_listener(
+            consumer, listener,
+        ))
     }
 }

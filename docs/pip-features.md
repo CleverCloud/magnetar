@@ -278,6 +278,7 @@ assert_eq!(receipt_id, source_id); // round-trip preservation
 
 This entry **bypasses batching** by design — mirrors Java's `org.apache.pulsar.broker.service.persistent.Replicator`, which writes each entry one at a time.
 Chunking still applies for payloads larger than `max_message_size`; in that case the same `source_msg_id` is stamped on every chunk (one logical message, multiple frames).
+On the receive side, chunk reassembly (PIP-37) is bounded to match the Java client — `ConsumerBuilder::max_pending_chunked_message` (default 10) evicts the oldest incomplete message on cap breach and `expire_time_of_incomplete_chunked_message` (default 60s) sweeps stale buffers on the timeout tick, so a hostile/buggy broker streaming distinct-UUID first chunks cannot grow the reassembly map without bound.
 
 The regular `Producer::send(...)` continues to emit `CommandSend.message_id = None` — byte-identical on the wire (no proto bump).
 The new field on `OutgoingMessage` defaults to `None` so callers that don't use the replicator entry see no change.
@@ -537,7 +538,8 @@ These are the two explicit non-goals locked in [ADR-0034](../specs/adr/0034-pip-
 
 - **Unit / proto**: 11 tests in `crates/magnetar-proto/src/markers.rs` + `…/src/conn.rs` cover the decoder, the filter, and the `CommandSubscribe` wire field.
   Run via `cargo test -p magnetar-proto`.
-- **Runtime parity (ADR-0024)**: 5 tokio + 5 moonpool integration tests under `crates/magnetar-runtime-{tokio,moonpool}/tests/replicated_subscriptions.rs` with identical names — verified by `cargo run -p xtask -- check-runtime-test-parity`.
+- **Runtime parity (ADR-0024)**: 6 tokio + 6 moonpool integration tests across `crates/magnetar-runtime-{tokio,moonpool}/tests/replicated_subscriptions.rs` (5) + `crates/magnetar-runtime-{tokio,moonpool}/tests/marker_lost_wakeup.rs` (1, enroll-before-drain lost-wakeup twin), with identical names — verified by `cargo run -p xtask -- check-runtime-test-parity`.
+- **Moonpool-only sim harness**: `crates/magnetar-runtime-moonpool/tests/replicated_subscriptions_sim.rs` drives the delayed-marker `SimProviders` harness under the enroll-before-drain discipline; parity-exempt (no tokio twin) per ADR-0024.
 - **Differential**: 2 equivalence tests at `crates/magnetar-differential/tests/replicated_subscriptions_equivalence.rs` assert tokio ↔ moonpool produce the same `EventStream` + byte-identical `CommandSubscribe`.
 - **End-to-end**: 2 tests at `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the two-cluster Docker fixture: cursor-resume across a cluster failover, and remote materialization of the replicated subscription once the acked position crosses a snapshot window.
   The client-side marker observation channel is exercised by the scripted sim suites only — real Pulsar dispatchers filter `REPLICATED_SUBSCRIPTION_*` marker entries off consumer delivery, so an e2e can never observe one.

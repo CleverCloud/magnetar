@@ -796,6 +796,19 @@ pub struct SubscribeRequest {
     /// caller; `Discard` silently drops the message; `Consume` delivers the encrypted
     /// ciphertext as-is.
     pub crypto_failure_action: CryptoFailureAction,
+    /// Mirrors Java `ConsumerBuilder#maxPendingChunkedMessage` (default `10`).
+    /// Bounds the number of distinct incomplete chunked messages the consumer
+    /// buffers; on breach the oldest is evicted. `0` disables the cap.
+    pub max_pending_chunked_message: usize,
+    /// Mirrors Java `ConsumerBuilder#autoAckOldestChunkedMessageOnQueueFull`
+    /// (default `false`). When `true`, an evicted/expired partial's first-chunk
+    /// id is acked before drop; when `false`, it is dropped without acking so
+    /// the broker redelivers the whole message.
+    pub auto_ack_oldest_chunked_message_on_queue_full: bool,
+    /// Mirrors Java `ConsumerBuilder#expireTimeOfIncompleteChunkedMessage`
+    /// (default `60s`). Incomplete chunked messages older than this are swept
+    /// on the connection's existing timeout tick. `None` disables expiry.
+    pub expire_time_of_incomplete_chunked_message: Option<Duration>,
 }
 
 /// PIP-4 decryption failure handling. Mirrors Java
@@ -865,6 +878,11 @@ impl Default for SubscribeRequest {
             ack_timeout_backoff: None,
             ack_group_time: None,
             crypto_failure_action: CryptoFailureAction::Fail,
+            max_pending_chunked_message: crate::consumer::DEFAULT_MAX_PENDING_CHUNKED_MESSAGE,
+            auto_ack_oldest_chunked_message_on_queue_full: false,
+            expire_time_of_incomplete_chunked_message: Some(
+                crate::consumer::DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE,
+            ),
         }
     }
 }

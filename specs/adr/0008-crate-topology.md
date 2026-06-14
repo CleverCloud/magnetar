@@ -5,6 +5,8 @@
 - **Decider**: Florentin Dubois
 - **Tags**: workspace, dependency-direction, packaging
 
+> **Amendment (2026-06-14)**: the workspace has since grown to 12 crates plus `xtask` (the 12th is `magnetar-differential`, the tokio↔moonpool EventStream-equivalence harness); see `CLAUDE.md` and `ARCHITECTURE.md#crate-topology` for the current canonical listing.
+
 ## Context
 
 We could have shipped magnetar as a single crate with feature flags.

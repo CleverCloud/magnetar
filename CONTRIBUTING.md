@@ -51,7 +51,7 @@ MOONPOOL_SEED=0xdeadbeef cargo test -p magnetar-runtime-moonpool \
 E2e tests (require Docker; auto-pulls `apachepulsar/pulsar:4.0.4`):
 
 ```
-cargo test --workspace --features e2e -- --include-ignored
+cargo test --workspace --all-features
 ```
 
 ## Commit hygiene
