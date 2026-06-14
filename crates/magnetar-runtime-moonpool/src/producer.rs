@@ -554,7 +554,7 @@ impl<P: Providers> Producer<P> {
                 // Expected anomaly surfaced as `Err` to the caller —
                 // `debug!` per ADR-0054 §2.1.
                 tracing::debug!(error = %err, "send rejected by producer state machine");
-                // ADR-0059 / follow-ups §4.1: `fail_all_pending` flips the
+                // ADR-0059: `fail_all_pending` flips the
                 // per-slot `closed` flag on a terminal drop, so a send issued
                 // AFTER a plain connection went terminal fast-fails here. The
                 // proto-layer `ProducerSlot::queue_send` collapses the inner
@@ -641,7 +641,7 @@ impl<P: Providers> Producer<P> {
     /// - [`ClientError::Broker`] if the broker returns an error correlated with the close.
     /// - [`ClientError::Other`] if an unexpected outcome arrives on the close request id.
     pub async fn close(self) -> Result<(), ClientError> {
-        // ADR-0059 / follow-ups §4.1: a `producer.close()` issued after a plain
+        // ADR-0059: a `producer.close()` issued after a plain
         // connection has gone terminal with no driver would register a
         // `CommandCloseProducer` request that never resolves (no driver left).
         // Fast-fail synchronously with `PeerClosed` instead. The guard fires
@@ -783,7 +783,7 @@ impl<P: Providers + Send + Sync> Client<P> {
         // `ProxyUnsupportedOnUnsupervisedClient`.
         let (target, landed_on) = self.lookup_topic_target(&req.topic).await?;
         let target_shared = self.resolve_target(&target, &landed_on, &req.topic).await?;
-        // ADR-0059 / follow-ups §4.1: the resolved data-plane connection may be
+        // ADR-0059: the resolved data-plane connection may be
         // a pool entry distinct from the bootstrap; fast-fail if it has already
         // gone terminal with no driver, before registering a doomed
         // `CommandProducer`. 1:1 with the tokio engine.

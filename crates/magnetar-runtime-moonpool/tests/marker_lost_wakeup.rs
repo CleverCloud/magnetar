@@ -52,7 +52,7 @@ impl Wake for CountingWaker {
     }
 }
 
-/// The primitive-level statement of the §5.1 bug and its fix (engine-agnostic).
+/// The primitive-level statement of the marker-lost-wakeup bug and its fix (engine-agnostic).
 ///
 /// `Notify::notify_waiters()` stores no permit: it only wakes waiters already
 /// enrolled at the instant it fires. A `Notified` constructed *after* a racing
@@ -74,7 +74,7 @@ fn enroll_before_drain_catches_notify_that_drain_then_enroll_loses() {
         let fut = pin!(notify.notified());
         assert!(
             fut.poll(&mut cx).is_pending(),
-            "drain-then-enroll loses the wakeup: the Notified must park (the §5.1 hang)"
+            "drain-then-enroll loses the wakeup: the Notified must park (the marker-lost-wakeup hang)"
         );
     }
 

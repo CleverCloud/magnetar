@@ -103,7 +103,7 @@ fn stable_socket_resets_persisted_backoff_to_initial() {
 
 #[test]
 fn give_up_budget_fires_behind_tcp_accepting_endpoint() {
-    // ADR-0061 / follow-ups §3.2: 1:1 twin of the tokio test
+    // ADR-0061: 1:1 twin of the tokio test
     // (`crates/magnetar-runtime-tokio/tests/supervisor_backoff_persistence.rs`).
     // Behind a TCP-accepting proxy whose backend is down, every dial succeeds
     // but the Pulsar handshake never completes, so each post-dial

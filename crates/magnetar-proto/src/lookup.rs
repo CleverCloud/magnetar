@@ -399,7 +399,7 @@ mod tests {
         assert!(matches!(out, LookupOutcome::Connect { .. }));
     }
 
-    /// ADR-0060 / follow-ups §4.1: the engine-side lookup-retry-on-`SessionLost`
+    /// ADR-0060: the engine-side lookup-retry-on-`SessionLost`
     /// loop is bounded by [`MAX_LOOKUP_SESSION_REISSUES`]. The const must be
     /// non-zero (at least one re-issue is allowed — otherwise a single transient
     /// reconnect would surface `PeerClosed` and defeat the whole point) and

@@ -919,7 +919,7 @@ impl Connection {
         // future. Take the per-slot lock, drain, DROP it, then wake.
         //
         // We ALSO flip the slot's `closed` flag inside this same per-slot lock
-        // scope (ADR-0059, follow-ups §4.1): a terminal drop is final, so a
+        // scope (ADR-0059): a terminal drop is final, so a
         // `queue_send` issued AFTER it must fast-fail synchronously with
         // `ProducerError::Closed` via the existing `if self.closed` guard
         // (`producer.rs`) instead of registering a doomed pending op that no
@@ -5680,7 +5680,7 @@ mod conn_state_tests {
         conn.fail_all_pending("peer closed");
     }
 
-    /// ADR-0059 / follow-ups §4.1: `fail_all_pending` must ALSO mark every
+    /// ADR-0059: `fail_all_pending` must ALSO mark every
     /// producer slot `closed` so a NEW `queue_send` issued AFTER the terminal
     /// drop fast-fails synchronously with `ProducerError::Closed` (via the
     /// existing per-slot `if self.closed` guard) instead of registering a
@@ -8518,7 +8518,7 @@ mod conn_state_tests {
         );
     }
 
-    /// ADR-0060 / follow-ups §4.1 (layer a): the proto-level surface the
+    /// ADR-0060 (layer a): the proto-level surface the
     /// engine-side bounded lookup-retry loop consults. An in-flight lookup
     /// severed by `reset()` surfaces `OpOutcome::SessionLost` (the signal to
     /// re-issue, NOT a terminal error), and after a fresh handshake the
@@ -8588,7 +8588,7 @@ mod conn_state_tests {
         );
     }
 
-    /// ADR-0060 / follow-ups §4.1 (layer a): the terminal short-circuit the
+    /// ADR-0060 (layer a): the terminal short-circuit the
     /// engine loop's `await_reconnect_or_terminal` returns. When the connection
     /// has gone `is_closed()` (here: a transport `Failed`) and the runtime's
     /// `no_driver` latch is set, the engine maps a severed lookup to a clean

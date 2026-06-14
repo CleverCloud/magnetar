@@ -599,7 +599,7 @@ impl<P: Providers> Client<P> {
 
     /// Issue one `CommandLookupTopic` against `shared` and await its terminal
     /// [`OpOutcome`], with the bounded `SessionLost` re-issue loop
-    /// (ADR-0060 / follow-ups §4.1). `redirect_budget` is `None` for the
+    /// (ADR-0060). `redirect_budget` is `None` for the
     /// user's first lookup (proto seeds the full cap) and `Some(hops)` for a
     /// redirect re-issue on a dialed target (proto clamps + re-checks the cap
     /// in `Connection::lookup_redirect`). 1:1 with the tokio engine's
@@ -611,12 +611,12 @@ impl<P: Providers> Client<P> {
         authoritative: bool,
         redirect_budget: Option<u8>,
     ) -> Result<OpOutcome, ClientError> {
-        // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
+        // ADR-0059: fast-fail BEFORE registering the lookup
         // when the connection is already terminal with no driver to recover it
         // — otherwise the caller hangs on a request no driver will resolve.
         shared.fail_if_no_driver()?;
 
-        // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
+        // ADR-0060: bounded lookup-retry on `SessionLost`.
         // `Connection::reset` (supervised reconnect) fails the in-flight lookup
         // with `OpOutcome::SessionLost` but does not re-issue it; on that, park
         // until the connection is live again (or terminal), then re-issue. The

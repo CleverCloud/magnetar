@@ -113,7 +113,7 @@ fn simulated_give_up_trace(cfg: &SupervisorConfig, socket_lifetimes: &[Duration]
 
 #[test]
 fn tokio_and_moonpool_engines_agree_on_give_up_sequence() {
-    // ADR-0061 / follow-ups §3.2, layer (d): both engines pull the
+    // ADR-0061, layer (d): both engines pull the
     // same `SupervisorConfig::should_give_up` + `should_reset_backoff` helpers
     // out of `magnetar-proto`, so running the shared decision trace twice with
     // identical inputs must produce the IDENTICAL give-up event sequence. A

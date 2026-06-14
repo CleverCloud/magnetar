@@ -270,7 +270,7 @@ struct SessionDeps {
     /// When `true`, the FIRST `CommandProducer` on a REDIAL session (a session
     /// that opened after [`Self::dropped_once`] latched) is answered with a
     /// TRANSIENT `ServiceNotReady` `CommandError` instead of a
-    /// `CommandProducerSuccess`, forcing the engine's §3.1 lookup-then-retry
+    /// `CommandProducerSuccess`, forcing the engine's lookup-then-retry
     /// leg; the retry's open is acked. A one-shot latch
     /// ([`Self::transient_reject_fired`]) gates it to a single rejection so the
     /// scenario is one deterministic transient → retry → recovery cycle.
@@ -340,7 +340,7 @@ pub struct ScriptedBroker {
     /// resume mode but do not drop. Reset by [`Self::clear_cross_session_state`].
     dropped_once: Arc<AtomicBool>,
     /// When `true`, the FIRST `CommandProducer` on a REDIAL session is answered
-    /// with a transient `ServiceNotReady` `CommandError`, exercising the §3.1
+    /// with a transient `ServiceNotReady` `CommandError`, exercising the
     /// lookup-then-retry leg on both engines. Armed by
     /// [`Self::transient_reject_first_redial_producer_open`] for the
     /// transient-retry equivalence scenario; the
@@ -497,7 +497,7 @@ impl ScriptedBroker {
         *self.drop_after.lock() = Some(n);
     }
 
-    /// Arm the transient-retry injection (follow-ups §3.1): the FIRST
+    /// Arm the transient-retry injection: the FIRST
     /// `CommandProducer` on a REDIAL session (any session that opens after the
     /// [`Self::drop_connection_after`] drop has latched) is answered with a
     /// transient `ServiceNotReady` `CommandError` ("Please redo the lookup")
@@ -714,7 +714,7 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
     // A session is a REDIAL session when the drop has ALREADY latched before
     // this session opened — snapshot the latch BEFORE the `drop_at` CAS below
     // claims it for the dropping session. The transient-retry knob only
-    // perturbs redial sessions (follow-ups §3.1).
+    // perturbs redial sessions.
     let is_redial = dropped_once.load(Ordering::SeqCst);
     let transient_reject_armed = is_redial && *deps.transient_reject_on_redial.lock();
     // This session drops only if the knob is armed AND it wins the one-shot
@@ -838,7 +838,7 @@ struct FrameInjections {
     corrupt_after_connected: bool,
     /// Answer the first `CommandSend` with a decode-fatal frame (ADR-0055 §1).
     decode_fatal_on_send: bool,
-    /// Transiently reject the first redial producer-open (follow-ups §3.1).
+    /// Transiently reject the first redial producer-open.
     transient_reject_armed: bool,
 }
 
@@ -887,7 +887,7 @@ fn handle_frame(
         }
         pb::base_command::Type::Producer => {
             if let Some(p) = &frame.command.producer {
-                // Transient-retry injection (follow-ups §3.1): on a redial
+                // Transient-retry injection: on a redial
                 // session, transiently reject the FIRST producer-open with
                 // `ServiceNotReady` ("Please redo the lookup") so the engine's
                 // lookup-then-retry leg fires; the `transient_reject_fired`
@@ -1423,7 +1423,7 @@ fn emit_producer_success(out: &mut BytesMut, request_id: u64, _topic: &str) {
 /// Encode a TRANSIENT `CommandError` (`ServiceNotReady` "Please redo the
 /// lookup") correlated with a producer-open `request_id`. The proto layer
 /// classifies `ServiceNotReady` as transient, RETAINS the producer state, and
-/// emits `ProducerOpenFailedTransient` so the engine's §3.1 lookup-then-retry
+/// emits `ProducerOpenFailedTransient` so the engine's lookup-then-retry
 /// leg fires instead of failing the open. Used by
 /// [`ScriptedBroker::transient_reject_first_redial_producer_open`].
 fn emit_transient_producer_error(out: &mut BytesMut, request_id: u64) {

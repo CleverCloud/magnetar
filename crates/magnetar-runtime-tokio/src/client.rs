@@ -468,7 +468,7 @@ impl Client {
         let (target, landed_on) = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
         let target_shared = self.resolve_target(target, &landed_on, &topic).await?;
-        // ADR-0059 / follow-ups §4.1: the resolved data-plane connection may be
+        // ADR-0059: the resolved data-plane connection may be
         // a pool entry distinct from the bootstrap; fast-fail if it has already
         // gone terminal with no driver, before registering a doomed
         // `CommandProducer`.
@@ -623,7 +623,7 @@ impl Client {
 
     /// Issue one `CommandLookupTopic` against `shared` and await its terminal
     /// [`OpOutcome`], with the bounded `SessionLost` re-issue loop
-    /// (ADR-0060 / follow-ups §4.1). `redirect_budget` is `None` for the
+    /// (ADR-0060). `redirect_budget` is `None` for the
     /// user's first lookup (proto seeds the full cap) and `Some(hops)` for a
     /// redirect re-issue on a dialed target (proto clamps + re-checks the cap
     /// in `Connection::lookup_redirect`).
@@ -634,12 +634,12 @@ impl Client {
         authoritative: bool,
         redirect_budget: Option<u8>,
     ) -> Result<OpOutcome, ClientError> {
-        // ADR-0059 / follow-ups §4.1: fast-fail BEFORE registering the lookup
+        // ADR-0059: fast-fail BEFORE registering the lookup
         // when the connection is already terminal with no driver to recover it
         // — otherwise the caller hangs on a request no driver will resolve.
         shared.fail_if_no_driver()?;
 
-        // ADR-0060 / follow-ups §4.1: bounded lookup-retry on `SessionLost`.
+        // ADR-0060: bounded lookup-retry on `SessionLost`.
         // `Connection::reset` (supervised reconnect) fails the in-flight lookup
         // with `OpOutcome::SessionLost` but does not re-issue it; on that, park
         // until the connection is live again (or terminal), then re-issue. The
@@ -691,7 +691,7 @@ impl Client {
 
     /// Translate a terminal lookup [`OpOutcome`] into a [`LookupTarget`] or a
     /// [`ClientError`]. Split out of [`Self::lookup_topic`] so the
-    /// bounded-retry loop (ADR-0060 / follow-ups §4.1) only re-runs the
+    /// bounded-retry loop (ADR-0060) only re-runs the
     /// issue-await steps; the `SessionLost` arm is handled by the loop before
     /// this is reached, so it never appears here.
     fn map_lookup_outcome(
@@ -1317,7 +1317,7 @@ impl Client {
         let (target, landed_on) = self.lookup_topic(&req.topic).await?;
         let topic = req.topic.clone();
         let target_shared = self.resolve_target(target, &landed_on, &topic).await?;
-        // ADR-0059 / follow-ups §4.1: fast-fail if the resolved data-plane
+        // ADR-0059: fast-fail if the resolved data-plane
         // connection is already terminal with no driver, before registering a
         // doomed `CommandSubscribe`.
         target_shared.fail_if_no_driver()?;

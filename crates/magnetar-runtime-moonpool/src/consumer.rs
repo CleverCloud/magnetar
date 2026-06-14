@@ -1240,7 +1240,7 @@ impl<P: Providers + Send + Sync> Client<P> {
         // `Proxy` branch through the per-broker pool inside `Client::resolve_target`.
         let (target, landed_on) = self.lookup_topic_target(&req.topic).await?;
         let shared = self.resolve_target(&target, &landed_on, &req.topic).await?;
-        // ADR-0059 / follow-ups §4.1: fast-fail if the resolved data-plane
+        // ADR-0059: fast-fail if the resolved data-plane
         // connection is already terminal with no driver, before registering a
         // doomed `CommandSubscribe`. 1:1 with the tokio engine.
         shared.fail_if_no_driver()?;

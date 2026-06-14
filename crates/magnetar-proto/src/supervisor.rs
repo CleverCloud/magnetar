@@ -134,8 +134,7 @@ impl SupervisorConfig {
         socket_alive > self.drop_grace
     }
 
-    /// Give-up policy gate for the engine drivers' reconnect budget (ADR-0061,
-    /// follow-ups §3.2).
+    /// Give-up policy gate for the engine drivers' reconnect budget (ADR-0061).
     ///
     /// Returns `true` once `attempts` post-drop dial+handshake attempts have
     /// been spent without landing a stable session — i.e. when the supervisor
