@@ -34,8 +34,8 @@
 //! - [`ScriptedBroker::drop_connection_after`] — the first session closes after writing N frames,
 //!   forcing a supervised client to redial. This one also turns on **resume mode**: the ledger,
 //!   per-topic entry-id sequence, and durable per-subscription cursor move into a cross-session
-//!   store (`CrossSession`) so the redialled session resumes from the acked position
-//!   (docs/follow-ups.md §4.2; ADR-0055 §3 shape). Reset both the knob and the persisted state with
+//!   store (`CrossSession`) so the redialled session resumes from the acked position (ADR-0055 §3
+//!   shape). Reset both the knob and the persisted state with
 //!   [`ScriptedBroker::clear_cross_session_state`] between legs that share one broker.
 
 use std::collections::HashMap;

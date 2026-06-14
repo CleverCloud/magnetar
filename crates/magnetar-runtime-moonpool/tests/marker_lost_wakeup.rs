@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! PIP-33 marker-accessor lost-wakeup regression (follow-ups.md §5.1) — moonpool
+//! PIP-33 marker-accessor lost-wakeup regression — moonpool
 //! engine twin of `crates/magnetar-runtime-tokio/tests/marker_lost_wakeup.rs`
 //! (ADR-0024 cross-runtime test parity, 1:1 test names).
 //!

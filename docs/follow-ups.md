@@ -19,15 +19,10 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                  | Status                                                                                                                                                                    |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                         | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460                                                                          |
-| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance)                                                      | 🧠 needs design decision                                                                                                                                                  |
-| 3   | [Reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix)                                      | 🟢 all four residuals closed (ADR-0061 give-up budget; moonpool transient arms; differential drop knob; send-loop hygiene)                                                |
-| 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix)                   | 🟢 closed — 3 test-state caveats resolved (admin-policy deflake; §5 marker fix covers the seed-13 flake; check-sim-coverage is a stale-base artifact that clears on push) |
-| 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)                                | 🟢 closed — enroll-before-drain marker-accessor fix (both engines, 1:1) + tls-chaos active-provider build gate                                                            |
-| 6   | [Lookup redirect chase ignores the redirect target](#6-lookup-redirect-chase-ignores-the-redirect-target)                             | 🟢 closed — engine-side redirect-target dialing (ADR-0039 amendment, 2026-06-14); Java `findBroker` parity                                                                |
-| 7   | [MessageListener on multi-topic / partitioned / pattern consumers](#7-messagelistener-on-multi-topic--partitioned--pattern-consumers) | 🟢 closed — wrapper-surface push delivery shipped (ADR-0064 extension); late-discovered pattern children inherit the listener                                             |
+| #   | Item                                                                             | Status                                                                                           |
+| --- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                    | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Log rate-limiting / sampling guidance](#2-log-rate-limiting--sampling-guidance) | 🧠 needs design decision                                                                         |
 
 ---
 
@@ -52,151 +47,12 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 
 **Gap.** [ADR-0054](../specs/adr/0054-logging-policy.md) §7 bounds log volume structurally — per-message records are confined to `trace!`/`debug!`, and `warn!` and above are bounded by churn, never by send throughput — but defines no rate-limiting or sampling story for when the churn itself storms (e.g. a broker-restart cascade emitting one `warn!` per reconnect attempt across many connections). sozu solves this with render-time sanitization in its own logger; `tracing` has no built-in per-callsite rate limit, so the options are subscriber-side sampling (application-owned, zero library change), a documented filtering recipe, or library-side per-callsite rate limiting (which carries state per call site — exactly the "state not worth carrying for a log line" trade-off ADR-0054 leans against).
 
-(Closed residual: the `topic`-field-presence enforcement once parked here is subsumed by the `cargo run -p xtask -- check-log-fields` gate that shipped with ADR-0054.)
-
-(Closed residual: error/connect-error fields that embed peer-supplied text were not length-bounded. The one broker-text sink was the mid-handshake `CommandError.message`, stored unbounded in `Connection::handshake_failure_reason` and inherited by the tokio `ClientError::Other("handshake failed: …")` / moonpool `EngineError::HandshakeFailed` connect errors plus the adjacent `warn!`. Closed by [ADR-0059](../specs/adr/0059-broker-error-field-truncation.md): the broker text is truncated ONCE at the proto capture site via the existing `truncate_broker_str` (256 bytes, `char` boundary) BEFORE it is stored, so every downstream sink inherits the bound — completing ADR-0054 §3 for the sink its log-field-only phrasing missed; short messages still round-trip verbatim. The audit confirmed the supervisor reconnect-failed `error = %err` sites wrap LOCAL errors (dial / TLS / DNS / URL-parse / `ProtocolError`), not broker text, so they are correctly left unbounded. The same changeset fixed a tokio capture-vs-terminal-drop race where a broker `CommandError`-then-socket-drop surfaced the opaque `"peer closed the connection"` instead of the captured reason. Request-correlated `ClientError::Broker { message }` (a post-handshake error path) is left for a separate decision. See the `fix(proto,runtime)` commit.)
-
-## 3. Reconnect parity residuals (surfaced by the re-attach replay fix)
-
-**Gap.** Fixing the `e2e_reconnect` livelock (replay/flow gated on broker acks, snapshot-window waker routing — see the `fix(proto)` commit in the ADR-0054 series) surfaced four adjacent residuals, none blocking that fix. All four are now closed.
-
-(Closed residual: supervisor give-up semantics behind TCP-accepting proxies — the dial-loop `max_attempts` budget only counted TCP-dial failures; the `attempt` counter was declared per OUTER supervisor iteration and checked only inside the inner TCP-dial loop, so a post-dial handshake failure returned up to the outer loop, which reset `attempt` to 0. Behind a docker-proxy / LB that accepts TCP while the backend is down — the exact storm class the anti-thrash supervision was built for — the dial always succeeded and the handshake never completed, so the budget NEVER fired and a finite `max_attempts` retried forever.
-Closed by [ADR-0061](../specs/adr/0061-supervisor-give-up-counts-handshake-failures.md): the give-up counter is hoisted to span the FULL dial+handshake cycle via the new sans-io `SupervisorConfig::should_give_up(attempts)` policy gate (zero-I/O, ADR-0004), and resets to 0 ONLY on `should_reset_backoff` (a socket surviving `drop_grace`) — so give-up-reset and backoff-reset share ONE stability definition; every post-dial failure counts uniformly (Java parity).
-The pre-handshake `"supervisor: reconnected to broker"` info log is relabelled `"supervisor: TCP connected; handshaking"`, with a TRUE reconnect-success info log after the handshake actually completes. **Breaking** for callers with a finite `max_attempts` (default `None`/infinite is unaffected; flagged `BREAKING CHANGE:` in the commit).
-The four-layer + e2e coverage lands in the same changeset: proto unit `give_up_{fires_at_budget_behind_tcp_accept,counter_resets_on_socket_surviving_drop_grace,never_fires_with_default_infinite_max_attempts,boundary_is_strict_greater_than}`, the tokio + moonpool 1:1 `give_up_budget_fires_behind_tcp_accepting_endpoint` (extending `supervisor_backoff_persistence.rs`), the differential `tokio_and_moonpool_engines_agree_on_give_up_sequence`, and the e2e `e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint` (a localhost handshake-failing stub-acceptor, since a real broker always completes the handshake).
-See the `feat(proto,runtime)!` commit.)
-
-(Closed residual: the moonpool transient-retry arms were missing — the moonpool driver never consumed `ProducerOpenFailedTransient` / `SubscribeFailedTransient`, so a post-restart broker answering a rebuild with `ServiceNotReady` dead-ended the re-attach on the moonpool engine while the tokio driver recovered via its lookup-then-retry leg.
-Closed by wiring the matching arms into the moonpool driver: `handle_pending_events` drains each transient event into a `RetryRequest`, and the generic `driver_loop_inner` dispatches each one as a detached task through the engine's `TaskProvider` + `TimeProvider` — the delayed lookup + `retry_producer_open` / `retry_consumer_subscribe` sleeps on the INJECTED clock, never a host `tokio::time::sleep`, so the leg stays deterministic under `SimProviders` (ADR-0011) and its detached-spawn serialization matches the tokio engine's `tokio::spawn` so the differential `EventStream` order is identical (ADR-0024).
-The broker `message` field is truncated via `truncate_broker_str` on the new `warn!` arms.
-The four-layer + e2e coverage lands in the same changeset: proto unit `command_error_on_{producer_open,subscribe}_emits_*_transient` (pre-existing), the dedicated tokio `producer_open_recovers_after_transient_reject`, the moonpool virtual-time `transient_producer_open_retry_fires_under_virtual_time` (advances the sim clock and observes the retry fire — the structural determinism proof `check-no-internal-clock` cannot give), the differential `drop_redial_with_transient_reject_is_equivalent_across_engines` (event-ORDER parity via `ScriptedBroker::transient_reject_first_redial_producer_open`), and the moonpool-engine e2e `e2e_moonpool_transient_producer_open_retry_across_broker_restart`.
-See the `feat(runtime-moonpool)` commit.)
-
-(Closed residual: the differential harness had no connection-drop knob — `ScriptedBroker` accepted multiple sessions but could not script a mid-scenario drop + redial, so the re-attach replay fix carried proto-unit + 1:1 runtime-pair + e2e layers with the differential layer justified-out.
-Closed by `ScriptedBroker::drop_connection_after`, a cross-session ledger + durable per-subscription cursor that survives the redial, supervised runner entry points, and the `reconnect_replay_gating_equivalence` differential scenario asserting tokio ↔ moonpool `EventStream` parity in event order with resume-from-acked-cursor — see the `test(differential)` commit.
-The harness reset is `ScriptedBroker::clear_cross_session_state`, with a `broker_smoke` guard that two back-to-back legs each start from an empty ledger.)
-
-(Closed residual: the `e2e_reconnect` send-loop hygiene gap — unbounded `send().await` turning environmental broker death into an infinite hang — was fixed in the same series after a crashed standalone container hung the validation chain for 20 hours; each send attempt is now timeout-bounded.)
-
-**Status.** All four §3 residuals are now closed (see the closed-residual notes above): supervisor give-up semantics (ADR-0061), the moonpool transient-retry arms, the differential connection-drop knob, and the `e2e_reconnect` send-loop hygiene gap.
-No reconnect-parity work remains here.
-
 **Why it stays open.** Needs a design decision on where the mechanism lives (subscriber vs library) before any guidance is written; picking the library side adds per-callsite state and an API surface that the subscriber side gets for free.
 
 **`/goal` (once the design question is settled).**
 
 ```text
 /goal design and document rate-limiting / sampling guidance for magnetar log output per docs/follow-ups.md §2. Decide subscriber-side (document a tracing-subscriber filtering/sampling recipe in docs/logging.md, zero library change) vs library-side (per-callsite rate limiting — justify the added state against ADR-0054 §7). Land the guidance in docs/logging.md and, if the decision is binding, a short ADR-0054 amendment per specs/README.md procedure. Validation chain per CLAUDE.md (docs-only exemption applies if no code changes).
-```
-
----
-
-## 4. Survivability residuals (surfaced by the ADR-0055 bit-flip fix)
-
-> **✅ Closed 2026-06-14.** All three test-state caveats are resolved: the admin-policy retention round-trip is deflaked (the `test(admin)` commit polls topic-policy reads until they propagate on Pulsar 4.0.4), the seed-13 marker flake gains deterministic coverage from the §5 enroll-before-drain fix, and the `check-sim-coverage` ~77-line report is a stale-base artifact (gate diffs vs `origin/main`, which lags the unpushed stack) that clears on push — per-changeset coverage is verified via `--base main`. The engine residuals were already closed by ADR-0059 / ADR-0060. (Historical detail below.)
-
-**Finding.** PR #218's `seed-replay` failure was not `a02f401`'s logic and not a moonpool delivery bug.
-It was moonpool's default-on FoundationDB bit-flip chaos corrupting a Pulsar _command_ frame — which TCP would never deliver in production, since only message payloads carry CRC32C — and `a02f401`'s write-schedule shift happened to land that flip on the two ADR-0038 anchor seeds.
-[ADR-0055](../specs/adr/0055-bit-flip-survivability-model.md) makes corruption _survivable_ instead of disabling the chaos: a plain connection fails its in-flight ops fast (`PeerClosed`) instead of hanging, and the chaos workloads run supervised over a broker that persists its ledger + per-subscription cursor across reconnects.
-Both anchor seeds (`0x56201ccaba82dbc1`, `0xdc638c565234d23f`) are green.
-
-**Gap.** Both engine residuals are now closed; no survivability work remains here.
-
-(Closed residual: lookup `SessionLost` was not transparently re-issued — a transient `SessionLost` on the in-flight `CommandLookupTopic` behind `subscribe` / `open_producer` during a supervised reconnect surfaced to the caller as `ClientError::Other("unexpected lookup outcome: SessionLost…")`, because `Connection::reset` re-issues in-flight publishes and re-subscribes consumers but does **not** re-issue the lookup.
-Closed by [ADR-0060](../specs/adr/0060-lookup-retry-on-session-lost.md): both engines' `lookup_topic` now park on `ConnectionShared::await_reconnect_or_terminal` — a `driver_waker` wake-or-terminal readiness check, no clock read — and re-issue the lookup against the freshly-handshaked session, bounded by the new proto const `MAX_LOOKUP_SESSION_REISSUES` (next to `MAX_LOOKUP_REDIRECTS`); a terminal `SessionLost` (supervisor gave up → `no_driver` latched, composing with ADR-0059) short-circuits to `PeerClosed`.
-`reset`'s `SessionLost` emission is untouched; mirrors Java's lookup-after-reset.
-See the `feat(proto,runtime)` commit and the extended `e2e_reconnect.rs` subscribe-during-reconnect assertion.)
-
-(Closed residual: terminal-state fast-fail for NEW ops — a `producer.send()` / `subscribe()` / `producer.close()` / `lookup` issued AFTER a plain connection was already terminal used to register a doomed pending op that hung, since `fail_all_pending` terminalized only the ops pending AT the drop.
-Closed by [ADR-0059](../specs/adr/0059-terminal-fast-fail-new-ops.md): `fail_all_pending` now flips each producer slot's `closed` flag inside its existing per-slot lock scope so a post-terminal `queue_send` fast-fails through the existing `if self.closed` guard; a runtime `ConnectionShared::no_driver` `AtomicBool` latch — set on both the plain driver's terminal exit and the supervisor give-up path, 1:1 across engines — drives synchronous `fail_if_no_driver()` guards at `open_producer` / `subscribe` / `lookup` / `producer.close()` returning `PeerClosed` only when `is_closed()` AND `no_driver`, so a supervised connection's transient `Failed` reconnect window is never wrongly `PeerClosed`d — see the `feat(proto,runtime)` commit and the `e2e_terminal_exit.rs` scope-note removal.)
-
-**Test-state caveats** — NOT caused by this change (the diff touches no `magnetar-admin` or replicated-subscription code), flagged so the next reader is not surprised that a full `--all-features` run is not 100% green:
-
-- **`e2e_admin_topic_policies_breadth` fails on `apachepulsar/pulsar:4.0.4`** (a `retention = -1` round-trip).
-  Pre-existing — reproduces on the base branch, unrelated to ADR-0055.
-  It keeps the full `cargo test --workspace --all-features` run (and the per-PR `test` CI job) red until addressed separately; this is a `magnetar-admin` / Pulsar-version concern, not a survivability one.
-- **Seed-13 `replicated_subscriptions::consumer_emits_marker_observation_in_order` flake.** Pre-existing seed-flakiness (passes on re-run and in isolation).
-  The deterministic `sim_chaos` surface this change edits is clean on every seed `1..32`.
-  See [§5.1](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes) — this flake is plausibly the latent lost-wakeup race in the marker accessor, surfaced by the seed-sweep work.
-- **`check-sim-coverage` reports ~77 uncovered lines.** The diff is computed vs `origin/main`, so it bundles the prior terminal-outcome commit plus line-number-shift artifacts of pre-existing code; the behavioral lines this change adds (the `Closed → PeerClosed` waiter mappings, the decode-fatal broker hook, the fatal-on-send arm) are exercised by the new differential + integration tests.
-  The gate is local-first / scheduled-CI (it short-circuits on `main`); dispatch it from a feature branch for true patch gating once `feat/logging` lands on `main`.
-
-**Progress on [§3 reconnect parity residuals](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).**
-The ADR-0055 change added a corrupt-frame injection to the differential `ScriptedBroker` (`inject_decode_fatal_frame_on_send`).
-The mid-scenario **drop + redial** knob that residual asked for has since landed: `ScriptedBroker::drop_connection_after` + a cross-session ledger / durable cursor + the `reconnect_replay_gating_equivalence` differential scenario (see the `test(differential)` commit and the closed-residual note under §3).
-
-**Why it stays open.** It does not — both engine survivability residuals (terminal fast-fail for new ops; lookup-retry-on-`SessionLost`) are closed by ADR-0059 and ADR-0060.
-What remains under §4 is the three pre-existing test-state caveats above, which are suite issues / gate mechanics, not survivability work.
-
----
-
-## 5. Residuals surfaced by the moonpool seed-sweep fixes
-
-> **✅ Closed 2026-06-14.** Both residuals shipped in the `fix(runtime)` enroll-before-drain commit. §5.1 arms the marker `Notify` _before_ the `pop_front()`/`is_closed()` drain in both engines (1:1), mirroring `await_reconnect_or_terminal`; the single-threaded cooperative moonpool sim cannot split the sub-poll cross-thread gap, so the deterministic FAIL-on-main discriminator is a Notify-mechanism unit test, with the SimProviders delayed-marker harness as positive coverage. §5.2 derives the active crypto provider in `tls_handshake_chaos.rs` (validated across all 16 `check-crypto-matrix` cells). (Historical detail below.)
-
-Found while reproducing and fixing the daily-sweep `seed-failure` issues (the `fix/moonpool-seed-sweep-fixes` series: post-dial handshake timeout, progress-based keepalive watchdog [ADR-0058](../specs/adr/0058-keepalive-watchdog-progress-based.md), anti-thrash cooldown gating, memory-limit live-connection gating).
-Neither residual blocks that series.
-
-1. **Replicated-subscription marker accessor lost-wakeup race (latent).**
-   `Client::next_replicated_subscription_marker` (tokio `crates/magnetar-runtime-tokio/src/client.rs`, moonpool `crates/magnetar-runtime-moonpool/src/client.rs`) loops `pop_front()` → `is_closed()` → `notified().await`, enrolling the `Notify` waiter _after_ the empty check; the driver pushes the observation then calls `notify_waiters()`, which stores no permit, so a marker delivered in that gap is lost and the future hangs.
-   This is the exact shape already fixed for `SubscribeAckedFut` at `crates/magnetar-runtime-moonpool/src/consumer.rs:1494-1505`.
-   It is real by inspection but not currently seed-reproducible: the `replicated_subscriptions` suite runs over real-TCP `TokioProviders`, not `SimProviders`, so it is non-deterministic and never drives the parked-waiter gap — which is why issue #157's seed passes on `main` and the [§4](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) "seed-13 marker flake" caveat only manifests intermittently.
-   Fix: the enroll-before-drain idiom already used at `producer.rs:510-513`, mirrored 1:1 across both engines; a deterministic regression test needs a new `SimulationBuilder` / `SimProviders`-driven `replicated_subscriptions` harness with a delayed-marker broker.
-
-2. **`tls_handshake_chaos.rs` hardcodes the ring crypto provider (build gap).**
-   `crates/magnetar-runtime-tokio/tests/tls_handshake_chaos.rs:23` calls `rustls::crypto::ring::default_provider()` with no `#[cfg(feature = "crypto-ring")]` gate, so `cargo build` / `test` / `clippy -p magnetar-runtime-tokio --no-default-features --features crypto-aws-lc-rs` fails to compile (`E0433`) — the single-provider feature set the moonpool sweep and the per-PR `seed-replay` job use.
-   Pre-existing (reproduces on the base branch); it blocks a single-provider tokio test build but is unrelated to any seed fix.
-   Fix: gate the test on `crypto-ring`, or derive the provider from the active feature like the rest of the tokio TLS surface.
-
-**Partial progress on [§3.3](#3-reconnect-parity-residuals-surfaced-by-the-re-attach-replay-fix).**
-The handshake-timeout fix bounds the post-dial CONNECT→CONNECTED handshake by `operation_timeout` (surfacing `Io(TimedOut)` instead of hanging when a broker accepts TCP but never answers `CommandConnect`), so a wedged handshake now fails fast; the §3.3 budget-counting residual (handshake failures restart the dial cycle with `attempt = 1`) is unchanged.
-
-**Why it stays open.** §5.1 is an engine concurrency fix with its own ADR-0024 obligations plus a new SimProviders harness; §5.2 is a one-line test feature-gate.
-
-**`/goal` (marker lost-wakeup §5.1).**
-
-```text
-/goal fix the replicated-subscription marker accessor lost-wakeup race per docs/follow-ups.md §5.1. Move the replicated_subscription_marker_notify.notified() enrollment BEFORE the pop_front()/is_closed() drain in next_replicated_subscription_marker in both engines (the producer.rs:510-513 enroll-before-drain idiom), keeping tokio and moonpool at 1:1. Ship the four ADR-0024 layers INCLUDING a new SimProviders/SimulationBuilder-driven replicated_subscriptions harness with a delayed-marker broker that deterministically parks the waiter before the marker arrives. Validation chain per CLAUDE.md.
-```
-
----
-
-## 6. Lookup redirect chase ignores the redirect target
-
-**Status.** Closed by the [ADR-0039](../specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md) "redirect-target dialing" amendment (2026-06-14).
-
-**Gap (closed).** Surfaced by the PIP-33 two-cluster fixture work: on `LookupType::Redirect` the proto layer used to re-issue the lookup **on the same connection** (the `lookup redirected; chasing internally` path in `crates/magnetar-proto/src/conn.rs`), ignoring the redirect's `broker_service_url`.
-Against any cluster whose broker redirects to a **different** broker, the chase asked the same broker the same question until the `MAX_LOOKUP_REDIRECTS` cap (5 hops) tripped — `ClientError::Broker { message: "lookup redirect cap exceeded …" }` within milliseconds.
-Single-broker clusters (the testcontainers e2e brokers, the fixed PIP-33 fixture) only ever self-redirect, where same-connection re-issue was coincidentally correct — which is why nothing else caught this.
-
-**How it was closed.** `magnetar-proto` now surfaces a **driveable** `LookupOutcome::Redirected { broker_service_url, broker_service_url_tls, authoritative, hops_remaining }` instead of chasing on the bootstrap socket, and both engines consume it: they dial the redirect-target broker (reusing `resolve_direct_broker` / the per-broker `ProxyConnectionPool`) and re-issue the lookup THERE via the new `Connection::lookup_redirect(topic, authoritative, hops_remaining)` — Java `BinaryProtoLookupService#findBroker` parity. The `MAX_LOOKUP_REDIRECTS` cap is threaded as plain data and enforced end-to-end (proto translate floor + proto-side clamp in `lookup_redirect` + engine-side guard). Shipped with all four ADR-0024 layers — proto unit (`crates/magnetar-proto/src/conn.rs`, `crates/magnetar-proto/src/lookup.rs`), tokio + moonpool integration twins (`crates/magnetar-runtime-{tokio,moonpool}/tests/lookup_redirect_chain.rs`, a genuine two-broker A→B dial topology), a differential two-broker dial parity scenario (`crates/magnetar-differential/tests/lookup_redirect_chain_equivalence.rs`), and an e2e (`crates/magnetar/tests/e2e_lookup_redirect_chain.rs`). The moonpool `ProxyConnectionPool` dials redirect targets the same way as tokio (`docs/follow-ups.md §3` parity), so no §3 residual remained for this path.
-
----
-
-## 7. MessageListener on multi-topic / partitioned / pattern consumers
-
-> **How it closed.** `MultiTopicsConsumer` / `PartitionedConsumer` / `PatternConsumer` now expose `message_listener(...)` + `subscribe_with_listener()` via a second poller (`spawn_wrapper_message_listener` over the new `WrapperReceiver` trait) with a `Fn(&str, &IncomingMessage)` callback (topic routes the explicit ack); ADR-0064 semantics preserved (sequential, in-order, no-auto-ack, clean shutdown). Late-discovered pattern/partition children inherit the listener via a membership-change `Notify` (Java `MultiTopicsConsumerImpl` parity). (Historical detail below.)
-
-**Status.** ✅ Closed 2026-06-14 — wrapper-surface push delivery shipped (`feat(consumer)`; ADR-0064 wrapper-surface extension).
-
-**Shipped.** Consumer-side push delivery (Java `ConsumerBuilder#messageListener`) landed on the two single-topic builder surfaces ([ADR-0064](../specs/adr/0064-consumer-message-listener-push-delivery.md)): `ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (delivers `IncomingMessage`) and `TypedConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (delivers a decoded `TypedMessage<S>`). Delivery is sequential, in order, no-auto-ack, with clean shutdown on consumer close / handle drop — see the ADR for the full semantics.
-
-**Gap.** `MultiTopicsConsumer`, `PartitionedConsumer`, and `PatternConsumer` do **not** yet expose `message_listener(...)`. Java routes their per-child consumers through the same listener executor, so the parity target is "fan a poller over each child and deliver the wrapper message".
-
-**Why it stays open.** The single-topic poller (`crate::consumer_listener::spawn_listener_loop`) is bound to `ConsumerApi`, whose `receive()` yields a `magnetar_proto::IncomingMessage`. The wrapper consumers are **not** `ConsumerApi`: their `receive()` returns the topic-tagged wrapper types (`MultiTopicsMessage` / `PatternMessage`, `IncomingMessage` + originating `topic`), and `PatternConsumer` additionally reconciles its child set on `TopicListChanged` deltas. Supporting them cleanly needs a second poller abstraction over `async fn receive() -> Result<WrapperMsg, PulsarError>` plus a decision on whether a newly-discovered pattern child inherits the listener. Bolting that onto this changeset would widen the cross-runtime test surface (ADR-0024) for a non-load-bearing parity edge. The single-topic surfaces cover the common case; multi-topic push delivery is a follow-up.
-
-**`/goal` block (copy-paste verbatim into a fresh session):**
-
-```
-/goal Add message_listener(...) push delivery to MultiTopicsConsumer, PartitionedConsumer, and
-PatternConsumer, matching ADR-0064's single-topic semantics (sequential, in-order, no-auto-ack,
-clean shutdown). Add a wrapper-message poller alongside crate::consumer_listener::spawn_listener_loop
-that drives each surface's own async receive() (yielding MultiTopicsMessage / PatternMessage) instead
-of ConsumerApi::receive(). Decide and document whether a pattern child discovered after subscribe
-inherits the listener. Ship all four ADR-0024 layers (proto N/A — runtime-only; tokio + moonpool
-integration twins keeping check-runtime-test-parity 1:1; a differential sequence-equivalence test;
-an e2e under crates/magnetar/tests/e2e_*.rs) plus a builder-surface wiring test. Flip the README
-parity-matrix MessageListener note to cover the wrapper surfaces and remove follow-ups.md §7.
 ```
 
 ---

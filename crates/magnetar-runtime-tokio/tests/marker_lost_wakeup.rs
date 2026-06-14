@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! PIP-33 marker-accessor lost-wakeup regression (follow-ups.md §5.1).
+//! PIP-33 marker-accessor lost-wakeup regression.
 //!
 //! `Client::next_replicated_subscription_marker` used to drain the buffer and
 //! re-check `is_closed()` *before* enrolling on

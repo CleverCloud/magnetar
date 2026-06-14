@@ -2,7 +2,7 @@
 
 //! PIP-33 (replicated subscriptions, ADR-0034) — deterministic
 //! `SimProviders` / `SimulationBuilder` regression for the marker-accessor
-//! lost-wakeup race (follow-ups.md §5.1).
+//! lost-wakeup race.
 //!
 //! The real-TCP `replicated_subscriptions.rs` suite runs over
 //! `TokioProviders` (multi-threaded, non-deterministic) so it never drives the

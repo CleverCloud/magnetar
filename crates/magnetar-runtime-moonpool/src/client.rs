@@ -868,7 +868,7 @@ impl<P: Providers> Client<P> {
     /// `replicated_subscription_marker_notify.notify_waiters()`, which stores no permit)
     /// between the drain and the park is captured by this already-armed waiter rather than
     /// lost. The previous drain-then-`notified().await` shape hung whenever the marker
-    /// landed in that gap (follow-ups.md §5.1; same race fixed for `SubscribeAckedFut`).
+    /// landed in that gap (same race fixed for `SubscribeAckedFut`).
     /// No channel (ADR-0003), no virtual-clock read (ADR-0011). 1:1 mirror of the tokio
     /// engine.
     pub async fn next_replicated_subscription_marker(

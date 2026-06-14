@@ -538,7 +538,8 @@ These are the two explicit non-goals locked in [ADR-0034](../specs/adr/0034-pip-
 
 - **Unit / proto**: 11 tests in `crates/magnetar-proto/src/markers.rs` + `…/src/conn.rs` cover the decoder, the filter, and the `CommandSubscribe` wire field.
   Run via `cargo test -p magnetar-proto`.
-- **Runtime parity (ADR-0024)**: 5 tokio + 5 moonpool integration tests under `crates/magnetar-runtime-{tokio,moonpool}/tests/replicated_subscriptions.rs` with identical names — verified by `cargo run -p xtask -- check-runtime-test-parity`.
+- **Runtime parity (ADR-0024)**: 6 tokio + 6 moonpool integration tests across `crates/magnetar-runtime-{tokio,moonpool}/tests/replicated_subscriptions.rs` (5) + `crates/magnetar-runtime-{tokio,moonpool}/tests/marker_lost_wakeup.rs` (1, enroll-before-drain lost-wakeup twin), with identical names — verified by `cargo run -p xtask -- check-runtime-test-parity`.
+- **Moonpool-only sim harness**: `crates/magnetar-runtime-moonpool/tests/replicated_subscriptions_sim.rs` drives the delayed-marker `SimProviders` harness under the enroll-before-drain discipline; parity-exempt (no tokio twin) per ADR-0024.
 - **Differential**: 2 equivalence tests at `crates/magnetar-differential/tests/replicated_subscriptions_equivalence.rs` assert tokio ↔ moonpool produce the same `EventStream` + byte-identical `CommandSubscribe`.
 - **End-to-end**: 2 tests at `crates/magnetar/tests/e2e_replicated_subscriptions.rs` against the two-cluster Docker fixture: cursor-resume across a cluster failover, and remote materialization of the replicated subscription once the acked position crosses a snapshot window.
   The client-side marker observation channel is exercised by the scripted sim suites only — real Pulsar dispatchers filter `REPLICATED_SUBSCRIPTION_*` marker entries off consumer delivery, so an e2e can never observe one.

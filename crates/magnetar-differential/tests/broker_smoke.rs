@@ -74,8 +74,8 @@ async fn tokio_client_handshakes() {
     eprintln!("[test] done");
 }
 
-/// Regression guard for the cross-session resume state (docs/follow-ups.md
-/// §4.2). The drop knob promotes the ledger + durable cursor out of the
+/// Regression guard for the cross-session resume state. The drop knob promotes
+/// the ledger + durable cursor out of the
 /// per-session state into a broker-level [`ScriptedBroker`] store shared by
 /// every session of one broker. The differential runner drives BOTH engine
 /// legs against ONE broker, so a leaked ledger would silently corrupt the

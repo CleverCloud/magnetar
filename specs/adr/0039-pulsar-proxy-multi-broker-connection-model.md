@@ -1,6 +1,6 @@
 # ADR-0039 — Per-broker connection pool for the Apache Pulsar Proxy
 
-- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing)
+- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing)
 - **Date**: 2026-05-27
 - **Decider**: Florentin Dubois
 - **Tags**: architecture, proxy, lookup, connection-pool, runtime
