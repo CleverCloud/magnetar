@@ -55,6 +55,11 @@ pub struct PartitionedConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     force_topic_creation: Option<bool>,
     start_message_rollback_duration_sec: Option<u64>,
     auto_update_partitions_interval: Option<std::time::Duration>,
+    /// Optional push-delivery callback (Java `ConsumerBuilder#messageListener` at
+    /// the partitioned scope). Set via [`Self::message_listener`] and subscribe via
+    /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores it.
+    /// Forwarded onto the underlying [`crate::MultiTopicsConsumerBuilder`].
+    listener: Option<crate::consumer_listener::WrapperMessageListener>,
 }
 
 impl<E: Engine> std::fmt::Debug for PartitionedConsumerBuilder<'_, E> {
@@ -93,7 +98,34 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
             auto_update_partitions_interval: None,
+            listener: None,
         }
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// `true` once a push-delivery listener has been set via
+    /// [`Self::message_listener`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_listener_for_test(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
+    /// at the partitioned scope). Once set, subscribe via
+    /// [`Self::subscribe_with_listener`] to start a background poller over the
+    /// per-partition consumer set, handing every message to `listener`
+    /// sequentially and in order, with no auto-ack. The callback receives the
+    /// originating partition topic so it can ack against the right child. The
+    /// plain [`Self::subscribe`] ignores the listener and returns a pull-mode
+    /// consumer.
+    #[must_use]
+    pub fn message_listener(
+        mut self,
+        listener: crate::consumer_listener::WrapperMessageListener,
+    ) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Required: set the subscription name (shared across every per-partition child consumer).
@@ -374,6 +406,46 @@ where
                 .auto_update_partitions_interval(interval)
                 .auto_update_base_topic(self.topic.clone());
         }
+        if let Some(listener) = self.listener {
+            builder = builder.message_listener(listener);
+        }
         builder.subscribe().await
+    }
+}
+
+impl<E> PartitionedConsumerBuilder<'_, E>
+where
+    E: Engine,
+    E::ClientState: SubscribeApi + crate::BrokerMetadataApi,
+    <E::ClientState as SubscribeApi>::Consumer: Clone + Send + Sync + 'static,
+{
+    /// Query the partition count, open one consumer per partition, and start a
+    /// push-delivery poller over the resulting [`PartitionedConsumer`], returning
+    /// the owning [`crate::MessageListenerHandle`]. Mirrors Java's
+    /// `ConsumerBuilder#messageListener(...)` + `subscribe()` against a
+    /// partitioned topic.
+    ///
+    /// Same semantics as [`crate::MultiTopicsConsumerBuilder::subscribe_with_listener`]:
+    /// sequential, in-order delivery across every partition, no auto-ack (the
+    /// callback acks via the topic-routed [`PartitionedConsumer::ack`]), clean
+    /// shutdown on consumer-set drain / handle drop.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - any subscribe / metadata-lookup error from [`Self::subscribe`].
+    pub async fn subscribe_with_listener(
+        self,
+    ) -> Result<crate::MessageListenerHandle, PulsarError> {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        Ok(crate::consumer_listener::spawn_wrapper_message_listener(
+            consumer, listener,
+        ))
     }
 }

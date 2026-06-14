@@ -139,6 +139,10 @@ The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` backgr
 It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
 Delivery is sequential and in order, the callback acks explicitly (the poller never auto-acks), and the task ends cleanly when `receive()` errors (closed consumer) or the returned `MessageListenerHandle` is dropped.
 
+The same push surface extends to the wrapper consumers — `MultiTopicsConsumer`, `PartitionedConsumer`, `PatternConsumer` — via a second poller (`spawn_wrapper_message_listener`) generic over the `WrapperReceiver` trait, since those are not `ConsumerApi` (their `receive()` yields a topic-tagged message).
+Its callback is `Fn(&str, &IncomingMessage)`: the originating topic is the extra argument so the callback can route an explicit ack to the right child.
+Pattern / partition children discovered **after** subscribe inherit the listener — each poller iteration races the in-flight `receive()` against a membership-change `Notify` the wrapper signals on every child add, so a child that joins while the poller is parked is swept on the next iteration (matching Java's parent-owns-the-listener model, where every child is created with `messageListener` `null`).
+
 ---
 
 ## Layering

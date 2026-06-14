@@ -111,7 +111,10 @@ pub use client::{
 #[cfg(feature = "tokio")]
 pub use client_builder::ClientBuilder;
 #[cfg(feature = "tokio")]
-pub use consumer_listener::{MessageListener, MessageListenerHandle, spawn_message_listener};
+pub use consumer_listener::{
+    MessageListener, MessageListenerHandle, WrapperMessageListener, WrapperReceiver,
+    spawn_message_listener, spawn_wrapper_message_listener,
+};
 #[cfg(feature = "tokio")]
 pub use multi_topics::{MultiTopicsConsumer, MultiTopicsConsumerBuilder, MultiTopicsMessage};
 #[cfg(feature = "tokio")]

@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Builder-surface completeness pin for the consumer push-delivery listener
-//! (`ConsumerBuilder::message_listener` / `TypedConsumerBuilder::message_listener`,
-//! ADR-0064).
+//! (`ConsumerBuilder::message_listener` / `TypedConsumerBuilder::message_listener`
+//! / the three wrapper builders, ADR-0064 + its wrapper-surface extension).
 //!
 //! A partial wiring would let `message_listener(...)` silently drop on one
-//! builder while the Java-parity matrix claims parity. This test drives the two
-//! supported builder surfaces and asserts:
+//! builder while the Java-parity matrix claims parity. This test drives every
+//! supported builder surface and asserts:
 //!
 //! 1. base `ConsumerBuilder` — `message_listener(...)` flips the listener slot (read via the
 //!    `#[doc(hidden)]` `has_listener_for_test()` seam); a default builder has no listener.
 //! 2. `TypedConsumerBuilder` — same, with a typed callback.
-//! 3. `subscribe_with_listener()` on a builder with **no** listener fails fast with
+//! 3. the three wrapper builders — `MultiTopicsConsumerBuilder`, `PartitionedConsumerBuilder`,
+//!    `PatternConsumerBuilder` — `message_listener(...)` flips the slot (wrapper callback shape
+//!    `Fn(&str, &IncomingMessage)`); a default builder has no listener.
+//! 4. `subscribe_with_listener()` on any builder with **no** listener fails fast with
 //!    `PulsarError::Config` (the missing-listener guard) — proving the push path refuses to
 //!    silently no-op.
 //!
@@ -29,7 +32,10 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use magnetar::proto::pb::command_subscribe::SubType;
-use magnetar::{IncomingMessage, MessageListener, PulsarClient, PulsarError, TypedMessageListener};
+use magnetar::{
+    IncomingMessage, MessageListener, PulsarClient, PulsarError, TypedMessageListener,
+    WrapperMessageListener,
+};
 use magnetar_proto::schema::StringSchema;
 use magnetar_proto::{FrameError, decode_one, encode_command, pb};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -106,7 +112,7 @@ async fn spawn_fake_broker() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn message_listener_wired_on_both_single_topic_builders() {
+async fn message_listener_wired_on_single_topic_and_typed_builders() {
     let addr = spawn_fake_broker().await;
     let client = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -153,7 +159,12 @@ async fn message_listener_wired_on_both_single_topic_builders() {
         "TypedConsumerBuilder::message_listener must set the listener slot"
     );
 
-    // 3. subscribe_with_listener() with no listener fails fast (guard).
+    // 3. subscribe_with_listener() with no listener on the single-topic builder fails fast with
+    //    `PulsarError::Config` (the missing-listener guard) — proving the push path refuses to
+    //    silently no-op.
+    // 4. subscribe_with_listener() with no listener fails fast (guard) — on the single-topic
+    //    builder AND each wrapper builder. The guard runs before any wire call, so no broker
+    //    round-trip is needed for these.
     let err = client
         .consumer("persistent://public/default/ml-nolistener")
         .subscription("g")
@@ -164,5 +175,116 @@ async fn message_listener_wired_on_both_single_topic_builders() {
     assert!(
         matches!(err, PulsarError::Config(_)),
         "missing listener must be a Config error, got: {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_listener_wired_on_wrapper_builders() {
+    let addr = spawn_fake_broker().await;
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        PulsarClient::builder()
+            .service_url(format!("pulsar://{addr}"))
+            .build(),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    // 3. The three wrapper builders — multi-topic / partitioned / pattern — each flip their
+    //    listener slot, and a default builder has none. The wrapper callback shape is `Fn(&str,
+    //    &IncomingMessage)` (topic + message).
+    let wrapper_noop: WrapperMessageListener = Arc::new(|_t: &str, _m: &IncomingMessage| {});
+
+    let multi = client
+        .multi_topics_consumer()
+        .topic("persistent://public/default/ml-multi")
+        .subscription("g")
+        .message_listener(wrapper_noop.clone());
+    assert!(
+        multi.has_listener_for_test(),
+        "MultiTopicsConsumerBuilder::message_listener must set the listener slot"
+    );
+    assert!(
+        !client
+            .multi_topics_consumer()
+            .topic("persistent://public/default/ml-multi-default")
+            .subscription("g")
+            .has_listener_for_test(),
+        "a MultiTopicsConsumerBuilder without message_listener() has no listener"
+    );
+
+    let partitioned = client
+        .partitioned_consumer("persistent://public/default/ml-part")
+        .subscription("g")
+        .message_listener(wrapper_noop.clone());
+    assert!(
+        partitioned.has_listener_for_test(),
+        "PartitionedConsumerBuilder::message_listener must set the listener slot"
+    );
+    assert!(
+        !client
+            .partitioned_consumer("persistent://public/default/ml-part-default")
+            .subscription("g")
+            .has_listener_for_test(),
+        "a PartitionedConsumerBuilder without message_listener() has no listener"
+    );
+
+    let pattern = client
+        .pattern_consumer()
+        .namespace("public/default")
+        .pattern("persistent://public/default/ml-pat-.*")
+        .subscription("g")
+        .message_listener(wrapper_noop.clone());
+    assert!(
+        pattern.has_listener_for_test(),
+        "PatternConsumerBuilder::message_listener must set the listener slot"
+    );
+    assert!(
+        !client
+            .pattern_consumer()
+            .namespace("public/default")
+            .pattern("persistent://public/default/ml-pat-default-.*")
+            .subscription("g")
+            .has_listener_for_test(),
+        "a PatternConsumerBuilder without message_listener() has no listener"
+    );
+
+    // subscribe_with_listener() with no listener fails fast (guard) on each wrapper
+    // builder — the guard runs before any wire call, so no broker round-trip is needed.
+    let multi_err = client
+        .multi_topics_consumer()
+        .topic("persistent://public/default/ml-multi-nolistener")
+        .subscription("g")
+        .subscribe_with_listener()
+        .await
+        .expect_err("multi-topic subscribe_with_listener with no listener must error");
+    assert!(
+        matches!(multi_err, PulsarError::Config(_)),
+        "missing listener must be a Config error on the multi-topic builder, got: {multi_err:?}"
+    );
+
+    let part_err = client
+        .partitioned_consumer("persistent://public/default/ml-part-nolistener")
+        .subscription("g")
+        .subscribe_with_listener()
+        .await
+        .expect_err("partitioned subscribe_with_listener with no listener must error");
+    assert!(
+        matches!(part_err, PulsarError::Config(_)),
+        "missing listener must be a Config error on the partitioned builder, got: {part_err:?}"
+    );
+
+    let pattern_err = client
+        .pattern_consumer()
+        .namespace("public/default")
+        .pattern("persistent://public/default/ml-pat-nolistener-.*")
+        .subscription("g")
+        .subscribe_with_listener()
+        .await
+        .expect_err("pattern subscribe_with_listener with no listener must error");
+    assert!(
+        matches!(pattern_err, PulsarError::Config(_)),
+        "missing listener must be a Config error on the pattern builder, got: {pattern_err:?}"
     );
 }
