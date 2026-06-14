@@ -132,6 +132,13 @@ The pattern is uniform:
 
 The schedule API lives on the relevant builder (`PartitionedProducerBuilder::auto_update_partitions_interval`, `MultiTopicsConsumerBuilder::auto_update_partitions_interval`, `TableViewBuilder::auto_update_partitions_interval`, `PatternConsumer::start_auto_reconcile`).
 
+### Push delivery (consumer `MessageListener`)
+
+`ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (and the `TypedConsumerBuilder` twin) flip a consumer from pull to push, mirroring Java `ConsumerBuilder#messageListener` ([ADR-0064](specs/adr/0064-consumer-message-listener-push-delivery.md)).
+The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` background task `TableView::listen` uses (`crates/magnetar/src/table_view.rs` `spawn_drain`), generalised in `crates/magnetar/src/consumer_listener.rs` over `C: ConsumerApi + Clone` so the tokio and moonpool consumers share one poller.
+It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
+Delivery is sequential and in order, the callback acks explicitly (the poller never auto-acks), and the task ends cleanly when `receive()` errors (closed consumer) or the returned `MessageListenerHandle` is dropped.
+
 ---
 
 ## Layering

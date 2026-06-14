@@ -593,6 +593,15 @@ impl<S: Schema> TypedProducerBuilder<'_, S, crate::TokioEngine> {
     }
 }
 
+/// Schema-aware push-delivery callback (Java
+/// `ConsumerBuilder<T>#messageListener`). Fired once per delivered message with
+/// the decoded [`TypedMessage`]. Like the raw [`crate::MessageListener`], it
+/// runs inside the poller task — sequentially, in order — and **must ack
+/// explicitly** (the poller never auto-acks). Register it via
+/// [`TypedConsumerBuilder::message_listener`] and subscribe via
+/// [`TypedConsumerBuilder::subscribe_with_listener`].
+pub type TypedMessageListener<S> = Arc<dyn Fn(&TypedMessage<S>) + Send + Sync>;
+
 /// A decoded message yielded by [`TypedConsumer::receive`].
 pub struct TypedMessage<S: Schema> {
     /// Broker-assigned message id (use it to ack).
@@ -1148,6 +1157,7 @@ pub struct TypedConsumerBuilder<'a, S: Schema, E: crate::Engine = crate::TokioEn
     replicate_subscription_state: Option<bool>,
     force_topic_creation: Option<bool>,
     start_message_rollback_duration_sec: Option<u64>,
+    listener: Option<TypedMessageListener<S>>,
 }
 
 impl<S: Schema, E: crate::Engine> std::fmt::Debug for TypedConsumerBuilder<'_, S, E> {
@@ -1190,7 +1200,23 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
             replicate_subscription_state: None,
             force_topic_creation: None,
             start_message_rollback_duration_sec: None,
+            listener: None,
         }
+    }
+
+    /// Register a schema-aware push-delivery callback (Java
+    /// `ConsumerBuilder<T>#messageListener`). Once set, subscribe via
+    /// [`Self::subscribe_with_listener`] to start a background poller that
+    /// decodes each message and hands the [`TypedMessage`] to `listener`,
+    /// sequentially and in order. The plain [`Self::subscribe`] ignores the
+    /// listener and returns a pull-mode [`TypedConsumer`].
+    ///
+    /// The callback **must ack explicitly** — the poller never auto-acks (Java
+    /// parity).
+    #[must_use]
+    pub fn message_listener(mut self, listener: TypedMessageListener<S>) -> Self {
+        self.listener = Some(listener);
+        self
     }
 
     /// Set the consumer name advertised to the broker. Mirrors Java
@@ -1351,6 +1377,16 @@ impl<'a, S: Schema, E: crate::Engine> TypedConsumerBuilder<'a, S, E> {
         )
     }
 
+    /// Test-support seam (`#[doc(hidden)]`): `true` once a push-delivery
+    /// listener has been set via [`Self::message_listener`]. Lets the
+    /// builder-surface guard test pin the listener → field wiring without a
+    /// broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_listener_for_test(&self) -> bool {
+        self.listener.is_some()
+    }
+
     /// Set the subscription type.
     #[must_use]
     pub fn subscription_type(mut self, sub_type: pb::command_subscribe::SubType) -> Self {
@@ -1468,6 +1504,69 @@ where
             inner,
             schema: self.schema,
         })
+    }
+}
+
+impl<S: Schema + Send + Sync + 'static, E: crate::Engine> TypedConsumerBuilder<'_, S, E>
+where
+    E::ClientState: crate::SubscribeApi,
+    <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
+{
+    /// Subscribe and start a schema-aware push-delivery poller, returning the
+    /// owning [`crate::MessageListenerHandle`]. Mirrors Java's
+    /// `ConsumerBuilder<T>#messageListener(...)` + `subscribe()`.
+    ///
+    /// Each message is decoded against the configured schema and the resulting
+    /// [`TypedMessage`] is handed to the callback sequentially and in order.
+    /// The poller does **not** auto-ack (the callback acks explicitly) and stops
+    /// cleanly when the consumer is closed or the returned handle is dropped.
+    ///
+    /// If the schema needs a broker-side resolution
+    /// ([`Schema::needs_broker_schema`](magnetar_proto::schema::Schema::needs_broker_schema)),
+    /// it is resolved once before the poller starts, so per-message decoding in
+    /// the callback stays synchronous.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::message_listener`].
+    /// - [`PulsarError::Client`] if the one-shot broker schema resolution fails.
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn subscribe_with_listener(
+        self,
+    ) -> Result<crate::MessageListenerHandle, PulsarError> {
+        let Some(listener) = self.listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_listener() requires a listener — \
+                 call message_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let typed = self.subscribe().await?;
+        let schema = typed.schema.clone();
+        // Resolve the broker schema once up front so the per-message decode in
+        // the poller closure can stay synchronous (matches `receive()`'s lazy
+        // first-call resolution, hoisted to subscribe time for push mode).
+        if schema.needs_broker_schema() {
+            let resolved = crate::ConsumerApi::get_schema(&typed.inner, None)
+                .await
+                .map_err(|err| PulsarError::Other(format!("get_schema: {err}")))?;
+            schema.store_resolved_schema(resolved);
+        }
+        let handle = crate::consumer_listener::spawn_listener_loop(typed.inner, move |raw| {
+            // Decode against the (now-resolved) schema. A per-message decode
+            // failure is dropped rather than poisoning the whole poller — the
+            // message is left unacked so the broker can redeliver, matching the
+            // callback's explicit-ack contract.
+            if let Ok(value) = schema.decode(&raw.payload) {
+                let msg = TypedMessage {
+                    message_id: raw.message_id,
+                    value,
+                    payload: raw.payload.clone(),
+                    raw,
+                };
+                listener(&msg);
+            }
+        });
+        Ok(handle)
     }
 }
 

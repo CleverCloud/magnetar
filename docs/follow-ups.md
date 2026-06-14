@@ -27,6 +27,7 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 4   | [Survivability residuals (ADR-0055 bit-flip fix)](#4-survivability-residuals-surfaced-by-the-adr-0055-bit-flip-fix) | 🟢 engine residuals closed (ADR-0059, ADR-0060); 3 pre-existing test-state caveats remain                                  |
 | 5   | [Residuals from the moonpool seed-sweep fixes](#5-residuals-surfaced-by-the-moonpool-seed-sweep-fixes)              | ⚡ marker lost-wakeup race (latent) + a single-provider tls-chaos build gap                                                |
 | 6   | [Lookup redirect chase ignores the redirect target](#6-lookup-redirect-chase-ignores-the-redirect-target)           | 🟢 closed — engine-side redirect-target dialing (ADR-0039 amendment, 2026-06-14); Java `findBroker` parity                 |
+| 7   | [MessageListener on multi-topic / partitioned / pattern consumers](#7-messagelistener-on-multi-topic--partitioned--pattern-consumers) | 🟡 deferred — push delivery shipped on the single-topic + typed builders (ADR-0064); wrapper surfaces need a wrapper-message poller |
 
 ---
 
@@ -165,6 +166,32 @@ Against any cluster whose broker redirects to a **different** broker, the chase 
 Single-broker clusters (the testcontainers e2e brokers, the fixed PIP-33 fixture) only ever self-redirect, where same-connection re-issue was coincidentally correct — which is why nothing else caught this.
 
 **How it was closed.** `magnetar-proto` now surfaces a **driveable** `LookupOutcome::Redirected { broker_service_url, broker_service_url_tls, authoritative, hops_remaining }` instead of chasing on the bootstrap socket, and both engines consume it: they dial the redirect-target broker (reusing `resolve_direct_broker` / the per-broker `ProxyConnectionPool`) and re-issue the lookup THERE via the new `Connection::lookup_redirect(topic, authoritative, hops_remaining)` — Java `BinaryProtoLookupService#findBroker` parity. The `MAX_LOOKUP_REDIRECTS` cap is threaded as plain data and enforced end-to-end (proto translate floor + proto-side clamp in `lookup_redirect` + engine-side guard). Shipped with all four ADR-0024 layers — proto unit (`crates/magnetar-proto/src/conn.rs`, `crates/magnetar-proto/src/lookup.rs`), tokio + moonpool integration twins (`crates/magnetar-runtime-{tokio,moonpool}/tests/lookup_redirect_chain.rs`, a genuine two-broker A→B dial topology), a differential two-broker dial parity scenario (`crates/magnetar-differential/tests/lookup_redirect_chain_equivalence.rs`), and an e2e (`crates/magnetar/tests/e2e_lookup_redirect_chain.rs`). The moonpool `ProxyConnectionPool` dials redirect targets the same way as tokio (`docs/follow-ups.md §3` parity), so no §3 residual remained for this path.
+
+---
+
+## 7. MessageListener on multi-topic / partitioned / pattern consumers
+
+**Status.** 🟡 deferred — not load-bearing for single-topic Java parity.
+
+**Shipped.** Consumer-side push delivery (Java `ConsumerBuilder#messageListener`) landed on the two single-topic builder surfaces ([ADR-0064](../specs/adr/0064-consumer-message-listener-push-delivery.md)): `ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (delivers `IncomingMessage`) and `TypedConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (delivers a decoded `TypedMessage<S>`). Delivery is sequential, in order, no-auto-ack, with clean shutdown on consumer close / handle drop — see the ADR for the full semantics.
+
+**Gap.** `MultiTopicsConsumer`, `PartitionedConsumer`, and `PatternConsumer` do **not** yet expose `message_listener(...)`. Java routes their per-child consumers through the same listener executor, so the parity target is "fan a poller over each child and deliver the wrapper message".
+
+**Why it stays open.** The single-topic poller (`crate::consumer_listener::spawn_listener_loop`) is bound to `ConsumerApi`, whose `receive()` yields a `magnetar_proto::IncomingMessage`. The wrapper consumers are **not** `ConsumerApi`: their `receive()` returns the topic-tagged wrapper types (`MultiTopicsMessage` / `PatternMessage`, `IncomingMessage` + originating `topic`), and `PatternConsumer` additionally reconciles its child set on `TopicListChanged` deltas. Supporting them cleanly needs a second poller abstraction over `async fn receive() -> Result<WrapperMsg, PulsarError>` plus a decision on whether a newly-discovered pattern child inherits the listener. Bolting that onto this changeset would widen the cross-runtime test surface (ADR-0024) for a non-load-bearing parity edge. The single-topic surfaces cover the common case; multi-topic push delivery is a follow-up.
+
+**`/goal` block (copy-paste verbatim into a fresh session):**
+
+```
+/goal Add message_listener(...) push delivery to MultiTopicsConsumer, PartitionedConsumer, and
+PatternConsumer, matching ADR-0064's single-topic semantics (sequential, in-order, no-auto-ack,
+clean shutdown). Add a wrapper-message poller alongside crate::consumer_listener::spawn_listener_loop
+that drives each surface's own async receive() (yielding MultiTopicsMessage / PatternMessage) instead
+of ConsumerApi::receive(). Decide and document whether a pattern child discovered after subscribe
+inherits the listener. Ship all four ADR-0024 layers (proto N/A — runtime-only; tokio + moonpool
+integration twins keeping check-runtime-test-parity 1:1; a differential sequence-equivalence test;
+an e2e under crates/magnetar/tests/e2e_*.rs) plus a builder-surface wiring test. Flip the README
+parity-matrix MessageListener note to cover the wrapper surfaces and remove follow-ups.md §7.
+```
 
 ---
 
