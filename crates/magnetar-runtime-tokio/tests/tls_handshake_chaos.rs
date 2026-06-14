@@ -20,7 +20,13 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 fn make_session() -> ClientConnection {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // `active_provider()` installs the cfg-selected crypto provider as the
+    // process-global default before returning it, so no separate
+    // `install_default()` is needed here. The previous hard-coded
+    // `rustls::crypto::ring::default_provider().install_default()` failed to
+    // compile under any single-provider feature set that excluded
+    // `crypto-ring` (e.g. `--no-default-features --features crypto-aws-lc-rs`,
+    // the set the moonpool sweep + per-PR seed-replay job build with — E0433).
     let config = Arc::new(
         ClientConfig::builder_with_provider(active_provider())
             .with_safe_default_protocol_versions()

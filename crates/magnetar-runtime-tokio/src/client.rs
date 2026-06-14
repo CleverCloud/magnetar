@@ -1113,10 +1113,25 @@ impl Client {
     /// when the namespace has `replicated_subscription_status=true`), or `None` if the
     /// connection has closed. Markers are filtered off the regular [`Consumer::receive`]
     /// stream — applications that just want to consume messages don't need this.
+    ///
+    /// Enroll-before-drain (mirror of [`ConnectionShared::await_reconnect_or_terminal`]):
+    /// the `Notified` future is created and `enable()`d *before* the buffer drain +
+    /// `is_closed()` re-check, so a marker the driver pushes (via
+    /// `replicated_subscription_marker_notify.notify_waiters()`, which stores no permit)
+    /// between the drain and the park is captured by this already-armed waiter rather than
+    /// lost. The previous drain-then-`notified().await` shape hung whenever the marker
+    /// landed in that gap (follow-ups.md §5.1; same race fixed for `SubscribeAckedFut`).
+    /// No channel (ADR-0003), no host-clock read (ADR-0011).
     pub async fn next_replicated_subscription_marker(
         &self,
     ) -> Option<crate::ObservedReplicatedSubscriptionMarker> {
         loop {
+            // Arm the wakeup BEFORE inspecting the buffer so a marker pushed
+            // between the drain and the park is captured by this `Notified`.
+            let notified = self.shared.replicated_subscription_marker_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if let Some(marker) = self
                 .shared
                 .replicated_subscription_markers
@@ -1128,10 +1143,9 @@ impl Client {
             if self.shared.inner.lock().is_closed() {
                 return None;
             }
-            self.shared
-                .replicated_subscription_marker_notify
-                .notified()
-                .await;
+            // Neither a buffered marker nor closed — park on the pre-armed
+            // waiter, then re-loop and re-arm. A spurious wake just re-drains.
+            notified.await;
         }
     }
 

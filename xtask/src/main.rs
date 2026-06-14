@@ -1580,6 +1580,11 @@ const PARITY_EXEMPT_FILES: &[&str] = &[
     "magnetar-runtime-moonpool/tests/sim_chaos.rs",
     "magnetar-runtime-moonpool/src/pool.rs",
     "magnetar-runtime-moonpool/tests/proxy_multi_conn.rs",
+    // Moonpool-only deterministic SimProviders harness for the PIP-33 marker
+    // lost-wakeup fix (follow-ups.md §5.1). Like sim_chaos.rs it has no tokio
+    // twin — the tokio engine's equivalent coverage is the live-path positive
+    // test in `marker_lost_wakeup.rs` (which IS a 1:1 twin across engines).
+    "magnetar-runtime-moonpool/tests/replicated_subscriptions_sim.rs",
 ];
 
 /// Count test attributes (`#[test]`, `#[tokio::test]`, `#[moonpool::test]`)

@@ -361,6 +361,12 @@ The driver-to-driver communication path is _also_ not a channel — it is a sing
 `Notify` is permitted because it has no queue and no payload — it is an async condvar, not a channel.
 If even `Notify` feels too channel-flavoured, a `parking_lot::Condvar + Mutex<bool>` is the documented fallback.
 
+**Enroll-before-drain wakeup discipline.**
+Every `Notify` the driver pulses with `notify_waiters()` — `driver_waker`, `topic_list_notify`, `replicated_subscription_marker_notify`, `scalable_notify` — stores **no permit**: it only wakes waiters enrolled at the instant it fires.
+So every accessor that parks on one of these (`Client::await_reconnect_or_terminal`, `next_topic_list_change`, `next_replicated_subscription_marker`, `next_scalable_event`) MUST arm its `Notified` future — create it and call `enable()` — **before** it drains the buffer and re-checks `is_closed()`, then `await` the pre-armed future.
+The reverse (drain → check → `notified().await`) leaves a window in which the driver can push an item and `notify_waiters()` between the empty-check and the (too-late) enrollment, losing the wakeup and hanging the accessor forever.
+This is enforced 1:1 across both engines; the marker accessor's missing enrollment was the latent §5.1 lost-wakeup race (the same shape already fixed for `SubscribeAckedFut`).
+
 ### Reference
 
 The pattern is the same one [`quinn`] _would_ be using if it didn't ship its own bespoke `tokio::sync::mpsc` wrapper for legacy reasons — `quinn-proto` itself is sans-io and channel-free; the channels are only in the engine glue.
