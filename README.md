@@ -4,14 +4,13 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](rust-toolchain.toml)
-[![Status](https://img.shields.io/badge/status-pre--alpha-red.svg)](#status)
+[![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status)
 [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: pre-alpha.** The wire protocol layer is feature-rich, the tokio
-> engine is usable end-to-end with supervised reconnect + transparent
-> producer/consumer rebuild, and the moonpool engine carries
-> client/producer/consumer for deterministic-simulation testing. API is
-> unstable. Do not depend on this in production.
+> **Status: stable (1.0.0).**
+> Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
+> The public API follows Semantic Versioning.
+> PIP-460 scalable topics and the CLI `produce`/`consume` subcommands remain experimental / not-yet-implemented and are excluded from the 1.0 stability promise.
 
 ---
 
@@ -104,12 +103,15 @@ Pulsar Java client.
 
 ## Installation
 
-Magnetar is not yet on crates.io. Use the Git path until the first release:
+Magnetar's first release is `1.0.0`.
+Until it is published to crates.io, depend on the tagged release via Git:
 
 ```toml
 [dependencies]
-magnetar = { git = "https://github.com/CleverCloud/magnetar", branch = "main" }
+magnetar = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.0.0" }
 ```
+
+Once published to crates.io, depend on it directly: `magnetar = "1.0.0"`.
 
 The default feature set enables the tokio engine. The feature flags catalog:
 
@@ -211,7 +213,7 @@ banner:
 
 ```
 $ magnetar --version
-magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
+magnetar 1.0.0 (a1b2c3d4e5f6)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
@@ -219,7 +221,7 @@ os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
 - `-V` prints a single-line, never-colorized form:
-  `magnetar 0.1.0-dev.0 (sha-dirty)`.
+  `magnetar 1.0.0 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
 - `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for
@@ -843,12 +845,10 @@ The bulk of the parity matrix above ships on `main`, including:
 
 Known open work is narrow and tracked in
 [`docs/follow-ups.md`](docs/follow-ups.md): PIP-460 e2e waits for a
-Pulsar 5.0 RC that pins the scalable-topic wire commands, the moonpool
-git dependency waits for a release containing upstream PR #113, and a
-few simulation / test-harness gaps remain.
+Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few
+simulation / test-harness gaps remain.
 
-API is unstable until the first tagged release — do not depend on this
-in production yet.
+The public API is stable as of `1.0.0` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
 
 ---
 

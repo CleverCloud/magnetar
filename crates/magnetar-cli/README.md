@@ -1,6 +1,6 @@
 # magnetar-cli
 
-> **Status: pre-alpha (M9).** `admin` subcommands fully wired; `produce` / `consume` are stubs until M2+M3 land in the façade.
+> **Status: stable (1.0.0).** `admin` subcommands are fully wired; `produce` / `consume` are not yet implemented and are excluded from the 1.0 stability guarantee.
 
 `magnetar` — the command-line client for Apache Pulsar built on the magnetar workspace.
 

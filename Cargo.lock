@@ -1708,7 +1708,7 @@ checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 
 [[package]]
 name = "magnetar"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-admin"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "http",
  "magnetar-proto",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-auth-athenz"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-auth-oauth2"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "magnetar-proto",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-auth-sasl"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "libgssapi",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-cli"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-differential"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-fakes"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "magnetar-proto",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-messagecrypto"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-proto"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "apache-avro",
  "bytes",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime-moonpool"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime-tokio"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "flate2",
@@ -4478,7 +4478,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0-dev.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",

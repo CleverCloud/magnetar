@@ -1,7 +1,7 @@
 # `magnetar` CLI
 
-> **Status: pre-alpha (M9).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
-> `produce` / `consume` remain stubs until M2 + M3 land in the façade.
+> **Status: stable (1.0.0).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
+> `produce` / `consume` are not yet implemented and are excluded from the 1.0 stability guarantee.
 
 `magnetar` — the command-line client for Apache Pulsar built on the magnetar workspace.
 This page is the canonical CLI reference; for the full subcommand surface, run `magnetar --help` (or `magnetar <subcommand> --help`).
