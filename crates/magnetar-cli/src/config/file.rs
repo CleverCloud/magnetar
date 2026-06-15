@@ -144,19 +144,19 @@ pub(crate) fn load(resolved: &ResolvedPath) -> Result<Option<PulsarConfig>, Conf
     Ok(Some(cfg))
 }
 
-/// Serialize a config to YAML.
-pub(crate) fn to_yaml(cfg: &PulsarConfig) -> Result<String, ConfigError> {
-    serde_norway::to_string(cfg).map_err(|source| ConfigError::Yaml {
-        path: PathBuf::new(),
-        source,
-    })
+/// Serialize a config to YAML. Returns the raw `serde_norway` error so the
+/// caller can attach the real path (this function has none to give).
+pub(crate) fn to_yaml(cfg: &PulsarConfig) -> Result<String, serde_norway::Error> {
+    serde_norway::to_string(cfg)
 }
 
 /// Save the config to a path, creating the parent directory if needed.
 ///
-/// On Unix the file is created `0600` (best-effort — it carries bearer tokens
-/// and client secrets). pulsarctl itself does not chmod, so we tighten rather
-/// than loosen; an existing file's mode is left untouched.
+/// On Unix the file is forced to `0600` — it carries bearer tokens and client
+/// secrets. pulsarctl itself does not chmod, so we tighten rather than loosen,
+/// and we re-apply `0600` to a PRE-EXISTING file too: a `0644` config left by
+/// pulsarctl or an editor would otherwise keep the credential bytes
+/// world-readable after we write into it.
 pub(crate) fn save(path: &Path, cfg: &PulsarConfig) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -166,18 +166,22 @@ pub(crate) fn save(path: &Path, cfg: &PulsarConfig) -> Result<(), ConfigError> {
             })?;
         }
     }
-    let yaml = to_yaml(cfg)?;
+    let yaml = to_yaml(cfg).map_err(|source| ConfigError::Yaml {
+        path: path.to_path_buf(),
+        source,
+    })?;
     write_private(path, yaml.as_bytes()).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
     })
 }
 
-/// Write bytes to `path`, creating the file `0600` on Unix.
+/// Write bytes to `path` at mode `0600` on Unix, for both new and pre-existing
+/// files.
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -185,6 +189,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `.mode(0o600)` only takes effect when the file is CREATED. A pre-existing
+    // file keeps its old mode, so re-apply `0600` explicitly before the
+    // credential bytes are written (the open above already truncated it, so no
+    // secret has touched the disk yet).
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(bytes)
 }
 
@@ -305,5 +314,40 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// save() tightens a PRE-EXISTING world-readable file to 0600 — the
+    /// `.mode(0o600)` open flag only applies on creation, so an existing 0644
+    /// config would otherwise keep the credential bytes world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_preexisting_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config");
+        // Pre-create the file 0644, as pulsarctl or an editor might.
+        std::fs::write(&path, "current-context: \"\"\n").expect("pre-create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let mut cfg = PulsarConfig::default();
+        cfg.auth_info.insert(
+            "c".to_owned(),
+            super::super::model::AuthInfo {
+                token: "secret".to_owned(),
+                ..Default::default()
+            },
+        );
+        save(&path, &cfg).expect("save");
+
+        // The credential bytes are now behind 0600.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

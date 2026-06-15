@@ -3447,14 +3447,15 @@ impl AdminClient {
                 flow.ensure_fresh()
                     .await
                     .map_err(|err| AdminError::Auth(format!("oauth2 token refresh: {err}")))?;
-                let token = flow.cached_access_token().ok_or_else(|| {
-                    AdminError::Auth("oauth2 returned an empty access token".to_owned())
-                })?;
-                if token.is_empty() {
-                    return Err(AdminError::Auth(
-                        "oauth2 returned an empty access token".to_owned(),
-                    ));
-                }
+                // A cache miss (None) and an IDP that handed back an empty
+                // `access_token` (Some(empty)) are both "no usable token" —
+                // collapse them into one guard.
+                let token = flow
+                    .cached_access_token()
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| {
+                        AdminError::Auth("oauth2 returned an empty access token".to_owned())
+                    })?;
                 // The access token is base64url JWT text — valid UTF-8 — but
                 // guard the conversion rather than assume it.
                 let tok = std::str::from_utf8(&token).map_err(|err| {

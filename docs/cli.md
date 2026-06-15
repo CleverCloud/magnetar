@@ -27,8 +27,8 @@ cargo build -p magnetarctl --release
 --tls-trust-cert-path <p>    Custom CA trust cert (PEM).
 --tls-allow-insecure         Disable TLS cert verification (dev only — INSECURE).
 --tls-enable-hostname-verification   Enable TLS hostname verification (pulsarctl parity).
---tls-cert-file <path>       Client TLS cert (mTLS).
---tls-key-file <path>        Client TLS key (mTLS).
+--tls-cert-file <path>       Client TLS cert (mTLS). NOT yet wired in — setting it warns and has no effect.
+--tls-key-file <path>        Client TLS key (mTLS). NOT yet wired in (see --tls-cert-file).
 --config <path>              pulsarctl config file.                [env MAGNETAR_CONFIG]
                              default: $HOME/.config/pulsar/config
 --context <name>             Select a named context (overrides current-context).
@@ -95,6 +95,7 @@ For an `admin` / `produce` / `consume` call:
 4. **Explicit flags / env always override the context**, and **no config + no context → the localhost defaults, identical to today.**
 
 OAuth2 from a context requires `key_file` (a Pulsar-style `client_id` + `client_secret` JSON blob) — the on-disk format carries no inline `client_secret`, so the key file is the only secret source.
+The `issuer_endpoint` **must be `https://`**: the `client_credentials` flow POSTs the `client_secret` as a form body, so a plaintext issuer is rejected up front rather than leaking the secret on the wire.
 
 ### Data-plane URL derivation (`produce` / `consume`)
 
@@ -212,7 +213,7 @@ These verbs are file-management only — they never open a connection.
 | `context delete <name>`      | `del`    | Remove from BOTH `contexts` and `auth-info`. Warns when it was the current context.               |
 | `context get`                |          | Table: `CURRENT(*) NAME / ADMIN SERVICE URL / BOOKIE SERVICE URL`; `*` marks the current context. |
 | `context current`            |          | Print the current context name; errors when unset.                                                |
-| `context rename <old> <new>` | `update` | Rename a context (and its `auth-info`); updates `current-context` when it pointed at `<old>`.     |
+| `context rename <old> <new>` | `update` | Rename a context (and its `auth-info`); updates `current-context` when it pointed at `<old>`. Refuses to overwrite an existing `<new>`. |
 
 `context set` flags (mapping to the `auth-info` / `contexts` keys):
 
@@ -231,8 +232,10 @@ These verbs are file-management only — they never open a connection.
 | `--key-file`            | `-k`  | `auth-info.<name>.key_file`                      |
 
 `--token`, `--token-file`, `--tls-trust-cert-path`, and `--tls-allow-insecure` are the GLOBAL connection flags (they double as `context set` write values), e.g. `magnetarctl context set prod --admin-service-url https://broker:443 --token tok`.
+Only an **explicit `--token` flag** is persisted; an inherited `MAGNETAR_TOKEN` env var applies to the live connection but is never written to disk.
+The auth methods are mutually exclusive (token › token-file › OAuth2): a `set` that introduces one mode clears the others, so switching modes never leaves a stale higher-precedence credential behind.
 
-Writes go to the resolved config path; the parent directory and file are created if absent (`0600` on Unix).
+Writes go to the resolved config path; the parent directory is created if absent, and the file is written `0600` on Unix — a pre-existing world-readable file is tightened to `0600` before any credential is written.
 
 ### `admin clusters`
 

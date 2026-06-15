@@ -20,6 +20,7 @@
 //! `auth-info` field), so `#[serde(default)]` + `String` reproduces them.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +79,7 @@ pub(crate) struct Context {
 /// Field renames reproduce pulsarctl's exact casing. `locationoforigin` is
 /// pulsarctl bookkeeping (the file a context was loaded from); it is modeled
 /// explicitly so it round-trips, but magnetar never reads it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AuthInfo {
     /// Origin-file bookkeeping (untagged in pulsarctl). Preserved, unused.
     #[serde(default)]
@@ -123,6 +124,38 @@ pub(crate) struct AuthInfo {
     /// Any unknown `auth-info` keys, preserved verbatim.
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, serde_norway::Value>,
+}
+
+/// Redacting `Debug` (mirrors the custom `Debug` on `magnetar_admin::AdminAuth`):
+/// the raw bearer `token` is the one inline secret here, so it never appears in
+/// a `{:?}` / `dbg!` of a `PulsarConfig` (e.g. a test-failure message). Path
+/// fields (`token_file`, `key_file`) are not secrets and are shown verbatim.
+impl fmt::Debug for AuthInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthInfo")
+            .field("locationoforigin", &self.locationoforigin)
+            .field("tls_trust_certs_file_path", &self.tls_trust_certs_file_path)
+            .field(
+                "tls_allow_insecure_connection",
+                &self.tls_allow_insecure_connection,
+            )
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("token_file", &self.token_file)
+            .field("issuer_endpoint", &self.issuer_endpoint)
+            .field("client_id", &self.client_id)
+            .field("audience", &self.audience)
+            .field("scope", &self.scope)
+            .field("key_file", &self.key_file)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +270,24 @@ telemetry:
         assert_eq!(cfg, reparsed);
         assert_eq!(reparsed.auth_info["dev"].token, "abc");
         assert_eq!(reparsed.auth_info["dev"].token_file, "");
+    }
+
+    /// The custom `Debug` redacts the raw bearer token but keeps the (non-secret)
+    /// path fields, so a `{:?}` of a config cannot leak the token.
+    #[test]
+    fn auth_info_debug_redacts_token() {
+        let info = AuthInfo {
+            token: "super-secret".to_owned(),
+            token_file: "/run/tok".to_owned(),
+            key_file: "/run/kf.json".to_owned(),
+            ..Default::default()
+        };
+        let dbg = format!("{info:?}");
+        assert!(!dbg.contains("super-secret"), "token leaked: {dbg}");
+        assert!(dbg.contains("<redacted>"), "no redaction marker: {dbg}");
+        assert!(dbg.contains("/run/tok"), "token_file hidden: {dbg}");
+        assert!(dbg.contains("/run/kf.json"), "key_file hidden: {dbg}");
+        // An unset token shows as "" (not redacted) — distinguishes unset from set.
+        assert!(!format!("{:?}", AuthInfo::default()).contains("<redacted>"));
     }
 }

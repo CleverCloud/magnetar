@@ -111,8 +111,12 @@ fn context_lifecycle_round_trips() {
     let (_, out, _) = run_context(&cfg, &["current"]);
     assert_eq!(out.trim(), "production");
     let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    // serde_norway indents nested keys two spaces, so the old context appears as
+    // `  prod:` — assert that indented key is gone (the literal `prod:` is not a
+    // substring of `production:`, and `prod-tok`/`https://broker:443` contain no
+    // `prod:`), and the renamed key is present.
     assert!(
-        !yaml.contains("\nprod:") && yaml.contains("production:"),
+        !yaml.contains("prod:") && yaml.contains("production:"),
         "yaml: {yaml}"
     );
 
@@ -127,6 +131,216 @@ fn context_lifecycle_round_trips() {
     let (ok, _, err) = run_context(&cfg, &["delete", "production"]);
     assert!(ok, "delete current failed");
     assert!(err.contains("current context"), "warn missing: {err}");
+}
+
+/// Run `magnetarctl --config <cfg> <args...>` with a controlled environment
+/// (ambient `MAGNETAR_TOKEN` is always cleared first, then `envs` applied), so
+/// env-vs-flag provenance tests are deterministic regardless of the runner's
+/// environment. Returns (status-ok, stdout, stderr).
+fn run_cli_env(cfg: &Path, envs: &[(&str, &str)], args: &[&str]) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.env_remove("MAGNETAR_TOKEN");
+    cmd.arg("--config").arg(cfg);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.args(args);
+    let out = cmd.output().expect("spawn magnetarctl");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `rename` onto an EXISTING destination is rejected and leaves both contexts
+/// (and the destination's credentials) intact — it must not silently clobber.
+#[test]
+fn context_rename_onto_existing_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+
+    let (ok, _, err) = run_context(
+        &cfg,
+        &["set", "dev", "--admin-service-url", "http://dev:8080"],
+    );
+    assert!(ok, "set dev failed: {err}");
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "prod",
+            "--admin-service-url",
+            "https://prod:443",
+            "--token",
+            "prod-secret",
+        ],
+    );
+    assert!(ok, "set prod failed: {err}");
+
+    // rename dev → prod must fail (prod already exists).
+    let (ok, _, err) = run_context(&cfg, &["rename", "dev", "prod"]);
+    assert!(!ok, "rename onto existing should fail");
+    assert!(err.contains("already exists"), "err: {err}");
+
+    // prod's endpoint AND token survive untouched; dev is still present.
+    let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    assert!(yaml.contains("https://prod:443"), "prod url lost: {yaml}");
+    assert!(yaml.contains("prod-secret"), "prod token lost: {yaml}");
+    let (_, out, _) = run_context(&cfg, &["get"]);
+    assert!(out.contains("dev"), "dev lost: {out}");
+}
+
+/// An inherited `MAGNETAR_TOKEN` is for the live connection only — `context set`
+/// must NOT persist it to disk. An explicit `--token` flag IS persisted.
+#[test]
+fn context_set_token_env_not_persisted_flag_is() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+
+    // Env-sourced token: not written.
+    let (ok, _, err) = run_cli_env(
+        &cfg,
+        &[("MAGNETAR_TOKEN", "env-secret")],
+        &[
+            "context",
+            "set",
+            "fromenv",
+            "--admin-service-url",
+            "http://h:8080",
+        ],
+    );
+    assert!(ok, "set fromenv failed: {err}");
+    let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    assert!(
+        !yaml.contains("env-secret"),
+        "env token must not be persisted: {yaml}"
+    );
+
+    // Flag-sourced token: written.
+    let (ok, _, err) = run_cli_env(
+        &cfg,
+        &[],
+        &[
+            "context",
+            "set",
+            "fromflag",
+            "--admin-service-url",
+            "http://h:8080",
+            "--token",
+            "flag-secret",
+        ],
+    );
+    assert!(ok, "set fromflag failed: {err}");
+    let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    assert!(
+        yaml.contains("flag-secret"),
+        "flag token must be persisted: {yaml}"
+    );
+}
+
+/// Switching auth mode on a later `set` clears the mutually-exclusive fields, so
+/// a stale higher-precedence token cannot keep shadowing a freshly-set OAuth2.
+#[test]
+fn context_set_switching_auth_mode_clears_stale() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "c",
+            "--admin-service-url",
+            "https://h:443",
+            "--token",
+            "stale-tok",
+        ],
+    );
+    assert!(ok, "set token failed: {err}");
+
+    // Now switch the same context to OAuth2.
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "c",
+            "--issuer-endpoint",
+            "https://idp.example/token",
+            "--key-file",
+            "/run/kf.json",
+        ],
+    );
+    assert!(ok, "switch to oauth2 failed: {err}");
+
+    let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    assert!(
+        !yaml.contains("stale-tok"),
+        "stale token not cleared: {yaml}"
+    );
+    assert!(
+        yaml.contains("issuer_endpoint: https://idp.example/token"),
+        "issuer not set: {yaml}"
+    );
+}
+
+/// An OAuth2 context with a plaintext `http://` issuer is rejected before any
+/// secret is sent — the client_credentials secret must not leak in cleartext.
+#[test]
+fn oauth2_http_issuer_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "oauth",
+            "--admin-service-url",
+            "http://h:8080",
+            "--issuer-endpoint",
+            "http://idp.example/token",
+            "--key-file",
+            "/run/kf.json",
+        ],
+    );
+    assert!(ok, "set oauth failed: {err}");
+
+    let (ok, _, err) = run_cli_env(
+        &cfg,
+        &[],
+        &["--context", "oauth", "admin", "clusters", "list"],
+    );
+    assert!(!ok, "http issuer should be rejected");
+    assert!(err.contains("https"), "err should mention https: {err}");
+}
+
+/// An empty token file is rejected locally rather than producing a malformed
+/// `Authorization: Bearer ` header sent to the broker.
+#[test]
+fn empty_token_file_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+    // An explicit `--config` that does not exist is itself an error; create an
+    // empty config (parses as defaults) so the failure under test is the empty
+    // token file, not a missing config.
+    std::fs::write(&cfg, "").expect("touch config");
+    let tok = dir.path().join("empty.token");
+    std::fs::write(&tok, "   \n").expect("write empty token");
+
+    let (ok, _, err) = run_cli_env(
+        &cfg,
+        &[],
+        &[
+            "--token-file",
+            tok.to_str().expect("utf8 path"),
+            "admin",
+            "clusters",
+            "list",
+        ],
+    );
+    assert!(!ok, "empty token file should be rejected");
+    assert!(err.contains("is empty"), "err should mention empty: {err}");
 }
 
 /// `use` / `delete` / `rename` on an unknown context fail with a non-zero exit.
@@ -185,7 +399,7 @@ fn admin_resolves_context_admin_url() {
     );
     assert!(!out.status.success(), "expected connection failure");
     assert!(
-        combined.contains("127.0.0.1:1") || combined.contains("1\n") || combined.contains(":1/"),
+        combined.contains("127.0.0.1:1") || combined.contains(":1/"),
         "error should reference the context URL; got: {combined}"
     );
 }

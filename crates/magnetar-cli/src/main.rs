@@ -42,7 +42,7 @@ mod version;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use magnetar::proto::TokenAuth;
 use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
@@ -119,12 +119,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) tls_enable_hostname_verification: bool,
 
-    /// Client TLS certificate file (mTLS). Accepted for pulsarctl parity;
-    /// applied to the data-plane connection where supported.
+    /// Client TLS certificate file (mTLS). Accepted for pulsarctl parity, but
+    /// client-certificate mTLS is **not yet wired in** — setting it warns and
+    /// otherwise has no effect.
     #[arg(long, global = true)]
     pub(crate) tls_cert_file: Option<String>,
 
     /// Client TLS private-key file (mTLS). Pairs with `--tls-cert-file`.
+    /// **Not yet wired in** (see `--tls-cert-file`).
     #[arg(long, global = true)]
     pub(crate) tls_key_file: Option<String>,
 
@@ -1883,7 +1885,18 @@ pub(crate) enum ShadowCmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    // Distinguish an explicit `--token` flag from an inherited `MAGNETAR_TOKEN`
+    // env var. `context set` persists the token to disk and must only do so for
+    // an explicit flag — the env var is meant for the current connection, not a
+    // durable write. (`token` is a global arg, whose source clap propagates to
+    // the root matches.)
+    let token_from_flag =
+        matches.value_source("token") == Some(clap::parser::ValueSource::CommandLine);
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
     init_tracing(cli.verbose);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1898,7 +1911,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(run(cli)) {
+    match runtime.block_on(run(cli, token_from_flag)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("magnetar: {err}");
@@ -1946,7 +1959,7 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
+async fn run(cli: Cli, token_from_flag: bool) -> Result<(), CliError> {
     // `context` is config-file management only — it never opens a connection,
     // so resolve nothing and dispatch directly. The credential / TLS GLOBAL
     // flags (`--token` / `--token-file` / `--tls-trust-cert-path` /
@@ -1955,7 +1968,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     // clash; we thread them in here instead.
     if matches!(cli.cmd, Cmd::Context { .. }) {
         let globals = ContextSetGlobals {
-            token: cli.token.clone(),
+            // Persist a token only when it came from an explicit `--token`; an
+            // inherited `MAGNETAR_TOKEN` is for the live connection, not a write
+            // to disk (it would silently leak a transient secret into the file).
+            token: token_from_flag.then(|| cli.token.clone()).flatten(),
             token_file: cli.token_file.clone(),
             tls_trust_cert_path: cli.tls_trust_cert_path.clone(),
             // Only treat allow-insecure as a write when explicitly passed; the
@@ -2112,6 +2128,16 @@ fn resolve_connection(cli: &Cli) -> Result<ResolvedConnection, CliError> {
         .filter(|s| !s.is_empty());
     let admin_allow_insecure =
         cli.tls_allow_insecure || resolved_ctx.as_ref().is_some_and(|c| c.tls.allow_insecure);
+    // When insecure TLS comes from the context rather than an explicit flag, the
+    // operator gets no signal that certificate verification is off — unlike a
+    // bad token (fail-closed → 401), this silently downgrades security. Warn.
+    if !cli.tls_allow_insecure && admin_allow_insecure {
+        tracing::warn!(
+            target: "magnetar",
+            context = resolved_ctx.as_ref().map_or("", |c| c.name.as_str()),
+            "context has tls_allow_insecure_connection=true — TLS certificate verification is DISABLED",
+        );
+    }
     let admin_trust_cert_pem =
         match &trust_cert_path {
             Some(path) => Some(std::fs::read(path).map_err(|err| {
@@ -2119,6 +2145,19 @@ fn resolve_connection(cli: &Cli) -> Result<ResolvedConnection, CliError> {
             })?),
             None => None,
         };
+    // Client-certificate mTLS is not wired into either client yet. Accepting
+    // the flags silently would hand a user a plain connection while they
+    // believe mutual TLS is in effect — warn loudly that they are no-ops.
+    if cli.tls_cert_file.is_some() || cli.tls_key_file.is_some() {
+        tracing::warn!(
+            target: "magnetar",
+            cert_file = cli.tls_cert_file.as_deref().unwrap_or(""),
+            key_file = cli.tls_key_file.as_deref().unwrap_or(""),
+            "--tls-cert-file / --tls-key-file are accepted for pulsarctl parity but \
+             client-certificate mTLS is not yet wired in; the connection will NOT present \
+             a client certificate",
+        );
+    }
 
     // --- Auth: explicit token/token-file flag › context auth. ---
     let (admin_auth, data_auth) = resolve_auth(cli, resolved_ctx.as_ref())?;
@@ -2183,10 +2222,19 @@ fn resolve_auth(
 }
 
 /// Read a bearer token from a file, trimming trailing whitespace/newline.
+///
+/// An empty (or whitespace-only) file is rejected here rather than producing a
+/// malformed `Authorization: Bearer ` header that fails opaquely at the broker.
+/// Guarding at the single read point covers both the `--token-file` flag and
+/// the context-derived `tokenFile` arm.
 fn read_token_file(path: &str) -> Result<String, CliError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|err| CliError::BadArg(format!("token file `{path}`: {err}")))?;
-    Ok(raw.trim().to_owned())
+    let tok = raw.trim();
+    if tok.is_empty() {
+        return Err(CliError::BadArg(format!("token file `{path}` is empty")));
+    }
+    Ok(tok.to_owned())
 }
 
 /// Build an `OAuth2` `client_credentials` flow from resolved context params.
@@ -2202,6 +2250,15 @@ fn build_oauth2_flow(
         .issuer_endpoint
         .parse::<url::Url>()
         .map_err(|err| CliError::BadArg(format!("issuer_endpoint: {err}")))?;
+    // The client_credentials flow POSTs client_id + client_secret as a form
+    // body. Over a plaintext `http://` issuer that secret leaks on the wire, so
+    // reject any non-https issuer endpoint up front.
+    if issuer.scheme() != "https" {
+        return Err(CliError::BadArg(
+            "issuer_endpoint must use https (OAuth2 client_secret must not be sent over plaintext)"
+                .to_owned(),
+        ));
+    }
 
     let credentials = oauth2_credentials(params)?;
 
@@ -2336,6 +2393,14 @@ fn run_context(
             Ok(())
         }
         ContextCmd::Rename { old, new } => {
+            // Refuse to clobber an existing destination: an unconditional insert
+            // would silently destroy `<new>`'s endpoint AND credentials (the
+            // `auth_info` remove/insert below would drop them too).
+            if old != new && (cfg.contexts.contains_key(&new) || cfg.auth_info.contains_key(&new)) {
+                return Err(CliError::BadArg(format!(
+                    "context \"{new}\" already exists; delete it first or pick another name"
+                )));
+            }
             let ctx = cfg
                 .contexts
                 .remove(&old)
@@ -2385,18 +2450,57 @@ fn context_set(
         ctx.bookie_service_url = v;
     }
     let info = cfg.auth_info.entry(name.clone()).or_default();
-    if let Some(v) = &globals.token {
-        info.token.clone_from(v);
-    }
-    if let Some(v) = &globals.token_file {
-        info.token_file.clone_from(v);
-    }
     if let Some(v) = &globals.tls_trust_cert_path {
         info.tls_trust_certs_file_path.clone_from(v);
     }
     if let Some(v) = globals.tls_allow_insecure {
         info.tls_allow_insecure_connection = v;
     }
+
+    // Auth methods are mutually exclusive and resolved by precedence
+    // (token › token_file › oauth2, see `config::resolve`). A `set` that
+    // introduces one mode clears the others, so switching modes in a later
+    // `set` cannot leave a stale higher-precedence credential that the resolver
+    // keeps serving in preference to the one just configured.
+    if let Some(v) = &globals.token {
+        info.token.clone_from(v);
+        info.token_file.clear();
+        clear_oauth2(info);
+    } else if let Some(v) = &globals.token_file {
+        info.token_file.clone_from(v);
+        info.token.clear();
+        clear_oauth2(info);
+    } else if issuer_endpoint.is_some() {
+        info.token.clear();
+        info.token_file.clear();
+        set_oauth2(info, issuer_endpoint, client_id, audience, scope, key_file);
+    } else {
+        // No mode-defining flag: tweak oauth2 sub-fields in place (if provided)
+        // without disturbing an existing token / token_file.
+        set_oauth2(info, None, client_id, audience, scope, key_file);
+    }
+    name
+}
+
+/// Clear every `OAuth2` field on an `auth-info` entry.
+fn clear_oauth2(info: &mut config::model::AuthInfo) {
+    info.issuer_endpoint.clear();
+    info.client_id.clear();
+    info.audience.clear();
+    info.scope.clear();
+    info.key_file.clear();
+}
+
+/// Apply the provided `OAuth2` fields onto an `auth-info` entry; `None` fields
+/// are left untouched.
+fn set_oauth2(
+    info: &mut config::model::AuthInfo,
+    issuer_endpoint: Option<String>,
+    client_id: Option<String>,
+    audience: Option<String>,
+    scope: Option<String>,
+    key_file: Option<String>,
+) {
     if let Some(v) = issuer_endpoint {
         info.issuer_endpoint = v;
     }
@@ -2412,7 +2516,6 @@ fn context_set(
     if let Some(v) = key_file {
         info.key_file = v;
     }
-    name
 }
 
 /// Load the config, treating an absent file (explicit OR default) as an empty
