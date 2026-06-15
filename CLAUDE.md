@@ -16,6 +16,9 @@ The architecture is **sans-io + multi-engine**:
 - `magnetar` — top-level façade.
   `PulsarClient<E: Engine = TokioEngine>` is generic over an `Engine` marker trait that selects per-engine storage.
   Engine-specific methods live in concrete `impl PulsarClient<TokioEngine>` / `impl PulsarClient<MoonpoolEngine<P>>` blocks.
+  Published on crates.io as **`magnetar-driver`** (the `magnetar` name is taken); the library/import name is still `magnetar`, so `use magnetar::*` is unchanged.
+  The CLI ships as **`magnetarctl`** (binary command `magnetarctl`).
+  See [ADR-0067](specs/adr/0067-publish-facade-as-magnetar-driver-cli-as-magnetarctl.md).
 
 The user-visible parity target is the Apache Pulsar Java client.
 The parity matrix lives in [`README.md#java-client-parity-matrix`](README.md).

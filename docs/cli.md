@@ -1,18 +1,18 @@
-# `magnetar` CLI
+# `magnetarctl` CLI
 
-> **Status: stable (1.0.0).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
+> **Status: stable (1.0.1).** Full `admin` surface wired across V2 + V3 — clusters, tenants, namespaces, topics (+ policies + shadow + PIP-415), subscriptions, brokers (+ dynamic config), bookies, schemas, and the V3 Functions / IO Sources / IO Sinks / Packages families.
 > `produce` / `consume` are not yet implemented and are excluded from the 1.0 stability guarantee.
 
-`magnetar` — the command-line client for Apache Pulsar built on the magnetar workspace.
-This page is the canonical CLI reference; for the full subcommand surface, run `magnetar --help` (or `magnetar <subcommand> --help`).
+`magnetarctl` — the command-line client for Apache Pulsar built on the magnetar workspace.
+This page is the canonical CLI reference; for the full subcommand surface, run `magnetarctl --help` (or `magnetarctl <subcommand> --help`).
 
 ## Install
 
 ```sh
 cargo install --path crates/magnetar-cli
 # or, from inside this workspace
-cargo build -p magnetar-cli --release
-./target/release/magnetar --help
+cargo build -p magnetarctl --release
+./target/release/magnetarctl --help
 ```
 
 ## Global flags
@@ -32,7 +32,7 @@ cargo build -p magnetar-cli --release
                              -vvvvv + all four at trace
 ```
 
-All flags are global — `magnetar admin -vv tenants list` is equivalent to `magnetar -vv admin tenants list`, and either form works.
+All flags are global — `magnetarctl admin -vv tenants list` is equivalent to `magnetarctl -vv admin tenants list`, and either form works.
 The `MAGNETAR_*` environment variables seed the same flags so CI pipelines and shell aliases don't have to repeat them.
 
 ## Quickstart against a local broker
@@ -42,10 +42,10 @@ docker run --rm -p 6650:6650 -p 8080:8080 \
   apachepulsar/pulsar:4.0.0 \
   bin/pulsar standalone
 
-magnetar admin tenants list
-magnetar admin namespaces create public/scratch
-magnetar admin topics create public/scratch/events --partitions 3
-magnetar admin topics stats public/scratch/events | jq '.msgInCounter'
+magnetarctl admin tenants list
+magnetarctl admin namespaces create public/scratch
+magnetarctl admin topics create public/scratch/events --partitions 3
+magnetarctl admin topics stats public/scratch/events | jq '.msgInCounter'
 ```
 
 ## `--version` / `-V`
@@ -55,7 +55,7 @@ The CLI exposes two forms, modeled on `sozu` and `systemd`:
 - **`-V`** prints a single-line, never-colorized identification banner:
 
   ```
-  magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
+  magnetarctl 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
   ```
 
 The parenthesized token is the 12-character git short SHA the binary was built from.
@@ -65,7 +65,7 @@ Outside a git checkout (e.g. released tarballs) the SHA is `unknown` and the dir
 - **`--version`** prints a multi-line build-metadata banner:
 
   ```
-  magnetar 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
+  magnetarctl 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
   built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21
@@ -80,7 +80,7 @@ The long banner is colorized when **both** conditions hold:
 
 1. The `NO_COLOR` environment variable is unset or empty (https://no-color.org).
 2. Standard output is a terminal — tested via `IsTerminal::is_terminal` on `stdout`.
-   Piping (`magnetar --version | tee …`) automatically suppresses color.
+   Piping (`magnetarctl --version | tee …`) automatically suppresses color.
 
 Palette (sozu/systemd convention):
 
@@ -118,10 +118,10 @@ Both the driver and the CLI banner read from `magnetar_proto::SUPPORTED_PROTOCOL
 
 ## Subcommands
 
-`magnetar --help` (and `magnetar <subcommand> --help` recursively) lists the full set.
+`magnetarctl --help` (and `magnetarctl <subcommand> --help` recursively) lists the full set.
 This page is the canonical reference; tables below cite every admin verb's REST endpoint so an operator can match the CLI call against the broker-side audit log.
 
-The admin surface is grouped kubectl-style: `magnetar admin <resource> <verb>`.
+The admin surface is grouped kubectl-style: `magnetarctl admin <resource> <verb>`.
 Output is JSON on stdout (pipeable into `jq`); errors are written to stderr with a non-zero exit code.
 Every admin call shares the global `--admin-url` / `--token` / `--admin-timeout-secs` / `-v` flags.
 
@@ -361,8 +361,8 @@ The `<type>` argument selects which subregistry: `function`, `source`, or `sink`
 ### `produce` / `consume` (M9 stubs)
 
 ```sh
-magnetar produce persistent://public/default/x --message hi
-magnetar consume persistent://public/default/x --subscription s --count 5
+magnetarctl produce persistent://public/default/x --message hi
+magnetarctl consume persistent://public/default/x --subscription s --count 5
 ```
 
 These print `not yet wired (M9)` and exit 0 today.
@@ -373,12 +373,12 @@ They get implemented once the `Connection` state machine and the tokio engine ar
 Every admin verb streams a single JSON value (object, array, or primitive) to stdout — pipe it into `jq` for transformation:
 
 ```sh
-magnetar admin clusters list | jq '.[]'
-magnetar admin topics stats acme/svc/orders | jq '.msgInCounter'
-magnetar admin functions list acme/svc | jq 'length'
+magnetarctl admin clusters list | jq '.[]'
+magnetarctl admin topics stats acme/svc/orders | jq '.msgInCounter'
+magnetarctl admin functions list acme/svc | jq 'length'
 ```
 
-Errors print `magnetar: <error>` to stderr followed by indented `caused by:` lines walking the full source chain (so a TLS handshake failure surfaces all the way down to the OS-level `Connection refused`, not just `error sending request for url …`).
+Errors print `magnetarctl: <error>` to stderr followed by indented `caused by:` lines walking the full source chain (so a TLS handshake failure surfaces all the way down to the OS-level `Connection refused`, not just `error sending request for url …`).
 The exit code is non-zero on any error.
 
 ## Error chain
@@ -392,9 +392,9 @@ The binary defaults to `crypto-aws-lc-rs` (post-quantum hybrid X25519MLKEM768 KE
 Single-provider builds pick an alternate explicitly:
 
 ```sh
-cargo build -p magnetar-cli --no-default-features --features crypto-ring
-cargo build -p magnetar-cli --no-default-features --features crypto-openssl   # needs system OpenSSL
-cargo build -p magnetar-cli --no-default-features --features crypto-fips      # needs cmake + clang
+cargo build -p magnetarctl --no-default-features --features crypto-ring
+cargo build -p magnetarctl --no-default-features --features crypto-openssl   # needs system OpenSSL
+cargo build -p magnetarctl --no-default-features --features crypto-fips      # needs cmake + clang
 ```
 
 A build with `--no-default-features` and no `crypto-*` selected fails fast with a `compile_error!` — the user-facing binary always needs TLS for both the admin REST client (reqwest + rustls) and the data-plane runtime (tokio-rustls).

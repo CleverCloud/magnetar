@@ -1,6 +1,6 @@
 [package]
-name        = "magnetar"
-description = "Apache Pulsar client driver for Rust. Public façade — re-exports the sans-io core plus the selected runtime engine."
+name        = "magnetar-driver"
+description = "Apache Pulsar client driver for Rust. Public façade — re-exports the sans-io core plus the selected runtime engine. Imported as `magnetar`."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -11,6 +11,12 @@ homepage      = { workspace = true }
 readme        = "../../README.md"
 keywords      = { workspace = true }
 categories    = { workspace = true }
+
+[lib]
+# Published on crates.io as `magnetar-driver` (the `magnetar` name is held by
+# an unrelated crate). The import path stays `magnetar`, so `use magnetar::*`
+# is unchanged for consumers — only the dependency line differs.
+name = "magnetar"
 
 [lints]
 workspace = true

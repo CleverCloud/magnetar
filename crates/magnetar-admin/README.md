@@ -1,6 +1,6 @@
 # magnetar-admin
 
-> **Status: stable (1.0.0).** Async admin REST client backing `magnetar-cli` across the V2 + V3 surface — policies, schemas, brokers/bookies, subscriptions, and the V3 Functions / IO Sources / IO Sinks / Packages families.
+> **Status: stable (1.0.1).** Async admin REST client backing `magnetarctl` across the V2 + V3 surface — policies, schemas, brokers/bookies, subscriptions, and the V3 Functions / IO Sources / IO Sinks / Packages families.
 
 Async Apache Pulsar admin REST client (`/admin/v2/...`).
 Backed by `reqwest` with the `rustls-tls` feature — no `native-tls`, no `openssl`.
@@ -57,7 +57,7 @@ The base service URL is whatever the broker exposes (`http://localhost:8080`, `h
 
 `topic_partitioned_stats` reuses the same `TopicStats` shape (it carries the broker's aggregated top-level counters); the per-partition breakdown is intentionally dropped.
 Call `topic_partitions_count` to size a topic and then either dispatch to `topic_stats` (non-partitioned) or `topic_partitioned_stats` (partitioned).
-The `magnetar` CLI's `admin topic-stats` does this auto-dispatch.
+The `magnetarctl` CLI's `admin topic-stats` does this auto-dispatch.
 
 ## Auth
 

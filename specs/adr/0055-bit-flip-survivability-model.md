@@ -62,7 +62,7 @@ No corruption-specific recovery path is added; corruption simply joins the set o
 ### §3 `sim_chaos` workload tests run supervised over a persistent broker
 
 Every bit-flip-exposed `sim_chaos` workload test that uses a plain client with delivery assertions is converted to a **supervised** client.
-The in-sim broker persists its ledger + per-subscription cursor in an `Arc<Mutex<SharedBroker>>` keyed by **stable identity** — topic for the ledger + next-entry-id, subscription **name** for the cursor — that survives the per-session reset, resumes a re-subscribe from the acked cursor (`start_message_id = last_acked_message_id`, redelivering only un-acked messages), and dedups replayed publishes by `(topic, sequence_id)` (re-emitting the existing receipt, and recording the `SENDS_TRAIL` correctness fact only on the *first* acceptance so the monotonic-sequence-id invariant still holds).
+The in-sim broker persists its ledger + per-subscription cursor in an `Arc<Mutex<SharedBroker>>` keyed by **stable identity** — topic for the ledger + next-entry-id, subscription **name** for the cursor — that survives the per-session reset, resumes a re-subscribe from the acked cursor (`start_message_id = last_acked_message_id`, redelivering only un-acked messages), and dedups replayed publishes by `(topic, sequence_id)` (re-emitting the existing receipt, and recording the `SENDS_TRAIL` correctness fact only on the _first_ acceptance so the monotonic-sequence-id invariant still holds).
 The shared state is cleared per iteration in the broker workload's `Workload::setup` (one workload instance is reused across a seed sweep).
 The consumer drain loops dedup received message ids by `(ledger_id, entry_id)` to absorb legitimate at-least-once redelivery.
 

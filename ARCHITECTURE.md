@@ -38,12 +38,12 @@ For binding decisions read the [ADR series](specs/adr/); for the user-facing sur
 
 ```text
 crates/
-  magnetar/                       Public façade — PulsarClient<E>, builders, typed schemas, partitioned / multi-topics / pattern / reader / table-view / interceptors
+  magnetar/                       Public façade (crates.io package `magnetar-driver`, library / import name `magnetar`) — PulsarClient<E>, builders, typed schemas, partitioned / multi-topics / pattern / reader / table-view / interceptors
   magnetar-proto/                 Sans-io state machine + codec + trackers + topic watcher (zero I/O deps)
   magnetar-runtime-tokio/         Production engine (TCP, tokio-rustls, supervised reconnect)
   magnetar-runtime-moonpool/      Deterministic-simulation engine over moonpool_core::Providers (rustls byte-pipe)
   magnetar-admin/                 reqwest-backed REST admin client (rustls-tls)
-  magnetar-cli/                   `magnetar` binary
+  magnetar-cli/                   `magnetarctl` crate + binary
   magnetar-fakes/                 In-process broker stub for tests
   magnetar-messagecrypto/         PIP-4 AES-GCM (aws-lc-rs)
   magnetar-auth-oauth2/           ClientCredentialsFlow + token caching
@@ -56,8 +56,8 @@ xtask/                            Workspace automation (check-no-channels, check
 The dependency direction is strictly downward:
 
 ```text
-magnetar-cli ──> magnetar-admin
-            └──> magnetar ──> magnetar-runtime-tokio    ──┐
+magnetarctl ──> magnetar-admin
+           └──> magnetar ──> magnetar-runtime-tokio    ──┐
                           ├──> magnetar-runtime-moonpool ──┤
                           ├──> magnetar-auth-{oauth2,sasl,athenz}
                           └──> magnetar-messagecrypto    ──┤
@@ -157,7 +157,7 @@ Lower layers know nothing about higher ones — `magnetar-proto` is pure-Rust st
                                     |
                                     v
 +--------------------------------------------------------------------------+
-| magnetar (façade)                | magnetar-cli      | magnetar-admin     |
+| magnetar (façade)                | magnetarctl       | magnetar-admin     |
 | ----------------------------     | --------------    | -----------------  |
 | PulsarClient, builders,          | clap-driven       | reqwest + rustls   |
 | typed schemas wiring,            | produce / consume | REST admin client. |
@@ -207,8 +207,8 @@ Lower layers know nothing about higher ones — `magnetar-proto` is pure-Rust st
 ### Crate-level dependency directions
 
 ```text
-magnetar-cli ──> magnetar-admin
-            └──> magnetar (faç.) ──> magnetar-runtime-tokio ───┐
+magnetarctl ──> magnetar-admin
+           └──> magnetar (faç.) ──> magnetar-runtime-tokio ───┐
                                 ├──> magnetar-runtime-moonpool ┤
                                 ├──> magnetar-auth-{oauth2,sasl,athenz}
                                 └──> magnetar-messagecrypto ───┤

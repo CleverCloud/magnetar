@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version       = "1.0.0"
+version       = "1.0.1"
 edition       = "2024"
 rust-version  = "1.88"
 license       = "Apache-2.0"
@@ -30,22 +30,22 @@ categories    = ["asynchronous", "network-programming"]
 
 [workspace.dependencies]
 # Internal crates
-# `default-features = false` so the only consumer (magnetar-cli) can pick
+# `default-features = false` so the only consumer (magnetarctl) can pick
 # its own `crypto-*` provider via `--no-default-features --features
 # crypto-ring|openssl|fips`. Without this, the façade's own defaults
 # (`tokio` + `crypto-aws-lc-rs`) leak in and produce a multi-provider
 # build for any single-provider override. ADR-0035 §1.
-magnetar                 = { version = "^1.0.0", path = "crates/magnetar", default-features = false }
-magnetar-admin           = { version = "^1.0.0", path = "crates/magnetar-admin" }
-magnetar-auth-athenz     = { version = "^1.0.0", path = "crates/magnetar-auth-athenz" }
-magnetar-auth-oauth2     = { version = "^1.0.0", path = "crates/magnetar-auth-oauth2" }
-magnetar-auth-sasl       = { version = "^1.0.0", path = "crates/magnetar-auth-sasl" }
-magnetar-differential    = { version = "^1.0.0", path = "crates/magnetar-differential" }
-magnetar-fakes           = { version = "^1.0.0", path = "crates/magnetar-fakes" }
-magnetar-messagecrypto   = { version = "^1.0.0", path = "crates/magnetar-messagecrypto" }
-magnetar-proto           = { version = "^1.0.0", path = "crates/magnetar-proto" }
-magnetar-runtime-moonpool = { version = "^1.0.0", path = "crates/magnetar-runtime-moonpool" }
-magnetar-runtime-tokio   = { version = "^1.0.0", path = "crates/magnetar-runtime-tokio" }
+magnetar-driver          = { version = "^1.0.1", path = "crates/magnetar", default-features = false }
+magnetar-admin           = { version = "^1.0.1", path = "crates/magnetar-admin" }
+magnetar-auth-athenz     = { version = "^1.0.1", path = "crates/magnetar-auth-athenz" }
+magnetar-auth-oauth2     = { version = "^1.0.1", path = "crates/magnetar-auth-oauth2" }
+magnetar-auth-sasl       = { version = "^1.0.1", path = "crates/magnetar-auth-sasl" }
+magnetar-differential    = { version = "^1.0.1", path = "crates/magnetar-differential" }
+magnetar-fakes           = { version = "^1.0.1", path = "crates/magnetar-fakes" }
+magnetar-messagecrypto   = { version = "^1.0.1", path = "crates/magnetar-messagecrypto" }
+magnetar-proto           = { version = "^1.0.1", path = "crates/magnetar-proto" }
+magnetar-runtime-moonpool = { version = "^1.0.1", path = "crates/magnetar-runtime-moonpool" }
+magnetar-runtime-tokio   = { version = "^1.0.1", path = "crates/magnetar-runtime-tokio" }
 
 # Codec
 prost           = "^0.14.4"

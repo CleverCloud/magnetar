@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-//! Smoke-tests for the `magnetar --version` / `-V` output.
+//! Smoke-tests for the `magnetarctl --version` / `-V` output.
 //!
-//! These spawn the actual binary (via `CARGO_BIN_EXE_magnetar`, which
+//! These spawn the actual binary (via `CARGO_BIN_EXE_magnetarctl`, which
 //! Cargo sets for `[[bin]]` targets in the same package) rather than
 //! call into `version::{short,long}` directly, so the assertions cover
 //! the clap wiring as well as the renderer.
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn binary() -> PathBuf {
-    env!("CARGO_BIN_EXE_magnetar").into()
+    env!("CARGO_BIN_EXE_magnetarctl").into()
 }
 
 /// `-V` short form: one line, no ANSI, starts with the binary name and
@@ -25,7 +25,7 @@ fn short_form_is_single_line_without_ansi() {
         .arg("-V")
         .env("NO_COLOR", "1")
         .output()
-        .expect("spawn magnetar -V");
+        .expect("spawn magnetarctl -V");
     assert!(out.status.success(), "exit code: {:?}", out.status);
 
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
@@ -34,7 +34,7 @@ fn short_form_is_single_line_without_ansi() {
         1,
         "short version must be one line, got: {stdout:?}",
     );
-    let expected_prefix = format!("magnetar {} (", env!("CARGO_PKG_VERSION"));
+    let expected_prefix = format!("magnetarctl {} (", env!("CARGO_PKG_VERSION"));
     assert!(
         stdout.starts_with(&expected_prefix),
         "expected prefix {expected_prefix:?}, got: {stdout:?}",
@@ -53,7 +53,7 @@ fn long_form_no_color_has_all_fields() {
         .arg("--version")
         .env("NO_COLOR", "1")
         .output()
-        .expect("spawn magnetar --version with NO_COLOR=1");
+        .expect("spawn magnetarctl --version with NO_COLOR=1");
     assert!(out.status.success(), "exit code: {:?}", out.status);
 
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
@@ -61,7 +61,7 @@ fn long_form_no_color_has_all_fields() {
         !stdout.contains('\x1b'),
         "NO_COLOR=1 must suppress all ANSI escapes, got: {stdout:?}",
     );
-    let expected_prefix = format!("magnetar {} (", env!("CARGO_PKG_VERSION"));
+    let expected_prefix = format!("magnetarctl {} (", env!("CARGO_PKG_VERSION"));
     assert!(stdout.starts_with(&expected_prefix));
     for needle in [
         "built ",
@@ -90,7 +90,7 @@ fn long_form_piped_has_no_ansi() {
         .arg("--version")
         .env_remove("NO_COLOR")
         .output()
-        .expect("spawn magnetar --version (piped)");
+        .expect("spawn magnetarctl --version (piped)");
     assert!(out.status.success(), "exit code: {:?}", out.status);
 
     assert!(

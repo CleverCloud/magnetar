@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-//! `--version` banner for the `magnetar` CLI binary.
+//! `--version` banner for the `magnetarctl` CLI binary.
 //!
 //! Two entry points, both returning `&'static str` (clap's
 //! `version` / `long_version` derive attributes require it):
@@ -8,9 +8,9 @@
 //! - [`short`] — one-liner payload: `X.Y.Z (sha-dirty)`. Bound to `-V`.
 //! - [`long`]  — multi-line banner with build metadata. Bound to `--version`.
 //!
-//! clap prepends the binary name (from `#[command(name = "magnetar")]`)
-//! to the payload, so these strings deliberately omit `"magnetar"` from
-//! their first token. The user sees `magnetar X.Y.Z (sha)` end-to-end.
+//! clap prepends the binary name (from `#[command(name = "magnetarctl")]`)
+//! to the payload, so these strings deliberately omit `"magnetarctl"` from
+//! their first token. The user sees `magnetarctl X.Y.Z (sha)` end-to-end.
 //!
 //! The long form is colorized when stdout is a TTY and `NO_COLOR` is unset
 //! (see <https://no-color.org>). When piped or `NO_COLOR=1`, output is plain
@@ -40,7 +40,7 @@ const PULSAR_PROTOCOL_VERSION: i32 = magnetar::proto::SUPPORTED_PROTOCOL_VERSION
 
 /// Short `-V` payload. One line, never colorized.
 ///
-/// Clap prepends `"magnetar "` (the `name` attribute); this returns
+/// Clap prepends `"magnetarctl "` (the `name` attribute); this returns
 /// `0.1.0-dev.0 (a1b2c3d4e5f6-dirty)`.
 pub(crate) fn short() -> &'static str {
     static CACHE: OnceLock<&'static str> = OnceLock::new();
@@ -81,7 +81,7 @@ fn should_color() -> bool {
 /// Build the multi-line banner. `colored=true` wraps select tokens in
 /// ANSI escapes; `false` produces pure ASCII.
 ///
-/// Note: clap prepends the binary `name = "magnetar"` to whatever we return,
+/// Note: clap prepends the binary `name = "magnetarctl"` to whatever we return,
 /// so line 1 here starts with the version, not the program name.
 fn render_long(colored: bool) -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -107,7 +107,7 @@ fn render_long(colored: bool) -> String {
 
     let mut out = String::with_capacity(512);
 
-    // Line 1: version + (git sha[-dirty]). Clap glues "magnetar " on front.
+    // Line 1: version + (git sha[-dirty]). Clap glues "magnetarctl " on front.
     // `write!` against a `String` is infallible — `expect` only documents intent.
     if colored {
         write!(out, "{bold}{version}{bold:#} ").expect("infallible String write");

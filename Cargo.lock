@@ -1707,8 +1707,98 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 
 [[package]]
-name = "magnetar"
-version = "1.0.0"
+name = "magnetar-admin"
+version = "1.0.1"
+dependencies = [
+ "http",
+ "magnetar-proto",
+ "reqwest",
+ "rustls",
+ "rustls-openssl",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "magnetar-auth-athenz"
+version = "1.0.1"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64",
+ "bytes",
+ "magnetar-proto",
+ "parking_lot",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-openssl",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "magnetar-auth-oauth2"
+version = "1.0.1"
+dependencies = [
+ "bytes",
+ "magnetar-proto",
+ "parking_lot",
+ "reqwest",
+ "rustls",
+ "rustls-openssl",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "magnetar-auth-sasl"
+version = "1.0.1"
+dependencies = [
+ "bytes",
+ "libgssapi",
+ "magnetar-proto",
+ "parking_lot",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "magnetar-differential"
+version = "1.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "magnetar-auth-athenz",
+ "magnetar-auth-sasl",
+ "magnetar-proto",
+ "magnetar-runtime-moonpool",
+ "magnetar-runtime-tokio",
+ "moonpool-core",
+ "parking_lot",
+ "prost",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "magnetar-driver"
+version = "1.0.1"
 dependencies = [
  "aws-lc-rs",
  "base64",
@@ -1742,116 +1832,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "magnetar-admin"
-version = "1.0.0"
-dependencies = [
- "http",
- "magnetar-proto",
- "reqwest",
- "rustls",
- "rustls-openssl",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "magnetar-auth-athenz"
-version = "1.0.0"
-dependencies = [
- "async-trait",
- "aws-lc-rs",
- "base64",
- "bytes",
- "magnetar-proto",
- "parking_lot",
- "reqwest",
- "ring",
- "rustls",
- "rustls-openssl",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "magnetar-auth-oauth2"
-version = "1.0.0"
-dependencies = [
- "bytes",
- "magnetar-proto",
- "parking_lot",
- "reqwest",
- "rustls",
- "rustls-openssl",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "magnetar-auth-sasl"
-version = "1.0.0"
-dependencies = [
- "bytes",
- "libgssapi",
- "magnetar-proto",
- "parking_lot",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "magnetar-cli"
-version = "1.0.0"
-dependencies = [
- "anstream",
- "anstyle",
- "clap",
- "magnetar",
- "magnetar-admin",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "magnetar-differential"
-version = "1.0.0"
-dependencies = [
- "async-trait",
- "bytes",
- "magnetar-auth-athenz",
- "magnetar-auth-sasl",
- "magnetar-proto",
- "magnetar-runtime-moonpool",
- "magnetar-runtime-tokio",
- "moonpool-core",
- "parking_lot",
- "prost",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "magnetar-fakes"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "magnetar-proto",
@@ -1861,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-messagecrypto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -1873,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-proto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "apache-avro",
  "bytes",
@@ -1898,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime-moonpool"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1926,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime-tokio"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "flate2",
@@ -1954,6 +1936,24 @@ dependencies = [
  "url",
  "wiremock",
  "zstd",
+]
+
+[[package]]
+name = "magnetarctl"
+version = "1.0.1"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap",
+ "magnetar-admin",
+ "magnetar-driver",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -4478,7 +4478,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",

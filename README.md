@@ -7,7 +7,7 @@
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status)
 [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: stable (1.0.0).**
+> **Status: stable (1.0.1).**
 > Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
 > PIP-460 scalable topics and the CLI `produce`/`consume` subcommands remain experimental / not-yet-implemented and are excluded from the 1.0 stability promise.
@@ -95,23 +95,31 @@ Pulsar Java client.
 - **Interceptors**: `ProducerInterceptor` + `ConsumerInterceptor` SPIs.
 - **Admin REST client**: a `reqwest`-backed admin client lives in
   `magnetar-admin`.
-- **CLI**: `magnetar` binary in `magnetar-cli` covers admin lookups and
-  stats today; data-plane subcommands (produce / consume / inspect) are
-  in progress.
+- **CLI**: `magnetarctl` binary in the `magnetarctl` crate covers admin
+  lookups and stats today; data-plane subcommands (produce / consume /
+  inspect) are in progress.
 
 ---
 
 ## Installation
 
-Magnetar's first release is `1.0.0`.
-Until it is published to crates.io, depend on the tagged release via Git:
+Magnetar's current release is `1.0.1`.
+The façade is published to crates.io under the package name `magnetar-driver` (the `magnetar` name is held by an unrelated crate); its library / import name stays `magnetar`, so `use magnetar::...` is unchanged.
+
+Depend on it directly from crates.io:
 
 ```toml
 [dependencies]
-magnetar = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.0.0" }
+# crates.io package is `magnetar-driver`; the import path stays `magnetar`.
+magnetar-driver = "1.0.1"
 ```
 
-Once published to crates.io, depend on it directly: `magnetar = "1.0.0"`.
+Or pin the tagged release via Git:
+
+```toml
+[dependencies]
+magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.0.1" }
+```
 
 The default feature set enables the tokio engine. The feature flags catalog:
 
@@ -140,20 +148,20 @@ and no `#[ignore]`. Docker on the host is the only prerequisite. -->
 
 The workspace ships twelve crates:
 
-| Crate                       | Role                                                                         |
-| --------------------------- | ---------------------------------------------------------------------------- |
-| `magnetar`                  | Public façade — re-exports + builder + typed schemas wiring.                 |
-| `magnetar-proto`            | Sans-io protocol crate. The heart of the project.                            |
-| `magnetar-runtime-tokio`    | Production tokio engine with `tokio-rustls` TLS.                             |
-| `magnetar-runtime-moonpool` | Deterministic-simulation engine (rustls-over-bytepipe TLS, no native TLS).   |
-| `magnetar-differential`     | Tokio ↔ moonpool `EventStream` equivalence harness (cross-engine tests).     |
-| `magnetar-admin`            | REST admin client (`reqwest` + `rustls-tls`).                                |
-| `magnetar-cli`              | `magnetar` binary — admin lookups today, produce / consume / inspect coming. |
-| `magnetar-fakes`            | In-process broker fake (dev-dep). Mirrors Java's `MockBrokerService`.        |
-| `magnetar-auth-oauth2`      | OAuth2 ClientCredentialsFlow auth provider.                                  |
-| `magnetar-auth-sasl`        | SASL auth provider.                                                          |
-| `magnetar-auth-athenz`      | Athenz auth provider.                                                        |
-| `magnetar-messagecrypto`    | PIP-4 end-to-end encryption (AES-GCM via `aws-lc-rs`).                       |
+| Crate                       | Role                                                                                                                                |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `magnetar`                  | Public façade — re-exports + builder + typed schemas wiring. crates.io package `magnetar-driver`; library / import name `magnetar`. |
+| `magnetar-proto`            | Sans-io protocol crate. The heart of the project.                                                                                   |
+| `magnetar-runtime-tokio`    | Production tokio engine with `tokio-rustls` TLS.                                                                                    |
+| `magnetar-runtime-moonpool` | Deterministic-simulation engine (rustls-over-bytepipe TLS, no native TLS).                                                          |
+| `magnetar-differential`     | Tokio ↔ moonpool `EventStream` equivalence harness (cross-engine tests).                                                            |
+| `magnetar-admin`            | REST admin client (`reqwest` + `rustls-tls`).                                                                                       |
+| `magnetarctl`               | `magnetarctl` binary — admin lookups today, produce / consume / inspect coming.                                                     |
+| `magnetar-fakes`            | In-process broker fake (dev-dep). Mirrors Java's `MockBrokerService`.                                                               |
+| `magnetar-auth-oauth2`      | OAuth2 ClientCredentialsFlow auth provider.                                                                                         |
+| `magnetar-auth-sasl`        | SASL auth provider.                                                                                                                 |
+| `magnetar-auth-athenz`      | Athenz auth provider.                                                                                                               |
+| `magnetar-messagecrypto`    | PIP-4 end-to-end encryption (AES-GCM via `aws-lc-rs`).                                                                              |
 
 `xtask` is a workspace member but is **not published** — it hosts build
 helpers (`protoc` codegen, e2e driver, dependency audits).
@@ -177,16 +185,17 @@ posture of the underlying primitives.
 
 ```bash
 # Pick a single provider (mutually exclusive at build time).
-cargo build -p magnetar --no-default-features --features tokio,crypto-aws-lc-rs
-cargo build -p magnetar --no-default-features --features tokio,crypto-ring
-cargo build -p magnetar --no-default-features --features tokio,crypto-openssl   # needs system OpenSSL
-cargo build -p magnetar --no-default-features --features tokio,crypto-fips      # needs cmake + C toolchain
+# Façade crates.io package is `magnetar-driver`; import path stays `magnetar`.
+cargo build -p magnetar-driver --no-default-features --features tokio,crypto-aws-lc-rs
+cargo build -p magnetar-driver --no-default-features --features tokio,crypto-ring
+cargo build -p magnetar-driver --no-default-features --features tokio,crypto-openssl   # needs system OpenSSL
+cargo build -p magnetar-driver --no-default-features --features tokio,crypto-fips      # needs cmake + C toolchain
 
-# The `magnetar` binary (magnetar-cli) mirrors the same cascade — the
+# The `magnetarctl` binary (magnetarctl crate) mirrors the same cascade — the
 # admin REST client (reqwest + rustls) and the data-plane runtime both
-# bind to the selected provider. `cargo build -p magnetar-cli` alone
+# bind to the selected provider. `cargo build -p magnetarctl` alone
 # defaults to `crypto-aws-lc-rs`.
-cargo build -p magnetar-cli --no-default-features --features crypto-ring
+cargo build -p magnetarctl --no-default-features --features crypto-ring
 ```
 
 Under `cargo build --workspace --all-features` the compile-time cfg
@@ -206,14 +215,14 @@ decision.
 
 ---
 
-## Build metadata (`magnetar --version`)
+## Build metadata (`magnetarctl --version`)
 
-The `magnetar` binary exposes a sozu / systemd-style identification
+The `magnetarctl` binary exposes a sozu / systemd-style identification
 banner:
 
 ```
-$ magnetar --version
-magnetar 1.0.0 (a1b2c3d4e5f6)
+$ magnetarctl --version
+magnetarctl 1.0.1 (a1b2c3d4e5f6)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
@@ -221,7 +230,7 @@ os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
 - `-V` prints a single-line, never-colorized form:
-  `magnetar 1.0.0 (sha)`.
+  `magnetarctl 1.0.1 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
 - `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for
@@ -848,7 +857,7 @@ Known open work is narrow and tracked in
 Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few
 simulation / test-harness gaps remain.
 
-The public API is stable as of `1.0.0` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
+The public API is stable as of `1.0.1` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
 
 ---
 

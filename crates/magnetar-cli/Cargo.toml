@@ -1,6 +1,6 @@
 [package]
-name        = "magnetar-cli"
-description = "magnetar CLI — produce, consume, inspect, and admin against an Apache Pulsar broker."
+name        = "magnetarctl"
+description = "magnetarctl — the Magnetar CLI: produce, consume, inspect, and admin against an Apache Pulsar broker."
 version       = { workspace = true }
 edition       = { workspace = true }
 rust-version  = { workspace = true }
@@ -15,11 +15,11 @@ publish     = true
 build       = "build.rs"
 
 [[bin]]
-name = "magnetar"
+name = "magnetarctl"
 path = "src/main.rs"
-# The `magnetar` lib crate also emits rustdoc into `target/doc/magnetar/`.
-# Disabling rustdoc on the binary avoids the documented output collision
-# (cargo issue #6313) without renaming the user-visible CLI.
+# Binary is `magnetarctl`; the façade lib is `magnetar` (package
+# `magnetar-driver`). Distinct names, so no rustdoc-dir collision.
+# `doc = false` kept: the CLI exposes no library API to document.
 doc  = false
 
 [lints]
@@ -31,7 +31,7 @@ default = ["crypto-aws-lc-rs"]
 # PIP-460 scalable topics (ADR-0031). Default OFF. Adds the `topic-info`
 # subcommand (prints a scalable topic's segment DAG). Propagates the façade's
 # experimental scalable surface.
-scalable-topics = ["magnetar/scalable-topics", "magnetar-admin/scalable-topics"]
+scalable-topics = ["magnetar-driver/scalable-topics", "magnetar-admin/scalable-topics"]
 
 # --- Crypto provider features (ADR-0035). Mirror the façade's pluggable
 # rustls crypto backend down into the binary crate. `magnetar-admin` is
@@ -41,24 +41,24 @@ scalable-topics = ["magnetar/scalable-topics", "magnetar-admin/scalable-topics"]
 # admin URL fails at the connector layer. Single-provider builds use
 # `--no-default-features --features crypto-<x>`. ---
 crypto-aws-lc-rs = [
-    "magnetar/crypto-aws-lc-rs",
+    "magnetar-driver/crypto-aws-lc-rs",
     "magnetar-admin/crypto-aws-lc-rs",
 ]
 crypto-ring = [
-    "magnetar/crypto-ring",
+    "magnetar-driver/crypto-ring",
     "magnetar-admin/crypto-ring",
 ]
 crypto-openssl = [
-    "magnetar/crypto-openssl",
+    "magnetar-driver/crypto-openssl",
     "magnetar-admin/crypto-openssl",
 ]
 crypto-fips = [
-    "magnetar/crypto-fips",
+    "magnetar-driver/crypto-fips",
     "magnetar-admin/crypto-fips",
 ]
 
 [dependencies]
-magnetar           = { workspace = true, default-features = false, features = ["tokio"] }
+magnetar-driver    = { workspace = true, default-features = false, features = ["tokio"] }
 magnetar-admin     = { workspace = true }
 anstream           = "1"
 anstyle            = "1"

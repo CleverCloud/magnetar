@@ -68,7 +68,7 @@
 /// PIP-145 `CommandWatchTopicList`, the PIP-31 transactional family,
 /// and the rest of the baseline parity surface.
 ///
-/// Exposed so the CLI banner (`magnetar --version`) and any external
+/// Exposed so the CLI banner (`magnetarctl --version`) and any external
 /// tooling read the same number the wire driver sends, removing the
 /// drift risk of two parallel literals.
 pub const SUPPORTED_PROTOCOL_VERSION: i32 = 21;

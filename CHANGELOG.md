@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-06-15
+
+### Changed
+
+- Renamed the published crates.io packages to avoid a name collision (the `magnetar` name is held by an unrelated, abandoned crate): the façade ships as **`magnetar-driver`** and the CLI as **`magnetarctl`** (binary command `magnetarctl`). The façade's library/import name is unchanged — `use magnetar::*` still works; only the dependency line differs (`magnetar-driver = "1.0.1"`). No API, behavior, or wire-format change. (ADR-0067)
+
 ## [1.0.0] - 2026-06-15
 
 First stable release.
@@ -62,4 +68,5 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - CRC32C verify-or-drop on frames with magic `0x0e01`: a checksum mismatch emits a `ChecksumMismatch` event and drops the frame.
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained). (2a9fafb, abc7aad)
 
+[1.0.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.1
 [1.0.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.0

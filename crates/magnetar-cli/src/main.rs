@@ -53,10 +53,10 @@ use magnetar_admin::{
     SourceConfig, TenantInfo,
 };
 
-/// magnetar — produce, consume, inspect, and admin against an Apache Pulsar broker.
+/// magnetarctl — produce, consume, inspect, and admin against an Apache Pulsar broker.
 #[derive(Debug, Parser)]
 #[command(
-    name = "magnetar",
+    name = "magnetarctl",
     version = version::short(),
     long_version = version::long(),
     about,
