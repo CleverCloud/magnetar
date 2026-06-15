@@ -27,16 +27,23 @@ workspace = true
 # cascade in `src/tls_crypto.rs` mirrors `magnetar-runtime-tokio` (aws-lc-rs
 # wins, then FIPS, then openssl, then ring) so admin standalone matches the
 # façade's provider choice without depending on the tokio runtime crate.
-crypto-aws-lc-rs = ["reqwest/rustls", "rustls/aws_lc_rs"]
-crypto-ring      = ["reqwest/rustls-no-provider", "rustls/ring"]
-crypto-openssl   = ["reqwest/rustls-no-provider", "dep:rustls-openssl"]
-crypto-fips      = ["reqwest/rustls-no-provider", "rustls/fips"]
+# Each crypto-* feature also forwards to `magnetar-auth-oauth2`'s matching
+# feature so the OAuth2 token-exchange client (used by `AdminAuth::OAuth2`)
+# binds the same rustls provider as the admin reqwest client. Without the
+# forward, a single-provider build (`--no-default-features --features
+# crypto-ring`) would leave the OAuth2 client's reqwest with no TLS feature
+# and every `https://` issuer fail at the connector layer.
+crypto-aws-lc-rs = ["reqwest/rustls", "rustls/aws_lc_rs", "magnetar-auth-oauth2/crypto-aws-lc-rs"]
+crypto-ring      = ["reqwest/rustls-no-provider", "rustls/ring", "magnetar-auth-oauth2/crypto-ring"]
+crypto-openssl   = ["reqwest/rustls-no-provider", "dep:rustls-openssl", "magnetar-auth-oauth2/crypto-openssl"]
+crypto-fips      = ["reqwest/rustls-no-provider", "rustls/fips", "magnetar-auth-oauth2/crypto-fips"]
 # PIP-460 scalable topics (ADR-0031). Keeps admin's `MessageId` construction
 # in sync with the proto-layer `segment_id` field gate. Default OFF.
 scalable-topics  = ["magnetar-proto/scalable-topics"]
 
 [dependencies]
-magnetar-proto = { workspace = true }
+magnetar-proto       = { workspace = true }
+magnetar-auth-oauth2 = { workspace = true }
 reqwest        = { workspace = true }
 rustls         = { workspace = true }
 rustls-openssl = { workspace = true, optional = true }
@@ -48,5 +55,9 @@ thiserror      = { workspace = true }
 tracing        = { workspace = true }
 
 [dev-dependencies]
+# OAuth2 flow constructor for the `AdminAuth::OAuth2` auth test. Its rustls
+# provider is selected by the test build's crypto-* feature (forwarded through
+# this crate's own crypto features).
+magnetar-auth-oauth2 = { workspace = true }
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock = { workspace = true }

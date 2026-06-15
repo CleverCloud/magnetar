@@ -41,8 +41,10 @@
 mod tls_crypto;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use magnetar_auth_oauth2::ClientCredentialsFlow;
 use magnetar_proto::MessageId;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
@@ -69,7 +71,10 @@ pub const PACKAGE_REGISTER_TIMEOUT: Duration = Duration::from_secs(300);
 /// Authentication strategy used by the admin client.
 ///
 /// `Token(...)` adds `Authorization: Bearer <token>` to every request.
-/// Mirrors Java's `AuthenticationToken` provider.
+/// Mirrors Java's `AuthenticationToken` provider. `OAuth2(...)` performs a
+/// `client_credentials` exchange against the IDP and attaches the resulting
+/// access token as a bearer credential — mirrors Java's
+/// `AuthenticationOAuth2`.
 #[derive(Clone, Default)]
 pub enum AdminAuth {
     /// No authentication.
@@ -78,6 +83,11 @@ pub enum AdminAuth {
     /// Bearer token. The string is the raw token; the `Bearer ` prefix is added
     /// at request time.
     Token(String),
+    /// `OAuth2` `client_credentials` flow. The cached access token is refreshed
+    /// (when missing or near expiry) and attached as `Authorization: Bearer
+    /// <access-token>` at request time. The flow is shared (`Arc`) so its
+    /// token cache is reused across every admin call.
+    OAuth2(Arc<ClientCredentialsFlow>),
 }
 
 impl std::fmt::Debug for AdminAuth {
@@ -89,6 +99,9 @@ impl std::fmt::Debug for AdminAuth {
         match self {
             Self::None => f.write_str("None"),
             Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            // `ClientCredentialsFlow`'s own `Debug` already redacts the secret
+            // and cached token, so forwarding to it is safe.
+            Self::OAuth2(flow) => f.debug_tuple("OAuth2").field(flow).finish(),
         }
     }
 }
@@ -3425,13 +3438,29 @@ impl AdminClient {
     async fn send(&self, req: RequestBuilder) -> Result<Response, AdminError> {
         let req = match &self.auth {
             AdminAuth::None => req,
-            AdminAuth::Token(tok) => {
-                let value = format!("Bearer {tok}");
-                let mut headers = HeaderMap::new();
-                let header_value = HeaderValue::from_str(&value)
-                    .map_err(|err| AdminError::Builder(format!("invalid bearer token: {err}")))?;
-                headers.insert(AUTHORIZATION, header_value);
-                req.headers(headers)
+            AdminAuth::Token(tok) => bearer(req, tok)?,
+            AdminAuth::OAuth2(flow) => {
+                // Refresh the cached token if it is missing or near expiry,
+                // then attach it. `ensure_fresh` is a no-op when the cached
+                // token is still valid, so the steady-state path is a single
+                // mutex read.
+                flow.ensure_fresh()
+                    .await
+                    .map_err(|err| AdminError::Auth(format!("oauth2 token refresh: {err}")))?;
+                let token = flow.cached_access_token().ok_or_else(|| {
+                    AdminError::Auth("oauth2 returned an empty access token".to_owned())
+                })?;
+                if token.is_empty() {
+                    return Err(AdminError::Auth(
+                        "oauth2 returned an empty access token".to_owned(),
+                    ));
+                }
+                // The access token is base64url JWT text — valid UTF-8 — but
+                // guard the conversion rather than assume it.
+                let tok = std::str::from_utf8(&token).map_err(|err| {
+                    AdminError::Auth(format!("oauth2 access token is not valid utf-8: {err}"))
+                })?;
+                bearer(req, tok)?
             }
         };
         Ok(req.send().await?)
@@ -4019,6 +4048,13 @@ pub struct AdminClientBuilder {
     base_url: Option<Url>,
     auth: AdminAuth,
     timeout: Option<Duration>,
+    /// Extra CA root, PEM-encoded, added to reqwest's trust store. Mirrors
+    /// pulsarctl's `tls_trust_certs_file_path`.
+    tls_trust_cert_pem: Option<Vec<u8>>,
+    /// Disable certificate verification. Mirrors pulsarctl's
+    /// `tls_allow_insecure_connection`. **Insecure** — defeats MITM
+    /// protection; only for self-signed dev brokers.
+    tls_allow_insecure: bool,
 }
 
 impl AdminClientBuilder {
@@ -4033,6 +4069,32 @@ impl AdminClientBuilder {
     #[must_use]
     pub fn token(mut self, token: String) -> Self {
         self.auth = AdminAuth::Token(token);
+        self
+    }
+
+    /// Configure `OAuth2` `client_credentials` auth. The shared flow's token
+    /// cache is refreshed on demand at request time (see [`AdminAuth::OAuth2`]).
+    #[must_use]
+    pub fn oauth2(mut self, flow: Arc<ClientCredentialsFlow>) -> Self {
+        self.auth = AdminAuth::OAuth2(flow);
+        self
+    }
+
+    /// Add a custom CA root (PEM bytes) to the HTTPS trust store. Mirrors
+    /// pulsarctl's `tls_trust_certs_file_path`. The CLI reads the file and
+    /// passes its bytes here.
+    #[must_use]
+    pub fn tls_trust_cert_pem(mut self, pem: Vec<u8>) -> Self {
+        self.tls_trust_cert_pem = Some(pem);
+        self
+    }
+
+    /// Disable TLS certificate verification (`danger_accept_invalid_certs`).
+    /// Mirrors pulsarctl's `tls_allow_insecure_connection`. **Insecure** —
+    /// only for self-signed dev brokers; never in production.
+    #[must_use]
+    pub fn tls_allow_insecure(mut self, allow: bool) -> Self {
+        self.tls_allow_insecure = allow;
         self
     }
 
@@ -4084,10 +4146,20 @@ impl AdminClientBuilder {
         tls_crypto::install_default_provider();
 
         let timeout = self.timeout.unwrap_or(DEFAULT_TIMEOUT);
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(AdminError::Http)?;
+        let http_builder = reqwest::Client::builder().timeout(timeout);
+        // The custom-CA / allow-insecure reqwest knobs only exist when a
+        // rustls TLS feature (`__tls`) is compiled in, which every `crypto-*`
+        // feature enables. The binary crate always selects one provider, so
+        // this branch is live in production; a no-crypto library build that
+        // asks for TLS options gets a clear builder error rather than a
+        // silently-ignored option.
+        let http = apply_tls_options(
+            http_builder,
+            self.tls_trust_cert_pem,
+            self.tls_allow_insecure,
+        )?
+        .build()
+        .map_err(AdminError::Http)?;
 
         Ok(AdminClient {
             base_url,
@@ -4121,6 +4193,10 @@ pub enum AdminError {
     /// Builder configuration error (missing service URL, invalid argument...).
     #[error("invalid builder: {0}")]
     Builder(String),
+    /// Authentication failure — e.g. the `OAuth2` `client_credentials` exchange
+    /// failed or returned an empty access token.
+    #[error("auth error: {0}")]
+    Auth(String),
     /// Caller passed a namespace or topic name that the client could not parse.
     #[error("invalid name: {0}")]
     InvalidName(String),
@@ -4129,6 +4205,77 @@ pub enum AdminError {
     /// `MessageIdImpl` cannot represent either).
     #[error("broker protocol violation: {0}")]
     Protocol(String),
+}
+
+/// Apply the pulsarctl-derived TLS options (custom CA root + allow-insecure)
+/// to a reqwest [`ClientBuilder`].
+///
+/// `add_root_certificate` / `danger_accept_invalid_certs` / `Certificate`
+/// live behind reqwest's `__tls` cfg, enabled by every `crypto-*` feature.
+/// The two-variant cfg split keeps a no-crypto library build compiling: with
+/// no TLS feature, asking for either option is a hard builder error rather
+/// than a silently-dropped knob.
+#[cfg(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+))]
+fn apply_tls_options(
+    mut builder: reqwest::ClientBuilder,
+    trust_cert_pem: Option<Vec<u8>>,
+    allow_insecure: bool,
+) -> Result<reqwest::ClientBuilder, AdminError> {
+    // Custom CA trust (pulsarctl `tls_trust_certs_file_path`). reqwest's
+    // `add_root_certificate` adds the cert *alongside* the platform roots,
+    // matching Pulsar's "extra trust anchor" semantics.
+    if let Some(pem) = trust_cert_pem {
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|err| AdminError::Builder(format!("invalid tls trust cert PEM: {err}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    // Allow-insecure (pulsarctl `tls_allow_insecure_connection`). Defeats
+    // certificate verification — only meaningful against self-signed dev
+    // brokers, hence gated behind the explicit opt-in flag.
+    if allow_insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    Ok(builder)
+}
+
+/// No-TLS fallback: a library build with no `crypto-*` feature cannot honour
+/// TLS options. Accept the builder unchanged when no option is requested;
+/// error clearly when one is.
+#[cfg(not(any(
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-ring",
+    feature = "crypto-openssl",
+    feature = "crypto-fips",
+)))]
+fn apply_tls_options(
+    builder: reqwest::ClientBuilder,
+    trust_cert_pem: Option<Vec<u8>>,
+    allow_insecure: bool,
+) -> Result<reqwest::ClientBuilder, AdminError> {
+    if trust_cert_pem.is_some() || allow_insecure {
+        return Err(AdminError::Builder(
+            "TLS options (trust cert / allow-insecure) require a crypto-* feature".to_owned(),
+        ));
+    }
+    Ok(builder)
+}
+
+/// Attach `Authorization: Bearer <tok>` to a request builder.
+///
+/// Shared by the `Token` and `OAuth2` auth arms — both ultimately set a
+/// bearer header; only the source of the token bytes differs.
+fn bearer(req: RequestBuilder, tok: &str) -> Result<RequestBuilder, AdminError> {
+    let value = format!("Bearer {tok}");
+    let mut headers = HeaderMap::new();
+    let header_value = HeaderValue::from_str(&value)
+        .map_err(|err| AdminError::Builder(format!("invalid bearer token: {err}")))?;
+    headers.insert(AUTHORIZATION, header_value);
+    Ok(req.headers(headers))
 }
 
 /// Decode a non-error JSON response body.
