@@ -43,6 +43,104 @@ Volume expectations: `warn!` and above are bounded by churn (reconnects, refusal
 Per-message records live at `trace!` and `debug!` only, and the per-message `debug!` paths are allocation-free when the level is disabled, so `debug!` is safe to enable in production with per-target filtering.
 Nothing operator-load-bearing lives below `info!` — your application may compile out `trace!`/`debug!` via `tracing`'s `release_max_level_*` features without losing an alarm; magnetar itself never sets those features (they would propagate to your binary through feature unification).
 
+## Rate-limiting and sampling
+
+[ADR-0054 §7](../specs/adr/0054-logging-policy.md) bounds volume _structurally_ — per-message records live at `trace!` / `debug!`, and `warn!` and above are bounded by churn, never by throughput.
+But churn can itself storm: a broker-restart cascade has every supervised connection's reconnect loop emit one `warn!` per attempt at a single callsite (`"supervisor: reconnect attempt failed; will retry"`), so many reconnecting connections collapse onto one line at an unbounded rate.
+
+Rate-limiting and sampling are **subscriber-side**: magnetar emits unchanged and ships no limiter ([ADR-0065](../specs/adr/0065-log-rate-limiting-subscriber-side.md) — a library-side limiter would carry per-callsite state and read a clock, which the sans-io core must not).
+Compose these three tiers to taste.
+
+### 1. Static — raise a noisy target's floor
+
+The cheapest tool is the `EnvFilter` you already installed: lift one target above the storming level.
+
+```sh
+RUST_LOG=info,magnetar_runtime_tokio::driver=error ./my-app   # drop supervisor warn!s, keep its error!s
+```
+
+This is coarse — it silences _every_ `warn!` from `magnetar_runtime_tokio::driver` (reconnect-failed, anti-thrash cooldown, give-up), not just the cascade.
+Use it when one target is known-noisy and you don't need its other warnings.
+
+### 2. Dynamic — a per-callsite rate-limiting layer
+
+For per-line control, drop events from any single callsite that exceeds a rate.
+A token bucket keyed by `tracing` callsite is a small, dependency-free `Layer`; because the reconnect cascade shares one callsite, a single bucket caps the whole storm while every other callsite is untouched:
+
+```rust
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
+
+use tracing::Event;
+use tracing::callsite::Identifier;
+use tracing_subscriber::layer::{Context, Layer};
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+/// Drops events from any single callsite exceeding `rate`/sec, allowing
+/// bursts up to `burst`. The keyspace is the set of `tracing` callsites
+/// compiled into the binary — finite and `&'static`, so the map is
+/// naturally bounded; no eviction needed.
+pub struct CallsiteRateLimit {
+    rate: f64,
+    burst: f64,
+    buckets: Mutex<HashMap<Identifier, Bucket>>,
+}
+
+impl CallsiteRateLimit {
+    pub fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self { rate: rate_per_sec, burst, buckets: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for CallsiteRateLimit {
+    fn event_enabled(&self, event: &Event<'_>, _ctx: Context<'_, S>) -> bool {
+        let id = event.metadata().callsite();
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().unwrap();
+        let b = buckets.entry(id).or_insert(Bucket { tokens: self.burst, last: now });
+        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
+        b.last = now;
+        b.tokens = (b.tokens + elapsed * self.rate).min(self.burst);
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+```
+
+Install it at registry level, so a dropped event is suppressed for every layer:
+
+```rust
+use tracing_subscriber::prelude::*;
+
+tracing_subscriber::registry()
+    .with(tracing_subscriber::EnvFilter::from_default_env())
+    .with(tracing_subscriber::fmt::layer())
+    .with(CallsiteRateLimit::new(5.0, 20.0)) // 5 events/sec per callsite, burst 20
+    .init();
+```
+
+`event_enabled` is the per-event hook (`tracing-subscriber` 0.3); returning `false` skips the event for the whole stack.
+The clock (`Instant::now()`) and the bucket state live here, in your process — which is exactly why this belongs subscriber-side and not in the sans-io driver.
+
+### 3. Fleet — sample in the collector
+
+An in-process limiter only sees its own process.
+When a storm aggregates across many instances, sample or deduplicate downstream — in the OTLP collector, Vector, or Loki pipeline — where the whole fleet's stream converges.
+See [`observability.md`](observability.md) for the export path.
+
+**Keep the signal.**
+Every tier drops _log lines_, not the underlying condition.
+Pair rate-limiting with a metric or alert on the cause (e.g. reconnect rate) so a genuinely escalating outage still pages you when its logs are being throttled.
+
 ## Field glossary
 
 Logs carry structured snake_case fields, never values formatted into the message string.
