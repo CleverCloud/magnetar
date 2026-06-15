@@ -31,7 +31,7 @@
     feature = "crypto-fips",
 )))]
 compile_error!(
-    "magnetar-cli: enable at least one of crypto-{aws-lc-rs,ring,openssl,fips}. \
+    "magnetarctl: enable at least one of crypto-{aws-lc-rs,ring,openssl,fips}. \
      The default feature set covers this; only `--no-default-features` users \
      need to pick one explicitly."
 );

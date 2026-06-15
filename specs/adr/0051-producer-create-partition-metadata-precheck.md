@@ -24,7 +24,7 @@ Three options were on the table:
    No type cascade.
 
 2. **Full Java-parity auto-dispatch.** `client.producer(t).create()` returns a `PartitionedProducer<R>` for both N=0 and N>0 cases, delegating internally to the partitioned path.
-   The change cascades through `TypedProducer<S, P: ProducerApi>` (the `inner: P` slot would have to be `PartitionedProducer<R>`, which needs a `ProducerApi for PartitionedProducer` impl), through `v5::Producer::from_v4` (which assumes the v4 inner is `R`, not a wrapper), and through `magnetar-cli` / the moonpool engine seam.
+   The change cascades through `TypedProducer<S, P: ProducerApi>` (the `inner: P` slot would have to be `PartitionedProducer<R>`, which needs a `ProducerApi for PartitionedProducer` impl), through `v5::Producer::from_v4` (which assumes the v4 inner is `R`, not a wrapper), and through `magnetarctl` / the moonpool engine seam.
    Substantial refactor — 600–1200 LOC across 6–8 files, plus 4-layer test coverage per ADR-0024.
 
 3. **Reactive translation only.** Catch the broker `NotAllowedError(22)` with the specific body inside `open_producer` and translate to the same actionable error.

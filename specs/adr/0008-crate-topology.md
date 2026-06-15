@@ -25,7 +25,7 @@ Eleven crates plus an internal `xtask`:
 | `magnetar-runtime-tokio`    | Production engine: TCP + `tokio-rustls`, driver loop, producer / consumer / reader / table-view façades.                        | Yes                                |
 | `magnetar-runtime-moonpool` | Deterministic-simulation engine over `moonpool_core::Providers`, mirror of the tokio engine surface.                            | Yes                                |
 | `magnetar-admin`            | `reqwest`-backed REST admin client.                                                                                             | Yes                                |
-| `magnetar-cli`              | `magnetar` binary — admin lookups, stats, data-plane subcommands.                                                               | Yes                                |
+| `magnetarctl`               | `magnetar` binary — admin lookups, stats, data-plane subcommands.                                                               | Yes                                |
 | `magnetar-fakes`            | In-process broker stub for sans-io unit tests. **Dev-dep only**.                                                                | Yes (cargo dev-dep)                |
 | `magnetar-messagecrypto`    | PIP-4 AES-GCM encryption bridge.                                                                                                | Yes (behind `encryption` feature)  |
 | `magnetar-auth-oauth2`      | OAuth2 `ClientCredentialsFlow` provider.                                                                                        | Yes (behind `auth-oauth2` feature) |
@@ -40,7 +40,7 @@ magnetar           — depends on magnetar-runtime-tokio | -moonpool, magnetar-a
 magnetar-runtime-* — depends on magnetar-proto
 magnetar-proto     — depends on nothing magnetar-specific; **no I/O deps**
 magnetar-admin     — depends on nothing magnetar-specific; reqwest+rustls-tls
-magnetar-cli       — depends on magnetar + magnetar-admin
+magnetarctl       — depends on magnetar + magnetar-admin
 magnetar-fakes     — depends on magnetar-proto (sans-io fake broker)
 magnetar-auth-*    — depends on magnetar-proto (auth trait lives there)
 ```

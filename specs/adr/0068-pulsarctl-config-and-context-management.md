@@ -7,7 +7,7 @@
 
 ## Context
 
-`magnetarctl` reads its connection settings only from flags / env: `--admin-url` / `MAGNETAR_ADMIN_URL` (default `http://localhost:8080`), `--service-url` / `MAGNETAR_SERVICE_URL` (default `pulsar://localhost:6650`), and `--token` / `MAGNETAR_TOKEN` (`crates/magnetar-cli/src/main.rs` globals).
+`magnetarctl` reads its connection settings only from flags / env: `--admin-url` / `MAGNETAR_ADMIN_URL` (default `http://localhost:8080`), `--service-url` / `MAGNETAR_SERVICE_URL` (default `pulsar://localhost:6650`), and `--token` / `MAGNETAR_TOKEN` (`crates/magnetarctl/src/main.rs` globals).
 It has no awareness of the standard pulsarctl config file, so a user with a working pulsarctl setup gets the built-in localhost default with no credentials:
 
 ```console
@@ -34,7 +34,7 @@ Teach `magnetarctl` to read and write the pulsarctl config and manage contexts, 
   Each struct carries a `#[serde(flatten)] BTreeMap<String, serde_norway::Value>` so any unknown key round-trips untouched.
   A file written by `magnetarctl context set` stays readable by pulsarctl and vice-versa.
 - **YAML crate: `serde_norway`** — the actively-maintained fork of the now-unmaintained `serde_yaml`; its untagged `serde_norway::Value` backs the unknown-key preservation.
-  Added to `[workspace.dependencies]` and used by `magnetar-cli` only (MIT OR Apache-2.0, no banned channel crates).
+  Added to `[workspace.dependencies]` and used by `magnetarctl` only (MIT OR Apache-2.0, no banned channel crates).
 - **Path resolution** (most-specific first): `--config <path>` › `MAGNETAR_CONFIG` › `$XDG_CONFIG_HOME/pulsar/config` (only when `XDG_CONFIG_HOME` is set) › `$HOME/.config/pulsar/config` (the pulsarctl-hardcoded default).
   A missing file at the default path is **not** an error (fall back to built-in defaults); a missing file at an **explicit** `--config` / `MAGNETAR_CONFIG` path **is** an error.
   `$HOME` / `$XDG_CONFIG_HOME` are read with `std::env::var` — the no-internal-clock / env allowlist (ADR-0011) governs `magnetar-proto`, not the CLI.
@@ -53,7 +53,7 @@ Teach `magnetarctl` to read and write the pulsarctl config and manage contexts, 
 
 - A working pulsarctl config "just works" with `magnetarctl` (zero extra flags), and the config can be edited via the CLI instead of by hand.
 - **Round-trip fidelity is a hard constraint**: the exact key casing plus the `#[serde(flatten)]` unknown-key capture are load-bearing — a regression that drops `locationoforigin` or normalises `tokenFile` to snake_case silently corrupts a shared pulsarctl config.
-  Covered by a golden round-trip test (`crates/magnetar-cli/src/config/model.rs`).
+  Covered by a golden round-trip test (`crates/magnetarctl/src/config/model.rs`).
 - The data-plane derivation is a **heuristic, not a guarantee**: many deployments (incl. Clever Cloud behind the Pulsar Proxy) expose the binary protocol on a different host/port than the admin endpoint.
   An explicit `--service-url` / `MAGNETAR_SERVICE_URL` always overrides, and the derived value is logged so a wrong guess is obvious.
 - New workspace dependency (`serde_norway`) and a new `magnetar-admin → magnetar-auth-oauth2` edge.
@@ -65,8 +65,8 @@ Teach `magnetarctl` to read and write the pulsarctl config and manage contexts, 
 
 - GitHub issue [CleverCloud/magnetar#281](https://github.com/CleverCloud/magnetar/issues/281) — the demand + the exact format spec; #282 — the out-of-scope non-JSON-response follow-up.
 - `streamnative/pulsarctl` [`pkg/cmdutils/ctx_conf.go`](https://github.com/streamnative/pulsarctl/blob/master/pkg/cmdutils/ctx_conf.go) — config-format source of truth.
-- `crates/magnetar-cli/src/config/` — `model.rs` (serde tags + round-trip), `file.rs` (path resolution + load/save), `resolve.rs` (context selection + data-plane derivation).
-- `crates/magnetar-cli/src/main.rs` — `context` command group, connection resolution, precedence.
+- `crates/magnetarctl/src/config/` — `model.rs` (serde tags + round-trip), `file.rs` (path resolution + load/save), `resolve.rs` (context selection + data-plane derivation).
+- `crates/magnetarctl/src/main.rs` — `context` command group, connection resolution, precedence.
 - `crates/magnetar-admin/src/lib.rs` — `AdminAuth::OAuth2`, builder `oauth2` / `tls_trust_cert_pem` / `tls_allow_insecure`.
 - `docs/cli.md` — "Config file & contexts" + the `context` command reference.
 - [ADR-0011](0011-clock-injection-sans-io.md) (env allowlist scope), [ADR-0014](0014-oauth2-client-credentials-caching.md) (OAuth2 flow), [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md) (test-policy exemption), [ADR-0035](0035-pluggable-crypto-provider.md) (crypto-feature forwarding), [ADR-0054](0054-logging-policy.md) (structured derived-URL log).

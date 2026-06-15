@@ -9,7 +9,7 @@ This page is the canonical CLI reference; for the full subcommand surface, run `
 ## Install
 
 ```sh
-cargo install --path crates/magnetar-cli
+cargo install --path crates/magnetarctl
 # or, from inside this workspace
 cargo build -p magnetarctl --release
 ./target/release/magnetarctl --help
@@ -167,7 +167,7 @@ The short form (`-V`) is never colorized.
 
 ### Build-time metadata source
 
-The metadata is captured at compile time by `crates/magnetar-cli/build.rs` and exposed via `cargo:rustc-env=` to the binary:
+The metadata is captured at compile time by `crates/magnetarctl/build.rs` and exposed via `cargo:rustc-env=` to the binary:
 
 | Variable                   | Source                                                             |
 | -------------------------- | ------------------------------------------------------------------ |
@@ -206,13 +206,13 @@ Pulsar's own routing makes the split — `magnetar-admin` keeps two pre-computed
 Manage pulsarctl-compatible contexts in the resolved [config file](#config-file--contexts).
 These verbs are file-management only — they never open a connection.
 
-| Command                      | Aliases  | Effect                                                                                            |
-| ---------------------------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `context use <name>`         |          | Set `current-context`; prints `Switched to context "<name>".`.                                    |
-| `context set <name> [flags]` | `create` | Create / update a context. Flag values are MERGED — unset flags leave existing fields untouched.  |
-| `context delete <name>`      | `del`    | Remove from BOTH `contexts` and `auth-info`. Warns when it was the current context.               |
-| `context get`                |          | Table: `CURRENT(*) NAME / ADMIN SERVICE URL / BOOKIE SERVICE URL`; `*` marks the current context. |
-| `context current`            |          | Print the current context name; errors when unset.                                                |
+| Command                           | Aliases  | Effect                                                                                                                                                                                                                                                                      |
+| --------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context use <name>`              |          | Set `current-context`; prints `Switched to context "<name>".`.                                                                                                                                                                                                              |
+| `context set <name> [flags]`      | `create` | Create / update a context. Flag values are MERGED — unset flags leave existing fields untouched.                                                                                                                                                                            |
+| `context delete <name>`           | `del`    | Remove from BOTH `contexts` and `auth-info`. Warns when it was the current context.                                                                                                                                                                                         |
+| `context get`                     |          | Table: `CURRENT(*) NAME / ADMIN SERVICE URL / BOOKIE SERVICE URL`; `*` marks the current context.                                                                                                                                                                           |
+| `context current`                 |          | Print the current context name; errors when unset.                                                                                                                                                                                                                          |
 | `context rename <old> <new> [-f]` | `update` | Rename a context (and its `auth-info`); updates `current-context` when it pointed at `<old>`. Refuses to overwrite an existing `<new>` unless `--force` (`-f`) is given — the destination then fully BECOMES the source (endpoint + credentials), and a warning is printed. |
 
 `context set` flags (mapping to the `auth-info` / `contexts` keys):

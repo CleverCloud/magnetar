@@ -607,7 +607,7 @@ The **authoritative** proto bump lands when upstream tags a Pulsar 5.0 RC — at
 ### Scalable topics feature flag
 
 `scalable-topics` on the `magnetar` crate, **default off**. Compiling without it leaves the non-scalable surface bit-for-bit unchanged on the wire (proved by the `scalable_topics_feature_off_does_not_export` test on both runtime engines).
-The CLI picks it up via `--features magnetar-cli/scalable-topics`.
+The CLI picks it up via `--features magnetarctl/scalable-topics`.
 
 ### Scalable topics example (against a future Pulsar 5.0 broker)
 
