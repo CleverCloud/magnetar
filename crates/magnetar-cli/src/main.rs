@@ -36,6 +36,7 @@ compile_error!(
      need to pick one explicitly."
 );
 
+mod config;
 mod version;
 
 use std::process::ExitCode;
@@ -47,10 +48,10 @@ use magnetar::proto::pb::command_subscribe::SubType;
 use magnetar::runtime_tokio::ClientError;
 use magnetar::{MessageId, OutgoingMessage, PulsarClient};
 use magnetar_admin::{
-    AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType, BookieInfo,
-    DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PackageMetadata, PackageType,
-    PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies, SinkConfig,
-    SourceConfig, TenantInfo,
+    AdminAuth, AdminClient, AdminClientBuilder, AdminError, BacklogQuota, BacklogQuotaType,
+    BookieInfo, DelayedDeliveryPolicies, DispatchRate, FunctionConfig, PackageMetadata,
+    PackageType, PersistencePolicies, PostSchemaPayload, PublishRate, RetentionPolicies,
+    SinkConfig, SourceConfig, TenantInfo,
 };
 
 /// magnetarctl — produce, consume, inspect, and admin against an Apache Pulsar broker.
@@ -70,26 +71,71 @@ pub(crate) struct Cli {
     pub(crate) verbose: u8,
 
     /// Pulsar service URL for data-plane (`pulsar://` / `pulsar+ssl://`).
-    #[arg(
-        long,
-        env = "MAGNETAR_SERVICE_URL",
-        default_value = "pulsar://localhost:6650",
-        global = true
-    )]
-    pub(crate) service_url: String,
+    ///
+    /// No `default_value`: when unset (and no env var), the URL is resolved
+    /// from the active context's `admin-service-url` (derived data-plane URL),
+    /// falling back to `pulsar://localhost:6650` only when no context applies.
+    /// An explicit `--service-url` / `MAGNETAR_SERVICE_URL` always wins.
+    #[arg(long, env = "MAGNETAR_SERVICE_URL", global = true)]
+    pub(crate) service_url: Option<String>,
 
-    /// Pulsar admin REST URL (`http://` / `https://`).
-    #[arg(
-        long,
-        env = "MAGNETAR_ADMIN_URL",
-        default_value = "http://localhost:8080",
-        global = true
-    )]
-    pub(crate) admin_url: String,
+    /// Pulsar admin REST URL (`http://` / `https://`). pulsarctl-style short
+    /// alias: `-s`.
+    ///
+    /// No `default_value`: when unset (and no env var), resolved from the
+    /// active context's `admin-service-url`, falling back to
+    /// `http://localhost:8080` only when no context applies. An explicit
+    /// `--admin-url` / `-s` / `MAGNETAR_ADMIN_URL` always wins.
+    ///
+    /// NB: the long pulsarctl spelling `--admin-service-url` is the per-context
+    /// write flag on `context set` (it would collide with this global flag if
+    /// also aliased here), so the global connection flag keeps `-s` + the
+    /// canonical `--admin-url`.
+    #[arg(long, short = 's', env = "MAGNETAR_ADMIN_URL", global = true)]
+    pub(crate) admin_url: Option<String>,
 
-    /// Bearer token for admin auth. Reads from `MAGNETAR_TOKEN` if unset.
+    /// Bearer token for admin auth. Reads from `MAGNETAR_TOKEN` if unset,
+    /// then from the active context's `token` / `tokenFile`.
     #[arg(long, env = "MAGNETAR_TOKEN", global = true)]
     pub(crate) token: Option<String>,
+
+    /// Path to a file containing a bearer token (pulsarctl `tokenFile`).
+    #[arg(long, env = "MAGNETAR_TOKEN_FILE", global = true)]
+    pub(crate) token_file: Option<String>,
+
+    /// Path to a custom CA trust cert PEM (pulsarctl
+    /// `tls_trust_certs_file_path`).
+    #[arg(long, global = true)]
+    pub(crate) tls_trust_cert_path: Option<String>,
+
+    /// Disable TLS certificate verification (pulsarctl
+    /// `tls_allow_insecure_connection`). **Insecure** — dev only.
+    #[arg(long, global = true)]
+    pub(crate) tls_allow_insecure: bool,
+
+    /// Enable TLS hostname verification (pulsarctl flag; accepted for
+    /// pulsarctl muscle-memory — verification is on by default in rustls and
+    /// this flag is a no-op unless paired with `--tls-allow-insecure`).
+    #[arg(long, global = true)]
+    pub(crate) tls_enable_hostname_verification: bool,
+
+    /// Client TLS certificate file (mTLS). Accepted for pulsarctl parity;
+    /// applied to the data-plane connection where supported.
+    #[arg(long, global = true)]
+    pub(crate) tls_cert_file: Option<String>,
+
+    /// Client TLS private-key file (mTLS). Pairs with `--tls-cert-file`.
+    #[arg(long, global = true)]
+    pub(crate) tls_key_file: Option<String>,
+
+    /// Path to a pulsarctl-compatible config file. Overrides the default
+    /// `$HOME/.config/pulsar/config`. A named-but-missing file is an error.
+    #[arg(long, env = "MAGNETAR_CONFIG", global = true)]
+    pub(crate) config: Option<String>,
+
+    /// Select a named context (overrides the config's `current-context`).
+    #[arg(long, global = true)]
+    pub(crate) context: Option<String>,
 
     /// Admin request timeout in seconds.
     #[arg(
@@ -158,6 +204,13 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: AdminCmd,
     },
+    /// Manage pulsarctl-compatible contexts in `~/.config/pulsar/config`.
+    /// Mirrors `pulsarctl context` (`use` / `set` / `delete` / `get` /
+    /// `current` / `rename`). A file written here stays readable by pulsarctl.
+    Context {
+        #[command(subcommand)]
+        sub: ContextCmd,
+    },
     /// **Experimental** (PIP-460 / ADR-0031). Print a scalable topic's current
     /// segment DAG. Resolves a `topic://...` URL against the controller broker
     /// and prints each segment's id, key range, state, and broker URL.
@@ -167,6 +220,70 @@ pub(crate) enum Cmd {
     TopicInfo {
         /// Scalable topic URL (`topic://tenant/namespace/topic`).
         topic: String,
+    },
+}
+
+/// `context` subcommands — pulsarctl-compatible context management. All verbs
+/// operate on the resolved config file (`--config` › `MAGNETAR_CONFIG` ›
+/// `$XDG_CONFIG_HOME/pulsar/config` › `$HOME/.config/pulsar/config`).
+#[derive(Debug, Subcommand)]
+pub(crate) enum ContextCmd {
+    /// Set `current-context` to `<name>`. Prints `Switched to context "<name>".`.
+    Use {
+        /// Context name (must already exist).
+        name: String,
+    },
+    /// Create or update a context. Alias: `create`. Flag values are MERGED
+    /// onto any existing context — unset flags leave existing fields untouched.
+    ///
+    /// The credential / TLS flags `--token`, `--token-file`,
+    /// `--tls-trust-cert-path`, `--tls-allow-insecure` are the GLOBAL
+    /// connection flags (they apply to `context set` too): e.g.
+    /// `magnetarctl context set prod --admin-service-url https://b:443 --token tok`.
+    #[command(alias = "create")]
+    Set {
+        /// Context name.
+        name: String,
+        /// `admin-service-url` (REST endpoint).
+        #[arg(long)]
+        admin_service_url: Option<String>,
+        /// `bookie-service-url` (`BookKeeper` HTTP).
+        #[arg(long)]
+        bookie_service_url: Option<String>,
+        /// `issuer_endpoint` (`OAuth2`).
+        #[arg(long, short = 'i')]
+        issuer_endpoint: Option<String>,
+        /// `client_id` (`OAuth2`).
+        #[arg(long, short = 'c')]
+        client_id: Option<String>,
+        /// `audience` (`OAuth2`).
+        #[arg(long, short = 'a')]
+        audience: Option<String>,
+        /// `scope` (`OAuth2`).
+        #[arg(long)]
+        scope: Option<String>,
+        /// `key_file` (`OAuth2` Pulsar-style key file).
+        #[arg(long, short = 'k')]
+        key_file: Option<String>,
+    },
+    /// Delete a context (from BOTH `contexts` and `auth-info`). Alias: `del`.
+    #[command(alias = "del")]
+    Delete {
+        /// Context name.
+        name: String,
+    },
+    /// List all contexts as a table; `*` marks `current-context`.
+    Get,
+    /// Print the current context name. Errors when unset.
+    Current,
+    /// Rename a context (and its `auth-info` entry). Alias: `update`. Updates
+    /// `current-context` when it pointed at `<old>`.
+    #[command(alias = "update")]
+    Rename {
+        /// Existing context name.
+        old: String,
+        /// New context name.
+        new: String,
     },
 }
 
@@ -1830,8 +1947,34 @@ fn init_tracing(verbose: u8) {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
-    let service_url = cli.service_url.clone();
-    let token_for_data = cli.token.clone();
+    // `context` is config-file management only — it never opens a connection,
+    // so resolve nothing and dispatch directly. The credential / TLS GLOBAL
+    // flags (`--token` / `--token-file` / `--tls-trust-cert-path` /
+    // `--tls-allow-insecure`) double as `context set` write values — they are
+    // global, so they cannot also be declared on `set` without a clap name
+    // clash; we thread them in here instead.
+    if matches!(cli.cmd, Cmd::Context { .. }) {
+        let globals = ContextSetGlobals {
+            token: cli.token.clone(),
+            token_file: cli.token_file.clone(),
+            tls_trust_cert_path: cli.tls_trust_cert_path.clone(),
+            // Only treat allow-insecure as a write when explicitly passed; the
+            // default `false` must not clobber an existing `true`.
+            tls_allow_insecure: cli.tls_allow_insecure.then_some(true),
+        };
+        // Move `sub` out without cloning the whole command.
+        let Cmd::Context { sub } = cli.cmd else {
+            unreachable!("matched Context above")
+        };
+        return run_context(cli.config.as_deref(), &globals, sub);
+    }
+
+    // Resolve the active context (if any) once, then merge with explicit
+    // flags/env to produce the connection settings. Explicit flags always win;
+    // a context fills the gaps; built-in localhost defaults are the last
+    // resort. No config + no context → identical to today's behavior.
+    let conn = resolve_connection(&cli)?;
+
     match cli.cmd {
         Cmd::Produce {
             topic,
@@ -1841,8 +1984,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             count,
         } => {
             run_produce(
-                &service_url,
-                token_for_data,
+                &conn.service_url,
+                conn.data_auth.clone(),
                 &topic,
                 message,
                 key,
@@ -1860,8 +2003,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             replicate_subscription_state,
         } => {
             run_consume(
-                &service_url,
-                token_for_data,
+                &conn.service_url,
+                conn.data_auth.clone(),
                 &topic,
                 &subscription,
                 sub_type,
@@ -1871,11 +2014,438 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             )
             .await
         }
-        Cmd::Admin { sub } => {
-            run_admin(&cli.admin_url, cli.token, cli.admin_timeout_secs, sub).await
-        }
+        Cmd::Admin { sub } => run_admin(&conn, cli.admin_timeout_secs, sub).await,
+        Cmd::Context { .. } => unreachable!("handled above"),
         #[cfg(feature = "scalable-topics")]
-        Cmd::TopicInfo { topic } => run_topic_info(&service_url, token_for_data, &topic).await,
+        Cmd::TopicInfo { topic } => {
+            run_topic_info(&conn.service_url, conn.data_auth.clone(), &topic).await
+        }
+    }
+}
+
+/// Default admin REST URL when no flag/env/context applies (today's default).
+const DEFAULT_ADMIN_URL: &str = "http://localhost:8080";
+/// Default data-plane URL when no flag/env/context/derivation applies.
+const DEFAULT_SERVICE_URL: &str = "pulsar://localhost:6650";
+
+/// Auth for the data-plane (`produce` / `consume`) client: a bare bearer token
+/// or an `OAuth2` flow (primed before the data client is built so its
+/// `AuthProvider::initial` succeeds).
+#[derive(Clone)]
+enum DataAuth {
+    /// No credentials.
+    None,
+    /// Inline bearer token.
+    Token(String),
+    /// `OAuth2` `client_credentials` flow. Its token cache is refreshed in
+    /// `build_data_client` before the flow is handed to the client as an
+    /// `AuthProvider`.
+    OAuth2(std::sync::Arc<magnetar_auth_oauth2::ClientCredentialsFlow>),
+}
+
+/// Connection settings resolved from explicit flags/env, the active context,
+/// and built-in defaults. Built once per run and shared by the admin and
+/// data-plane paths.
+struct ResolvedConnection {
+    /// Admin REST URL.
+    admin_url: String,
+    /// Data-plane URL.
+    service_url: String,
+    /// Admin auth (already including any `OAuth2` flow).
+    admin_auth: AdminAuth,
+    /// Data-plane auth.
+    data_auth: DataAuth,
+    /// Custom CA trust cert PEM bytes for the admin client (read from a path).
+    admin_trust_cert_pem: Option<Vec<u8>>,
+    /// Allow-insecure TLS for the admin client.
+    admin_allow_insecure: bool,
+}
+
+/// Resolve the connection settings for a connecting subcommand.
+///
+/// Precedence per setting: explicit flag / env › active context › built-in
+/// localhost default. No config file AND no context → byte-identical to the
+/// pre-context behavior. The derived data-plane URL is logged (structured
+/// field per ADR-0054) so a wrong heuristic guess is visible at `-v`.
+fn resolve_connection(cli: &Cli) -> Result<ResolvedConnection, CliError> {
+    // Load + resolve the active context, if any.
+    let resolved_ctx = load_active_context(cli)?;
+
+    // --- Admin URL: flag/env › context.admin-service-url › default. ---
+    let admin_url = cli
+        .admin_url
+        .clone()
+        .or_else(|| resolved_ctx.as_ref().map(|c| c.admin_url.clone()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_ADMIN_URL.to_owned());
+
+    // --- Service URL: flag/env › derived(context) › default. ---
+    let service_url = cli
+        .service_url
+        .clone()
+        .or_else(|| {
+            resolved_ctx
+                .as_ref()
+                .and_then(|c| c.data_plane_url.clone())
+                .inspect(|derived| {
+                    tracing::info!(
+                        target: "magnetar",
+                        derived_service_url = %derived,
+                        admin_service_url = %resolved_ctx.as_ref().map_or("", |c| c.admin_url.as_str()),
+                        "deriving data-plane URL from context admin-service-url; \
+                         pass --service-url to override",
+                    );
+                })
+        })
+        .unwrap_or_else(|| DEFAULT_SERVICE_URL.to_owned());
+
+    // --- TLS settings: explicit flag › context. ---
+    let trust_cert_path = cli
+        .tls_trust_cert_path
+        .clone()
+        .or_else(|| {
+            resolved_ctx
+                .as_ref()
+                .map(|c| c.tls.trust_cert_path.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .filter(|s| !s.is_empty());
+    let admin_allow_insecure =
+        cli.tls_allow_insecure || resolved_ctx.as_ref().is_some_and(|c| c.tls.allow_insecure);
+    let admin_trust_cert_pem =
+        match &trust_cert_path {
+            Some(path) => Some(std::fs::read(path).map_err(|err| {
+                CliError::BadArg(format!("--tls-trust-cert-path `{path}`: {err}"))
+            })?),
+            None => None,
+        };
+
+    // --- Auth: explicit token/token-file flag › context auth. ---
+    let (admin_auth, data_auth) = resolve_auth(cli, resolved_ctx.as_ref())?;
+
+    Ok(ResolvedConnection {
+        admin_url,
+        service_url,
+        admin_auth,
+        data_auth,
+        admin_trust_cert_pem,
+        admin_allow_insecure,
+    })
+}
+
+/// Load + resolve the active context. `None` when there is no usable config /
+/// context AND none was explicitly requested (caller uses defaults).
+fn load_active_context(cli: &Cli) -> Result<Option<config::ResolvedContext>, CliError> {
+    let resolved_path =
+        config::resolve_path(cli.config.as_deref(), config::std_env).map_err(map_config_err)?;
+    let Some(cfg) = config::load(&resolved_path).map_err(map_config_err)? else {
+        return Ok(None);
+    };
+    config::resolve(&cfg, cli.context.as_deref()).map_err(|err| match err {
+        config::ResolveError::NotFound(_) => CliError::BadArg(err.to_string()),
+    })
+}
+
+/// Resolve admin + data-plane auth from explicit flags and the active context.
+///
+/// Explicit `--token` / `--token-file` win over the context. Within a context,
+/// the single active method (token › token-file › `OAuth2`) was already selected
+/// by [`config::resolve`].
+fn resolve_auth(
+    cli: &Cli,
+    ctx: Option<&config::ResolvedContext>,
+) -> Result<(AdminAuth, DataAuth), CliError> {
+    // Explicit bearer token (flag/env) — highest precedence.
+    if let Some(tok) = &cli.token {
+        return Ok((AdminAuth::Token(tok.clone()), DataAuth::Token(tok.clone())));
+    }
+    // Explicit token file.
+    if let Some(path) = &cli.token_file {
+        let tok = read_token_file(path)?;
+        return Ok((AdminAuth::Token(tok.clone()), DataAuth::Token(tok)));
+    }
+
+    // Context-derived auth.
+    match ctx.map(|c| &c.auth) {
+        Some(config::ResolvedAuth::Token(tok)) => {
+            Ok((AdminAuth::Token(tok.clone()), DataAuth::Token(tok.clone())))
+        }
+        Some(config::ResolvedAuth::TokenFile(path)) => {
+            let tok = read_token_file(path)?;
+            Ok((AdminAuth::Token(tok.clone()), DataAuth::Token(tok)))
+        }
+        Some(config::ResolvedAuth::OAuth2(params)) => {
+            let flow = std::sync::Arc::new(build_oauth2_flow(params)?);
+            Ok((AdminAuth::OAuth2(flow.clone()), DataAuth::OAuth2(flow)))
+        }
+        Some(config::ResolvedAuth::None) | None => Ok((AdminAuth::None, DataAuth::None)),
+    }
+}
+
+/// Read a bearer token from a file, trimming trailing whitespace/newline.
+fn read_token_file(path: &str) -> Result<String, CliError> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| CliError::BadArg(format!("token file `{path}`: {err}")))?;
+    Ok(raw.trim().to_owned())
+}
+
+/// Build an `OAuth2` `client_credentials` flow from resolved context params.
+///
+/// The `key_file` (pulsarctl Pulsar-style key file) carries the
+/// `client_id` + `client_secret` as a JSON blob; an inline `client_id`
+/// (context `client_id`) without a secret cannot complete the exchange, so the
+/// key file is required when no other secret source is configured.
+fn build_oauth2_flow(
+    params: &config::resolve::OAuth2Params,
+) -> Result<magnetar_auth_oauth2::ClientCredentialsFlow, CliError> {
+    let issuer = params
+        .issuer_endpoint
+        .parse::<url::Url>()
+        .map_err(|err| CliError::BadArg(format!("issuer_endpoint: {err}")))?;
+
+    let credentials = oauth2_credentials(params)?;
+
+    let mut builder = magnetar_auth_oauth2::ClientCredentialsFlow::builder()
+        .issuer_url(issuer)
+        .credentials(credentials);
+    if !params.audience.is_empty() {
+        builder = builder.audience(params.audience.clone());
+    }
+    if !params.scope.is_empty() {
+        builder = builder.scope(params.scope.clone());
+    }
+    builder
+        .build()
+        .map_err(|err| CliError::BadArg(format!("oauth2 flow: {err}")))
+}
+
+/// Resolve `OAuth2` credentials from the `key_file` (a Pulsar-style JSON blob
+/// with `client_id` + `client_secret`) or, as a fallback, fail with a clear
+/// message: the context format has no inline `client_secret` field, so the key
+/// file is the only secret source.
+fn oauth2_credentials(
+    params: &config::resolve::OAuth2Params,
+) -> Result<magnetar_auth_oauth2::Credentials, CliError> {
+    if params.key_file.is_empty() {
+        return Err(CliError::BadArg(
+            "OAuth2 context requires key_file (Pulsar-style client_id+client_secret JSON)"
+                .to_owned(),
+        ));
+    }
+    let text = std::fs::read_to_string(&params.key_file)
+        .map_err(|err| CliError::BadArg(format!("key_file `{}`: {err}", params.key_file)))?;
+    let blob: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| CliError::BadArg(format!("key_file `{}`: {err}", params.key_file)))?;
+    // Pulsar's key file uses `client_id` / `client_secret`; fall back to the
+    // context's `client_id` if the file omits it.
+    let client_id = blob
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(params.client_id.clone()).filter(|s| !s.is_empty()))
+        .ok_or_else(|| CliError::BadArg("key_file: missing client_id".to_owned()))?;
+    let client_secret = blob
+        .get("client_secret")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CliError::BadArg("key_file: missing client_secret".to_owned()))?;
+    Ok(magnetar_auth_oauth2::Credentials::KeyFile {
+        client_id,
+        client_secret,
+    })
+}
+
+/// Map a [`config::ConfigError`] into a [`CliError`]. Takes the error by value
+/// so it can be used directly as a `.map_err(map_config_err)` adapter
+/// (`FnOnce(ConfigError) -> CliError`).
+#[allow(clippy::needless_pass_by_value)]
+fn map_config_err(err: config::ConfigError) -> CliError {
+    CliError::BadArg(err.to_string())
+}
+
+/// The GLOBAL credential / TLS flags that double as `context set` write
+/// values (they cannot be redeclared on `set` without a clap name clash).
+struct ContextSetGlobals {
+    token: Option<String>,
+    token_file: Option<String>,
+    tls_trust_cert_path: Option<String>,
+    /// `Some(true)` only when `--tls-allow-insecure` was explicitly passed, so
+    /// the default `false` never clobbers an existing `true`.
+    tls_allow_insecure: Option<bool>,
+}
+
+/// Dispatch the `context` command group. Operates on the config file resolved
+/// from `--config` / `MAGNETAR_CONFIG` / the default path; never connects.
+fn run_context(
+    config_flag: Option<&str>,
+    globals: &ContextSetGlobals,
+    cmd: ContextCmd,
+) -> Result<(), CliError> {
+    let resolved_path =
+        config::resolve_path(config_flag, config::std_env).map_err(map_config_err)?;
+    // For reads/writes, a missing default-path file is an empty config we can
+    // create on save; an explicit-but-missing path is only an error for verbs
+    // that read existing state where that matters. `get` / `current` tolerate
+    // an absent file (empty listing); mutating verbs create it.
+    let mut cfg = load_or_default(&resolved_path)?;
+
+    match cmd {
+        ContextCmd::Use { name } => {
+            if !cfg.contexts.contains_key(&name) {
+                return Err(CliError::BadArg(format!("context not found: {name}")));
+            }
+            cfg.current_context.clone_from(&name);
+            config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
+            println!("Switched to context \"{name}\".");
+            Ok(())
+        }
+        ContextCmd::Set { .. } => {
+            let name = context_set(&mut cfg, globals, cmd);
+            config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
+            println!("Context \"{name}\" set.");
+            Ok(())
+        }
+        ContextCmd::Delete { name } => {
+            let had_ctx = cfg.contexts.remove(&name).is_some();
+            let had_auth = cfg.auth_info.remove(&name).is_some();
+            if !had_ctx && !had_auth {
+                return Err(CliError::BadArg(format!("context not found: {name}")));
+            }
+            if cfg.current_context == name {
+                // Match pulsarctl: warn but leave the (now-dangling) pointer.
+                eprintln!(
+                    "warning: deleted context \"{name}\" was the current context; \
+                     set a new one with `magnetarctl context use <name>`"
+                );
+            }
+            config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
+            println!("Context \"{name}\" deleted.");
+            Ok(())
+        }
+        ContextCmd::Get => {
+            print_context_table(&cfg);
+            Ok(())
+        }
+        ContextCmd::Current => {
+            if cfg.current_context.is_empty() {
+                return Err(CliError::BadArg("no current context set".to_owned()));
+            }
+            println!("{}", cfg.current_context);
+            Ok(())
+        }
+        ContextCmd::Rename { old, new } => {
+            let ctx = cfg
+                .contexts
+                .remove(&old)
+                .ok_or_else(|| CliError::BadArg(format!("context not found: {old}")))?;
+            cfg.contexts.insert(new.clone(), ctx);
+            if let Some(info) = cfg.auth_info.remove(&old) {
+                cfg.auth_info.insert(new.clone(), info);
+            }
+            if cfg.current_context == old {
+                cfg.current_context.clone_from(&new);
+            }
+            config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
+            println!("Context \"{old}\" renamed to \"{new}\".");
+            Ok(())
+        }
+    }
+}
+
+/// Apply a `context set` to `cfg`, merging flag values onto any existing
+/// entries (unset flags leave fields untouched). Returns the context name.
+/// The credential / TLS values come from the GLOBAL connection flags (they
+/// cannot be redeclared on `set` without a clap name clash).
+fn context_set(
+    cfg: &mut config::PulsarConfig,
+    globals: &ContextSetGlobals,
+    cmd: ContextCmd,
+) -> String {
+    let ContextCmd::Set {
+        name,
+        admin_service_url,
+        bookie_service_url,
+        issuer_endpoint,
+        client_id,
+        audience,
+        scope,
+        key_file,
+    } = cmd
+    else {
+        unreachable!("context_set is only called with ContextCmd::Set")
+    };
+
+    let ctx = cfg.contexts.entry(name.clone()).or_default();
+    if let Some(v) = admin_service_url {
+        ctx.admin_service_url = v;
+    }
+    if let Some(v) = bookie_service_url {
+        ctx.bookie_service_url = v;
+    }
+    let info = cfg.auth_info.entry(name.clone()).or_default();
+    if let Some(v) = &globals.token {
+        info.token.clone_from(v);
+    }
+    if let Some(v) = &globals.token_file {
+        info.token_file.clone_from(v);
+    }
+    if let Some(v) = &globals.tls_trust_cert_path {
+        info.tls_trust_certs_file_path.clone_from(v);
+    }
+    if let Some(v) = globals.tls_allow_insecure {
+        info.tls_allow_insecure_connection = v;
+    }
+    if let Some(v) = issuer_endpoint {
+        info.issuer_endpoint = v;
+    }
+    if let Some(v) = client_id {
+        info.client_id = v;
+    }
+    if let Some(v) = audience {
+        info.audience = v;
+    }
+    if let Some(v) = scope {
+        info.scope = v;
+    }
+    if let Some(v) = key_file {
+        info.key_file = v;
+    }
+    name
+}
+
+/// Load the config, treating an absent file (explicit OR default) as an empty
+/// config the mutating verbs can create. `context` verbs are file-management,
+/// so a not-yet-existing explicit path is a create target, not an error.
+fn load_or_default(resolved: &config::ResolvedPath) -> Result<config::PulsarConfig, CliError> {
+    if !resolved.path.exists() {
+        return Ok(config::PulsarConfig::default());
+    }
+    match config::load(resolved).map_err(map_config_err)? {
+        Some(cfg) => Ok(cfg),
+        None => Ok(config::PulsarConfig::default()),
+    }
+}
+
+/// Print the `context get` table: `CURRENT(*) NAME | ADMIN SERVICE URL |
+/// BOOKIE SERVICE URL`, `*` on the current context.
+#[allow(clippy::print_literal)]
+fn print_context_table(cfg: &config::PulsarConfig) {
+    println!(
+        "{:<8} {:<28} {:<28} {}",
+        "CURRENT", "NAME", "ADMIN SERVICE URL", "BOOKIE SERVICE URL"
+    );
+    for (name, ctx) in &cfg.contexts {
+        let marker = if *name == cfg.current_context {
+            "*"
+        } else {
+            ""
+        };
+        println!(
+            "{:<8} {:<28} {:<28} {}",
+            marker, name, ctx.admin_service_url, ctx.bookie_service_url
+        );
     }
 }
 
@@ -1886,17 +2456,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 // shape; `print_literal` would have us synthesise owned `String`s for no gain.
 #[allow(clippy::print_literal)]
 #[cfg(feature = "scalable-topics")]
-async fn run_topic_info(
-    service_url: &str,
-    token: Option<String>,
-    topic: &str,
-) -> Result<(), CliError> {
+async fn run_topic_info(service_url: &str, auth: DataAuth, topic: &str) -> Result<(), CliError> {
     if !magnetar::runtime_tokio::is_scalable_topic_url(topic) {
         return Err(CliError::BadArg(format!(
             "topic-info expects a scalable `topic://...` URL, got `{topic}`"
         )));
     }
-    let client = build_data_client(service_url, token.as_deref()).await?;
+    let client = build_data_client(service_url, auth).await?;
     let lookup = client
         .lookup_scalable_topic(topic)
         .await
@@ -1920,12 +2486,11 @@ async fn run_topic_info(
 }
 
 async fn run_admin(
-    admin_url: &str,
-    token: Option<String>,
+    conn: &ResolvedConnection,
     timeout_secs: u64,
     cmd: AdminCmd,
 ) -> Result<(), CliError> {
-    let admin = build_admin(admin_url, token, timeout_secs)?;
+    let admin = build_admin(conn, timeout_secs)?;
     match cmd {
         AdminCmd::Clusters { sub } => run_admin_clusters(&admin, sub).await,
         AdminCmd::Tenants { sub } => run_admin_tenants(&admin, sub).await,
@@ -3239,19 +3804,26 @@ fn split_namespace_ref(spec: &str) -> Result<(&str, &str), String> {
     magnetar_admin::split_namespace(spec).map_err(|e| e.to_string())
 }
 
-fn build_admin(
-    admin_url: &str,
-    token: Option<String>,
-    timeout_secs: u64,
-) -> Result<AdminClient, CliError> {
-    let url = admin_url
+fn build_admin(conn: &ResolvedConnection, timeout_secs: u64) -> Result<AdminClient, CliError> {
+    let url = conn
+        .admin_url
         .parse()
         .map_err(|err: url::ParseError| CliError::BadArg(format!("--admin-url: {err}")))?;
     let mut builder: AdminClientBuilder = AdminClient::builder()
         .service_url(url)
         .timeout(Duration::from_secs(timeout_secs));
-    if let Some(tok) = token {
-        builder = builder.token(tok);
+    // Apply the resolved auth (token / oauth2 / none). The OAuth2 flow's token
+    // cache is refreshed lazily on the first request inside the admin client.
+    builder = match &conn.admin_auth {
+        AdminAuth::None => builder,
+        AdminAuth::Token(tok) => builder.token(tok.clone()),
+        AdminAuth::OAuth2(flow) => builder.oauth2(flow.clone()),
+    };
+    if let Some(pem) = &conn.admin_trust_cert_pem {
+        builder = builder.tls_trust_cert_pem(pem.clone());
+    }
+    if conn.admin_allow_insecure {
+        builder = builder.tls_allow_insecure(true);
     }
     Ok(builder.build()?)
 }
@@ -3392,7 +3964,7 @@ fn parse_sub_type(s: &str) -> Result<SubType, String> {
 #[allow(clippy::too_many_arguments)]
 async fn run_produce(
     service_url: &str,
-    token: Option<String>,
+    auth: DataAuth,
     topic: &str,
     message: Option<String>,
     key: Option<String>,
@@ -3408,7 +3980,7 @@ async fn run_produce(
         buf
     };
 
-    let client = build_data_client(service_url, token.as_deref()).await?;
+    let client = build_data_client(service_url, auth).await?;
     let producer = client.producer(topic).create().await?;
 
     for idx in 0..count {
@@ -3433,7 +4005,7 @@ async fn run_produce(
 #[allow(clippy::too_many_arguments)]
 async fn run_consume(
     service_url: &str,
-    token: Option<String>,
+    auth: DataAuth,
     topic: &str,
     subscription: &str,
     sub_type: SubType,
@@ -3441,7 +4013,7 @@ async fn run_consume(
     ack: bool,
     replicate_subscription_state: bool,
 ) -> Result<(), CliError> {
-    let client = build_data_client(service_url, token.as_deref()).await?;
+    let client = build_data_client(service_url, auth).await?;
     let consumer = client
         .consumer(topic)
         .subscription(subscription)
@@ -3470,14 +4042,23 @@ async fn run_consume(
     Ok(())
 }
 
-async fn build_data_client(
-    service_url: &str,
-    token: Option<&str>,
-) -> Result<PulsarClient, CliError> {
+async fn build_data_client(service_url: &str, auth: DataAuth) -> Result<PulsarClient, CliError> {
     let mut builder = PulsarClient::builder().service_url(service_url);
-    if let Some(t) = token {
-        let provider = std::sync::Arc::new(TokenAuth::from_string(t.to_owned()));
-        builder = builder.auth(provider);
+    match auth {
+        DataAuth::None => {}
+        DataAuth::Token(t) => {
+            let provider = std::sync::Arc::new(TokenAuth::from_string(t));
+            builder = builder.auth(provider);
+        }
+        DataAuth::OAuth2(flow) => {
+            // Prime the token cache so the flow's `AuthProvider::initial`
+            // (called by the client at connect time) returns the access token
+            // rather than erroring on an empty cache.
+            flow.ensure_fresh()
+                .await
+                .map_err(|err| CliError::BadArg(format!("oauth2 token refresh: {err}")))?;
+            builder = builder.auth(flow);
+        }
     }
     Ok(builder.build().await?)
 }

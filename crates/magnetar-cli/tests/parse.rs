@@ -502,7 +502,7 @@ fn admin_flags_are_globals() {
         "tenants",
         "list",
     ]);
-    assert_eq!(cli.admin_url, "http://broker:8080");
+    assert_eq!(cli.admin_url.as_deref(), Some("http://broker:8080"));
     assert_eq!(cli.token.as_deref(), Some("secret"));
 }
 
@@ -549,7 +549,7 @@ fn root_flags_accepted_after_subcommand() {
         "5",
         "-vv",
     ]);
-    assert_eq!(cli.admin_url, "http://broker:8080");
+    assert_eq!(cli.admin_url.as_deref(), Some("http://broker:8080"));
     assert_eq!(cli.token.as_deref(), Some("secret"));
     assert_eq!(cli.admin_timeout_secs, 5);
     assert_eq!(cli.verbose, 2);
@@ -871,6 +871,6 @@ fn produce_accepts_global_service_url_after_topic() {
         "--service-url",
         "pulsar://broker:6650",
     ]);
-    assert_eq!(cli.service_url, "pulsar://broker:6650");
+    assert_eq!(cli.service_url.as_deref(), Some("pulsar://broker:6650"));
     assert!(matches!(cli.cmd, Cmd::Produce { .. }));
 }
