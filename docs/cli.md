@@ -213,7 +213,7 @@ These verbs are file-management only — they never open a connection.
 | `context delete <name>`      | `del`    | Remove from BOTH `contexts` and `auth-info`. Warns when it was the current context.               |
 | `context get`                |          | Table: `CURRENT(*) NAME / ADMIN SERVICE URL / BOOKIE SERVICE URL`; `*` marks the current context. |
 | `context current`            |          | Print the current context name; errors when unset.                                                |
-| `context rename <old> <new>` | `update` | Rename a context (and its `auth-info`); updates `current-context` when it pointed at `<old>`. Refuses to overwrite an existing `<new>`. |
+| `context rename <old> <new> [-f]` | `update` | Rename a context (and its `auth-info`); updates `current-context` when it pointed at `<old>`. Refuses to overwrite an existing `<new>` unless `--force` (`-f`) is given — the destination then fully BECOMES the source (endpoint + credentials), and a warning is printed. |
 
 `context set` flags (mapping to the `auth-info` / `contexts` keys):
 

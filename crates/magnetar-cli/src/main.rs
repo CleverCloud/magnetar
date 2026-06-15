@@ -279,13 +279,18 @@ pub(crate) enum ContextCmd {
     /// Print the current context name. Errors when unset.
     Current,
     /// Rename a context (and its `auth-info` entry). Alias: `update`. Updates
-    /// `current-context` when it pointed at `<old>`.
+    /// `current-context` when it pointed at `<old>`. Refuses to overwrite an
+    /// existing `<new>` unless `--force` is given.
     #[command(alias = "update")]
     Rename {
         /// Existing context name.
         old: String,
         /// New context name.
         new: String,
+        /// Overwrite `<new>` if it already exists. Without this the rename is
+        /// refused, to avoid silently destroying an existing context.
+        #[arg(long, short = 'f')]
+        force: bool,
     },
 }
 
@@ -2392,13 +2397,15 @@ fn run_context(
             println!("{}", cfg.current_context);
             Ok(())
         }
-        ContextCmd::Rename { old, new } => {
-            // Refuse to clobber an existing destination: an unconditional insert
-            // would silently destroy `<new>`'s endpoint AND credentials (the
-            // `auth_info` remove/insert below would drop them too).
-            if old != new && (cfg.contexts.contains_key(&new) || cfg.auth_info.contains_key(&new)) {
+        ContextCmd::Rename { old, new, force } => {
+            // An existing destination would be silently destroyed by the move
+            // below, so refuse unless `--force` is given.
+            let overwriting =
+                old != new && (cfg.contexts.contains_key(&new) || cfg.auth_info.contains_key(&new));
+            if overwriting && !force {
                 return Err(CliError::BadArg(format!(
-                    "context \"{new}\" already exists; delete it first or pick another name"
+                    "context \"{new}\" already exists; pass --force to overwrite it, \
+                     delete it first, or pick another name"
                 )));
             }
             let ctx = cfg
@@ -2406,13 +2413,24 @@ fn run_context(
                 .remove(&old)
                 .ok_or_else(|| CliError::BadArg(format!("context not found: {old}")))?;
             cfg.contexts.insert(new.clone(), ctx);
-            if let Some(info) = cfg.auth_info.remove(&old) {
-                cfg.auth_info.insert(new.clone(), info);
+            // The destination fully BECOMES the source: move `<old>`'s auth-info
+            // onto `<new>`, and when `<old>` had none, drop any credentials that
+            // were sitting on `<new>` so an overwrite never leaves a stale one.
+            match cfg.auth_info.remove(&old) {
+                Some(info) => {
+                    cfg.auth_info.insert(new.clone(), info);
+                }
+                None => {
+                    cfg.auth_info.remove(&new);
+                }
             }
             if cfg.current_context == old {
                 cfg.current_context.clone_from(&new);
             }
             config::save(&resolved_path.path, &cfg).map_err(map_config_err)?;
+            if overwriting {
+                eprintln!("warning: overwrote existing context \"{new}\".");
+            }
             println!("Context \"{old}\" renamed to \"{new}\".");
             Ok(())
         }

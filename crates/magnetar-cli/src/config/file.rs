@@ -316,7 +316,7 @@ mod tests {
         }
     }
 
-    /// save() tightens a PRE-EXISTING world-readable file to 0600 — the
+    /// `save()` tightens a PRE-EXISTING world-readable file to 0600 — the
     /// `.mode(0o600)` open flag only applies on creation, so an existing 0644
     /// config would otherwise keep the credential bytes world-readable.
     #[cfg(unix)]

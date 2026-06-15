@@ -191,6 +191,108 @@ fn context_rename_onto_existing_is_rejected() {
     assert!(out.contains("dev"), "dev lost: {out}");
 }
 
+/// `rename --force` onto an existing destination overwrites it: the destination
+/// fully BECOMES the source (endpoint + credentials), and the source is gone.
+#[test]
+fn context_rename_force_overwrites_existing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+
+    // URLs deliberately avoid the substrings "src"/"dst" colliding with the
+    // context names so the `get` assertions below are unambiguous.
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "src",
+            "--admin-service-url",
+            "http://alpha:8080",
+            "--token",
+            "alpha-tok",
+        ],
+    );
+    assert!(ok, "set src failed: {err}");
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "dst",
+            "--admin-service-url",
+            "https://beta:443",
+            "--token",
+            "beta-tok",
+        ],
+    );
+    assert!(ok, "set dst failed: {err}");
+
+    // rename src → dst with --force overwrites dst with src's data, warns.
+    let (ok, out, err) = run_context(&cfg, &["rename", "src", "dst", "--force"]);
+    assert!(ok, "force rename failed: {err}");
+    assert!(out.contains("renamed"), "out: {out}");
+    assert!(
+        err.contains("overwrote"),
+        "overwrite warning missing: {err}"
+    );
+
+    let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    // dst now holds src's endpoint + token; the old dst values are gone.
+    assert!(
+        yaml.contains("http://alpha:8080"),
+        "src url missing: {yaml}"
+    );
+    assert!(yaml.contains("alpha-tok"), "src token missing: {yaml}");
+    assert!(
+        !yaml.contains("https://beta:443"),
+        "old dst url survived: {yaml}"
+    );
+    assert!(!yaml.contains("beta-tok"), "old dst token survived: {yaml}");
+    // src is removed; dst remains.
+    let (_, out, _) = run_context(&cfg, &["get"]);
+    assert!(!out.contains("src"), "src still listed: {out}");
+    assert!(out.contains("dst"), "dst missing: {out}");
+}
+
+/// `rename -f` (short form) onto an existing destination where the SOURCE has no
+/// credentials clears the destination's stale credentials too.
+#[test]
+fn context_rename_force_clears_stale_dest_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = dir.path().join("config");
+
+    // Source has NO token; destination has one.
+    let (ok, _, err) = run_context(
+        &cfg,
+        &["set", "src", "--admin-service-url", "http://alpha:8080"],
+    );
+    assert!(ok, "set src failed: {err}");
+    let (ok, _, err) = run_context(
+        &cfg,
+        &[
+            "set",
+            "dst",
+            "--admin-service-url",
+            "https://beta:443",
+            "--token",
+            "beta-tok",
+        ],
+    );
+    assert!(ok, "set dst failed: {err}");
+
+    let (ok, _, err) = run_context(&cfg, &["rename", "src", "dst", "-f"]);
+    assert!(ok, "force rename failed: {err}");
+
+    let yaml = std::fs::read_to_string(&cfg).expect("read config");
+    // dst's stale token must be gone — the source carried no credentials.
+    assert!(
+        !yaml.contains("beta-tok"),
+        "stale dst token survived: {yaml}"
+    );
+    assert!(
+        yaml.contains("http://alpha:8080"),
+        "src url missing: {yaml}"
+    );
+}
+
 /// An inherited `MAGNETAR_TOKEN` is for the live connection only — `context set`
 /// must NOT persist it to disk. An explicit `--token` flag IS persisted.
 #[test]
@@ -240,7 +342,7 @@ fn context_set_token_env_not_persisted_flag_is() {
 }
 
 /// Switching auth mode on a later `set` clears the mutually-exclusive fields, so
-/// a stale higher-precedence token cannot keep shadowing a freshly-set OAuth2.
+/// a stale higher-precedence token cannot keep shadowing a freshly-set `OAuth2`.
 #[test]
 fn context_set_switching_auth_mode_clears_stale() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -284,8 +386,8 @@ fn context_set_switching_auth_mode_clears_stale() {
     );
 }
 
-/// An OAuth2 context with a plaintext `http://` issuer is rejected before any
-/// secret is sent — the client_credentials secret must not leak in cleartext.
+/// An `OAuth2` context with a plaintext `http://` issuer is rejected before any
+/// secret is sent — the `client_credentials` secret must not leak in cleartext.
 #[test]
 fn oauth2_http_issuer_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
