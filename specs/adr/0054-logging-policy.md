@@ -116,7 +116,9 @@ Applications MAY set them in their own binary to compile out `trace!` / `debug!`
 - `warn!` and above are bounded by churn (reconnects, refusals, lifecycle), never by send throughput.
 - `debug!` is production-enableable: per-message `debug!` paths must stay allocation-free when the level is disabled (integer / pre-existing-`&str` fields only; the disabled-level cost is a cached callsite check plus a relaxed atomic load), and applications use per-target filtering to scope it.
 - A subscriber-less embedding emits nothing.
-- Rate-limiting / sampling guidance for churn storms is an open follow-up (`docs/follow-ups.md`).
+- Rate-limiting / sampling for churn storms is **subscriber-side**, not in the library: the application's `tracing` subscriber drops or samples; magnetar ships no limiter API and emits unchanged. The operator recipe (static `EnvFilter` suppression → a per-callsite token-bucket `Layer` → collector-side sampling) lives in [`docs/logging.md`](../../docs/logging.md).
+
+> Amendment (resolved by [ADR-0065](0065-log-rate-limiting-subscriber-side.md), 2026-06-15): this section's closing bullet originally deferred rate-limiting / sampling as an open follow-up. [ADR-0065](0065-log-rate-limiting-subscriber-side.md) resolves it — the mechanism is **subscriber-side**. A library-side per-callsite limiter would carry per-callsite state and read a clock, violating [ADR-0011](0011-clock-injection-sans-io.md) inside `magnetar-proto` and incurring exactly the "state not worth carrying for a log line" trade-off this section leans against; the subscriber owns the limiter, so its clock and state live outside the sans-io core. This ADR is **not superseded** — only §7's open-follow-up bullet is resolved.
 
 ## Consequences
 
