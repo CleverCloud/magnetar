@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Admin client (`magnetar-admin`):** non-JSON admin responses now surface the request method, URL, HTTP status, `Content-Type`, and a truncated body snippet instead of the bare `serde_json` message (`json decode: expected value at line 1 column 1`). Hitting the wrong endpoint, a reverse proxy, or an auth-redirect on a 2xx is now self-diagnosing. Non-success statuses (`AdminError::Status`) also name the method + URL. (#282)
+
+### Changed
+
+- **`magnetar-admin` (`AdminError`):** added a new `AdminError::Decode { method, url, status, content_type, snippet, source }` variant carried by the JSON decoders, and added `method: String` + `url: String` fields to the existing `AdminError::Status` variant. `AdminError` stays exhaustive (no `#[non_exhaustive]`), so any exhaustive `match` over it or any `Status { code, body }` destructure without `..` must be updated. The existing `AdminError::Json` variant is now reserved for request-body **encode** failures only (its `#[error]` text changed from `json decode: …` to `json encode: …`); response **decode** failures route through `AdminError::Decode`. (#282)
+
 ## [1.0.1] - 2026-06-15
 
 ### Changed

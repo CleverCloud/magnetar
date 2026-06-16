@@ -106,7 +106,7 @@ async fn get_message_id_by_index_propagates_broker_412() {
         .await
         .unwrap_err();
     match err {
-        AdminError::Status { code, body } => {
+        AdminError::Status { code, body, .. } => {
             assert_eq!(code, 412);
             assert!(body.contains("Broker entry metadata"));
         }

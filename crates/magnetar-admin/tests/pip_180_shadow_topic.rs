@@ -81,7 +81,7 @@ async fn create_shadow_topic_propagates_409_conflict() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, AdminError::Status { code: 409, ref body } if body.contains("already exists")),
+        matches!(err, AdminError::Status { code: 409, ref body, .. } if body.contains("already exists")),
         "expected AdminError::Status {{ code: 409, .. }}, got {err:?}",
     );
 }
