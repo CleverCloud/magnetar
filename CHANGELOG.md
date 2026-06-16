@@ -7,13 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [1.1.0] - 2026-06-16
 
-- **Admin client (`magnetar-admin`):** non-JSON admin responses now surface the request method, URL, HTTP status, `Content-Type`, and a truncated body snippet instead of the bare `serde_json` message (`json decode: expected value at line 1 column 1`). Hitting the wrong endpoint, a reverse proxy, or an auth-redirect on a 2xx is now self-diagnosing. Non-success statuses (`AdminError::Status`) also name the method + URL. (#282)
+### Added
+
+- **Admin client (`magnetar-admin`) OAuth2 + TLS:** `AdminClientBuilder` gains `oauth2(...)`, `tls_trust_cert_pem(...)`, and `tls_allow_insecure(...)`; a new `AdminAuth::OAuth2` arm refreshes the cached token on demand and attaches it as a bearer credential (erroring clearly on an empty access token). `magnetar-admin` now depends on `magnetar-auth-oauth2` (acyclic) and forwards each `crypto-*` feature to it so the token-exchange client binds the same rustls provider. (#281)
+- **CLI (`magnetarctl`) pulsarctl config file + contexts:** `magnetarctl` now reads the standard pulsarctl config (`--config` > `MAGNETAR_CONFIG` > `$XDG_CONFIG_HOME` > `$HOME/.config/pulsar/config`) and ships a `context` command group (`use`/`set`/`delete`/`get`/`current`/`rename`, with `create`/`del`/`update` aliases) matching the pulsarctl output strings — a working pulsarctl setup now works with zero extra flags. Unknown keys and key casing round-trip untouched, so a magnetarctl-written file stays pulsarctl-readable. New global flags `--config`, `--context`, `--token-file`, `--tls-trust-cert-path`, `--tls-allow-insecure`, `--tls-enable-hostname-verification`, `--tls-cert-file`, `--tls-key-file`, and `-s` (short for `--admin-url`); the active context supplies the admin URL + auth + TLS, and the data-plane URL is derived from the admin-service-url (`http` → `pulsar://…:6650`, `https` → `pulsar+ssl://…:6651`) unless an explicit `--service-url` is given. (#281, #284; ADR-0068)
+- **CLI `context rename --force` (`-f`):** opt into overwriting an existing destination context; the destination then fully becomes the source (endpoint + credentials, clearing any stale destination credential), with a warning printed. (#284)
 
 ### Changed
 
 - **`magnetar-admin` (`AdminError`):** added a new `AdminError::Decode { method, url, status, content_type, snippet, source }` variant carried by the JSON decoders, and added `method: String` + `url: String` fields to the existing `AdminError::Status` variant. `AdminError` stays exhaustive (no `#[non_exhaustive]`), so any exhaustive `match` over it or any `Status { code, body }` destructure without `..` must be updated. The existing `AdminError::Json` variant is now reserved for request-body **encode** failures only (its `#[error]` text changed from `json decode: …` to `json encode: …`); response **decode** failures route through `AdminError::Decode`. (#282)
+- **`magnetar-admin` (`AdminError`):** added an `AdminError::Auth(String)` variant for OAuth2 token-acquisition failures. Since `AdminError` is exhaustive, downstream exhaustive matches must add this arm. (#281)
+
+### Fixed
+
+- **Admin client (`magnetar-admin`):** non-JSON admin responses now surface the request method, URL, HTTP status, `Content-Type`, and a truncated body snippet instead of the bare `serde_json` message (`json decode: expected value at line 1 column 1`). Hitting the wrong endpoint, a reverse proxy, or an auth-redirect on a 2xx is now self-diagnosing. Non-success statuses (`AdminError::Status`) also name the method + URL. (#282)
+- **CLI (`magnetarctl`) config/context correctness:** `context rename` refuses to overwrite an existing destination instead of silently destroying its endpoint + credentials (use `--force` to opt in); `context set` no longer persists an inherited `MAGNETAR_TOKEN` (only an explicit `--token` is written) and clears mutually-exclusive auth fields when switching auth mode so a stale higher-precedence credential cannot shadow the one just configured. (#281, #284)
+
+### Security
+
+- **CLI (`magnetarctl`) credential safety:** OAuth2 rejects a non-`https` `issuer_endpoint` up front so the `client_secret` is never POSTed over plaintext; `AuthInfo` carries a redacting `Debug` so a `{:?}` of the config never leaks the bearer token; `config save` forces `0600` on a pre-existing world-readable config before writing credentials; an empty token-file token is rejected rather than sending a malformed `Authorization: Bearer ` header to the broker; and the CLI warns when `tls_allow_insecure` is inherited from a context (silent verification downgrade). (#281, #284)
 
 ## [1.0.1] - 2026-06-15
 
@@ -78,5 +92,6 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - CRC32C verify-or-drop on frames with magic `0x0e01`: a checksum mismatch emits a `ChecksumMismatch` event and drops the frame.
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained). (2a9fafb, abc7aad)
 
+[1.1.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.0
 [1.0.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.1
 [1.0.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.0

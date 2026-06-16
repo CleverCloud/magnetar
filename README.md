@@ -111,14 +111,14 @@ Depend on it directly from crates.io:
 ```toml
 [dependencies]
 # crates.io package is `magnetar-driver`; the import path stays `magnetar`.
-magnetar-driver = "1.0.1"
+magnetar-driver = "1.1.0"
 ```
 
 Or pin the tagged release via Git:
 
 ```toml
 [dependencies]
-magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.0.1" }
+magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.1.0" }
 ```
 
 The default feature set enables the tokio engine. The feature flags catalog:
@@ -857,7 +857,7 @@ Known open work is narrow and tracked in
 Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few
 simulation / test-harness gaps remain.
 
-The public API is stable as of `1.0.1` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
+The public API is stable as of `1.1.0` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
 
 ---
 
