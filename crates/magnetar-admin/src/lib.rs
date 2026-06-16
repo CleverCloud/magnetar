@@ -214,9 +214,9 @@ impl AdminClient {
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         match json_ok::<serde_json::Value>(resp).await {
             Ok(v) => Ok(v),
-            Err(AdminError::Status { code: 404, body })
-                if body.contains("NamespaceIsolationPolicies") =>
-            {
+            Err(AdminError::Status {
+                code: 404, body, ..
+            }) if body.contains("NamespaceIsolationPolicies") => {
                 Ok(serde_json::Value::Object(serde_json::Map::new()))
             }
             Err(e) => Err(e),
@@ -328,7 +328,7 @@ impl AdminClient {
         let url = self.url(&["brokers", "health"])?;
         let resp = self.send(self.http.request(Method::GET, url)).await?;
         let resp = ensure_status(resp).await?;
-        Ok(resp.text().await?)
+        Ok(resp.resp.text().await?)
     }
 
     /// List the namespaces a specific broker currently owns.
@@ -3435,7 +3435,12 @@ impl AdminClient {
     }
 
     /// Apply auth headers and dispatch.
-    async fn send(&self, req: RequestBuilder) -> Result<Response, AdminError> {
+    ///
+    /// Returns an [`ApiResponse`] carrying the response alongside the
+    /// resolved method + URL, so the decode helpers can attribute a
+    /// non-JSON body to the exact request that produced it
+    /// (see [`AdminError::Decode`] / [`AdminError::Status`]).
+    async fn send(&self, req: RequestBuilder) -> Result<ApiResponse, AdminError> {
         let req = match &self.auth {
             AdminAuth::None => req,
             AdminAuth::Token(tok) => bearer(req, tok)?,
@@ -3464,8 +3469,26 @@ impl AdminClient {
                 bearer(req, tok)?
             }
         };
-        Ok(req.send().await?)
+        // Build the request so the resolved method + URL are captured for
+        // diagnostics, then execute on the shared client. This is
+        // behaviorally identical to `req.send()`.
+        let request = req.build()?;
+        let method = request.method().clone();
+        let url = request.url().clone();
+        let resp = self.http.execute(request).await?;
+        Ok(ApiResponse { method, url, resp })
     }
+}
+
+/// A dispatched response paired with the request's resolved method + URL.
+///
+/// Threaded from [`AdminClient::send`] into the decode helpers so a
+/// decode / status failure can name the exact request that produced it
+/// (see [`AdminError::Decode`] and [`AdminError::Status`]).
+struct ApiResponse {
+    method: Method,
+    url: Url,
+    resp: Response,
 }
 
 /// Pulsar Functions configuration — the subset of Java's
@@ -4178,15 +4201,55 @@ pub enum AdminError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     /// API returned a non-success HTTP status.
-    #[error("api error {code}: {body}")]
+    ///
+    /// `method` and `url` identify the exact request that failed, so an
+    /// operator can tell at a glance whether they hit the wrong endpoint,
+    /// cluster, or proxy without re-deriving the URL from the call site.
+    #[error("api error {code} from {method} {url}: {body}")]
     Status {
+        /// HTTP method of the failed request (`GET`, `POST`, …).
+        method: String,
+        /// Full request URL the client dispatched.
+        url: String,
         /// HTTP status code.
         code: u16,
         /// Response body (or a placeholder if reading the body failed).
         body: String,
     },
-    /// JSON decode error.
-    #[error("json decode: {0}")]
+    /// A 2xx response body could not be decoded as the expected JSON.
+    ///
+    /// Carries the request `method` + `url`, the HTTP `status`, the
+    /// response `content_type`, and a truncated body `snippet` so the
+    /// failure is self-diagnosing: a `text/html` body or an empty
+    /// `<none>` content-type on a 200 almost always means the request
+    /// was answered by the wrong endpoint, a reverse proxy, or an auth
+    /// redirect rather than the broker's admin API. Replaces the bare
+    /// `serde_json` "expected value at line 1 column 1" message.
+    #[error(
+        "unexpected response from {method} {url}: HTTP {status}, content-type {content_type}, body: {snippet}"
+    )]
+    Decode {
+        /// HTTP method of the request whose response failed to decode.
+        method: String,
+        /// Full request URL the client dispatched.
+        url: String,
+        /// HTTP status code of the response (always 2xx here).
+        status: u16,
+        /// Response `Content-Type` header, or `<none>` when absent.
+        content_type: String,
+        /// First ~256 bytes of the body (UTF-8 lossy), truncated with an
+        /// ellipsis marker when longer.
+        snippet: String,
+        /// The underlying serde decode error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// JSON encode error — building a request body from a Rust value.
+    ///
+    /// Response-decode failures surface as [`AdminError::Decode`]; this
+    /// variant covers the rare serialization-side failure (e.g.
+    /// `build_url_config_multipart`).
+    #[error("json encode: {0}")]
     Json(#[from] serde_json::Error),
     /// URL parse / construction error.
     #[error("invalid url: {0}")]
@@ -4279,14 +4342,56 @@ fn bearer(req: RequestBuilder, tok: &str) -> Result<RequestBuilder, AdminError> 
     Ok(req.headers(headers))
 }
 
+/// Maximum number of body bytes echoed back in [`AdminError::Decode`].
+/// Enough to recognise an HTML error page or a plain-text proxy banner
+/// without dumping a whole payload into the error message.
+const DECODE_SNIPPET_LIMIT: usize = 256;
+
+/// Build an [`AdminError::Decode`] from a failed-to-decode response's
+/// parts. Centralises content-type extraction and body-snippet
+/// truncation so every JSON decoder reports the same enriched context.
+fn decode_error(
+    method: &Method,
+    url: &Url,
+    status: u16,
+    headers: &HeaderMap,
+    body: &[u8],
+    source: serde_json::Error,
+) -> AdminError {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| "<none>".to_owned(), ToOwned::to_owned);
+    let snippet = if body.len() > DECODE_SNIPPET_LIMIT {
+        format!(
+            "{}… (truncated)",
+            String::from_utf8_lossy(&body[..DECODE_SNIPPET_LIMIT])
+        )
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    };
+    AdminError::Decode {
+        method: method.to_string(),
+        url: url.to_string(),
+        status,
+        content_type,
+        snippet,
+        source,
+    }
+}
+
 /// Decode a non-error JSON response body.
-async fn json_ok<T>(resp: Response) -> Result<T, AdminError>
+async fn json_ok<T>(api: ApiResponse) -> Result<T, AdminError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let resp = ensure_status(resp).await?;
+    let api = ensure_status(api).await?;
+    let ApiResponse { method, url, resp } = api;
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let bytes = resp.bytes().await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    serde_json::from_slice(&bytes)
+        .map_err(|err| decode_error(&method, &url, status, &headers, &bytes, err))
 }
 
 /// Decode a JSON response body, defaulting to `T::default()` when the
@@ -4303,14 +4408,18 @@ where
 /// `RetentionPolicies::default()` (broker semantic: missing fields ==
 /// broker default). Callers asserting "post-remove returns the
 /// default" stay correct without changing the public signature.
-async fn json_ok_or_default<T>(resp: Response) -> Result<T, AdminError>
+async fn json_ok_or_default<T>(api: ApiResponse) -> Result<T, AdminError>
 where
     T: for<'de> Deserialize<'de> + Default,
 {
-    let resp = ensure_status(resp).await?;
+    let api = ensure_status(api).await?;
+    let ApiResponse { method, url, resp } = api;
+    // Tolerant short-circuits MUST run before any serde attempt.
     if resp.status() == StatusCode::NO_CONTENT {
         return Ok(T::default());
     }
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let bytes = resp.bytes().await?;
     if bytes.is_empty() {
         return Ok(T::default());
@@ -4319,7 +4428,8 @@ where
     if bytes.as_ref().trim_ascii() == b"null" {
         return Ok(T::default());
     }
-    Ok(serde_json::from_slice::<T>(&bytes)?)
+    serde_json::from_slice::<T>(&bytes)
+        .map_err(|err| decode_error(&method, &url, status, &headers, &bytes, err))
 }
 
 /// Decode a JSON response body that the broker may emit as an empty
@@ -4335,40 +4445,54 @@ where
 ///   - 2xx with empty body bytes       → `Ok(None)`
 ///   - 2xx with the literal `null`     → `Ok(None)`
 ///   - 2xx with a JSON value           → `Ok(Some(value))` via serde
-async fn json_ok_optional<T>(resp: Response) -> Result<Option<T>, AdminError>
+async fn json_ok_optional<T>(api: ApiResponse) -> Result<Option<T>, AdminError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let resp = ensure_status(resp).await?;
+    let api = ensure_status(api).await?;
+    let ApiResponse { method, url, resp } = api;
+    // Tolerant short-circuits MUST run before any serde attempt.
     if resp.status() == StatusCode::NO_CONTENT {
         return Ok(None);
     }
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let bytes = resp.bytes().await?;
     if bytes.is_empty() {
         return Ok(None);
     }
-    Ok(serde_json::from_slice::<Option<T>>(&bytes)?)
+    serde_json::from_slice::<Option<T>>(&bytes)
+        .map_err(|err| decode_error(&method, &url, status, &headers, &bytes, err))
 }
 
 /// Discard a successful no-content response body.
-async fn empty_ok(resp: Response) -> Result<(), AdminError> {
-    let _ = ensure_status(resp).await?;
+async fn empty_ok(api: ApiResponse) -> Result<(), AdminError> {
+    let _ = ensure_status(api).await?;
     Ok(())
 }
 
 /// Convert a non-success response into [`AdminError::Status`]. Returns the
-/// original response on 2xx so the caller can decode the body.
-async fn ensure_status(resp: Response) -> Result<Response, AdminError> {
-    let status = resp.status();
+/// original [`ApiResponse`] on 2xx so the caller can decode the body.
+///
+/// The `Status` error carries the request method + URL so a failure
+/// names the exact endpoint hit, not just the status code and body.
+async fn ensure_status(api: ApiResponse) -> Result<ApiResponse, AdminError> {
+    let status = api.resp.status();
     if status.is_success() || status == StatusCode::NO_CONTENT {
-        return Ok(resp);
+        return Ok(api);
     }
     let code = status.as_u16();
+    let ApiResponse { method, url, resp } = api;
     let body = resp
         .text()
         .await
         .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
-    Err(AdminError::Status { code, body })
+    Err(AdminError::Status {
+        method: method.to_string(),
+        url: url.to_string(),
+        code,
+        body,
+    })
 }
 
 /// Split a `tenant/namespace` string into its two segments.
