@@ -31,11 +31,11 @@
 //!   the handshake (recoverable; ADR-0054).
 //! - [`ScriptedBroker::inject_decode_fatal_frame_on_send`] — one unparseable command frame in place
 //!   of the first send receipt, then close (terminal; ADR-0055 §1).
-//! - [`ScriptedBroker::drop_connection_after`] — the first session closes after writing N frames,
-//!   forcing a supervised client to redial. This one also turns on **resume mode**: the ledger,
-//!   per-topic entry-id sequence, and durable per-subscription cursor move into a cross-session
-//!   store (`CrossSession`) so the redialled session resumes from the acked position (ADR-0055 §3
-//!   shape). Reset both the knob and the persisted state with
+//! - [`ScriptedBroker::drop_connection_after_first_ack`] — the first session closes right after it
+//!   flushes the first ack-response, forcing a supervised client to redial. This one also turns on
+//!   **resume mode**: the ledger, per-topic entry-id sequence, and durable per-subscription cursor
+//!   move into a cross-session store (`CrossSession`) so the redialled session resumes from the
+//!   acked position (ADR-0055 §3 shape). Reset both the knob and the persisted state with
 //!   [`ScriptedBroker::clear_cross_session_state`] between legs that share one broker.
 
 use std::collections::HashMap;
@@ -115,7 +115,7 @@ struct ProducerState {
 ///
 /// It is shared behind an `Arc<Mutex<…>>` by every session of one
 /// [`ScriptedBroker`], but is **only consulted when the drop knob is armed**
-/// ([`ScriptedBroker::drop_connection_after`]). When the knob is disarmed —
+/// ([`ScriptedBroker::drop_connection_after_first_ack`]). When the knob is disarmed —
 /// the default for every other differential trace — each session stays fully
 /// isolated on its own [`SessionState`], so two back-to-back legs on one
 /// broker each start from an empty ledger (asserted by `broker_smoke`).
@@ -265,7 +265,7 @@ struct SessionDeps {
     txn_drain_log: TxnDrainLog,
     corrupt_after_connected: Arc<Mutex<bool>>,
     decode_fatal_on_send: Arc<Mutex<bool>>,
-    drop_after: Arc<Mutex<Option<usize>>>,
+    drop_after: Arc<Mutex<bool>>,
     dropped_once: Arc<AtomicBool>,
     /// When `true`, the FIRST `CommandProducer` on a REDIAL session (a session
     /// that opened after [`Self::dropped_once`] latched) is answered with a
@@ -321,23 +321,33 @@ pub struct ScriptedBroker {
     /// `OpOutcome::Terminal` → `ClientError::PeerClosed`. Both engines must
     /// surface that terminal outcome identically.
     decode_fatal_on_send: Arc<Mutex<bool>>,
-    /// When `Some(n)`, the FIRST session closes its socket after writing
-    /// exactly `n` frames, forcing a supervised client to redial; every
-    /// redialled session then serves normally (the [`Self::dropped_once`]
-    /// latch gates the drop to one occurrence so the scenario is a single,
-    /// deterministic drop + redial rather than a redial storm). Armed by
-    /// [`Self::drop_connection_after`] for the drop + redial differential
-    /// scenario (`reconnect_replay_gating_equivalence`). Arming this knob also
-    /// switches every session into **resume mode**: the ledger + per-topic
-    /// entry-id sequence + durable per-subscription cursor live in the
-    /// cross-session `CrossSession` store so the redialled session resumes
-    /// from the acked position instead of starting fresh. `None` (the
+    /// When `true`, the FIRST session closes its socket immediately after it
+    /// writes the `CommandAckResponse` for the first durable ack, forcing a
+    /// supervised client to redial; every redialled session then serves
+    /// normally (the [`Self::dropped_once`] latch gates the drop to one
+    /// occurrence so the scenario is a single, deterministic drop + redial
+    /// rather than a redial storm). Armed by [`Self::drop_connection_after_first_ack`]
+    /// for the drop + redial differential scenario
+    /// (`reconnect_replay_gating_equivalence`).
+    ///
+    /// The drop point is keyed to a **protocol-semantic marker** (the first
+    /// ack-response) rather than a raw broker-write count, so it lands at the
+    /// same logical position on every engine leg regardless of timing-driven
+    /// frames. A keepalive `PING` used to slip a `PONG` into a frame-count
+    /// window and shift the drop ahead of the ack-response on one leg only,
+    /// desyncing the durable cursor and diverging the two `EventStream`s
+    /// (issue #286).
+    ///
+    /// Arming this knob also switches every session into **resume mode**: the
+    /// ledger + per-topic entry-id sequence + durable per-subscription cursor
+    /// live in the cross-session `CrossSession` store so the redialled session
+    /// resumes from the acked position instead of starting fresh. `false` (the
     /// default) keeps each session fully isolated and never drops — the shape
     /// every other differential trace relies on.
-    drop_after: Arc<Mutex<Option<usize>>>,
+    drop_after: Arc<Mutex<bool>>,
     /// Latch ensuring [`Self::drop_after`] fires on exactly one session. The
-    /// first session to reach the frame budget sets it; later sessions stay in
-    /// resume mode but do not drop. Reset by [`Self::clear_cross_session_state`].
+    /// first session to write the first ack-response sets it; later sessions
+    /// stay in resume mode but do not drop. Reset by [`Self::clear_cross_session_state`].
     dropped_once: Arc<AtomicBool>,
     /// When `true`, the FIRST `CommandProducer` on a REDIAL session is answered
     /// with a transient `ServiceNotReady` `CommandError`, exercising the
@@ -386,7 +396,7 @@ impl ScriptedBroker {
         let corrupt_after_connected_clone = corrupt_after_connected.clone();
         let decode_fatal_on_send = Arc::new(Mutex::new(false));
         let decode_fatal_on_send_clone = decode_fatal_on_send.clone();
-        let drop_after = Arc::new(Mutex::new(None));
+        let drop_after = Arc::new(Mutex::new(false));
         let drop_after_clone = drop_after.clone();
         let dropped_once = Arc::new(AtomicBool::new(false));
         let dropped_once_clone = dropped_once.clone();
@@ -470,13 +480,23 @@ impl ScriptedBroker {
     }
 
     /// Arm the drop + redial injection: the FIRST session closes its socket
-    /// immediately after writing exactly `n` frames, forcing a supervised
-    /// client to redial; every redialled session then serves to completion.
-    /// The one-shot latch keeps the scenario a single, deterministic drop +
-    /// redial rather than a redial storm. The per-session frame counter is
-    /// deterministic (it counts encoded `BaseCommand` replies in the order the
-    /// broker writes them), so the drop lands at the same wire position on
-    /// every engine leg.
+    /// immediately after it writes the `CommandAckResponse` for the first
+    /// durable ack, forcing a supervised client to redial; every redialled
+    /// session then serves to completion. The one-shot latch keeps the scenario
+    /// a single, deterministic drop + redial rather than a redial storm.
+    ///
+    /// The drop point is keyed to a **protocol-semantic marker** — the first
+    /// ack-response the broker writes — not a raw count of broker writes. That
+    /// makes the drop land at the same logical position on every engine leg
+    /// even when timing-driven frames interleave. (A keepalive `PING` fires on
+    /// the wall clock, so under load it lands on one leg but not the other; the
+    /// `PONG` it provokes used to shift an `n`-frame drop window ahead of the
+    /// ack-response on that leg only, leaving its durable cursor un-advanced and
+    /// diverging the two `EventStream`s — issue #286.)
+    ///
+    /// The drop fires *after* the ack-response is flushed, so the client
+    /// observes the ack durably (an `Acked` event) and then redials — exactly
+    /// the post-ack drop the resume traces assert.
     ///
     /// Arming this knob also switches every session into **resume mode**: the
     /// ledger, per-topic entry-id sequence, and durable per-subscription
@@ -487,19 +507,17 @@ impl ScriptedBroker {
     /// de-duplicated by `(topic, sequence_id)` so it re-emits the existing
     /// receipt rather than double-appending.
     ///
-    /// **Reset rule.** Disarming with `drop_connection_after(0)` is *not* the
-    /// reset — passing `0` would close the first session before its handshake
-    /// reply, which no scenario wants. Instead the disarm + state reset is
+    /// **Reset rule.** The disarm + state reset is
     /// [`Self::clear_cross_session_state`], which clears the persisted ledger /
     /// cursors, re-arms the one-shot latch, and re-disarms the knob, mirroring
     /// [`Self::clear_frame_log`] for between-leg isolation.
-    pub fn drop_connection_after(&self, n: usize) {
-        *self.drop_after.lock() = Some(n);
+    pub fn drop_connection_after_first_ack(&self) {
+        *self.drop_after.lock() = true;
     }
 
     /// Arm the transient-retry injection: the FIRST
     /// `CommandProducer` on a REDIAL session (any session that opens after the
-    /// [`Self::drop_connection_after`] drop has latched) is answered with a
+    /// [`Self::drop_connection_after_first_ack`] drop has latched) is answered with a
     /// transient `ServiceNotReady` `CommandError` ("Please redo the lookup")
     /// instead of a `CommandProducerSuccess`. This is exactly the post-restart
     /// bundle-not-served window: the proto layer RETAINS the producer state and
@@ -510,7 +528,7 @@ impl ScriptedBroker {
     /// engines — and the resulting `EventStream` must stay identical in ORDER
     /// (the differential parity claim).
     ///
-    /// Pair with [`Self::drop_connection_after`]: the drop opens the redial
+    /// Pair with [`Self::drop_connection_after_first_ack`]: the drop opens the redial
     /// window this knob then perturbs. Reset by
     /// [`Self::clear_cross_session_state`].
     pub fn transient_reject_first_redial_producer_open(&self) {
@@ -538,12 +556,12 @@ impl ScriptedBroker {
     /// leg starts from an empty ledger (mirrors [`Self::clear_frame_log`]).
     ///
     /// This is the deterministic reset rule for
-    /// [`Self::drop_connection_after`]: it re-disarms the knob (sessions go
+    /// [`Self::drop_connection_after_first_ack`]: it re-disarms the knob (sessions go
     /// back to per-session isolation and never drop) and wipes the persisted
     /// resume state in one call, so a missing reset between legs fails loudly
     /// (the second leg would observe the first leg's ledger entries).
     pub fn clear_cross_session_state(&self) {
-        *self.drop_after.lock() = None;
+        *self.drop_after.lock() = false;
         self.dropped_once.store(false, Ordering::SeqCst);
         *self.transient_reject_on_redial.lock() = false;
         self.transient_reject_fired.store(false, Ordering::SeqCst);
@@ -652,39 +670,6 @@ fn partition_index_of(topic: &str) -> i32 {
     }
 }
 
-/// Count the number of complete frames at the head of `buf`. Used by the
-/// drop-after-N knob to know how many frames a pending flush would carry, so
-/// the session can stop at exactly the Nth frame. Every byte the broker
-/// writes is a frame it itself encoded, so the buffer always parses cleanly
-/// here; a non-frame tail (impossible in practice) is ignored.
-fn count_frames(buf: &[u8]) -> usize {
-    let mut cursor = Bytes::copy_from_slice(buf);
-    let mut count = 0;
-    while !cursor.is_empty() {
-        match decode_one(&mut cursor) {
-            Ok(_) => count += 1,
-            Err(_) => break,
-        }
-    }
-    count
-}
-
-/// Byte length of the first `n` complete frames at the head of `buf`. Used by
-/// the drop-after-N knob to truncate a pending flush to exactly `n` frames.
-/// If `buf` holds fewer than `n` frames, returns the full parsed length.
-fn frame_prefix_len(buf: &[u8], n: usize) -> usize {
-    let mut cursor = Bytes::copy_from_slice(buf);
-    let total = cursor.len();
-    let mut taken = 0;
-    while taken < n && !cursor.is_empty() {
-        match decode_one(&mut cursor) {
-            Ok(_) => taken += 1,
-            Err(_) => break,
-        }
-    }
-    total - cursor.len()
-}
-
 async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
     // Only the handles this session loop touches directly are destructured;
     // the per-frame logs (`seeked_partitions`, `txn_drain_log`) are read
@@ -705,14 +690,18 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
     // session must flush that frame and then close (the byte stream is
     // unparseable from there on, so there is nothing more to do).
     let mut terminate_after_flush = false;
+    // Set once the dropping session has staged the first ack-response: the
+    // session flushes that frame (so the client observes the ack durably) and
+    // then closes, forcing a supervised client to redial.
+    let mut drop_after_flush = false;
     // Resume mode: the drop knob is armed, so the ledger + durable cursors
     // live in the cross-session store. Snapshot the knob ONCE at session start
     // so a `clear_cross_session_state` mid-flight does not change this
-    // session's behaviour. `None` → never drop, per-session isolation.
+    // session's behaviour. `false` → never drop, per-session isolation.
     let armed = *drop_after.lock();
-    let resume = armed.map(|_| cross_session);
+    let resume = armed.then_some(cross_session);
     // A session is a REDIAL session when the drop has ALREADY latched before
-    // this session opened — snapshot the latch BEFORE the `drop_at` CAS below
+    // this session opened — snapshot the latch BEFORE the drop CAS below
     // claims it for the dropping session. The transient-retry knob only
     // perturbs redial sessions.
     let is_redial = dropped_once.load(Ordering::SeqCst);
@@ -722,15 +711,10 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
     // single, deterministic drop + redial, and every redialled session then
     // serves to completion (resuming from the durable cursor). The CAS claims
     // the latch atomically: `Ok` means this session is the one that drops.
-    let drop_at = armed.filter(|_| {
-        dropped_once
+    let drop_this_session = armed
+        && dropped_once
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-    });
-    // Count of frames the broker has written on this session, used only when
-    // `drop_at` is `Some`.
-    let mut frames_written: usize = 0;
-    eprintln!("[broker] session opened");
+            .is_ok();
 
     loop {
         // Decode every complete frame currently in the buffer, then
@@ -746,14 +730,10 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
             let frame = match decode_one(&mut framed) {
                 Ok(f) => f,
                 Err(FrameError::Incomplete { .. }) => break,
-                Err(e) => {
-                    eprintln!("[broker] decode error: {e:?}");
-                    return;
-                }
+                Err(_) => return,
             };
             let consumed = before - framed.len();
             let _ = read_buf.split_to(consumed);
-            eprintln!("[broker] decoded frame type={}", frame.command.r#type);
             frame_log.lock().push(frame.command.r#type);
             let inject = FrameInjections {
                 corrupt_after_connected: *corrupt_after_connected.lock(),
@@ -761,10 +741,32 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
                 transient_reject_armed,
             };
             let keep_going = handle_frame(&state, &frame, &mut out_buf, &deps, inject, resume);
+            // Semantic drop marker: the dropping session closes right after it
+            // flushes the FIRST ack-response — i.e. a `CommandAck` carrying a
+            // `request_id`, which `handle_frame` answers with a
+            // `CommandAckResponse`. Keying the drop to this protocol event,
+            // rather than a raw count of broker writes, keeps the drop point
+            // invariant to timing-driven frames: a keepalive PING used to slip
+            // a PONG into an `n`-frame window and shift the drop ahead of the
+            // ack-response on one leg only, diverging the streams (issue #286).
+            if drop_this_session
+                && frame
+                    .command
+                    .ack
+                    .as_ref()
+                    .is_some_and(|a| a.request_id.is_some())
+            {
+                drop_after_flush = true;
+            }
             if !keep_going {
                 // The decode-fatal frame is already staged in `out_buf`;
                 // flush it below, then close the session.
                 terminate_after_flush = true;
+                break;
+            }
+            if drop_after_flush {
+                // Stop draining further client frames; flush what we have
+                // (through the ack-response) and close below.
                 break;
             }
         }
@@ -773,57 +775,29 @@ async fn handle_session(mut stream: TcpStream, deps: SessionDeps) {
         push_pending(&state, &mut out_buf, resume);
 
         if !out_buf.is_empty() {
-            // Drop-after-N: when the knob is armed, truncate `out_buf` to the
-            // first `drop_at - frames_written` complete frames, write those,
-            // and close the session so a supervised client redials. The
-            // counter is per-session and deterministic (frames are emitted in
-            // a fixed order), so the drop lands at the same wire position on
-            // every engine leg.
-            let mut close_after_write = false;
-            if let Some(limit) = drop_at {
-                let remaining = limit.saturating_sub(frames_written);
-                let available = count_frames(&out_buf);
-                if available >= remaining {
-                    let cut = frame_prefix_len(&out_buf, remaining);
-                    out_buf.truncate(cut);
-                    frames_written = limit;
-                    close_after_write = true;
-                } else {
-                    frames_written += available;
-                }
-            }
-            eprintln!("[broker] writing {} bytes", out_buf.len());
             if stream.write_all(&out_buf).await.is_err() {
-                eprintln!("[broker] write failed");
                 return;
             }
             if stream.flush().await.is_err() {
-                eprintln!("[broker] flush failed");
                 return;
             }
             out_buf.clear();
-            if close_after_write {
-                eprintln!(
-                    "[broker] drop-after-{} reached; closing session",
-                    drop_at.unwrap_or(0)
-                );
-                return;
-            }
+        }
+
+        if drop_after_flush {
+            // The ack-response is on the wire; close so the supervised client
+            // redials and resumes from the now-durable cursor.
+            return;
         }
 
         if terminate_after_flush {
-            eprintln!("[broker] decode-fatal frame flushed; closing session");
             return;
         }
 
         // Read more bytes.
-        eprintln!("[broker] about to read; buf has {} bytes", read_buf.len());
         match stream.read_buf(&mut read_buf).await {
-            Ok(0) | Err(_) => {
-                eprintln!("[broker] read returned 0/err");
-                return;
-            }
-            Ok(n) => eprintln!("[broker] read {n} bytes; buf now has {}", read_buf.len()),
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
     }
 }

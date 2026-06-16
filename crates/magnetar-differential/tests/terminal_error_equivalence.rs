@@ -33,10 +33,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
-
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};
+use magnetar_differential::{Event, HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio};
 
 #[tokio::test(flavor = "current_thread")]
 async fn terminal_decode_fatal_on_send_is_equivalent_across_engines() {
@@ -59,7 +57,7 @@ async fn terminal_decode_fatal_on_send_is_equivalent_across_engines() {
     let broker_t = ScriptedBroker::bind().await.expect("broker bind");
     broker_t.inject_decode_fatal_frame_on_send();
     let tokio_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_tokio::run(&broker_t.pulsar_url(), &trace),
     )
     .await
@@ -71,7 +69,7 @@ async fn terminal_decode_fatal_on_send_is_equivalent_across_engines() {
     let broker_m = ScriptedBroker::bind().await.expect("broker bind");
     broker_m.inject_decode_fatal_frame_on_send();
     let moonpool_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_moonpool::run(&broker_m.host_port(), &trace),
     )
     .await
@@ -137,7 +135,7 @@ async fn terminal_new_send_after_drop_is_equivalent_across_engines() {
     let broker_t = ScriptedBroker::bind().await.expect("broker bind");
     broker_t.inject_decode_fatal_frame_on_send();
     let tokio_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_tokio::run(&broker_t.pulsar_url(), &trace),
     )
     .await
@@ -149,7 +147,7 @@ async fn terminal_new_send_after_drop_is_equivalent_across_engines() {
     let broker_m = ScriptedBroker::bind().await.expect("broker bind");
     broker_m.inject_decode_fatal_frame_on_send();
     let moonpool_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_moonpool::run(&broker_m.host_port(), &trace),
     )
     .await

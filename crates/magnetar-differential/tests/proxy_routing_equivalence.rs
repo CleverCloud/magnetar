@@ -24,9 +24,9 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
+use magnetar_differential::HANG_GUARD;
 use magnetar_proto::{
     ConnectionConfig, CreateProducerRequest, FrameError, SupervisorConfig, decode_one,
     encode_command, pb,
@@ -216,7 +216,7 @@ fn observation_from(snapshot: &[SessionRecord]) -> ProxyObservation {
 async fn run_tokio(url: &str) -> ProxyObservation {
     use magnetar_runtime_tokio::Client;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(url, ConnectionConfig::default()),
     )
     .await
@@ -224,7 +224,7 @@ async fn run_tokio(url: &str) -> ProxyObservation {
     .expect("tokio connect ok");
 
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/proxy-routing-equiv-tokio".to_owned(),
             ..Default::default()
@@ -258,7 +258,7 @@ async fn run_moonpool(host_port: &str) -> ProxyObservation {
         ..ConnectionConfig::default()
     };
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect_plain_supervised(&engine, host_port, cfg, None, None),
     )
     .await
@@ -266,7 +266,7 @@ async fn run_moonpool(host_port: &str) -> ProxyObservation {
     .expect("moonpool connect ok");
 
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/proxy-routing-equiv-moonpool".to_owned(),
             ..Default::default()

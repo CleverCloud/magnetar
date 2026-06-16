@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use magnetar_differential::HANG_GUARD;
 use magnetar_proto::{
     ConnectionConfig, FrameError, ReplicatedSubscriptionMarkerKind, SubscribeRequest, decode_one,
     encode_command, encode_payload, pb,
@@ -309,14 +310,14 @@ async fn drive_engine_tokio(
     let (url, log) = spawn_broker(actions).await;
     let pulsar_url = format!("pulsar://{url}");
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         TokioClient::connect(&pulsar_url, ConnectionConfig::default()),
     )
     .await
     .expect("connect")
     .expect("connect ok");
     let consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(subscribe_request("persistent://public/default/diff"), None),
     )
     .await
@@ -325,7 +326,7 @@ async fn drive_engine_tokio(
 
     let mut user_messages = 0;
     for _ in 0..6 {
-        let msg = tokio::time::timeout(Duration::from_secs(2), consumer.receive())
+        let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
             .await
             .expect("receive ok")
             .expect("msg");
@@ -342,13 +343,10 @@ async fn drive_engine_tokio(
 
     let mut kinds = Vec::new();
     for _ in 0..4 {
-        let obs = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.next_replicated_subscription_marker(),
-        )
-        .await
-        .expect("marker timeout")
-        .expect("marker some");
+        let obs = tokio::time::timeout(HANG_GUARD, client.next_replicated_subscription_marker())
+            .await
+            .expect("marker timeout")
+            .expect("marker some");
         kinds.push(obs.marker.kind);
     }
     let wire_len = log.lock().raw_subscribe_bytes.as_ref().map_or(0, Vec::len);
@@ -369,14 +367,14 @@ async fn drive_engine_moonpool(
         .run_until(async move {
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 MoonpoolClient::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
             .expect("connect")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request("persistent://public/default/diff")),
             )
             .await
@@ -385,7 +383,7 @@ async fn drive_engine_moonpool(
 
             let mut user_messages = 0;
             for _ in 0..6 {
-                let msg = tokio::time::timeout(Duration::from_secs(2), consumer.receive())
+                let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
                     .await
                     .expect("receive ok")
                     .expect("msg");
@@ -401,13 +399,11 @@ async fn drive_engine_moonpool(
 
             let mut kinds = Vec::new();
             for _ in 0..4 {
-                let obs = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    client.next_replicated_subscription_marker(),
-                )
-                .await
-                .expect("marker timeout")
-                .expect("marker some");
+                let obs =
+                    tokio::time::timeout(HANG_GUARD, client.next_replicated_subscription_marker())
+                        .await
+                        .expect("marker timeout")
+                        .expect("marker some");
                 kinds.push(obs.marker.kind);
             }
             let wire_len = log.lock().raw_subscribe_bytes.as_ref().map_or(0, Vec::len);
@@ -448,14 +444,14 @@ async fn capture_subscribe_bytes_tokio() -> Vec<u8> {
     let (url, log) = spawn_broker(Vec::new()).await;
     let pulsar_url = format!("pulsar://{url}");
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         TokioClient::connect(&pulsar_url, ConnectionConfig::default()),
     )
     .await
     .expect("connect")
     .expect("connect ok");
     let _consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(subscribe_request("persistent://public/default/diff"), None),
     )
     .await
@@ -477,14 +473,14 @@ async fn capture_subscribe_bytes_moonpool() -> Vec<u8> {
         .run_until(async move {
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 MoonpoolClient::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
             .expect("connect")
             .expect("connect ok");
             let _consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request("persistent://public/default/diff")),
             )
             .await

@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use magnetar_differential::HANG_GUARD;
 use magnetar_differential::broker::ScriptedBroker;
 use magnetar_proto::pb;
 use magnetar_runtime_moonpool::MoonpoolEngine;
@@ -32,7 +33,7 @@ async fn partition_suffix_fast_path_event_stream_parity() {
     // ----- tokio leg -----
     let tokio_count = {
         let client = tokio::time::timeout(
-            Duration::from_secs(5),
+            HANG_GUARD,
             magnetar_runtime_tokio::Client::connect(
                 &pulsar_url,
                 magnetar_proto::ConnectionConfig::default(),
@@ -41,13 +42,10 @@ async fn partition_suffix_fast_path_event_stream_parity() {
         .await
         .expect("tokio connect did not time out")
         .expect("tokio connect ok");
-        let count = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.partitioned_topic_metadata(topic),
-        )
-        .await
-        .expect("tokio fast-path did not time out")
-        .expect("tokio fast-path Ok");
+        let count = tokio::time::timeout(HANG_GUARD, client.partitioned_topic_metadata(topic))
+            .await
+            .expect("tokio fast-path did not time out")
+            .expect("tokio fast-path Ok");
         if let Some(d) = client.take_driver() {
             d.abort();
         }
@@ -68,7 +66,7 @@ async fn partition_suffix_fast_path_event_stream_parity() {
             .run_until(async {
                 let engine = MoonpoolEngine::new(TokioProviders::new());
                 let client = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    HANG_GUARD,
                     magnetar_runtime_moonpool::Client::connect_plain(
                         &engine,
                         &host_port,
@@ -78,13 +76,11 @@ async fn partition_suffix_fast_path_event_stream_parity() {
                 .await
                 .expect("moonpool connect did not time out")
                 .expect("moonpool connect ok");
-                let count = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    client.partitioned_topic_metadata(topic),
-                )
-                .await
-                .expect("moonpool fast-path did not time out")
-                .expect("moonpool fast-path Ok");
+                let count =
+                    tokio::time::timeout(HANG_GUARD, client.partitioned_topic_metadata(topic))
+                        .await
+                        .expect("moonpool fast-path did not time out")
+                        .expect("moonpool fast-path Ok");
                 client.close().await;
                 count
             })

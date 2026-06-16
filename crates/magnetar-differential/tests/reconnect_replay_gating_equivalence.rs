@@ -4,13 +4,14 @@
 //! replay fix).
 //!
 //! The scripted broker is armed with
-//! [`ScriptedBroker::drop_connection_after`], so it closes the socket mid
-//! scenario after writing a fixed number of frames, forcing the supervised
-//! client to redial. The knob also switches the broker into **resume mode**:
-//! the ledger, per-topic entry-id sequence, and durable per-subscription
-//! cursor live in the cross-session store, so the replayed in-flight publish
-//! and the re-subscribe after the redial resume from the acked position
-//! instead of starting fresh (ADR-0055 §3 shape).
+//! [`ScriptedBroker::drop_connection_after_first_ack`], so it closes the socket
+//! right after it flushes the first ack-response — the protocol point at which
+//! the first message is durably acked — forcing the supervised client to
+//! redial. The knob also switches the broker into **resume mode**: the ledger,
+//! per-topic entry-id sequence, and durable per-subscription cursor live in the
+//! cross-session store, so the replayed in-flight publish and the re-subscribe
+//! after the redial resume from the acked position instead of starting fresh
+//! (ADR-0055 §3 shape).
 //!
 //! Both engine legs run the SAME trace through the SUPERVISED runner
 //! ([`runner_tokio::run_supervised`] / [`runner_moonpool::run_supervised`]) so
@@ -32,7 +33,7 @@
 use std::time::Duration;
 
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};
+use magnetar_differential::{Event, HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio};
 use magnetar_proto::{MessageId, SupervisorConfig};
 
 /// Build a message id with default partition/batch fields so the trace can
@@ -58,25 +59,14 @@ fn supervisor() -> SupervisorConfig {
     }
 }
 
-/// Frames the broker writes before it drops the session. The handshake +
-/// first round-trip emits, in this exact order (verified identical on both
-/// engine legs — the differential parity assertion below would catch any
-/// drift):
-///
-/// 1. `CommandConnected` (Connect reply)
-/// 2. `CommandLookupTopicResponse` (producer's Lookup reply)
-/// 3. `CommandProducerSuccess` (Producer open)
-/// 4. `CommandSendReceipt` (first send — entry `(1, 0)`)
-/// 5. `CommandLookupTopicResponse` (consumer's Lookup reply, on first Recv)
-/// 6. `CommandSuccess` (Subscribe)
-/// 7. pushed `CommandMessage` (first recv delivers `(1, 0)`)
-/// 8. `CommandAckResponse` (first ack — advances the durable cursor to 1)
-///
-/// Dropping after frame 8 closes the connection once the first message is
-/// durably acked, so the SECOND send is issued across the redial and the
-/// re-subscribe must resume from cursor 1 — redelivering nothing already
-/// acked, delivering only the new entry `(1, 1)`.
-const DROP_AFTER_FRAMES: usize = 8;
+// The broker drops right after it flushes the first ack-response (see
+// `ScriptedBroker::drop_connection_after_first_ack`): the first message `(1, 0)`
+// is durably acked, so the SECOND send is issued across the redial and the
+// re-subscribe must resume from cursor 1 — redelivering nothing already acked,
+// delivering only the new entry `(1, 1)`. The drop point is keyed to the
+// ack-response protocol event rather than a raw broker-write count, so a
+// keepalive PING that lands on one leg but not the other cannot shift it and
+// desync the two legs (issue #286).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drop_redial_replay_is_equivalent_across_engines() {
@@ -115,9 +105,9 @@ async fn drop_redial_replay_is_equivalent_across_engines() {
 
     // ── Tokio leg ──
     let broker_t = ScriptedBroker::bind().await.expect("broker bind");
-    broker_t.drop_connection_after(DROP_AFTER_FRAMES);
+    broker_t.drop_connection_after_first_ack();
     let tokio_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_tokio::run_supervised(&broker_t.pulsar_url(), &trace, supervisor()),
     )
     .await
@@ -127,9 +117,9 @@ async fn drop_redial_replay_is_equivalent_across_engines() {
 
     // ── Moonpool leg ──
     let broker_m = ScriptedBroker::bind().await.expect("broker bind");
-    broker_m.drop_connection_after(DROP_AFTER_FRAMES);
+    broker_m.drop_connection_after_first_ack();
     let moonpool_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_moonpool::run_supervised(&broker_m.host_port(), &trace, supervisor()),
     )
     .await
@@ -240,10 +230,10 @@ async fn drop_redial_with_transient_reject_is_equivalent_across_engines() {
 
     // ── Tokio leg ──
     let broker_t = ScriptedBroker::bind().await.expect("broker bind");
-    broker_t.drop_connection_after(DROP_AFTER_FRAMES);
+    broker_t.drop_connection_after_first_ack();
     broker_t.transient_reject_first_redial_producer_open();
     let tokio_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_tokio::run_supervised(&broker_t.pulsar_url(), &trace, supervisor()),
     )
     .await
@@ -253,10 +243,10 @@ async fn drop_redial_with_transient_reject_is_equivalent_across_engines() {
 
     // ── Moonpool leg ──
     let broker_m = ScriptedBroker::bind().await.expect("broker bind");
-    broker_m.drop_connection_after(DROP_AFTER_FRAMES);
+    broker_m.drop_connection_after_first_ack();
     broker_m.transient_reject_first_redial_producer_open();
     let moonpool_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_moonpool::run_supervised(&broker_m.host_port(), &trace, supervisor()),
     )
     .await
