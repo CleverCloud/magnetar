@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{Event, Op, Trace, runner_moonpool, runner_tokio};
+use magnetar_differential::{Event, HANG_GUARD, Op, Trace, runner_moonpool, runner_tokio};
 use magnetar_proto::MessageId;
 use parking_lot::Mutex;
 
@@ -119,7 +119,7 @@ async fn corrupted_frame_drop_is_equivalent_across_engines() {
     let broker_t = ScriptedBroker::bind().await.expect("broker bind");
     broker_t.inject_corrupted_frame_after_connected();
     let tokio_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_tokio::run(&broker_t.pulsar_url(), &trace),
     )
     .await
@@ -139,7 +139,7 @@ async fn corrupted_frame_drop_is_equivalent_across_engines() {
     let broker_m = ScriptedBroker::bind().await.expect("broker bind");
     broker_m.inject_corrupted_frame_after_connected();
     let moonpool_stream = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_moonpool::run(&broker_m.host_port(), &trace),
     )
     .await

@@ -409,8 +409,7 @@ fn tokio_and_moonpool_observe_the_same_cap_exceeded_failed() {
 // only one in-memory connection). Run via real `Client`s over TCP.
 // ---------------------------------------------------------------------------
 
-use std::time::Duration;
-
+use magnetar_differential::HANG_GUARD;
 use magnetar_proto::{CreateProducerRequest, FrameError, SupervisorConfig, decode_one};
 use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
@@ -597,14 +596,14 @@ async fn run_tokio_dial() -> DialObservation {
         spawn_dial_broker(DialBehaviour::RedirectOnceTo(format!("pulsar://{addr_b}"))).await;
     let url_a = format!("pulsar://{addr_a}");
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url_a, ConnectionConfig::default()),
     )
     .await
     .expect("tokio connect")
     .expect("tokio connect ok");
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/diff-redirect-dial-tokio".to_owned(),
             ..Default::default()
@@ -632,14 +631,14 @@ async fn run_moonpool_dial() -> DialObservation {
         ..ConnectionConfig::default()
     };
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect_plain_supervised(&engine, &addr_a, cfg, None, None),
     )
     .await
     .expect("moonpool connect")
     .expect("moonpool connect ok");
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/diff-redirect-dial-moonpool".to_owned(),
             ..Default::default()

@@ -49,7 +49,7 @@ pub async fn run(pulsar_url: &str, trace: &Trace) -> Result<EventStream, ClientE
 /// enabled (`config.supervisor = Some(...)`). The driver transparently
 /// redials on a broker-induced drop and replays the in-flight publish /
 /// re-subscribes, so a scenario armed with
-/// [`crate::broker::ScriptedBroker::drop_connection_after`] resumes from the
+/// [`crate::broker::ScriptedBroker::drop_connection_after_first_ack`] resumes from the
 /// durable cursor instead of failing the op. Mirrors the moonpool sibling
 /// [`crate::runner_moonpool::run_supervised`] so the two legs compare equal.
 ///

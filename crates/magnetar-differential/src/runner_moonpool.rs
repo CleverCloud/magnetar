@@ -62,7 +62,7 @@ pub async fn run(host_port: &str, trace: &Trace) -> Result<EventStream, ClientEr
 /// Run `trace` against the moonpool engine with the auto-reconnect supervisor
 /// enabled. The supervised driver transparently redials on a broker-induced
 /// drop and replays the in-flight publish / re-subscribes, so a scenario
-/// armed with [`crate::broker::ScriptedBroker::drop_connection_after`]
+/// armed with [`crate::broker::ScriptedBroker::drop_connection_after_first_ack`]
 /// resumes from the durable cursor instead of failing the op. Mirrors the
 /// tokio sibling [`crate::runner_tokio::run_supervised`] so the two legs
 /// compare equal.

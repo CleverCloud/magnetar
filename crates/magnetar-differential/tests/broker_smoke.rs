@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use magnetar_differential::broker::ScriptedBroker;
-use magnetar_differential::{Op, Trace, runner_tokio};
+use magnetar_differential::{HANG_GUARD, Op, Trace, runner_tokio};
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{ConnectionConfig, CreateProducerRequest, SupervisorConfig};
 use magnetar_runtime_tokio::Client;
@@ -19,7 +19,7 @@ async fn tokio_client_handshakes() {
     eprintln!("[test] broker @ {url}");
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -32,7 +32,7 @@ async fn tokio_client_handshakes() {
     // Try opening a producer.
     eprintln!("[test] opening producer");
     let producer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.open_producer_with(
             CreateProducerRequest {
                 topic: "persistent://public/default/smoke".to_owned(),
@@ -49,7 +49,7 @@ async fn tokio_client_handshakes() {
     // Send a message.
     eprintln!("[test] sending");
     let mid = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         producer.send(OutgoingMessage {
             payload: Bytes::from_static(b"smoke"),
             metadata: magnetar_proto::pb::MessageMetadata::default(),
@@ -105,7 +105,7 @@ async fn cross_session_state_is_isolated_between_legs() {
     // (2) Arm the drop knob and run one supervised leg: a send + recv + ack +
     // redial-resumed send. Resume mode persists the ledger to the broker-level
     // store.
-    broker.drop_connection_after(8);
+    broker.drop_connection_after_first_ack();
     let supervisor = SupervisorConfig {
         initial_backoff: Duration::from_millis(20),
         max_backoff: Duration::from_millis(200),
@@ -147,7 +147,7 @@ async fn cross_session_state_is_isolated_between_legs() {
         ],
     );
     let _ = tokio::time::timeout(
-        Duration::from_secs(30),
+        HANG_GUARD,
         runner_tokio::run_supervised(&broker.pulsar_url(), &trace, supervisor),
     )
     .await
