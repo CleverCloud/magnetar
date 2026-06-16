@@ -43,7 +43,7 @@ crates/
   magnetar-runtime-tokio/         Production engine (TCP, tokio-rustls, supervised reconnect)
   magnetar-runtime-moonpool/      Deterministic-simulation engine over moonpool_core::Providers (rustls byte-pipe)
   magnetar-admin/                 reqwest-backed REST admin client (rustls-tls)
-  magnetar-cli/                   `magnetarctl` crate + binary
+  magnetarctl/                   `magnetarctl` crate + binary
   magnetar-fakes/                 In-process broker stub for tests
   magnetar-messagecrypto/         PIP-4 AES-GCM (aws-lc-rs)
   magnetar-auth-oauth2/           ClientCredentialsFlow + token caching

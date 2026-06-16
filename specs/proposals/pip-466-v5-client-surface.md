@@ -138,7 +138,7 @@ No new sim-side broker fake.
 No new `BrokerWorkload` variant.
 No new scripted scenario.
 
-### 3.3 `magnetar-cli`
+### 3.3 `magnetarctl`
 
 No V5-specific subcommand yet.
 The CLI continues to use the v4 API internally; advertising the V5 module from the CLI is deferred to a follow-up.

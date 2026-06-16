@@ -98,7 +98,7 @@ Authoritative landing artefacts:
 | Tokio runtime wiring (producer + consumer + subscribe hint)            | [`crates/magnetar-runtime-tokio/src/`](../../crates/magnetar-runtime-tokio/src)                             |
 | Moonpool runtime mirror + scripted broker `ShadowTopic` workload       | [`crates/magnetar-runtime-moonpool/src/`](../../crates/magnetar-runtime-moonpool/src), `tests/sim_chaos.rs` |
 | Differential golden trace                                              | `crates/magnetar-differential/tests/golden/shadow_send_with_source.json`                                    |
-| CLI `magnetar shadow {create,delete,list,source}`                      | [`crates/magnetar-cli/src/main.rs`](../../crates/magnetar-cli/src/main.rs) (`ShadowCmd` + `run_shadow`)     |
+| CLI `magnetar shadow {create,delete,list,source}`                      | [`crates/magnetarctl/src/main.rs`](../../crates/magnetarctl/src/main.rs) (`ShadowCmd` + `run_shadow`)       |
 | User docs                                                              | [`docs/pip-features.md#shadow-topics-pip-180`](../../docs/pip-features.md#shadow-topics-pip-180)            |
 | E2E                                                                    | `crates/magnetar/tests/e2e_shadow_topic.rs`                                                                 |
 

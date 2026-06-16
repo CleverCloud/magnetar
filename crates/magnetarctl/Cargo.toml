@@ -43,23 +43,31 @@ scalable-topics = ["magnetar-driver/scalable-topics", "magnetar-admin/scalable-t
 crypto-aws-lc-rs = [
     "magnetar-driver/crypto-aws-lc-rs",
     "magnetar-admin/crypto-aws-lc-rs",
+    "magnetar-auth-oauth2/crypto-aws-lc-rs",
 ]
 crypto-ring = [
     "magnetar-driver/crypto-ring",
     "magnetar-admin/crypto-ring",
+    "magnetar-auth-oauth2/crypto-ring",
 ]
 crypto-openssl = [
     "magnetar-driver/crypto-openssl",
     "magnetar-admin/crypto-openssl",
+    "magnetar-auth-oauth2/crypto-openssl",
 ]
 crypto-fips = [
     "magnetar-driver/crypto-fips",
     "magnetar-admin/crypto-fips",
+    "magnetar-auth-oauth2/crypto-fips",
 ]
 
 [dependencies]
-magnetar-driver    = { workspace = true, default-features = false, features = ["tokio"] }
-magnetar-admin     = { workspace = true }
+magnetar-driver      = { workspace = true, default-features = false, features = ["tokio"] }
+magnetar-admin       = { workspace = true }
+# OAuth2 client-credentials flow for context `auth-info` carrying an
+# `issuer_endpoint`. Wired into the admin client via `AdminAuth::OAuth2` and
+# into the data-plane client via its `AuthProvider` impl. ADR-0068.
+magnetar-auth-oauth2 = { workspace = true }
 anstream           = "1"
 anstyle            = "1"
 clap               = { workspace = true }
@@ -68,5 +76,11 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
+# YAML for the pulsarctl-compatible `~/.config/pulsar/config` context file.
+serde_norway       = { workspace = true }
 thiserror          = { workspace = true }
 url                = { workspace = true }
+
+[dev-dependencies]
+# Temp config-file fixtures for the context round-trip + resolution tests.
+tempfile = { workspace = true }

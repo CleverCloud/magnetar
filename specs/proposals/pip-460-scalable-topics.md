@@ -332,7 +332,7 @@ where
 ```
 
 Feature flag: `scalable-topics` on the `magnetar` crate, **default off**. Compiling without the flag leaves the pre-PIP-460 surface bit-for-bit unchanged.
-The `magnetar-cli` binary picks the feature up via `--features magnetar/scalable-topics` only.
+The `magnetarctl` binary picks the feature up via `--features magnetar/scalable-topics` only.
 
 `#[doc = "**Experimental** (PIP-460).
 StreamConsumer drops on DAG change."]` banner on every public type in the module.
@@ -350,7 +350,7 @@ StreamConsumer drops on DAG change."]` banner on every public type in the module
 The moonpool engine inherits `StreamConsumer` from the `magnetar` façade — generic over `E: Engine`.
 No GAT growth; new behaviour rides the `ScalableTopicsApi` extension trait per ADR-0026 §D1.
 
-### 3.3 `magnetar-cli`
+### 3.3 `magnetarctl`
 
 `magnetar://topic-info <topic://...>` subcommand prints the current segment DAG.
 Gated on the same feature flag.
@@ -434,7 +434,7 @@ Once Pulsar 5.0 GA ships, e2e becomes blocking — at which point we cut a follo
 | `ScalableTopicsApi` extension-trait impls per engine                 | ~250      |
 | Moonpool `ScalableTopicBroker` fake + sim_chaos variant              | ~250      |
 | Tests (4-layer)                                                      | ~400      |
-| `magnetar-cli` `topic-info` subcommand                               | ~80       |
+| `magnetarctl` `topic-info` subcommand                                | ~80       |
 | e2e + docker-compose helper                                          | ~200      |
 | **Total**                                                            | **~2080** |
 
@@ -466,7 +466,7 @@ No revert PR needed; pre-PIP-460-compatible callers are unaffected.
 5. **Wave 3**: moonpool surface + (c) test layer.
    Test-count parity enforced.
 6. **Wave 4**: differential + (d) test layer.
-7. **Wave 5**: `magnetar-cli` `topic-info` subcommand + docs + parity-matrix flip in `README.md` to `🟡 experimental`.
+7. **Wave 5**: `magnetarctl` `topic-info` subcommand + docs + parity-matrix flip in `README.md` to `🟡 experimental`.
 8. **Wave 6** (post-RC): e2e tests, fixture, docker-compose helper.
 
 ## 8. Documentation deliverables (same wave)

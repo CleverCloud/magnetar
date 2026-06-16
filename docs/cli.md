@@ -9,7 +9,7 @@ This page is the canonical CLI reference; for the full subcommand surface, run `
 ## Install
 
 ```sh
-cargo install --path crates/magnetar-cli
+cargo install --path crates/magnetarctl
 # or, from inside this workspace
 cargo build -p magnetarctl --release
 ./target/release/magnetarctl --help
@@ -19,10 +19,19 @@ cargo build -p magnetarctl --release
 
 ```text
 --service-url <url>          Pulsar service URL (data-plane).      [env MAGNETAR_SERVICE_URL]
-                             default: pulsar://localhost:6650
---admin-url <url>            Pulsar admin REST URL.                [env MAGNETAR_ADMIN_URL]
-                             default: http://localhost:8080
+                             default: derived from the active context, else pulsar://localhost:6650
+--admin-url, -s <url>        Pulsar admin REST URL.                [env MAGNETAR_ADMIN_URL]
+                             default: derived from the active context, else http://localhost:8080
 --token <token>              Bearer token for admin auth.          [env MAGNETAR_TOKEN]
+--token-file <path>          File holding a bearer token.          [env MAGNETAR_TOKEN_FILE]
+--tls-trust-cert-path <p>    Custom CA trust cert (PEM).
+--tls-allow-insecure         Disable TLS cert verification (dev only — INSECURE).
+--tls-enable-hostname-verification   Enable TLS hostname verification (pulsarctl parity).
+--tls-cert-file <path>       Client TLS cert (mTLS). NOT yet wired in — setting it warns and has no effect.
+--tls-key-file <path>        Client TLS key (mTLS). NOT yet wired in (see --tls-cert-file).
+--config <path>              pulsarctl config file.                [env MAGNETAR_CONFIG]
+                             default: $HOME/.config/pulsar/config
+--context <name>             Select a named context (overrides current-context).
 --admin-timeout-secs <n>     Admin request timeout (seconds).      default: 60
 -v, --verbose                Increase logging verbosity.
                              -v     magnetar=debug
@@ -34,6 +43,70 @@ cargo build -p magnetarctl --release
 
 All flags are global — `magnetarctl admin -vv tenants list` is equivalent to `magnetarctl -vv admin tenants list`, and either form works.
 The `MAGNETAR_*` environment variables seed the same flags so CI pipelines and shell aliases don't have to repeat them.
+
+`--service-url` and `--admin-url` no longer carry a built-in clap default: when neither the flag/env nor an active context supplies a value, the localhost fallback is applied in code, so a context can override the default while an explicit value always wins.
+
+## Config file & contexts
+
+`magnetarctl` reads the standard pulsarctl config file as-is and can edit it with the [`context`](#context) command group, so an existing pulsarctl setup works with zero extra flags.
+
+### Path resolution
+
+The config file is located most-specific first:
+
+1. `--config <path>` (a named-but-missing file IS an error).
+2. `MAGNETAR_CONFIG` (a named-but-missing file IS an error).
+3. `$XDG_CONFIG_HOME/pulsar/config` (only when `XDG_CONFIG_HOME` is set).
+4. `$HOME/.config/pulsar/config` — the pulsarctl-hardcoded default; **a missing file here is not an error** (the built-in localhost defaults apply, identical to running without a config).
+
+### File format
+
+The format is fixed by `streamnative/pulsarctl` ([`pkg/cmdutils/ctx_conf.go`](https://github.com/streamnative/pulsarctl/blob/master/pkg/cmdutils/ctx_conf.go)) and reproduced verbatim — the casing is intentionally mixed (kebab-case at the top level, snake_case inside `auth-info` with a lone camelCase outlier `tokenFile`).
+A file written by `magnetarctl context set` stays readable by pulsarctl: unknown keys (and `locationoforigin`) round-trip untouched.
+
+```yaml
+# $HOME/.config/pulsar/config
+auth-info: # singular key, but a map
+  prod:
+    locationoforigin: "" # pulsarctl bookkeeping (origin file)
+    tls_trust_certs_file_path: ""
+    tls_allow_insecure_connection: false
+    token: "" # inline bearer token
+    tokenFile: "" # camelCase outlier — path to a token file
+    issuer_endpoint: "" # OAuth2
+    client_id: ""
+    audience: ""
+    scope: ""
+    key_file: "" # OAuth2 Pulsar-style client_id+client_secret JSON
+contexts:
+  prod:
+    admin-service-url: https://broker:443 # the only two context keys
+    bookie-service-url: http://bookie:8080 # (there is no broker-service-url)
+current-context: prod
+```
+
+### Resolution at runtime
+
+For an `admin` / `produce` / `consume` call:
+
+1. Locate the config file (above).
+2. Select the active context: `--context <name>` › the file's `current-context`.
+3. Apply the context's `admin-service-url` + `auth-info` (token / token-file / TLS trust+insecure / OAuth2) to the admin client.
+4. **Explicit flags / env always override the context**, and **no config + no context → the localhost defaults, identical to today.**
+
+OAuth2 from a context requires `key_file` (a Pulsar-style `client_id` + `client_secret` JSON blob) — the on-disk format carries no inline `client_secret`, so the key file is the only secret source.
+The `issuer_endpoint` **must be `https://`**: the `client_credentials` flow POSTs the `client_secret` as a form body, so a plaintext issuer is rejected up front rather than leaking the secret on the wire.
+
+### Data-plane URL derivation (`produce` / `consume`)
+
+pulsarctl stores no binary-protocol (`pulsar://`) URL, so when a context is active and `--service-url` is absent, the data-plane URL is derived from `admin-service-url`: keep the host, **always** substitute the default binary port, map the scheme.
+
+| `admin-service-url` scheme | derived data-plane URL   |
+| -------------------------- | ------------------------ |
+| `http://host[:port]`       | `pulsar://host:6650`     |
+| `https://host[:port]`      | `pulsar+ssl://host:6651` |
+
+This is a best-effort heuristic — many deployments (incl. Clever Cloud behind the Pulsar Proxy) expose the binary protocol on a different host/port, so an explicit `--service-url` / `MAGNETAR_SERVICE_URL` always wins, and the derived value is logged at startup so a wrong guess is visible.
 
 ## Quickstart against a local broker
 
@@ -94,7 +167,7 @@ The short form (`-V`) is never colorized.
 
 ### Build-time metadata source
 
-The metadata is captured at compile time by `crates/magnetar-cli/build.rs` and exposed via `cargo:rustc-env=` to the binary:
+The metadata is captured at compile time by `crates/magnetarctl/build.rs` and exposed via `cargo:rustc-env=` to the binary:
 
 | Variable                   | Source                                                             |
 | -------------------------- | ------------------------------------------------------------------ |
@@ -127,6 +200,42 @@ Every admin call shares the global `--admin-url` / `--token` / `--admin-timeout-
 
 The V2 verbs (`clusters` / `tenants` / `namespaces` / `topics` / `subscriptions` / `brokers` / `bookies` / `schemas`) hit `/admin/v2/...`; the V3 verbs (`functions` / `sources` / `sinks` / `packages`) hit `/admin/v3/...`.
 Pulsar's own routing makes the split — `magnetar-admin` keeps two pre-computed base URLs internally so a caller never has to know which family an endpoint belongs to.
+
+### `context`
+
+Manage pulsarctl-compatible contexts in the resolved [config file](#config-file--contexts).
+These verbs are file-management only — they never open a connection.
+
+| Command                           | Aliases  | Effect                                                                                                                                                                                                                                                                      |
+| --------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context use <name>`              |          | Set `current-context`; prints `Switched to context "<name>".`.                                                                                                                                                                                                              |
+| `context set <name> [flags]`      | `create` | Create / update a context. Flag values are MERGED — unset flags leave existing fields untouched.                                                                                                                                                                            |
+| `context delete <name>`           | `del`    | Remove from BOTH `contexts` and `auth-info`. Warns when it was the current context.                                                                                                                                                                                         |
+| `context get`                     |          | Table: `CURRENT(*) NAME / ADMIN SERVICE URL / BOOKIE SERVICE URL`; `*` marks the current context.                                                                                                                                                                           |
+| `context current`                 |          | Print the current context name; errors when unset.                                                                                                                                                                                                                          |
+| `context rename <old> <new> [-f]` | `update` | Rename a context (and its `auth-info`); updates `current-context` when it pointed at `<old>`. Refuses to overwrite an existing `<new>` unless `--force` (`-f`) is given — the destination then fully BECOMES the source (endpoint + credentials), and a warning is printed. |
+
+`context set` flags (mapping to the `auth-info` / `contexts` keys):
+
+| Flag                    | Short | Config key                                       |
+| ----------------------- | ----- | ------------------------------------------------ |
+| `--admin-service-url`   |       | `contexts.<name>.admin-service-url`              |
+| `--bookie-service-url`  |       | `contexts.<name>.bookie-service-url`             |
+| `--token`               |       | `auth-info.<name>.token`                         |
+| `--token-file`          |       | `auth-info.<name>.tokenFile`                     |
+| `--tls-trust-cert-path` |       | `auth-info.<name>.tls_trust_certs_file_path`     |
+| `--tls-allow-insecure`  |       | `auth-info.<name>.tls_allow_insecure_connection` |
+| `--issuer-endpoint`     | `-i`  | `auth-info.<name>.issuer_endpoint`               |
+| `--client-id`           | `-c`  | `auth-info.<name>.client_id`                     |
+| `--audience`            | `-a`  | `auth-info.<name>.audience`                      |
+| `--scope`               |       | `auth-info.<name>.scope`                         |
+| `--key-file`            | `-k`  | `auth-info.<name>.key_file`                      |
+
+`--token`, `--token-file`, `--tls-trust-cert-path`, and `--tls-allow-insecure` are the GLOBAL connection flags (they double as `context set` write values), e.g. `magnetarctl context set prod --admin-service-url https://broker:443 --token tok`.
+Only an **explicit `--token` flag** is persisted; an inherited `MAGNETAR_TOKEN` env var applies to the live connection but is never written to disk.
+The auth methods are mutually exclusive (token › token-file › OAuth2): a `set` that introduces one mode clears the others, so switching modes never leaves a stale higher-precedence credential behind.
+
+Writes go to the resolved config path; the parent directory is created if absent, and the file is written `0600` on Unix — a pre-existing world-readable file is tightened to `0600` before any credential is written.
 
 ### `admin clusters`
 

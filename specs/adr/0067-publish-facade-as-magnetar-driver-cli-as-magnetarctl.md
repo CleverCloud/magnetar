@@ -8,7 +8,7 @@
 ## Context
 
 The 1.0.0 release ([ADR-0066](0066-release-1-0-0-first-stable.md)) published nine supporting crates to crates.io but could **not** publish the top-level façade: the crates.io name `magnetar` is held by an unrelated, abandoned crate ("An exploratory ActivityPub project", owner `AMNatty`, a single `0.1.0` from 2023).
-`magnetar-cli` was blocked transitively, since it depends on the façade.
+`magnetarctl` was blocked transitively, since it depends on the façade.
 
 Two paths were considered: pursue a transfer of the `magnetar` name (slow, uncertain), or rename the published packages so the full stack can ship now.
 We chose to rename.
@@ -19,7 +19,7 @@ We chose to rename.
   Its **library name stays `magnetar`** (`[lib] name = "magnetar"`), so consumer code is unchanged — `use magnetar::*` still works; only the dependency line differs (`magnetar-driver = "1.0.1"`).
 - The CLI crate is published as **`magnetarctl`**, and its **binary / command is `magnetarctl`** (kubectl-style).
   All CLI docs and examples use `magnetarctl`.
-- The directories `crates/magnetar` and `crates/magnetar-cli` are kept as-is — cosmetic, and the library is still `magnetar`.
+- The façade directory `crates/magnetar` is kept as-is (cosmetic — the library is still `magnetar`); the CLI directory is `crates/magnetarctl`, matching the package and binary name.
 - The supporting crates (`magnetar-proto`, `magnetar-admin`, `magnetar-auth-*`, `magnetar-messagecrypto`, `magnetar-runtime-*`, `magnetar-differential`) keep their names; the publishable ones already shipped at 1.0.0 and are unaffected.
 - Shipped as a **patch release 1.0.1**: the whole workspace bumps `1.0.0` → `1.0.1` (shared version) and every publishable crate is (re)published at 1.0.1, so crates.io and the `v1.0.1` tag are coherent.
   The `v1.0.0` tag / GitHub Release is left in place as historical.

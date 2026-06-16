@@ -22,13 +22,13 @@ The open question is the version to assign: continue the `0.x` line per ADR-0010
 - The first published release is **1.0.0**, a stable release under Semantic Versioning.
   The public API is stable; post-1.0.0 breaking changes require a major-version bump.
   Internal crates version in lockstep with the workspace.
-- Project status moves from **pre-alpha** to **stable** across all user-facing docs (`README.md` badge + blurb, `crates/magnetar-cli/README.md`, `crates/magnetar-admin/README.md`, `docs/cli.md`).
+- Project status moves from **pre-alpha** to **stable** across all user-facing docs (`README.md` badge + blurb, `crates/magnetarctl/README.md`, `crates/magnetar-admin/README.md`, `docs/cli.md`).
   The "API is unstable / do not depend on this in production" caveat is removed.
 - This supersedes only the `v0-1` version framing implied by ADR-0010's filename.
   ADR-0010's scope decision and release-cut gate remain in force, unchanged.
 - Surfaces not yet stable stay honestly labeled and are **excluded from the 1.0 stability promise** until they graduate:
   - **PIP-460 scalable topics** — experimental scaffold behind `feature = "scalable-topics"` (default off); may change without a major bump while gated ([ADR-0031](0031-pip-460-scalable-subscription-scope.md)).
-  - **CLI `produce` / `consume`** — documented stubs; `magnetar-cli` ships at 1.0.0 with these subcommands marked not-yet-implemented.
+  - **CLI `produce` / `consume`** — documented stubs; `magnetarctl` ships at 1.0.0 with these subcommands marked not-yet-implemented.
   - **moonpool engine** — carries client/producer/consumer; documented as a subset of the tokio engine surface.
 - The workspace version and all internal `[workspace.dependencies]` requirements move `0.1.0-dev.0` / `^0.1.0-dev.0` → `1.0.0` / `^1.0.0` in lockstep.
 - Tag scheme: annotated, GPG-signed `vMAJOR.MINOR.PATCH` (first tag `v1.0.0`).

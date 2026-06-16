@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Build script for `magnetar-cli`.
+// Build script for `magnetarctl`.
 //
 // Emits build-time metadata into `cargo:rustc-env=` so the binary can surface
 // a rich `--version` banner (git short SHA, dirty bit, build timestamp, target
@@ -9,7 +9,7 @@
 //
 // Sans-io invariant note: `SystemTime::now()` runs here on the build host,
 // not in the shipped binary. ADR-0011 (clock-injection sans-io) governs the
-// runtime hot path; build scripts are out of scope and `magnetar-cli` is not
+// runtime hot path; build scripts are out of scope and `magnetarctl` is not
 // in `magnetar-proto`.
 
 use std::process::Command;
@@ -124,7 +124,7 @@ fn rustc_version() -> String {
 /// Space-joined `+name` tokens for every cargo feature Cargo enabled on this
 /// crate. Cargo sets `CARGO_FEATURE_<NAME>=1` for each enabled feature.
 ///
-/// `magnetar-cli` has no `[features]` table today; emits `+default` so the
+/// `magnetarctl` has no `[features]` table today; emits `+default` so the
 /// rendered version line has a stable shape.
 fn enabled_features() -> String {
     let mut on: Vec<String> = std::env::vars()
