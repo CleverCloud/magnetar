@@ -53,6 +53,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+mod common;
+use common::HANG_GUARD;
 
 /// SNI hostname every fixture-issued cert carries as a SAN. The cert is
 /// also valid for `localhost` so a host-resolved IPv4 dial still verifies.
@@ -271,7 +273,7 @@ async fn connect_tls_completes_handshake_then_drives_pulsar_connected() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let result = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 engine.connect_tls(
                     &fixture.addr,
                     FIXTURE_HOSTNAME,
@@ -365,7 +367,7 @@ async fn connect_tls_propagates_peer_drop_after_tls_handshake() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let result = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 engine.connect_tls(
                     &fixture.addr,
                     FIXTURE_HOSTNAME,
@@ -424,7 +426,7 @@ async fn connect_tls_clean_shutdown_releases_resources() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let (shared, driver) = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 engine.connect_tls(
                     &fixture.addr,
                     FIXTURE_HOSTNAME,
@@ -456,7 +458,7 @@ async fn connect_tls_clean_shutdown_releases_resources() {
             // so it runs its shutdown path and exits, letting a subsequent
             // `.join().await` resolve rather than hang.
             driver.abort();
-            let join_outcome = tokio::time::timeout(Duration::from_secs(3), driver.join()).await;
+            let join_outcome = tokio::time::timeout(HANG_GUARD, driver.join()).await;
             assert!(
                 join_outcome.is_ok(),
                 "driver join must not hang after user_close + abort"

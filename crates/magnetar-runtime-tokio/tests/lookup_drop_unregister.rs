@@ -33,6 +33,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordedKind(i32);
@@ -121,7 +123,7 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
 async fn cancelled_partitioned_metadata_unregisters_waker() {
     let (url, log) = spawn_silent_lookup_broker().await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await

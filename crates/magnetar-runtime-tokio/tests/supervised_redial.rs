@@ -38,6 +38,8 @@ use magnetar_proto::{
 use magnetar_runtime_tokio::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Spawn a fake broker on `127.0.0.1:0` that runs the canonical
 /// create-then-drop session on every inbound connection and re-accepts the
@@ -227,7 +229,7 @@ async fn supervised_loop_redials_under_drop_accept_cycle() {
 
     // Supervised connect — `config.supervisor = Some` wires
     // `spawn_supervised_driver` (the reconnect body) on the tokio engine.
-    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, cfg))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
         .await
         .expect("connect did not time out")
         .expect("connect ok");

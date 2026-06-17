@@ -32,6 +32,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordedKind(i32);
@@ -150,7 +152,7 @@ async fn partitioned_topic_metadata_short_circuits_on_partition_suffix() {
             let (host_port, log) = spawn_recording_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
@@ -190,7 +192,7 @@ async fn partitioned_topic_metadata_still_emits_frame_for_non_partition_topic() 
             let (host_port, log) = spawn_recording_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await

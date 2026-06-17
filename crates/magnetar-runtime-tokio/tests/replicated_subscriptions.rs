@@ -32,6 +32,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Default, Clone)]
 struct BrokerScript {
@@ -303,7 +305,7 @@ fn subscribe_request(topic: &str, replicate: Option<bool>) -> SubscribeRequest {
 async fn builder_replicate_subscription_state_true_emits_field() {
     let (url, log) = spawn_broker(BrokerScript::default()).await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -311,7 +313,7 @@ async fn builder_replicate_subscription_state_true_emits_field() {
     .expect("connect ok");
 
     let _consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(
             subscribe_request("persistent://public/default/replicated-true", Some(true)),
             None,
@@ -335,7 +337,7 @@ async fn builder_replicate_subscription_state_true_emits_field() {
 async fn builder_replicate_subscription_state_default_false() {
     let (url, log) = spawn_broker(BrokerScript::default()).await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -343,7 +345,7 @@ async fn builder_replicate_subscription_state_default_false() {
     .expect("connect ok");
 
     let _consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(
             subscribe_request("persistent://public/default/replicated-default", None),
             None,
@@ -375,14 +377,14 @@ async fn consumer_skips_replicated_marker_against_scripted_broker() {
     actions.push(Action::Marker(13)); // UPDATE
     let (url, _log) = spawn_broker(BrokerScript { actions }).await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
     .expect("connect")
     .expect("connect ok");
     let consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(
             subscribe_request("persistent://public/default/filter", Some(true)),
             None,
@@ -425,14 +427,14 @@ async fn consumer_emits_marker_observation_in_order() {
     actions.push(Action::Marker(13)); // UPDATE
     let (url, _log) = spawn_broker(BrokerScript { actions }).await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
     .expect("connect")
     .expect("connect ok");
     let consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(
             subscribe_request("persistent://public/default/observe", Some(true)),
             None,
@@ -491,14 +493,14 @@ async fn consumer_filters_all_four_marker_kinds() {
     ];
     let (url, _log) = spawn_broker(BrokerScript { actions }).await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
     .expect("connect")
     .expect("connect ok");
     let consumer = tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(
             subscribe_request("persistent://public/default/all-kinds", Some(true)),
             None,

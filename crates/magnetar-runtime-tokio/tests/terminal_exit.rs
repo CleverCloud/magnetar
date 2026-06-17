@@ -39,7 +39,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use magnetar_proto::producer::OutgoingMessage;
@@ -50,6 +49,8 @@ use magnetar_proto::{
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 fn outgoing(payload: &'static [u8]) -> OutgoingMessage {
     OutgoingMessage {
@@ -204,13 +205,13 @@ async fn plain_connection_in_flight_ops_fail_fast_on_terminal_drop() {
         "this test pins the UNSUPERVISED plain path",
     );
 
-    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, config))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
         .await
         .expect("connect did not time out")
         .expect("connect must succeed");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/terminal-exit".to_owned(),
             ..Default::default()
@@ -233,11 +234,15 @@ async fn plain_connection_in_flight_ops_fail_fast_on_terminal_drop() {
     });
     let send_fut = producer.send(outgoing(b"in-flight-when-peer-dies"));
 
-    let (sub_res, send_res) = tokio::time::timeout(Duration::from_secs(10), async move {
-        tokio::join!(subscribe_fut, send_fut)
-    })
-    .await
-    .expect("in-flight subscribe + send must resolve promptly after the terminal drop, not hang");
+    let (sub_res, send_res) =
+        tokio::time::timeout(
+            HANG_GUARD,
+            async move { tokio::join!(subscribe_fut, send_fut) },
+        )
+        .await
+        .expect(
+            "in-flight subscribe + send must resolve promptly after the terminal drop, not hang",
+        );
 
     assert!(
         data_plane_seen.load(Ordering::SeqCst),
@@ -287,13 +292,13 @@ async fn new_ops_after_terminal_drop_fail_fast() {
         "this test pins the UNSUPERVISED plain path",
     );
 
-    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, config))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
         .await
         .expect("connect did not time out")
         .expect("connect must succeed");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/terminal-exit-newop".to_owned(),
             ..Default::default()
@@ -306,12 +311,9 @@ async fn new_ops_after_terminal_drop_fail_fast() {
     // One in-flight send drives the terminal drop; await it so the plain driver
     // has run `fail_all_pending` (slot closed) and latched `no_driver` before we
     // issue the fresh ops.
-    let drop_res = tokio::time::timeout(
-        Duration::from_secs(10),
-        producer.send(outgoing(b"in-flight-trigger")),
-    )
-    .await
-    .expect("the in-flight send must resolve promptly on the terminal drop, not hang");
+    let drop_res = tokio::time::timeout(HANG_GUARD, producer.send(outgoing(b"in-flight-trigger")))
+        .await
+        .expect("the in-flight send must resolve promptly on the terminal drop, not hang");
     assert!(
         data_plane_seen.load(Ordering::SeqCst),
         "the broker must have dropped on the in-flight data-plane op",
@@ -328,12 +330,9 @@ async fn new_ops_after_terminal_drop_fail_fast() {
     // (1) A FRESH send on the same producer fast-fails with PeerClosed: the
     // slot is `closed` and `no_driver` is latched, so the producer-send arm maps
     // the proto-layer rejection to PeerClosed without registering anything.
-    let send_after = tokio::time::timeout(
-        Duration::from_secs(5),
-        producer.send(outgoing(b"after-terminal")),
-    )
-    .await
-    .expect("a post-terminal send must fast-fail synchronously, not hang");
+    let send_after = tokio::time::timeout(HANG_GUARD, producer.send(outgoing(b"after-terminal")))
+        .await
+        .expect("a post-terminal send must fast-fail synchronously, not hang");
     assert!(
         matches!(send_after, Err(ClientError::PeerClosed)),
         "post-terminal send must fast-fail with PeerClosed, got {send_after:?}",
@@ -343,7 +342,7 @@ async fn new_ops_after_terminal_drop_fail_fast() {
     // (`fail_if_no_driver`: is_closed() AND no_driver), never parking a doomed
     // `CommandSubscribe`.
     let subscribe_after = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.subscribe(SubscribeRequest {
             topic: "persistent://public/default/terminal-exit-newop".to_owned(),
             subscription: "sub-after-terminal".to_owned(),
@@ -361,7 +360,7 @@ async fn new_ops_after_terminal_drop_fail_fast() {
 
     // (3) A FRESH producer.close() fast-fails at its `fail_if_no_driver` guard
     // instead of registering a `CommandCloseProducer` no driver can resolve.
-    let close_after = tokio::time::timeout(Duration::from_secs(5), producer.close())
+    let close_after = tokio::time::timeout(HANG_GUARD, producer.close())
         .await
         .expect("a post-terminal producer.close() must fast-fail synchronously, not hang");
     assert!(

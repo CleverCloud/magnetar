@@ -39,6 +39,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Sentinel token carried in `CommandConnect.auth_data` and returned by the
 /// `TokenAuth` provider on the challenge refresh. Must never be logged.
@@ -200,7 +202,7 @@ async fn logs_never_contain_auth_secrets() {
     };
     let provider: Arc<dyn AuthProvider> = Arc::new(TokenAuth::from_string(TOKEN_SENTINEL));
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect_auth(&url, config, Some(provider)),
     )
     .await

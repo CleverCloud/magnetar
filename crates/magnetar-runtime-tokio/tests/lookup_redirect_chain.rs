@@ -28,7 +28,6 @@
 #![allow(clippy::similar_names)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -38,6 +37,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Debug, Default, Clone)]
 struct SessionRecord {
@@ -256,7 +257,7 @@ async fn lookup_redirect_dials_target_broker_and_re_lookups_there() {
     );
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url_a, ConnectionConfig::default()),
     )
     .await
@@ -264,7 +265,7 @@ async fn lookup_redirect_dials_target_broker_and_re_lookups_there() {
     .expect("connect ok");
 
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/redirect-dial-producer".to_owned(),
             ..Default::default()
@@ -353,7 +354,7 @@ async fn lookup_redirect_chain_cap_surfaces_to_user() {
     );
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url_a, ConnectionConfig::default()),
     )
     .await
@@ -361,7 +362,7 @@ async fn lookup_redirect_chain_cap_surfaces_to_user() {
     .expect("connect ok");
 
     let err = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/redirect-chain-cap-producer".to_owned(),
             ..Default::default()

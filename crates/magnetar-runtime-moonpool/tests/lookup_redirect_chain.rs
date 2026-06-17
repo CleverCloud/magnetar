@@ -24,7 +24,6 @@
 #![allow(clippy::similar_names)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -36,6 +35,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// The per-broker redirect dial requires the proxy pool, which is only built
 /// on a supervised client.
@@ -265,7 +266,7 @@ async fn lookup_redirect_dials_target_broker_and_re_lookups_there() {
             // A redirect dial requires the per-broker pool, which is only built on a
             // supervised client (`connect_plain_supervised`).
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     &hostport_a,
@@ -279,7 +280,7 @@ async fn lookup_redirect_dials_target_broker_and_re_lookups_there() {
             .expect("connect ok");
 
             let _producer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/redirect-dial-producer".to_owned(),
                     ..Default::default()
@@ -365,7 +366,7 @@ async fn lookup_redirect_chain_cap_surfaces_to_user() {
 
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     &hostport_a,
@@ -379,7 +380,7 @@ async fn lookup_redirect_chain_cap_surfaces_to_user() {
             .expect("connect ok");
 
             let err = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/redirect-chain-cap-producer".to_owned(),
                     ..Default::default()

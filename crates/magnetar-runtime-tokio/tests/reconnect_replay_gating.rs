@@ -33,6 +33,8 @@ use magnetar_proto::{
 use magnetar_runtime_tokio::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+mod common;
+use common::HANG_GUARD;
 
 /// Shared script state across the two scripted connections.
 #[derive(Default)]
@@ -286,13 +288,13 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
         }),
         ..Default::default()
     };
-    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, config))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
         .await
         .expect("connect did not time out")
         .expect("connect must succeed");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/replay-gating".to_owned(),
             ..Default::default()
@@ -304,7 +306,7 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
 
     // Healthy round-trip; the broker drops the connection right after this
     // receipt.
-    let _ = tokio::time::timeout(Duration::from_secs(5), producer.send_bytes(&b"one"[..]))
+    let _ = tokio::time::timeout(HANG_GUARD, producer.send_bytes(&b"one"[..]))
         .await
         .expect("first send did not time out")
         .expect("first send must succeed");
@@ -314,7 +316,7 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
     // the transient-error + lookup + retry leg, until the post-ack replay's
     // receipt arrives (transparent replay, Java resendMessages parity).
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let receipt = tokio::time::timeout(Duration::from_secs(20), producer.send_bytes(&b"two"[..]))
+    let receipt = tokio::time::timeout(HANG_GUARD, producer.send_bytes(&b"two"[..]))
         .await
         .expect(
             "replayed send must resolve after the retry ack — the \
@@ -410,7 +412,7 @@ async fn producer_open_recovers_after_transient_reject() {
     let url = format!("pulsar://{addr}");
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -420,7 +422,7 @@ async fn producer_open_recovers_after_transient_reject() {
     // The transient reject must NOT fail the open: the retry leg re-looks-up
     // and re-opens after its delay, and the open resolves on the retry's ack.
     let producer = tokio::time::timeout(
-        Duration::from_secs(20),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/transient-open".to_owned(),
             ..Default::default()

@@ -31,8 +31,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
-
 use bytes::BytesMut;
 use magnetar_proto::{
     ConnectionConfig, CreateProducerRequest, FrameError, MemoryLimitPolicy, decode_one,
@@ -41,6 +39,8 @@ use magnetar_proto::{
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+mod common;
+use common::HANG_GUARD;
 
 /// Total memory budget for the connection. Small enough that a single
 /// modest payload can exceed it, large enough that the under-limit send
@@ -214,13 +214,13 @@ async fn tokio_producer_memory_limit_fail_immediately_smoke() {
         ..ConnectionConfig::default()
     };
 
-    let client = tokio::time::timeout(Duration::from_secs(10), Client::connect(&url, cfg))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
         .await
         .expect("connect did not exceed the test timeout")
         .expect("connect must succeed against the loopback broker");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/mem-limit".to_owned(),
             enable_batching: false,
@@ -234,7 +234,7 @@ async fn tokio_producer_memory_limit_fail_immediately_smoke() {
     // (1) Under-limit send — reserves, rides the wire, resolves Ok once the
     // broker's SendReceipt lands.
     let under = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         producer.send_bytes(vec![0u8; UNDER_LIMIT_PAYLOAD]),
     )
     .await
@@ -248,7 +248,7 @@ async fn tokio_producer_memory_limit_fail_immediately_smoke() {
     // (2) Over-limit send — a single payload larger than the whole budget.
     // Must surface MemoryLimitExceeded synchronously (no wire round-trip).
     let over = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         producer.send_bytes(vec![0u8; OVER_LIMIT_PAYLOAD]),
     )
     .await
@@ -287,13 +287,13 @@ async fn tokio_producer_memory_limit_fail_immediately_repeated() {
         ..ConnectionConfig::default()
     };
 
-    let client = tokio::time::timeout(Duration::from_secs(10), Client::connect(&url, cfg))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
         .await
         .expect("connect did not exceed the test timeout")
         .expect("connect must succeed against the loopback broker");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/mem-limit-repeated".to_owned(),
             enable_batching: false,
@@ -309,7 +309,7 @@ async fn tokio_producer_memory_limit_fail_immediately_repeated() {
         // iteration's reservation was released on its receipt, so the
         // budget is clean.
         let under = tokio::time::timeout(
-            Duration::from_secs(5),
+            HANG_GUARD,
             producer.send_bytes(vec![0u8; UNDER_LIMIT_PAYLOAD]),
         )
         .await
@@ -321,7 +321,7 @@ async fn tokio_producer_memory_limit_fail_immediately_repeated() {
 
         // Over-limit send must be rejected every iteration.
         let over = tokio::time::timeout(
-            Duration::from_secs(5),
+            HANG_GUARD,
             producer.send_bytes(vec![0u8; OVER_LIMIT_PAYLOAD]),
         )
         .await

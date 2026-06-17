@@ -19,7 +19,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -30,6 +29,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordedKind(i32);
@@ -170,7 +171,7 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
 async fn open_producer_issues_lookup_first() {
     let (url, log) = spawn_recording_broker().await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -178,7 +179,7 @@ async fn open_producer_issues_lookup_first() {
     .expect("connect ok");
 
     tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.open_producer_with(
             CreateProducerRequest {
                 topic: "persistent://public/default/lookup-before-open-producer".to_owned(),
@@ -216,7 +217,7 @@ async fn open_producer_issues_lookup_first() {
 async fn subscribe_issues_lookup_first() {
     let (url, log) = spawn_recording_broker().await;
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -224,7 +225,7 @@ async fn subscribe_issues_lookup_first() {
     .expect("connect ok");
 
     tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.subscribe_with(
             SubscribeRequest {
                 topic: "persistent://public/default/lookup-before-open-consumer".to_owned(),

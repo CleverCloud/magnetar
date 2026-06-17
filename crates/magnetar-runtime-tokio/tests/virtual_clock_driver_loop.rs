@@ -30,6 +30,8 @@ use magnetar_proto::{
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 const SEND_TIMEOUT_MS: u64 = 600;
 
@@ -178,7 +180,7 @@ async fn driver_loop_send_timeout_fires_against_host_clock() {
     let (url, sends_observed) = spawn_send_timeout_broker().await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -186,7 +188,7 @@ async fn driver_loop_send_timeout_fires_against_host_clock() {
     .expect("connect ok");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/virtual-clock-driver".to_owned(),
             send_timeout: Some(Duration::from_millis(SEND_TIMEOUT_MS)),
@@ -202,7 +204,7 @@ async fn driver_loop_send_timeout_fires_against_host_clock() {
     // a regression surfaces as a `tokio::time::error::Elapsed` rather
     // than hanging the suite.
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         producer.send_bytes(Bytes::from_static(b"will-time-out")),
     )
     .await

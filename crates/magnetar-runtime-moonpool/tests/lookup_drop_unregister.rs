@@ -21,6 +21,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordedKind(i32);
@@ -110,7 +112,7 @@ async fn cancelled_partitioned_metadata_unregisters_waker() {
             let (host_port, log) = spawn_silent_lookup_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await

@@ -29,7 +29,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -41,6 +40,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Per-session log: records the `proxy_to_broker_url` we saw on `CommandConnect`
 /// and the kinds of every subsequent frame, in arrival order.
@@ -244,7 +245,7 @@ async fn open_producer_through_proxy_opens_second_connection() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     &host_port,
@@ -258,7 +259,7 @@ async fn open_producer_through_proxy_opens_second_connection() {
             .expect("connect ok");
 
             let _producer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/proxy-moonpool-producer".to_owned(),
                     ..Default::default()
@@ -331,7 +332,7 @@ async fn subscribe_through_proxy_opens_second_connection() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     &host_port,
@@ -345,7 +346,7 @@ async fn subscribe_through_proxy_opens_second_connection() {
             .expect("connect ok");
 
             let _consumer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/proxy-moonpool-consumer".to_owned(),
                     subscription: "proxy-moonpool-sub".to_owned(),
@@ -393,7 +394,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     &host_port,
@@ -407,7 +408,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             .expect("connect ok");
 
             let _p1 = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/proxy-moonpool-pool-reuse-a".to_owned(),
                     ..Default::default()
@@ -418,7 +419,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             .expect("p1 ok");
 
             let _p2 = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/proxy-moonpool-pool-reuse-b".to_owned(),
                     ..Default::default()
