@@ -41,6 +41,7 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,6 +52,9 @@ use magnetar_runtime_moonpool::{Client, EngineError, MoonpoolEngine};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TimeProvider};
 use moonpool_sim::{SimContext, SimulationBuilder, SimulationError, SimulationResult, Workload};
 use parking_lot::Mutex;
+
+mod common;
+use common::sweep_seeds;
 
 /// Port the in-sim broker binds to (the sim hands every workload its own IP).
 const BROKER_PORT: u16 = 6650;
@@ -70,6 +74,20 @@ const RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
 /// sleep), so the reject is unambiguously mid-session.
 const SETTLE_DELAY: Duration = Duration::from_millis(300);
 
+/// Inner sim seeds the daily moonpool-seed-sweep recorded in `seeds_used`
+/// when this test failed — issue #290 (`MOONPOOL_SEED=0x645244daaeccc7cb`)
+/// and issue #291 (`MOONPOOL_SEED=0x65ea4fbea60a11a6`). On these seeds the
+/// `SimulationBuilder`'s **unavoidable** default-network chaos
+/// (`ConnectFailureMode::Probabilistic`) exhausts the client's bounded
+/// `connect_timeout` before the handshake completes, so the malformed-frame
+/// scenario never sets up and the dial surfaces a bounded `TimedOut` error.
+/// Pinned into the sweep below so this bounded chaos-severance is exercised
+/// deterministically — and so the test can never regress to the original
+/// unpinned wall-clock seed that made #290 / #291 unreproducible from
+/// `MOONPOOL_SEED`.
+const CONNECT_SEVERED_REGRESSION_SEEDS: [u64; 2] =
+    [9_388_503_268_189_738_858, 17_161_897_233_139_508_114];
+
 /// What the client workload observed for the driver after the broker
 /// pushed the malformed frame. The `check()` rejects a `None` (the driver
 /// neither terminated nor surfaced an error — i.e. it self-deadlocked and
@@ -78,6 +96,13 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 enum DriverOutcome {
     /// The driver task terminated with the expected protocol reject.
     RejectedAndTerminated,
+    /// The connection was severed by the unavoidable default-network chaos
+    /// *before* the handshake completed (the client's dial exhausted its
+    /// bounded `connect_timeout`, or the link was cut before `CONNECTED`).
+    /// A bounded, terminating outcome — not the re-entrant-lock deadlock
+    /// under test — so the malformed-frame scenario simply never set up.
+    /// Carries the stringified reason for diagnostics.
+    Severed(String),
     /// The driver terminated with some *other* error — still bounded, but
     /// flagged so a future regression that changes the reject mapping is
     /// visible rather than silently green.
@@ -210,13 +235,26 @@ fn encode_connected(out: &mut BytesMut) {
 /// so reaching `check()` at all already proves termination.
 struct ClientWorkload {
     outcome: Arc<Mutex<Option<DriverOutcome>>>,
+    /// Set once any seed in the sweep completes the handshake and observes
+    /// the exact `BadLength(0)` reject, so the sweep can require the
+    /// mid-session-reject window was actually exercised at least once (a run
+    /// chaos-severed before the handshake does not prove the property).
+    observed_reject: Arc<AtomicBool>,
 }
 
 impl ClientWorkload {
     fn new() -> Self {
         Self {
             outcome: Arc::new(Mutex::new(None)),
+            observed_reject: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Shared flag set when any run observes the `BadLength(0)` reject — read
+    /// by the sweep test after `run()` to require the property held on at
+    /// least one chaos-free seed.
+    fn observed_reject_handle(&self) -> Arc<AtomicBool> {
+        self.observed_reject.clone()
     }
 }
 
@@ -236,23 +274,37 @@ impl Workload for ClientWorkload {
         // Non-supervised: the driver exits on the first failure rather than
         // re-dialling, so the malformed-frame reject is directly observable
         // as the driver's terminal error.
-        let client = Client::connect_plain(&engine, &addr, ConnectionConfig::default())
-            .await
-            .map_err(|e| SimulationError::InvalidState(format!("connect_plain: {e:?}")))?;
+        //
+        // The `SimulationBuilder`'s unavoidable default-network chaos
+        // (`ConnectFailureMode::Probabilistic`, bit-flip, random-close) can
+        // exhaust the client's bounded `connect_timeout` before the handshake
+        // completes on a fraction of seeds. That surfaces as a bounded connect
+        // error — a terminating outcome, NOT the re-entrant-lock self-deadlock
+        // under test — so we classify it `Severed` and let the seeds that
+        // complete the handshake carry the reject assertion.
+        let outcome = match Client::connect_plain(&engine, &addr, ConnectionConfig::default()).await
+        {
+            Err(e) => DriverOutcome::Severed(format!("connect_plain: {e:?}")),
+            Ok(client) => {
+                let driver = client.take_driver().ok_or_else(|| {
+                    SimulationError::InvalidState("driver handle already taken".into())
+                })?;
 
-        let driver = client
-            .take_driver()
-            .ok_or_else(|| SimulationError::InvalidState("driver handle already taken".into()))?;
-
-        // This await is the crux: pre-fix it would park forever (the driver
-        // task self-deadlocked on the re-entrant `shared.inner` lock).
-        let outcome = match driver.join().await {
-            Err(EngineError::Protocol(ProtocolError::Frame(FrameError::BadLength(0)))) => {
-                DriverOutcome::RejectedAndTerminated
+                // This await is the crux: pre-fix it would park forever (the
+                // driver task self-deadlocked on the re-entrant `shared.inner`
+                // lock).
+                match driver.join().await {
+                    Err(EngineError::Protocol(ProtocolError::Frame(FrameError::BadLength(0)))) => {
+                        DriverOutcome::RejectedAndTerminated
+                    }
+                    Err(other) => DriverOutcome::OtherError(format!("{other:?}")),
+                    Ok(()) => DriverOutcome::CleanExit,
+                }
             }
-            Err(other) => DriverOutcome::OtherError(format!("{other:?}")),
-            Ok(()) => DriverOutcome::CleanExit,
         };
+        if matches!(outcome, DriverOutcome::RejectedAndTerminated) {
+            self.observed_reject.store(true, Ordering::SeqCst);
+        }
         *self.outcome.lock() = Some(outcome.clone());
 
         // Gate the *secondary* contract HERE in run(): a moonpool
@@ -265,6 +317,18 @@ impl Workload for ClientWorkload {
         // run() Err DOES land the iteration in `failed_runs`.
         match outcome {
             DriverOutcome::RejectedAndTerminated => Ok(()),
+            // A connect severed by the unavoidable default-network chaos
+            // before the handshake is a bounded, terminating outcome — not
+            // the deadlock under test. Surface it for diagnostics, do not
+            // fail the run.
+            DriverOutcome::Severed(reason) => {
+                tracing::info!(
+                    capture = true,
+                    trail = "connect_severed_by_chaos",
+                    reason = %reason,
+                );
+                Ok(())
+            }
             DriverOutcome::OtherError(reason) => Err(SimulationError::InvalidState(format!(
                 "driver terminated with an unexpected error (expected a BadLength protocol \
                  reject): {reason}"
@@ -279,7 +343,10 @@ impl Workload for ClientWorkload {
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
         match self.outcome.lock().take() {
-            Some(DriverOutcome::RejectedAndTerminated) => Ok(()),
+            // `RejectedAndTerminated` is the property; `Severed` is bounded
+            // chaos-severance before the handshake (the malformed-frame
+            // scenario simply never set up on this seed) — both acceptable.
+            Some(DriverOutcome::RejectedAndTerminated | DriverOutcome::Severed(_)) => Ok(()),
             Some(DriverOutcome::OtherError(reason)) => Err(SimulationError::InvalidState(format!(
                 "driver terminated, but with an unexpected error (the malformed frame must surface \
                  as a BadLength protocol reject): {reason}"
@@ -302,23 +369,58 @@ impl Workload for ClientWorkload {
 /// malformed frame mid-session; assert the driver terminates with the
 /// framing reject instead of self-deadlocking on the re-entrant
 /// `shared.inner` lock (ADR-0038).
+///
+/// Deterministic seed sweep: 16 seeds derived from `MOONPOOL_SEED` (so the
+/// daily sweep keeps exploring this path under fresh randoms) plus the two
+/// regression seeds the sweep flagged for #290 / #291. The original test
+/// drove a single **unpinned** `SimulationBuilder::new().run()` whose seed
+/// came from the wall clock, so the daily sweep's failures were
+/// unreproducible from `MOONPOOL_SEED` — pinning the seeds fixes that.
+///
+/// The `SimulationBuilder`'s default network injects unavoidable chaos
+/// (`ConnectFailureMode::Probabilistic`, bit-flip, random-close) that the
+/// builder gives no API to disable. On a fraction of seeds the client's dial
+/// exhausts its bounded `connect_timeout` before the handshake completes, so
+/// the malformed-frame scenario never sets up — a bounded `Severed` outcome,
+/// not the deadlock under test. The resilience claim is therefore bounded
+/// termination (no run hangs ⇒ `failed_runs == 0`) **plus** the reject being
+/// observed on at least one chaos-free seed (`observed_reject`), mirroring
+/// `connect_resilience.rs` and the `sim_delayed_marker_*` sweep.
 #[test]
 fn moonpool_malformed_mid_session_frame_terminates_driver_not_deadlock() {
+    let mut seeds = sweep_seeds(16);
+    seeds.extend_from_slice(&CONNECT_SEVERED_REGRESSION_SEEDS);
+    let iterations = seeds.len();
+
+    let client = ClientWorkload::new();
+    let observed_reject = client.observed_reject_handle();
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
         .workload(BrokerWorkload)
-        .workload(ClientWorkload::new())
-        .set_iterations(1)
+        .workload(client)
+        .set_debug_seeds(seeds)
+        .set_iterations(iterations)
         .run();
     // `run()` returning at all is the termination proof: a re-entrant-lock
-    // deadlock would have wedged the sim thread. `check()` additionally
-    // pins that the driver surfaced the BadLength reject.
-    assert_eq!(
-        report.iterations, 1,
-        "the run must dispatch and terminate (no self-deadlock): {report:?}",
-    );
+    // deadlock would have wedged the sim thread. No seed may hang or surface
+    // the wrong terminal error — a genuine lost reject / clean exit / wrong
+    // mapping returns a hard `Err` and lands in `failed_runs`; a connection
+    // chaos-severed before the handshake is a bounded `Severed` outcome and
+    // stays out of `failed_runs`.
     assert_eq!(
         report.failed_runs, 0,
         "the driver must surface the malformed-frame reject and terminate: {report:?}",
+    );
+    assert!(
+        report.successful_runs >= 1,
+        "the run must dispatch and terminate (no self-deadlock): {report:?}",
+    );
+    // At least one seed must have completed the handshake and observed the
+    // exact `BadLength(0)` reject — a sweep where every seed was chaos-severed
+    // before the handshake would never exercise the mid-session reject the
+    // ADR-0038 regression protects.
+    assert!(
+        observed_reject.load(Ordering::SeqCst),
+        "no seed reached the mid-session malformed frame to observe the BadLength reject: {report:?}",
     );
 }
