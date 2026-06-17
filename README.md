@@ -7,7 +7,7 @@
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status)
 [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: stable (1.0.1).**
+> **Status: stable (1.1.1).**
 > Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
 > PIP-460 scalable topics and the CLI `produce`/`consume` subcommands remain experimental / not-yet-implemented and are excluded from the 1.0 stability promise.
@@ -103,7 +103,7 @@ Pulsar Java client.
 
 ## Installation
 
-Magnetar's current release is `1.0.1`.
+Magnetar's current release is `1.1.1`.
 The façade is published to crates.io under the package name `magnetar-driver` (the `magnetar` name is held by an unrelated crate); its library / import name stays `magnetar`, so `use magnetar::...` is unchanged.
 
 Depend on it directly from crates.io:
@@ -111,14 +111,14 @@ Depend on it directly from crates.io:
 ```toml
 [dependencies]
 # crates.io package is `magnetar-driver`; the import path stays `magnetar`.
-magnetar-driver = "1.1.0"
+magnetar-driver = "1.1.1"
 ```
 
 Or pin the tagged release via Git:
 
 ```toml
 [dependencies]
-magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.1.0" }
+magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.1.1" }
 ```
 
 The default feature set enables the tokio engine. The feature flags catalog:
@@ -222,7 +222,7 @@ banner:
 
 ```
 $ magnetarctl --version
-magnetarctl 1.0.1 (a1b2c3d4e5f6)
+magnetarctl 1.1.1 (a1b2c3d4e5f6)
 built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
@@ -230,7 +230,7 @@ os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
 - `-V` prints a single-line, never-colorized form:
-  `magnetarctl 1.0.1 (sha)`.
+  `magnetarctl 1.1.1 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
 - `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for
@@ -857,7 +857,7 @@ Known open work is narrow and tracked in
 Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few
 simulation / test-harness gaps remain.
 
-The public API is stable as of `1.1.0` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
+The public API is stable as of `1.1.1` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
 
 ---
 

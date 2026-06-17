@@ -5,12 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1] - 2026-06-17
 
 ### Added
 
-- **`magnetar-admin` topic stats — full rate/throughput/size surface:** `TopicStats` now decodes the high-signal `PersistentTopicStats` metrics it previously dropped: `msgRateIn`, `msgRateOut`, `msgThroughputIn`, `msgThroughputOut`, `averageMsgSize`, `storageSize`, and `backlogSize` (alongside the existing `msgInCounter` / `bytesInCounter`). `magnetarctl admin topics stats <topic>` emits all of them in its JSON output, so `jq '.msgRateIn'` (and the out-rate, throughput, and storage/backlog sizes) now work for both non-partitioned and partitioned topics. Fields default to `0` when a broker release omits them.
-- **`magnetarctl` message-id output — `segmentId` no longer dropped:** under the `scalable-topics` feature, `topics terminate` and `topics get-message-id-by-index` now surface the PIP-460 `segmentId` (JSON `null` when absent) instead of silently omitting it; both commands share one `message_id_to_json` renderer so their shapes can't drift.
+- **`magnetar-admin` topic stats — full rate/throughput/size surface:** `TopicStats` now decodes the high-signal `PersistentTopicStats` metrics it previously dropped: `msgRateIn`, `msgRateOut`, `msgThroughputIn`, `msgThroughputOut`, `averageMsgSize`, `storageSize`, and `backlogSize` (alongside the existing `msgInCounter` / `bytesInCounter`). `magnetarctl admin topics stats <topic>` emits all of them in its JSON output, so `jq '.msgRateIn'` (and the out-rate, throughput, and storage/backlog sizes) now work for both non-partitioned and partitioned topics. Fields default to `0` when a broker release omits them. (#293)
+- **`magnetarctl` message-id output — `segmentId` no longer dropped:** under the `scalable-topics` feature, `topics terminate` and `topics get-message-id-by-index` now surface the PIP-460 `segmentId` (JSON `null` when absent) instead of silently omitting it; both commands share one `message_id_to_json` renderer so their shapes can't drift. (#293)
+
+### Changed
+
+- **CLI (`magnetarctl`) default log level lowered to `warn`:** the default floor dropped from `magnetar=info` to `magnetar=warn`, so `magnetarctl` is quiet by default and surfaces only degraded-state warnings and errors. The whole `-v` ladder shifted down one rung — no capability is lost: `-v` now maps to `info` (the old default), `-vv` to `debug`, `-vvv` to `trace`, and `-vvvv`+ widen into the transport stack (reqwest/hyper/rustls/h2). Scripts that relied on the prior `info`-level default output must now pass `-v`. `docs/cli.md` and `docs/logging.md` updated to match. (#292)
+- **Dependencies:** bumped `zeroize` 1.8.2→1.9.0. (#288)
 
 ## [1.1.0] - 2026-06-16
 
@@ -97,6 +102,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - CRC32C verify-or-drop on frames with magic `0x0e01`: a checksum mismatch emits a `ChecksumMismatch` event and drops the frame.
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained). (2a9fafb, abc7aad)
 
+[1.1.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.1
 [1.1.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.0
 [1.0.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.1
 [1.0.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.0
