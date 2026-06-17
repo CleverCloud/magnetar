@@ -874,3 +874,45 @@ fn produce_accepts_global_service_url_after_topic() {
     assert_eq!(cli.service_url.as_deref(), Some("pulsar://broker:6650"));
     assert!(matches!(cli.cmd, Cmd::Produce { .. }));
 }
+
+// The `topics terminate` and `topics get-message-id-by-index` outputs share
+// `message_id_to_json`. Pin the camelCase field layout so the two commands
+// can't drift apart or silently drop a field again.
+#[test]
+fn message_id_to_json_emits_full_camel_case_shape() {
+    let mut id = magnetar::MessageId::EARLIEST;
+    id.ledger_id = 7;
+    id.entry_id = 42;
+    id.partition = 3;
+    id.batch_index = 1;
+    id.batch_size = 5;
+
+    let json = cli::message_id_to_json(&id);
+    assert_eq!(json["ledgerId"], 7);
+    assert_eq!(json["entryId"], 42);
+    assert_eq!(json["partition"], 3);
+    assert_eq!(json["batchIndex"], 1);
+    assert_eq!(json["batchSize"], 5);
+}
+
+// Under `scalable-topics`, the id carries an optional PIP-460 segment. The
+// output must surface it — `null` when absent, the raw id when present —
+// rather than dropping it. Only compiled when the feature is on.
+#[cfg(feature = "scalable-topics")]
+#[test]
+fn message_id_to_json_surfaces_segment_id_under_feature() {
+    use magnetar::proto::SegmentId;
+
+    let mut id = magnetar::MessageId::EARLIEST;
+    id.ledger_id = 1;
+    id.entry_id = 2;
+
+    let without = cli::message_id_to_json(&id);
+    assert!(
+        without["segmentId"].is_null(),
+        "absent segment must serialise as JSON null, not be dropped"
+    );
+
+    let with = cli::message_id_to_json(&id.with_segment(SegmentId(9)));
+    assert_eq!(with["segmentId"], 9);
+}

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`magnetar-admin` topic stats — full rate/throughput/size surface:** `TopicStats` now decodes the high-signal `PersistentTopicStats` metrics it previously dropped: `msgRateIn`, `msgRateOut`, `msgThroughputIn`, `msgThroughputOut`, `averageMsgSize`, `storageSize`, and `backlogSize` (alongside the existing `msgInCounter` / `bytesInCounter`). `magnetarctl admin topics stats <topic>` emits all of them in its JSON output, so `jq '.msgRateIn'` (and the out-rate, throughput, and storage/backlog sizes) now work for both non-partitioned and partitioned topics. Fields default to `0` when a broker release omits them.
+- **`magnetarctl` message-id output — `segmentId` no longer dropped:** under the `scalable-topics` feature, `topics terminate` and `topics get-message-id-by-index` now surface the PIP-460 `segmentId` (JSON `null` when absent) instead of silently omitting it; both commands share one `message_id_to_json` renderer so their shapes can't drift.
+
 ## [1.1.0] - 2026-06-16
 
 ### Added

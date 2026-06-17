@@ -1898,10 +1898,10 @@ impl AdminClient {
     /// `PersistentTopicStats` with `partitions: Map<String, TopicStats>`
     /// and `metadata: PartitionedTopicMetadata`).
     ///
-    /// magnetar exposes only the aggregated top-level counters through the
-    /// same [`TopicStats`] shape — the broker populates `msgInCounter`,
-    /// `bytesInCounter`, `publishers`, `subscriptions` at the response root
-    /// summed across partitions. The `partitions` and `metadata` fields are
+    /// magnetar exposes only the aggregated top-level metrics through the
+    /// same [`TopicStats`] shape — the broker populates the rate, throughput,
+    /// size, and counter fields at the response root summed across partitions.
+    /// The `partitions` and `metadata` fields are
     /// dropped on deserialisation; for per-partition detail call
     /// [`Self::topic_stats`] on each `<topic>-partition-N` instead. We pass
     /// `perPartition=false` to keep the wire response small.
@@ -3605,16 +3605,49 @@ impl MessageIdResponse {
 
 /// Topic stats. Intentionally permissive: the Java
 /// `PersistentTopicStatsImpl` shape is large and shifts between releases;
-/// we extract the high-signal counters and pass the rest through as raw JSON.
+/// we extract the high-signal rates, throughput, sizes, and counters and
+/// pass the rest through as raw JSON.
+///
+/// All scalar fields default to `0` / `0.0` when the broker omits them, so a
+/// release that drops or renames one decodes cleanly instead of failing the
+/// whole stats call.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TopicStats {
+    /// Current publish rate into the topic, in messages/sec, averaged over
+    /// the broker's most recent stats window. Java: `PersistentTopicStats#msgRateIn`.
+    #[serde(rename = "msgRateIn")]
+    pub msg_rate_in: f64,
+    /// Current dispatch rate out of the topic, in messages/sec.
+    /// Java: `PersistentTopicStats#msgRateOut`.
+    #[serde(rename = "msgRateOut")]
+    pub msg_rate_out: f64,
+    /// Current publish throughput into the topic, in bytes/sec.
+    /// Java: `PersistentTopicStats#msgThroughputIn`.
+    #[serde(rename = "msgThroughputIn")]
+    pub msg_throughput_in: f64,
+    /// Current dispatch throughput out of the topic, in bytes/sec.
+    /// Java: `PersistentTopicStats#msgThroughputOut`.
+    #[serde(rename = "msgThroughputOut")]
+    pub msg_throughput_out: f64,
+    /// Average message size, in bytes, over the most recent stats window.
+    /// Java: `PersistentTopicStats#averageMsgSize`.
+    #[serde(rename = "averageMsgSize")]
+    pub average_msg_size: f64,
     /// Total messages received.
     #[serde(rename = "msgInCounter")]
     pub msg_in_counter: i64,
     /// Total bytes received.
     #[serde(rename = "bytesInCounter")]
     pub bytes_in_counter: i64,
+    /// Total storage used by the topic's managed ledger, in bytes (includes
+    /// replicas). Java: `PersistentTopicStats#storageSize`.
+    #[serde(rename = "storageSize")]
+    pub storage_size: i64,
+    /// Current backlog size across all subscriptions, in bytes.
+    /// Java: `PersistentTopicStats#backlogSize`.
+    #[serde(rename = "backlogSize")]
+    pub backlog_size: i64,
     /// Publishers, raw JSON because the schema is large and version-dependent.
     pub publishers: Vec<serde_json::Value>,
     /// Subscriptions map (raw JSON).
