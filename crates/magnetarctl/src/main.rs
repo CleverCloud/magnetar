@@ -3370,8 +3370,15 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             // output is human-friendly.
             let json = serde_json::json!({
                 "partitions": partitions,
+                "msgRateIn": stats.msg_rate_in,
+                "msgRateOut": stats.msg_rate_out,
+                "msgThroughputIn": stats.msg_throughput_in,
+                "msgThroughputOut": stats.msg_throughput_out,
+                "averageMsgSize": stats.average_msg_size,
                 "msgInCounter": stats.msg_in_counter,
                 "bytesInCounter": stats.bytes_in_counter,
+                "storageSize": stats.storage_size,
+                "backlogSize": stats.backlog_size,
                 "publishers": stats.publishers,
                 "subscriptions": stats.subscriptions,
             });
@@ -3389,19 +3396,13 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::Terminate { topic } => {
-            // `MessageId` doesn't derive `Serialize` — build the JSON manually
-            // (same shape as `topics get-message-id-by-index`). `None` means
-            // the broker returned the `(-1, -1)` sentinel ("no confirmed entry
-            // at terminate time") — surface as JSON `null` so scripts can
-            // distinguish from a real message-id.
+            // `None` means the broker returned the `(-1, -1)` sentinel ("no
+            // confirmed entry at terminate time") — surface as JSON `null` so
+            // scripts can distinguish from a real message-id. A real id is
+            // rendered by `message_id_to_json` (same shape as
+            // `topics get-message-id-by-index`).
             let json = match admin.topic_terminate(&topic).await? {
-                Some(id) => serde_json::json!({
-                    "ledgerId": id.ledger_id,
-                    "entryId": id.entry_id,
-                    "partition": id.partition,
-                    "batchIndex": id.batch_index,
-                    "batchSize": id.batch_size,
-                }),
+                Some(id) => message_id_to_json(&id),
                 None => serde_json::Value::Null,
             };
             print_json(&json)
@@ -3411,18 +3412,8 @@ async fn run_admin_topics(admin: &AdminClient, cmd: TopicsCmd) -> Result<(), Cli
             Ok(())
         }
         TopicsCmd::GetMessageIdByIndex { topic, index } => {
-            // `MessageId` doesn't derive `Serialize` (it's a pure proto
-            // type); build the JSON shape manually so the CLI output
-            // mirrors Java's `MessageIdImpl.toString()` field layout.
             let id = admin.topic_get_message_id_by_index(&topic, index).await?;
-            let json = serde_json::json!({
-                "ledgerId": id.ledger_id,
-                "entryId": id.entry_id,
-                "partition": id.partition,
-                "batchIndex": id.batch_index,
-                "batchSize": id.batch_size,
-            });
-            print_json(&json)
+            print_json(&message_id_to_json(&id))
         }
         TopicsCmd::GetRetention { topic } => print_json(&admin.topic_get_retention(&topic).await?),
         TopicsCmd::SetRetention {
@@ -3956,6 +3947,31 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
     let s = serde_json::to_string_pretty(value)?;
     println!("{s}");
     Ok(())
+}
+
+/// Render a [`MessageId`] as the canonical CLI JSON object, mirroring Java's
+/// `MessageIdImpl.toString()` field layout. `MessageId` is a pure proto type
+/// without a `Serialize` impl, so the shape is built by hand here and shared
+/// by every command that emits a message id (`topics terminate`,
+/// `topics get-message-id-by-index`). Under the `scalable-topics` feature the
+/// id also carries an optional PIP-460 `segmentId`; we surface it (as JSON
+/// `null` when absent) so the output faithfully represents the full type
+/// rather than silently dropping the segment.
+pub(crate) fn message_id_to_json(id: &MessageId) -> serde_json::Value {
+    let value = serde_json::json!({
+        "ledgerId": id.ledger_id,
+        "entryId": id.entry_id,
+        "partition": id.partition,
+        "batchIndex": id.batch_index,
+        "batchSize": id.batch_size,
+    });
+    #[cfg(feature = "scalable-topics")]
+    let value = {
+        let mut value = value;
+        value["segmentId"] = id.segment_id.map(|s| s.0).into();
+        value
+    };
+    value
 }
 
 /// Errors surfaced from the CLI run loop.
