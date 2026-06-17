@@ -43,6 +43,26 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Wall-clock anti-hang backstop for the steps in these lifecycle tests.
+///
+/// Each test drives a real mock proxy over real TCP on the multi-thread tokio
+/// runtime, so every `tokio::time::timeout` here is a real wall-clock guard.
+/// This constant is an **anti-hang backstop, not a timing assertion**: a step
+/// that genuinely wedges (e.g. a pool teardown whose supervised driver join
+/// never resolves) still fails the test — just later, never silently. It is
+/// sized generously so host-scheduling jitter under CI oversubscription cannot
+/// trip it.
+///
+/// Issue #295: the old tight 5 s per-step guards fired on pure scheduling
+/// latency — under a saturated CI runner the `connect` → `open_producer`
+/// sequence is starved past a 5 s bound without anything being wrong (green
+/// locally, `Elapsed(())` on contended CI). The failure is timing, not a logic
+/// bug, so unifying every step behind one generous backstop kills the flake
+/// class while keeping a finite deadlock guard (ADR-0021: de-flake, never
+/// `#[ignore]`). Mirrors `magnetar_differential::HANG_GUARD` (issue #286). Do
+/// NOT re-tighten this to "make the tests faster".
+const HANG_GUARD: Duration = Duration::from_secs(60);
+
 /// Synthetic broker URL the fake proxy advertises in lookup responses. The
 /// host is meaningless — the client never dials it; the pinned pool entry
 /// stays on the proxy address and rides `proxy_to_broker_url` to reach it.
@@ -223,7 +243,7 @@ async fn tokio_pooled_proxy_connection_opens_and_tears_down_clean() {
 
     // Bootstrap connect.
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -232,7 +252,7 @@ async fn tokio_pooled_proxy_connection_opens_and_tears_down_clean() {
 
     // Open a producer through the proxy → forces the pinned pool dial.
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/pool-lifecycle-producer".to_owned(),
             ..Default::default()
@@ -275,7 +295,7 @@ async fn tokio_pooled_proxy_connection_opens_and_tears_down_clean() {
     // would blow this timeout. We drop the producer first so the only thing
     // keeping the pinned connection alive is the pool itself.
     drop(producer);
-    tokio::time::timeout(Duration::from_secs(5), client.close())
+    tokio::time::timeout(HANG_GUARD, client.close())
         .await
         .expect("Client::close must drain the proxy pool and return (no wedged teardown)");
 }
@@ -290,7 +310,7 @@ async fn tokio_pooled_proxy_connection_reused_then_torn_down() {
     let (url, sessions) = spawn_proxy().await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -298,7 +318,7 @@ async fn tokio_pooled_proxy_connection_reused_then_torn_down() {
     .expect("connect ok");
 
     let p1 = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/pool-lifecycle-reuse-a".to_owned(),
             ..Default::default()
@@ -309,7 +329,7 @@ async fn tokio_pooled_proxy_connection_reused_then_torn_down() {
     .expect("p1 ok");
 
     let p2 = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/pool-lifecycle-reuse-b".to_owned(),
             ..Default::default()
@@ -343,7 +363,7 @@ async fn tokio_pooled_proxy_connection_reused_then_torn_down() {
     // Clean teardown of the reused pool entry.
     drop(p1);
     drop(p2);
-    tokio::time::timeout(Duration::from_secs(5), client.close())
+    tokio::time::timeout(HANG_GUARD, client.close())
         .await
         .expect("Client::close must drain the reused proxy pool and return (no wedged teardown)");
 }
