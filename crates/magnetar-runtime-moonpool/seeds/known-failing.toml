@@ -93,3 +93,28 @@ green replay: the per-PR seed-replay re-validates the ADR-0038 fix. Also
 pinned by the sim_chaos_swizzle_clog_sweep_16_seeds debug-seed set.
 Discovery issue #136 (closed resolved).
 """
+
+[[seed]]
+value        = "0x0c825551f55805bf"
+discovered   = "2026-06-17"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/27666718898"
+commit_sha   = "f7161f25ed56a13cda77ef927a73770983b3354d"
+test_name    = "sim_delayed_marker_is_observed_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/289"
+note         = """
+The moonpool deterministic sweep for
+`sim_delayed_marker_is_observed_sweep_16_seeds` still fails on this branch.
+Under `MOONPOOL_SEED=0x0c825551f55805bf`, iteration 12
+(`11296247158142279166`) returns
+`InvalidState("One or more workloads failed")` after the marker wait times
+out.
+
+This is reproduced with:
+
+MOONPOOL_SEED=0x0c825551f55805bf cargo test -p magnetar-runtime-moonpool \
+    --features crypto-aws-lc-rs --locked
+
+Per ADR-0047, this remains open for per-PR seed replay until the underlying
+bug is fixed and this entry is removed.
+"""
