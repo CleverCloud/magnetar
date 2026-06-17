@@ -185,7 +185,7 @@ If your deployment treats topic names as confidential, filter those fields subsc
 
 ## CLI verbosity
 
-The `magnetar` CLI wires its own subscriber behind the `-v` flag ladder (`-v` → `magnetar=debug` … `-vvvvv` → full dependency trace); see [the CLI reference](cli.md#global-flags).
+The `magnetar` CLI wires its own subscriber behind the `-v` flag ladder (default → `magnetar=warn`, `-v` → `magnetar=info` … `-vvvvvv` → full dependency trace); see [the CLI reference](cli.md#global-flags).
 
 ## Correlation with OpenTelemetry
 

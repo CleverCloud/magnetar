@@ -67,6 +67,8 @@ pub(crate) struct Cli {
     /// Increase logging verbosity (-v, -vv, -vvv). Accepted at any level
     /// (`magnetar admin -vv tenant-list` is the same as
     /// `magnetar -vv admin tenant-list`).
+    /// The default (no `-v`) is `magnetar=warn`; `-v` adds `info`, `-vv`
+    /// `debug`, `-vvv` `trace`, and `-vvvv`+ widen to the transport stack.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub(crate) verbose: u8,
 
@@ -1944,16 +1946,17 @@ fn print_source_chain(err: &dyn std::error::Error) {
 }
 
 fn init_tracing(verbose: u8) {
-    // Step 4+ pulls in the transport stack (`hyper`, `rustls`, `h2`) —
+    // Step 5+ pulls in the transport stack (`hyper`, `rustls`, `h2`) —
     // that is where TLS handshakes and connector errors actually log.
-    // Without these directives `-vvvvv` is silent on the layer where
+    // Without these directives `-vvvvvv` is silent on the layer where
     // most admin REST failures happen.
     let default = match verbose {
-        0 => "magnetar=info",
-        1 => "magnetar=debug",
-        2 => "magnetar=trace",
-        3 => "magnetar=trace,reqwest=debug",
-        4 => "magnetar=trace,reqwest=debug,hyper=debug,rustls=debug,h2=debug",
+        0 => "magnetar=warn",
+        1 => "magnetar=info",
+        2 => "magnetar=debug",
+        3 => "magnetar=trace",
+        4 => "magnetar=trace,reqwest=debug",
+        5 => "magnetar=trace,reqwest=debug,hyper=debug,rustls=debug,h2=debug",
         _ => "magnetar=trace,reqwest=trace,hyper=trace,rustls=trace,h2=trace",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
