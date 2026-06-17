@@ -34,11 +34,13 @@ cargo build -p magnetarctl --release
 --context <name>             Select a named context (overrides current-context).
 --admin-timeout-secs <n>     Admin request timeout (seconds).      default: 60
 -v, --verbose                Increase logging verbosity.
-                             -v     magnetar=debug
-                             -vv    magnetar=trace
-                             -vvv   + reqwest=debug
-                             -vvvv  + hyper=debug,rustls=debug,h2=debug
-                             -vvvvv + all four at trace
+                             (default) magnetar=warn
+                             -v      magnetar=info
+                             -vv     magnetar=debug
+                             -vvv    magnetar=trace
+                             -vvvv   + reqwest=debug
+                             -vvvvv  + hyper=debug,rustls=debug,h2=debug
+                             -vvvvvv + all four at trace
 ```
 
 All flags are global — `magnetarctl admin -vv tenants list` is equivalent to `magnetarctl -vv admin tenants list`, and either form works.
@@ -493,7 +495,7 @@ The exit code is non-zero on any error.
 ## Error chain
 
 `reqwest::Error`'s own `Display` only shows its top-level message; the CLI walks `err.source()` recursively so the operator sees the actual cause — a `hyper` connector error, a `rustls` handshake failure, a missing TLS backend, or a DNS resolution — without re-running under tcpdump.
-The verbose ladder (`-v` … `-vvvvv`) escalates the tracing filter through `magnetar` → `reqwest` → `hyper` + `rustls` + `h2`, with the highest level putting all four at `trace`.
+The default level is `magnetar=warn`; the verbose ladder (`-v` … `-vvvvvv`) escalates the tracing filter through `magnetar` → `reqwest` → `hyper` + `rustls` + `h2`, with the highest level putting all four at `trace`.
 
 ## Crypto provider
 
