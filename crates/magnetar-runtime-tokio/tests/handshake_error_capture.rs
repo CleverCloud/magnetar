@@ -22,13 +22,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
-
 use bytes::BytesMut;
 use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Broker-side message — a SHORT message must round-trip verbatim into the
 /// engine-surfaced `ClientError::Other("handshake failed: …")` payload.
@@ -124,7 +124,7 @@ async fn connect_surfaces_handshake_failure_reason_from_broker_command_error() {
     let url = spawn_reject_handshake_broker(BROKER_MESSAGE.to_owned()).await;
 
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -169,7 +169,7 @@ async fn connect_bounds_oversized_broker_handshake_message() {
     let url = spawn_reject_handshake_broker(oversized.clone()).await;
 
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await

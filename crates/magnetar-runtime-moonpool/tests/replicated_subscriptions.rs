@@ -22,6 +22,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Default, Clone)]
 struct BrokerScript {
@@ -289,7 +291,7 @@ async fn builder_replicate_subscription_state_true_emits_field() {
             let (addr, log) = spawn_broker(BrokerScript::default()).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
@@ -297,7 +299,7 @@ async fn builder_replicate_subscription_state_true_emits_field() {
             .expect("connect ok");
 
             let _consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request(
                     "persistent://public/default/replicated-true",
                     Some(true),
@@ -323,7 +325,7 @@ async fn builder_replicate_subscription_state_default_false() {
             let (addr, log) = spawn_broker(BrokerScript::default()).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
@@ -331,7 +333,7 @@ async fn builder_replicate_subscription_state_default_false() {
             .expect("connect ok");
 
             let _consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request(
                     "persistent://public/default/replicated-default",
                     None,
@@ -366,14 +368,14 @@ async fn consumer_skips_replicated_marker_against_scripted_broker() {
             let (addr, _log) = spawn_broker(BrokerScript { actions }).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
             .expect("connect")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request(
                     "persistent://public/default/filter",
                     Some(true),
@@ -415,14 +417,14 @@ async fn consumer_emits_marker_observation_in_order() {
             let (addr, _log) = spawn_broker(BrokerScript { actions }).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
             .expect("connect")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request(
                     "persistent://public/default/observe",
                     Some(true),
@@ -439,24 +441,20 @@ async fn consumer_emits_marker_observation_in_order() {
                     .expect("msg");
             }
 
-            let first = tokio::time::timeout(
-                Duration::from_secs(10),
-                client.next_replicated_subscription_marker(),
-            )
-            .await
-            .expect("first marker timeout")
-            .expect("first marker some");
+            let first =
+                tokio::time::timeout(HANG_GUARD, client.next_replicated_subscription_marker())
+                    .await
+                    .expect("first marker timeout")
+                    .expect("first marker some");
             assert_eq!(
                 first.marker.kind,
                 ReplicatedSubscriptionMarkerKind::Snapshot
             );
-            let second = tokio::time::timeout(
-                Duration::from_secs(10),
-                client.next_replicated_subscription_marker(),
-            )
-            .await
-            .expect("second marker timeout")
-            .expect("second marker some");
+            let second =
+                tokio::time::timeout(HANG_GUARD, client.next_replicated_subscription_marker())
+                    .await
+                    .expect("second marker timeout")
+                    .expect("second marker some");
             assert_eq!(second.marker.kind, ReplicatedSubscriptionMarkerKind::Update);
             client.close().await;
         })
@@ -481,14 +479,14 @@ async fn consumer_filters_all_four_marker_kinds() {
             let (addr, _log) = spawn_broker(BrokerScript { actions }).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
             .expect("connect")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(subscribe_request(
                     "persistent://public/default/all-kinds",
                     Some(true),

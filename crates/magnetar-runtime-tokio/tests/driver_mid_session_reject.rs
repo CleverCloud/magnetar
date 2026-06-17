@@ -39,6 +39,8 @@ use magnetar_proto::{ConnectionConfig, FrameError, ProtocolError, decode_one, en
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+mod common;
+use common::HANG_GUARD;
 
 /// Beat the broker waits after acking the handshake before injecting the
 /// malformed frame. Comfortably longer than the (sub-millisecond) handshake
@@ -143,7 +145,7 @@ async fn tokio_malformed_mid_session_frame_terminates_driver_not_deadlock() {
     // The crux: pre-fix `join()` never resolves (the driver task parked
     // forever on the re-entrant `shared.inner` lock), so the timeout would
     // elapse and `expect` would fail loudly instead of the suite hanging.
-    let terminal = tokio::time::timeout(Duration::from_secs(5), driver.join())
+    let terminal = tokio::time::timeout(HANG_GUARD, driver.join())
         .await
         .expect("driver must TERMINATE on a malformed mid-session frame, not self-deadlock");
 

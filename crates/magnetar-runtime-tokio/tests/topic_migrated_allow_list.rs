@@ -49,6 +49,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// In-process broker stub that records every inbound `BaseCommand` kind
 /// and, after producer-open, pushes a `CommandTopicMigrated` whose URL
@@ -225,13 +227,13 @@ async fn topic_migrated_to_disallowed_url_is_rejected_and_does_not_reconnect() {
         ..ConnectionConfig::default()
     };
 
-    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, config))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
         .await
         .expect("connect did not time out")
         .expect("connect ok");
 
     tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.open_producer_with(
             CreateProducerRequest {
                 topic: "persistent://public/default/redirect-allowlist-tokio".to_owned(),
@@ -304,13 +306,13 @@ async fn topic_migrated_with_no_allow_list_preserves_pre_existing_behaviour() {
     // No allow-list — pre-allow-list behaviour preserved.
     assert!(config.redirect_url_allow_list.is_none());
 
-    let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(&url, config))
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
         .await
         .expect("connect did not time out")
         .expect("connect ok");
 
     tokio::time::timeout(
-        Duration::from_secs(3),
+        HANG_GUARD,
         client.open_producer_with(
             CreateProducerRequest {
                 topic: "persistent://public/default/redirect-no-allowlist-tokio".to_owned(),

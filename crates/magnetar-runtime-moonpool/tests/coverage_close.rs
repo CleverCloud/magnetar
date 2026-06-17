@@ -17,7 +17,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -31,6 +30,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Mock-broker driver: handles every frame the moonpool engine needs to
 /// drive a producer / consumer through `get_schema`, `last_message_id`,
@@ -367,7 +368,7 @@ async fn connect_with_resolver_propagates_last_error() {
             let resolver =
                 std::sync::Arc::new(StaticDnsResolver::new(vec![unreachable_a, unreachable_b]));
             let res = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     "broker.invalid:6650",
@@ -402,7 +403,7 @@ async fn connect_with_resolver_dials_resolved_address() {
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let resolver = std::sync::Arc::new(StaticDnsResolver::single(listener_addr));
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     "broker.invalid:1", // arbitrary; resolver overrides the dial target
@@ -432,14 +433,14 @@ async fn producer_get_schema_returns_broker_response() {
             let host_port = spawn_full_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
             .expect("connect did not time out")
             .expect("connect ok");
             let producer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/coverage-close-producer".to_owned(),
                     ..Default::default()
@@ -448,7 +449,7 @@ async fn producer_get_schema_returns_broker_response() {
             .await
             .expect("open_producer did not time out")
             .expect("open_producer ok");
-            let schema = tokio::time::timeout(Duration::from_secs(3), producer.get_schema(None))
+            let schema = tokio::time::timeout(HANG_GUARD, producer.get_schema(None))
                 .await
                 .expect("get_schema did not time out")
                 .expect("get_schema ok");
@@ -470,14 +471,14 @@ async fn consumer_get_schema_returns_broker_response() {
             let host_port = spawn_full_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
             .expect("connect did not time out")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/coverage-close-consumer".to_owned(),
                     subscription: "cov-close-sub".to_owned(),
@@ -489,7 +490,7 @@ async fn consumer_get_schema_returns_broker_response() {
             .await
             .expect("subscribe did not time out")
             .expect("subscribe ok");
-            let schema = tokio::time::timeout(Duration::from_secs(3), consumer.get_schema(None))
+            let schema = tokio::time::timeout(HANG_GUARD, consumer.get_schema(None))
                 .await
                 .expect("consumer get_schema did not time out")
                 .expect("consumer get_schema ok");
@@ -510,14 +511,14 @@ async fn consumer_last_message_id_returns_broker_response() {
             let host_port = spawn_full_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
             .expect("connect did not time out")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/coverage-close-last-msg-id".to_owned(),
                     subscription: "cov-close-last".to_owned(),
@@ -529,7 +530,7 @@ async fn consumer_last_message_id_returns_broker_response() {
             .await
             .expect("subscribe did not time out")
             .expect("subscribe ok");
-            let msg_id = tokio::time::timeout(Duration::from_secs(3), consumer.last_message_id())
+            let msg_id = tokio::time::timeout(HANG_GUARD, consumer.last_message_id())
                 .await
                 .expect("last_message_id did not time out")
                 .expect("last_message_id ok");
@@ -545,11 +546,10 @@ async fn consumer_last_message_id_returns_broker_response() {
                 #[cfg(feature = "scalable-topics")]
                 segment_id: None,
             };
-            let has_more =
-                tokio::time::timeout(Duration::from_secs(3), consumer.has_message_after(lower))
-                    .await
-                    .expect("has_message_after did not time out")
-                    .expect("has_message_after ok");
+            let has_more = tokio::time::timeout(HANG_GUARD, consumer.has_message_after(lower))
+                .await
+                .expect("has_message_after did not time out")
+                .expect("has_message_after ok");
             assert!(has_more);
             client.close().await;
         })
@@ -567,14 +567,14 @@ async fn consumer_seek_paths_complete() {
             let host_port = spawn_full_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
             .expect("connect did not time out")
             .expect("connect ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/coverage-close-seek".to_owned(),
                     subscription: "cov-close-seek".to_owned(),
@@ -595,17 +595,14 @@ async fn consumer_seek_paths_complete() {
                 #[cfg(feature = "scalable-topics")]
                 segment_id: None,
             };
-            tokio::time::timeout(Duration::from_secs(3), consumer.seek_to_message(target))
+            tokio::time::timeout(HANG_GUARD, consumer.seek_to_message(target))
                 .await
                 .expect("seek_to_message did not time out")
                 .expect("seek_to_message ok");
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                consumer.seek_to_timestamp(1_700_000_000),
-            )
-            .await
-            .expect("seek_to_timestamp did not time out")
-            .expect("seek_to_timestamp ok");
+            tokio::time::timeout(HANG_GUARD, consumer.seek_to_timestamp(1_700_000_000))
+                .await
+                .expect("seek_to_timestamp did not time out")
+                .expect("seek_to_timestamp ok");
             client.close().await;
         })
         .await;
@@ -623,14 +620,14 @@ async fn producer_and_consumer_close_complete() {
             let host_port = spawn_full_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
             .expect("connect did not time out")
             .expect("connect ok");
             let producer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/coverage-close-pclose".to_owned(),
                     ..Default::default()
@@ -641,16 +638,16 @@ async fn producer_and_consumer_close_complete() {
             .expect("open_producer ok");
             // `flush()` on a quiescent producer must return immediately
             // (src/producer.rs:366-394).
-            tokio::time::timeout(Duration::from_secs(3), producer.flush())
+            tokio::time::timeout(HANG_GUARD, producer.flush())
                 .await
                 .expect("flush did not time out")
                 .expect("flush ok");
-            tokio::time::timeout(Duration::from_secs(3), producer.close())
+            tokio::time::timeout(HANG_GUARD, producer.close())
                 .await
                 .expect("producer close did not time out")
                 .expect("producer close ok");
             let consumer = tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/coverage-close-cclose".to_owned(),
                     subscription: "cov-close-c".to_owned(),
@@ -662,7 +659,7 @@ async fn producer_and_consumer_close_complete() {
             .await
             .expect("subscribe did not time out")
             .expect("subscribe ok");
-            tokio::time::timeout(Duration::from_secs(3), consumer.close())
+            tokio::time::timeout(HANG_GUARD, consumer.close())
                 .await
                 .expect("consumer close did not time out")
                 .expect("consumer close ok");
@@ -684,7 +681,7 @@ async fn driver_handle_abort_drives_cooperative_shutdown() {
             let host_port = spawn_full_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let (_shared, driver) = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 engine.connect_plain(&host_port, ConnectionConfig::default()),
             )
             .await
@@ -698,7 +695,7 @@ async fn driver_handle_abort_drives_cooperative_shutdown() {
             // its shutdown path and exits cleanly. `join()` waits for that real
             // terminal outcome (no synthetic "aborted" result) and must resolve.
             driver.abort();
-            let res = tokio::time::timeout(Duration::from_secs(3), driver.join())
+            let res = tokio::time::timeout(HANG_GUARD, driver.join())
                 .await
                 .expect("join did not time out");
             assert!(

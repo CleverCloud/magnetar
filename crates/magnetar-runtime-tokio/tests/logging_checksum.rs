@@ -32,7 +32,6 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use magnetar_proto::{
@@ -43,6 +42,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// The proto point-of-detection record (`crates/magnetar-proto/src/conn.rs`
 /// decode loop). Exactly one occurrence proves the corrupted frame was
@@ -257,7 +258,7 @@ async fn checksum_mismatch_logged_once_and_connection_survives() {
     let url = format!("pulsar://{addr}");
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -268,7 +269,7 @@ async fn checksum_mismatch_logged_once_and_connection_survives() {
     // BEHIND the corrupted frame on the wire, so resolving this round-trip
     // proves the engine processed (and survived) the corruption first.
     let producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/logging-checksum".to_owned(),
             ..Default::default()

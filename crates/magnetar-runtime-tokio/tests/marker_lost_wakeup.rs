@@ -33,13 +33,14 @@ use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Wake};
-use std::time::Duration;
 
 use magnetar_proto::{ConnectionConfig, ReplicatedSubscriptionMarkerKind, encode_command, pb};
 use magnetar_runtime_tokio::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+mod common;
+use common::HANG_GUARD;
 
 /// Counting waker — records how many times it was woken so a manual poll loop
 /// can assert a `notify_waiters()` actually reached the parked future.
@@ -293,7 +294,7 @@ async fn positive_end_to_end_marker_observation() {
         .expect("handshake");
 
     let consumer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.subscribe(magnetar_proto::SubscribeRequest {
             topic: "persistent://public/default/marker-live".to_owned(),
             subscription: "marker-live-sub".to_owned(),
@@ -309,19 +310,16 @@ async fn positive_end_to_end_marker_observation() {
 
     // Drain the one regular message so the consumer parks; the marker is
     // filtered off the receive stream and surfaces only via the accessor.
-    let msg = tokio::time::timeout(Duration::from_secs(5), consumer.receive())
+    let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
         .await
         .expect("receive did not time out")
         .expect("receive ok");
     assert_eq!(msg.payload.as_ref(), b"user-payload");
 
-    let observed = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.next_replicated_subscription_marker(),
-    )
-    .await
-    .expect("marker accessor did not time out (lost wakeup would hang here)")
-    .expect("connection still open");
+    let observed = tokio::time::timeout(HANG_GUARD, client.next_replicated_subscription_marker())
+        .await
+        .expect("marker accessor did not time out (lost wakeup would hang here)")
+        .expect("connection still open");
     assert_eq!(
         observed.marker.kind,
         ReplicatedSubscriptionMarkerKind::Snapshot

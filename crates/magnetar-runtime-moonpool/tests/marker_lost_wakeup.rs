@@ -24,7 +24,6 @@ use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Wake};
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -36,6 +35,8 @@ use moonpool_core::TokioProviders;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+mod common;
+use common::HANG_GUARD;
 
 /// Counting waker — records wake calls so a manual poll loop can assert a
 /// `notify_waiters()` reached the parked future.
@@ -278,7 +279,7 @@ async fn positive_end_to_end_marker_observation() {
 
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
             )
             .await
@@ -286,7 +287,7 @@ async fn positive_end_to_end_marker_observation() {
             .expect("connect ok");
 
             let consumer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/marker-live".to_owned(),
                     subscription: "marker-live-sub".to_owned(),
@@ -300,19 +301,17 @@ async fn positive_end_to_end_marker_observation() {
             .expect("subscribe did not time out")
             .expect("subscribe ok");
 
-            let msg = tokio::time::timeout(Duration::from_secs(5), consumer.receive())
+            let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
                 .await
                 .expect("receive did not time out")
                 .expect("receive ok");
             assert_eq!(msg.payload.as_ref(), b"user-payload");
 
-            let observed = tokio::time::timeout(
-                Duration::from_secs(10),
-                client.next_replicated_subscription_marker(),
-            )
-            .await
-            .expect("marker accessor did not time out (lost wakeup would hang here)")
-            .expect("connection still open");
+            let observed =
+                tokio::time::timeout(HANG_GUARD, client.next_replicated_subscription_marker())
+                    .await
+                    .expect("marker accessor did not time out (lost wakeup would hang here)")
+                    .expect("connection still open");
             assert_eq!(
                 observed.marker.kind,
                 ReplicatedSubscriptionMarkerKind::Snapshot

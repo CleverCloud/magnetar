@@ -31,8 +31,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
-
 use bytes::BytesMut;
 use magnetar_proto::{
     ConnectionConfig, CreateProducerRequest, FrameError, decode_one, encode_command, pb,
@@ -40,6 +38,8 @@ use magnetar_proto::{
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+mod common;
+use common::HANG_GUARD;
 
 /// Topic the producer targets. The broker answers by frame kind, not by
 /// topic; a realistic name keeps logs readable.
@@ -227,7 +227,7 @@ async fn tokio_lookup_failed_response_surfaces_bounded_broker_error() {
     let url = spawn_lookup_broker(LookupBehavior::Failed).await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -235,7 +235,7 @@ async fn tokio_lookup_failed_response_surfaces_bounded_broker_error() {
     .expect("connect ok");
 
     let err = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: TOPIC.to_owned(),
             ..Default::default()
@@ -282,7 +282,7 @@ async fn tokio_lookup_redirect_loop_surfaces_bounded_cap_error() {
     .await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -290,7 +290,7 @@ async fn tokio_lookup_redirect_loop_surfaces_bounded_cap_error() {
     .expect("connect ok");
 
     let err = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: TOPIC.to_owned(),
             ..Default::default()

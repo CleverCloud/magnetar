@@ -32,7 +32,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -44,6 +43,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 #[derive(Debug, Default, Clone)]
 struct SessionRecord {
@@ -286,7 +287,7 @@ async fn open_producer_routes_to_resolved_broker() {
 
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(&engine, &host_a, supervised_config(), None, None),
             )
             .await
@@ -294,7 +295,7 @@ async fn open_producer_routes_to_resolved_broker() {
             .expect("connect ok");
 
             let _producer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/moonpool-direct-multi-broker-producer"
                         .to_owned(),
@@ -387,7 +388,7 @@ async fn subscribe_routes_to_resolved_broker() {
 
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(&engine, &host_a, supervised_config(), None, None),
             )
             .await
@@ -395,7 +396,7 @@ async fn subscribe_routes_to_resolved_broker() {
             .expect("connect ok");
 
             let _consumer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/moonpool-direct-multi-broker-consumer"
                         .to_owned(),
@@ -456,7 +457,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
 
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(&engine, &host_a, supervised_config(), None, None),
             )
             .await
@@ -464,7 +465,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             .expect("connect ok");
 
             let _p1 = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/moonpool-direct-reuse-a".to_owned(),
                     ..Default::default()
@@ -475,7 +476,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             .expect("p1 ok");
 
             let _p2 = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/moonpool-direct-reuse-b".to_owned(),
                     ..Default::default()
@@ -548,7 +549,7 @@ async fn lookup_resolving_to_bootstrap_broker_reuses_bootstrap_connection() {
 
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain_supervised(
                     &engine,
                     &host_port,
@@ -562,7 +563,7 @@ async fn lookup_resolving_to_bootstrap_broker_reuses_bootstrap_connection() {
             .expect("connect ok");
 
             let _producer = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/moonpool-direct-bootstrap-equality"
                         .to_owned(),

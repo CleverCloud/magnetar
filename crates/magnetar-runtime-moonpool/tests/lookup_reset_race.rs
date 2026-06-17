@@ -34,7 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 mod common;
-use common::handshake_complete_shared;
+use common::{HANG_GUARD, handshake_complete_shared};
 
 struct CountingWake(AtomicUsize);
 
@@ -327,7 +327,7 @@ async fn lookup_severed_by_reconnect_reissues_and_succeeds() {
         ..ConnectionConfig::default()
     };
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect_plain_supervised(&engine, &addr, config, None, None),
     )
     .await
@@ -335,7 +335,7 @@ async fn lookup_severed_by_reconnect_reissues_and_succeeds() {
     .expect("connect must succeed");
 
     let producer = tokio::time::timeout(
-        Duration::from_secs(10),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/lookup-retry-transient".to_owned(),
             ..Default::default()
@@ -375,7 +375,7 @@ async fn terminal_session_lost_surfaces_peer_closed_without_spin() {
         ..ConnectionConfig::default()
     };
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect_plain_supervised(&engine, &addr, config, None, None),
     )
     .await
@@ -383,7 +383,7 @@ async fn terminal_session_lost_surfaces_peer_closed_without_spin() {
     .expect("connect must succeed");
 
     let res = tokio::time::timeout(
-        Duration::from_secs(10),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/lookup-retry-terminal".to_owned(),
             ..Default::default()
@@ -418,7 +418,7 @@ async fn flapping_lookup_is_bounded_never_spins() {
         ..ConnectionConfig::default()
     };
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect_plain_supervised(&engine, &addr, config, None, None),
     )
     .await
@@ -426,7 +426,7 @@ async fn flapping_lookup_is_bounded_never_spins() {
     .expect("connect must succeed");
 
     let res = tokio::time::timeout(
-        Duration::from_secs(15),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/lookup-retry-flap".to_owned(),
             ..Default::default()

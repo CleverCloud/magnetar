@@ -21,7 +21,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -33,6 +32,8 @@ use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Type-tag log entry; we don't need the full frame for the assertion,
 /// just the wire-protocol command kind in the order it arrived.
@@ -186,7 +187,7 @@ async fn open_producer_issues_lookup_first() {
             let (host_port, log) = spawn_recording_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
@@ -194,7 +195,7 @@ async fn open_producer_issues_lookup_first() {
             .expect("connect ok");
 
             tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.open_producer(CreateProducerRequest {
                     topic: "persistent://public/default/lookup-before-open-producer".to_owned(),
                     ..Default::default()
@@ -237,7 +238,7 @@ async fn subscribe_issues_lookup_first() {
             let (host_port, log) = spawn_recording_broker().await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
             let client = tokio::time::timeout(
-                Duration::from_secs(5),
+                HANG_GUARD,
                 Client::connect_plain(&engine, &host_port, ConnectionConfig::default()),
             )
             .await
@@ -245,7 +246,7 @@ async fn subscribe_issues_lookup_first() {
             .expect("connect ok");
 
             tokio::time::timeout(
-                Duration::from_secs(3),
+                HANG_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: "persistent://public/default/lookup-before-open-consumer".to_owned(),
                     subscription: "lookup-test-sub".to_owned(),

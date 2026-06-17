@@ -35,7 +35,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -46,6 +45,8 @@ use magnetar_runtime_tokio::Client;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+mod common;
+use common::HANG_GUARD;
 
 /// Per-session log: records the `proxy_to_broker_url` seen on `CommandConnect`
 /// and the kinds of every subsequent frame, in arrival order.
@@ -240,7 +241,7 @@ async fn open_producer_routes_to_resolved_broker() {
     .await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url_a, ConnectionConfig::default()),
     )
     .await
@@ -248,7 +249,7 @@ async fn open_producer_routes_to_resolved_broker() {
     .expect("connect ok");
 
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/direct-multi-broker-producer".to_owned(),
             ..Default::default()
@@ -341,7 +342,7 @@ async fn subscribe_routes_to_resolved_broker() {
     .await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url_a, ConnectionConfig::default()),
     )
     .await
@@ -349,7 +350,7 @@ async fn subscribe_routes_to_resolved_broker() {
     .expect("connect ok");
 
     let _consumer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.subscribe(SubscribeRequest {
             topic: "persistent://public/default/direct-multi-broker-consumer".to_owned(),
             subscription: "direct-multi-broker-sub".to_owned(),
@@ -400,7 +401,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
     .await;
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url_a, ConnectionConfig::default()),
     )
     .await
@@ -408,7 +409,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
     .expect("connect ok");
 
     let _p1 = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/direct-multi-broker-reuse-a".to_owned(),
             ..Default::default()
@@ -419,7 +420,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
     .expect("p1 ok");
 
     let _p2 = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/direct-multi-broker-reuse-b".to_owned(),
             ..Default::default()
@@ -490,7 +491,7 @@ async fn lookup_resolving_to_bootstrap_broker_reuses_bootstrap_connection() {
     });
 
     let client = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         Client::connect(&url, ConnectionConfig::default()),
     )
     .await
@@ -498,7 +499,7 @@ async fn lookup_resolving_to_bootstrap_broker_reuses_bootstrap_connection() {
     .expect("connect ok");
 
     let _producer = tokio::time::timeout(
-        Duration::from_secs(5),
+        HANG_GUARD,
         client.open_producer(CreateProducerRequest {
             topic: "persistent://public/default/direct-bootstrap-equality".to_owned(),
             ..Default::default()

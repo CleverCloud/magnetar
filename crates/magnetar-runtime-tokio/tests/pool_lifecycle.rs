@@ -32,7 +32,6 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -43,25 +42,8 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Wall-clock anti-hang backstop for the steps in these lifecycle tests.
-///
-/// Each test drives a real mock proxy over real TCP on the multi-thread tokio
-/// runtime, so every `tokio::time::timeout` here is a real wall-clock guard.
-/// This constant is an **anti-hang backstop, not a timing assertion**: a step
-/// that genuinely wedges (e.g. a pool teardown whose supervised driver join
-/// never resolves) still fails the test — just later, never silently. It is
-/// sized generously so host-scheduling jitter under CI oversubscription cannot
-/// trip it.
-///
-/// Issue #295: the old tight 5 s per-step guards fired on pure scheduling
-/// latency — under a saturated CI runner the `connect` → `open_producer`
-/// sequence is starved past a 5 s bound without anything being wrong (green
-/// locally, `Elapsed(())` on contended CI). The failure is timing, not a logic
-/// bug, so unifying every step behind one generous backstop kills the flake
-/// class while keeping a finite deadlock guard (ADR-0021: de-flake, never
-/// `#[ignore]`). Mirrors `magnetar_differential::HANG_GUARD` (issue #286). Do
-/// NOT re-tighten this to "make the tests faster".
-const HANG_GUARD: Duration = Duration::from_secs(60);
+mod common;
+use common::HANG_GUARD;
 
 /// Synthetic broker URL the fake proxy advertises in lookup responses. The
 /// host is meaningless — the client never dials it; the pinned pool entry
