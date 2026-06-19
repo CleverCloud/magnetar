@@ -35,6 +35,7 @@ pub struct PartitionedConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     client: &'a PulsarClient<E>,
     topic: String,
     subscription: Option<String>,
+    consumer_name: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     receiver_queue_size: usize,
     initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
@@ -78,6 +79,7 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
             client,
             topic,
             subscription: None,
+            consumer_name: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
@@ -111,6 +113,16 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
         self.listener.is_some()
     }
 
+    /// Test-support seam (`#[doc(hidden)]`): the consumer name this builder will
+    /// propagate to every per-partition child via the underlying multi-topics
+    /// builder. Lets the builder-surface guard test pin the `name()` → field
+    /// plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn consumer_name_for_test(&self) -> Option<&str> {
+        self.consumer_name.as_deref()
+    }
+
     /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
     /// at the partitioned scope). Once set, subscribe via
     /// [`Self::subscribe_with_listener`] to start a background poller over the
@@ -132,6 +144,18 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
     #[must_use]
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
         self.subscription = Some(name.into());
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::name`. The name is propagated verbatim to every
+    /// per-partition child consumer (no per-partition suffix), so each child
+    /// subscribes with the same `consumer_name` and broker `topics stats` reports
+    /// it for every partition — matching the Java client and letting you attribute
+    /// a Failover-active consumer to an instance. Default `None` lets the broker
+    /// assign a name.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.consumer_name = Some(name.into());
         self
     }
 
@@ -359,6 +383,9 @@ where
             .initial_position(self.initial_position)
             .durable(self.durable)
             .read_compacted(self.read_compacted);
+        if let Some(name) = self.consumer_name {
+            builder = builder.name(name);
+        }
         if let Some(level) = self.priority_level {
             builder = builder.priority_level(level);
         }

@@ -16,6 +16,10 @@
 #[derive(Debug, Clone)]
 pub(crate) struct ConsumerTemplate {
     pub(crate) subscription: String,
+    /// Consumer name propagated verbatim to every per-topic child (no per-partition
+    /// suffix — broker `topics stats` then shows the same `consumerName` for each
+    /// child, matching the Java client). `None` lets the broker assign one.
+    pub(crate) consumer_name: Option<String>,
     pub(crate) sub_type: magnetar_proto::pb::command_subscribe::SubType,
     pub(crate) receiver_queue_size: usize,
     pub(crate) initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
@@ -50,6 +54,9 @@ impl ConsumerTemplate {
             .initial_position(self.initial_position)
             .receiver_queue_size(self.receiver_queue_size)
             .read_compacted(self.read_compacted);
+        if let Some(name) = &self.consumer_name {
+            builder = builder.name(name.clone());
+        }
         for (k, v) in &self.properties {
             builder = builder.property(k.clone(), v.clone());
         }
