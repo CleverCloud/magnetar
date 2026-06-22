@@ -1094,13 +1094,31 @@ where
         };
 
         tokio::select! {
+            // ADR-0070 read-fairness (issue #303): under a sustained `send`
+            // burst every `Producer::send` pulses `driver_waker.notify_one()`,
+            // so a waker permit is almost always pending on loop entry. With
+            // `biased;` the FIRST arm wins whenever it is ready, so polling the
+            // `driver_waker` arm first would let writes starve the inbound path
+            // — already-arrived `CommandSendReceipt` bytes would not be read
+            // that iteration and the matching `SendFut`s would resolve late.
+            //
+            // The outbound path is NOT starved by giving reads priority here:
+            // `poll_transmit` + `write_all` already run at the TOP of every loop
+            // iteration (above), so each tick flushes pending sends regardless
+            // of which `select!` arm wins. Draining the socket first therefore
+            // keeps BOTH directions live. `biased;` is retained so the arm
+            // order is deterministic — the moonpool engine's
+            // bit-for-bit-reproducible simulation depends on it, and a
+            // non-biased `select!` would pick arms via an uncontrolled
+            // thread-local RNG (ADR-0024 determinism constraint). The read arm
+            // is cancel-safe: bytes land in the persistent `read_buf` and are
+            // only consumed via `split()` AFTER this arm wins, so reordering
+            // drops nothing. The full read/write task split is the deferred
+            // follow-up (TLS streams cannot `into_split`; supervisor reconnect
+            // rework) — this localized reorder is the minimal fix.
             biased;
-            // Driver wake-up from user-facing futures (e.g. a freshly-enqueued send).
-            () = shared.driver_waker.notified() => {
-                // Loop: poll_transmit will drain whatever the future enqueued.
-            }
 
-            // Inbound bytes.
+            // Inbound bytes (polled first for receipt fairness — see above).
             r = socket.read_buf(&mut read_buf) => {
                 let n = match r {
                     Ok(n) => n,
@@ -1220,6 +1238,16 @@ where
                 // and observe the freshly-pushed event.
                 handle_pending_events(shared)?;
                 shared.driver_waker.notify_waiters();
+            }
+
+            // Driver wake-up from user-facing futures (e.g. a freshly-enqueued
+            // send). Polled AFTER the inbound arm (see the read-fairness note at
+            // the top of this `select!`): when both are ready the socket is
+            // drained first so receipts are not deferred; the enqueued frames
+            // are still flushed by the top-of-loop `poll_transmit` on the next
+            // iteration.
+            () = shared.driver_waker.notified() => {
+                // Loop: poll_transmit will drain whatever the future enqueued.
             }
 
             // Timer fired.
