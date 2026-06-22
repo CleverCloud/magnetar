@@ -8294,6 +8294,186 @@ mod conn_state_tests {
         }
     }
 
+    /// ADR-0070 — Java-parity default `send_timeout`. A producer opened from a
+    /// `CreateProducerRequest::default()` carries `Some(30s)`, so a send whose
+    /// `CommandSendReceipt` never arrives (lost / corrupted on the wire — the
+    /// receipt has no CRC32C, invariant #4) does NOT hang forever: once the
+    /// INJECTED clock (ADR-0011) crosses `enqueued_at + 30s`, the
+    /// `handle_timeout` sweep resolves the `PendingOpKey::Send` future with a
+    /// `code=-1, "send timeout"` `SendError` and wakes the parked waker. The
+    /// companion `send_resolves_before_default_deadline_without_false_timeout`
+    /// pins the no-false-positive direction.
+    #[test]
+    fn default_send_timeout_fires_when_receipt_lost() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker_inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&waker_inner).into();
+
+        // Pin the default itself: the Java client's sendTimeoutMs = 30000.
+        let default_req = CreateProducerRequest::default();
+        assert_eq!(
+            default_req.send_timeout,
+            Some(Duration::from_secs(30)),
+            "CreateProducerRequest::default() must carry the 30s Java-parity send_timeout"
+        );
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/send-timeout-default".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        // Enqueue a single send at a fixed `t0` on the injected clock.
+        let t0 = Instant::now();
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"lost-receipt"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 12,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let key = PendingOpKey::Send(producer, seq);
+        conn.register_waker(key, waker.clone());
+
+        // A wake-up deadline is surfaced via poll_timeout against the injected
+        // clock (the earliest of keepalive + the new send deadline), so the
+        // driver schedules a deterministic wake to drive the sweep.
+        assert!(
+            conn.poll_timeout().is_some(),
+            "a wake-up deadline must be scheduled while a send is in flight"
+        );
+
+        // Just BEFORE the deadline: no timeout, no wake, no outcome — the
+        // broker still had a chance to ack.
+        conn.handle_timeout(t0 + Duration::from_secs(29));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no send-timeout outcome before the 30s deadline"
+        );
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            0,
+            "waker must not fire before the deadline"
+        );
+
+        // Past the deadline: the sweep resolves the send with a timeout error
+        // and wakes the parked waker.
+        conn.handle_timeout(t0 + Duration::from_secs(31));
+        match conn.take_outcome(key) {
+            Some(OpOutcome::SendError {
+                sequence_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(sequence_id, seq);
+                assert_eq!(code, -1, "send-timeout SendError uses the -1 sentinel");
+                assert_eq!(message, "send timeout");
+            }
+            other => panic!("expected a send-timeout SendError, got {other:?}"),
+        }
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "the parked waker must be woken exactly once on timeout"
+        );
+        assert_eq!(
+            conn.producer_pending_count(producer),
+            0,
+            "the timed-out send must drain out of the pending queue"
+        );
+    }
+
+    /// ADR-0070 no-false-positive: a send whose `CommandSendReceipt` lands
+    /// BEFORE the 30s default deadline resolves normally with a `SendReceipt`
+    /// outcome — the default timeout must not spuriously fail a healthy send.
+    #[test]
+    fn send_resolves_before_default_deadline_without_false_timeout() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/send-timeout-happy".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let t0 = Instant::now();
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"acked"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 5,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+        let key = PendingOpKey::Send(producer, seq);
+
+        // Broker acks well within the 30s window.
+        let receipt_bytes = send_receipt_bytes(producer, seq);
+        conn.handle_bytes(t0 + Duration::from_secs(1), &receipt_bytes)
+            .expect("handle SendReceipt");
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::SendReceipt { sequence_id, .. }) => assert_eq!(sequence_id, seq),
+            other => panic!("expected a SendReceipt before the deadline, got {other:?}"),
+        }
+
+        // A later sweep past the would-be deadline finds nothing to time out —
+        // the send already drained, so no spurious second outcome.
+        conn.handle_timeout(t0 + Duration::from_secs(31));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no spurious send-timeout outcome after a healthy ack"
+        );
+    }
+
     /// Ordering invariant: when a producer has multiple in-flight publishes with
     /// non-contiguous sequence ids (one batched + one single), the snapshot replays them
     /// in original FIFO order, preserving the per-producer wire ordering.

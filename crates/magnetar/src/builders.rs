@@ -150,12 +150,27 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
         self
     }
 
-    /// Mirrors Java `ProducerBuilder#sendTimeout`. When set, in-flight sends past
+    /// Mirrors Java `ProducerBuilder#sendTimeout`. In-flight sends past
     /// `enqueued_at + timeout` resolve with a synthetic `SendError` carrying
     /// `code=-1, message="send timeout"` on the next state-machine tick.
+    ///
+    /// The default is **30 s** (Java parity — `sendTimeoutMs = 30000`, ADR-0070),
+    /// so a send whose receipt is lost or corrupted in flight fails deterministically
+    /// rather than hanging forever. Call [`Self::disable_send_timeout`] for the
+    /// unbounded (never-times-out) behavior.
     #[must_use]
     pub fn send_timeout(mut self, timeout: Duration) -> Self {
         self.req.send_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable the send timeout: in-flight sends never resolve with a synthetic
+    /// timeout `SendError` — they wait indefinitely for the broker's receipt
+    /// (or a session-loss / terminal error). Mirrors Java
+    /// `ProducerBuilder#sendTimeout(0, …)`. Overrides the 30 s default (ADR-0070).
+    #[must_use]
+    pub fn disable_send_timeout(mut self) -> Self {
+        self.req.send_timeout = None;
         self
     }
 

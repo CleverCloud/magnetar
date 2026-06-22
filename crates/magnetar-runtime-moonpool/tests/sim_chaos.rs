@@ -662,10 +662,18 @@ fn classify_send_outcome(
         ))) => Some(SEND_RESOLUTION_MEMORY_LIMIT),
         // Every other ClientError flavour reaches the workload only
         // after the supervisor surfaced the broker drop / handshake
-        // failure as a `SessionLost` for in-flight ops. Map them all
-        // onto the SessionLost bucket — the invariant only cares that
-        // the resolution kind is one of the three allowed values, not
-        // which specific error variant the engine wrapped it in.
+        // failure as a `SessionLost` for in-flight ops, OR after the
+        // proto-level `send_timeout` sweep fired a `code=-1, "send timeout"`
+        // SendError for a send whose `CommandSendReceipt` the bit-flip
+        // chaos corrupted/lost in flight (the receipt carries no CRC32C —
+        // invariant #4 — so a structurally-valid-but-wrong receipt is
+        // delivered, `apply_receipt` misses, and the send times out). Both
+        // are BOUNDED, expected resolutions under chaos: map them all onto
+        // the SessionLost bucket — the invariant only cares that the
+        // resolution kind is one of the three allowed values, not which
+        // specific error variant the engine wrapped it in. Crucially the
+        // future RESOLVED (not pending), so the liveness completion check
+        // passes and the run is not a false hang.
         Some(Err(_)) => Some(SEND_RESOLUTION_SESSION_LOST),
         None => None,
     }
@@ -1468,6 +1476,24 @@ impl Invariant for NoDupOnAckedInvariant {
 
 const PRODUCE_COUNT: u32 = 8;
 
+/// Explicit per-send timeout for the produce/consume chaos workload.
+///
+/// Shorter than both the per-send `tokio::time::timeout(5s)` await guard and
+/// the `CHAOS_RUN_TIME_BUDGET` (30s virtual seconds), so a send whose
+/// `CommandSendReceipt` the default-network bit-flip chaos corrupts/drops in
+/// flight (the receipt carries no CRC32C, unlike a `CommandSend` payload —
+/// invariant #4) fails FAST and deterministically with a `code=-1,
+/// "send timeout"` `SendError` rather than parking forever. The proto-level
+/// `send_timeout` sweep (`Connection::handle_timeout` against the INJECTED
+/// virtual clock, ADR-0011) fires the timeout well within the run budget, so
+/// the workload always completes; [`classify_send_outcome`] then maps the
+/// timeout error onto a bounded, expected `SEND_RESOLUTION_SESSION_LOST`
+/// resolution (a chaos-lost receipt is a legitimate outcome — same spirit as
+/// the #305 bit-flip clean-exit fix). The 30s Java-parity default (ADR-0070)
+/// would land outside this run's budget, so the workload pins this tighter
+/// value explicitly.
+const CHAOS_PRODUCE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct ProducerConsumerWorkload {
     // moonpool main's `Workload` is `Send + Sync` (was `?Send`); the
     // per-run scratch state migrates `Rc<RefCell<…>>` → `Arc<Mutex<…>>`
@@ -1529,6 +1555,10 @@ impl Workload for ProducerConsumerWorkload {
         let producer = retry_setup(&time_provider_setup, || {
             client.open_producer(CreateProducerRequest {
                 topic: "persistent://public/default/sim-chaos-pc".to_owned(),
+                // Bound the send within the run budget: a chaos-corrupted/lost
+                // receipt fails fast with a timeout instead of hanging forever
+                // (see CHAOS_PRODUCE_SEND_TIMEOUT).
+                send_timeout: Some(CHAOS_PRODUCE_SEND_TIMEOUT),
                 ..Default::default()
             })
         })
