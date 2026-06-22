@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Consumer name on the multi-child consumer builders:** `PartitionedConsumerBuilder`, `MultiTopicsConsumerBuilder`, and `PatternConsumerBuilder` gain a `.name(impl Into<String>)` setter that propagates the consumer name verbatim to every per-partition / per-topic child via `ConsumerTemplate` (no per-partition suffix — every child subscribes with the same `consumer_name`, matching the Java client). Broker `topics stats` now reports a non-empty `consumerName` for each child, so a multi-instance Failover (or Shared) partitioned consumer is attributable to an instance. Previously only the inner per-topic `ConsumerBuilder` exposed `.name()`, leaving partitioned consumers stuck at `consumer_name: None`. (#300)
+
 ## [1.1.1] - 2026-06-17
 
 ### Added

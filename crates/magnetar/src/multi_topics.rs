@@ -811,6 +811,7 @@ pub struct MultiTopicsConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     client: &'a PulsarClient<E>,
     topics: Vec<String>,
     subscription: Option<String>,
+    consumer_name: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     receiver_queue_size: usize,
     initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
@@ -860,6 +861,7 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
             client,
             topics: Vec::new(),
             subscription: None,
+            consumer_name: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
@@ -893,6 +895,16 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
     #[must_use]
     pub fn has_listener_for_test(&self) -> bool {
         self.listener.is_some()
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the consumer name this builder will
+    /// propagate to every per-topic child via
+    /// [`crate::consumer_template::ConsumerTemplate`]. Lets the builder-surface
+    /// guard test pin the `name()` → field plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn consumer_name_for_test(&self) -> Option<&str> {
+        self.consumer_name.as_deref()
     }
 
     /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
@@ -929,6 +941,17 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
     #[must_use]
     pub fn topics(mut self, topics: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.topics.extend(topics.into_iter().map(Into::into));
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::name`. The name is propagated verbatim to every
+    /// per-topic child consumer (no per-topic suffix), so broker `topics stats`
+    /// reports the same `consumerName` for each child — matching the Java client
+    /// and making multi-instance consumers attributable. Default `None` lets the
+    /// broker assign a name.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.consumer_name = Some(name.into());
         self
     }
 
@@ -1170,6 +1193,7 @@ where
 
         let template = ConsumerTemplate {
             subscription,
+            consumer_name: self.consumer_name,
             sub_type: self.sub_type,
             receiver_queue_size: self.receiver_queue_size,
             initial_position: self.initial_position,
@@ -1296,6 +1320,7 @@ mod tests {
     fn empty_template() -> ConsumerTemplate {
         ConsumerTemplate {
             subscription: "sub".to_owned(),
+            consumer_name: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,

@@ -489,6 +489,7 @@ pub struct PatternConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     namespace: Option<String>,
     pattern: Option<String>,
     subscription: Option<String>,
+    consumer_name: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     receiver_queue_size: usize,
     initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
@@ -531,6 +532,7 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
             namespace: None,
             pattern: None,
             subscription: None,
+            consumer_name: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
@@ -561,6 +563,15 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
     #[must_use]
     pub fn has_listener_for_test(&self) -> bool {
         self.listener.is_some()
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`): the consumer name this builder will
+    /// propagate to every per-topic child. Lets the builder-surface guard test
+    /// pin the `name()` → field plumbing without a broker.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn consumer_name_for_test(&self) -> Option<&str> {
+        self.consumer_name.as_deref()
     }
 
     /// Register a push-delivery callback (Java `ConsumerBuilder#messageListener`
@@ -600,6 +611,16 @@ impl<'a, E: Engine> PatternConsumerBuilder<'a, E> {
     #[must_use]
     pub fn subscription(mut self, name: impl Into<String>) -> Self {
         self.subscription = Some(name.into());
+        self
+    }
+
+    /// Mirrors `ConsumerBuilder::name`. Propagated verbatim to every per-topic
+    /// child (including topics discovered later on reconciliation), so broker
+    /// `topics stats` reports the same `consumerName` for each. Default `None`
+    /// lets the broker assign a name.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.consumer_name = Some(name.into());
         self
     }
 
@@ -802,6 +823,7 @@ where
 
         let template = ConsumerTemplate {
             subscription,
+            consumer_name: self.consumer_name,
             sub_type: self.sub_type,
             receiver_queue_size: self.receiver_queue_size,
             initial_position: self.initial_position,
@@ -937,6 +959,7 @@ mod tests {
     fn empty_pattern_consumer() -> PatternConsumer<magnetar_runtime_tokio::Consumer> {
         let template = ConsumerTemplate {
             subscription: "test-sub".to_owned(),
+            consumer_name: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
