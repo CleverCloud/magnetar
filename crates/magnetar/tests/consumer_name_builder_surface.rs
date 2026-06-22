@@ -127,6 +127,13 @@ async fn multi_child_consumer_builders_thread_consumer_name() {
     );
     assert_eq!(
         client
+            .pattern_consumer()
+            .subscription("g")
+            .consumer_name_for_test(),
+        None
+    );
+    assert_eq!(
+        client
             .partitioned_consumer("persistent://public/default/consumer-name-default")
             .subscription("g")
             .consumer_name_for_test(),
