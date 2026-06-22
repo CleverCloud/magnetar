@@ -1462,8 +1462,17 @@ impl Future for ReceiveFut {
                     }
                 }
             }
-            // Closed connection with no buffered message → terminal.
-            if conn.is_closed() || conn.consumer_is_closed(handle) {
+            // Genuinely-terminal state with no buffered message → resolve Err.
+            // Issue #299: gate on `consumer_handle_is_terminal`, NOT
+            // `is_closed()`. A transport drop sets `HandshakeState::Failed` for
+            // the WHOLE supervised reconnect window and `reset()` wakes the
+            // parked receive wakers while still `Failed`; the old `is_closed()`
+            // guard erroneously resolved `Err(Closed)` during that recoverable
+            // window. The terminal predicate re-parks instead (folding in a
+            // per-handle terminal subscribe failure, issue #302), so `receive()`
+            // transparently resumes once the supervisor reconnects + rebuild
+            // replays `CommandSubscribe`. 1:1 with the tokio engine.
+            if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
                 return Poll::Ready(Err(ClientError::Closed));
             }
             // Refresh the slab registration so the current task is the one woken.

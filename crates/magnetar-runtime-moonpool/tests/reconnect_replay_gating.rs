@@ -53,7 +53,8 @@ use futures::io::{
 };
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, Frame, FrameError, decode_one, encode_command, pb,
+    ConnectionConfig, ConsumerHandle, CreateProducerRequest, Frame, FrameError, SubscribeRequest,
+    decode_one, encode_command, encode_payload, pb,
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TokioProviders};
@@ -381,6 +382,366 @@ async fn queued_send_replays_only_after_retry_ack_across_reconnect() {
         state.conn2_producer_opens.load(Ordering::SeqCst),
         2,
         "rebuild open (transient-rejected) + retry open (acked)"
+    );
+
+    client.close().await;
+}
+
+// ============================================================================
+// Issue #299 + #302 — moonpool engine mirrors of the tokio give-up + receive-
+// across-drop tests (ADR-0024 1:1 runtime-test-parity). Driven over the real
+// `TokioProviders` loopback harness like
+// `queued_send_replays_only_after_retry_ack_across_reconnect`; the give-up
+// tests run under `start_paused = true` so the transient-retry backoff sleeps
+// (which route through the injected `TimeProvider`, i.e. `tokio::time::sleep`
+// under `TokioProviders`) auto-advance in virtual time.
+// ============================================================================
+
+fn emit_subscribe_success(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Success as i32,
+        success: Some(pb::CommandSuccess {
+            request_id,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// A `CommandMessage` + payload addressed to `handle` at entry `entry`.
+fn emit_message_frame(out: &mut BytesMut, handle: ConsumerHandle, entry: u64, payload: &[u8]) {
+    let msg_cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Message as i32,
+        message: Some(pb::CommandMessage {
+            consumer_id: handle.0,
+            message_id: pb::MessageIdData {
+                ledger_id: 9,
+                entry_id: entry,
+                partition: None,
+                batch_index: None,
+                ack_set: vec![],
+                batch_size: None,
+                first_chunk_message_id: None,
+            },
+            redelivery_count: Some(0),
+            ack_set: vec![],
+            consumer_epoch: None,
+        }),
+        ..Default::default()
+    };
+    let metadata = pb::MessageMetadata {
+        producer_name: "magnetar-test-prod".to_owned(),
+        sequence_id: entry,
+        publish_time: 0,
+        ..Default::default()
+    };
+    encode_payload(out, &msg_cmd, &metadata, payload).expect("encode message frame");
+}
+
+#[derive(Default)]
+struct GiveUpGating {
+    producer_opens: AtomicU32,
+    subscribes: AtomicU32,
+}
+
+/// Broker that NEVER acks the producer-open — every `CommandProducer` is bounced
+/// transiently. Mirror of the tokio engine's `run_always_transient_producer_broker`.
+async fn run_always_transient_producer_broker(listener: TcpListener, state: Arc<GiveUpGating>) {
+    let Ok((mut s, _)) = listener.accept().await else {
+        return;
+    };
+    let st = Arc::clone(&state);
+    serve_conn(&mut s, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(l) = &frame.command.lookup_topic {
+                    emit_lookup_response(out, l.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Producer) => {
+                if let Some(p) = &frame.command.producer {
+                    st.producer_opens.fetch_add(1, Ordering::SeqCst);
+                    emit_transient_error(out, p.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+/// #302 (moonpool integration, producer give-up): 1:1 twin of the tokio
+/// `producer_open_gives_up_with_error_after_budget_exhausted`. The bounded
+/// retry loop re-arms across MANY transient rejects then surfaces `Err` once
+/// the proto budget is exhausted — never hangs `open_producer` forever.
+#[tokio::test(start_paused = true)]
+async fn producer_open_gives_up_with_error_after_budget_exhausted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(GiveUpGating::default());
+    tokio::spawn(run_always_transient_producer_broker(
+        listener,
+        Arc::clone(&state),
+    ));
+
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        ConnectionConfig::default(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect must succeed");
+
+    let result = client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/never-served".to_owned(),
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "open_producer must surface Err after the transient retry budget is exhausted, \
+         not hang forever (issue #302); got {result:?}"
+    );
+    assert!(
+        state.producer_opens.load(Ordering::SeqCst) >= 2,
+        "the retry leg must re-arm across MULTIPLE transient rejects before giving up \
+         (saw {} opens)",
+        state.producer_opens.load(Ordering::SeqCst),
+    );
+
+    client.close().await;
+}
+
+/// Broker that NEVER acks the subscribe — every `CommandSubscribe` is bounced
+/// transiently. Mirror of the tokio engine's `run_always_transient_subscribe_broker`.
+async fn run_always_transient_subscribe_broker(listener: TcpListener, state: Arc<GiveUpGating>) {
+    let Ok((mut s, _)) = listener.accept().await else {
+        return;
+    };
+    let st = Arc::clone(&state);
+    serve_conn(&mut s, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(l) = &frame.command.lookup_topic {
+                    emit_lookup_response(out, l.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Subscribe) => {
+                if let Some(sub) = &frame.command.subscribe {
+                    st.subscribes.fetch_add(1, Ordering::SeqCst);
+                    emit_transient_error(out, sub.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+/// #302 (moonpool integration, consumer give-up): 1:1 twin of the tokio
+/// `subscribe_gives_up_and_receive_errors_after_budget_exhausted`.
+#[tokio::test(start_paused = true)]
+async fn subscribe_gives_up_and_receive_errors_after_budget_exhausted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(GiveUpGating::default());
+    tokio::spawn(run_always_transient_subscribe_broker(
+        listener,
+        Arc::clone(&state),
+    ));
+
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        ConnectionConfig::default(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect must succeed");
+
+    let consumer = client
+        .subscribe(SubscribeRequest {
+            topic: "persistent://public/default/never-served-sub".to_owned(),
+            subscription: "giveup-302".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        })
+        .await;
+
+    match consumer {
+        Err(_) => {}
+        Ok(consumer) => {
+            let got = consumer.receive().await;
+            assert!(
+                got.is_err(),
+                "receive() must surface Err after the subscribe give-up, not block forever \
+                 (issue #302); got {got:?}"
+            );
+        }
+    }
+    assert!(
+        state.subscribes.load(Ordering::SeqCst) >= 2,
+        "the subscribe retry leg must re-arm across MULTIPLE transient rejects before \
+         giving up (saw {} subscribes)",
+        state.subscribes.load(Ordering::SeqCst),
+    );
+
+    client.close().await;
+}
+
+#[derive(Default)]
+struct ReceiveAcrossDropGating {
+    subscribes: AtomicU32,
+}
+
+/// Two-session supervised broker for the #299 receive-across-drop test. Mirror
+/// of the tokio engine's `run_receive_across_drop_broker`.
+async fn run_receive_across_drop_broker(
+    listener: TcpListener,
+    state: Arc<ReceiveAcrossDropGating>,
+    consumer_id: u64,
+) {
+    // Session 1: ack subscribe, drop on the initial flow.
+    if let Ok((mut s1, _)) = listener.accept().await {
+        let st = Arc::clone(&state);
+        serve_conn(&mut s1, move |frame, out| {
+            match pb::base_command::Type::try_from(frame.command.r#type) {
+                Ok(pb::base_command::Type::Connect) => emit_connected(out),
+                Ok(pb::base_command::Type::Lookup) => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(out, l.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Subscribe) => {
+                    if let Some(sub) = &frame.command.subscribe {
+                        st.subscribes.fetch_add(1, Ordering::SeqCst);
+                        emit_subscribe_success(out, sub.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Flow) => return false,
+                Ok(pb::base_command::Type::Ping) => emit_pong(out),
+                _ => {}
+            }
+            true
+        })
+        .await;
+        drop(s1);
+    }
+
+    for _ in 0..2 {
+        let Ok((s_dead, _)) = listener.accept().await else {
+            return;
+        };
+        drop(s_dead);
+    }
+
+    // Session 2: re-ack subscribe, deliver one message on the rebuild flow.
+    if let Ok((mut s2, _)) = listener.accept().await {
+        let st = Arc::clone(&state);
+        serve_conn(&mut s2, move |frame, out| {
+            match pb::base_command::Type::try_from(frame.command.r#type) {
+                Ok(pb::base_command::Type::Connect) => emit_connected(out),
+                Ok(pb::base_command::Type::Lookup) => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(out, l.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Subscribe) => {
+                    if let Some(sub) = &frame.command.subscribe {
+                        st.subscribes.fetch_add(1, Ordering::SeqCst);
+                        emit_subscribe_success(out, sub.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Flow) => {
+                    emit_message_frame(out, ConsumerHandle(consumer_id), 1, b"after-reconnect");
+                }
+                Ok(pb::base_command::Type::Ping) => emit_pong(out),
+                _ => {}
+            }
+            true
+        })
+        .await;
+    }
+}
+
+/// #299 (moonpool integration): 1:1 twin of the tokio
+/// `receive_across_supervised_drop_resolves_with_message_not_closed`. A
+/// `receive()` outstanding across a supervised drop must re-park during the
+/// recoverable `Failed` window and resolve with the post-reconnect message,
+/// NOT `Err(Closed)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_across_supervised_drop_resolves_with_message_not_closed() {
+    const CONSUMER_ID: u64 = 0;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(ReceiveAcrossDropGating::default());
+    tokio::spawn(run_receive_across_drop_broker(
+        listener,
+        Arc::clone(&state),
+        CONSUMER_ID,
+    ));
+
+    let config = ConnectionConfig {
+        supervisor: Some(magnetar_proto::SupervisorConfig {
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(250),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = tokio::time::timeout(
+        Duration::from_secs(5),
+        Client::connect_plain_supervised(&engine, &addr.to_string(), config, None, None),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect must succeed");
+
+    let consumer = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/recv-across-drop".to_owned(),
+            subscription: "recv-299".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe must succeed");
+
+    let msg = tokio::time::timeout(Duration::from_secs(20), consumer.receive())
+        .await
+        .expect("receive() must resolve after the supervised reconnect, not hang")
+        .expect(
+            "receive() must transparently resume across a supervised reconnect and deliver \
+             the post-reconnect message, NOT surface Err(Closed) during the recoverable \
+             Failed window (issue #299)",
+        );
+    assert_eq!(
+        msg.payload.as_ref(),
+        b"after-reconnect",
+        "the receive() must resolve with the message delivered on the rebuilt session"
+    );
+    assert!(
+        state.subscribes.load(Ordering::SeqCst) >= 2,
+        "the subscribe must be replayed on the rebuilt session (saw {} subscribes)",
+        state.subscribes.load(Ordering::SeqCst),
     );
 
     client.close().await;

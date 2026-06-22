@@ -243,6 +243,30 @@ impl core::fmt::Debug for Connection {
 /// Everything else (auth failures, fenced producer, "topic already deleted", quota
 /// exceeded, …) stays on the permanent-failure path so the user-facing future surfaces
 /// the error instead of silently looping.
+/// Maximum number of consecutive transient `CommandProducer` /
+/// `CommandSubscribe` rejections the state machine answers with a lookup +
+/// retry before declaring the open TERMINAL (issue #302). Each transient
+/// rejection bumps the per-handle attempt counter
+/// ([`crate::producer::ProducerState::transient_open_attempts`] /
+/// [`crate::consumer::ConsumerState::transient_subscribe_attempts`]); once the
+/// counter crosses this cap the state machine stops emitting the recoverable
+/// `*FailedTransient` event and instead installs a terminal failure
+/// ([`Connection::fail_producer_open`] / [`Connection::fail_consumer_subscribe`])
+/// so the parked `send()` / `receive()` future surfaces an `Err` instead of
+/// hanging forever. The runtime drivers size their exponential backoff between
+/// attempts off the same counter, so this cap together with
+/// [`crate::Backoff`]'s `max` bounds the worst-case give-up latency. Mirrors
+/// the bounded-retry shape of Java `ProducerImpl#connectionFailed` /
+/// `ConsumerImpl#connectionFailed`, which give up after
+/// `maxReconnectAttempts` (default unbounded only when the user opts in;
+/// magnetar bounds it so a permanently-fenced bundle cannot strand a handle).
+///
+/// Sized together with the engines' `transient_retry_delay` backoff
+/// (2 s initial, capped at 8 s) so the worst-case give-up window —
+/// `~2+4+8×6 ≈ 54 s` — lands in the same ballpark as Java's default 30 s
+/// `operationTimeout` give-up, rather than minutes.
+pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
+
 fn is_transient_open_error(code: i32) -> bool {
     matches!(
         pb::ServerError::try_from(code),
@@ -1010,6 +1034,192 @@ impl Connection {
         });
     }
 
+    /// Install a TERMINAL failure for a SINGLE producer handle whose open could
+    /// not be recovered — the transient-retry budget
+    /// ([`MAX_TRANSIENT_OPEN_RETRIES`]) was exhausted (issue #302). Scoped
+    /// per-handle counterpart of [`Self::fail_all_pending`] step (2): it drains
+    /// every staged / in-flight `OpSend` for this producer WITHOUT a replay
+    /// snapshot (there is no recoverable session to replay onto), installs an
+    /// [`OpOutcome::Terminal`] on each `Send` key, flips the slot's `closed`
+    /// flag so any later `queue_send` fast-fails with `ProducerError::Closed`
+    /// instead of registering a doomed pending op, wakes each parked send
+    /// waker so `Producer::send` resolves `Err(PeerClosed)` promptly, drops the
+    /// producer state so it is not re-emitted on the next reconnect, and pushes
+    /// a [`ConnectionEvent::ProducerOpenFailed`] so an open future parked on the
+    /// event stream also observes the terminal disposition.
+    ///
+    /// Before this method existed, a one-shot transient retry that gave up left
+    /// the per-slot `broker_ready` gate closed forever:
+    /// [`Self::drain_producer_outbound`] refuses to flush staged frames while
+    /// `!broker_ready`, so `send()` stayed PENDING with no error and no
+    /// progress. Surfacing the terminal error lets caller-side
+    /// reconnect/rebuild logic fire.
+    ///
+    /// Lock-ordering (ADR-0038): the global connection mutex is held by the
+    /// `&mut self` receiver; each per-slot mutex is taken BELOW it in a single
+    /// acquisition, and the guard is dropped before user wakers fire.
+    pub fn fail_producer_open(&mut self, handle: ProducerHandle, reason: &str) {
+        // Drain + terminalize every pending send under the per-slot lock,
+        // flip `closed` in the same scope, then wake outside the lock.
+        let drained = self.producers.get(&handle).map(|slot| {
+            let mut slot_state = slot.state.lock();
+            slot_state.closed = true;
+            slot_state.broker_ready = false;
+            slot_state.drain_pending_sends()
+        });
+        if let Some(drained) = drained {
+            for (seq, waker_opt) in drained {
+                let key = PendingOpKey::Send(handle, seq);
+                self.outcomes.insert(
+                    key,
+                    OpOutcome::Terminal {
+                        key,
+                        reason: reason.to_owned(),
+                    },
+                );
+                if let Some(w) = waker_opt {
+                    let _ = self.wakers.remove(&key);
+                    w.wake();
+                } else if let Some(w) = self.wakers.remove(&key) {
+                    w.wake();
+                }
+            }
+        }
+        // Drop the now-dead producer state so a subsequent reconnect rebuild
+        // does not re-emit a `CommandProducer` for a handle the user has been
+        // told is terminally failed.
+        self.producers.remove(&handle);
+        self.producer_create_requests.remove(&handle);
+        self.in_flight_publish_snapshots.remove(&handle);
+        self.events.push_back(ConnectionEvent::ProducerOpenFailed {
+            handle,
+            // `MetadataError` is the canonical "the broker never managed to
+            // serve this bundle" transient code; we reached the cap on it.
+            code: pb::ServerError::MetadataError as i32,
+            message: reason.to_owned(),
+        });
+    }
+
+    /// Install a TERMINAL failure for a SINGLE consumer handle whose subscribe
+    /// could not be recovered — the transient-retry budget
+    /// ([`MAX_TRANSIENT_OPEN_RETRIES`]) was exhausted (issue #302). Sets the
+    /// per-consumer [`crate::consumer::ConsumerState::terminal_failure`] marker
+    /// so [`Self::consumer_handle_is_terminal`] returns `true` for this handle,
+    /// drains + wakes every parked `receive()` waker so the future re-polls and
+    /// resolves `Err` (instead of blocking forever on a subscription that will
+    /// never reattach — `available_permits` stays `0`), drops the per-session
+    /// subscribe request so a reconnect rebuild does not re-attach it, and
+    /// pushes a [`ConnectionEvent::SubscribeFailed`] so an open future parked on
+    /// the event stream also observes the terminal disposition.
+    ///
+    /// This is the consumer twin of [`Self::fail_producer_open`]. Receive
+    /// futures distinguish this genuinely-terminal state from a recoverable
+    /// supervised `Failed` window (issue #299) via
+    /// [`Self::consumer_handle_is_terminal`]: a recoverable `Failed` re-parks,
+    /// a terminal failure resolves `Err`.
+    ///
+    /// Lock-ordering (ADR-0038): global mutex held by `&mut self`; the per-slot
+    /// mutex is taken below it, and the receive wakers fire after the slot lock
+    /// is dropped.
+    pub fn fail_consumer_subscribe(&mut self, handle: ConsumerHandle, reason: &str) {
+        // Set the terminal marker + drain the parked receive wakers under the
+        // slot lock, then wake them outside it.
+        let wakers: Vec<std::task::Waker> = match self.consumers.get(&handle) {
+            Some(slot) => {
+                let mut c = slot.state.lock();
+                c.terminal_failure = Some(reason.to_owned());
+                c.available_permits = 0;
+                c.receive_wakers.drain().collect()
+            }
+            None => Vec::new(),
+        };
+        for w in wakers {
+            w.wake();
+        }
+        // Drop the per-session subscribe request so a reconnect rebuild does
+        // not re-attach a consumer the user has been told is terminally
+        // failed. The `ConsumerState` slot itself is RETAINED so a parked
+        // `receive()` future can still read `terminal_failure` on re-poll.
+        self.consumer_subscribe_requests.remove(&handle);
+        self.events.push_back(ConnectionEvent::SubscribeFailed {
+            handle,
+            code: pb::ServerError::MetadataError as i32,
+            message: reason.to_owned(),
+        });
+    }
+
+    /// `true` only when the connection is GENUINELY terminal for *every* handle
+    /// — there is no recovery path left: the user asked for a graceful close
+    /// ([`Self::is_user_closed`]), OR the transport is `Failed` AND no
+    /// supervisor is configured to reconnect it.
+    ///
+    /// Distinct from [`Self::is_closed`], which also returns `true` for the
+    /// TRANSIENT `Failed` window a supervisor walks through between
+    /// [`Self::mark_disconnected`] and its [`Self::reset`] + re-handshake.
+    /// Issue #299: a `receive()` / `send()` future woken across a transport
+    /// drop must re-park (not error) while that window is recoverable, and only
+    /// surface `Err` once the state is truly terminal. The receive futures gate
+    /// on [`Self::consumer_handle_is_terminal`] (which also folds in a
+    /// per-handle terminal failure from [`Self::fail_consumer_subscribe`]); the
+    /// send futures already re-park naturally on a `Send` key staying PENDING
+    /// and surface `Err` on the [`OpOutcome::Terminal`] that
+    /// [`Self::fail_producer_open`] installs.
+    #[must_use]
+    pub fn is_terminally_closed(&self) -> bool {
+        if self.is_user_closed() {
+            return true;
+        }
+        matches!(self.state, HandshakeState::Failed) && self.supervisor_config().is_none()
+    }
+
+    /// `true` when a `receive()` on this consumer handle must resolve a terminal
+    /// `Err` instead of re-parking — the connection is terminally closed
+    /// ([`Self::is_terminally_closed`]), OR a per-handle terminal subscribe
+    /// failure has been installed ([`Self::fail_consumer_subscribe`], issue
+    /// #302), OR the handle is no longer registered (closed / removed).
+    ///
+    /// Returns `false` for a recoverable supervised `Failed` window so a
+    /// `receive()` woken by [`Self::reset`] (which drains the parked receive
+    /// wakers WHILE still `Failed`) re-parks and transparently resumes once the
+    /// supervisor reconnects + the rebuild replays `CommandSubscribe` (issue
+    /// #299).
+    #[must_use]
+    pub fn consumer_handle_is_terminal(&self, handle: ConsumerHandle) -> bool {
+        if self.is_terminally_closed() {
+            return true;
+        }
+        match self.consumers.get(&handle) {
+            Some(slot) => {
+                let c = slot.state.lock();
+                c.closed || c.terminal_failure.is_some()
+            }
+            // Unknown handle ⇒ treat as terminal (mirrors `consumer_is_closed`).
+            None => true,
+        }
+    }
+
+    /// Number of consecutive transient `CommandProducer` rejections recorded
+    /// for this producer since its last success (issue #302). The runtime
+    /// drivers read this to size their exponential-backoff sleep before the
+    /// next lookup + retry. Returns `0` for an unknown handle.
+    #[must_use]
+    pub fn producer_transient_open_attempts(&self, handle: ProducerHandle) -> u32 {
+        self.producers
+            .get(&handle)
+            .map_or(0, |slot| slot.state.lock().transient_open_attempts)
+    }
+
+    /// Number of consecutive transient `CommandSubscribe` rejections recorded
+    /// for this consumer since its last success (issue #302). The runtime
+    /// drivers read this to size their exponential-backoff sleep before the
+    /// next lookup + retry. Returns `0` for an unknown handle.
+    #[must_use]
+    pub fn consumer_transient_subscribe_attempts(&self, handle: ConsumerHandle) -> u32 {
+        self.consumers
+            .get(&handle)
+            .map_or(0, |slot| slot.state.lock().transient_subscribe_attempts)
+    }
+
     /// Reason the last handshake attempt failed, if the broker sent a
     /// `CommandError` while in `ConnectSent` / `AuthChallenging` state.
     /// Engines surface this in the user-facing connect error so
@@ -1743,6 +1953,10 @@ impl Connection {
                             producer.replay_snapshots(snapshots);
                         }
                         producer.broker_ready = true;
+                        // The re-attach succeeded — clear the transient-retry
+                        // budget so a future bundle reshuffle starts its backoff
+                        // schedule fresh (issue #302).
+                        producer.transient_open_attempts = 0;
                         tracing::debug!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
@@ -1798,6 +2012,12 @@ impl Connection {
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
                     self.events
                         .push_back(ConnectionEvent::SubscribeAcked { handle });
+                    // The (re-)subscribe succeeded — clear the transient-retry
+                    // budget so a future bundle reshuffle starts its backoff
+                    // schedule fresh (issue #302).
+                    if let Some(slot) = self.consumers.get(&handle) {
+                        slot.state.lock().transient_subscribe_attempts = 0;
+                    }
                     // ADR-0028 anti-thrash: feed the successful subscribe ack into
                     // the detector. No-op when the detector is disabled (default).
                     self.record_reattach_outcome(
@@ -1923,15 +2143,52 @@ impl Connection {
                             // staged send reaches the wire before the retry's
                             // `ProducerSuccess` (the broker closes the whole
                             // connection on a send to a not-ready producer).
-                            if let Some(slot) = self.producers.get(&handle) {
-                                slot.state.lock().broker_ready = false;
-                            }
-                            self.events
-                                .push_back(ConnectionEvent::ProducerOpenFailedTransient {
+                            //
+                            // Bump the per-handle attempt counter under the same
+                            // slot lock. Once it crosses
+                            // [`MAX_TRANSIENT_OPEN_RETRIES`] the one-shot retry has
+                            // re-failed too many times (issue #302): stop emitting
+                            // the recoverable `*Transient` event — which would
+                            // re-arm the driver's lookup+retry leg forever — and
+                            // install a TERMINAL failure so the parked `send()`
+                            // future surfaces `Err(PeerClosed)` instead of hanging.
+                            let attempts = {
+                                let mut slot_state =
+                                    self.producers.get(&handle).map(|slot| slot.state.lock());
+                                match slot_state.as_mut() {
+                                    Some(s) => {
+                                        s.broker_ready = false;
+                                        s.transient_open_attempts =
+                                            s.transient_open_attempts.saturating_add(1);
+                                        s.transient_open_attempts
+                                    }
+                                    // Producer already gone (closed between the
+                                    // broker error and here) — nothing to retry.
+                                    None => u32::MAX,
+                                }
+                            };
+                            if attempts > MAX_TRANSIENT_OPEN_RETRIES {
+                                tracing::warn!(
+                                    target: "magnetar_proto::conn",
+                                    handle = ?handle,
+                                    code = err.error,
+                                    attempts,
+                                    "producer-open transient retry budget exhausted; \
+                                     surfacing terminal failure"
+                                );
+                                self.fail_producer_open(
                                     handle,
-                                    code: err.error,
-                                    message: err.message.clone(),
-                                });
+                                    "producer-open transient retry budget exhausted",
+                                );
+                            } else {
+                                self.events.push_back(
+                                    ConnectionEvent::ProducerOpenFailedTransient {
+                                        handle,
+                                        code: err.error,
+                                        message: err.message.clone(),
+                                    },
+                                );
+                            }
                         } else {
                             self.producers.remove(&handle);
                             self.producer_create_requests.remove(&handle);
@@ -1944,12 +2201,44 @@ impl Connection {
                     }
                     Some(PendingRequestKind::ConsumerSubscribe { handle }) => {
                         if is_transient_open_error(err.error) {
-                            self.events
-                                .push_back(ConnectionEvent::SubscribeFailedTransient {
+                            // Bump the per-handle attempt counter; give up
+                            // terminally once it crosses the cap (issue #302 —
+                            // companion to the producer arm above). A terminal
+                            // give-up installs a per-consumer terminal failure +
+                            // wakes parked `receive()` wakers so the future
+                            // resolves `Err` instead of blocking forever on a
+                            // subscription that will never come back.
+                            let attempts = match self.consumers.get(&handle) {
+                                Some(slot) => {
+                                    let mut c = slot.state.lock();
+                                    c.transient_subscribe_attempts =
+                                        c.transient_subscribe_attempts.saturating_add(1);
+                                    c.transient_subscribe_attempts
+                                }
+                                // Consumer already gone — nothing to retry.
+                                None => u32::MAX,
+                            };
+                            if attempts > MAX_TRANSIENT_OPEN_RETRIES {
+                                tracing::warn!(
+                                    target: "magnetar_proto::conn",
+                                    handle = ?handle,
+                                    code = err.error,
+                                    attempts,
+                                    "consumer-subscribe transient retry budget exhausted; \
+                                     surfacing terminal failure"
+                                );
+                                self.fail_consumer_subscribe(
                                     handle,
-                                    code: err.error,
-                                    message: err.message.clone(),
-                                });
+                                    "consumer-subscribe transient retry budget exhausted",
+                                );
+                            } else {
+                                self.events
+                                    .push_back(ConnectionEvent::SubscribeFailedTransient {
+                                        handle,
+                                        code: err.error,
+                                        message: err.message.clone(),
+                                    });
+                            }
                         } else {
                             self.consumers.remove(&handle);
                             self.consumer_subscribe_requests.remove(&handle);
@@ -7046,6 +7335,415 @@ mod conn_state_tests {
         assert!(
             !conn.has_pending_request_for_test(request_id),
             "pending request slot freed"
+        );
+    }
+
+    // ============================================================================
+    // Issue #302 — bounded transient retry: repeated transient open / subscribe
+    // failures must back off and eventually SURFACE a terminal error to the
+    // parked send / receive future instead of giving up forever (one-shot
+    // retry) or re-arming forever. The per-handle attempt counter bumps on each
+    // transient rejection and a give-up past `MAX_TRANSIENT_OPEN_RETRIES`
+    // terminalizes the handle, waking the parked waker.
+    // ============================================================================
+
+    /// Feed a transient `CommandError` correlated with `request_id` into `conn`.
+    fn feed_transient_error(conn: &mut Connection, request_id: RequestId) {
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: request_id.0,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "namespace bundle not served".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode CommandError");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandError");
+    }
+
+    /// #302 (proto unit, producer): the FIRST transient producer-open failure
+    /// bumps the attempt counter to 1 and re-emits a recoverable
+    /// `ProducerOpenFailedTransient`; a SECOND transient failure on the retry
+    /// bumps it to 2 and re-emits again (proving the retry re-arms across
+    /// MULTIPLE failures — no existing test exercised a repeated transient
+    /// failure). Driving the counter past `MAX_TRANSIENT_OPEN_RETRIES` then
+    /// terminalizes the open: the parked `send()` future's waker fires and the
+    /// `Send` outcome flips to `Terminal` (so `send()` returns `Err` instead of
+    /// hanging on the closed `broker_ready` drain gate forever).
+    #[test]
+    fn transient_producer_open_retries_then_terminalizes_and_wakes_send() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Open a producer; the broker bounces the open with a transient code.
+        let mut request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/no-bundle".to_owned(),
+            ..Default::default()
+        });
+
+        // A staged send parks a user waker on the Send key. It can never flow
+        // while `broker_ready` is false (the drain gate), so its future stays
+        // PENDING until the open terminalizes (issue #302's hang).
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&counter).into();
+        let seq = conn
+            .send(
+                handle,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"hi"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 2,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("send queues");
+        let send_key = PendingOpKey::Send(handle, seq);
+        conn.register_waker(send_key, waker);
+
+        // First transient rejection → attempt 1, recoverable event re-emitted.
+        feed_transient_error(&mut conn, request_id);
+        assert_eq!(conn.producer_transient_open_attempts(handle), 1);
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ProducerOpenFailedTransient { .. })
+        ));
+
+        // Drive a SECOND retry + transient rejection: re-issue the open (as the
+        // engine's retry leg would) and bounce it again. Attempt → 2, still
+        // recoverable.
+        let _ = drain_outbound_commands(&mut conn);
+        request_id = conn
+            .retry_producer_open(handle)
+            .expect("retry re-issues open");
+        feed_transient_error(&mut conn, request_id);
+        assert_eq!(conn.producer_transient_open_attempts(handle), 2);
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ProducerOpenFailedTransient { .. })
+        ));
+
+        // Now exhaust the budget: keep re-issuing + bouncing until the counter
+        // crosses `MAX_TRANSIENT_OPEN_RETRIES`. The crossing event must be a
+        // TERMINAL `ProducerOpenFailed`, NOT another transient.
+        let mut saw_terminal = false;
+        for _ in 0..(MAX_TRANSIENT_OPEN_RETRIES + 4) {
+            let _ = drain_outbound_commands(&mut conn);
+            let Some(rid) = conn.retry_producer_open(handle) else {
+                // Producer was removed by the terminal give-up.
+                break;
+            };
+            feed_transient_error(&mut conn, rid);
+            match conn.poll_event() {
+                Some(ConnectionEvent::ProducerOpenFailed { handle: h, .. }) => {
+                    assert_eq!(h, handle);
+                    saw_terminal = true;
+                    break;
+                }
+                Some(ConnectionEvent::ProducerOpenFailedTransient { .. }) => {}
+                other => panic!("unexpected event during retry loop: {other:?}"),
+            }
+        }
+        assert!(
+            saw_terminal,
+            "transient retries must terminalize once the budget is exhausted"
+        );
+
+        // The parked send waker fired and the Send key now resolves Terminal so
+        // `send()` returns Err — no permanent hang.
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "parked send waker must fire on terminal give-up"
+        );
+        assert!(
+            matches!(
+                conn.take_outcome(send_key),
+                Some(OpOutcome::Terminal { .. })
+            ),
+            "staged send surfaces Terminal so send() returns Err"
+        );
+        assert!(
+            conn.producer(handle).is_none(),
+            "terminal give-up drops the producer state"
+        );
+    }
+
+    /// #302 (proto unit, consumer): the twin of the producer test. Repeated
+    /// transient subscribe failures bump the attempt counter; the give-up past
+    /// the cap installs a per-consumer terminal failure, wakes the parked
+    /// `receive()` waker, and makes `consumer_handle_is_terminal` return true
+    /// (so `receive()` resolves `Err` instead of blocking on a subscription
+    /// that will never reattach with `available_permits = 0`).
+    #[test]
+    fn transient_subscribe_retries_then_terminalizes_and_wakes_receive() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let mut request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/no-bundle".to_owned(),
+            subscription: "retry-302".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+
+        // Park a receive waker on the consumer (the future that would hang).
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&counter).into();
+        conn.register_consumer_receive_waker(handle, waker)
+            .expect("register receive waker");
+
+        // First transient → attempt 1, recoverable.
+        feed_transient_error(&mut conn, request_id);
+        assert_eq!(conn.consumer_transient_subscribe_attempts(handle), 1);
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::SubscribeFailedTransient { .. })
+        ));
+        assert!(
+            !conn.consumer_handle_is_terminal(handle),
+            "a recoverable transient subscribe must NOT be terminal"
+        );
+
+        // Exhaust the budget.
+        let mut saw_terminal = false;
+        for _ in 0..(MAX_TRANSIENT_OPEN_RETRIES + 4) {
+            let _ = drain_outbound_commands(&mut conn);
+            let Some(rid) = conn.retry_consumer_subscribe(handle) else {
+                break;
+            };
+            request_id = rid;
+            feed_transient_error(&mut conn, request_id);
+            match conn.poll_event() {
+                Some(ConnectionEvent::SubscribeFailed { handle: h, .. }) => {
+                    assert_eq!(h, handle);
+                    saw_terminal = true;
+                    break;
+                }
+                Some(ConnectionEvent::SubscribeFailedTransient { .. }) => {}
+                other => panic!("unexpected event during subscribe retry loop: {other:?}"),
+            }
+        }
+        assert!(
+            saw_terminal,
+            "transient subscribe retries must terminalize once the budget is exhausted"
+        );
+
+        // The parked receive waker fired, the handle is now terminal, and the
+        // consumer slot is RETAINED so the parked future can read the marker.
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "parked receive waker must fire on terminal give-up"
+        );
+        assert!(
+            conn.consumer_handle_is_terminal(handle),
+            "terminal give-up makes the handle terminal so receive() returns Err"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "terminal give-up leaves no broker permits"
+        );
+    }
+
+    // ============================================================================
+    // Issue #299 — recoverable-vs-terminal receive gating: a consumer parked in
+    // `receive()` across a transport drop must distinguish a TRANSIENT,
+    // supervisor-recoverable `Failed` window (re-park) from a GENUINELY terminal
+    // state (resolve Err). `is_terminally_closed` / `consumer_handle_is_terminal`
+    // encode that distinction.
+    // ============================================================================
+
+    /// #299 (proto unit): `is_terminally_closed` is FALSE for a supervised
+    /// `Failed` window (recoverable — the receive future must re-park) and TRUE
+    /// for a non-supervised `Failed` (terminal — the receive future must Err).
+    /// This is the predicate the runtime receive guard switched to (replacing
+    /// the old blanket `is_closed()`, which erroneously errored during the
+    /// recoverable window).
+    #[test]
+    fn is_terminally_closed_distinguishes_recoverable_failed_from_terminal() {
+        // Supervised connection: a `Failed` window is RECOVERABLE.
+        let supervised_cfg = ConnectionConfig {
+            supervisor: Some(crate::supervisor::SupervisorConfig::default()),
+            ..ConnectionConfig::default()
+        };
+        let mut supervised = Connection::new(
+            supervised_cfg,
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        supervised.begin_handshake().expect("handshake");
+        supervised
+            .handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        supervised.mark_disconnected();
+        assert_eq!(supervised.state(), HandshakeState::Failed);
+        assert!(
+            supervised.is_closed(),
+            "is_closed() is true for Failed (the old, too-coarse guard)"
+        );
+        assert!(
+            !supervised.is_terminally_closed(),
+            "a SUPERVISED Failed window is recoverable — receive() must re-park"
+        );
+
+        // Non-supervised connection: a `Failed` window is TERMINAL.
+        let mut plain = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        plain.begin_handshake().expect("handshake");
+        plain
+            .handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        plain.mark_disconnected();
+        assert_eq!(plain.state(), HandshakeState::Failed);
+        assert!(
+            plain.is_terminally_closed(),
+            "a NON-supervised Failed is terminal — receive() must Err"
+        );
+    }
+
+    /// #299 (proto unit): a consumer parked in `receive()` across a transport
+    /// drop on a SUPERVISED connection re-parks (`consumer_handle_is_terminal`
+    /// is false) during the recoverable `Failed` window — even though `reset()`
+    /// drains + wakes the parked receive waker while still `Failed`. After the
+    /// supervisor re-handshakes + replays the subscribe, a delivered message
+    /// pops normally. The companion branch — a per-handle terminal failure
+    /// (#302) — DOES make the handle terminal.
+    #[test]
+    fn consumer_handle_terminal_false_during_recoverable_failed_true_on_terminal() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let cfg = ConnectionConfig {
+            supervisor: Some(crate::supervisor::SupervisorConfig::default()),
+            ..ConnectionConfig::default()
+        };
+        let mut conn = Connection::new(cfg, std::sync::Arc::new(std::time::SystemTime::now));
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/recoverable".to_owned(),
+            subscription: "recover-299".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        // Ack the subscribe so the consumer is live.
+        let ok = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ok).expect("encode CommandSuccess");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandSuccess");
+        while conn.poll_event().is_some() {}
+
+        // Park a receive waker, then drop the transport.
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&counter).into();
+        conn.register_consumer_receive_waker(handle, waker)
+            .expect("register receive waker");
+        // Transport drop → `Failed`. A receive future re-polled here (e.g. woken
+        // by `fail_all_pending` on a per-attempt drop, or simply re-scheduled)
+        // must NOT see a terminal handle: the supervisor will reconnect.
+        conn.mark_disconnected();
+        assert_eq!(conn.state(), HandshakeState::Failed);
+        assert!(
+            !conn.consumer_handle_is_terminal(handle),
+            "recoverable supervised Failed must NOT be terminal — receive() re-parks \
+             (issue #299: the old is_closed()-based guard erroneously Err'd here)"
+        );
+
+        // `reset()` drains + wakes the parked receive waker (the canonical
+        // wake-across-drop the bug report hit) and snaps the state to
+        // `Uninitialized` for the fresh handshake. The woken future re-polls and
+        // STILL sees a non-terminal handle, so it re-parks instead of erroring.
+        conn.reset();
+        assert_eq!(conn.state(), HandshakeState::Uninitialized);
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "reset() wakes the parked receive future"
+        );
+        assert!(
+            !conn.consumer_handle_is_terminal(handle),
+            "recoverable Uninitialized (post-reset, pre-handshake) must NOT be terminal"
+        );
+
+        // Now the OTHER branch: a per-handle terminal failure makes it terminal.
+        conn.fail_consumer_subscribe(handle, "test terminal");
+        assert!(
+            conn.consumer_handle_is_terminal(handle),
+            "an installed terminal failure makes the handle terminal — receive() Errs"
         );
     }
 

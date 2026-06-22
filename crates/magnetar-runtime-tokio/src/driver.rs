@@ -254,13 +254,29 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 );
                 let shared_for_retry = shared.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Exponential backoff (issue #302): the fixed 2s one-shot
+                    // retry gave up after a single attempt, stranding `send()`
+                    // PENDING forever. Size the sleep off the proto-tracked
+                    // attempt counter so repeated transient failures back off,
+                    // and let the proto layer terminalize the open once it
+                    // crosses `MAX_TRANSIENT_OPEN_RETRIES` (which wakes the
+                    // parked send with `Err(PeerClosed)`). Each transient event
+                    // re-arms this leg, so the loop lives across driver
+                    // iterations; this leg handles ONE attempt.
+                    let attempts = shared_for_retry
+                        .inner
+                        .lock()
+                        .producer_transient_open_attempts(handle);
+                    tokio::time::sleep(transient_retry_delay(attempts)).await;
                     let topic = shared_for_retry
                         .inner
                         .lock()
                         .producer_topic(handle)
                         .map(str::to_owned);
                     let Some(topic) = topic else { return };
+                    // A retry-path lookup landing an "unexpected outcome" is
+                    // RETRYABLE, not fatal (issue #302): just bail this leg; the
+                    // next transient event (or the proto cap) drives progress.
                     if !lookup_then(&shared_for_retry, &topic).await {
                         return;
                     }
@@ -288,7 +304,17 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 );
                 let shared_for_retry = shared.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Exponential backoff (issue #302) — consumer twin of the
+                    // producer-open arm above. Repeated transient subscribe
+                    // rejections back off; the proto layer terminalizes the
+                    // subscribe once the attempt counter crosses
+                    // `MAX_TRANSIENT_OPEN_RETRIES`, which wakes the parked
+                    // `receive()` with an `Err` instead of blocking forever.
+                    let attempts = shared_for_retry
+                        .inner
+                        .lock()
+                        .consumer_transient_subscribe_attempts(handle);
+                    tokio::time::sleep(transient_retry_delay(attempts)).await;
                     let topic = shared_for_retry
                         .inner
                         .lock()
@@ -392,6 +418,34 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
 /// `retry_*` that will re-fail if the bundle is still not served). Used by the
 /// transient-error retry path (see #71 + #72) to force the broker to (re)acquire
 /// namespace bundle ownership before we re-attach the producer / consumer.
+/// Exponential-backoff delay for the `attempts`-th transient producer-open /
+/// subscribe retry (issue #302). Steps a fresh [`magnetar_proto::Backoff`]
+/// `attempts` times so each successive transient rejection waits longer (the
+/// pre-fix code used a fixed 2s on the single attempt it made before giving up
+/// forever). `attempts` is the proto-tracked counter — `1` on the first
+/// rejection — so a `0` is treated as the first step. The schedule is bounded
+/// by `Backoff`'s `max`, and the proto layer caps the number of attempts at
+/// [`magnetar_proto::MAX_TRANSIENT_OPEN_RETRIES`], so the worst-case give-up
+/// latency is bounded. The moonpool engine derives the same delay from the
+/// same counter (ADR-0024).
+fn transient_retry_delay(attempts: u32) -> std::time::Duration {
+    // Seed from the original fixed 2s delay (now the FIRST step) so attempt #1
+    // keeps the pre-fix cadence and later attempts grow, capped at 4× the
+    // initial (8s). 1:1 with the moonpool engine's `transient_retry_delay`.
+    let initial = std::time::Duration::from_secs(2);
+    let mut backoff = magnetar_proto::Backoff::new(
+        initial,
+        initial.saturating_mul(4),
+        magnetar_proto::backoff::DEFAULT_MANDATORY_STOP,
+        0,
+    );
+    let mut delay = backoff.next();
+    for _ in 1..attempts {
+        delay = backoff.next();
+    }
+    delay
+}
+
 async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
     use magnetar_proto::OpOutcome;
 

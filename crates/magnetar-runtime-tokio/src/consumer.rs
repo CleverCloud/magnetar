@@ -1271,14 +1271,26 @@ impl Future for ReceiveFut {
         loop {
             let mut conn = shared.inner.lock();
             let Some(mut msg) = conn.pop_message(handle) else {
-                // No message ready. First, check whether the connection or
-                // the consumer has already been closed — `close()` on a cloned
-                // handle flips `consumer_is_closed` synchronously and drains
-                // every parked waker BEFORE we install ours. Without this
-                // pre-check the freshly-installed slab slot would never be
-                // woken, parking the receive future forever. Mirrors the
-                // moonpool `ReceiveFut::poll` close-race guard.
-                if conn.is_closed() || conn.consumer_is_closed(handle) {
+                // No message ready. First, check whether this consumer handle
+                // has reached a GENUINELY-terminal state — a graceful close, a
+                // non-supervised `Failed`, a per-handle terminal subscribe
+                // failure (issue #302), or the slot being removed. `close()` on
+                // a cloned handle flips this synchronously and drains every
+                // parked waker BEFORE we install ours; without the pre-check the
+                // freshly-installed slab slot would never be woken, parking the
+                // receive future forever.
+                //
+                // CRITICAL (issue #299): we gate on
+                // `consumer_handle_is_terminal`, NOT `is_closed()`. A transport
+                // drop sets `HandshakeState::Failed` for the WHOLE supervised
+                // backoff + redial + re-handshake window, and `reset()` wakes
+                // the parked receive wakers WHILE still `Failed`. The old
+                // `is_closed()` guard erroneously resolved `Err(Closed)` during
+                // that recoverable window; gating on the terminal predicate
+                // re-parks instead, so `receive()` transparently resumes once
+                // the supervisor reconnects and the rebuild replays
+                // `CommandSubscribe`.
+                if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
                     if let Some(old_key) = this.slab_key.take() {
                         conn.cancel_consumer_receive_waker(handle, old_key);
                     }
@@ -1304,7 +1316,12 @@ impl Future for ReceiveFut {
                         conn.cancel_consumer_receive_waker(handle, key);
                         continue;
                     }
-                    if conn.is_closed() || conn.consumer_is_closed(handle) {
+                    // Same terminal-vs-recoverable distinction as the pre-check
+                    // above (issue #299): re-check under the lock so a terminal
+                    // close that landed between the pre-check and the slab
+                    // insert is still observed, while a recoverable `Failed`
+                    // window keeps us parked.
+                    if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
                         conn.cancel_consumer_receive_waker(handle, key);
                         return Poll::Ready(Err(ClientError::Closed));
                     }

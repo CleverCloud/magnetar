@@ -198,6 +198,28 @@ pub struct ConsumerState {
     pub receive_wakers: Slab<Waker>,
     /// Closed flag.
     pub closed: bool,
+    /// Number of consecutive transient `CommandSubscribe` rejections
+    /// (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) the broker has
+    /// returned for this consumer since the last success. Bumped by the
+    /// [`crate::Connection`] error handler on each transient subscribe
+    /// failure; reset to `0` when the re-subscribe is acked. The runtime
+    /// drivers read it via
+    /// [`crate::Connection::consumer_transient_subscribe_attempts`] to size
+    /// their exponential-backoff sleep before the next lookup + retry, and the
+    /// proto layer installs a terminal failure once it crosses
+    /// [`crate::conn::MAX_TRANSIENT_OPEN_RETRIES`] (issue #302).
+    pub transient_subscribe_attempts: u32,
+    /// `Some(reason)` once this consumer has been given a TERMINAL subscribe
+    /// failure — the transient-retry budget was exhausted (issue #302) or a
+    /// non-recoverable subscribe error landed. Installed by
+    /// [`crate::Connection::fail_consumer_subscribe`], which also wakes every
+    /// parked `receive()` waker so the future resolves `Err` instead of
+    /// hanging forever. The runtime receive futures gate on this (via
+    /// [`crate::Connection::consumer_handle_is_terminal`]) to distinguish a
+    /// genuinely-dead subscription from a transiently-`Failed` connection a
+    /// supervisor is still reconnecting (issue #299 — a recoverable `Failed`
+    /// window must NOT surface `Closed`).
+    pub terminal_failure: Option<String>,
     /// Re-attach flow gate: set by `rebuild_consumers` /
     /// `retry_consumer_subscribe` so the connection emits the initial
     /// `CommandFlow` only when the broker ACKS the re-subscribe (`Success`
@@ -513,6 +535,8 @@ impl ConsumerState {
             pending_seek: None,
             receive_wakers: Slab::new(),
             closed: false,
+            transient_subscribe_attempts: 0,
+            terminal_failure: None,
             flow_on_subscribe_ack: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),

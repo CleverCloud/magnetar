@@ -68,11 +68,13 @@ use crate::{ConnectionShared, EngineError, ObservedReplicatedSubscriptionMarker,
 /// grows.
 const READ_BUFFER_CAPACITY: usize = 64 * 1024;
 
-/// Delay before a transient producer-open / subscribe retry leg re-issues its
-/// lookup, mirroring the tokio engine's `tokio::time::sleep` of the same
-/// duration (`magnetar-runtime-tokio/src/driver.rs`). Scheduled through the
-/// injected [`TimeProvider`] — never a host clock — so under `SimProviders`
-/// the retry fires at a deterministic point in virtual time (ADR-0011).
+/// Initial delay before the FIRST transient producer-open / subscribe retry
+/// leg re-issues its lookup, mirroring the tokio engine's same initial sleep
+/// (`magnetar-runtime-tokio/src/driver.rs`). [`transient_retry_delay`] seeds a
+/// [`magnetar_proto::Backoff`] from this value and doubles it on each repeated
+/// transient rejection (issue #302). Scheduled through the injected
+/// [`TimeProvider`] — never a host clock — so under `SimProviders` the retry
+/// fires at a deterministic point in virtual time (ADR-0011).
 const TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// A transient broker rejection that the driver must answer with a delayed
@@ -416,7 +418,24 @@ fn spawn_retry_leg<P>(
     let shared = shared.clone();
     let time = time.clone();
     let _detached = task.spawn_task("magnetar-moonpool-transient-retry", async move {
-        let _ = time.sleep(TRANSIENT_RETRY_DELAY).await;
+        // Exponential backoff sized off the proto-tracked attempt counter
+        // (issue #302) — 1:1 with the tokio engine's `transient_retry_delay`
+        // (ADR-0024). The pre-fix code slept a fixed `TRANSIENT_RETRY_DELAY` on
+        // the single attempt it made before giving up forever. The sleep MUST
+        // run on the INJECTED `time` provider (never a host clock) so the retry
+        // fires at a deterministic point in virtual time (ADR-0011). The proto
+        // layer terminalizes the open / subscribe once the counter crosses
+        // `MAX_TRANSIENT_OPEN_RETRIES`, waking the parked send / receive.
+        let attempts = {
+            let conn = shared.inner.lock();
+            match req {
+                RetryRequest::Producer(handle) => conn.producer_transient_open_attempts(handle),
+                RetryRequest::Consumer(handle) => {
+                    conn.consumer_transient_subscribe_attempts(handle)
+                }
+            }
+        };
+        let _ = time.sleep(transient_retry_delay(attempts)).await;
         let topic = {
             let conn = shared.inner.lock();
             match req {
@@ -456,6 +475,34 @@ fn spawn_retry_leg<P>(
 /// module-private `client::RequestFut`): the lookup request id is registered
 /// against the proto waker slab, parked on the driver waker, and unregistered
 /// on drop so a severed session leaves no dangling `Waker`.
+/// Exponential-backoff delay for the `attempts`-th transient producer-open /
+/// subscribe retry (issue #302). 1:1 with the tokio engine's
+/// `transient_retry_delay` (ADR-0024): steps a fresh
+/// [`magnetar_proto::Backoff`] `attempts` times so each successive transient
+/// rejection waits longer, bounded by `Backoff`'s `max`. The leg sleeps this
+/// duration on the INJECTED [`TimeProvider`] so the schedule is deterministic
+/// under `SimProviders` (ADR-0011). `attempts` is the proto-tracked counter
+/// (`1` on the first rejection); a `0` is treated as the first step.
+fn transient_retry_delay(attempts: u32) -> Duration {
+    // Seed the schedule from `TRANSIENT_RETRY_DELAY` (the pre-fix fixed delay,
+    // now the FIRST step) so attempt #1 keeps the original cadence and later
+    // attempts grow. `max` is `TRANSIENT_RETRY_DELAY * 4` (8s) so the
+    // worst-case per-attempt sleep stays bounded; the `mandatory_stop` window
+    // is left at the `Backoff` default (it is not exercised within the attempt
+    // cap). 1:1 with the tokio engine.
+    let mut backoff = magnetar_proto::Backoff::new(
+        TRANSIENT_RETRY_DELAY,
+        TRANSIENT_RETRY_DELAY.saturating_mul(4),
+        magnetar_proto::backoff::DEFAULT_MANDATORY_STOP,
+        0,
+    );
+    let mut delay = backoff.next();
+    for _ in 1..attempts {
+        delay = backoff.next();
+    }
+    delay
+}
+
 async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
     let request_id = {
         let mut conn = shared.inner.lock();
