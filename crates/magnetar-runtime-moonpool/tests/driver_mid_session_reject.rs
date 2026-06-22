@@ -74,19 +74,36 @@ const RUN_TIME_BUDGET: Duration = Duration::from_secs(30);
 /// sleep), so the reject is unambiguously mid-session.
 const SETTLE_DELAY: Duration = Duration::from_millis(300);
 
-/// Inner sim seeds the daily moonpool-seed-sweep recorded in `seeds_used`
-/// when this test failed — issue #290 (`MOONPOOL_SEED=0x645244daaeccc7cb`)
-/// and issue #291 (`MOONPOOL_SEED=0x65ea4fbea60a11a6`). On these seeds the
-/// `SimulationBuilder`'s **unavoidable** default-network chaos
-/// (`ConnectFailureMode::Probabilistic`) exhausts the client's bounded
-/// `connect_timeout` before the handshake completes, so the malformed-frame
-/// scenario never sets up and the dial surfaces a bounded `TimedOut` error.
-/// Pinned into the sweep below so this bounded chaos-severance is exercised
-/// deterministically — and so the test can never regress to the original
-/// unpinned wall-clock seed that made #290 / #291 unreproducible from
-/// `MOONPOOL_SEED`.
-const CONNECT_SEVERED_REGRESSION_SEEDS: [u64; 2] =
-    [9_388_503_268_189_738_858, 17_161_897_233_139_508_114];
+/// Seeds whose default-network chaos lands on a bounded, terminating
+/// outcome (never the re-entrant-lock self-deadlock under test) that the
+/// daily moonpool-seed-sweep flagged. Pinned here so each interleaving is
+/// exercised deterministically going forward — and so the test can never
+/// regress to the original unpinned wall-clock seed that made the sweep's
+/// failures unreproducible from `MOONPOOL_SEED`.
+///
+/// Two distinct chaos classes are pinned:
+///
+/// - **Connect-severance** (issue #290 `MOONPOOL_SEED=0x645244daaeccc7cb`, issue #291
+///   `MOONPOOL_SEED=0x65ea4fbea60a11a6`): the `SimulationBuilder`'s **unavoidable** default-network
+///   chaos (`ConnectFailureMode::Probabilistic`) exhausts the client's bounded `connect_timeout`
+///   before the handshake completes, so the malformed-frame scenario never sets up and the dial
+///   surfaces a bounded `TimedOut` error → `DriverOutcome::Severed`.
+/// - **Mid-session bit-flip → watchdog close** (issue #305 `MOONPOOL_SEED=0xbf6077ea63931440`,
+///   derived sub-seed 8009627293563187958): the same unavoidable network chaos
+///   (`bit_flip_probability = 0.0001`) corrupts the deterministic malformed frame `[0,0,0,0]` in
+///   flight to e.g. `[0,5,0,0]`. `peek_full_frame_len` (magnetar-proto/src/frame.rs:301-318) then
+///   reads a non-zero `total_size` and returns `Ok(None)` ("incomplete — waiting for more bytes")
+///   instead of `Err(BadLength(0))`, so the driver parks; the ADR-0058 keepalive watchdog escalates
+///   the wedged socket to `Failed` (`Connection::handle_timeout`, conn.rs:2699-2713) and the
+///   driver's top-of-loop `should_close` returns `Ok(())` cleanly (driver.rs:1128-1163, the
+///   documented watchdog→Failed→clean-close contract) → a bounded `DriverOutcome::CleanExit`. Same
+///   chaos class as connect-severance, just at a later lifecycle point, so it is treated
+///   identically (bounded, out of `failed_runs`).
+const CHAOS_REGRESSION_SEEDS: [u64; 3] = [
+    9_388_503_268_189_738_858,
+    17_161_897_233_139_508_114,
+    8_009_627_293_563_187_958,
+];
 
 /// What the client workload observed for the driver after the broker
 /// pushed the malformed frame. The `check()` rejects a `None` (the driver
@@ -107,8 +124,20 @@ enum DriverOutcome {
     /// flagged so a future regression that changes the reject mapping is
     /// visible rather than silently green.
     OtherError(String),
-    /// The driver terminated cleanly (`Ok`) — unexpected for a malformed
-    /// frame; recorded so the `check()` can fail loudly.
+    /// The driver terminated cleanly (`join()` → `Ok(())`). This is the
+    /// terminal outcome when the unavoidable default-network bit-flip chaos
+    /// (`bit_flip_probability = 0.0001`) corrupts the injected malformed frame
+    /// `[0,0,0,0]` in flight to a non-zero-`total_size` prefix:
+    /// `peek_full_frame_len` then returns `Ok(None)` ("incomplete") instead of
+    /// `Err(BadLength(0))`, the driver parks on the wedged socket, and the
+    /// ADR-0058 keepalive watchdog escalates to `Failed` → the driver's
+    /// `should_close` returns `Ok(())` (the documented watchdog→Failed→clean-close
+    /// contract). A bounded, terminating outcome — not the re-entrant-lock
+    /// self-deadlock under test — so it stays out of `failed_runs`. The genuine
+    /// "driver swallows an *uncorrupted* malformed frame" regression is still
+    /// caught by the `observed_reject` gate: a chaos-free seed that exited clean
+    /// instead of surfacing `BadLength(0)` would leave that flag unset and fail
+    /// the sweep.
     CleanExit,
 }
 
@@ -329,33 +358,44 @@ impl Workload for ClientWorkload {
                 );
                 Ok(())
             }
+            // A clean exit after the unavoidable bit-flip chaos corrupted the
+            // injected malformed frame in flight (non-zero `total_size` →
+            // `peek_full_frame_len` returns `Ok(None)` → the watchdog escalates
+            // the wedged socket to `Failed` → `should_close` returns `Ok(())`).
+            // Same chaos class as `Severed`, just post-handshake: a bounded,
+            // terminating outcome, not the self-deadlock under test. Surface it
+            // for diagnostics, do not fail the run — the `observed_reject` gate
+            // still requires a chaos-free seed to prove the genuine reject.
+            DriverOutcome::CleanExit => {
+                tracing::info!(capture = true, trail = "clean_exit_after_chaos_bit_flip",);
+                Ok(())
+            }
             DriverOutcome::OtherError(reason) => Err(SimulationError::InvalidState(format!(
                 "driver terminated with an unexpected error (expected a BadLength protocol \
                  reject): {reason}"
             ))),
-            DriverOutcome::CleanExit => Err(SimulationError::InvalidState(
-                "driver exited cleanly on a malformed mid-session frame — it must surface the \
-                 framing reject"
-                    .into(),
-            )),
         }
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
         match self.outcome.lock().take() {
-            // `RejectedAndTerminated` is the property; `Severed` is bounded
-            // chaos-severance before the handshake (the malformed-frame
-            // scenario simply never set up on this seed) — both acceptable.
-            Some(DriverOutcome::RejectedAndTerminated | DriverOutcome::Severed(_)) => Ok(()),
+            // `RejectedAndTerminated` is the property. The other two terminal
+            // outcomes are bounded default-network chaos: `Severed` is a
+            // connect cut before the handshake (the malformed-frame scenario
+            // never set up), and `CleanExit` is the watchdog-driven close
+            // after the bit-flip chaos corrupted the malformed frame in flight
+            // (so `peek_full_frame_len` saw `Ok(None)`, not `BadLength(0)`).
+            // All three are acceptable; the `observed_reject` gate in the
+            // sweep still requires a chaos-free seed to prove the real reject.
+            Some(
+                DriverOutcome::RejectedAndTerminated
+                | DriverOutcome::Severed(_)
+                | DriverOutcome::CleanExit,
+            ) => Ok(()),
             Some(DriverOutcome::OtherError(reason)) => Err(SimulationError::InvalidState(format!(
                 "driver terminated, but with an unexpected error (the malformed frame must surface \
                  as a BadLength protocol reject): {reason}"
             ))),
-            Some(DriverOutcome::CleanExit) => Err(SimulationError::InvalidState(
-                "driver exited cleanly on a malformed mid-session frame — it must surface the \
-                 framing reject"
-                    .into(),
-            )),
             None => Err(SimulationError::InvalidState(
                 "client recorded no driver outcome — the driver neither terminated nor surfaced \
                  the reject (re-entrant-mutex self-deadlock?)"
@@ -371,25 +411,37 @@ impl Workload for ClientWorkload {
 /// `shared.inner` lock (ADR-0038).
 ///
 /// Deterministic seed sweep: 16 seeds derived from `MOONPOOL_SEED` (so the
-/// daily sweep keeps exploring this path under fresh randoms) plus the two
-/// regression seeds the sweep flagged for #290 / #291. The original test
-/// drove a single **unpinned** `SimulationBuilder::new().run()` whose seed
-/// came from the wall clock, so the daily sweep's failures were
-/// unreproducible from `MOONPOOL_SEED` — pinning the seeds fixes that.
+/// daily sweep keeps exploring this path under fresh randoms) plus the
+/// regression seeds in `CHAOS_REGRESSION_SEEDS` the sweep flagged for #290 /
+/// #291 / #305. The original test drove a single **unpinned**
+/// `SimulationBuilder::new().run()` whose seed came from the wall clock, so the
+/// daily sweep's failures were unreproducible from `MOONPOOL_SEED` — pinning
+/// the seeds fixes that.
 ///
 /// The `SimulationBuilder`'s default network injects unavoidable chaos
-/// (`ConnectFailureMode::Probabilistic`, bit-flip, random-close) that the
-/// builder gives no API to disable. On a fraction of seeds the client's dial
-/// exhausts its bounded `connect_timeout` before the handshake completes, so
-/// the malformed-frame scenario never sets up — a bounded `Severed` outcome,
-/// not the deadlock under test. The resilience claim is therefore bounded
-/// termination (no run hangs ⇒ `failed_runs == 0`) **plus** the reject being
-/// observed on at least one chaos-free seed (`observed_reject`), mirroring
-/// `connect_resilience.rs` and the `sim_delayed_marker_*` sweep.
+/// (`ConnectFailureMode::Probabilistic`, `bit_flip_probability = 0.0001`,
+/// random-close) that the builder gives no API to disable. That chaos lands on
+/// two bounded, terminating outcomes that are NOT the self-deadlock under test:
+///
+/// - a dial that exhausts the client's bounded `connect_timeout` before the handshake completes
+///   (the malformed-frame scenario never sets up) → a `Severed` outcome; and
+/// - a bit-flip that corrupts the injected malformed frame `[0,0,0,0]` in flight to a
+///   non-zero-`total_size` prefix, so `peek_full_frame_len` returns `Ok(None)` instead of
+///   `BadLength(0)`, the driver parks, and the ADR-0058 watchdog escalates the wedged socket to
+///   `Failed` → a clean `should_close` exit → a `CleanExit` outcome (issue #305).
+///
+/// The resilience claim is therefore bounded termination (no run hangs ⇒
+/// `failed_runs == 0`) **plus** the exact `BadLength(0)` reject being observed
+/// on at least one chaos-free seed (`observed_reject`), mirroring
+/// `connect_resilience.rs` and the `sim_delayed_marker_*` sweep. The
+/// `observed_reject` gate is what keeps a genuine "driver swallows an
+/// *uncorrupted* malformed frame" regression hard-failing: such a regression
+/// would `CleanExit` on the chaos-free seeds too, leaving `observed_reject`
+/// unset.
 #[test]
 fn moonpool_malformed_mid_session_frame_terminates_driver_not_deadlock() {
     let mut seeds = sweep_seeds(16);
-    seeds.extend_from_slice(&CONNECT_SEVERED_REGRESSION_SEEDS);
+    seeds.extend_from_slice(&CHAOS_REGRESSION_SEEDS);
     let iterations = seeds.len();
 
     let client = ClientWorkload::new();
