@@ -2218,11 +2218,45 @@ impl Connection {
                             "missing CommandActiveConsumerChange",
                         ))?;
                 let handle = ConsumerHandle(acc.consumer_id);
+                let active = acc.is_active.unwrap_or(false);
                 self.events
-                    .push_back(ConnectionEvent::ActiveConsumerChanged {
-                        handle,
-                        active: acc.is_active.unwrap_or(false),
+                    .push_back(ConnectionEvent::ActiveConsumerChanged { handle, active });
+                // Failover re-arm (issue #307): when a standby consumer is
+                // promoted to active and is sitting at zero broker-side
+                // permits, nothing else re-issues flow — `initial_flow` only
+                // runs at subscribe time / re-attach ack, and `maybe_flow`
+                // only fires once messages have been consumed (which can never
+                // happen at `available_permits == 0`, since the broker pushes
+                // nothing). Such a promoted-but-starved consumer would block
+                // `receive()` forever with a non-empty broker backlog. Re-arm
+                // flow exactly once on promotion.
+                //
+                // Guarded so an already-fed consumer is left untouched (no
+                // double-flow): only when `available_permits == 0`, and only
+                // when the consumer is in a dispatch-eligible state — not
+                // user-closed, not paused, no in-flight seek freezing the
+                // queue, not terminal, and not mid-re-attach (the re-attach
+                // gate at the `Success` arm owns that flow). The predicate read
+                // takes only the per-slot lock and is dropped before
+                // `initial_flow` re-acquires it (ADR-0038 lock ordering).
+                let needs_reflow = active
+                    && self.consumers.get(&handle).is_some_and(|slot| {
+                        let consumer = slot.state.lock();
+                        consumer.available_permits == 0
+                            && !consumer.closed
+                            && !consumer.paused
+                            && consumer.pending_seek.is_none()
+                            && !consumer.reached_end_of_topic
+                            && !consumer.flow_on_subscribe_ack
                     });
+                if needs_reflow {
+                    let _ = self.initial_flow(handle);
+                    tracing::debug!(
+                        target: "magnetar_proto::conn",
+                        handle = ?handle,
+                        "failover consumer promoted to active; initial flow re-armed"
+                    );
+                }
             }
             pb::base_command::Type::TopicMigrated => {
                 let migrated = command
@@ -7999,6 +8033,209 @@ mod conn_state_tests {
             }
             assert!(!bytes.is_empty(), "no CommandSubscribe in outbound");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Failover active-consumer-change re-flow (issue #307).
+    //
+    // A Failover standby promoted to active while sitting at
+    // `available_permits == 0` must have its flow re-armed — otherwise
+    // `receive()` starves forever against a non-empty broker backlog. The
+    // re-arm is guarded so an already-fed / paused / closed / terminal /
+    // mid-re-attach consumer is left untouched.
+    // -------------------------------------------------------------------
+
+    /// Subscribe a Failover consumer over a handshaked connection and drain the
+    /// outbound `CommandSubscribe`, leaving the consumer registered at zero
+    /// permits (no initial flow issued yet).
+    fn handshake_subscribe_failover() -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/failover".to_owned(),
+            subscription: "sub-failover".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: 100,
+            ..Default::default()
+        });
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.poll_transmit();
+        (conn, handle)
+    }
+
+    /// Encode a `CommandActiveConsumerChange` frame for `handle`.
+    fn active_consumer_change_frame(handle: ConsumerHandle, is_active: bool) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::ActiveConsumerChange as i32,
+            active_consumer_change: Some(pb::CommandActiveConsumerChange {
+                consumer_id: handle.0,
+                is_active: Some(is_active),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandActiveConsumerChange");
+        buf
+    }
+
+    /// Decode the next `CommandFlow` for `handle` out of the connection's
+    /// outbound buffer, if one was emitted.
+    fn drain_command_flow(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+    ) -> Option<pb::CommandFlow> {
+        let mut bytes = conn.poll_transmit();
+        while !bytes.is_empty() {
+            let frame = crate::frame::decode_one(&mut bytes).expect("decode outbound");
+            if frame.command.r#type == pb::base_command::Type::Flow as i32 {
+                let flow = frame.command.flow.expect("CommandFlow body");
+                if flow.consumer_id == handle.0 {
+                    return Some(flow);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn failover_promotion_rearms_flow_when_permits_zeroed() {
+        // A Failover consumer that re-attached via the gated path (or was
+        // reset) sits at `available_permits == 0`. On promotion to active the
+        // handler must re-arm flow.
+        let (mut conn, handle) = handshake_subscribe_failover();
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "a freshly-subscribed consumer holds zero permits until flow is issued"
+        );
+
+        let frame = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        // Flow re-armed: permits back to the receiver queue size.
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            100,
+            "promotion must re-arm initial flow"
+        );
+        // And a CommandFlow actually went out on the wire.
+        let flow = drain_command_flow(&mut conn, handle).expect("CommandFlow emitted on promotion");
+        assert_eq!(flow.message_permits, 100);
+
+        // The ActiveConsumerChanged event is still surfaced.
+        let mut saw_event = false;
+        while let Some(ev) = conn.poll_event() {
+            if let ConnectionEvent::ActiveConsumerChanged { handle: h, active } = ev {
+                if h == handle && active {
+                    saw_event = true;
+                }
+            }
+        }
+        assert!(saw_event, "ActiveConsumerChanged event must still fire");
+    }
+
+    #[test]
+    fn failover_promotion_does_not_double_flow_when_permits_outstanding() {
+        // A consumer that already holds permits must NOT be given extra flow on
+        // a redundant promotion (no double-flow).
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+        assert_eq!(conn.consumer_available_permits(handle), 100);
+
+        let frame = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            100,
+            "an already-fed consumer keeps its permits, no re-arm"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "no extra CommandFlow when permits are already outstanding"
+        );
+    }
+
+    #[test]
+    fn failover_promotion_does_not_flow_when_paused() {
+        // A paused consumer is intentionally starved by the user; promotion must
+        // not override the pause.
+        let (mut conn, handle) = handshake_subscribe_failover();
+        if let Some(slot) = conn.consumers.get(&handle) {
+            slot.state.lock().paused = true;
+        }
+        assert_eq!(conn.consumer_available_permits(handle), 0);
+
+        let frame = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "a paused consumer must not be re-flowed on promotion"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "no CommandFlow for a paused consumer"
+        );
+    }
+
+    #[test]
+    fn failover_promotion_does_not_flow_when_closed() {
+        // A user-closed consumer must not be re-flowed.
+        let (mut conn, handle) = handshake_subscribe_failover();
+        if let Some(slot) = conn.consumers.get(&handle) {
+            slot.state.lock().closed = true;
+        }
+
+        let frame = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "a closed consumer must not be re-flowed on promotion"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "no CommandFlow for a closed consumer"
+        );
+    }
+
+    #[test]
+    fn failover_demotion_to_standby_does_not_flow() {
+        // `is_active == false` (promoted active → standby) must never re-arm
+        // flow — only promotion to active does.
+        let (mut conn, handle) = handshake_subscribe_failover();
+        assert_eq!(conn.consumer_available_permits(handle), 0);
+
+        let frame = active_consumer_change_frame(handle, false);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            0,
+            "demotion to standby must not re-arm flow"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "no CommandFlow on demotion"
+        );
     }
 
     #[test]
