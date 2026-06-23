@@ -2991,6 +2991,13 @@ impl Connection {
             if let Some(d) = consumer.next_chunk_expiry_deadline() {
                 consider(d);
             }
+            // Issue #301: surface the next receiver-queue auto-adjust deadline so
+            // the driver wakes us deterministically for the adjust tick in
+            // `handle_timeout`. `None` when the consumer uses the default
+            // `Fixed` policy (no auto-adjust), so this is a no-op there.
+            if let Some(d) = consumer.next_adjust_deadline() {
+                consider(d);
+            }
         }
         for slot in self.producers.values() {
             let producer = slot.state.lock();
@@ -3052,6 +3059,9 @@ impl Connection {
         let mut redeliveries: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
         let mut ack_actions: Vec<crate::trackers::AckAction> = Vec::new();
         let mut chunk_acks: Vec<(ConsumerHandle, Vec<MessageId>)> = Vec::new();
+        // Issue #301: receiver-queue auto-adjust flow commands staged inside the
+        // per-slot loop, emitted after it under `&mut self`.
+        let mut adjust_flows: Vec<pb::CommandFlow> = Vec::new();
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
@@ -3084,9 +3094,49 @@ impl Connection {
                 let ids = std::mem::take(&mut consumer.chunk_auto_ack_pending);
                 chunk_acks.push((*handle, ids));
             }
+            // ---- BEGIN issue #301: receiver-queue auto-adjust (CONSUMER slot) ----
+            // Kept in its own clearly-delineated block inside the CONSUMER-slot
+            // loop so the eventual merge with the producer send-timeout drain
+            // (#304, in the PRODUCER loop further down) is trivial. Runs entirely
+            // under the per-slot lock with the injected `now` (ADR-0038 lock
+            // ordering, ADR-0011 clock injection) — `adjust_receiver_queue` never
+            // takes the connection-wide mutex. A grown target yields an
+            // incremental `CommandFlow`, staged here and emitted after the loop.
+            // `next_adjust_deadline`/`poll_timeout` gate when this actually fires;
+            // a sub-interval tick is a cheap no-op (the policy recomputes the
+            // same target and the `delta == 0` guard suppresses the flow).
+            match consumer.next_adjust_deadline() {
+                Some(d) if now >= d => {
+                    // Per-partition proto consumer: partition count is 1 here;
+                    // the façade scopes the `Auto` byte budget per-partition (see
+                    // the policy ADR / docs/pip-features.md), so the budget
+                    // division is already baked into the policy the façade
+                    // supplies.
+                    if let Some(flow) = consumer.adjust_receiver_queue(now, 1) {
+                        adjust_flows.push(flow);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    // First tick for an auto-adjust consumer: seed the schedule so
+                    // `poll_timeout` can surface the deadline next round. No-op for
+                    // the default `Fixed` policy (auto-adjust disabled).
+                    consumer.arm_adjust_clock(now);
+                }
+            }
+            // ---- END issue #301 ----
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
+        }
+        // Issue #301: emit the staged incremental receiver-queue flow commands.
+        for flow in adjust_flows {
+            let base = pb::BaseCommand {
+                r#type: pb::base_command::Type::Flow as i32,
+                flow: Some(flow),
+                ..Default::default()
+            };
+            let _ = self.encode_command(&base);
         }
         // Auto-ack the first-chunk ids of partials evicted/expired under the
         // `auto_ack = true` policy. Individual acks; the broker treats the
@@ -3343,11 +3393,19 @@ impl Connection {
     pub fn subscribe(&mut self, req: SubscribeRequest) -> ConsumerHandle {
         let handle = ConsumerHandle(self.next_consumer_id);
         self.next_consumer_id = self.next_consumer_id.wrapping_add(1);
-        let mut state = ConsumerState::new(
+        // Issue #301: build with the request's receiver-queue policy. `None`
+        // resolves to the default `Fixed(receiver_queue_size)`, so the raw
+        // `receiver_queue_size` path is unchanged.
+        let policy = req
+            .receiver_queue_policy
+            .clone()
+            .unwrap_or_else(|| crate::receiver_queue::fixed(req.receiver_queue_size));
+        let mut state = ConsumerState::with_policy(
             handle,
             req.topic.clone(),
             req.subscription.clone(),
-            req.receiver_queue_size,
+            policy,
+            req.receiver_queue_adjust_interval,
         );
         state.max_redeliver_count = req.max_redeliver_count;
         state.consumer_name = req.consumer_name.clone();
@@ -3672,6 +3730,19 @@ impl Connection {
         self.consumers
             .get(&handle)
             .map_or(0, |slot| slot.state.lock().available_permits)
+    }
+
+    /// The consumer's CURRENT receiver-queue target (issue #301). For the
+    /// default [`crate::receiver_queue::Fixed`] policy this is the constant the
+    /// user configured; for [`crate::receiver_queue::Auto`] it is the live,
+    /// auto-tuned target after the latest adjust tick. Returns `0` for unknown
+    /// handles. Mirrors Java `ConsumerImpl#getCurrentReceiverQueueSize` under
+    /// PIP-74 auto-scaling.
+    #[must_use]
+    pub fn consumer_receiver_queue_size(&self, handle: ConsumerHandle) -> usize {
+        self.consumers
+            .get(&handle)
+            .map_or(0, |slot| slot.state.lock().receiver_queue_size)
     }
 
     /// PIP-4 decryption failure handling configured for this consumer. Returns
@@ -8933,6 +9004,155 @@ mod conn_state_tests {
         assert!(
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow on demotion"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #301 — pluggable receiver-queue policy, connection-driven adjust.
+    //
+    // The `Auto` policy ticks from `handle_timeout`'s injected `now`; a grown
+    // target emits an incremental `CommandFlow`. These tests drive the whole
+    // path through the public `Connection` surface (subscribe → initial flow →
+    // adjust tick → outbound flow) so the proto integration covers the
+    // connection plumbing, not just the pure policy unit tests.
+    // -------------------------------------------------------------------
+
+    /// Subscribe an `Auto`-policy consumer over a handshaked connection, drain
+    /// the outbound `CommandSubscribe`, and feed the initial flow. Returns the
+    /// connection, handle, and the adjust interval used.
+    fn handshake_subscribe_auto(
+        min: usize,
+        max_bytes: usize,
+        adjust_interval: Duration,
+    ) -> (Connection, ConsumerHandle, Duration) {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/auto-rq".to_owned(),
+            subscription: "sub-auto-rq".to_owned(),
+            receiver_queue_policy: Some(std::sync::Arc::new(crate::receiver_queue::Auto::new(
+                min, max_bytes,
+            ))),
+            receiver_queue_adjust_interval: Some(adjust_interval),
+            ..Default::default()
+        });
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+        (conn, handle, adjust_interval)
+    }
+
+    #[test]
+    fn auto_policy_seeds_initial_flow_at_the_floor() {
+        // `Auto::initial()` returns the floor; the consumer's first flow grants
+        // exactly that, not the (ignored) raw `receiver_queue_size`.
+        let (conn, handle, _) =
+            handshake_subscribe_auto(100, 128 * 1024 * 1024, Duration::from_secs(1));
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            100,
+            "Auto seeds the initial flow at its floor"
+        );
+    }
+
+    #[test]
+    fn auto_policy_grows_target_under_starvation_and_emits_incremental_flow() {
+        // With the broker holding zero permits (starvation) and the byte budget
+        // wide open, the adjust tick doubles the target and emits an incremental
+        // flow for the delta.
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
+        let t0 = Instant::now();
+
+        // Drain the broker's grant to zero so `available_permits == 0` is the
+        // observed signal at tick time.
+        if let Some(slot) = conn.consumers.get(&handle) {
+            slot.state.lock().available_permits = 0;
+        }
+
+        // First tick arms the adjust clock (no adjust yet).
+        conn.handle_timeout(t0);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "the first tick only arms the schedule"
+        );
+
+        // Second tick, one interval later, runs the adjust: 100 -> 200.
+        conn.handle_timeout(t0 + interval);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "starvation doubles the target"
+        );
+        let flow = drain_command_flow(&mut conn, handle)
+            .expect("growing the target emits an incremental flow");
+        assert_eq!(
+            flow.message_permits, 200,
+            "the broker had zero permits, so the delta tops it up to the new target"
+        );
+        assert_eq!(
+            conn.consumer_available_permits(handle),
+            200,
+            "available permits track the new target after the incremental grant"
+        );
+    }
+
+    #[test]
+    fn auto_policy_does_not_flow_when_target_holds_steady() {
+        // Permits remain and bytes are within budget: the target holds and no
+        // flow is emitted (invariant: no thrash).
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
+        let t0 = Instant::now();
+        // Healthy: the initial flow left 100 permits in place.
+        conn.handle_timeout(t0); // arm
+        let _ = conn.poll_transmit();
+        conn.handle_timeout(t0 + interval); // adjust — holds
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "a healthy consumer holds its target"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "no flow when the target does not grow"
+        );
+    }
+
+    #[test]
+    fn fixed_policy_default_never_adjusts() {
+        // The default `Fixed` policy disables auto-adjust: no adjust deadline is
+        // surfaced and the target never moves even under starvation.
+        let (mut conn, handle) = handshake_subscribe_failover(); // receiver_queue_size: 100, Fixed
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+        let t0 = Instant::now();
+        if let Some(slot) = conn.consumers.get(&handle) {
+            slot.state.lock().available_permits = 0;
+        }
+        // Many ticks: a Fixed consumer never grows and never flows from adjust.
+        for i in 0..10u32 {
+            conn.handle_timeout(t0 + Duration::from_secs(u64::from(i)));
+        }
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "Fixed default never auto-adjusts"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "Fixed default never emits an adjust-driven flow"
         );
     }
 

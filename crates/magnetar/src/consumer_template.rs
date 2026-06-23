@@ -18,6 +18,13 @@ pub(crate) struct ConsumerTemplate {
     pub(crate) subscription: String,
     pub(crate) sub_type: magnetar_proto::pb::command_subscribe::SubType,
     pub(crate) receiver_queue_size: usize,
+    /// Issue #301: pluggable receiver-queue policy propagated to every child
+    /// consumer so partitioned / multi-topics consumers self-tune too. `None`
+    /// keeps the `Fixed(receiver_queue_size)` default.
+    pub(crate) receiver_queue_policy:
+        Option<std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>>,
+    /// Issue #301: auto-adjust tick cadence for [`Self::receiver_queue_policy`].
+    pub(crate) receiver_queue_adjust_interval: Option<std::time::Duration>,
     pub(crate) initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
     pub(crate) durable: bool,
     pub(crate) properties: Vec<(String, String)>,
@@ -50,6 +57,17 @@ impl ConsumerTemplate {
             .initial_position(self.initial_position)
             .receiver_queue_size(self.receiver_queue_size)
             .read_compacted(self.read_compacted);
+        // Issue #301: propagate the receiver-queue policy (and its tick cadence)
+        // to every per-topic child so partitioned / multi-topics consumers
+        // self-tune too. `receiver_queue_size` above already seeds the `Fixed`
+        // default; a `Some(policy)` here overrides it (and the builder's
+        // last-setter-wins keeps them consistent).
+        if let Some(policy) = self.receiver_queue_policy.clone() {
+            builder = builder.receiver_queue_policy(policy);
+            if let Some(interval) = self.receiver_queue_adjust_interval {
+                builder = builder.receiver_queue_adjust_interval(interval);
+            }
+        }
         for (k, v) in &self.properties {
             builder = builder.property(k.clone(), v.clone());
         }

@@ -237,6 +237,18 @@ impl<P: Providers> Consumer<P> {
         self.slot.state.lock().available_permits
     }
 
+    /// This consumer's CURRENT receiver-queue target (issue #301). For the
+    /// default [`magnetar_proto::Fixed`] policy this is the configured constant;
+    /// for [`magnetar_proto::Auto`] it is the live, auto-tuned value after the
+    /// latest adjust tick. Mirrors Java `ConsumerImpl#getCurrentReceiverQueueSize`
+    /// under PIP-74 auto-scaling. 1:1 with the tokio engine.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn current_receiver_queue_size(&self) -> usize {
+        self.slot.state.lock().receiver_queue_size
+    }
+
     /// `true` if this consumer has received at least one message since
     /// opening. Mirrors Java `Consumer#hasReceivedAnyMessage` — useful as a
     /// "did anything ever arrive?" probe without inspecting the full
@@ -1233,7 +1245,6 @@ impl<P: Providers + Send + Sync> Client<P> {
         req: SubscribeRequest,
         decryptor: Option<Arc<dyn MessageDecryptor>>,
     ) -> Result<Consumer<P>, ClientError> {
-        let receiver_queue_size = req.receiver_queue_size;
         // See `Client::open_producer`: subscribe also needs lookup-driven bundle
         // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`. On a
         // client built via `connect_plain_supervised`, ADR-0039 proxy routing fans the
@@ -1263,12 +1274,17 @@ impl<P: Providers + Send + Sync> Client<P> {
 
         // Feed an initial flow so the broker starts delivering. `initial_flow`
         // returns `None` when there is no consumer state; we still send an
-        // explicit FLOW with the configured queue size as a safety net.
+        // explicit FLOW with the policy's CURRENT target as a safety net.
+        // Issue #301: read the live target from the slot (`policy.initial()`
+        // after construction) rather than the raw `req.receiver_queue_size`, so
+        // an `Auto` policy is not double-granted a stale raw value. 1:1 with the
+        // tokio engine.
         {
             let mut conn = shared.inner.lock();
             let _ = conn.initial_flow(handle);
-            if receiver_queue_size > 0 {
-                conn.flow(handle, receiver_queue_size as u32);
+            let initial_target = slot.state.lock().receiver_queue_size;
+            if initial_target > 0 {
+                conn.flow(handle, initial_target as u32);
             }
         }
         shared.driver_waker.notify_one();
@@ -2712,6 +2728,54 @@ mod tests {
         let closed: Consumer<TokioProviders> =
             make_consumer(shared, magnetar_proto::ConsumerHandle(9999));
         assert_eq!(closed.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_receiver_queue_policy_grows_target_under_starvation() {
+        // Issue #301: an `Auto`-policy consumer driven through the moonpool
+        // engine's proto connection grows its receiver-queue target when the
+        // broker drains every permit (starvation), and the grown target rides an
+        // incremental flow. Mirrors the tokio engine test 1:1 (ADR-0024).
+        use std::time::Duration;
+        let shared = handshake_complete_shared();
+        let interval = Duration::from_secs(1);
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/auto-rq".to_owned(),
+                subscription: "s".to_owned(),
+                receiver_queue_policy: Some(std::sync::Arc::new(magnetar_proto::Auto::new(
+                    100,
+                    128 * 1024 * 1024,
+                ))),
+                receiver_queue_adjust_interval: Some(interval),
+                ..Default::default()
+            })
+        };
+        let t0 = Instant::now();
+        {
+            let mut conn = shared.inner.lock();
+            let _ = conn.initial_flow(handle);
+            // Seed at the floor.
+            assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
+            // Drain the broker's grant so the tick observes starvation.
+            if let Some(slot) = conn.consumer(handle) {
+                slot.state.lock().available_permits = 0;
+            }
+            // First tick arms the schedule; the second runs the adjust.
+            conn.handle_timeout(t0);
+            conn.handle_timeout(t0 + interval);
+            assert_eq!(
+                conn.consumer_receiver_queue_size(handle),
+                200,
+                "starvation doubles the Auto target on the moonpool engine"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                200,
+                "the incremental flow tops the broker grant up to the new target"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -8,8 +8,9 @@ For the binding scope decisions, follow the per-section ADR links; for the parit
 1. [V5 client surface (PIP-466)](#v5-client-surface-pip-466)
 2. [Shadow topics (PIP-180)](#shadow-topics-pip-180)
 3. [Replicated subscriptions (PIP-33)](#replicated-subscriptions-pip-33)
-4. [Scalable topics (PIP-460) — experimental](#scalable-topics-pip-460--experimental)
-5. [Athenz auth provider](#athenz-auth-provider)
+4. [Auto-scaled receiver queue (PIP-74)](#auto-scaled-receiver-queue-pip-74)
+5. [Scalable topics (PIP-460) — experimental](#scalable-topics-pip-460--experimental)
+6. [Athenz auth provider](#athenz-auth-provider)
 
 ---
 
@@ -552,6 +553,76 @@ These are the two explicit non-goals locked in [ADR-0034](../specs/adr/0034-pip-
 - [ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md) — weekly-workflow precedent for cost-shifting heavy fixtures.
 - [`crates/magnetar-proto/src/markers.rs`](../crates/magnetar-proto/src/markers.rs) — decoder + types.
 - Apache Pulsar Java — `org.apache.pulsar.client.impl.ConsumerBuilderImpl#replicateSubscriptionState`.
+
+---
+
+## Auto-scaled receiver queue (PIP-74)
+
+The consumer's receiver queue size — the number of permits handed to the broker so it may push messages without further consent — is sized by a pluggable [`ReceiverQueuePolicy`](../crates/magnetar-proto/src/receiver_queue.rs).
+The binding scope decision is [ADR-0071](../specs/adr/0071-pluggable-receiver-queue-policy.md) (issue #301).
+
+### When to use a policy
+
+- **`Fixed` (the default)** — pins the queue to a constant size.
+  This is the historical behaviour, byte-for-byte identical to the pre-policy client, so existing code needs no change.
+  Use it when you want a predictable, static memory-vs-throughput trade-off.
+- **`Auto` (PIP-74 `autoScaledReceiverQueueSizeEnabled`)** — self-tunes the queue: grows under starvation, shrinks under memory pressure.
+  Use it for consumers draining a deep, bursty backlog where a fixed size either starves throughput (too small) or pins memory (too large).
+
+### Quick start
+
+```rust,no_run
+use std::sync::Arc;
+use std::time::Duration;
+use magnetar::{PulsarClient, proto::pb::command_subscribe::{InitialPosition, SubType}};
+use magnetar_proto::Auto;
+
+# async fn demo(client: &PulsarClient) -> Result<(), Box<dyn std::error::Error>> {
+let consumer = client
+    .consumer("persistent://public/default/orders")
+    .subscription("orders-sub")
+    .subscription_type(SubType::Exclusive)
+    .initial_position(InitialPosition::Earliest)
+    // Opt into the auto-scaled queue: floor of 1000 permits, 128 MiB byte budget.
+    .receiver_queue_policy(Arc::new(Auto::new(1_000, 128 * 1024 * 1024)))
+    // Optional: override the 5-second default adjust cadence.
+    .receiver_queue_adjust_interval(Duration::from_secs(2))
+    .subscribe()
+    .await?;
+
+// The current auto-tuned target is observable at any time.
+let _target = consumer.current_receiver_queue_size();
+# Ok(())
+# }
+```
+
+`ConsumerBuilder::receiver_queue_size(n)` still works and is sugar for `Fixed(n)`; the two setters are last-setter-wins.
+The policy is threaded through partitioned, multi-topics, and pattern consumers too — each per-topic / per-partition child gets the same policy.
+
+### How `Auto` decides
+
+`Auto { min, max_bytes }` recomputes the target from the observed [`FlowStats`](../crates/magnetar-proto/src/receiver_queue.rs) on each adjust tick:
+
+- **Grow** (bounded doubling) while the broker has drained every permit (`available_permits == 0`, the starvation signal) and the byte budget still has room.
+  A grown target emits an incremental `CommandFlow` so the broker is fed more.
+- **Shrink** (gentle halving toward `min`) when the buffered-queue bytes reach the byte budget (the OOM guard).
+  Permits already granted cannot be un-granted, so the surplus drains naturally and the next refill asks for less.
+- **Hold** otherwise — the target only moves on a clear starve/OOM signal, so it converges without thrashing.
+
+For partitioned consumers the byte budget is divided across the live partition count, so the **aggregate** buffered bytes across all partitions stay within `max_bytes`.
+
+### Determinism contract
+
+`adjust` and `initial` are **pure functions** of their inputs — no clock, no randomness, no I/O.
+The adjust tick is driven from the connection's sans-io timeout (`handle_timeout`) on the injected clock, never from a wall clock inside the policy ([ADR-0004](../specs/adr/0004-sans-io-protocol-core.md), [ADR-0011](../specs/adr/0011-clock-injection-sans-io.md)).
+This keeps the production tokio engine and the deterministic moonpool simulation engine bit-for-bit identical ([ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)).
+**Custom user policies MUST honour the same purity contract** — a policy that reads a clock or an RNG inside `adjust` would diverge the two engines.
+
+### PIP-74 references
+
+- [ADR-0071](../specs/adr/0071-pluggable-receiver-queue-policy.md) — scope, design, and the five-layer test coverage.
+- [`crates/magnetar-proto/src/receiver_queue.rs`](../crates/magnetar-proto/src/receiver_queue.rs) — the trait, `FlowStats`, `Fixed`, `Auto`.
+- Apache Pulsar Java — `org.apache.pulsar.client.api.ConsumerBuilder#autoScaledReceiverQueueSizeEnabled`.
 
 ---
 

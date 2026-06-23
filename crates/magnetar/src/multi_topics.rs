@@ -813,6 +813,9 @@ pub struct MultiTopicsConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     subscription: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     receiver_queue_size: usize,
+    /// Issue #301: pluggable receiver-queue policy applied to every child consumer.
+    receiver_queue_policy: Option<std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>>,
+    receiver_queue_adjust_interval: Option<std::time::Duration>,
     initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
     durable: bool,
     properties: Vec<(String, String)>,
@@ -862,6 +865,8 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
             subscription: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
+            receiver_queue_policy: None,
+            receiver_queue_adjust_interval: None,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
             durable: true,
             properties: Vec::new(),
@@ -969,6 +974,31 @@ impl<'a, E: Engine> MultiTopicsConsumerBuilder<'a, E> {
     #[must_use]
     pub fn receiver_queue_size(mut self, size: usize) -> Self {
         self.receiver_queue_size = size;
+        self.receiver_queue_policy = None;
+        self.receiver_queue_adjust_interval = None;
+        self
+    }
+
+    /// Set a pluggable receiver-queue-size policy (issue #301) applied to every
+    /// per-topic child. Pass [`magnetar_proto::Auto`] to let each partition's
+    /// queue self-tune. Enabling a policy turns on auto-adjust with a default
+    /// 5-second tick; override with [`Self::receiver_queue_adjust_interval`].
+    #[must_use]
+    pub fn receiver_queue_policy(
+        mut self,
+        policy: std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>,
+    ) -> Self {
+        self.receiver_queue_policy = Some(policy);
+        if self.receiver_queue_adjust_interval.is_none() {
+            self.receiver_queue_adjust_interval = Some(Duration::from_secs(5));
+        }
+        self
+    }
+
+    /// Override the auto-adjust tick cadence for [`Self::receiver_queue_policy`].
+    #[must_use]
+    pub fn receiver_queue_adjust_interval(mut self, interval: Duration) -> Self {
+        self.receiver_queue_adjust_interval = Some(interval);
         self
     }
 
@@ -1172,6 +1202,8 @@ where
             subscription,
             sub_type: self.sub_type,
             receiver_queue_size: self.receiver_queue_size,
+            receiver_queue_policy: self.receiver_queue_policy,
+            receiver_queue_adjust_interval: self.receiver_queue_adjust_interval,
             initial_position: self.initial_position,
             durable: self.durable,
             properties: self.properties,
@@ -1298,6 +1330,8 @@ mod tests {
             subscription: "sub".to_owned(),
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
+            receiver_queue_policy: None,
+            receiver_queue_adjust_interval: None,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
             durable: true,
             properties: Vec::new(),

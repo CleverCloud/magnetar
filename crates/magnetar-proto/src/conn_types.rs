@@ -720,8 +720,25 @@ pub struct SubscribeRequest {
     pub subscription: String,
     /// Subscription type (`Exclusive`, `Shared`, `Failover`, `Key_Shared`).
     pub sub_type: pb::command_subscribe::SubType,
-    /// Receiver queue size.
+    /// Receiver queue size. With the default [`crate::receiver_queue::Fixed`]
+    /// policy this is the fixed permit count; with an explicit
+    /// [`Self::receiver_queue_policy`] it is ignored (the policy's
+    /// `initial()` seeds the target instead). Mirrors Java
+    /// `ConsumerBuilder#receiverQueueSize`.
     pub receiver_queue_size: usize,
+    /// Pluggable receiver-queue-size policy (issue #301, PIP-74). `None` (the
+    /// default) means a [`crate::receiver_queue::Fixed`] queue of
+    /// [`Self::receiver_queue_size`] — behaviour identical to the pre-#301
+    /// client. `Some(policy)` (e.g. [`crate::receiver_queue::Auto`]) lets the
+    /// queue self-tune. Carried as `Arc<dyn>` so a reconnect subscribe replay
+    /// clones the handle, not the policy.
+    pub receiver_queue_policy:
+        Option<std::sync::Arc<dyn crate::receiver_queue::ReceiverQueuePolicy>>,
+    /// Spacing between [`crate::receiver_queue::ReceiverQueuePolicy::adjust`]
+    /// ticks when [`Self::receiver_queue_policy`] is set (issue #301). `None`
+    /// disables auto-adjust (the default, and the only sensible value for a
+    /// `Fixed` policy). Mirrors the cadence Java drives its auto-scale check on.
+    pub receiver_queue_adjust_interval: Option<Duration>,
     /// Initial position to read from.
     pub initial_position: pb::command_subscribe::InitialPosition,
     /// Consumer name (optional — broker assigns one).
@@ -858,6 +875,8 @@ impl Default for SubscribeRequest {
             subscription: String::new(),
             sub_type: pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
+            receiver_queue_policy: None,
+            receiver_queue_adjust_interval: None,
             initial_position: pb::command_subscribe::InitialPosition::Latest,
             consumer_name: None,
             schema: None,

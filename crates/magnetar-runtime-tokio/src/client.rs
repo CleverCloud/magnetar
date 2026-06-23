@@ -1311,7 +1311,6 @@ impl Client {
         req: SubscribeRequest,
         decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
     ) -> Result<Consumer, ClientError> {
-        let receiver_queue_size = req.receiver_queue_size;
         // See `open_producer_with`: subscribe also needs lookup-driven bundle activation,
         // and ADR-0039 routes proxy-resolved subscribes onto a pinned pool entry.
         let (target, landed_on) = self.lookup_topic(&req.topic).await?;
@@ -1338,10 +1337,15 @@ impl Client {
             let mut conn = target_shared.inner.lock();
             // `initial_flow` returns None when there is no consumer state; ignore that.
             let _ = conn.initial_flow(handle);
-            // Also send an explicit FLOW with the configured queue size as a safety net for any
-            // sans-io version that gates the initial flow on internal state we haven't reached.
-            if receiver_queue_size > 0 {
-                conn.flow(handle, receiver_queue_size as u32);
+            // Also send an explicit FLOW with the policy's CURRENT target as a safety net for
+            // any sans-io version that gates the initial flow on internal state we haven't
+            // reached. Issue #301: read the live target from the slot
+            // (`policy.initial()` after construction) rather than the raw
+            // `req.receiver_queue_size`, so an `Auto` policy is not double-granted a stale
+            // raw value.
+            let initial_target = slot.state.lock().receiver_queue_size;
+            if initial_target > 0 {
+                conn.flow(handle, initial_target as u32);
             }
         }
         target_shared.driver_waker.notify_one();

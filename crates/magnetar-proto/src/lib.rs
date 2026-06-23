@@ -106,6 +106,7 @@ pub(crate) mod log_fields;
 pub mod lookup;
 pub mod markers;
 pub mod producer;
+pub mod receiver_queue;
 pub mod schema;
 pub mod service_url;
 pub mod supervisor;
@@ -189,6 +190,9 @@ pub use crate::markers::{
     decode_replicated_subscription_marker,
 };
 pub use crate::producer::{ProducerIdentity, ProducerSlot, ProducerStats};
+pub use crate::receiver_queue::{
+    Auto, DEFAULT_RECEIVER_QUEUE_SIZE, Fixed, FlowStats, ReceiverQueuePolicy, default_policy, fixed,
+};
 pub use crate::service_url::{
     ServiceUrlProvider, StaticServiceUrlProvider, static_service_url_provider,
 };

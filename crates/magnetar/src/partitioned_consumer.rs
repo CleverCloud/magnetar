@@ -37,6 +37,9 @@ pub struct PartitionedConsumerBuilder<'a, E: Engine = crate::TokioEngine> {
     subscription: Option<String>,
     sub_type: magnetar_proto::pb::command_subscribe::SubType,
     receiver_queue_size: usize,
+    /// Issue #301: pluggable receiver-queue policy forwarded to every per-partition child.
+    receiver_queue_policy: Option<std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>>,
+    receiver_queue_adjust_interval: Option<std::time::Duration>,
     initial_position: magnetar_proto::pb::command_subscribe::InitialPosition,
     durable: bool,
     priority_level: Option<i32>,
@@ -80,6 +83,8 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
             subscription: None,
             sub_type: magnetar_proto::pb::command_subscribe::SubType::Exclusive,
             receiver_queue_size: 1000,
+            receiver_queue_policy: None,
+            receiver_queue_adjust_interval: None,
             initial_position: magnetar_proto::pb::command_subscribe::InitialPosition::Latest,
             durable: true,
             priority_level: None,
@@ -164,6 +169,33 @@ impl<'a, E: Engine> PartitionedConsumerBuilder<'a, E> {
     #[must_use]
     pub fn receiver_queue_size(mut self, size: usize) -> Self {
         self.receiver_queue_size = size;
+        self.receiver_queue_policy = None;
+        self.receiver_queue_adjust_interval = None;
+        self
+    }
+
+    /// Set a pluggable receiver-queue-size policy (issue #301) applied to every
+    /// per-partition child. The byte budget on [`magnetar_proto::Auto`] is
+    /// divided across the live partition count inside the policy's `adjust`, so
+    /// the aggregate buffered bytes across all partitions stay within
+    /// `max_bytes`. Enabling a policy turns on auto-adjust with a default
+    /// 5-second tick; override with [`Self::receiver_queue_adjust_interval`].
+    #[must_use]
+    pub fn receiver_queue_policy(
+        mut self,
+        policy: std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>,
+    ) -> Self {
+        self.receiver_queue_policy = Some(policy);
+        if self.receiver_queue_adjust_interval.is_none() {
+            self.receiver_queue_adjust_interval = Some(std::time::Duration::from_secs(5));
+        }
+        self
+    }
+
+    /// Override the auto-adjust tick cadence for [`Self::receiver_queue_policy`].
+    #[must_use]
+    pub fn receiver_queue_adjust_interval(mut self, interval: std::time::Duration) -> Self {
+        self.receiver_queue_adjust_interval = Some(interval);
         self
     }
 
@@ -359,6 +391,15 @@ where
             .initial_position(self.initial_position)
             .durable(self.durable)
             .read_compacted(self.read_compacted);
+        // Issue #301: forward the receiver-queue policy + cadence to every
+        // per-partition child. `receiver_queue_size` above seeds the `Fixed`
+        // default; a `Some(policy)` overrides it.
+        if let Some(policy) = self.receiver_queue_policy {
+            builder = builder.receiver_queue_policy(policy);
+            if let Some(interval) = self.receiver_queue_adjust_interval {
+                builder = builder.receiver_queue_adjust_interval(interval);
+            }
+        }
         if let Some(level) = self.priority_level {
             builder = builder.priority_level(level);
         }
