@@ -99,10 +99,16 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 ///   documented watchdog→Failed→clean-close contract) → a bounded `DriverOutcome::CleanExit`. Same
 ///   chaos class as connect-severance, just at a later lifecycle point, so it is treated
 ///   identically (bounded, out of `failed_runs`).
-const CHAOS_REGRESSION_SEEDS: [u64; 3] = [
+/// - **Mid-session bit-flip → watchdog close, second master seed** (issue #308
+///   `MOONPOOL_SEED=0x326bd5e9514d947b`, derived sub-seed 10325270525572099338): an independent
+///   master seed that lands the *same* bit-flip → `Ok(None)` → watchdog → `CleanExit` interleaving
+///   as #305. Confirms the reclassification is generic (not a per-seed whitelist); pinned here as an
+///   explicit regression anchor.
+const CHAOS_REGRESSION_SEEDS: [u64; 4] = [
     9_388_503_268_189_738_858,
     17_161_897_233_139_508_114,
     8_009_627_293_563_187_958,
+    10_325_270_525_572_099_338,
 ];
 
 /// What the client workload observed for the driver after the broker
