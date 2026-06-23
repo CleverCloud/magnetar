@@ -311,7 +311,7 @@ async fn driver_loop_send_timeout_fires_against_host_clock() {
     drop(client);
 }
 
-/// ADR-0070 — the Java-parity DEFAULT `send_timeout` (30s) is wired through
+/// ADR-0072 — the Java-parity DEFAULT `send_timeout` (30s) is wired through
 /// the tokio open-producer path. A `CreateProducerRequest` left with its
 /// default `send_timeout` carries `Some(30s)` byte-for-byte with the Java
 /// client's `sendTimeoutMs = 30000`, so a send whose receipt is lost fails

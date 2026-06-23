@@ -8294,7 +8294,7 @@ mod conn_state_tests {
         }
     }
 
-    /// ADR-0070 — Java-parity default `send_timeout`. A producer opened from a
+    /// ADR-0072 — Java-parity default `send_timeout`. A producer opened from a
     /// `CreateProducerRequest::default()` carries `Some(30s)`, so a send whose
     /// `CommandSendReceipt` never arrives (lost / corrupted on the wire — the
     /// receipt has no CRC32C, invariant #4) does NOT hang forever: once the
@@ -8415,7 +8415,7 @@ mod conn_state_tests {
         );
     }
 
-    /// ADR-0070 no-false-positive: a send whose `CommandSendReceipt` lands
+    /// ADR-0072 no-false-positive: a send whose `CommandSendReceipt` lands
     /// BEFORE the 30s default deadline resolves normally with a `SendReceipt`
     /// outcome — the default timeout must not spuriously fail a healthy send.
     #[test]

@@ -1,4 +1,4 @@
-# ADR-0070 — Default the producer send-timeout to the Java client's 30 s
+# ADR-0072 — Default the producer send-timeout to the Java client's 30 s
 
 - **Status**: Accepted
 - **Date**: 2026-06-22

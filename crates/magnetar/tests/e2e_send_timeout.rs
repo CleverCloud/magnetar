@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end coverage for the producer `send_timeout` (ADR-0070), layer (e)
+//! End-to-end coverage for the producer `send_timeout` (ADR-0072), layer (e)
 //! of the ADR-0024 five-layer policy.
 //!
 //! Pins the production contract that an in-flight `send()` whose
 //! `CommandSendReceipt` never comes back fails with the synthetic timeout
 //! sentinel (`code = -1`, message "send timeout") instead of hanging forever —
-//! the user-visible behavior the Java-parity 30s default (ADR-0070) restores,
+//! the user-visible behavior the Java-parity 30s default (ADR-0072) restores,
 //! and the root-cause fix for moonpool seed `0x4402f874c43758d1` (a chaos
 //! bit-flip corrupted a receipt's `sequence_id`, the receipt carries no CRC32C
 //! so it was delivered-but-wrong, the matching send was dropped, and the

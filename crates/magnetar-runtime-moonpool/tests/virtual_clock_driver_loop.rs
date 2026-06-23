@@ -267,7 +267,7 @@ struct SendTimeoutClient {
     obs: Arc<Mutex<ClientObservation>>,
     /// Per-send timeout to configure on the producer. `None` opens the
     /// producer WITHOUT setting `send_timeout`, exercising the Java-parity
-    /// 30s default baked into `CreateProducerRequest::default()` (ADR-0070).
+    /// 30s default baked into `CreateProducerRequest::default()` (ADR-0072).
     send_timeout: Option<Duration>,
 }
 
@@ -280,7 +280,7 @@ impl SendTimeoutClient {
         }
     }
 
-    /// Client that relies on the DEFAULT `send_timeout` (ADR-0070, 30s) by
+    /// Client that relies on the DEFAULT `send_timeout` (ADR-0072, 30s) by
     /// leaving the field unset on the open request.
     fn with_default_timeout() -> Self {
         Self {
@@ -301,7 +301,7 @@ impl SendTimeoutClient {
     /// send-timeout deadline, so the keepalive watchdog's self-re-arming timer
     /// does not storm virtual time before the send-timeout sweep fires. This
     /// keeps the deterministic-firing assertion clean regardless of whether the
-    /// producer uses the explicit value or the 30s default (ADR-0070).
+    /// producer uses the explicit value or the 30s default (ADR-0072).
     fn connect_config(&self) -> ConnectionConfig {
         ConnectionConfig {
             keepalive_interval: self.effective_timeout() + Duration::from_secs(120),
@@ -344,7 +344,7 @@ impl Workload for SendTimeoutClient {
         // Build the open request from the canonical default, then override
         // `send_timeout` ONLY when this client pins an explicit value. The
         // default client leaves the field untouched so it exercises the
-        // Java-parity 30s default (ADR-0070) — assigning `self.send_timeout`
+        // Java-parity 30s default (ADR-0072) — assigning `self.send_timeout`
         // unconditionally would write `None` and DISABLE the timeout, masking
         // the very behavior under test.
         let mut open_req = CreateProducerRequest {
@@ -501,7 +501,7 @@ fn driver_loop_send_timeout_fires_against_virtual_clock() {
     );
 }
 
-/// ADR-0070 — the Java-parity DEFAULT `send_timeout` (30s) fires end-to-end
+/// ADR-0072 — the Java-parity DEFAULT `send_timeout` (30s) fires end-to-end
 /// through the moonpool driver loop against virtual time. The producer is
 /// opened WITHOUT setting `send_timeout`, so it inherits
 /// `CreateProducerRequest::default()`'s `Some(30s)`. A send whose
@@ -518,7 +518,7 @@ fn driver_loop_default_send_timeout_fires_against_virtual_clock() {
     assert_eq!(
         CreateProducerRequest::default().send_timeout,
         Some(Duration::from_secs(30)),
-        "this test relies on the 30s Java-parity default (ADR-0070)"
+        "this test relies on the 30s Java-parity default (ADR-0072)"
     );
 
     let broker = SendTimeoutBroker::new();

@@ -1489,7 +1489,7 @@ const PRODUCE_COUNT: u32 = 8;
 /// the workload always completes; [`classify_send_outcome`] then maps the
 /// timeout error onto a bounded, expected `SEND_RESOLUTION_SESSION_LOST`
 /// resolution (a chaos-lost receipt is a legitimate outcome — same spirit as
-/// the #305 bit-flip clean-exit fix). The 30s Java-parity default (ADR-0070)
+/// the #305 bit-flip clean-exit fix). The 30s Java-parity default (ADR-0072)
 /// would land outside this run's budget, so the workload pins this tighter
 /// value explicitly.
 const CHAOS_PRODUCE_SEND_TIMEOUT: Duration = Duration::from_secs(2);

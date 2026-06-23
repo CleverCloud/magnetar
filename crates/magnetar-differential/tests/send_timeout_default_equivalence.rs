@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Default `send_timeout` firing — differential equivalence
-//! (ADR-0024 layer d for ADR-0070).
+//! (ADR-0024 layer d for ADR-0072).
 //!
 //! The Java-parity default (`CreateProducerRequest::default().send_timeout ==
 //! Some(30s)`) and the timeout sweep that enforces it both live entirely in
@@ -104,7 +104,7 @@ fn project(outcome: OpOutcome) -> SendResolution {
 }
 
 /// The shared `magnetar-proto` send-timeout decision both engines' driver loops
-/// delegate to: open a producer with the DEFAULT `send_timeout` (ADR-0070, 30s),
+/// delegate to: open a producer with the DEFAULT `send_timeout` (ADR-0072, 30s),
 /// enqueue one send at `t0`, then tick `handle_timeout` past the 30s deadline
 /// with NO `CommandSendReceipt` ever delivered (the receipt was lost/corrupted
 /// in flight). Returns the resolved outcome the in-flight send surfaced — the
@@ -167,7 +167,7 @@ fn engines_agree_on_default_send_timeout_firing() {
     assert_eq!(
         CreateProducerRequest::default().send_timeout,
         Some(Duration::from_secs(30)),
-        "CreateProducerRequest::default() must carry the 30s Java-parity send_timeout (ADR-0070)",
+        "CreateProducerRequest::default() must carry the 30s Java-parity send_timeout (ADR-0072)",
     );
 
     // Both engines delegate to the same `magnetar-proto` timeout path; running
