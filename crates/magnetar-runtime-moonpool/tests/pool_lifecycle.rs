@@ -32,13 +32,20 @@
 //! `SimulationBuilder::new()` (no `random_network()`) installs
 //! `NetworkConfiguration::default()`, whose fault model includes probabilistic
 //! connect failure and FDB-style bit-flip corruption (ADR-0055). The exact
-//! lifecycle shape is pinned by the smoke test; the multi-seed sweep pins the
-//! chaos property: every seed must terminate with either the strong lifecycle
-//! result or a bounded error. A bit-flip on an unchecksummed Pulsar command
-//! frame can corrupt `CommandConnected` or `CommandConnect.proxy_to_broker_url`;
-//! that is a valid chaos drop, not evidence that the pool lifecycle code broke.
-//! The caps are virtual-time bounded (ADR-0011, ADR-0052), so every seed is
-//! bit-for-bit reproducible and the wall-clock cost is just scheduler steps.
+//! lifecycle shape is pinned by the smoke test under a FIXED `SMOKE_SEED` (the
+//! pinning is load-bearing — see `SMOKE_SEED`: an unpinned builder seeds the
+//! iteration from the wall clock, which `MOONPOOL_SEED` does not control, so an
+//! unlucky run could bit-flip the `proxy_to_broker_url` bytes and trip the
+//! strict equality with no way to replay it — issue #309). The multi-seed sweep
+//! pins the chaos property: every seed must terminate with either the strong
+//! lifecycle result or a bounded error. A bit-flip on an unchecksummed Pulsar
+//! command frame can corrupt `CommandConnected` or
+//! `CommandConnect.proxy_to_broker_url`; that is a valid chaos drop, not
+//! evidence that the pool lifecycle code broke — so even the smoke assertion
+//! accepts a present-but-corrupted pinned URL as a bounded chaos drop, asserting
+//! the exact `host:port` bytes only when the URL arrived intact. The caps are
+//! virtual-time bounded (ADR-0011, ADR-0052), so every seed is bit-for-bit
+//! reproducible and the wall-clock cost is just scheduler steps.
 //!
 //! ## Runtime-test-parity
 //!
@@ -80,6 +87,30 @@ const ADVERTISED_BROKER_URL: &str = "pulsar://broker-pool-lifecycle.proxy.intern
 /// stuff into `CommandConnect.proxy_to_broker_url` after stripping the
 /// `pulsar://` scheme (parity with Java + pulsar-rs; ADR-0039).
 const ADVERTISED_BROKER_HOST_PORT: &str = "broker-pool-lifecycle.proxy.internal:6650";
+
+/// Pinned iteration seed for the single-seed smoke test. Pinning is
+/// load-bearing: an unpinned `SimulationBuilder` derives its iteration seed
+/// from the wall clock (`SystemTime::now()` nanos in moonpool-sim's
+/// `IterationManager::new` → `next_iteration`, builder leaves `seeds` empty),
+/// which `MOONPOOL_SEED` does NOT control. So an unlucky wall-clock run could
+/// fire the always-on default-network bit-flip chaos (ADR-0055) on the
+/// unchecksummed `CommandConnect.proxy_to_broker_url` bytes and trip the strict
+/// `host:port` equality assert below with no way to replay the failure — exactly
+/// the flake class already pinned in `producer_memory_limit_concurrent.rs`
+/// (#160). This seed reaches the clean lifecycle (no URL corruption), so the
+/// exact pinned-CONNECT shape is actually exercised. Issue #309 (the CI
+/// `moonpool-sim (seed=0xb895b56a297d2e6e)` job) failed here NOT because of the
+/// `MOONPOOL_SEED` value — the smoke test never read it — but because the
+/// wall-clock-derived seed on that run happened to corrupt the URL; pinning
+/// removes the lottery, and the assert is now chaos-robust as defence in depth.
+const SMOKE_SEED: u64 = 0x4242_4242_4242_4242;
+
+/// Regression anchor for issue #309. The CI sweep job was labelled with this
+/// `MOONPOOL_SEED`, but the smoke test ignored that env var (no
+/// `set_debug_seeds` → wall-clock-derived seed); the value is pinned into the
+/// chaos sweep below so a corrupting iteration on it is exercised under the
+/// chaos-tolerant assertion (`assert_every_iteration_terminated`).
+const ISSUE_309_REGRESSION_SEED: u64 = 0xb895_b56a_297d_2e6e;
 
 /// Per-run virtual-time budget. Comfortably above the worst-case pooled-dial
 /// recovery (a handful of `connect_timeout`-bounded hangs plus short backoffs,
@@ -463,13 +494,46 @@ fn assert_every_iteration_pooled_then_clean(
                     "iter {i}: bootstrap CONNECT must NOT carry proxy_to_broker_url, got {:?}",
                     bootstrap.connect_proxy_to_broker_url,
                 );
-                assert_eq!(
-                    pinned.connect_proxy_to_broker_url.as_deref(),
-                    Some(ADVERTISED_BROKER_HOST_PORT),
-                    "iter {i}: pinned pool CONNECT must carry proxy_to_broker_url = host:port \
-                     (no scheme), got {:?}",
-                    pinned.connect_proxy_to_broker_url,
-                );
+                // The runtime MUST always stuff the advertised `host:port` into
+                // `proxy_to_broker_url` on the pinned dial — that field being
+                // present (`Some`) is the non-vacuous proof the pinned pool
+                // entry rode the proxy address. The *exact bytes* are asserted
+                // only when they arrived intact: the always-on default-network
+                // bit-flip chaos (ADR-0055) can corrupt the unchecksummed
+                // CONNECT-frame bytes in flight (issue #309 — a `.`→U+000E
+                // single-bit flip), which is a valid bounded chaos drop, not a
+                // runtime regression. The smoke test pins `SMOKE_SEED` (clean
+                // path) so this branch DOES hit the strict equality below; the
+                // robustness keeps the assert honest even if a future
+                // builder/seed change reintroduces chaos here.
+                let pinned_url = pinned
+                    .connect_proxy_to_broker_url
+                    .as_deref()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "iter {i}: pinned pool CONNECT must CARRY proxy_to_broker_url \
+                         (present), got {:?}",
+                            pinned.connect_proxy_to_broker_url,
+                        )
+                    });
+                if pinned_url.len() == ADVERTISED_BROKER_HOST_PORT.len()
+                    && pinned_url != ADVERTISED_BROKER_HOST_PORT
+                {
+                    // Same length, different bytes → a bit-flip corrupted the
+                    // URL in flight. Bounded chaos drop; the URL field is still
+                    // present and the lifecycle still terminated cleanly.
+                    eprintln!(
+                        "iter {i}: pinned proxy_to_broker_url bit-flipped by default-network \
+                         chaos (expected {ADVERTISED_BROKER_HOST_PORT:?}, got {pinned_url:?}); \
+                         accepted as a bounded chaos drop"
+                    );
+                } else {
+                    assert_eq!(
+                        pinned_url, ADVERTISED_BROKER_HOST_PORT,
+                        "iter {i}: pinned pool CONNECT must carry proxy_to_broker_url = host:port \
+                         (no scheme), got {pinned_url:?}",
+                    );
+                }
                 assert!(
                     pinned
                         .frames
@@ -519,6 +583,11 @@ fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_smoke() {
             sessions: sessions.clone(),
         })
         .workload(ClientWorkload::new(sessions, outcomes.clone()))
+        // Pin the iteration seed (see `SMOKE_SEED`): without this the builder
+        // derives the seed from the wall clock, which `MOONPOOL_SEED` cannot
+        // control, leaving the strict `proxy_to_broker_url` equality below at
+        // the mercy of an unlucky bit-flip (issue #309).
+        .set_debug_seeds(vec![SMOKE_SEED])
         .set_iterations(1)
         .run();
     assert_eq!(
@@ -528,26 +597,35 @@ fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_smoke() {
     assert_every_iteration_pooled_then_clean(&outcomes, 1);
 }
 
-/// 8-seed sweep — the lifecycle surface under the default moonpool fault model.
-/// On a fraction of seeds a connect fault or bit-flip can prevent the clean path;
-/// every one must still terminate with either the strong lifecycle outcome or a
-/// bounded error. The smoke test above is the exact pooled-open + teardown proof.
+/// Multi-seed sweep — the lifecycle surface under the default moonpool fault
+/// model. On a fraction of seeds a connect fault or bit-flip can prevent the
+/// clean path; every one must still terminate with either the strong lifecycle
+/// outcome or a bounded error. The smoke test above is the exact pooled-open +
+/// teardown proof.
+///
+/// The issue #309 regression anchor (`ISSUE_309_REGRESSION_SEED`) is pinned
+/// FIRST so the corrupting-iteration path is exercised here under the
+/// chaos-tolerant assertion, regardless of the `MOONPOOL_SEED`-derived sweep
+/// tail.
 #[test]
 fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_sweep_8_seeds() {
     let sessions = Arc::new(Mutex::new(Vec::<SessionRecord>::new()));
     let outcomes = Arc::new(Mutex::new(Vec::<LifecycleOutcome>::new()));
+    let mut seeds = vec![ISSUE_309_REGRESSION_SEED];
+    seeds.extend(sweep_seeds(8));
+    let iterations = seeds.len();
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
         .workload(ProxyWorkload {
             sessions: sessions.clone(),
         })
         .workload(ClientWorkload::new(sessions, outcomes.clone()))
-        .set_debug_seeds(sweep_seeds(8))
-        .set_iterations(8)
+        .set_debug_seeds(seeds)
+        .set_iterations(iterations)
         .run();
     assert_eq!(
-        report.iterations, 8,
+        report.iterations, iterations,
         "every seed must be dispatched and terminate (no silent hang): {report:?}",
     );
-    assert_every_iteration_terminated(&outcomes, 8);
+    assert_every_iteration_terminated(&outcomes, iterations);
 }
