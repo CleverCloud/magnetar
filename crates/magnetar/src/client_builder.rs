@@ -40,6 +40,7 @@ pub struct ClientBuilder {
     supervisor: Option<magnetar_proto::SupervisorConfig>,
     memory_limit: Option<MemoryLimit>,
     dns_resolver: Option<std::sync::Arc<dyn magnetar_runtime_tokio::DnsResolver>>,
+    connections_per_broker: Option<usize>,
 }
 
 impl Default for ClientBuilder {
@@ -61,6 +62,7 @@ impl Default for ClientBuilder {
             supervisor: None,
             memory_limit: None,
             dns_resolver: None,
+            connections_per_broker: None,
         }
     }
 }
@@ -110,6 +112,28 @@ impl ClientBuilder {
     #[must_use]
     pub fn memory_limit(mut self, bytes: usize, policy: MemoryLimitPolicy) -> Self {
         self.memory_limit = Some(MemoryLimit { bytes, policy });
+        self
+    }
+
+    /// Set the number of connections the client opens to **each broker**. Mirrors
+    /// Java `ClientBuilder#connectionsPerBroker(int)` (issue #314, [ADR-0073]).
+    ///
+    /// Default (and `0`/`1`): **one** connection per broker — every producer and
+    /// consumer for a given broker shares a single TCP connection, exactly as
+    /// before. With `n > 1`, the client opens up to `n` connections per broker
+    /// and round-robins producers / consumers across them, so a single logical
+    /// producer fleet can spread its publish load over several independent
+    /// connections instead of contending on one (the per-connection driver, its
+    /// send path, and its receipt-read path are independent per connection).
+    /// This removes the send-side back-pressure that otherwise forces
+    /// applications to hand-roll a pool of [`PulsarClient`]s.
+    ///
+    /// `0` is treated as `1` (matching Java, where the floor is one connection).
+    ///
+    /// [ADR-0073]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0073-connections-per-broker.md
+    #[must_use]
+    pub fn connections_per_broker(mut self, n: usize) -> Self {
+        self.connections_per_broker = Some(n.max(1));
         self
     }
 
@@ -282,6 +306,12 @@ impl ClientBuilder {
                 ));
             }
         };
+        // `connections_per_broker` is a runtime connection-pool policy (it never
+        // reaches the sans-io `magnetar-proto` core — ADR-0004/ADR-0073), so it is
+        // applied to the runtime `Client` after connect rather than threaded into
+        // `ConnectionConfig`. Captured here (it is `Copy`) before `self` is moved
+        // into the connect-flavour branches below.
+        let connections_per_broker = self.connections_per_broker;
         let mut config = magnetar_proto::conn::ConnectionConfig::default();
         if let Some(v) = self.client_version {
             config.client_version = v;
@@ -398,6 +428,12 @@ impl ClientBuilder {
             .await?
         } else {
             Client::connect_auth(&service_url, config, self.auth_provider).await?
+        };
+        // Java `ClientBuilder#connectionsPerBroker` — apply the fan-out to the
+        // runtime client now that the bootstrap connection is up (ADR-0073, #314).
+        let inner = match connections_per_broker {
+            Some(n) => inner.with_connections_per_broker(n),
+            None => inner,
         };
         Ok(PulsarClient {
             inner,
