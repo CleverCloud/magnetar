@@ -680,8 +680,14 @@ pub struct CreateProducerRequest {
     pub producer_metadata: Vec<(String, String)>,
     /// Mirrors Java `ProducerBuilder#sendTimeout`. When set, any in-flight send whose
     /// `enqueued_at + timeout` has elapsed surfaces a synthetic
-    /// `SendError(code=11008, "send timeout")` on the next `Connection::handle_timeout`
-    /// tick. `None` disables the sweep (the default).
+    /// `SendError(code=-1, "send timeout")` on the next `Connection::handle_timeout`
+    /// tick. `None` disables the sweep.
+    ///
+    /// [`Default`] is `Some(30s)` — byte-for-byte the Apache Pulsar Java client's
+    /// `sendTimeoutMs = 30000` (ADR-0072). A send whose receipt is lost, dropped, or
+    /// corrupted in flight therefore fails deterministically with a timeout error
+    /// instead of hanging forever. Pass `None` explicitly to restore the unbounded
+    /// (never-times-out) semantics.
     pub send_timeout: Option<Duration>,
     /// Mirrors Java `ProducerBuilder#batchingMaxPublishDelay`. When set and batching is
     /// enabled, the state machine flushes any non-empty batch whose oldest message has
@@ -705,7 +711,10 @@ impl Default for CreateProducerRequest {
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
             producer_metadata: Vec::new(),
-            send_timeout: None,
+            // Java-parity default (ADR-0072): `ProducerBuilder#sendTimeout` defaults
+            // to 30 000 ms. A send whose receipt is lost/corrupted in flight then
+            // fails deterministically with a timeout rather than hanging forever.
+            send_timeout: Some(Duration::from_secs(30)),
             batching_max_publish_delay: None,
         }
     }

@@ -151,6 +151,81 @@ async fn handle_session(
     }
 }
 
+fn emit_send_receipt(out: &mut BytesMut, producer_id: u64, sequence_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::SendReceipt as i32,
+        send_receipt: Some(pb::CommandSendReceipt {
+            producer_id,
+            sequence_id,
+            message_id: Some(pb::MessageIdData {
+                ledger_id: 1,
+                entry_id: sequence_id,
+                ..Default::default()
+            }),
+            highest_sequence_id: None,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// Broker session that replies to CONNECT / LOOKUP / PRODUCER opens AND
+/// promptly acks every SEND with a matching `CommandSendReceipt`. Used by the
+/// default-send-timeout happy-path mirror to prove the 30s default does not
+/// spuriously fail a healthy, promptly-acked send.
+async fn handle_session_acking(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let mut out_buf = BytesMut::with_capacity(64 * 1024);
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+            let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                continue;
+            };
+            match kind {
+                pb::base_command::Type::Connect => emit_connected(&mut out_buf),
+                pb::base_command::Type::Ping => emit_pong(&mut out_buf),
+                pb::base_command::Type::Lookup => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(&mut out_buf, l.request_id);
+                    }
+                }
+                pb::base_command::Type::Producer => {
+                    if let Some(p) = &frame.command.producer {
+                        emit_producer_success(&mut out_buf, p.request_id);
+                    }
+                }
+                pb::base_command::Type::Send => {
+                    if let Some(s) = &frame.command.send {
+                        emit_send_receipt(&mut out_buf, s.producer_id, s.sequence_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !out_buf.is_empty() {
+            stream.write_all(&out_buf).await?;
+            stream.flush().await?;
+            out_buf.clear();
+        }
+
+        match stream.read_buf(&mut read_buf).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn spawn_send_timeout_broker() -> (String, Arc<AtomicU32>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -228,6 +303,85 @@ async fn driver_loop_send_timeout_fires_against_host_clock() {
     assert!(
         observed >= 1,
         "broker must have seen at least one CommandSend (observed={observed})",
+    );
+
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+    drop(client);
+}
+
+/// ADR-0072 — the Java-parity DEFAULT `send_timeout` (30s) is wired through
+/// the tokio open-producer path. A `CreateProducerRequest` left with its
+/// default `send_timeout` carries `Some(30s)` byte-for-byte with the Java
+/// client's `sendTimeoutMs = 30000`, so a send whose receipt is lost fails
+/// deterministically rather than hanging forever.
+///
+/// The *firing* of the default deadline over the host clock would require a
+/// real 30s wall-clock wait, so the deterministic firing assertion lives on
+/// the moonpool twin
+/// (`driver_loop_default_send_timeout_fires_against_virtual_clock`, which
+/// advances virtual time past 30s for free). This tokio mirror pins the
+/// default VALUE and the no-false-positive happy path over a real loopback
+/// socket, keeping `check-runtime-test-parity` 1:1 per ADR-0024.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_send_timeout_request_carries_java_parity_value() {
+    // The canonical default — what an unset builder leaves on the request.
+    let req = CreateProducerRequest::default();
+    assert_eq!(
+        req.send_timeout,
+        Some(Duration::from_secs(30)),
+        "CreateProducerRequest::default() must carry the 30s Java-parity send_timeout"
+    );
+
+    // No-false-positive over real loopback: a producer with the DEFAULT
+    // send_timeout whose send IS promptly acked resolves Ok, not a spurious
+    // timeout. We reuse the send-timeout broker but assert a fast ack path by
+    // pinning a SHORT explicit timeout is unnecessary here — instead we drive
+    // the happy path: open a default-timeout producer and confirm the send
+    // resolves without the deadline (the broker acks immediately).
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        while let Ok((stream, _peer)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = handle_session_acking(stream).await;
+            });
+        }
+    });
+    let url = format!("pulsar://{addr}");
+
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::connect(&url, ConnectionConfig::default()),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    // Open WITHOUT setting send_timeout — inherits the 30s default.
+    let producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/default-send-timeout".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out")
+    .expect("open_producer ok");
+
+    // The broker acks promptly, so the send resolves Ok well within the 30s
+    // default — the default deadline must not spuriously fail a healthy send.
+    let result = tokio::time::timeout(
+        HANG_GUARD,
+        producer.send_bytes(Bytes::from_static(b"acked-fast")),
+    )
+    .await
+    .expect("send resolved within the host budget");
+    assert!(
+        result.is_ok(),
+        "a healthy send must resolve Ok under the 30s default, got {result:?}"
     );
 
     if let Some(d) = client.take_driver() {
