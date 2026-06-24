@@ -118,6 +118,57 @@ async fn e2e_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Issue #303 (driver read-fairness) sanity: a large burst of CONCURRENT
+/// in-flight sends against a real broker all resolve with receipts. The driver
+/// loop must read back every `CommandSendReceipt` promptly even while the
+/// outbound `driver_waker` is hammered by the burst — the read-first `select!`
+/// reorder keeps the inbound path live. A regression that starved receipt reads
+/// would surface here as the burst-join timing out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_send_burst_all_receipts_resolve() -> Result<(), Box<dyn std::error::Error>> {
+    const BURST: usize = 512;
+
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+    let topic = "persistent://public/default/magnetar-e2e-send-burst";
+
+    let producer = std::sync::Arc::new(client.producer(topic).create().await?);
+
+    // Fire the whole burst before awaiting any of it, so the driver loop is
+    // driven under sustained `driver_waker` pressure while the broker streams
+    // receipts back. Every `SendFut` must resolve.
+    let mut tasks = Vec::with_capacity(BURST);
+    for i in 0..BURST {
+        let p = producer.clone();
+        tasks.push(tokio::spawn(async move {
+            p.send(OutgoingMessage::with_payload(format!("burst-{i}").into_bytes()).into())
+                .await
+        }));
+    }
+
+    let mut acked = 0usize;
+    for (i, t) in tasks.into_iter().enumerate() {
+        let result = tokio::time::timeout(Duration::from_secs(30), t)
+            .await
+            .map_err(|_| format!("send #{i} of {BURST} did not resolve within 30s"))?
+            .map_err(|e| format!("send task #{i} panicked: {e:?}"))?;
+        result.map_err(|e| format!("send #{i} of {BURST} failed: {e:?}"))?;
+        acked += 1;
+    }
+    assert_eq!(acked, BURST, "every send in the burst must resolve");
+
+    std::sync::Arc::try_unwrap(producer)
+        .map_err(|_| "producer still shared")?
+        .close()
+        .await?;
+    client.close().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_partitioned_topic_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;

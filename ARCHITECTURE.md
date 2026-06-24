@@ -546,18 +546,28 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
               ┌────────────────────────────────┼────────────────────────────────┐
               │                                │                                │
               ▼                                ▼                                ▼
-   ┌──────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-   │ shared.driver_waker  │     │ socket.read_buf(&buf)   │     │ sleep_until(deadline)   │
-   │   .notified()        │     │   on Ok(0) -> PeerClosed │     │   on tick -> handle_   │
-   │   (user enqueued     │     │   on Ok(n) -> lock +     │     │   timeout(now)           │
-   │   a send/ack/etc.)   │     │   handle_bytes(now, &b)  │     │                         │
-   │   loop continues     │     │   then drain events      │     │                         │
-   └──────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+   ┌─────────────────────────┐     ┌──────────────────────┐     ┌─────────────────────────┐
+   │ socket.read_buf(&buf)   │     │ shared.driver_waker  │     │ sleep_until(deadline)   │
+   │   (polled FIRST —        │     │   .notified()        │     │   on tick -> handle_   │
+   │   receipt fairness)      │     │   (user enqueued     │     │   timeout(now)           │
+   │   on Ok(0) -> PeerClosed │     │   a send/ack/etc.)   │     │                         │
+   │   on Ok(n) -> lock +     │     │   loop continues     │     │                         │
+   │   handle_bytes(now, &b)  │     │                      │     │                         │
+   │   then drain events      │     │                      │     │                         │
+   └─────────────────────────┘     └──────────────────────┘     └─────────────────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
                                 │     back to (1)             │
                                 └─────────────────────────────┘
 ```
+
+### Read fairness
+
+The `select!` keeps `biased;` — a non-biased `tokio::select!` chooses arms via an uncontrolled thread-local RNG, which would break the moonpool engine's bit-for-bit reproducibility — but the **inbound read arm is polled FIRST**, before the `driver_waker` arm.
+Every `Producer::send` pulses `driver_waker.notify_one()`, so under sustained publish load a waker permit is almost always pending on loop entry; polling the waker arm first would let the outbound path starve inbound `CommandSendReceipt` reads, inflating `send→ack` latency under load while the broker acks in milliseconds (issue #303).
+The outbound path is not starved by giving reads priority: `poll_transmit` + `write_all` run at the TOP of every loop iteration (step (1)/(2) above) regardless of which `select!` arm wins, so each tick still flushes pending sends.
+The read arm is cancel-safe — bytes land in the persistent `read_buf` and are consumed via `split()` only after the arm wins — so the reorder drops no bytes.
+A full read/write task split (a dedicated reader, mirroring `pulsar-client-go`) is a deferred follow-up: the TLS stream cannot `into_split` and the supervisor reconnect path would need rework, so the localized arm reorder is the minimal fairness fix.
 
 ### Lock discipline
 

@@ -4,8 +4,8 @@
 //! `magnetar-runtime-moonpool/tests/consumer_flow_control_edge.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): two `#[test]` functions here mirror the
-//! moonpool file's two.
+//! (`check-runtime-test-parity`): three `#[test]` functions here mirror the
+//! moonpool file's three.
 //!
 //! ## What this pins
 //!
@@ -32,7 +32,9 @@
 //! The first `#[test]` walks one full queue + one replenishment window; the
 //! second pins the `receiver_queue_size = 1` lower-bound edge (where the
 //! half-threshold floors to 1 so every pop owes a flow) covering the `max(1)`
-//! branch in [`ConsumerState::maybe_flow`].
+//! branch in [`ConsumerState::maybe_flow`]. The third (issue #307) pins the
+//! Failover-promotion re-flow: a subscribed-but-zero-permit consumer promoted
+//! to active re-arms its flow so `receive()` does not starve forever.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -381,5 +383,140 @@ fn flow_control_single_permit_window_never_underruns() {
     assert_eq!(
         total_replenished, WINDOWS as u32,
         "each of the {WINDOWS} single-message windows replenished exactly one permit",
+    );
+}
+
+/// Subscribe a `Failover` consumer and ack the subscribe so it is registered
+/// and `Ready`, but **do not** force the initial flow — the consumer sits at
+/// `available_permits == 0`, exactly the state a standby holds (or that a
+/// re-attached consumer holds between the gated re-subscribe and the broker's
+/// flow). Returns the handle.
+fn open_failover_standby(
+    shared: &ConnectionShared,
+    topic: &str,
+    receiver_queue_size: usize,
+    at: Instant,
+) -> magnetar_proto::ConsumerHandle {
+    {
+        let mut conn = shared.inner.lock();
+        conn.begin_handshake().expect("handshake");
+        let connected = handshake_response_bytes();
+        conn.handle_bytes(at, &connected).expect("Connected");
+        let _ = conn.poll_event();
+    }
+
+    let req = SubscribeRequest {
+        topic: topic.to_owned(),
+        subscription: "magnetar-test-failover".to_owned(),
+        sub_type: pb::command_subscribe::SubType::Failover,
+        receiver_queue_size,
+        ..Default::default()
+    };
+    let (handle, subscribe_request_id) = {
+        let mut conn = shared.inner.lock();
+        let request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(req);
+        (handle, request_id)
+    };
+
+    {
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: subscribe_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        encode_command(&mut buf, &success).expect("encode CommandSuccess");
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(at, &buf).expect("Success");
+        let _ = conn.poll_event();
+        // Drain the subscribe frame; NO initial flow is forced.
+        let _ = conn.poll_transmit();
+    }
+    handle
+}
+
+/// Encode a `CommandActiveConsumerChange` frame for `handle`.
+fn active_consumer_change_frame(
+    handle: magnetar_proto::ConsumerHandle,
+    is_active: bool,
+) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ActiveConsumerChange as i32,
+        active_consumer_change: Some(pb::CommandActiveConsumerChange {
+            consumer_id: handle.0,
+            is_active: Some(is_active),
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandActiveConsumerChange");
+    buf
+}
+
+/// Failover promotion re-arms flow (issue #307). A subscribed Failover consumer
+/// sitting at `available_permits == 0` (standby, or re-attached pre-flow) gets a
+/// `CommandActiveConsumerChange { is_active: true }`. The proto layer must
+/// re-arm the initial flow — granting `receiver_queue_size` permits and queuing
+/// a `CommandFlow` — so a `receive()` against a non-empty broker backlog is not
+/// starved forever. A redundant promotion (permits already outstanding) must
+/// NOT double-flow.
+#[test]
+fn failover_promotion_rearms_flow_so_receive_does_not_starve() {
+    const RQ: usize = 8;
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let handle = open_failover_standby(&shared, "persistent://public/default/failover", RQ, t0);
+
+    // Standby: zero broker-side permits. Without the #307 fix, a promoted
+    // consumer would sit here forever.
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        0,
+        "a standby Failover consumer holds zero permits until promotion re-arms flow",
+    );
+
+    // Promotion to active.
+    let promote = active_consumer_change_frame(handle, true);
+    let grants = {
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(t0, &promote).expect("active-change");
+        let mut out = conn.poll_transmit();
+        drain_flow_permits(&mut out)
+    };
+
+    // Flow re-armed: permits back to the receiver-queue size and exactly one
+    // grant of `RQ` permits went out on the wire.
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        RQ as u32,
+        "promotion to active must re-arm the initial flow",
+    );
+    assert_eq!(
+        grants,
+        vec![RQ as u32],
+        "promotion emits exactly one CommandFlow granting receiver_queue_size permits",
+    );
+
+    // A redundant promotion (permits already outstanding) must not double-flow.
+    let promote_again = active_consumer_change_frame(handle, true);
+    let regrants = {
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(t0, &promote_again)
+            .expect("active-change");
+        let mut out = conn.poll_transmit();
+        drain_flow_permits(&mut out)
+    };
+    assert!(
+        regrants.is_empty(),
+        "a consumer that already holds permits must not be re-flowed on a redundant promotion",
+    );
+    assert_eq!(
+        shared.inner.lock().consumer_available_permits(handle),
+        RQ as u32,
+        "permits unchanged by the redundant promotion — no double-flow",
     );
 }

@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, Frame, FrameError, decode_one, encode_command, pb,
+    ConnectionConfig, ConsumerHandle, CreateProducerRequest, Frame, FrameError, SubscribeRequest,
+    decode_one, encode_command, encode_payload, pb,
 };
 use magnetar_runtime_tokio::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -447,5 +448,396 @@ async fn producer_open_recovers_after_transient_reject() {
     // down without needing a broker close-ack (the recovered-open assertion
     // above is the contract under test).
     drop(producer);
+    client.close().await;
+}
+
+/// Shared script state for the #302 give-up tests: count transient rejects so
+/// the test can assert the retry leg re-armed MULTIPLE times before the proto
+/// layer terminalized the open / subscribe.
+#[derive(Default)]
+struct GiveUpGating {
+    producer_opens: AtomicU32,
+    subscribes: AtomicU32,
+}
+
+/// Broker that NEVER acks the producer-open: every `CommandProducer` is bounced
+/// with a transient `ServiceNotReady`. The retry leg keeps re-issuing
+/// lookup + open; after `MAX_TRANSIENT_OPEN_RETRIES` the proto layer
+/// terminalizes the open (issue #302) so the user's `open_producer` future
+/// resolves `Err` instead of hanging forever.
+async fn run_always_transient_producer_broker(listener: TcpListener, state: Arc<GiveUpGating>) {
+    let Ok((mut s, _)) = listener.accept().await else {
+        return;
+    };
+    let st = Arc::clone(&state);
+    serve_conn(&mut s, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(l) = &frame.command.lookup_topic {
+                    emit_lookup_response(out, l.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Producer) => {
+                if let Some(p) = &frame.command.producer {
+                    st.producer_opens.fetch_add(1, Ordering::SeqCst);
+                    emit_transient_error(out, p.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+/// #302 (tokio integration, producer give-up): the bounded retry loop must
+/// re-arm across MANY transient rejects and then SURFACE an `Err` once the
+/// proto budget is exhausted — never hang `open_producer` forever (the
+/// pre-fix one-shot retry, after a single failure, left the future PENDING
+/// behind the closed `broker_ready` drain gate). Runs under
+/// `start_paused = true` so the exponential-backoff sleeps auto-advance in
+/// virtual time. 1:1 twin of the moonpool engine's give-up test (ADR-0024).
+#[tokio::test(start_paused = true)]
+async fn producer_open_gives_up_with_error_after_budget_exhausted() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(GiveUpGating::default());
+    tokio::spawn(run_always_transient_producer_broker(
+        listener,
+        Arc::clone(&state),
+    ));
+    let url = format!("pulsar://{addr}");
+
+    let client = Client::connect(&url, ConnectionConfig::default())
+        .await
+        .expect("connect must succeed");
+
+    // The open must RESOLVE (with Err), not hang. Under paused time the retry
+    // backoff sleeps elapse instantly, so the give-up arrives promptly.
+    let result = client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/never-served".to_owned(),
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "open_producer must surface Err after the transient retry budget is exhausted, \
+         not hang forever (issue #302); got {result:?}"
+    );
+    assert!(
+        state.producer_opens.load(Ordering::SeqCst) >= 2,
+        "the retry leg must re-arm across MULTIPLE transient rejects before giving up \
+         (saw {} opens)",
+        state.producer_opens.load(Ordering::SeqCst),
+    );
+
+    client.close().await;
+}
+
+/// Broker that NEVER acks the subscribe: every `CommandSubscribe` is bounced
+/// with a transient `ServiceNotReady`. Consumer twin of
+/// [`run_always_transient_producer_broker`].
+async fn run_always_transient_subscribe_broker(listener: TcpListener, state: Arc<GiveUpGating>) {
+    let Ok((mut s, _)) = listener.accept().await else {
+        return;
+    };
+    let st = Arc::clone(&state);
+    serve_conn(&mut s, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(l) = &frame.command.lookup_topic {
+                    emit_lookup_response(out, l.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Subscribe) => {
+                if let Some(sub) = &frame.command.subscribe {
+                    st.subscribes.fetch_add(1, Ordering::SeqCst);
+                    emit_transient_error(out, sub.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+/// #302 (tokio integration, consumer give-up): the bounded subscribe-retry
+/// loop must re-arm across MANY transient rejects and then make `receive()`
+/// surface an `Err` once the proto budget is exhausted — never block
+/// `receive()` forever on a subscription that will never reattach. 1:1 twin of
+/// the moonpool engine's give-up test (ADR-0024).
+#[tokio::test(start_paused = true)]
+async fn subscribe_gives_up_and_receive_errors_after_budget_exhausted() {
+    use magnetar_proto::SubscribeRequest;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(GiveUpGating::default());
+    tokio::spawn(run_always_transient_subscribe_broker(
+        listener,
+        Arc::clone(&state),
+    ));
+    let url = format!("pulsar://{addr}");
+
+    let client = Client::connect(&url, ConnectionConfig::default())
+        .await
+        .expect("connect must succeed");
+
+    // The subscribe itself surfaces the broker error to the subscribe future
+    // (event-stream `SubscribeFailed`); either way a `receive()` on the handle
+    // must NOT block forever. We subscribe, and if the subscribe future
+    // resolves Err that already proves the give-up; if it somehow resolved Ok
+    // we then assert receive() errors. Drive both under the give-up budget.
+    let consumer = client
+        .subscribe(SubscribeRequest {
+            topic: "persistent://public/default/never-served-sub".to_owned(),
+            subscription: "giveup-302".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        })
+        .await;
+
+    match consumer {
+        Err(_) => {
+            // Subscribe surfaced the terminal failure directly — give-up proven.
+        }
+        Ok(consumer) => {
+            // Subscribe returned a handle; a receive() across the give-up must
+            // resolve Err rather than hang.
+            let got = consumer.receive().await;
+            assert!(
+                got.is_err(),
+                "receive() must surface Err after the subscribe give-up, not block forever \
+                 (issue #302); got {got:?}"
+            );
+        }
+    }
+    assert!(
+        state.subscribes.load(Ordering::SeqCst) >= 2,
+        "the subscribe retry leg must re-arm across MULTIPLE transient rejects before \
+         giving up (saw {} subscribes)",
+        state.subscribes.load(Ordering::SeqCst),
+    );
+
+    client.close().await;
+}
+
+/// A `CommandMessage` + payload addressed to `handle` at `(ledger, entry)`.
+fn emit_message_frame(out: &mut BytesMut, handle: ConsumerHandle, entry: u64, payload: &[u8]) {
+    let msg_cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Message as i32,
+        message: Some(pb::CommandMessage {
+            consumer_id: handle.0,
+            message_id: pb::MessageIdData {
+                ledger_id: 9,
+                entry_id: entry,
+                partition: None,
+                batch_index: None,
+                ack_set: vec![],
+                batch_size: None,
+                first_chunk_message_id: None,
+            },
+            redelivery_count: Some(0),
+            ack_set: vec![],
+            consumer_epoch: None,
+        }),
+        ..Default::default()
+    };
+    let metadata = pb::MessageMetadata {
+        producer_name: "magnetar-test-prod".to_owned(),
+        sequence_id: entry,
+        publish_time: 0,
+        ..Default::default()
+    };
+    encode_payload(out, &msg_cmd, &metadata, payload).expect("encode message frame");
+}
+
+/// Script state for the #299 receive-across-drop test.
+#[derive(Default)]
+struct ReceiveAcrossDropGating {
+    /// `CommandSubscribe` frames seen across both sessions (session 1 + the
+    /// rebuild on session 2).
+    subscribes: AtomicU32,
+}
+
+/// Two-session supervised broker for the #299 receive-across-drop test.
+///
+/// Session 1: handshake, ack the subscribe (consumer is live), then DROP the
+/// socket as soon as the consumer's initial `CommandFlow` arrives — the
+/// `receive()` the test started is now parked across a transport drop, and the
+/// connection sits in `HandshakeState::Failed` for the whole reconnect window.
+///
+/// Session 2: handshake, re-ack the rebuilt subscribe, and on the rebuild's
+/// `CommandFlow` deliver one `CommandMessage`. A correct client re-parks the
+/// `receive()` during the recoverable `Failed` window (issue #299) and resolves
+/// it with THIS message — the pre-fix `is_closed()` guard instead resolved
+/// `Err(Closed)` the instant `reset()` woke the parked receiver mid-`Failed`.
+async fn run_receive_across_drop_broker(
+    listener: TcpListener,
+    state: Arc<ReceiveAcrossDropGating>,
+    consumer_id: u64,
+) {
+    // ── Session 1: ack subscribe, drop on the initial flow. ──
+    if let Ok((mut s1, _)) = listener.accept().await {
+        let st = Arc::clone(&state);
+        serve_conn(&mut s1, move |frame, out| {
+            match pb::base_command::Type::try_from(frame.command.r#type) {
+                Ok(pb::base_command::Type::Connect) => emit_connected(out),
+                Ok(pb::base_command::Type::Lookup) => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(out, l.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Subscribe) => {
+                    if let Some(sub) = &frame.command.subscribe {
+                        st.subscribes.fetch_add(1, Ordering::SeqCst);
+                        emit_subscribe_success(out, sub.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Flow) => {
+                    // Consumer is live and has granted permits; the receive() is
+                    // now parked. Drop the session to trigger the supervised
+                    // reconnect window.
+                    return false;
+                }
+                Ok(pb::base_command::Type::Ping) => emit_pong(out),
+                _ => {}
+            }
+            true
+        })
+        .await;
+        drop(s1);
+    }
+
+    // A couple of failed redials (mirrors the docker-restart window).
+    for _ in 0..2 {
+        let Ok((s_dead, _)) = listener.accept().await else {
+            return;
+        };
+        drop(s_dead);
+    }
+
+    // ── Session 2: re-ack subscribe, deliver one message on the rebuild flow. ──
+    if let Ok((mut s2, _)) = listener.accept().await {
+        let st = Arc::clone(&state);
+        serve_conn(&mut s2, move |frame, out| {
+            match pb::base_command::Type::try_from(frame.command.r#type) {
+                Ok(pb::base_command::Type::Connect) => emit_connected(out),
+                Ok(pb::base_command::Type::Lookup) => {
+                    if let Some(l) = &frame.command.lookup_topic {
+                        emit_lookup_response(out, l.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Subscribe) => {
+                    if let Some(sub) = &frame.command.subscribe {
+                        st.subscribes.fetch_add(1, Ordering::SeqCst);
+                        emit_subscribe_success(out, sub.request_id);
+                    }
+                }
+                Ok(pb::base_command::Type::Flow) => {
+                    // The rebuilt consumer's initial flow — deliver the message
+                    // the parked receive() must resolve with.
+                    emit_message_frame(out, ConsumerHandle(consumer_id), 1, b"after-reconnect");
+                }
+                Ok(pb::base_command::Type::Ping) => emit_pong(out),
+                _ => {}
+            }
+            true
+        })
+        .await;
+    }
+}
+
+fn emit_subscribe_success(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Success as i32,
+        success: Some(pb::CommandSuccess {
+            request_id,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// #299 (tokio integration): a `receive()` outstanding ACROSS a transport drop
+/// on a SUPERVISED connection must NOT resolve `Err(Closed)` during the
+/// recoverable `Failed` window — it must re-park and transparently resolve with
+/// a delivered message once the supervisor reconnects and the rebuild replays
+/// `CommandSubscribe`. The pre-fix `is_closed()`-based receive guard errored
+/// the instant `reset()` woke the parked receiver mid-`Failed`; the
+/// `consumer_handle_is_terminal` guard re-parks instead. No existing test polls
+/// `receive()` during the `Failed` window. 1:1 twin of the moonpool engine's
+/// receive-across-drop test (ADR-0024).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_across_supervised_drop_resolves_with_message_not_closed() {
+    // The consumer id the broker addresses the post-reconnect message to. The
+    // first consumer on a fresh client is id 0 (the proto allocates from 0).
+    const CONSUMER_ID: u64 = 0;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(ReceiveAcrossDropGating::default());
+    tokio::spawn(run_receive_across_drop_broker(
+        listener,
+        Arc::clone(&state),
+        CONSUMER_ID,
+    ));
+    let url = format!("pulsar://{addr}");
+
+    let config = ConnectionConfig {
+        supervisor: Some(magnetar_proto::SupervisorConfig {
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(250),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
+        .await
+        .expect("connect did not time out")
+        .expect("connect must succeed");
+
+    let consumer = tokio::time::timeout(
+        HANG_GUARD,
+        client.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/recv-across-drop".to_owned(),
+            subscription: "recv-299".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe must succeed");
+
+    // The crux: this receive() is outstanding across the drop. It must resolve
+    // with the post-reconnect message — NOT Err(Closed) during the recoverable
+    // Failed window.
+    let msg = tokio::time::timeout(HANG_GUARD, consumer.receive())
+        .await
+        .expect("receive() must resolve after the supervised reconnect, not hang")
+        .expect(
+            "receive() must transparently resume across a supervised reconnect and deliver \
+             the post-reconnect message, NOT surface Err(Closed) during the recoverable \
+             Failed window (issue #299)",
+        );
+    assert_eq!(
+        msg.payload.as_ref(),
+        b"after-reconnect",
+        "the receive() must resolve with the message delivered on the rebuilt session"
+    );
+    assert!(
+        state.subscribes.load(Ordering::SeqCst) >= 2,
+        "the subscribe must be replayed on the rebuilt session (saw {} subscribes)",
+        state.subscribes.load(Ordering::SeqCst),
+    );
+
     client.close().await;
 }

@@ -284,3 +284,167 @@ async fn e2e_client_survives_malformed_mid_session_frame() -> Result<(), Box<dyn
     client.close().await;
     Ok(())
 }
+
+/// Frame-aware gate for the issue #302 give-up e2e: splice client↔broker, but
+/// intercept every `CommandProducer` flowing client→broker. Instead of
+/// forwarding the open, forge a transient `ServiceNotReady` `CommandError`
+/// (correlated with the open's `request_id`) straight back to the client — the
+/// "bundle not served, please redo the lookup" disposition. The real broker
+/// never sees the open, so the bundle is never served and the client's bounded
+/// transient-retry loop spins until the proto budget
+/// (`MAX_TRANSIENT_OPEN_RETRIES`) is exhausted and the open is terminalized.
+///
+/// The client writer is shared behind an `Arc<Mutex<...>>` so BOTH directions
+/// can write to the client: the broker→client copy forwards real broker frames,
+/// and the client→broker parser forges the transient error directly to the
+/// client for each open it swallows.
+async fn splice_with_producer_open_poison(inbound: TcpStream, outbound: TcpStream) {
+    use std::sync::Arc;
+
+    use bytes::BytesMut;
+    use magnetar::proto::{FrameError, decode_one, encode_command, pb};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    let (mut ri, wi) = inbound.into_split();
+    let (mut ro, mut wo) = outbound.into_split();
+    let wi = Arc::new(AsyncMutex::new(wi));
+
+    // broker → client: forward real broker frames to the client writer.
+    let wi_b2c = Arc::clone(&wi);
+    let b2c = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match ro.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let mut w = wi_b2c.lock().await;
+                    if w.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    let _ = w.flush().await;
+                }
+            }
+        }
+    };
+
+    // client → broker: forward everything EXCEPT `CommandProducer`, which we
+    // bounce back to the client as a transient error instead of forwarding.
+    let wi_c2b = Arc::clone(&wi);
+    let c2b = async move {
+        let mut read_buf = BytesMut::with_capacity(64 * 1024);
+        let mut tmp = vec![0u8; 16 * 1024];
+        loop {
+            loop {
+                let mut framed = read_buf.clone().freeze();
+                let before = framed.len();
+                let frame = match decode_one(&mut framed) {
+                    Ok(f) => f,
+                    Err(FrameError::Incomplete { .. }) => break,
+                    Err(_) => return,
+                };
+                let consumed = before - framed.len();
+                let raw = read_buf.split_to(consumed);
+                if let (Ok(pb::base_command::Type::Producer), Some(p)) = (
+                    pb::base_command::Type::try_from(frame.command.r#type),
+                    frame.command.producer.as_ref(),
+                ) {
+                    let err = pb::BaseCommand {
+                        r#type: pb::base_command::Type::Error as i32,
+                        error: Some(pb::CommandError {
+                            request_id: p.request_id,
+                            error: pb::ServerError::ServiceNotReady as i32,
+                            message: "bundle not served; please redo the lookup".to_owned(),
+                        }),
+                        ..Default::default()
+                    };
+                    let mut out = BytesMut::new();
+                    if encode_command(&mut out, &err).is_err() {
+                        return;
+                    }
+                    let mut w = wi_c2b.lock().await;
+                    if w.write_all(&out).await.is_err() {
+                        return;
+                    }
+                    let _ = w.flush().await;
+                } else if wo.write_all(&raw).await.is_err() {
+                    return;
+                } else {
+                    let _ = wo.flush().await;
+                }
+            }
+            match ri.read(&mut tmp).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => read_buf.extend_from_slice(&tmp[..n]),
+            }
+        }
+    };
+
+    tokio::join!(c2b, b2c);
+}
+
+/// Bind a loopback gate that forges transient producer-open rejects (see
+/// [`splice_with_producer_open_poison`]). Returns the gate `host:port`.
+async fn spawn_producer_open_poison_gate(
+    broker_host: String,
+    broker_port: u16,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gate_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _peer)) = listener.accept().await else {
+                return;
+            };
+            let host = broker_host.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = TcpStream::connect((host.as_str(), broker_port)).await else {
+                    return;
+                };
+                splice_with_producer_open_poison(inbound, outbound).await;
+            });
+        }
+    });
+    Ok(format!("{}:{}", gate_addr.ip(), gate_addr.port()))
+}
+
+/// #302 (e2e): with every producer-open transiently rejected by the gate (the
+/// real broker never serves the bundle), the client's bounded transient-retry
+/// loop must SURFACE an `Err` from `open_producer` once the budget is
+/// exhausted — never hang the call forever (the pre-fix one-shot retry left it
+/// PENDING behind the closed `broker_ready` drain gate). Runs against a real
+/// Pulsar container behind the frame-forging gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_producer_open_gives_up_with_error_when_bundle_never_served()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (broker_host, broker_port, _container) = start_pulsar().await?;
+    let gate_host_port = spawn_producer_open_poison_gate(broker_host, broker_port).await?;
+    let service_url = format!("pulsar://{gate_host_port}");
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(40),
+        PulsarClient::builder()
+            .service_url(service_url)
+            .enable_reconnect(SupervisorConfig::default())
+            .build(),
+    )
+    .await
+    .expect("client build must not exceed the test guard")
+    .expect("client must connect through the gate");
+
+    // The open must RESOLVE with Err, not hang. The bounded retry loop spins
+    // through the gate's transient rejects, then the proto budget terminalizes
+    // the open. The outer timeout is the anti-hang backstop: a pre-fix client
+    // hangs here forever and this fires loudly.
+    let topic = "persistent://public/default/magnetar-e2e-giveup-302";
+    let result = tokio::time::timeout(Duration::from_secs(120), client.producer(topic).create())
+        .await
+        .expect("open_producer must RESOLVE (with Err) after the transient give-up, not hang");
+    assert!(
+        result.is_err(),
+        "open_producer must surface Err once the transient-retry budget is exhausted \
+         (issue #302); got {result:?}"
+    );
+
+    client.close().await;
+    Ok(())
+}
