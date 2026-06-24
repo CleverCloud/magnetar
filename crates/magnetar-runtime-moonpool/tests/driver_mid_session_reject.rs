@@ -102,8 +102,8 @@ const SETTLE_DELAY: Duration = Duration::from_millis(300);
 /// - **Mid-session bit-flip → watchdog close, second master seed** (issue #308
 ///   `MOONPOOL_SEED=0x326bd5e9514d947b`, derived sub-seed 10325270525572099338): an independent
 ///   master seed that lands the *same* bit-flip → `Ok(None)` → watchdog → `CleanExit` interleaving
-///   as #305. Confirms the reclassification is generic (not a per-seed whitelist); pinned here as an
-///   explicit regression anchor.
+///   as #305. Confirms the reclassification is generic (not a per-seed whitelist); pinned here as
+///   an explicit regression anchor.
 const CHAOS_REGRESSION_SEEDS: [u64; 4] = [
     9_388_503_268_189_738_858,
     17_161_897_233_139_508_114,
