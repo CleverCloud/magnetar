@@ -265,12 +265,47 @@ struct ClientObservation {
 
 struct SendTimeoutClient {
     obs: Arc<Mutex<ClientObservation>>,
+    /// Per-send timeout to configure on the producer. `None` opens the
+    /// producer WITHOUT setting `send_timeout`, exercising the Java-parity
+    /// 30s default baked into `CreateProducerRequest::default()` (ADR-0072).
+    send_timeout: Option<Duration>,
 }
 
 impl SendTimeoutClient {
+    /// Client that pins an EXPLICIT `send_timeout`.
     fn new() -> Self {
         Self {
             obs: Arc::new(Mutex::new(ClientObservation::default())),
+            send_timeout: Some(Duration::from_secs(SEND_TIMEOUT_SECS)),
+        }
+    }
+
+    /// Client that relies on the DEFAULT `send_timeout` (ADR-0072, 30s) by
+    /// leaving the field unset on the open request.
+    fn with_default_timeout() -> Self {
+        Self {
+            obs: Arc::new(Mutex::new(ClientObservation::default())),
+            send_timeout: None,
+        }
+    }
+
+    /// The deadline the configured producer is expected to enforce — the
+    /// explicit value when set, else the canonical default.
+    fn effective_timeout(&self) -> Duration {
+        self.send_timeout
+            .or(CreateProducerRequest::default().send_timeout)
+            .unwrap_or(Duration::from_secs(SEND_TIMEOUT_SECS))
+    }
+
+    /// Connect config with a keepalive comfortably LONGER than the effective
+    /// send-timeout deadline, so the keepalive watchdog's self-re-arming timer
+    /// does not storm virtual time before the send-timeout sweep fires. This
+    /// keeps the deterministic-firing assertion clean regardless of whether the
+    /// producer uses the explicit value or the 30s default (ADR-0072).
+    fn connect_config(&self) -> ConnectionConfig {
+        ConnectionConfig {
+            keepalive_interval: self.effective_timeout() + Duration::from_secs(120),
+            ..ConnectionConfig::default()
         }
     }
 }
@@ -291,7 +326,7 @@ impl Workload for SendTimeoutClient {
 
         let connect = tokio::time::timeout(
             Duration::from_secs(20),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+            Client::connect_plain(&engine, &addr, self.connect_config()),
         )
         .await;
         let Ok(Ok(client)) = connect else {
@@ -306,22 +341,29 @@ impl Workload for SendTimeoutClient {
         // virtual clock in the driver loop — without it, the comparison
         // `now - enqueued_at >= send_timeout` would never trigger inside
         // the host-time budget.
-        let producer = match tokio::time::timeout(
-            Duration::from_secs(20),
-            client.open_producer(CreateProducerRequest {
-                topic: "persistent://public/default/virtual-clock-driver".to_owned(),
-                send_timeout: Some(Duration::from_secs(SEND_TIMEOUT_SECS)),
-                ..Default::default()
-            }),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            other => {
-                self.obs.lock().last_error = Some(format!("open_producer failed: {other:?}"));
-                return Ok(());
-            }
+        // Build the open request from the canonical default, then override
+        // `send_timeout` ONLY when this client pins an explicit value. The
+        // default client leaves the field untouched so it exercises the
+        // Java-parity 30s default (ADR-0072) — assigning `self.send_timeout`
+        // unconditionally would write `None` and DISABLE the timeout, masking
+        // the very behavior under test.
+        let mut open_req = CreateProducerRequest {
+            topic: "persistent://public/default/virtual-clock-driver".to_owned(),
+            ..Default::default()
         };
+        if let Some(explicit) = self.send_timeout {
+            open_req.send_timeout = Some(explicit);
+        }
+        let producer =
+            match tokio::time::timeout(Duration::from_secs(20), client.open_producer(open_req))
+                .await
+            {
+                Ok(Ok(p)) => p,
+                other => {
+                    self.obs.lock().last_error = Some(format!("open_producer failed: {other:?}"));
+                    return Ok(());
+                }
+            };
 
         // Capture virtual-time anchor BEFORE the send. We compare to
         // `time.now()` after the future resolves to assert the timeout
@@ -341,17 +383,22 @@ impl Workload for SendTimeoutClient {
         // Drive the simulation forward in virtual time so the driver
         // loop's `handle_timeout` tick has a chance to observe the
         // deadline. We interleave virtual sleeps with task yields so the
-        // sim scheduler keeps pumping the driver task. ~12s of virtual
-        // sleep covers the 10s deadline plus a margin for the timer
-        // wheel resolution. The outer `tokio::time::timeout` (host) is
-        // the safety budget.
+        // sim scheduler keeps pumping the driver task. The virtual-sleep
+        // budget covers the effective deadline (explicit or the 30s default)
+        // plus a margin for the timer-wheel resolution. The outer
+        // `tokio::time::timeout` (host) is the safety budget.
+        let drive_secs = self.effective_timeout().as_secs().saturating_add(8);
+        // The outer guard must be comfortably ABOVE the effective deadline so it
+        // never races the send-timeout firing (the default case deadline is 30s,
+        // so a fixed 30s guard would fire simultaneously with the timeout).
+        let outer_budget = self.effective_timeout() + Duration::from_secs(30);
         let resolved: Option<Result<magnetar_proto::MessageId, ClientError>> =
-            tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(outer_budget, async {
                 tokio::pin!(send_fut);
                 for _ in 0..32 {
                     tokio::task::yield_now().await;
                 }
-                for _ in 0..12 {
+                for _ in 0..drive_secs {
                     tokio::select! {
                         biased;
                         result = &mut send_fut => return Some(result),
@@ -451,6 +498,57 @@ fn driver_loop_send_timeout_fires_against_virtual_clock() {
         elapsed >= Duration::from_secs(SEND_TIMEOUT_SECS),
         "virtual time must have advanced past the deadline before resolution \
          (elapsed={elapsed:?}, obs={obs:?})"
+    );
+}
+
+/// ADR-0072 — the Java-parity DEFAULT `send_timeout` (30s) fires end-to-end
+/// through the moonpool driver loop against virtual time. The producer is
+/// opened WITHOUT setting `send_timeout`, so it inherits
+/// `CreateProducerRequest::default()`'s `Some(30s)`. A send whose
+/// `CommandSendReceipt` the broker never emits must still resolve with the
+/// `code=-1, "timeout"` sentinel once virtual time crosses the 30s deadline —
+/// proving the default reaches the proto sweep rather than leaving the send
+/// to hang forever (the root cause of moonpool seed 0x4402f874c43758d1).
+///
+/// 1:1 twin of the tokio
+/// `default_send_timeout_request_carries_java_parity_value` per ADR-0024.
+#[test]
+fn driver_loop_default_send_timeout_fires_against_virtual_clock() {
+    // Guard the precondition the test depends on.
+    assert_eq!(
+        CreateProducerRequest::default().send_timeout,
+        Some(Duration::from_secs(30)),
+        "this test relies on the 30s Java-parity default (ADR-0072)"
+    );
+
+    let broker = SendTimeoutBroker::new();
+    let sessions = broker.sessions_handled.clone();
+    let client = SendTimeoutClient::with_default_timeout();
+    let obs = client.obs.clone();
+    let _report = SimulationBuilder::new()
+        .workload(broker)
+        .workload(client)
+        .set_debug_seeds(vec![1_234_567_890_u64])
+        .set_iterations(1)
+        .run();
+
+    let handled = *sessions.lock();
+    assert!(
+        handled >= 1,
+        "broker must have accepted the client's CONNECT (sessions_handled={handled})"
+    );
+    let obs = obs.lock();
+    assert_eq!(
+        obs.timed_out,
+        Some(true),
+        "a producer with the DEFAULT send_timeout must still resolve its send \
+         with the synthetic timeout sentinel under virtual time (obs={obs:?})"
+    );
+    let elapsed = obs.virtual_elapsed.unwrap_or_default();
+    assert!(
+        elapsed >= Duration::from_secs(30),
+        "virtual time must have advanced past the 30s default deadline before \
+         resolution (elapsed={elapsed:?}, obs={obs:?})"
     );
 }
 

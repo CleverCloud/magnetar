@@ -238,6 +238,135 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// Issue #299 e2e: a `receive()` held OUTSTANDING across a broker restart must
+/// resolve with the post-restart message — never surface `Err(Closed)` during
+/// the recoverable `Failed` window.
+///
+/// The existing `e2e_supervised_reconnect_across_broker_restart` receives a
+/// message BEFORE the restart and a different one AFTER; it never holds a
+/// `receive()` future across the drop. This test does: it starts awaiting
+/// `consumer.receive()` while the broker is down and the supervisor is
+/// reconnecting (the `HandshakeState::Failed` window that `reset()` wakes the
+/// parked receiver through), and asserts the future re-parks instead of
+/// erroring and resolves with the message published after the broker returns.
+///
+/// Pre-fix the receive future's `is_closed()` guard resolved `Err(Closed)` the
+/// instant `reset()` woke it mid-`Failed`; the `consumer_handle_is_terminal`
+/// guard (issue #299) re-parks until the rebuild replays `CommandSubscribe`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _restart_guard = BROKER_RESTART_LOCK.lock().await;
+    let (service_url, _admin_url, container) = start_pulsar().await?;
+
+    let failover = ControlledClusterFailover::new(service_url);
+    let provider: std::sync::Arc<dyn ServiceUrlProvider> = std::sync::Arc::new(failover.clone());
+    let client = PulsarClient::builder()
+        .service_url_provider(provider)
+        .enable_reconnect(supervisor_for_e2e())
+        .operation_timeout(Duration::from_secs(60))
+        .build()
+        .await?;
+
+    let topic = format!(
+        "persistent://public/default/magnetar-e2e-recv-across-{}",
+        Uuid::new_v4()
+    );
+    let subscription = format!("magnetar-e2e-recv-across-sub-{}", Uuid::new_v4());
+
+    let producer = client.producer(&topic).create().await?;
+    let consumer = client
+        .consumer(&topic)
+        .subscription(&subscription)
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+
+    // Sanity round-trip so the subscription cursor is established.
+    producer
+        .send(OutgoingMessage::with_payload(b"warmup".to_vec()).into())
+        .await?;
+    let warm = tokio::time::timeout(Duration::from_secs(15), consumer.receive()).await??;
+    assert_eq!(warm.payload.as_ref(), b"warmup");
+    let _ = consumer.ack(warm.message_id).await;
+
+    // Start the OUTSTANDING receive() BEFORE the restart, on its own task, so it
+    // is genuinely parked across the transport drop + the whole supervised
+    // reconnect window (the `HandshakeState::Failed` window that `reset()` wakes
+    // the parked receiver through). The consumer queue is empty, so it parks
+    // immediately. Pre-fix this future resolves `Err(Closed)` the instant
+    // `reset()` wakes it mid-`Failed`; the fix re-parks it until the rebuild
+    // replays `CommandSubscribe` and the post-restart message lands.
+    let recv_task = {
+        let consumer = consumer.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(120), consumer.receive())
+                .await
+                .map_err(|_| "outstanding receive() did not resolve after supervised reconnect")?
+                .map_err(|e| {
+                    format!("outstanding receive() surfaced an error instead of resuming: {e:?}")
+                })
+        })
+    };
+
+    // Beat so the receive() above is parked before the drop.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart the broker (synchronously, the proven pattern from the sibling
+    // reconnect test — NOT a detached task whose publish loop can outlive the
+    // test).
+    tracing::info!("restarting pulsar to drive the outstanding-receive reconnect window");
+    let container_id = container.id().to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args(["restart", "--time", "5", &container_id])
+            .status()
+    })
+    .await??;
+    assert!(status.success(), "docker restart failed: {status:?}");
+    let new_host = container.get_host().await?;
+    let new_port = container.get_host_port_ipv4(BROKER_BINARY_PORT).await?;
+    failover.set_url(format!("pulsar://{new_host}:{new_port}"));
+
+    // Publish the message the outstanding receive() must resolve with, polling
+    // (timeout-bounded) until the producer reattaches on the new session.
+    let mut published = false;
+    for _ in 0..20 {
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            producer.send(OutgoingMessage::with_payload(b"across-restart".to_vec()).into()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                published = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+    assert!(published, "post-restart publish never succeeded");
+
+    // THE CRUX: the receive() parked across the whole drop + reconnect window
+    // must resolve with the post-restart message, NOT Err(Closed).
+    let msg = recv_task
+        .await?
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    assert_eq!(
+        msg.payload.as_ref(),
+        b"across-restart",
+        "the outstanding receive() must resolve with the post-restart message (issue #299)",
+    );
+    // Best-effort ack (see the sibling test): an ack in the still-settling
+    // post-reconnect window can surface a benign `SessionLost`.
+    let _ = consumer.ack(msg.message_id).await;
+
+    consumer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
 /// Stage 3 transparent in-flight publish replay: queue several publishes while the
 /// broker is stopped, then verify they all transparently complete on the user-facing
 /// `SendFut`s after the broker restarts (no `Err` surfacing to the caller). Mirrors

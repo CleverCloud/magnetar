@@ -254,13 +254,29 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 );
                 let shared_for_retry = shared.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Exponential backoff (issue #302): the fixed 2s one-shot
+                    // retry gave up after a single attempt, stranding `send()`
+                    // PENDING forever. Size the sleep off the proto-tracked
+                    // attempt counter so repeated transient failures back off,
+                    // and let the proto layer terminalize the open once it
+                    // crosses `MAX_TRANSIENT_OPEN_RETRIES` (which wakes the
+                    // parked send with `Err(PeerClosed)`). Each transient event
+                    // re-arms this leg, so the loop lives across driver
+                    // iterations; this leg handles ONE attempt.
+                    let attempts = shared_for_retry
+                        .inner
+                        .lock()
+                        .producer_transient_open_attempts(handle);
+                    tokio::time::sleep(transient_retry_delay(attempts)).await;
                     let topic = shared_for_retry
                         .inner
                         .lock()
                         .producer_topic(handle)
                         .map(str::to_owned);
                     let Some(topic) = topic else { return };
+                    // A retry-path lookup landing an "unexpected outcome" is
+                    // RETRYABLE, not fatal (issue #302): just bail this leg; the
+                    // next transient event (or the proto cap) drives progress.
                     if !lookup_then(&shared_for_retry, &topic).await {
                         return;
                     }
@@ -288,7 +304,17 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                 );
                 let shared_for_retry = shared.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Exponential backoff (issue #302) — consumer twin of the
+                    // producer-open arm above. Repeated transient subscribe
+                    // rejections back off; the proto layer terminalizes the
+                    // subscribe once the attempt counter crosses
+                    // `MAX_TRANSIENT_OPEN_RETRIES`, which wakes the parked
+                    // `receive()` with an `Err` instead of blocking forever.
+                    let attempts = shared_for_retry
+                        .inner
+                        .lock()
+                        .consumer_transient_subscribe_attempts(handle);
+                    tokio::time::sleep(transient_retry_delay(attempts)).await;
                     let topic = shared_for_retry
                         .inner
                         .lock()
@@ -392,6 +418,34 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
 /// `retry_*` that will re-fail if the bundle is still not served). Used by the
 /// transient-error retry path (see #71 + #72) to force the broker to (re)acquire
 /// namespace bundle ownership before we re-attach the producer / consumer.
+/// Exponential-backoff delay for the `attempts`-th transient producer-open /
+/// subscribe retry (issue #302). Steps a fresh [`magnetar_proto::Backoff`]
+/// `attempts` times so each successive transient rejection waits longer (the
+/// pre-fix code used a fixed 2s on the single attempt it made before giving up
+/// forever). `attempts` is the proto-tracked counter — `1` on the first
+/// rejection — so a `0` is treated as the first step. The schedule is bounded
+/// by `Backoff`'s `max`, and the proto layer caps the number of attempts at
+/// [`magnetar_proto::MAX_TRANSIENT_OPEN_RETRIES`], so the worst-case give-up
+/// latency is bounded. The moonpool engine derives the same delay from the
+/// same counter (ADR-0024).
+fn transient_retry_delay(attempts: u32) -> std::time::Duration {
+    // Seed from the original fixed 2s delay (now the FIRST step) so attempt #1
+    // keeps the pre-fix cadence and later attempts grow, capped at 4× the
+    // initial (8s). 1:1 with the moonpool engine's `transient_retry_delay`.
+    let initial = std::time::Duration::from_secs(2);
+    let mut backoff = magnetar_proto::Backoff::new(
+        initial,
+        initial.saturating_mul(4),
+        magnetar_proto::backoff::DEFAULT_MANDATORY_STOP,
+        0,
+    );
+    let mut delay = backoff.next();
+    for _ in 1..attempts {
+        delay = backoff.next();
+    }
+    delay
+}
+
 async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
     use magnetar_proto::OpOutcome;
 
@@ -1040,13 +1094,31 @@ where
         };
 
         tokio::select! {
+            // ADR-0070 read-fairness (issue #303): under a sustained `send`
+            // burst every `Producer::send` pulses `driver_waker.notify_one()`,
+            // so a waker permit is almost always pending on loop entry. With
+            // `biased;` the FIRST arm wins whenever it is ready, so polling the
+            // `driver_waker` arm first would let writes starve the inbound path
+            // — already-arrived `CommandSendReceipt` bytes would not be read
+            // that iteration and the matching `SendFut`s would resolve late.
+            //
+            // The outbound path is NOT starved by giving reads priority here:
+            // `poll_transmit` + `write_all` already run at the TOP of every loop
+            // iteration (above), so each tick flushes pending sends regardless
+            // of which `select!` arm wins. Draining the socket first therefore
+            // keeps BOTH directions live. `biased;` is retained so the arm
+            // order is deterministic — the moonpool engine's
+            // bit-for-bit-reproducible simulation depends on it, and a
+            // non-biased `select!` would pick arms via an uncontrolled
+            // thread-local RNG (ADR-0024 determinism constraint). The read arm
+            // is cancel-safe: bytes land in the persistent `read_buf` and are
+            // only consumed via `split()` AFTER this arm wins, so reordering
+            // drops nothing. The full read/write task split is the deferred
+            // follow-up (TLS streams cannot `into_split`; supervisor reconnect
+            // rework) — this localized reorder is the minimal fix.
             biased;
-            // Driver wake-up from user-facing futures (e.g. a freshly-enqueued send).
-            () = shared.driver_waker.notified() => {
-                // Loop: poll_transmit will drain whatever the future enqueued.
-            }
 
-            // Inbound bytes.
+            // Inbound bytes (polled first for receipt fairness — see above).
             r = socket.read_buf(&mut read_buf) => {
                 let n = match r {
                     Ok(n) => n,
@@ -1166,6 +1238,16 @@ where
                 // and observe the freshly-pushed event.
                 handle_pending_events(shared)?;
                 shared.driver_waker.notify_waiters();
+            }
+
+            // Driver wake-up from user-facing futures (e.g. a freshly-enqueued
+            // send). Polled AFTER the inbound arm (see the read-fairness note at
+            // the top of this `select!`): when both are ready the socket is
+            // drained first so receipts are not deferred; the enqueued frames
+            // are still flushed by the top-of-loop `poll_transmit` on the next
+            // iteration.
+            () = shared.driver_waker.notified() => {
+                // Loop: poll_transmit will drain whatever the future enqueued.
             }
 
             // Timer fired.

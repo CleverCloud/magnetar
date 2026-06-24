@@ -1945,13 +1945,13 @@ fn check_crypto_matrix() -> Result<()> {
         for base in ["tokio", "tokio,moonpool"] {
             let features = format!("{base},{crypto}");
             eprintln!(
-                "xtask check-crypto-matrix: cargo build -p magnetar --no-default-features --features {features}"
+                "xtask check-crypto-matrix: cargo build -p magnetar-driver --no-default-features --features {features}"
             );
             let mut cmd = StdCommand::new(&cargo);
             cmd.current_dir(&workspace_root).args([
                 "build",
                 "-p",
-                "magnetar",
+                "magnetar-driver",
                 "--no-default-features",
                 "--features",
                 &features,
@@ -1962,7 +1962,7 @@ fn check_crypto_matrix() -> Result<()> {
             })?;
             total_cells += 1;
             if !status.success() {
-                failures.push(format!("magnetar:{features}"));
+                failures.push(format!("magnetar-driver:{features}"));
             }
         }
     }

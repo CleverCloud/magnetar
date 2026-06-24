@@ -202,6 +202,18 @@ pub struct ProducerState {
     /// `resendMessages`, which only re-issues pending messages after the
     /// broker confirms the attachment.
     pub broker_ready: bool,
+    /// Number of consecutive transient `CommandProducer` rejections
+    /// (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) the broker has
+    /// returned for this producer since the last success. Bumped by the
+    /// [`crate::Connection`] error handler on each transient open failure;
+    /// reset to `0` when the re-attach is acked (`CommandProducerSuccess`).
+    /// The runtime drivers read it via
+    /// [`crate::Connection::producer_transient_open_attempts`] to size their
+    /// exponential-backoff sleep before the next lookup + retry, and the proto
+    /// layer surfaces a terminal `ProducerOpenFailed` once it crosses
+    /// [`crate::conn::MAX_TRANSIENT_OPEN_RETRIES`] (issue #302 — a one-shot
+    /// retry that gave up forever stranded `send()` PENDING with no error).
+    pub transient_open_attempts: u32,
     /// Cumulative count of logical messages handed to the wire (sum of `num_messages` per
     /// emitted SEND, including each chunk of a chunked publish). Mirrors Java
     /// `ProducerStats#getTotalMsgsSent`.
@@ -517,6 +529,7 @@ impl ProducerState {
             outbound: VecDeque::new(),
             closed: false,
             broker_ready: false,
+            transient_open_attempts: 0,
             total_msgs_sent: 0,
             total_bytes_sent: 0,
             total_send_failed: 0,

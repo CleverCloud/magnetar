@@ -134,9 +134,46 @@ pub struct ConsumerState {
     /// `None` means the broker is free to assign one. Mirrors Java
     /// `Consumer#getConsumerName`.
     pub consumer_name: Option<String>,
-    /// Max receiver queue size — the consumer asks the broker for permits in batches of
+    /// Current receiver queue target — the consumer asks the broker for permits in batches of
     /// `receiver_queue_size / 2` once half of the queue has been consumed.
+    ///
+    /// Issue #301: this is no longer the immutable user setting. It is the
+    /// *current* target produced by [`Self::policy`]: seeded from
+    /// `policy.initial()` at subscribe time, and recomputed each adjust tick by
+    /// `policy.adjust(&FlowStats)`. For the default [`crate::receiver_queue::Fixed`]
+    /// policy it never changes, so behaviour is identical to the raw-`usize`
+    /// design; an [`crate::receiver_queue::Auto`] policy ramps it under load.
     pub receiver_queue_size: usize,
+    /// Pluggable receiver-queue-size policy (issue #301). Holds only immutable
+    /// configuration — all mutable target state lives in
+    /// [`Self::receiver_queue_size`]. `Arc<dyn>` so a subscribe replay clones the
+    /// handle, never the policy. Default is
+    /// [`crate::receiver_queue::Fixed`]`(receiver_queue_size)`, preserving the
+    /// pre-#301 behaviour exactly.
+    ///
+    /// `policy.adjust` is pure (no clock/RNG/I/O) so the tokio and moonpool
+    /// engines stay bit-reproducible — see the module docs on
+    /// [`crate::receiver_queue`].
+    pub policy: std::sync::Arc<dyn crate::receiver_queue::ReceiverQueuePolicy>,
+    /// Running total of `payload.len()` across every message currently buffered
+    /// in [`Self::queue`] (issue #301). Maintained in lock-step: bumped on
+    /// enqueue in [`Self::classify_and_queue`], decremented on dequeue in
+    /// [`Self::pop_message`]. This is the `in_flight_bytes` signal the
+    /// [`crate::receiver_queue::Auto`] OOM guard bounds; it is distinct from
+    /// [`Self::chunk_buffered_bytes`] (which counts *incomplete* chunk
+    /// reassembly buffers, not delivered queue entries).
+    pub(crate) queued_bytes: u64,
+    /// Minimum spacing between [`crate::receiver_queue::ReceiverQueuePolicy::adjust`]
+    /// ticks, driven from [`crate::Connection::handle_timeout`] (issue #301).
+    /// `None` disables auto-adjust entirely (the default for the
+    /// [`crate::receiver_queue::Fixed`] policy — no point ticking a constant).
+    /// `Some(d)` schedules the next adjust at `last_adjust_at + d`, surfaced via
+    /// [`crate::Connection::poll_timeout`].
+    pub(crate) adjust_interval: Option<std::time::Duration>,
+    /// Injected-clock timestamp of the last adjust tick, or `None` before the
+    /// first. Drives the [`Self::next_adjust_deadline`] schedule. Never
+    /// `Instant::now()` (ADR-0011) — set from `handle_timeout`'s `now`.
+    pub(crate) last_adjust_at: Option<std::time::Instant>,
     /// Number of permits the broker currently has us at (i.e., messages the broker may still
     /// push to us without our explicit consent).
     pub available_permits: u32,
@@ -198,6 +235,28 @@ pub struct ConsumerState {
     pub receive_wakers: Slab<Waker>,
     /// Closed flag.
     pub closed: bool,
+    /// Number of consecutive transient `CommandSubscribe` rejections
+    /// (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) the broker has
+    /// returned for this consumer since the last success. Bumped by the
+    /// [`crate::Connection`] error handler on each transient subscribe
+    /// failure; reset to `0` when the re-subscribe is acked. The runtime
+    /// drivers read it via
+    /// [`crate::Connection::consumer_transient_subscribe_attempts`] to size
+    /// their exponential-backoff sleep before the next lookup + retry, and the
+    /// proto layer installs a terminal failure once it crosses
+    /// [`crate::conn::MAX_TRANSIENT_OPEN_RETRIES`] (issue #302).
+    pub transient_subscribe_attempts: u32,
+    /// `Some(reason)` once this consumer has been given a TERMINAL subscribe
+    /// failure — the transient-retry budget was exhausted (issue #302) or a
+    /// non-recoverable subscribe error landed. Installed by
+    /// [`crate::Connection::fail_consumer_subscribe`], which also wakes every
+    /// parked `receive()` waker so the future resolves `Err` instead of
+    /// hanging forever. The runtime receive futures gate on this (via
+    /// [`crate::Connection::consumer_handle_is_terminal`]) to distinguish a
+    /// genuinely-dead subscription from a transiently-`Failed` connection a
+    /// supervisor is still reconnecting (issue #299 — a recoverable `Failed`
+    /// window must NOT surface `Closed`).
+    pub terminal_failure: Option<String>,
     /// Re-attach flow gate: set by `rebuild_consumers` /
     /// `retry_consumer_subscribe` so the connection emits the initial
     /// `CommandFlow` only when the broker ACKS the re-subscribe (`Success`
@@ -485,19 +544,49 @@ pub enum DeliverOutcome {
 }
 
 impl ConsumerState {
-    /// Construct a new consumer.
+    /// Construct a new consumer with the default [`crate::receiver_queue::Fixed`]
+    /// policy of `receiver_queue_size`. Behaviour is identical to the pre-#301
+    /// raw-`usize` design.
     pub fn new(
         handle: ConsumerHandle,
         topic: String,
         subscription: String,
         receiver_queue_size: usize,
     ) -> Self {
+        Self::with_policy(
+            handle,
+            topic,
+            subscription,
+            crate::receiver_queue::fixed(receiver_queue_size),
+            None,
+        )
+    }
+
+    /// Construct a new consumer with an explicit receiver-queue [`policy`]
+    /// (issue #301). The initial target is seeded from `policy.initial()`.
+    /// `adjust_interval` is the spacing between auto-adjust ticks; `None`
+    /// disables auto-adjust (the right choice for a
+    /// [`crate::receiver_queue::Fixed`] policy, whose target never moves).
+    ///
+    /// [`policy`]: Self::policy
+    pub fn with_policy(
+        handle: ConsumerHandle,
+        topic: String,
+        subscription: String,
+        policy: std::sync::Arc<dyn crate::receiver_queue::ReceiverQueuePolicy>,
+        adjust_interval: Option<std::time::Duration>,
+    ) -> Self {
+        let receiver_queue_size = policy.initial();
         Self {
             handle,
             topic,
             subscription,
             consumer_name: None,
             receiver_queue_size,
+            policy,
+            queued_bytes: 0,
+            adjust_interval,
+            last_adjust_at: None,
             available_permits: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
@@ -513,6 +602,8 @@ impl ConsumerState {
             pending_seek: None,
             receive_wakers: Slab::new(),
             closed: false,
+            transient_subscribe_attempts: 0,
+            terminal_failure: None,
             flow_on_subscribe_ack: false,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
@@ -713,7 +804,14 @@ impl ConsumerState {
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
     }
 
-    /// Force an initial flow for the configured receiver queue.
+    /// Force an initial flow for the current receiver-queue target.
+    ///
+    /// Issue #301: `receiver_queue_size` is the policy's *current* target (seeded
+    /// from `policy.initial()` at subscribe time, ramped by
+    /// [`Self::adjust_receiver_queue`]). All three flow-emission sites in the
+    /// connection — fresh subscribe ack, reconnect re-attach, and the #307
+    /// Failover active-consumer-change re-arm — route through here, so each
+    /// grants the policy's CURRENT target rather than a stale raw value.
     pub fn initial_flow(&mut self) -> pb::CommandFlow {
         let permits = self.receiver_queue_size as u32;
         self.available_permits = permits;
@@ -724,6 +822,113 @@ impl ConsumerState {
         }
     }
 
+    /// Build the [`crate::receiver_queue::FlowStats`] snapshot for this
+    /// consumer (issue #301). Pure read of the current state under the per-slot
+    /// lock — carries no clock. `partitions` is supplied by the connection /
+    /// façade aggregate (a per-partition `ConsumerState` does not itself know the
+    /// partition count); `1` for a non-partitioned consumer.
+    #[must_use]
+    pub fn flow_stats(&self, partitions: usize) -> crate::receiver_queue::FlowStats {
+        let avg_message_bytes = self
+            .total_bytes_received
+            .checked_div(self.total_msgs_received)
+            .unwrap_or(0);
+        crate::receiver_queue::FlowStats {
+            current_queue_size: self.receiver_queue_size,
+            queued_messages: self.queue.len(),
+            available_permits: self.available_permits,
+            consume_rate_msgs_per_s: self.current_msgs_per_sec,
+            avg_message_bytes,
+            in_flight_bytes: self.queued_bytes,
+            partitions,
+        }
+    }
+
+    /// Run one auto-adjust tick (issue #301). Recomputes the receiver-queue
+    /// target via `policy.adjust(&FlowStats)` and reconciles the broker grant:
+    ///
+    /// - **Grow** (`new > current`): the broker has fewer permits than the new target wants, so
+    ///   emit an incremental `CommandFlow` for the delta and bump `available_permits`. This is what
+    ///   keeps a starving consumer fed.
+    /// - **Shrink / hold** (`new <= current`): permits already granted to the broker cannot be
+    ///   un-granted, so emit nothing — the surplus drains naturally as messages arrive and
+    ///   `maybe_flow` simply asks for less next time (its threshold is `new / 2`).
+    ///
+    /// Records `now` as the last-adjust timestamp so [`Self::next_adjust_deadline`]
+    /// schedules the following tick. Pure given (`policy`, `FlowStats`, `now`):
+    /// no clock is read inside — `now` is injected by
+    /// [`crate::Connection::handle_timeout`] (ADR-0011). Frozen states (closed,
+    /// in-flight seek, paused, terminal) are skipped so the policy never fights
+    /// the user's explicit gating.
+    ///
+    /// Returns `Some(CommandFlow)` when the target grew, `None` otherwise.
+    pub fn adjust_receiver_queue(
+        &mut self,
+        now: std::time::Instant,
+        partitions: usize,
+    ) -> Option<pb::CommandFlow> {
+        self.last_adjust_at = Some(now);
+        if self.closed
+            || self.pending_seek.is_some()
+            || self.paused
+            || self.terminal_failure.is_some()
+        {
+            return None;
+        }
+        let stats = self.flow_stats(partitions);
+        let new_target = self.policy.adjust(&stats).max(1);
+        let current = self.receiver_queue_size;
+        self.receiver_queue_size = new_target;
+        if new_target <= current {
+            // Shrink or hold: cannot un-grant permits, so let them drain. The
+            // smaller `maybe_flow` threshold (`new_target / 2`) then asks for
+            // less on the next refill.
+            return None;
+        }
+        // Grow: top the broker's grant up to the new target with an incremental
+        // flow for the delta the broker does not yet have.
+        let want = new_target as u32;
+        let have = self.available_permits;
+        let delta = want.saturating_sub(have);
+        if delta == 0 {
+            return None;
+        }
+        self.available_permits = self.available_permits.saturating_add(delta);
+        Some(pb::CommandFlow {
+            consumer_id: self.handle.0,
+            message_permits: delta,
+        })
+    }
+
+    /// Earliest moment at which the next auto-adjust tick is due, or `None` when
+    /// auto-adjust is disabled (`adjust_interval == None`, the default for the
+    /// [`crate::receiver_queue::Fixed`] policy). Surfaced through
+    /// [`crate::Connection::poll_timeout`] so the driver schedules a
+    /// deterministic wake for [`crate::Connection::handle_timeout`]'s adjust
+    /// sweep — without it the tick would only fire opportunistically on an
+    /// unrelated deadline, which is seed-divergent under the moonpool engine.
+    #[must_use]
+    pub fn next_adjust_deadline(&self) -> Option<std::time::Instant> {
+        let interval = self.adjust_interval?;
+        if self.closed || self.terminal_failure.is_some() {
+            return None;
+        }
+        // `None` (no tick yet) yields `None`; the driver re-derives the deadline
+        // from `poll_timeout` once `arm_adjust_clock` sets `last_adjust_at`.
+        self.last_adjust_at
+            .map(|last| crate::time::deadline_with_clamp(last, interval))
+    }
+
+    /// Seed the first adjust deadline at `now + adjust_interval`. Called once by
+    /// the connection when the consumer is first armed (subscribe ack) so the
+    /// `next_adjust_deadline` schedule has a starting point. No-op when
+    /// auto-adjust is disabled.
+    pub fn arm_adjust_clock(&mut self, now: std::time::Instant) {
+        if self.adjust_interval.is_some() && self.last_adjust_at.is_none() {
+            self.last_adjust_at = Some(now);
+        }
+    }
+
     /// Pop the next available message for the user. Caller wakes its future when a new message
     /// is delivered (the [`Connection`](crate::Connection) does this automatically).
     ///
@@ -731,6 +936,9 @@ impl ConsumerState {
     /// [`Self::receive_latency_hist`] so [`ConsumerStats`] can surface p50/p99/max.
     pub fn pop_message(&mut self) -> Option<IncomingMessage> {
         let msg = self.queue.pop_front()?;
+        // Issue #301: keep the buffered-queue-bytes counter in lock-step with
+        // the enqueue bump in `classify_and_queue`.
+        self.queued_bytes = self.queued_bytes.saturating_sub(msg.payload.len() as u64);
         self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
         let latency_ms = u64::try_from(msg.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(h) = self.receive_latency_hist.as_mut() {
@@ -1204,6 +1412,9 @@ impl ConsumerState {
             if let Some(tracker) = self.unacked_tracker.as_mut() {
                 tracker.add_with_redelivery_count(msg.message_id, msg.redelivery_count, now);
             }
+            // Issue #301: track buffered-queue bytes for the `Auto` OOM guard.
+            // Bumped here on enqueue, decremented in `pop_message` on dequeue.
+            self.queued_bytes = self.queued_bytes.saturating_add(payload_len as u64);
             self.queue.push_back(msg);
             // `classify_and_queue` always appends exactly one message to the queue (the
             // batched-delivery loop in `deliver` calls this once per sub-message and

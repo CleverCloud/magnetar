@@ -307,6 +307,20 @@ impl ConnectionShared {
         self.no_driver.store(true, Ordering::SeqCst);
     }
 
+    /// `true` once [`Self::mark_no_driver`] has latched — the connection has
+    /// reached a genuinely-terminal state and no driver task will recover it
+    /// (plain-driver terminal exit, or supervisor give-up after exhausting its
+    /// attempt budget). Read by the receive future (issue #299) to surface
+    /// `Err` after a supervised give-up: at that point the connection is still
+    /// `HandshakeState::Failed` with a supervisor configured, so
+    /// [`magnetar_proto::Connection::consumer_handle_is_terminal`] alone cannot
+    /// tell it apart from a recoverable mid-reconnect `Failed` window — the
+    /// engine-side `no_driver` latch is the discriminator.
+    #[must_use]
+    pub fn is_no_driver(&self) -> bool {
+        self.no_driver.load(Ordering::SeqCst)
+    }
+
     /// Fast-fail guard for the request-issue / subscribe / lookup entry points
     /// (ADR-0059). Returns `Err(ClientError::PeerClosed)`
     /// when the connection is terminal AND no driver will recover it — i.e.

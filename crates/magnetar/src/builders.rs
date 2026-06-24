@@ -150,12 +150,27 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
         self
     }
 
-    /// Mirrors Java `ProducerBuilder#sendTimeout`. When set, in-flight sends past
+    /// Mirrors Java `ProducerBuilder#sendTimeout`. In-flight sends past
     /// `enqueued_at + timeout` resolve with a synthetic `SendError` carrying
     /// `code=-1, message="send timeout"` on the next state-machine tick.
+    ///
+    /// The default is **30 s** (Java parity — `sendTimeoutMs = 30000`, ADR-0072),
+    /// so a send whose receipt is lost or corrupted in flight fails deterministically
+    /// rather than hanging forever. Call [`Self::disable_send_timeout`] for the
+    /// unbounded (never-times-out) behavior.
     #[must_use]
     pub fn send_timeout(mut self, timeout: Duration) -> Self {
         self.req.send_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable the send timeout: in-flight sends never resolve with a synthetic
+    /// timeout `SendError` — they wait indefinitely for the broker's receipt
+    /// (or a session-loss / terminal error). Mirrors Java
+    /// `ProducerBuilder#sendTimeout(0, …)`. Overrides the 30 s default (ADR-0072).
+    #[must_use]
+    pub fn disable_send_timeout(mut self) -> Self {
+        self.req.send_timeout = None;
         self
     }
 
@@ -400,10 +415,63 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         self
     }
 
-    /// Set the receiver queue size.
+    /// Set the receiver queue size (the fixed permit count handed to the broker).
+    ///
+    /// This is sugar for [`Self::receiver_queue_policy`]`(`[`magnetar_proto::Fixed`]`(size))`:
+    /// it pins the queue to a constant size, the historical (and default)
+    /// behaviour. To let the queue self-tune under load, use
+    /// [`Self::receiver_queue_policy`] with [`magnetar_proto::Auto`] instead.
     #[must_use]
     pub fn receiver_queue_size(mut self, size: usize) -> Self {
         self.req.receiver_queue_size = size;
+        // Clearing any previously-set policy keeps `receiver_queue_size` and
+        // `receiver_queue_policy` from disagreeing: the last setter wins.
+        self.req.receiver_queue_policy = None;
+        self.req.receiver_queue_adjust_interval = None;
+        self
+    }
+
+    /// Set a pluggable receiver-queue-size policy (issue #301, PIP-74
+    /// `autoScaledReceiverQueueSizeEnabled` parity).
+    ///
+    /// Pass [`magnetar_proto::Auto`] (wrapped in `Arc`) to let the queue grow
+    /// under starvation and shrink under memory pressure, or any custom
+    /// [`magnetar_proto::ReceiverQueuePolicy`]. The policy's `adjust` is called
+    /// from the connection's deterministic timeout tick, so it MUST be pure (no
+    /// clock, no RNG, no I/O) — see the trait docs.
+    ///
+    /// Enabling a policy turns on auto-adjust with a default 5-second tick;
+    /// override the cadence with [`Self::receiver_queue_adjust_interval`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use magnetar_proto::Auto;
+    /// # fn demo<'a>(b: magnetar::ConsumerBuilder<'a>) -> magnetar::ConsumerBuilder<'a> {
+    /// b.receiver_queue_policy(Arc::new(Auto::new(1_000, 128 * 1024 * 1024)))
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn receiver_queue_policy(
+        mut self,
+        policy: std::sync::Arc<dyn magnetar_proto::ReceiverQueuePolicy>,
+    ) -> Self {
+        self.req.receiver_queue_policy = Some(policy);
+        // Default auto-adjust cadence; tunable via `receiver_queue_adjust_interval`.
+        if self.req.receiver_queue_adjust_interval.is_none() {
+            self.req.receiver_queue_adjust_interval = Some(Duration::from_secs(5));
+        }
+        self
+    }
+
+    /// Override the auto-adjust tick cadence used when a
+    /// [`Self::receiver_queue_policy`] is set. No effect with the default
+    /// [`magnetar_proto::Fixed`] policy. Mirrors how often Java re-evaluates its
+    /// auto-scaled receiver queue.
+    #[must_use]
+    pub fn receiver_queue_adjust_interval(mut self, interval: Duration) -> Self {
+        self.req.receiver_queue_adjust_interval = Some(interval);
         self
     }
 

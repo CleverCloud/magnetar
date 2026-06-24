@@ -164,6 +164,19 @@ impl Consumer {
         self.slot.state.lock().available_permits
     }
 
+    /// This consumer's CURRENT receiver-queue target (issue #301). For the
+    /// default [`magnetar_proto::Fixed`] policy this is the constant configured
+    /// via the consumer builder's `receiver_queue_size`; for
+    /// [`magnetar_proto::Auto`] it is the live, auto-tuned value after the latest
+    /// adjust tick. Mirrors Java `ConsumerImpl#getCurrentReceiverQueueSize` under
+    /// PIP-74 auto-scaling.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn current_receiver_queue_size(&self) -> usize {
+        self.slot.state.lock().receiver_queue_size
+    }
+
     /// `true` if this consumer has received at least one message since opening. Mirrors
     /// Java `Consumer#hasReceivedAnyMessage` — useful as a "did anything ever arrive?"
     /// probe without inspecting the full `ConsumerStats`.
@@ -1271,14 +1284,26 @@ impl Future for ReceiveFut {
         loop {
             let mut conn = shared.inner.lock();
             let Some(mut msg) = conn.pop_message(handle) else {
-                // No message ready. First, check whether the connection or
-                // the consumer has already been closed — `close()` on a cloned
-                // handle flips `consumer_is_closed` synchronously and drains
-                // every parked waker BEFORE we install ours. Without this
-                // pre-check the freshly-installed slab slot would never be
-                // woken, parking the receive future forever. Mirrors the
-                // moonpool `ReceiveFut::poll` close-race guard.
-                if conn.is_closed() || conn.consumer_is_closed(handle) {
+                // No message ready. First, check whether this consumer handle
+                // has reached a GENUINELY-terminal state — a graceful close, a
+                // non-supervised `Failed`, a per-handle terminal subscribe
+                // failure (issue #302), or the slot being removed. `close()` on
+                // a cloned handle flips this synchronously and drains every
+                // parked waker BEFORE we install ours; without the pre-check the
+                // freshly-installed slab slot would never be woken, parking the
+                // receive future forever.
+                //
+                // CRITICAL (issue #299): we gate on
+                // `consumer_handle_is_terminal`, NOT `is_closed()`. A transport
+                // drop sets `HandshakeState::Failed` for the WHOLE supervised
+                // backoff + redial + re-handshake window, and `reset()` wakes
+                // the parked receive wakers WHILE still `Failed`. The old
+                // `is_closed()` guard erroneously resolved `Err(Closed)` during
+                // that recoverable window; gating on the terminal predicate
+                // re-parks instead, so `receive()` transparently resumes once
+                // the supervisor reconnects and the rebuild replays
+                // `CommandSubscribe`.
+                if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
                     if let Some(old_key) = this.slab_key.take() {
                         conn.cancel_consumer_receive_waker(handle, old_key);
                     }
@@ -1304,7 +1329,12 @@ impl Future for ReceiveFut {
                         conn.cancel_consumer_receive_waker(handle, key);
                         continue;
                     }
-                    if conn.is_closed() || conn.consumer_is_closed(handle) {
+                    // Same terminal-vs-recoverable distinction as the pre-check
+                    // above (issue #299): re-check under the lock so a terminal
+                    // close that landed between the pre-check and the slab
+                    // insert is still observed, while a recoverable `Failed`
+                    // window keeps us parked.
+                    if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
                         conn.cancel_consumer_receive_waker(handle, key);
                         return Poll::Ready(Err(ClientError::Closed));
                     }
@@ -2423,6 +2453,54 @@ mod tests {
             decryptor: None,
         };
         assert_eq!(closed.available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_receiver_queue_policy_grows_target_under_starvation() {
+        // Issue #301: an `Auto`-policy consumer driven through the tokio engine's
+        // proto connection grows its receiver-queue target when the broker
+        // drains every permit (starvation), and the grown target rides an
+        // incremental flow. Mirrors the moonpool engine test 1:1 (ADR-0024).
+        use std::time::Duration;
+        let shared = handshake_complete_shared();
+        let interval = Duration::from_secs(1);
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/auto-rq".to_owned(),
+                subscription: "s".to_owned(),
+                receiver_queue_policy: Some(std::sync::Arc::new(magnetar_proto::Auto::new(
+                    100,
+                    128 * 1024 * 1024,
+                ))),
+                receiver_queue_adjust_interval: Some(interval),
+                ..Default::default()
+            })
+        };
+        let t0 = Instant::now();
+        {
+            let mut conn = shared.inner.lock();
+            let _ = conn.initial_flow(handle);
+            // Seed at the floor.
+            assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
+            // Drain the broker's grant so the tick observes starvation.
+            if let Some(slot) = conn.consumer(handle) {
+                slot.state.lock().available_permits = 0;
+            }
+            // First tick arms the schedule; the second runs the adjust.
+            conn.handle_timeout(t0);
+            conn.handle_timeout(t0 + interval);
+            assert_eq!(
+                conn.consumer_receiver_queue_size(handle),
+                200,
+                "starvation doubles the Auto target on the tokio engine"
+            );
+            assert_eq!(
+                conn.consumer_available_permits(handle),
+                200,
+                "the incremental flow tops the broker grant up to the new target"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

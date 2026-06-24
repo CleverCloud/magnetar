@@ -657,7 +657,10 @@ impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
             initial_sequence_id: None,
             access_mode: pb::ProducerAccessMode::Shared,
             producer_metadata: Vec::new(),
-            send_timeout: None,
+            // Inherit the canonical Java-parity default (Some(30s), ADR-0072) from
+            // CreateProducerRequest so the partitioned builder never silently pins
+            // the old never-times-out semantics. `send_timeout(d)` overrides it.
+            send_timeout: CreateProducerRequest::default().send_timeout,
             batching_max_publish_delay: None,
             schema: None,
             encryptor: None,
