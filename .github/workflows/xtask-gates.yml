@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-runtime-test-parity
@@ -69,7 +69,7 @@ jobs:
     # cold runs after the crypto provider expansion.
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
         with:
@@ -116,7 +116,7 @@ jobs:
       # fetch-depth: 0 + an explicit fetch of origin/main so the xtask's
       # `git merge-base origin/main HEAD` resolves. On the scheduled `main`
       # run the merge-base is HEAD, so the check short-circuits.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - run: git fetch origin main:refs/remotes/origin/main || git fetch origin main
