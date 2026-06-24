@@ -51,7 +51,7 @@ magnetar-runtime-tokio   = { version = "^1.1.1", path = "crates/magnetar-runtime
 prost           = "^0.14.4"
 prost-build     = "^0.14.4"
 prost-types     = "^0.14.4"
-bytes           = "^1.11.1"
+bytes           = "^1.12.0"
 crc32c          = "^0.6.8"
 
 # Async runtime (engines only, NEVER magnetar-proto)
@@ -73,11 +73,11 @@ rustc-hash      = "^2.1.2"
 # via its own `crypto-*` feature so cargo does NOT silently unify two
 # providers into a single build (issue #9, ADR-0035). `tls12` and
 # `logging` stay on; both are rustls's own default-on features.
-rustls               = { version = "^0.23.40", default-features = false, features = ["std", "tls12", "logging"] }
+rustls               = { version = "^0.23.41", default-features = false, features = ["std", "tls12", "logging"] }
 # rustls-pemfile was marked unmaintained (RUSTSEC-2025-0134); we now parse PEMs via
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
 rustls-pki-types     = { version = "^1.14.1", features = ["std"] }
-rustls-native-certs  = "^0.8.3"
+rustls-native-certs  = "^0.8.4"
 tokio-rustls         = { version = "^0.26.4", default-features = false }
 # `rustls-openssl` is opted-in via the façade's `crypto-openssl` feature
 # only (issue #9, ADR-0035). It is the rustls crypto-provider crate that
@@ -117,7 +117,7 @@ aws-lc-rs  = { version = "^1.17.0", default-features = false, features = ["aws-l
 ring       = { version = "^0.17.14", default-features = false }
 # Defense-in-depth: zero parsed-key material on drop. Used by the Athenz
 # concrete JwtSigner backends (ADR-0030).
-zeroize    = { version = "^1.8.2", default-features = false }
+zeroize    = { version = "^1.9.0", default-features = false }
 # URL-safe-without-padding base64 for the JWS compact serialisation
 # emitted by the Athenz JwtSigner backends (RFC 7515 §3.1).
 base64     = { version = "^0.22.1", default-features = false, features = ["std"] }
@@ -157,7 +157,7 @@ http    = "^1.4.2"
 clap    = { version = "^4.6.1", features = ["derive", "env"] }
 
 # Telemetry + errors
-opentelemetry      = { version = "^0.32", default-features = false, features = ["trace"] }
+opentelemetry      = { version = "^0.32.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk  = { version = "^0.32.1", default-features = false, features = ["trace"] }
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
