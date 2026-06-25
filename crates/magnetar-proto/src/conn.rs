@@ -2494,6 +2494,13 @@ impl Connection {
                     consumer.available_permits = 0;
                     consumer.consumed_since_flow = 0;
                 }
+                tracing::info!(
+                    target: "mag307",
+                    consumer = handle.0,
+                    event = "broker_close_consumer",
+                    assigned_url = ?close.assigned_broker_service_url,
+                    "broker-initiated CloseConsumer (mirror reset)"
+                );
                 self.events
                     .push_back(ConnectionEvent::ConsumerClosedByBroker {
                         handle,
@@ -2530,6 +2537,18 @@ impl Connection {
                         ))?;
                 let handle = ConsumerHandle(acc.consumer_id);
                 let active = acc.is_active.unwrap_or(false);
+                let diag_permits = self
+                    .consumers
+                    .get(&handle)
+                    .map(|slot| slot.state.lock().available_permits);
+                tracing::info!(
+                    target: "mag307",
+                    consumer = handle.0,
+                    event = "active_consumer_change",
+                    active,
+                    available_permits = ?diag_permits,
+                    "ActiveConsumerChange"
+                );
                 self.events
                     .push_back(ConnectionEvent::ActiveConsumerChanged { handle, active });
                 // Failover re-arm (issue #307): when a standby consumer is

@@ -780,11 +780,37 @@ impl ConsumerState {
         }
         let threshold = (self.receiver_queue_size / 2).max(1) as u32;
         if self.consumed_since_flow < threshold {
+            // DIAG #307: wedge signature — queue drained empty while broker
+            // permits are below the replenish threshold and consumed hasn't
+            // reached it either, so no CommandFlow goes out and the consumer
+            // parks. Guarded on low permits so healthy momentary drains (permits
+            // still high) don't spam.
+            if self.queue.is_empty() && self.available_permits < threshold {
+                tracing::info!(
+                    target: "mag307",
+                    consumer = self.handle.0,
+                    event = "park_no_reflow",
+                    available_permits = self.available_permits,
+                    consumed_since_flow = self.consumed_since_flow,
+                    threshold,
+                    rqs = self.receiver_queue_size,
+                    "queue empty + permits below threshold, no reflow — PARK"
+                );
+            }
             return None;
         }
         let permits = self.consumed_since_flow;
         self.consumed_since_flow = 0;
         self.available_permits = self.available_permits.saturating_add(permits);
+        tracing::info!(
+            target: "mag307",
+            consumer = self.handle.0,
+            event = "flow_grant",
+            granted = permits,
+            available_permits = self.available_permits,
+            qlen = self.queue.len(),
+            "replenish flow emitted"
+        );
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
@@ -816,6 +842,13 @@ impl ConsumerState {
         let permits = self.receiver_queue_size as u32;
         self.available_permits = permits;
         self.consumed_since_flow = 0;
+        tracing::info!(
+            target: "mag307",
+            consumer = self.handle.0,
+            event = "initial_flow",
+            permits,
+            "initial flow granted"
+        );
         pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
