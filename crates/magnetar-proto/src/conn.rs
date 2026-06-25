@@ -9239,15 +9239,14 @@ mod conn_state_tests {
         //
         // Lifecycle reproduced here (all on ONE live socket — no reset):
         //   1. subscribe + initial flow -> available_permits = 100 (rqs).
-        //   2. broker dispatches the full grant; the app consumes it, drawing
-        //      the broker's permits down to 0 (steady state).
-        //   3. bundle reassignment: broker sends `CommandCloseConsumer` to
-        //      quiesce the dispatcher (NOT a CommandCloseProducer, NOT a socket
-        //      drop -> no `Connection::reset`, so the supervised reconnect /
-        //      `rebuild_consumers` re-arm path never fires).
-        //   4. broker re-creates the dispatcher and re-promotes this consumer
-        //      with `CommandActiveConsumerChange{is_active:true}` — but the
-        //      broker-side `availablePermits` is now 0.
+        //   2. broker dispatches the full grant; the app consumes it, drawing the broker's permits
+        //      down to 0 (steady state).
+        //   3. bundle reassignment: broker sends `CommandCloseConsumer` to quiesce the dispatcher
+        //      (NOT a CommandCloseProducer, NOT a socket drop -> no `Connection::reset`, so the
+        //      supervised reconnect / `rebuild_consumers` re-arm path never fires).
+        //   4. broker re-creates the dispatcher and re-promotes this consumer with
+        //      `CommandActiveConsumerChange{is_active:true}` — but the broker-side
+        //      `availablePermits` is now 0.
         //
         // The cf64240 re-arm at the ActiveConsumerChange arm only fires when the
         // client's `available_permits == 0`. Because nothing resets the client's
