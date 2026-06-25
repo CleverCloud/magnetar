@@ -2472,6 +2472,28 @@ impl Connection {
                 // closed.
                 //
                 // Refs: Task #65 (and the equivalent producer fix #56).
+                //
+                // Issue #307: the broker tearing the dispatcher down resets its
+                // side of the flow-control window — the re-created consumer
+                // starts at `availablePermits = 0`. Re-sync the client's permit
+                // MIRROR to 0 here so it tracks broker reality. Without this the
+                // mirror stays stale (it is purely additive on the client side;
+                // `available_permits` is never decremented as messages arrive),
+                // and the Failover re-arm at the `ActiveConsumerChange` arm —
+                // which only fires when `available_permits == 0` — is silently
+                // skipped on the subsequent re-promotion. The consumer then
+                // wedges at broker-permits=0 against a non-empty backlog with no
+                // `CommandFlow` ever sent. `consumed_since_flow` is reset in
+                // lock-step so the `maybe_flow` threshold restarts cleanly once
+                // flow is re-armed (mirrors the `reset` re-attach path, which
+                // zeroes both). The receiver queue itself is left intact: any
+                // already-dispatched messages still in the TCP buffer / queue
+                // remain user-visible (the #65 / `duringSeek` invariant).
+                if let Some(slot) = self.consumers.get(&handle) {
+                    let mut consumer = slot.state.lock();
+                    consumer.available_permits = 0;
+                    consumer.consumed_since_flow = 0;
+                }
                 self.events
                     .push_back(ConnectionEvent::ConsumerClosedByBroker {
                         handle,
@@ -9021,6 +9043,28 @@ mod conn_state_tests {
         (conn, handle)
     }
 
+    /// Encode a broker-initiated `CommandCloseConsumer` frame for `handle`
+    /// (issue #307 repro): the broker quiesces the dispatcher on a bundle
+    /// reassignment (`code=6` / `ServiceNotReady`) by closing the consumer on
+    /// the live socket WITHOUT a connection-level reset. `assigned_broker_service_url`
+    /// is left `None` so it mirrors the same-broker re-attach the supervised
+    /// reconnect does not fire on.
+    fn close_consumer_frame(handle: ConsumerHandle) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(pb::CommandCloseConsumer {
+                consumer_id: handle.0,
+                request_id: 0,
+                assigned_broker_service_url: None,
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandCloseConsumer");
+        buf
+    }
+
     /// Encode a `CommandActiveConsumerChange` frame for `handle`.
     fn active_consumer_change_frame(handle: ConsumerHandle, is_active: bool) -> bytes::BytesMut {
         let cmd = pb::BaseCommand {
@@ -9184,6 +9228,88 @@ mod conn_state_tests {
         assert!(
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow on demotion"
+        );
+    }
+
+    #[test]
+    fn failover_rearms_flow_after_broker_close_reattach_promotion() {
+        // Issue #307 (production wedge that cf64240 does NOT cover): an
+        // ALREADY-ACTIVE Failover consumer on a partitioned topic with a large
+        // backlog freezes after a `code=6` bundle reassignment.
+        //
+        // Lifecycle reproduced here (all on ONE live socket — no reset):
+        //   1. subscribe + initial flow -> available_permits = 100 (rqs).
+        //   2. broker dispatches the full grant; the app consumes it, drawing
+        //      the broker's permits down to 0 (steady state).
+        //   3. bundle reassignment: broker sends `CommandCloseConsumer` to
+        //      quiesce the dispatcher (NOT a CommandCloseProducer, NOT a socket
+        //      drop -> no `Connection::reset`, so the supervised reconnect /
+        //      `rebuild_consumers` re-arm path never fires).
+        //   4. broker re-creates the dispatcher and re-promotes this consumer
+        //      with `CommandActiveConsumerChange{is_active:true}` — but the
+        //      broker-side `availablePermits` is now 0.
+        //
+        // The cf64240 re-arm at the ActiveConsumerChange arm only fires when the
+        // client's `available_permits == 0`. Because nothing resets the client's
+        // permit MIRROR on a broker-initiated `CommandCloseConsumer`, the mirror
+        // is stale (still 100) while the broker holds 0. The guard reads
+        // `available_permits != 0`, skips the re-arm, and NO `CommandFlow` is
+        // ever sent — the consumer wedges at broker-permits=0 with a full
+        // backlog: `availablePermits=0`, `msgRateOut=0`, frozen `receive()`.
+        let (mut conn, handle) = handshake_subscribe_failover();
+
+        // (1) Initial flow on the active consumer.
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+        assert_eq!(conn.consumer_available_permits(handle), 100);
+
+        // (2) Consume the whole grant so the live consumer is genuinely active
+        // and has drained its receiver queue (mirrors the steady-state active
+        // consumer the production symptom describes). `available_permits` is the
+        // additive client mirror — it stays at 100 here (it is never decremented
+        // on the client side), which is exactly what makes the stale-mirror bug
+        // bite below.
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("deliver message");
+        }
+        while conn.pop_message(handle).is_some() {}
+        // Drain any maybe_flow top-ups the consume path emitted.
+        while drain_command_flow(&mut conn, handle).is_some() {}
+
+        // (3) Bundle reassignment: broker closes the consumer on the live socket.
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(Instant::now(), &close)
+            .expect("handle broker close");
+        // The consumer is intentionally left open (post-#65); no reset happened,
+        // so the client's permit mirror is still whatever it was — NOT zeroed.
+        assert!(
+            !conn.consumer_is_closed(handle),
+            "broker close must leave the consumer open for re-attach (issue #65)"
+        );
+
+        // (4) Broker re-promotes the re-created consumer. Broker-side permits = 0.
+        let promote = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &promote)
+            .expect("handle re-promotion");
+
+        // SUCCESS CONDITION: a `CommandFlow` MUST go out so the broker resumes
+        // dispatching the backlog. On current main this FAILS — the stale
+        // mirror (`available_permits != 0`) makes the cf64240 guard skip the
+        // re-arm and no flow is emitted, wedging the consumer forever.
+        let flow = drain_command_flow(&mut conn, handle);
+        assert!(
+            flow.is_some(),
+            "after a broker-initiated close + re-promotion the consumer MUST \
+             re-arm flow; otherwise it wedges at broker-permits=0 with a \
+             non-empty backlog (issue #307)"
+        );
+        assert_eq!(
+            flow.expect("flow re-armed").message_permits,
+            100,
+            "re-arm must restore the full receiver-queue grant"
         );
     }
 
