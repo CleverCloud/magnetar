@@ -9,7 +9,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use magnetar_proto::{
@@ -52,6 +52,18 @@ pub struct Client {
     /// Lazy per-broker connection pool (ADR-0039). `None` on the
     /// non-URL [`Client::from_socket`] test path.
     pool: Option<Arc<ProxyConnectionPool>>,
+    /// `connections_per_broker` fan-out (Java `ClientBuilder#connectionsPerBroker`,
+    /// ADR-0073, issue #314). `1` (the default) preserves the historical
+    /// single-connection-per-broker behaviour. Clamped to `≥ 1` by
+    /// [`Self::with_connections_per_broker`]. When the [`Self::pool`] is `None`
+    /// (the `from_socket` path) the client cannot dial siblings, so the
+    /// effective fan-out stays `1` regardless of this value.
+    connections_per_broker: usize,
+    /// Round-robin cursor handing out the next connection index for a producer /
+    /// consumer at [`Self::resolve_target`]. A plain `AtomicUsize` (not an RNG):
+    /// the spread is deterministic, which the moonpool engine mirrors so the
+    /// differential suite stays in lock-step (ADR-0011).
+    connection_rr: AtomicUsize,
 }
 
 /// Decision returned by [`Client::lookup_topic`] driving where the data ops for the resolved
@@ -352,8 +364,12 @@ impl Client {
                     driver: Mutex::new(Some(driver)),
                     // `from_socket` has no URL to dial back through, so the proxy pool is
                     // disabled. A lookup that returns `proxy_through_service_url = true`
-                    // surfaces `ClientError::ProxyUnsupportedOnSocketClient`.
+                    // surfaces `ClientError::ProxyUnsupportedOnSocketClient`. With no pool the
+                    // `connections_per_broker` fan-out cannot dial siblings either, so it
+                    // stays effectively `1`.
                     pool: None,
+                    connections_per_broker: 1,
+                    connection_rr: AtomicUsize::new(0),
                 })
             }
             Err(e) => {
@@ -422,6 +438,8 @@ impl Client {
                     shared,
                     driver: Mutex::new(Some(driver)),
                     pool: Some(ProxyConnectionPool::new(factory)),
+                    connections_per_broker: 1,
+                    connection_rr: AtomicUsize::new(0),
                 })
             }
             Err(e) => {
@@ -610,8 +628,11 @@ impl Client {
                 // Dial the redirect target (bootstrap-equality reuses the
                 // bootstrap; otherwise a pinned pool entry). The dial awaits
                 // OUTSIDE any proto/connection lock (ADR-0038) and uses no
-                // channel (ADR-0003).
-                current = self.resolve_direct_broker(&redirect_url, topic).await?;
+                // channel (ADR-0003). This is a control-plane lookup dial, not a
+                // data-plane producer/consumer placement, so it always pins the
+                // primary connection (index 0) — lookups never consume a
+                // `connections_per_broker` fan-out slot (ADR-0073).
+                current = self.resolve_direct_broker(&redirect_url, topic, 0).await?;
                 next_hop = Some((authoritative, hops_remaining));
                 continue;
             }
@@ -770,6 +791,55 @@ impl Client {
         }
     }
 
+    /// Set the `connections_per_broker` fan-out (Java
+    /// `ClientBuilder#connectionsPerBroker`, ADR-0073, issue #314). Consumed by
+    /// the `magnetar` façade's `ClientBuilder::connections_per_broker` after the
+    /// bootstrap connection is established. `n` is clamped to `≥ 1`; `1` (the
+    /// default) keeps the historical single-connection-per-broker behaviour.
+    #[must_use]
+    pub fn with_connections_per_broker(mut self, n: usize) -> Self {
+        self.connections_per_broker = n.max(1);
+        self
+    }
+
+    /// Round-robin the next connection index in `[0, connections_per_broker)` for
+    /// a producer / consumer. Returns `0` when fan-out is disabled
+    /// (`connections_per_broker <= 1`) or when there is no pool to dial siblings
+    /// through ([`Client::from_socket`]), so those paths never touch the atomic
+    /// and stay byte-identical to the pre-#314 client.
+    fn pick_connection_index(&self) -> usize {
+        if self.connections_per_broker <= 1 || self.pool.is_none() {
+            return 0;
+        }
+        self.connection_rr.fetch_add(1, Ordering::Relaxed) % self.connections_per_broker
+    }
+
+    /// Resolve the bootstrap broker's connection for `index`. Index `0` is the
+    /// bootstrap connection the lookup landed on; indices `≥ 1` are pool siblings
+    /// dialled to the same broker (ADR-0073, #314). Fan-out only applies when the
+    /// lookup actually landed on the bootstrap connection — a redirected
+    /// `landed_on` (already a distinct pool entry) is returned unchanged.
+    async fn bootstrap_connection_at_index(
+        &self,
+        landed_on: &Arc<ConnectionShared>,
+        index: usize,
+    ) -> Result<Arc<ConnectionShared>, ClientError> {
+        // index ≥ 1 on the bootstrap connection → dedicated sibling. Index 0
+        // (the default + every slot-0 producer/consumer) and a redirected
+        // `landed_on` (a distinct pool entry, never the bootstrap) ride
+        // `landed_on` as-is. `index ≥ 1` implies a pool exists
+        // (`pick_connection_index` returns 0 when it does not).
+        if index >= 1 && Arc::ptr_eq(landed_on, &self.shared) {
+            let Some(pool) = self.pool.as_ref() else {
+                unreachable!(
+                    "connections_per_broker index >= 1 implies a pool (pick_connection_index)"
+                )
+            };
+            return pool.get_or_open_bootstrap_sibling(index).await;
+        }
+        Ok(landed_on.clone())
+    }
+
     /// Resolve the [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
     /// CommandProducer / CommandSubscribe on.
     ///
@@ -795,11 +865,16 @@ impl Client {
         landed_on: &Arc<ConnectionShared>,
         topic: &str,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
+        // `connections_per_broker` fan-out slot for this producer / consumer
+        // (ADR-0073, #314). `0` for the default single-connection client.
+        let index = self.pick_connection_index();
         match target {
-            LookupTarget::Direct { broker_url: None } => Ok(landed_on.clone()),
+            LookupTarget::Direct { broker_url: None } => {
+                self.bootstrap_connection_at_index(landed_on, index).await
+            }
             LookupTarget::Direct {
                 broker_url: Some(broker_url),
-            } => self.resolve_direct_broker(&broker_url, topic).await,
+            } => self.resolve_direct_broker(&broker_url, topic, index).await,
             LookupTarget::Proxy { broker_url } => {
                 let pool = self.pool.as_ref().ok_or_else(|| {
                     ClientError::ProxyUnsupportedOnSocketClient {
@@ -808,9 +883,10 @@ impl Client {
                 })?;
                 // Every proxy pool entry dials the same physical address — the proxy URL the
                 // bootstrap was built with. The proto-layer's `CommandConnect.proxy_to_broker_url`
-                // is what tells the proxy which backend broker this connection serves.
+                // is what tells the proxy which backend broker this connection serves. `index`
+                // fans the same backend broker across N proxy connections.
                 let physical = pool.bootstrap_url();
-                pool.get_or_open(&broker_url, &physical, Some(broker_url.clone()))
+                pool.get_or_open(&broker_url, &physical, Some(broker_url.clone()), index)
                     .await
             }
         }
@@ -831,6 +907,7 @@ impl Client {
         &self,
         broker_url: &str,
         topic: &str,
+        index: usize,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         let Some(pool) = self.pool.as_ref() else {
             // `from_socket` callers have no URL to dial — the bootstrap is the only
@@ -852,14 +929,20 @@ impl Client {
         // socket (no spurious pool entry).
         let bootstrap = pool.bootstrap_url();
         if parsed.host == bootstrap.host && parsed.port == bootstrap.port {
-            return Ok(self.shared.clone());
+            // Bootstrap broker — same fan-out as the `Direct { broker_url: None }`
+            // path: index 0 reuses the bootstrap connection, siblings (index ≥ 1)
+            // ride dedicated pool entries dialled to the same broker (ADR-0073, #314).
+            return self
+                .bootstrap_connection_at_index(&self.shared, index)
+                .await;
         }
 
         // Different broker → pin a dedicated pool entry. `logical == physical` here because
         // we are dialling the broker directly (the proxy is not in the picture). The pool
-        // is keyed on `(logical, "host:port")` so two DIRECT lookups to the same broker URL
-        // share one entry, just like two PROXY lookups for the same backend share one.
-        pool.get_or_open(broker_url, &parsed, None).await
+        // is keyed on `(logical, "host:port", index)` so two DIRECT lookups to the same broker
+        // URL and the same fan-out slot share one entry, just like two PROXY lookups for the
+        // same backend share one.
+        pool.get_or_open(broker_url, &parsed, None, index).await
     }
 
     /// Scheme of the bootstrap connection — used by [`Self::lookup_topic`] to pick between

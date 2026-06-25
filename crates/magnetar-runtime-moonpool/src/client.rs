@@ -30,6 +30,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use magnetar_proto::event::LookupOutcome;
@@ -113,6 +114,19 @@ pub struct Client<P: Providers> {
     /// `proxy_through_service_url = true` on those paths still surfaces
     /// [`ClientError::ProxyUnsupportedOnUnsupervisedClient`].
     pool: Option<Arc<ProxyConnectionPool<P>>>,
+    /// `connections_per_broker` fan-out (Java `ClientBuilder#connectionsPerBroker`,
+    /// ADR-0073, issue #314). `1` (the default) keeps the historical
+    /// single-connection-per-broker behaviour. Clamped to `≥ 1` by
+    /// [`Self::with_connections_per_broker`]. When [`Self::pool`] is `None`
+    /// (the `connect_plain` / `from_parts` paths) the fan-out stays effectively
+    /// `1` because there is no pool to dial siblings through. 1:1 with the tokio
+    /// engine's identically-named field.
+    connections_per_broker: usize,
+    /// Round-robin cursor handing out the next connection index for a producer /
+    /// consumer at [`Self::resolve_target`]. A plain `AtomicUsize` (not an RNG)
+    /// so the spread is deterministic under `moonpool-sim` and matches the tokio
+    /// engine bit-for-bit (ADR-0011, differential parity).
+    connection_rr: AtomicUsize,
     /// Held only so `Client` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -159,6 +173,24 @@ impl<P: Providers> std::fmt::Debug for Client<P> {
 }
 
 impl<P: Providers> Client<P> {
+    /// Single field-initialisation site shared by [`Self::connect_plain`],
+    /// [`Self::connect_plain_supervised`], and [`Self::from_parts`]. Seeds the
+    /// default `connections_per_broker` (1) and a fresh round-robin cursor.
+    fn assemble(
+        shared: Arc<ConnectionShared>,
+        driver: DriverHandle,
+        pool: Option<Arc<ProxyConnectionPool<P>>>,
+    ) -> Self {
+        Self {
+            shared,
+            driver: Mutex::new(Some(driver)),
+            pool,
+            connections_per_broker: 1,
+            connection_rr: AtomicUsize::new(0),
+            _providers: std::marker::PhantomData,
+        }
+    }
+
     /// Connect to a Pulsar broker over the moonpool [`NetworkProvider`] and
     /// run the plaintext handshake.
     ///
@@ -179,12 +211,9 @@ impl<P: Providers> Client<P> {
         config: ConnectionConfig,
     ) -> Result<Self, ClientError> {
         let (shared, driver) = engine.connect_plain(addr, config).await?;
-        Ok(Self {
-            shared,
-            driver: Mutex::new(Some(driver)),
-            pool: None,
-            _providers: std::marker::PhantomData,
-        })
+        // Route through `from_parts` — `connect_plain` is exactly "wrap the
+        // (shared, driver) pair from a plain dial into a pool-less Client".
+        Ok(Self::from_parts(shared, driver))
     }
 
     /// Connect via the supervised driver. When [`ConnectionConfig::supervisor`]
@@ -230,12 +259,7 @@ impl<P: Providers> Client<P> {
             dns_resolver,
         };
         let pool = ProxyConnectionPool::new(factory);
-        Ok(Self {
-            shared,
-            driver: Mutex::new(Some(driver)),
-            pool: Some(pool),
-            _providers: std::marker::PhantomData,
-        })
+        Ok(Self::assemble(shared, driver, Some(pool)))
     }
 
     /// Wrap an existing `(shared, driver)` pair produced by
@@ -250,12 +274,7 @@ impl<P: Providers> Client<P> {
     /// against a hand-rolled connection).
     #[must_use]
     pub fn from_parts(shared: Arc<ConnectionShared>, driver: DriverHandle) -> Self {
-        Self {
-            shared,
-            driver: Mutex::new(Some(driver)),
-            pool: None,
-            _providers: std::marker::PhantomData,
-        }
+        Self::assemble(shared, driver, None)
     }
 
     /// Surrender the driver handle, leaving the [`Client`] without a
@@ -431,8 +450,10 @@ impl<P: Providers> Client<P> {
                     // Dial the redirect target. The dial awaits OUTSIDE any proto/connection
                     // lock (ADR-0038) and uses no channel (ADR-0003 — the moonpool pool dial
                     // rides a `spawn_task` + `Notify` park). `resolve_direct_broker` reuses the
-                    // bootstrap on a host:port match, else pins a pool entry.
-                    current = self.resolve_direct_broker(&raw, topic).await?;
+                    // bootstrap on a host:port match, else pins a pool entry. This is a
+                    // control-plane lookup dial, so it pins the primary connection (index 0) —
+                    // lookups never consume a `connections_per_broker` fan-out slot (ADR-0073).
+                    current = self.resolve_direct_broker(&raw, topic, 0).await?;
                     next_hop = Some((authoritative, hops_remaining));
                 }
                 LookupOutcome::Failed { code, message } => {
@@ -440,6 +461,58 @@ impl<P: Providers> Client<P> {
                 }
             }
         }
+    }
+
+    /// Set the `connections_per_broker` fan-out (Java
+    /// `ClientBuilder#connectionsPerBroker`, ADR-0073, issue #314). `n` is
+    /// clamped to `≥ 1`; `1` (the default) keeps the historical
+    /// single-connection-per-broker behaviour. 1:1 with the tokio engine.
+    #[must_use]
+    pub fn with_connections_per_broker(mut self, n: usize) -> Self {
+        self.connections_per_broker = n.max(1);
+        self
+    }
+
+    /// Round-robin the next connection index in `[0, connections_per_broker)` for
+    /// a producer / consumer. Returns `0` when fan-out is disabled
+    /// (`connections_per_broker <= 1`) or when there is no pool to dial siblings
+    /// through, so those paths never touch the atomic and stay byte-identical to
+    /// the pre-#314 client. 1:1 with the tokio engine.
+    fn pick_connection_index(&self) -> usize {
+        if self.connections_per_broker <= 1 || self.pool.is_none() {
+            return 0;
+        }
+        self.connection_rr.fetch_add(1, Ordering::Relaxed) % self.connections_per_broker
+    }
+
+    /// Resolve the bootstrap broker's connection for `index`. Index `0` is the
+    /// bootstrap connection the lookup landed on; indices `≥ 1` are pool siblings
+    /// dialled to the same broker (ADR-0073, #314). Fan-out only applies when the
+    /// lookup actually landed on the bootstrap connection — a redirected
+    /// `landed_on` (already a distinct pool entry) is returned unchanged. 1:1 with
+    /// the tokio engine.
+    async fn bootstrap_connection_at_index(
+        &self,
+        landed_on: &Arc<ConnectionShared>,
+        index: usize,
+    ) -> Result<Arc<ConnectionShared>, ClientError>
+    where
+        P: Send + Sync,
+    {
+        // index ≥ 1 on the bootstrap connection → dedicated sibling. Index 0
+        // (the default + every slot-0 producer/consumer) and a redirected
+        // `landed_on` (a distinct pool entry, never the bootstrap) ride
+        // `landed_on` as-is. `index ≥ 1` implies a pool exists
+        // (`pick_connection_index` returns 0 when it does not). 1:1 with tokio.
+        if index >= 1 && Arc::ptr_eq(landed_on, &self.shared) {
+            let Some(pool) = self.pool.as_ref() else {
+                unreachable!(
+                    "connections_per_broker index >= 1 implies a pool (pick_connection_index)"
+                )
+            };
+            return Ok(crate::pool::get_or_open_bootstrap_sibling(pool.clone(), index).await?);
+        }
+        Ok(landed_on.clone())
     }
 
     /// Resolve a [`LookupTarget`] to the `Arc<ConnectionShared>` the caller should drive
@@ -476,14 +549,20 @@ impl<P: Providers> Client<P> {
     where
         P: Send + Sync,
     {
+        // `connections_per_broker` fan-out slot for this producer / consumer
+        // (ADR-0073, #314). `0` for the default single-connection client. 1:1
+        // with the tokio engine.
+        let index = self.pick_connection_index();
         match target {
             // Ride the connection the final lookup resolved on — the bootstrap
             // for a non-redirected lookup, or the dialed redirect target after
             // the redirect-dial loop. 1:1 with the tokio engine.
-            LookupTarget::Direct { broker_url: None } => Ok(landed_on.clone()),
+            LookupTarget::Direct { broker_url: None } => {
+                self.bootstrap_connection_at_index(landed_on, index).await
+            }
             LookupTarget::Direct {
                 broker_url: Some(broker_url),
-            } => self.resolve_direct_broker(broker_url, topic).await,
+            } => self.resolve_direct_broker(broker_url, topic, index).await,
             LookupTarget::Proxy { broker_url } => {
                 let pool = self.pool.as_ref().ok_or_else(|| {
                     ClientError::ProxyUnsupportedOnUnsupervisedClient {
@@ -492,13 +571,15 @@ impl<P: Providers> Client<P> {
                 })?;
                 // Proxy entries dial the same physical address — the proxy URL the bootstrap was
                 // built with. `CommandConnect.proxy_to_broker_url = Some(broker_url)` tells the
-                // proxy which backend broker this connection serves.
+                // proxy which backend broker this connection serves. `index` fans the same backend
+                // broker across N proxy connections.
                 let physical = pool.bootstrap_addr().to_owned();
                 let shared = crate::pool::get_or_open(
                     pool.clone(),
                     broker_url,
                     &physical,
                     Some(broker_url.clone()),
+                    index,
                 )
                 .await?;
                 Ok(shared)
@@ -523,6 +604,7 @@ impl<P: Providers> Client<P> {
         &self,
         broker_url: &str,
         _topic: &str,
+        index: usize,
     ) -> Result<Arc<ConnectionShared>, ClientError>
     where
         P: Send + Sync,
@@ -546,14 +628,20 @@ impl<P: Providers> Client<P> {
         // lookup, and keeps existing single-broker tests on exactly one socket (no spurious pool
         // entry). Mirrors the tokio engine's identically-named bypass.
         if physical == pool.bootstrap_addr() {
-            return Ok(self.shared.clone());
+            // Bootstrap broker — same fan-out as the `Direct { broker_url: None }`
+            // path: index 0 reuses the bootstrap connection, siblings (index ≥ 1)
+            // ride dedicated pool entries dialled to the same broker (ADR-0073, #314).
+            return self
+                .bootstrap_connection_at_index(&self.shared, index)
+                .await;
         }
 
         // Different broker → pin a dedicated pool entry. `logical == broker_url`, `physical` is the
         // `host:port` we dial; the pool entry's CONNECT carries no `proxy_to_broker_url` (DIRECT
-        // routing, no proxy in the middle). Two DIRECT lookups to the same broker URL share one
-        // entry, just like two PROXY lookups for the same backend share one.
-        let shared = crate::pool::get_or_open(pool.clone(), broker_url, &physical, None).await?;
+        // routing, no proxy in the middle). Two DIRECT lookups to the same broker URL and the same
+        // fan-out slot share one entry, just like two PROXY lookups for the same backend share one.
+        let shared =
+            crate::pool::get_or_open(pool.clone(), broker_url, &physical, None, index).await?;
         Ok(shared)
     }
 

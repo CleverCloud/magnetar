@@ -100,10 +100,15 @@ impl<P: Providers> std::fmt::Debug for ConnectionFactory<P> {
     }
 }
 
-/// Composite key — mirror of the tokio pool's `(logical, physical)` shape.
-/// `randomKey` multiplexing (the Java client's third component) is punted
-/// the same way the tokio engine punts it (ADR-0039 §"Decision").
-type PoolKey = (String, String);
+/// Composite key — mirror of the tokio pool's
+/// `(logical, physical, connection_index)` shape. The `connection_index ∈
+/// [0, connections_per_broker)` is the `connections_per_broker` fan-out (Java
+/// `ClientBuilder#connectionsPerBroker`, issue #314, ADR-0073); at the default
+/// `connections_per_broker = 1` the index is always `0`, collapsing back to one
+/// entry per `(logical, physical)`. See
+/// [`magnetar_runtime_tokio::pool`] for the full rationale — the engines key
+/// identically so the differential suite stays in lock-step.
+type PoolKey = (String, String, usize);
 
 /// Result the dial task publishes to waiters. `Send` because the outer
 /// `get_or_open` future (which itself must be `Send` for the facade's
@@ -245,6 +250,12 @@ impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
 /// * `None` — direct multi-broker routing. The pool entry dials `physical` (= the resolved broker)
 ///   directly, no proxy in the middle. ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)".
 ///
+/// `index` is the `connections_per_broker` fan-out slot (ADR-0073, issue #314): callers asking
+/// for the same `(logical, physical)` but different `index` get distinct connections, so a logical
+/// producer fleet can spread its sends across several broker connections. The default
+/// `connections_per_broker = 1` always passes `index = 0`, collapsing to one entry per
+/// `(logical, physical)`. Mirrors `magnetar_runtime_tokio::pool::ProxyConnectionPool::get_or_open`.
+///
 /// Concurrency: if two callers race for the same key, only one dial task
 /// is spawned; the loser awaits the winner's [`PendingDial`].
 ///
@@ -265,11 +276,12 @@ pub(crate) async fn get_or_open<P>(
     logical: &str,
     physical: &str,
     proxy_to_broker_url: Option<String>,
+    index: usize,
 ) -> Result<Arc<ConnectionShared>, EngineError>
 where
     P: Providers + Send + Sync,
 {
-    let key: PoolKey = (logical.to_owned(), physical.to_owned());
+    let key: PoolKey = (logical.to_owned(), physical.to_owned(), index);
 
     // Fast path or race-resolution decision under the lock.
     let pending = {
@@ -339,6 +351,29 @@ where
             }
         }
     }
+}
+
+/// Open (or reuse) an additional connection to the **bootstrap** broker for
+/// `connections_per_broker > 1` (ADR-0073, issue #314). Mirror of the tokio
+/// pool's `get_or_open_bootstrap_sibling`.
+///
+/// `index` must be `≥ 1`: index `0` is the bootstrap connection itself, owned
+/// directly by [`crate::Client`] and never tracked in the pool. The sibling
+/// replicates the bootstrap CONNECT exactly — it dials the same physical address
+/// ([`ConnectionFactory::addr`]) and carries the same
+/// `CommandConnect.proxy_to_broker_url` the bootstrap used. Entries are keyed
+/// `(bootstrap_addr, bootstrap_addr, index)`, disjoint from the proxy /
+/// multi-broker-direct entries (whose `logical` is the resolved broker URL).
+pub(crate) async fn get_or_open_bootstrap_sibling<P>(
+    pool: Arc<ProxyConnectionPool<P>>,
+    index: usize,
+) -> Result<Arc<ConnectionShared>, EngineError>
+where
+    P: Providers + Send + Sync,
+{
+    let authority = pool.factory.addr.clone();
+    let proxy = pool.factory.bootstrap_config.proxy_to_broker_url.clone();
+    get_or_open(pool, &authority, &authority, proxy, index).await
 }
 
 /// Spawn the dial + handshake + supervised-driver task. The task runs on

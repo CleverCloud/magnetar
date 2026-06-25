@@ -98,12 +98,18 @@ impl std::fmt::Debug for ConnectionFactory {
 /// Composite key — the Java client uses an `InetSocketAddress`-typed
 /// `(logical, physical, randomKey)` triple
 /// ([`ConnectionPool.Key`](https://github.com/apache/pulsar/blob/master/pulsar-client/src/main/java/org/apache/pulsar/client/impl/ConnectionPool.java#L99)).
-/// We collapse to `(logical, physical)` (`randomKey` multiplexing is
-/// follow-up #—): magnetar's per-handle slot mutex (ADR-0038) already
-/// parallelises the hot path inside one connection, so the extra fan-out gain
-/// from running N parallel connections per broker is not worth the API
-/// complexity until we measure contention warranting it.
-type PoolKey = (String, String);
+/// magnetar mirrors it as `(logical, physical, connection_index)`. The
+/// `connection_index ∈ [0, connections_per_broker)` is the
+/// `connections_per_broker` fan-out (Java `ClientBuilder#connectionsPerBroker`,
+/// issue #314, [ADR-0073]): [`crate::Client`] round-robins the index across
+/// producers / consumers so a single logical producer fleet spreads its sends
+/// over several independent broker connections instead of contending on one.
+/// At the default `connections_per_broker = 1` the index is always `0`, so the
+/// key collapses to the historical one-entry-per-`(logical, physical)` model
+/// and behaviour is byte-identical to the pre-#314 client.
+///
+/// [ADR-0073]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0073-connections-per-broker.md
+type PoolKey = (String, String, usize);
 
 /// Tracking entry inside the pool. Owns the supervised driver handle so
 /// `Client::close` can join every spawned task on shutdown.
@@ -142,10 +148,10 @@ impl ProxyConnectionPool {
         })
     }
 
-    /// Snapshot of the currently-tracked `(logical, physical)` pairs — used by
-    /// tests and diagnostics.
+    /// Snapshot of the currently-tracked `(logical, physical, index)` triples —
+    /// used by tests and diagnostics.
     #[cfg(test)]
-    pub(crate) fn keys(&self) -> Vec<(String, String)> {
+    pub(crate) fn keys(&self) -> Vec<(String, String, usize)> {
         self.entries.lock().keys().cloned().collect()
     }
 
@@ -169,6 +175,12 @@ impl ProxyConnectionPool {
     ///   broker) directly, no proxy in the middle. ADR-0039 §"Multi-broker DIRECT routing
     ///   (2026-06-01)".
     ///
+    /// `index` is the `connections_per_broker` fan-out slot (ADR-0073, issue #314): two callers
+    /// asking for the same `(logical, physical)` but different `index` get distinct connections,
+    /// so a logical producer fleet can spread its sends across several broker connections. The
+    /// default `connections_per_broker = 1` always passes `index = 0`, collapsing back to one
+    /// entry per `(logical, physical)`.
+    ///
     /// Concurrency: if two callers race for the same key, only one connection
     /// is opened; the loser drops its half-built `Entry` and gets the
     /// winner's `Arc`.
@@ -177,10 +189,12 @@ impl ProxyConnectionPool {
         logical: &str,
         physical: &ParsedUrl,
         proxy_to_broker_url: Option<String>,
+        index: usize,
     ) -> Result<Arc<ConnectionShared>, ClientError> {
         let key: PoolKey = (
             logical.to_owned(),
             format!("{}:{}", physical.host, physical.port),
+            index,
         );
 
         // Fast path — already open.
@@ -227,6 +241,28 @@ impl ProxyConnectionPool {
             );
         }
         Ok(entry.shared.clone())
+    }
+
+    /// Open (or reuse) an additional connection to the **bootstrap** broker for
+    /// `connections_per_broker > 1` (ADR-0073, issue #314).
+    ///
+    /// `index` must be `≥ 1`: index `0` is the bootstrap connection itself,
+    /// owned directly by [`crate::Client`] and never tracked in the pool. The
+    /// sibling replicates the bootstrap CONNECT exactly — it dials the same
+    /// physical address ([`ConnectionFactory::url`]) and carries the same
+    /// `CommandConnect.proxy_to_broker_url` the bootstrap used (so a binary-proxy
+    /// client opens additional proxy connections, a direct client additional
+    /// direct ones). Entries are keyed `(bootstrap_authority, bootstrap_authority,
+    /// index)`, disjoint from the proxy / multi-broker-direct entries (whose
+    /// `logical` is the resolved broker URL).
+    pub(crate) async fn get_or_open_bootstrap_sibling(
+        &self,
+        index: usize,
+    ) -> Result<Arc<ConnectionShared>, ClientError> {
+        let physical = self.factory.url.clone();
+        let authority = format!("{}:{}", physical.host, physical.port);
+        let proxy = self.factory.bootstrap_config.proxy_to_broker_url.clone();
+        self.get_or_open(&authority, &physical, proxy, index).await
     }
 
     async fn build_entry(
