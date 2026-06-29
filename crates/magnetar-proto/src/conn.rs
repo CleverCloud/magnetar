@@ -2478,27 +2478,63 @@ impl Connection {
                 // starts at `availablePermits = 0`. Re-sync the client's permit
                 // MIRROR to 0 here so it tracks broker reality. Without this the
                 // mirror stays stale (it is purely additive on the client side;
-                // `available_permits` is never decremented as messages arrive),
-                // and the Failover re-arm at the `ActiveConsumerChange` arm —
-                // which only fires when `available_permits == 0` — is silently
-                // skipped on the subsequent re-promotion. The consumer then
-                // wedges at broker-permits=0 against a non-empty backlog with no
-                // `CommandFlow` ever sent. `consumed_since_flow` is reset in
-                // lock-step so the `maybe_flow` threshold restarts cleanly once
-                // flow is re-armed (mirrors the `reset` re-attach path, which
-                // zeroes both). The receiver queue itself is left intact: any
-                // already-dispatched messages still in the TCP buffer / queue
-                // remain user-visible (the #65 / `duringSeek` invariant).
+                // `available_permits` is never decremented as messages arrive).
+                // `consumed_since_flow` is reset in lock-step so the
+                // `maybe_flow` threshold restarts cleanly once flow is re-armed
+                // (mirrors the `reset` re-attach path, which zeroes both). The
+                // receiver queue itself is left intact: any already-dispatched
+                // messages still in the TCP buffer / queue remain user-visible
+                // (the #65 / `duringSeek` invariant).
                 if let Some(slot) = self.consumers.get(&handle) {
                     let mut consumer = slot.state.lock();
                     consumer.available_permits = 0;
                     consumer.consumed_since_flow = 0;
                 }
-                self.events
-                    .push_back(ConnectionEvent::ConsumerClosedByBroker {
-                        handle,
-                        assigned_broker_service_url: close.assigned_broker_service_url,
-                    });
+                // Issue #307 ROOT CAUSE: a broker-initiated `CommandCloseConsumer`
+                // with `assigned_broker_service_url = None` is a *same-broker*
+                // bundle reassignment on a LIVE socket — no TCP drop, so no
+                // `Connection::reset` + `rebuild_consumers` ever fires. The
+                // broker has torn its dispatcher's consumer id down; nothing
+                // re-subscribes it, so the consumer parks at
+                // `available_permits = 0` against a non-empty backlog forever
+                // (the production wedge: every bundle reassignment kills another
+                // partition). Resetting the permit mirror alone is NOT enough —
+                // the broker no longer has this consumer id, so any
+                // `CommandFlow` (e.g. an `ActiveConsumerChange` re-arm) is
+                // dropped silently ("Couldn't find consumer to handle flow").
+                //
+                // Re-subscribe the single running consumer in place, on the same
+                // connection, exactly like `rebuild_consumers` does per consumer
+                // on a reset and `resubscribe_consumer_after_seek` does after a
+                // seek: re-emit `CommandSubscribe` (resuming from the last acked
+                // id) and defer the initial `CommandFlow` to the broker's
+                // re-subscribe `Success` (the re-attach gate at the `Success`
+                // arm), so flow lands on a live consumer id rather than being
+                // dropped mid-subscribe.
+                //
+                // ONLY the same-broker (`None`) case is handled here. For
+                // `assigned_broker_service_url = Some(url)` (PIP-188 topic
+                // migration) the existing supervised-reconnect / migration path
+                // is left untouched — that consumer is supposed to reconnect on
+                // the new URL, not re-subscribe on this socket.
+                if close.assigned_broker_service_url.is_none() {
+                    // Same-broker bundle reassignment: re-subscribe in place and
+                    // DO NOT surface a `ConsumerClosedByBroker` event — the
+                    // re-attach is transparent to the runtime (which would
+                    // otherwise either drop the event or, if a `SubscribeAcked`
+                    // wait is parked, mistake it for a terminal close). The
+                    // method drains any older stale close events for this handle.
+                    self.resubscribe_consumer_after_broker_close(handle);
+                } else {
+                    // PIP-188 topic migration (`assigned_broker_service_url`
+                    // set): the supervised reconnect / migration path owns the
+                    // re-attach on the new URL — surface the event for it.
+                    self.events
+                        .push_back(ConnectionEvent::ConsumerClosedByBroker {
+                            handle,
+                            assigned_broker_service_url: close.assigned_broker_service_url,
+                        });
+                }
             }
             pb::base_command::Type::ReachedEndOfTopic => {
                 let rc = command
@@ -5338,6 +5374,76 @@ impl Connection {
             slot.state.lock().flow_on_subscribe_ack = true;
         }
         Some(request_id)
+    }
+
+    /// Re-subscribe a single consumer in place after the broker tore its
+    /// dispatcher down via a same-broker `CommandCloseConsumer`
+    /// (`assigned_broker_service_url = None`) on a still-live socket — issue
+    /// #307's proven root cause.
+    ///
+    /// Unlike [`Self::rebuild_consumers`] (whole-connection sweep, runs after a
+    /// `reset`) this re-attaches exactly one consumer without a transport
+    /// reconnect, the way [`Self::resubscribe_consumer_after_seek`] does after a
+    /// seek and [`Self::retry_consumer_subscribe`] does after a transient
+    /// subscribe rejection. It reuses the same machinery: re-emit
+    /// `CommandSubscribe` (resuming from the last acked id so the broker picks
+    /// up where draining stopped) and set `flow_on_subscribe_ack` so the initial
+    /// `CommandFlow` is deferred to the broker's re-subscribe `Success` (Pulsar
+    /// silently drops `CommandFlow` for a consumer id whose subscribe is still
+    /// being processed — `ServerCnx.handleFlow` "Couldn't find consumer").
+    ///
+    /// Skips (no-op) when the consumer is unknown, was never subscribed, is
+    /// user-closed, terminal, mid-seek (the seek's own
+    /// [`Self::resubscribe_consumer_after_seek`] owns re-attach), or already has
+    /// a re-attach pending (`flow_on_subscribe_ack` — `rebuild_consumers` /
+    /// transient-retry in flight). Drains any stale `ConsumerClosedByBroker`
+    /// event for this handle first so a runtime wait-future cannot trip on it
+    /// before the fresh `SubscribeAcked` (mirrors
+    /// `resubscribe_consumer_after_seek`).
+    ///
+    /// The receiver queue is left intact — already-dispatched messages stay
+    /// user-visible (the #65 / `duringSeek` invariant).
+    fn resubscribe_consumer_after_broker_close(&mut self, handle: ConsumerHandle) {
+        let Some(req) = self.consumer_subscribe_requests.get(&handle).cloned() else {
+            // Never subscribed (e.g. the broker closed a consumer whose
+            // subscribe never landed) — nothing to replay.
+            return;
+        };
+        let resume_from = {
+            let Some(slot) = self.consumers.get(&handle) else {
+                return;
+            };
+            let c = slot.state.lock();
+            if c.closed
+                || c.terminal_failure.is_some()
+                || c.pending_seek.is_some()
+                || c.flow_on_subscribe_ack
+            {
+                return;
+            }
+            // Resume from the last acked id when known (same logic
+            // `rebuild_consumers` / `retry_consumer_subscribe` use); the broker
+            // treats an unset `start_message_id` as "from the configured initial
+            // position" and otherwise resumes from its persisted cursor.
+            c.last_acked_message_id
+        };
+        // Drop the stale close-by-broker event(s) for this handle: the runtime's
+        // `EventWaitFut` only consumes them while parked on the initial
+        // `SubscribeAcked`, but draining keeps the queue from accumulating one
+        // per partition under bundle churn and prevents any future wait from
+        // observing a close that the re-subscribe has already superseded.
+        self.events.retain(
+            |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
+        );
+        let _ = self.emit_command_subscribe(handle, &req, resume_from);
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().flow_on_subscribe_ack = true;
+        }
+        tracing::debug!(
+            target: "magnetar_proto::conn",
+            handle = ?handle,
+            "broker closed running consumer (same-broker, url=None); re-subscribed in place (#307)"
+        );
     }
 
     fn encode_command(&mut self, cmd: &pb::BaseCommand) -> Result<(), ProtocolError> {
@@ -9231,30 +9337,63 @@ mod conn_state_tests {
         );
     }
 
+    /// Drain the next `CommandSubscribe` for `handle` out of the outbound
+    /// buffer, returning its body (with the `request_id` the client allocated),
+    /// or `None` if none was emitted.
+    fn drain_command_subscribe_for(
+        conn: &mut Connection,
+        handle: ConsumerHandle,
+    ) -> Option<pb::CommandSubscribe> {
+        let mut bytes = conn.poll_transmit();
+        while !bytes.is_empty() {
+            let frame = crate::frame::decode_one(&mut bytes).expect("decode outbound");
+            if frame.command.r#type == pb::base_command::Type::Subscribe as i32 {
+                let sub = frame.command.subscribe.expect("CommandSubscribe body");
+                if sub.consumer_id == handle.0 {
+                    return Some(sub);
+                }
+            }
+        }
+        None
+    }
+
+    /// Feed a broker `CommandSuccess` for `request_id` into the connection (acks
+    /// a re-subscribe so the re-attach flow gate at the `Success` arm fires).
+    fn feed_subscribe_success(conn: &mut Connection, request_id: u64) {
+        let ok = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ok).expect("encode CommandSuccess");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle CommandSuccess");
+    }
+
     #[test]
-    fn failover_rearms_flow_after_broker_close_reattach_promotion() {
-        // Issue #307 (production wedge that cf64240 does NOT cover): an
-        // ALREADY-ACTIVE Failover consumer on a partitioned topic with a large
-        // backlog freezes after a `code=6` bundle reassignment.
+    fn failover_resubscribes_and_rearms_flow_after_same_broker_close() {
+        // Issue #307 ROOT CAUSE: an ALREADY-RUNNING Failover consumer on a
+        // backlogged topic freezes after a same-broker (`code=6`) bundle
+        // reassignment because nothing re-subscribes it.
         //
         // Lifecycle reproduced here (all on ONE live socket — no reset):
         //   1. subscribe + initial flow -> available_permits = 100 (rqs).
         //   2. broker dispatches the full grant; the app consumes it, drawing the broker's permits
         //      down to 0 (steady state).
-        //   3. bundle reassignment: broker sends `CommandCloseConsumer` to quiesce the dispatcher
-        //      (NOT a CommandCloseProducer, NOT a socket drop -> no `Connection::reset`, so the
-        //      supervised reconnect / `rebuild_consumers` re-arm path never fires).
-        //   4. broker re-creates the dispatcher and re-promotes this consumer with
-        //      `CommandActiveConsumerChange{is_active:true}` — but the broker-side
-        //      `availablePermits` is now 0.
+        //   3. bundle reassignment: broker sends `CommandCloseConsumer{assigned_broker_service_url:
+        //      None}` to quiesce the dispatcher (NOT a socket drop -> no `Connection::reset`, so
+        //      the supervised reconnect / `rebuild_consumers` path never fires). The broker has
+        //      torn its consumer id down; a bare `CommandFlow` against it would be dropped.
         //
-        // The cf64240 re-arm at the ActiveConsumerChange arm only fires when the
-        // client's `available_permits == 0`. Because nothing resets the client's
-        // permit MIRROR on a broker-initiated `CommandCloseConsumer`, the mirror
-        // is stale (still 100) while the broker holds 0. The guard reads
-        // `available_permits != 0`, skips the re-arm, and NO `CommandFlow` is
-        // ever sent — the consumer wedges at broker-permits=0 with a full
-        // backlog: `availablePermits=0`, `msgRateOut=0`, frozen `receive()`.
+        // The fix re-subscribes the single consumer in place at close-time
+        // (re-emit `CommandSubscribe`, defer flow to its `Success`). Before the
+        // fix NO re-subscribe was issued, so the consumer wedged at
+        // broker-permits=0 with a full backlog: `availablePermits=0`,
+        // `msgRateOut=0`, frozen `receive()`.
         let (mut conn, handle) = handshake_subscribe_failover();
 
         // (1) Initial flow on the active consumer.
@@ -9264,10 +9403,7 @@ mod conn_state_tests {
 
         // (2) Consume the whole grant so the live consumer is genuinely active
         // and has drained its receiver queue (mirrors the steady-state active
-        // consumer the production symptom describes). `available_permits` is the
-        // additive client mirror — it stays at 100 here (it is never decremented
-        // on the client side), which is exactly what makes the stale-mirror bug
-        // bite below.
+        // consumer the production symptom describes).
         for i in 0..100u64 {
             let meta = regular_metadata();
             let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
@@ -9279,36 +9415,94 @@ mod conn_state_tests {
         while drain_command_flow(&mut conn, handle).is_some() {}
 
         // (3) Bundle reassignment: broker closes the consumer on the live socket.
+        // The fix MUST re-emit a `CommandSubscribe` for this handle here.
+        let resubscribe_rid = conn.peek_next_request_id_for_test();
         let close = close_consumer_frame(handle);
         conn.handle_bytes(Instant::now(), &close)
             .expect("handle broker close");
-        // The consumer is intentionally left open (post-#65); no reset happened,
-        // so the client's permit mirror is still whatever it was — NOT zeroed.
+        // The consumer is intentionally left open (post-#65); no reset happened.
         assert!(
             !conn.consumer_is_closed(handle),
             "broker close must leave the consumer open for re-attach (issue #65)"
         );
 
-        // (4) Broker re-promotes the re-created consumer. Broker-side permits = 0.
-        let promote = active_consumer_change_frame(handle, true);
-        conn.handle_bytes(Instant::now(), &promote)
-            .expect("handle re-promotion");
+        // SUCCESS CONDITION (a): a fresh `CommandSubscribe` re-attaches the
+        // consumer on the same socket. Before the fix NONE was emitted — the
+        // root-cause wedge. The permit mirror was reset to 0 and NO flow is sent
+        // yet (it is deferred to the re-subscribe ack — the broker drops pre-ack
+        // flow).
+        let sub = drain_command_subscribe_for(&mut conn, handle)
+            .expect("a fresh CommandSubscribe must re-attach the running consumer (#307)");
+        assert_eq!(
+            sub.request_id, resubscribe_rid,
+            "the re-subscribe should use the freshly-allocated request id"
+        );
+        assert_eq!(conn.consumer_available_permits(handle), 0);
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "flow MUST be deferred to the re-subscribe Success (pre-ack flow is dropped broker-side)"
+        );
 
-        // SUCCESS CONDITION: a `CommandFlow` MUST go out so the broker resumes
-        // dispatching the backlog. On current main this FAILS — the stale
-        // mirror (`available_permits != 0`) makes the cf64240 guard skip the
-        // re-arm and no flow is emitted, wedging the consumer forever.
+        // (4) Broker acks the re-subscribe -> the re-attach gate re-arms flow.
+        feed_subscribe_success(&mut conn, resubscribe_rid);
+
+        // SUCCESS CONDITION (b): a `CommandFlow` now goes out so the broker
+        // resumes dispatching the backlog.
         let flow = drain_command_flow(&mut conn, handle);
         assert!(
             flow.is_some(),
-            "after a broker-initiated close + re-promotion the consumer MUST \
-             re-arm flow; otherwise it wedges at broker-permits=0 with a \
-             non-empty backlog (issue #307)"
+            "after the re-subscribe is acked the consumer MUST re-arm flow; \
+             otherwise it wedges at broker-permits=0 with a non-empty backlog (issue #307)"
         );
         assert_eq!(
             flow.expect("flow re-armed").message_permits,
             100,
             "re-arm must restore the full receiver-queue grant"
+        );
+    }
+
+    #[test]
+    fn topic_migration_close_consumer_does_not_resubscribe_in_place() {
+        // For `assigned_broker_service_url = Some(url)` (PIP-188 topic
+        // migration) the supervised reconnect / migration path on the new URL
+        // owns the re-attach — the proto layer must NOT re-subscribe in place on
+        // this socket, and MUST still surface the `ConsumerClosedByBroker`
+        // event the runtime drives the migration from.
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::CloseConsumer as i32,
+            close_consumer: Some(pb::CommandCloseConsumer {
+                consumer_id: handle.0,
+                request_id: 0,
+                assigned_broker_service_url: Some("pulsar://new-broker:6650".to_owned()),
+                assigned_broker_service_url_tls: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandCloseConsumer");
+        conn.handle_bytes(Instant::now(), &buf)
+            .expect("handle migration close");
+
+        assert!(
+            drain_command_subscribe_for(&mut conn, handle).is_none(),
+            "topic-migration close (url=Some) must NOT re-subscribe in place"
+        );
+        let saw_close_event = std::iter::from_fn(|| conn.poll_event()).any(|ev| {
+            matches!(
+                ev,
+                ConnectionEvent::ConsumerClosedByBroker {
+                    handle: h,
+                    assigned_broker_service_url: Some(_),
+                } if h == handle
+            )
+        });
+        assert!(
+            saw_close_event,
+            "topic-migration close must surface ConsumerClosedByBroker for the migration path"
         );
     }
 

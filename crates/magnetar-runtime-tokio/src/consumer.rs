@@ -1354,6 +1354,22 @@ impl Future for ReceiveFut {
                 conn.cancel_consumer_receive_waker(handle, key);
             }
             drop(conn);
+            // `pop_message` crossed the half-queue threshold inside `maybe_flow`
+            // and queued a replenishment `CommandFlow` onto the connection
+            // outbound buffer (conn.rs `pop_message`). That buffer is only
+            // flushed by the driver task's top-of-loop `poll_transmit`, which
+            // runs when the driver is woken. Under sustained one-directional
+            // inbound load the wedge is: the broker dispatches exactly its
+            // granted window, the last few pops queue the replenishing flow, the
+            // buffered inbound runs dry so NO further read-arm wakeup fires, and
+            // — without this notify — the queued flow is never flushed. The
+            // broker then sits at zero permits and goes quiet forever
+            // (availablePermits=0, msgRateOut=0, no close/reconnect). Waking the
+            // driver here flushes the flow so replenishment reaches the broker
+            // even when the consumer never acks. `drain_messages` /
+            // `receive_batch` already do this; the single-message `receive()`
+            // success path was the gap (issue #307).
+            shared.driver_waker.notify_one();
             // Decrypt FIRST, then decompress. The producer applies the inverse order on send
             // — `compression → encryption` (see `producer::Producer::send` and Java
             // `ProducerImpl.java:986-1003`) — so the wire payload is ciphertext wrapping the
