@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-29
+
 ### Added
 
 - **Consumer name on the multi-child consumer builders:** `PartitionedConsumerBuilder`, `MultiTopicsConsumerBuilder`, and `PatternConsumerBuilder` gain a `.name(impl Into<String>)` setter that propagates the consumer name verbatim to every per-partition / per-topic child via `ConsumerTemplate` (no per-partition suffix — every child subscribes with the same `consumer_name`, matching the Java client). Broker `topics stats` now reports a non-empty `consumerName` for each child, so a multi-instance Failover (or Shared) partitioned consumer is attributable to an instance. Previously only the inner per-topic `ConsumerBuilder` exposed `.name()`, leaving partitioned consumers stuck at `consumer_name: None`. (#300)
+- **Pluggable consumer receiver-queue policy (PIP-74 auto-scaled queue):** a new `ReceiverQueuePolicy` trait in `magnetar-proto` makes the consumer receiver-queue size pluggable. `Fixed(usize)` is the DEFAULT and is byte-for-byte identical to the previous client; `Auto { min, max_bytes }` opts into PIP-74 `autoScaledReceiverQueueSizeEnabled` parity — growing the target by bounded doubling under starvation (`available_permits == 0`) and shrinking under a buffered-bytes guard, with hysteresis so it converges without thrashing. `adjust` is a pure function of `FlowStats` (no clock/RNG/I/O), so both engines stay bit-reproducible; the adjust tick rides the injected clock inside the per-slot consumer loop. Builder sugar: `receiver_queue_size(n)` resolves to `Fixed(n)`; `receiver_queue_policy(Arc::new(Auto::new(min, max_bytes)))` opts in (5s default tick, overridable). Threaded through partitioned / multi-topics / pattern consumers. (#301)
+- **`ClientBuilder::connections_per_broker(n)` (Java `connectionsPerBroker` parity):** magnetar opened a single connection per broker, capping a logical producer fleet at one connection's send pipeline and forcing applications to hand-roll a pool of `PulsarClient`s. The new knob (default 1) opens up to `n` connections per broker and deterministically round-robins producers AND consumers across them via a shared cursor, fanning out both data-plane surfaces. Runtime-only — never reaches the sans-io proto core; lookups and redirect dials always pin index 0. The default of 1 is a byte-identical no-op. (#314)
+
+### Changed
+
+- **Producer `send_timeout` now defaults to 30s (Java `sendTimeoutMs = 30000` parity):** `CreateProducerRequest::send_timeout` previously defaulted to `None`, which disabled the per-send timeout sweep — a send whose `CommandSendReceipt` was lost or corrupted in flight (receipts carry no CRC32C) hung `Poll::Pending` forever. The canonical default is now `Some(30s)`, inherited by the v4 `ProducerBuilder`, `PartitionedProducerBuilder`, and `TypedProducerBuilder` (the V5 surface already used 30s); a timed-out send resolves with `SendError { code: -1, "send timeout" }` and wakes the parked waker. `ProducerBuilder::disable_send_timeout()` restores the previous unbounded behavior. (#304)
+- **Dependencies:** raised workspace floors — `bytes` 1.11.1→1.12.0, `rustls` 0.23.40→0.23.41, `rustls-native-certs` 0.8.3→0.8.4, `zeroize` 1.8.2→1.9.0, and an explicit `opentelemetry` 0.32.0 patch pin — and refreshed `Cargo.lock`. (#312, #315)
+
+### Fixed
+
+- **Consumer wedge on same-broker bundle reassignment (broker-initiated `CloseConsumer`):** a code=6 bundle reassignment closes the consumer on the LIVE socket (no TCP drop, so the supervised reconnect / `rebuild_consumers` path never runs), which previously left a Failover/standby consumer parked at zero permits against a non-empty backlog — `receive()` frozen, `availablePermits=0`, `msgRateOut=0` — until a process restart. The sans-io core now: re-syncs the client permit mirror to zero on the broker-initiated close; re-subscribes the running consumer in place on the same connection (resuming from the last acked id, deferring the initial `CommandFlow` to the re-subscribe `Success`); re-arms flow when a Failover standby is promoted to active while holding zero permits; and wakes the driver after a single-message `receive()` so a queued replenishment `CommandFlow` is flushed at a buffered-inbound window boundary. Both engines inherit the fix from the proto seam. (#307, #317, #318)
+- **Reconnect: bounded transient-open retry + recoverable-receive gating:** a transient producer-open / subscribe failure is now retried on bounded exponential backoff (2s initial, 8s cap) off the injected clock and, past the cap, terminalized via `fail_producer_open` / `fail_consumer_subscribe` so `send()` / `receive()` return an error instead of hanging forever (#302); and a `receive()` outstanding across a supervised drop no longer resolves `Err(Closed)` during the recoverable reconnect window — new sans-io predicates re-park it and resolve with the post-reconnect message after the rebuild replays `CommandSubscribe` (#299). (#299, #302, #313)
+- **Driver read-arm fairness under sustained publish load:** the per-connection driver now polls the inbound read arm BEFORE the waker arm in its biased `select!`, so already-arrived `CommandSendReceipt`s are read promptly instead of sitting behind a near-always-pending send waker — collapsing `send().await` tail latency from hundreds of milliseconds back to broker-persist time. The outbound path is not starved (`poll_transmit` + `write_all` run at the top of every loop iteration) and the reorder is identical on both engines, so differential `EventStream` parity holds. (#303)
 
 ## [1.1.1] - 2026-06-17
 
@@ -108,6 +123,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - CRC32C verify-or-drop on frames with magic `0x0e01`: a checksum mismatch emits a `ChecksumMismatch` event and drops the frame.
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained). (2a9fafb, abc7aad)
 
+[1.2.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.0
 [1.1.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.1
 [1.1.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.0
 [1.0.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.0.1
