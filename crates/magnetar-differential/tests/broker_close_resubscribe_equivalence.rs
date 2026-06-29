@@ -14,7 +14,7 @@
 //! That suppression is a concrete, user-observable change to the event stream
 //! (`failover_active_reflow_equivalence.rs` only covers the
 //! `ActiveConsumerChange` promotion path), so per GUIDELINES §Cross-runtime test
-//! + CLAUDE.md invariant 9 it needs a `magnetar-differential` test asserting both
+//! and CLAUDE.md invariant 9 it needs a `magnetar-differential` test asserting both
 //! engines react identically: same suppressed close event, same fresh
 //! `CommandSubscribe`, same zeroed permits, same deferred-then-re-armed flow.
 //!
@@ -104,7 +104,7 @@ fn feed_success(conn: &mut Connection, request_id: u64, t0: Instant) {
 }
 
 /// Drain the outbound buffer ONCE, bucketing `CommandSubscribe` request ids and
-/// `CommandFlow` grants for `handle` (poll_transmit empties the buffer, so a
+/// `CommandFlow` grants for `handle` (`poll_transmit` empties the buffer, so a
 /// second call would see nothing — classify in one pass).
 fn drain_outbound(conn: &mut Connection, handle: ConsumerHandle) -> (Vec<u64>, Vec<u32>) {
     let mut out = conn.poll_transmit();
