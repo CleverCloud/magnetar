@@ -525,18 +525,19 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
                                 └──────────────┬──────────────┘
                                                │
         ┌──────────────────────────────────────▼──────────────────────────────────┐
-        │  (1) Lock state. Drain outbound bytes (poll_transmit) into write_buf.   │
+        │  (1) Lock state if no write tail is pending. Drain outbound bytes into  │
+        │      a driver-owned pending-write queue. Read deadline / closing flag.  │
         │      Read next deadline (poll_timeout). Read closing-flag. Drop lock.   │
         └──────────────────────────────────────┬──────────────────────────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
-                                │  (2) write_all(write_buf)   │
-                                │      then flush()           │
+                                │  (2) write at most 256 KiB  │
+                                │      from pending queue     │
                                 └──────────────┬──────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
-                                │  (3) if closing: shutdown   │
-                                │      return Ok(())          │
+                                │  (3) if closing and queue   │
+                                │      is empty: shutdown     │
                                 └──────────────┬──────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
@@ -557,6 +558,11 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
    └─────────────────────────┘     └──────────────────────┘     └─────────────────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
+                                │ pending-write continuation  │
+                                │ if tail bytes remain        │
+                                └──────────────┬──────────────┘
+                                               │
+                                ┌──────────────▼──────────────┐
                                 │     back to (1)             │
                                 └─────────────────────────────┘
 ```
@@ -567,7 +573,9 @@ The `select!` keeps `biased;` — a non-biased `tokio::select!` chooses arms via
 Every `Producer::send` pulses `driver_waker.notify_one()`, so under sustained publish load a waker permit is almost always pending on loop entry; polling the waker arm first would let the outbound path starve inbound `CommandSendReceipt` reads, inflating `send→ack` latency under load while the broker acks in milliseconds (issue #303).
 The outbound path is not starved by giving reads priority: `poll_transmit` + `write_all` run at the TOP of every loop iteration (step (1)/(2) above) regardless of which `select!` arm wins, so each tick still flushes pending sends.
 The read arm is cancel-safe — bytes land in the persistent `read_buf` and are consumed via `split()` only after the arm wins — so the reorder drops no bytes.
-A full read/write task split (a dedicated reader, mirroring `pulsar-client-go`) is a deferred follow-up: the TLS stream cannot `into_split` and the supervisor reconnect path would need rework, so the localized arm reorder is the minimal fairness fix.
+Issue #319 exposed the remaining single-task coupling: a large staged producer transmit could still monopolise the driver inside `write_all` before the read-first `select!` was reached.
+The driver now stores an owned pending-write queue and writes at most 256 KiB per loop turn before returning to the read-first `select!`; if tail bytes remain, a fixed continuation arm keeps flushing them when no read is ready.
+A full read/write task split (a dedicated reader, mirroring `pulsar-client-go`) remains a larger architectural option, but the bounded write turn closes the observed per-connection receipt starvation without splitting TLS or changing supervisor ownership.
 
 ### Lock discipline
 

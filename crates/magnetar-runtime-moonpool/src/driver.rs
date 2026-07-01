@@ -50,10 +50,11 @@
 //! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 //! [`Transport`]: crate::transport::Transport
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use magnetar_proto::{ConnectionEvent, ConsumerHandle, OpOutcome, PendingOpKey, ProducerHandle};
 use moonpool_core::{Providers, TaskProvider, TimeProvider};
 use parking_lot::Mutex;
@@ -67,6 +68,10 @@ use crate::{ConnectionShared, EngineError, ObservedReplicatedSubscriptionMarker,
 /// and append-style, so this is just the high-water mark before allocation
 /// grows.
 const READ_BUFFER_CAPACITY: usize = 64 * 1024;
+
+/// Maximum bytes a driver loop iteration writes before giving the inbound
+/// receipt path a chance to run.
+const DRIVER_WRITE_BUDGET_BYTES: usize = 256 * 1024;
 
 /// Initial delay before the FIRST transient producer-open / subscribe retry
 /// leg re-issues its lookup, mirroring the tokio engine's same initial sleep
@@ -460,6 +465,92 @@ fn spawn_retry_leg<P>(
             shared.driver_waker.notify_one();
         }
     });
+}
+
+struct PendingDriverWrite {
+    segments: VecDeque<Bytes>,
+    front_offset: usize,
+}
+
+impl PendingDriverWrite {
+    fn new() -> Self {
+        Self {
+            segments: VecDeque::new(),
+            front_offset: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_transmit(transmit: magnetar_proto::TransmitOwned) -> Self {
+        let mut pending = Self::new();
+        pending.push_transmit(transmit);
+        pending
+    }
+
+    fn push_transmit(&mut self, transmit: magnetar_proto::TransmitOwned) {
+        debug_assert!(
+            self.is_empty(),
+            "new transmit must only be pulled after the pending write queue drains"
+        );
+        match transmit {
+            magnetar_proto::TransmitOwned::Contiguous(buf) => {
+                if !buf.is_empty() {
+                    self.segments.push_back(buf);
+                }
+            }
+            magnetar_proto::TransmitOwned::Vectored(segs) => {
+                self.segments
+                    .extend(segs.into_iter().filter(|s| !s.is_empty()));
+            }
+        }
+        self.front_offset = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn pop_budgeted(&mut self, budget: usize) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+        let mut remaining = budget;
+        while remaining > 0 {
+            let Some(front) = self.segments.front() else {
+                break;
+            };
+            let available = front.len().saturating_sub(self.front_offset);
+            if available == 0 {
+                let _ = self.segments.pop_front();
+                self.front_offset = 0;
+                continue;
+            }
+            let n = available.min(remaining);
+            chunks.push(front.slice(self.front_offset..self.front_offset + n));
+            self.front_offset += n;
+            remaining -= n;
+            if self.front_offset == front.len() {
+                let _ = self.segments.pop_front();
+                self.front_offset = 0;
+            }
+        }
+        chunks
+    }
+
+    async fn write_budgeted<P>(
+        &mut self,
+        transport: &mut Transport<P>,
+        budget: usize,
+    ) -> std::io::Result<usize>
+    where
+        P: Providers,
+    {
+        let chunks = self.pop_budgeted(budget);
+        let mut written = 0usize;
+        for chunk in chunks {
+            written += chunk.len();
+            transport.write_all(&chunk).await?;
+        }
+        Ok(written)
+    }
 }
 
 /// Issue a `CommandLookupTopic` and await the broker's
@@ -1134,6 +1225,8 @@ where
     P: Providers,
 {
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
+    let mut pending_write = PendingDriverWrite::new();
+    let mut close_after_write = false;
 
     loop {
         // 0. Advance the engine's wall-clock atomic from `providers.time().now()`. The proto-layer
@@ -1172,7 +1265,7 @@ where
         //    segment is `Arc`-backed `Bytes`) and drop the lock BEFORE
         //    awaiting the network write. The `parking_lot::Mutex` is never
         //    held across an `.await`.
-        let (out, deadline, should_close) = {
+        let (out, deadline, should_close) = if pending_write.is_empty() {
             let mut conn = shared.inner.lock();
             let out = conn.poll_transmit_owned();
             let dl = conn.poll_timeout();
@@ -1183,20 +1276,38 @@ where
                     | magnetar_proto::HandshakeState::Failed
             );
             (out, dl, closing)
+        } else {
+            let conn = shared.inner.lock();
+            let dl = conn.poll_timeout();
+            let closing = matches!(
+                conn.state(),
+                magnetar_proto::HandshakeState::Closing
+                    | magnetar_proto::HandshakeState::Closed
+                    | magnetar_proto::HandshakeState::Failed
+            );
+            (
+                magnetar_proto::TransmitOwned::Contiguous(Bytes::new()),
+                dl,
+                closing,
+            )
         };
+        close_after_write |= should_close;
+        if pending_write.is_empty() {
+            pending_write.push_transmit(out);
+        }
 
         // 2. Flush whatever the state machine produced. This happens outside the lock so user
         //    futures can keep enqueuing.
-        if !out.is_empty() {
-            let write_result = match &out {
-                magnetar_proto::TransmitOwned::Contiguous(buf) => transport.write_all(buf).await,
-                magnetar_proto::TransmitOwned::Vectored(segs) => {
-                    transport.write_all_vectored(segs).await
+        if !pending_write.is_empty() {
+            match pending_write
+                .write_budgeted(&mut transport, DRIVER_WRITE_BUDGET_BYTES)
+                .await
+            {
+                Ok(bytes) => tracing::trace!(bytes, "writing outbound bytes"),
+                Err(err) => {
+                    shared.inner.lock().mark_disconnected();
+                    return Err(err.into());
                 }
-            };
-            if let Err(err) = write_result {
-                shared.inner.lock().mark_disconnected();
-                return Err(err.into());
             }
             if let Err(err) = transport.flush().await {
                 shared.inner.lock().mark_disconnected();
@@ -1204,7 +1315,7 @@ where
             }
         }
 
-        if should_close {
+        if pending_write.is_empty() && close_after_write {
             let _ = transport.shutdown().await;
             return Ok(());
         }
@@ -1383,6 +1494,15 @@ where
                 // Loop: poll_transmit will drain whatever the future enqueued.
             }
 
+            () = async {
+                if pending_write.is_empty() {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                // Pending outbound bytes remain. Yield the read arm once, then
+                // continue with the next bounded write slice.
+            }
+
             // Timer fired. `sleep_or_pending` only returns once the duration
             // elapses or the time provider shuts down; both are treated as
             // a tick.
@@ -1413,10 +1533,13 @@ async fn sleep_or_pending<P: Providers>(time: &P::Time, dur: Option<Duration>) {
 mod tests {
     use std::time::Instant;
 
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use magnetar_proto::{ConnectionConfig, ConnectionEvent, ProducerHandle, encode_command, pb};
 
-    use super::{handle_pending_events, strip_url_to_host_port};
+    use super::{
+        DRIVER_WRITE_BUDGET_BYTES, PendingDriverWrite, handle_pending_events,
+        strip_url_to_host_port,
+    };
     use crate::{ConnectionShared, EngineError};
 
     /// Build a synthetic `CommandConnected` frame for use in tests that need
@@ -1491,6 +1614,29 @@ mod tests {
         // routing inside the proto layer is already covered by the
         // magnetar-proto unit tests.
         assert_eq!(ProducerHandle(42), ProducerHandle(42));
+    }
+
+    #[test]
+    fn driver_write_budget_leaves_tail_for_next_tick() {
+        let mut pending =
+            PendingDriverWrite::from_transmit(magnetar_proto::TransmitOwned::Contiguous(
+                Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"),
+            ));
+
+        let first = pending.pop_budgeted(8);
+        assert_eq!(first, vec![Bytes::from_static(b"abcdefgh")]);
+        assert!(
+            !pending.is_empty(),
+            "the driver must keep unwritten bytes so it can read before continuing writes"
+        );
+
+        let rest = pending.pop_budgeted(DRIVER_WRITE_BUDGET_BYTES);
+        let mut observed = Vec::new();
+        for chunk in rest {
+            observed.extend_from_slice(&chunk);
+        }
+        assert_eq!(&observed, b"ijklmnopqrstuvwxyz");
+        assert!(pending.is_empty());
     }
 
     #[test]

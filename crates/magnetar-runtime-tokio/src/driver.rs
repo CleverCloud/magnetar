@@ -44,6 +44,8 @@
 //!
 //! [GUIDELINES.md]: https://github.com/CleverCloud/magnetar/blob/main/GUIDELINES.md
 
+use std::collections::VecDeque;
+#[cfg(test)]
 use std::io::IoSlice;
 use std::sync::Arc;
 use std::time::Instant;
@@ -476,6 +478,10 @@ async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
 /// Default size of the per-connection read buffer. Reads are non-blocking and append-style, so
 /// this is just the high-water mark before allocation grows.
 const READ_BUFFER_CAPACITY: usize = 64 * 1024;
+
+/// Maximum bytes a driver loop iteration writes before giving the inbound
+/// receipt path a chance to run.
+const DRIVER_WRITE_BUDGET_BYTES: usize = 256 * 1024;
 
 /// Handle to the driver task. Dropping this does not stop the driver — the driver keeps running
 /// as long as the [`ConnectionShared`] arc is alive. Call [`DriverHandle::join`] to wait for it.
@@ -945,6 +951,7 @@ fn transport_needs_flush(transport: &Transport) -> bool {
 ///   `poll_write_vectored` impl falls back to a single-buffer `poll_write` with the first non-empty
 ///   slice, which still makes progress (just without the syscall reduction). The fall-back loop is
 ///   correct on every `AsyncWrite + Unpin`.
+#[cfg(test)]
 async fn write_all_vectored<S>(stream: &mut S, segs: &[bytes::Bytes]) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -992,6 +999,81 @@ where
     }
 }
 
+struct PendingDriverWrite {
+    segments: VecDeque<bytes::Bytes>,
+    front_offset: usize,
+}
+
+impl PendingDriverWrite {
+    fn new() -> Self {
+        Self {
+            segments: VecDeque::new(),
+            front_offset: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_transmit(transmit: magnetar_proto::TransmitOwned) -> Self {
+        let mut pending = Self::new();
+        pending.push_transmit(transmit);
+        pending
+    }
+
+    fn push_transmit(&mut self, transmit: magnetar_proto::TransmitOwned) {
+        debug_assert!(
+            self.is_empty(),
+            "new transmit must only be pulled after the pending write queue drains"
+        );
+        match transmit {
+            magnetar_proto::TransmitOwned::Contiguous(buf) => {
+                if !buf.is_empty() {
+                    self.segments.push_back(buf);
+                }
+            }
+            magnetar_proto::TransmitOwned::Vectored(segs) => {
+                self.segments
+                    .extend(segs.into_iter().filter(|s| !s.is_empty()));
+            }
+        }
+        self.front_offset = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    async fn write_budgeted<S>(&mut self, stream: &mut S, budget: usize) -> std::io::Result<usize>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let mut written = 0usize;
+        let mut remaining = budget;
+        while remaining > 0 {
+            let Some(front) = self.segments.front() else {
+                break;
+            };
+            let available = front.len().saturating_sub(self.front_offset);
+            if available == 0 {
+                let _ = self.segments.pop_front();
+                self.front_offset = 0;
+                continue;
+            }
+            let n = available.min(remaining);
+            stream
+                .write_all(&front[self.front_offset..self.front_offset + n])
+                .await?;
+            self.front_offset += n;
+            written += n;
+            remaining -= n;
+            if self.front_offset == front.len() {
+                let _ = self.segments.pop_front();
+                self.front_offset = 0;
+            }
+        }
+        Ok(written)
+    }
+}
+
 /// The per-socket driver loop.
 ///
 /// Implementation notes:
@@ -999,10 +1081,9 @@ where
 /// - **Lock discipline**: every interaction with `magnetar_proto::Connection` happens inside a
 ///   `parking_lot::Mutex::lock()` critical section. Critical sections are short — they never
 ///   `.await`.
-/// - **Write path**: we drain outbound bytes from the state machine into an owned `Vec<u8>`,
-///   release the lock, then `write_all` the entire buffer to the socket. The state machine queues
-///   additional frames as user futures call `send`/`ack`/etc.; the driver picks them up on the next
-///   loop iteration after the `driver_waker` notification.
+/// - **Write path**: we drain outbound bytes from the state machine into an owned queue, release
+///   the lock, then write a bounded slice before giving reads a chance to run. The unwritten tail
+///   stays in the driver and is flushed by later iterations.
 /// - **Read path**: we read directly into a `BytesMut` then hand its slice to the state machine.
 ///   The state machine handles framing — partial frames stay in its internal `inbound` buffer.
 /// - **Timeout**: `Connection::poll_timeout` returns the next deadline if any. We `tokio::select!`
@@ -1016,6 +1097,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
+    let mut pending_write = PendingDriverWrite::new();
+    let mut close_after_write = false;
 
     loop {
         // Drain outbound bytes + check if the state machine wants us to terminate.
@@ -1024,7 +1107,7 @@ where
         // `Producer::send` without taking the global lock — ADR-0038 Phase 3)
         // into the connection-wide outbound buffer before returning the byte
         // slice for the driver to flush.
-        let (write_data, deadline, should_close) = {
+        let (write_data, deadline, should_close) = if pending_write.is_empty() {
             let mut conn = shared.inner.lock();
             // ADR-0040 wave 2: take the owned `TransmitOwned` so we can
             // drop the lock before awaiting on the socket. The contiguous
@@ -1042,7 +1125,25 @@ where
                     | magnetar_proto::HandshakeState::Failed
             );
             (out, dl, closing)
+        } else {
+            let conn = shared.inner.lock();
+            let dl = conn.poll_timeout();
+            let closing = matches!(
+                conn.state(),
+                magnetar_proto::HandshakeState::Closing
+                    | magnetar_proto::HandshakeState::Closed
+                    | magnetar_proto::HandshakeState::Failed
+            );
+            (
+                magnetar_proto::TransmitOwned::Contiguous(bytes::Bytes::new()),
+                dl,
+                closing,
+            )
         };
+        close_after_write |= should_close;
+        if pending_write.is_empty() {
+            pending_write.push_transmit(write_data);
+        }
 
         // Flush whatever the state machine produced. This happens *outside* the lock so user
         // futures can keep enqueuing while we hold the network handle.
@@ -1053,21 +1154,16 @@ where
         // plaintext TCP it's `false` — kernel-buffered `write_all` already
         // pushes the bytes to the socket and there's no user-space buffer to
         // drain, so the extra `flush()` is wasted syscall overhead.
-        if !write_data.is_empty() {
-            let write_result = match &write_data {
-                magnetar_proto::TransmitOwned::Contiguous(buf) => {
-                    tracing::trace!(bytes = buf.len(), "writing outbound bytes (contiguous)");
-                    socket.write_all(buf).await
+        if !pending_write.is_empty() {
+            match pending_write
+                .write_budgeted(socket, DRIVER_WRITE_BUDGET_BYTES)
+                .await
+            {
+                Ok(bytes) => tracing::trace!(bytes, "writing outbound bytes"),
+                Err(err) => {
+                    shared.inner.lock().mark_disconnected();
+                    return Err(err.into());
                 }
-                magnetar_proto::TransmitOwned::Vectored(segs) => {
-                    let total: usize = segs.iter().map(bytes::Bytes::len).sum();
-                    tracing::trace!(bytes = total, "writing outbound bytes (vectored)");
-                    write_all_vectored(socket, segs).await
-                }
-            };
-            if let Err(err) = write_result {
-                shared.inner.lock().mark_disconnected();
-                return Err(err.into());
             }
             if flush_after_write {
                 if let Err(err) = socket.flush().await {
@@ -1077,7 +1173,7 @@ where
             }
         }
 
-        if should_close {
+        if pending_write.is_empty() && close_after_write {
             // Connection is winding down; give the peer a chance to see the EOF and exit.
             let _ = socket.shutdown().await;
             return Ok(());
@@ -1250,6 +1346,15 @@ where
                 // Loop: poll_transmit will drain whatever the future enqueued.
             }
 
+            () = async {
+                if pending_write.is_empty() {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                // Pending outbound bytes remain. Yield the read arm once, then
+                // continue with the next bounded write slice.
+            }
+
             // Timer fired.
             () = async {
                 match sleep {
@@ -1278,7 +1383,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::write_all_vectored;
+    use super::{DRIVER_WRITE_BUDGET_BYTES, PendingDriverWrite, write_all_vectored};
 
     /// A small multi-segment vectored write reassembles, in order, to the
     /// concatenation of its segments on the peer.
@@ -1314,6 +1419,39 @@ mod tests {
             received, expected,
             "reassembled stream must equal the segment concatenation, in order",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn driver_write_budget_leaves_tail_for_next_tick() {
+        let mut pending =
+            PendingDriverWrite::from_transmit(magnetar_proto::TransmitOwned::Contiguous(
+                Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"),
+            ));
+        let (mut client, mut server) = tokio::io::duplex(64);
+
+        let written = pending
+            .write_budgeted(&mut client, 8)
+            .await
+            .expect("budgeted write");
+        assert_eq!(written, 8);
+        assert!(
+            !pending.is_empty(),
+            "the driver must keep unwritten bytes so it can read before continuing writes"
+        );
+
+        let mut observed = vec![0; 8];
+        server
+            .read_exact(&mut observed)
+            .await
+            .expect("read first budget");
+        assert_eq!(&observed, b"abcdefgh");
+
+        let rest = pending
+            .write_budgeted(&mut client, DRIVER_WRITE_BUDGET_BYTES)
+            .await
+            .expect("drain tail");
+        assert_eq!(rest, 18);
+        assert!(pending.is_empty());
     }
 
     /// Segments whose combined length far exceeds the socket send buffer

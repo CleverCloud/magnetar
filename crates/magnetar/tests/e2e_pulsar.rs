@@ -118,11 +118,11 @@ async fn e2e_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Issue #303 (driver read-fairness) sanity: a large burst of CONCURRENT
-/// in-flight sends against a real broker all resolve with receipts. The driver
-/// loop must read back every `CommandSendReceipt` promptly even while the
-/// outbound `driver_waker` is hammered by the burst — the read-first `select!`
-/// reorder keeps the inbound path live. A regression that starved receipt reads
+/// Issues #303 / #319 driver fairness sanity: a large burst of CONCURRENT
+/// in-flight sends with non-trivial payloads against a real broker all resolve
+/// with receipts. The driver loop must read back every `CommandSendReceipt`
+/// promptly while the outbound `driver_waker` is hammered and the write side
+/// crosses the per-iteration budget. A regression that starved receipt reads
 /// would surface here as the burst-join timing out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_send_burst_all_receipts_resolve() -> Result<(), Box<dyn std::error::Error>> {
@@ -145,8 +145,8 @@ async fn e2e_send_burst_all_receipts_resolve() -> Result<(), Box<dyn std::error:
     for i in 0..BURST {
         let p = producer.clone();
         tasks.push(tokio::spawn(async move {
-            p.send(OutgoingMessage::with_payload(format!("burst-{i}").into_bytes()).into())
-                .await
+            let payload = vec![u8::try_from(i % 251).unwrap_or(0); 4 * 1024];
+            p.send(OutgoingMessage::with_payload(payload).into()).await
         }));
     }
 

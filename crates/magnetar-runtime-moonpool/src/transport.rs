@@ -20,6 +20,7 @@
 //! [ADR-0006](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0006-moonpool-tls-byte-pipe.md).
 
 use std::io;
+#[cfg(test)]
 use std::io::IoSlice;
 use std::sync::Arc;
 use std::time::Duration;
@@ -414,6 +415,7 @@ impl<P: Providers> Transport<P> {
     /// rustls encryption failures (translated to [`io::ErrorKind::InvalidData`]).
     /// A `write_vectored` returning `0` with a non-empty slice list surfaces
     /// as [`io::ErrorKind::WriteZero`] so the driver doesn't spin.
+    #[cfg(test)]
     pub(crate) async fn write_all_vectored(&mut self, segs: &[bytes::Bytes]) -> io::Result<()> {
         match self {
             Self::Plain { stream, .. } => {
