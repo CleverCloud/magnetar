@@ -76,7 +76,7 @@ rustc-hash      = "^2.1.2"
 rustls               = { version = "^0.23.41", default-features = false, features = ["std", "tls12", "logging"] }
 # rustls-pemfile was marked unmaintained (RUSTSEC-2025-0134); we now parse PEMs via
 # rustls-pki-types' `PemObject` trait, which is the upstream-recommended replacement.
-rustls-pki-types     = { version = "^1.14.1", features = ["std"] }
+rustls-pki-types     = { version = "^1.15.0", features = ["std"] }
 rustls-native-certs  = "^0.8.4"
 tokio-rustls         = { version = "^0.26.4", default-features = false }
 # `rustls-openssl` is opted-in via the façade's `crypto-openssl` feature
@@ -105,12 +105,12 @@ apache-avro = "^0.21.0"
 schemars    = { version = "^1.2.1", default-features = false, features = ["derive", "std"] }
 
 # PIP-37 chunking + identifiers
-uuid       = { version = "^1.23.3", default-features = false, features = ["v4", "fast-rng", "std"] }
+uuid       = { version = "^1.23.4", default-features = false, features = ["v4", "fast-rng", "std"] }
 
 # PIP-4 message encryption — AES-GCM via aws-lc-rs (audited, FIPS-friendly).
 # Also serves as the default RSA backend for the Athenz JwtSigner under
 # `magnetar-auth-athenz/crypto-aws-lc-rs` (ADR-0030 + ADR-0035).
-aws-lc-rs  = { version = "^1.17.0", default-features = false, features = ["aws-lc-sys"] }
+aws-lc-rs  = { version = "^1.17.1", default-features = false, features = ["aws-lc-sys"] }
 # Alternate RSA backend for the Athenz JwtSigner under
 # `magnetar-auth-athenz/crypto-ring`. Same RSASSA-PKCS1-v1_5 SHA-256
 # signature bytes as aws-lc-rs (RFC 8017 deterministic encoding).
@@ -162,7 +162,7 @@ opentelemetry_sdk  = { version = "^0.32.1", default-features = false, features =
 tracing            = "^0.1.44"
 tracing-subscriber = { version = "^0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 thiserror          = "^2.0.18"
-anyhow             = "^1.0.102"
+anyhow             = "^1.0.103"
 hdrhistogram       = { version = "^7.5.4", default-features = false }
 
 # Test infrastructure
