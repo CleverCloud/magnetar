@@ -7,13 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Cumulative ack now prunes every `batch_ack_tracker` entry it covers:** the cumulative branch of `Connection::ack` removed only the tracker entry keyed on the acked id's exact `(ledger_id, entry_id)`, so a consumer acking exclusively via cumulative watermarks (never an individual ack) leaked one PIP-54 `BatchAckEntry` per batched broker entry for the lifetime of the connection — only a reconnect cleared the map. The fix prunes all entries at or below the cumulative position (`retain`, once per cumulative ack). Surfaced by the otelgw accesslogs converter OOMing at ~24 GiB every 4-6 h under a batched-topic, cumulative-only workload. (#326)
+## [1.2.1] - 2026-07-06
 
 ### Added
 
 - **`ConsumerStats::pending_batch_acks`:** live count of PIP-54 per-batch ack-bitset entries (`batch_ack_tracker`). Magnetar-specific gauge (no Java counterpart): bounded by the un-acked window under a correctly-pruning ack path, so a monotonically growing value is the signature of the #326 leak class. (#326)
+
+### Changed
+
+- **Dependencies:** bumped workspace manifest floors — `rustls-pki-types` 1.14.1→1.15.0, `uuid` 1.23.3→1.23.4, `aws-lc-rs` 1.17.0→1.17.1, and `anyhow` 1.0.102→1.0.103 — and refreshed `Cargo.lock`; the `anyhow` bump resolves `RUSTSEC-2026-0190` flagged by `cargo-deny`. (#325)
+
+### Fixed
+
+- **Cumulative ack now prunes every `batch_ack_tracker` entry it covers:** the cumulative branch of `Connection::ack` removed only the tracker entry keyed on the acked id's exact `(ledger_id, entry_id)`, so a consumer acking exclusively via cumulative watermarks (never an individual ack) leaked one PIP-54 `BatchAckEntry` per batched broker entry for the lifetime of the connection — only a reconnect cleared the map. The fix prunes all entries at or below the cumulative position (`retain`, once per cumulative ack). Surfaced by the otelgw accesslogs converter OOMing at ~24 GiB every 4-6 h under a batched-topic, cumulative-only workload. (#326)
+- **Driver write fairness: bounded write turns before reads:** the per-connection driver now retains staged outbound bytes and writes at most 256 KiB per loop turn before returning to the read-first `select!`, so already-persisted `CommandSendReceipt`s stay observable under large producer bursts instead of being starved behind an unbounded write drain — without splitting the single socket owner. Matched Tokio/Moonpool unit guards and an e2e burst that crosses the write budget keep both engines in `EventStream` parity; recorded as ADR-0074. (#319, #324)
 
 ## [1.2.0] - 2026-06-29
 
@@ -131,6 +138,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - CRC32C verify-or-drop on frames with magic `0x0e01`: a checksum mismatch emits a `ChecksumMismatch` event and drops the frame.
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained). (2a9fafb, abc7aad)
 
+[1.2.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.1
 [1.2.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.0
 [1.1.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.1
 [1.1.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.0
