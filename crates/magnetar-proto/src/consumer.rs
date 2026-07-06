@@ -455,6 +455,12 @@ pub struct ConsumerStats {
     pub msgs_per_sec: f64,
     /// Rolling per-second byte-receive rate. Mirrors Java `ConsumerStats#getRateBytesReceived`.
     pub bytes_per_sec: f64,
+    /// Current number of live [`ConsumerState::batch_ack_tracker`] entries (PIP-54
+    /// per-batch ack bitsets). Magnetar-specific gauge (no Java counterpart): under a
+    /// correctly-pruning ack path this is bounded by the un-acked window, so a
+    /// monotonically growing value is the signature of the issue-#326 leak (cumulative
+    /// acks failing to prune the entries they cover).
+    pub pending_batch_acks: usize,
 }
 
 /// Default for [`ConsumerState::max_pending_chunked_message`]. Mirrors Java
@@ -726,6 +732,7 @@ impl ConsumerState {
             receive_latency_max_ms: pmax,
             msgs_per_sec: self.current_msgs_per_sec,
             bytes_per_sec: self.current_bytes_per_sec,
+            pending_batch_acks: self.batch_ack_tracker.len(),
         }
     }
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cumulative ack now prunes every `batch_ack_tracker` entry it covers:** the cumulative branch of `Connection::ack` removed only the tracker entry keyed on the acked id's exact `(ledger_id, entry_id)`, so a consumer acking exclusively via cumulative watermarks (never an individual ack) leaked one PIP-54 `BatchAckEntry` per batched broker entry for the lifetime of the connection — only a reconnect cleared the map. The fix prunes all entries at or below the cumulative position (`retain`, once per cumulative ack). Surfaced by the otelgw accesslogs converter OOMing at ~24 GiB every 4-6 h under a batched-topic, cumulative-only workload. (#326)
+
+### Added
+
+- **`ConsumerStats::pending_batch_acks`:** live count of PIP-54 per-batch ack-bitset entries (`batch_ack_tracker`). Magnetar-specific gauge (no Java counterpart): bounded by the un-acked window under a correctly-pruning ack path, so a monotonically growing value is the signature of the #326 leak class. (#326)
+
 ## [1.2.0] - 2026-06-29
 
 ### Added

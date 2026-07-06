@@ -3997,18 +3997,23 @@ impl Connection {
                 }
             } else {
                 // Cumulative ack — every position up to the supplied id is implicitly acked,
-                // so any per-batch tracker entries the cumulative position covers are stale.
-                // Drop them so future individual acks on the same batch don't synthesise a
-                // partial bitset for state the broker has already moved past.
+                // so any per-batch tracker entries AT OR BELOW the cumulative position are
+                // stale, not just the entry of the supplied id itself. Prune them all: a
+                // cumulative-only acking pattern (e.g. a watermark acker) otherwise leaks one
+                // `BatchAckEntry` per batched broker entry for the lifetime of the connection
+                // (issue #326). `(ledger_id, entry_id)` ordering matches the broker's cursor
+                // order within this consumer's partition, and `retain` runs once per
+                // cumulative ack — which is coalesced by construction — so the O(map) sweep
+                // is negligible.
                 if let Some(slot) = self.consumers.get(&handle) {
                     let mut consumer = slot.state.lock();
-                    let covered: Vec<(u64, u64)> = ack
+                    let horizon = ack
                         .message_ids
                         .iter()
                         .map(|id| (id.ledger_id, id.entry_id))
-                        .collect();
-                    for key in covered {
-                        consumer.batch_ack_tracker.remove(&key);
+                        .max();
+                    if let Some(horizon) = horizon {
+                        consumer.batch_ack_tracker.retain(|key, _| *key > horizon);
                     }
                 }
                 ack.message_ids.iter().map(|m| m.to_pb()).collect()
@@ -10529,6 +10534,103 @@ mod conn_state_tests {
             0,
             "the ack-timeout sweep must not re-redeliver an id already nacked + removed"
         );
+    }
+
+    // --- Cumulative ack must prune every batch-ack tracker entry it covers ---
+    //
+    // Regression coverage for issue #326: a consumer that only ever acks cumulatively
+    // (e.g. a watermark acker) used to leak one `BatchAckEntry` per batched broker
+    // entry — the cumulative branch removed only the tracker entry of the acked id
+    // itself, never the entries below it, and only a reconnect cleared the map.
+
+    /// Snapshot the `(ledger, entry)` keys currently held by `handle`'s batch-ack
+    /// tracker, sorted for deterministic assertions.
+    fn batch_tracker_keys(conn: &Connection, handle: ConsumerHandle) -> Vec<(u64, u64)> {
+        let slot = conn.consumers.get(&handle).expect("consumer slot");
+        let state = slot.state.lock();
+        let mut keys: Vec<(u64, u64)> = state.batch_ack_tracker.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn cumulative_ack_prunes_batch_ack_tracker_entries_at_and_below_the_acked_position() {
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        // Four batched entries across a ledger rollover; each stamps one tracker entry.
+        deliver_batch(&mut conn, handle, t0, 7, 1, 2);
+        deliver_batch(&mut conn, handle, t0, 7, 2, 2);
+        deliver_batch(&mut conn, handle, t0, 7, 3, 2);
+        deliver_batch(&mut conn, handle, t0, 8, 0, 2);
+        assert_eq!(
+            batch_tracker_keys(&conn, handle),
+            vec![(7, 1), (7, 2), (7, 3), (8, 0)],
+            "every batched delivery stamps one batch-ack tracker entry"
+        );
+        // Cumulative ack at (7, 3): (7, 1) and (7, 2) are covered by the cumulative
+        // position and must be pruned along with (7, 3) itself; (8, 0) is above the
+        // horizon and must survive.
+        let _ = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 7,
+                    entry_id: 3,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: 0,
+                    #[cfg(feature = "scalable-topics")]
+                    segment_id: None,
+                }],
+                ack_type: pb::command_ack::AckType::Cumulative,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+        );
+        assert_eq!(
+            batch_tracker_keys(&conn, handle),
+            vec![(8, 0)],
+            "a cumulative ack must prune every tracker entry at or below its position, \
+             not just the exact (ledger, entry) of the acked id (issue #326)"
+        );
+    }
+
+    #[test]
+    fn cumulative_only_acking_keeps_the_batch_ack_tracker_bounded() {
+        // The production workload that surfaced #326: a stream of batched entries with a
+        // cumulative ack every N messages and never an individual ack. The tracker must
+        // stay bounded by the un-acked window instead of growing with every entry consumed.
+        let t0 = Instant::now();
+        let (mut conn, handle) = nack_test_conn(Duration::from_secs(10), None);
+        let ack_every = 10u64;
+        for entry in 0..100u64 {
+            deliver_batch(&mut conn, handle, t0, 12, entry, 2);
+            if (entry + 1) % ack_every == 0 {
+                let _ = conn.ack(
+                    handle,
+                    AckRequest {
+                        message_ids: vec![MessageId {
+                            ledger_id: 12,
+                            entry_id: entry,
+                            partition: -1,
+                            batch_index: -1,
+                            batch_size: 0,
+                            #[cfg(feature = "scalable-topics")]
+                            segment_id: None,
+                        }],
+                        ack_type: pb::command_ack::AckType::Cumulative,
+                        properties: Vec::new(),
+                        txn_id: None,
+                    },
+                );
+                assert_eq!(
+                    batch_tracker_keys(&conn, handle),
+                    Vec::<(u64, u64)>::new(),
+                    "after a cumulative ack at the consume front the tracker is empty; \
+                     before the #326 fix it kept every entry below the acked position"
+                );
+            }
+        }
     }
 }
 
