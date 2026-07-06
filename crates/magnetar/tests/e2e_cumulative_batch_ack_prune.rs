@@ -9,7 +9,7 @@
 //! tracker entry of the exact acked `(ledger, entry)` key; every entry below the
 //! cumulative position leaked one `BatchAckEntry` until reconnect — the production
 //! workload that surfaced this (a contiguous-watermark acker at 1000-message
-//! cadence) OOMed a 12-instance fleet at ~24 GiB every 4-6 h.
+//! cadence) drove a 12-instance fleet out of memory at ~24 GiB every 4-6 h.
 //!
 //! The deterministic trajectory proof lives in the proto / runtime / differential
 //! layers, which pin a synthetic frame sequence; this end-to-end test pins the

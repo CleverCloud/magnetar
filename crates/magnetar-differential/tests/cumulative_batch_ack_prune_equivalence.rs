@@ -11,7 +11,7 @@
 //! tracker kept every entry below the cumulative position — the
 //! `pending_batch_acks` gauge grew monotonically with entries consumed
 //! (~one `BatchAckEntry` per batch, forever) until reconnect; the converter
-//! fleet OOMed at ~24 GiB every 4-6 h on exactly this pattern.
+//! fleet ran out of memory at ~24 GiB every 4-6 h on exactly this pattern.
 //!
 //! Why this drives the engines' `ConnectionShared` directly instead of the
 //! `ScriptedBroker` runner: the scripted broker dispatches only non-batched

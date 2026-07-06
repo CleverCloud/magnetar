@@ -10,7 +10,7 @@
 //! `(ledger_id, entry_id)` key of the supplied id; every entry below the
 //! cumulative position leaked until reconnect. A production watermark acker on
 //! a batched topic (one cumulative ack per N messages, never an individual ack)
-//! grew one `BatchAckEntry` per batched broker entry forever — the fleet OOMed
+//! grew one `BatchAckEntry` per batched broker entry forever — the fleet ran out of memory
 //! at ~24 GiB every 4-6 h.
 //!
 //! Moonpool territory: pure synthetic-frame + synthetic-[`Instant`] drive of the
