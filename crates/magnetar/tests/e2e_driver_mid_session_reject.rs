@@ -433,10 +433,11 @@ async fn e2e_producer_open_gives_up_with_error_when_bundle_never_served()
 
     // The open must RESOLVE with Err, not hang. The bounded retry loop spins
     // through the gate's transient rejects, then the proto budget terminalizes
-    // the open. The outer timeout is the anti-hang backstop: a pre-fix client
-    // hangs here forever and this fires loudly.
+    // the open. Each retry also performs a broker lookup; slow CI runners can
+    // push the bounded window past two minutes, so the outer timeout is only the
+    // anti-hang backstop, not the expected duration.
     let topic = "persistent://public/default/magnetar-e2e-giveup-302";
-    let result = tokio::time::timeout(Duration::from_secs(120), client.producer(topic).create())
+    let result = tokio::time::timeout(Duration::from_secs(240), client.producer(topic).create())
         .await
         .expect("open_producer must RESOLVE (with Err) after the transient give-up, not hang");
     assert!(
