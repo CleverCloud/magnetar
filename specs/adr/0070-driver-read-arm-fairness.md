@@ -39,7 +39,7 @@ Applied IDENTICALLY to both engines so the differential `EventStream` parity (AD
 ## Consequences
 
 - **Easier**: under sustained publish load, `send→ack` tracks broker latency instead of inflating as the in-flight queue deepens — the receipt path is no longer behind the outbound path in the poll order.
-- **Harder / deferred**: this does not give per-connection read/write *parallelism*. While the single task `await`s a large or back-pressured `write_all`, it still cannot read; the full reader-task split (deferred) is what removes that coupling. The localized reorder removes only the `select!`-bias starvation.
+- **Harder / deferred**: this does not give per-connection read/write _parallelism_. While the single task `await`s a large or back-pressured `write_all`, it still cannot read; the full reader-task split (deferred) is what removes that coupling. The localized reorder removes only the `select!`-bias starvation.
 - **Cost / bound**: `tokio::sync::Notify` stores a SINGLE permit, so the pre-fix order cost at most one extra loop iteration of read latency per permit refresh; the unbounded latency in #303 came from a permit being re-armed at essentially every select boundary under real multi-threaded send concurrency. The reorder removes that whole class.
 - **Determinism**: the reordered arm interleaving is a different but still fully deterministic ordering under moonpool; the 32-seed sweep and the same-seed double-run stay reproducible.
 - **Incompatible with**: dropping `biased;` (would break moonpool determinism) — that path is explicitly closed off.

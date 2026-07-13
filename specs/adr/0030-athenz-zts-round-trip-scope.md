@@ -100,9 +100,9 @@ The implementation kept this ADR's _seam_ design (`ensure_role_token(now)`, the 
 - [ADR-0026 §D3](0026-design-decisions-d1-d4-from-fdb-pulsar-codex-review.md) — design-time deferral rationale.
 - Apache Pulsar Java — `org.apache.pulsar.client.impl.auth.AuthenticationAthenz`.
 - Athenz ZTS docs —
-<https://athenz.github.io/athenz/zts_api/>
-  <!-- TODO: verify the precise ZTS REST endpoint path matches
-pulsar-java client's request. -->
+  <https://athenz.github.io/athenz/zts_api/>
+  <!-- TODO: verify the precise ZTS REST endpoint path matches pulsar-java client's request. -->
+
 - Pulsar Athenz docs —
   <https://pulsar.apache.org/docs/security-athenz/>
 - `crates/magnetar-auth-athenz/src/lib.rs` — `AthenzProvider`, `AthenzConfig`, the `with_role_token` escape hatch, and the `impl AuthProvider for AthenzProvider` block that surfaces `AuthError::Unsupported` when no role token is cached.

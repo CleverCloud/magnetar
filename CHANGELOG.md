@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-13
+
 ### Fixed
 
 - **Chunked-consumer flow replenishment:** accepted incomplete PIP-37 chunks now repay their broker permits immediately, matching Java's per-chunk accounting and preventing queue-2,000 consumers from reaching zero permits below the logical-message refill threshold. (#331; ADR-0076)
@@ -142,6 +144,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - CRC32C verify-or-drop on frames with magic `0x0e01`: a checksum mismatch emits a `ChecksumMismatch` event and drops the frame.
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained). (2a9fafb, abc7aad)
 
+[1.2.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.2
 [1.2.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.1
 [1.2.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.0
 [1.1.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.1.1
