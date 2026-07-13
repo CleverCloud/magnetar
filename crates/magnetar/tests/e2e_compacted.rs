@@ -204,20 +204,18 @@ async fn e2e_compacted_reader_sees_latest_per_key() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Wait for a [`magnetar::TableView`] to materialise exactly `expected`
-/// distinct keys, polling the view every 100 ms. Returns the final
-/// snapshot. Times out after `deadline`, panicking with the last observed
-/// size for diagnostics. Mirrors the "spin until tv.size == n" loop in
-/// `TableViewTest#testTableView`.
-async fn wait_for_size(
+/// Wait for a [`magnetar::TableView`] to converge to exactly `expected`,
+/// polling the view every 100 ms. Returns the final snapshot. Times out
+/// after `deadline` with the expected key/value pairs for diagnostics.
+async fn wait_for_values(
     tv: &magnetar::TableView,
-    expected: usize,
+    expected: &[(&str, &[u8])],
     deadline: Duration,
 ) -> HashMap<String, bytes::Bytes> {
     let inner = async {
         loop {
             let snapshot = tv.snapshot();
-            if snapshot.len() == expected {
+            if snapshot_contains_expected_values(&snapshot, expected) {
                 return snapshot;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -225,7 +223,33 @@ async fn wait_for_size(
     };
     tokio::time::timeout(deadline, inner)
         .await
-        .unwrap_or_else(|_| panic!("table view did not reach size {expected} within {deadline:?}"))
+        .unwrap_or_else(|_| {
+            panic!("table view did not converge to {expected:?} within {deadline:?}")
+        })
+}
+
+fn snapshot_contains_expected_values(
+    snapshot: &HashMap<String, bytes::Bytes>,
+    expected: &[(&str, &[u8])],
+) -> bool {
+    snapshot.len() == expected.len()
+        && expected.iter().all(|(key, value)| {
+            snapshot
+                .get(*key)
+                .is_some_and(|actual| actual.as_ref() == *value)
+        })
+}
+
+#[test]
+fn tableview_ready_snapshot_rejects_stale_values() {
+    let snapshot = HashMap::from([
+        ("k1".to_owned(), bytes::Bytes::from_static(b"k1-v1")),
+        ("k2".to_owned(), bytes::Bytes::from_static(b"k2-v1")),
+        ("k3".to_owned(), bytes::Bytes::from_static(b"k3-v1")),
+    ]);
+    let expected: &[(&str, &[u8])] = &[("k1", b"k1-v2"), ("k2", b"k2-v2"), ("k3", b"k3-v2")];
+
+    assert!(!snapshot_contains_expected_values(&snapshot, expected));
 }
 
 /// Producer publishes 3 keys × 2 versions; the `TableView` must converge to
@@ -271,8 +295,9 @@ async fn e2e_tableview_compacted_snapshot() -> Result<(), Box<dyn std::error::Er
         .create()
         .await?;
 
-    // Wait until all three keys are materialised, then snapshot.
-    let snapshot = wait_for_size(&tv, 3, Duration::from_secs(10)).await;
+    // Wait until all three keys carry their latest values, then snapshot.
+    let expected: &[(&str, &[u8])] = &[("k1", b"k1-v2"), ("k2", b"k2-v2"), ("k3", b"k3-v2")];
+    let snapshot = wait_for_values(&tv, expected, Duration::from_secs(10)).await;
     tv.close().await;
     client.close().await;
 

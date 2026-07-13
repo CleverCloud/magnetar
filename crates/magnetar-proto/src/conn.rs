@@ -1867,7 +1867,7 @@ impl Connection {
                         }
                     }
                 }
-                let staged_events: Vec<ConnectionEvent> =
+                let (staged_events, flow_permits): (Vec<ConnectionEvent>, Option<u32>) =
                     if let Some(slot) = self.consumers.get(&handle) {
                         let mut consumer = slot.state.lock();
                         let outcome = consumer.deliver(
@@ -1915,12 +1915,16 @@ impl Connection {
                                 }
                             }
                         }
-                        events
+                        let flow_permits = consumer.maybe_flow().map(|flow| flow.message_permits);
+                        (events, flow_permits)
                     } else {
-                        Vec::new()
+                        (Vec::new(), None)
                     };
                 for ev in staged_events {
                     self.events.push_back(ev);
+                }
+                if let Some(permits) = flow_permits {
+                    self.flow(handle, permits);
                 }
             }
             pb::base_command::Type::ProducerSuccess => {
@@ -9154,6 +9158,46 @@ mod conn_state_tests {
         (conn, handle)
     }
 
+    /// Subscribe a Failover consumer with the issue-#331 queue shape and
+    /// drain only the subscribe frame. The caller explicitly issues the
+    /// initial flow so no helper-side grant is hidden from wire assertions.
+    fn handshake_subscribe_chunk_flow() -> (Connection, ConsumerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        match conn.poll_event() {
+            Some(ConnectionEvent::Connected { .. }) => {}
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/chunk-flow".to_owned(),
+            subscription: "sub-chunk-flow".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: 2,
+            ..Default::default()
+        });
+        let _ = drain_command_subscribe(&mut conn);
+        let _ = conn.poll_transmit();
+        (conn, handle)
+    }
+
+    fn chunk_metadata(uuid: &str, chunk_id: i32) -> pb::MessageMetadata {
+        pb::MessageMetadata {
+            producer_name: "chunk-flow-producer".to_owned(),
+            sequence_id: 7,
+            publish_time: 1_700_000_000_000,
+            uuid: Some(uuid.to_owned()),
+            num_chunks_from_msg: Some(3),
+            chunk_id: Some(chunk_id),
+            total_chunk_msg_size: Some(6),
+            ..Default::default()
+        }
+    }
+
     /// Encode a broker-initiated `CommandCloseConsumer` frame for `handle`
     /// (issue #307 repro): the broker quiesces the dispatcher on a bundle
     /// reassignment (`code=6` / `ServiceNotReady`) by closing the consumer on
@@ -9208,6 +9252,38 @@ mod conn_state_tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn accepted_incomplete_chunks_replenish_flow_before_reassembly() {
+        let (mut conn, handle) = handshake_subscribe_chunk_flow();
+        conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        for (chunk_id, body) in [(0, b"aa".as_slice()), (2, b"cc"), (1, b"bb")] {
+            let frame = message_frame(handle.0, &chunk_metadata("chunk-flow", chunk_id), body);
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("deliver chunk");
+            let flow = drain_command_flow(&mut conn, handle);
+            if chunk_id == 1 {
+                assert!(
+                    flow.is_none(),
+                    "the completing chunk is repaid on logical pop"
+                );
+            } else {
+                assert_eq!(flow.expect("incomplete chunk flow").message_permits, 1);
+            }
+        }
+
+        assert_eq!(conn.consumer_queue_len(handle), 1);
+        let message = conn.pop_message(handle).expect("reassembled message");
+        assert_eq!(message.payload.as_ref(), b"aabbcc");
+        assert_eq!(
+            drain_command_flow(&mut conn, handle)
+                .expect("completing chunk flow")
+                .message_permits,
+            1,
+        );
     }
 
     #[test]

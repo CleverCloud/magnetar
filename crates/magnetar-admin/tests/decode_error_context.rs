@@ -44,8 +44,6 @@ async fn decode_error_on_empty_body_names_method_url_status() {
             method,
             url,
             status,
-            content_type: _,
-            snippet: _,
             ..
         } => {
             assert_eq!(method, "GET");

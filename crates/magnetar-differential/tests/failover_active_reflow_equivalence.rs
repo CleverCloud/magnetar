@@ -23,10 +23,11 @@ use std::time::Instant;
 use bytes::BytesMut;
 use magnetar_proto::{
     Connection, ConnectionConfig, ConnectionEvent, ConsumerHandle, SubscribeRequest, decode_one,
-    encode_command, pb,
+    encode_command, encode_payload, pb,
 };
 
 const RQ: usize = 8;
+const CHUNK_RQ: usize = 2;
 
 /// The observable reaction to a Failover promotion the two engines must agree
 /// on: the permit count after promotion, the ordered `CommandFlow` grants that
@@ -40,6 +41,15 @@ struct Reaction {
     saw_active_event: bool,
     permits_after_redundant: u32,
     grants_on_redundant: Vec<u32>,
+}
+
+/// Observable permit and delivery trace for one out-of-order chunked message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkFlowReaction {
+    grants_after_chunks: Vec<Vec<u32>>,
+    queue_len_before_pop: usize,
+    payload: Vec<u8>,
+    grants_after_pop: Vec<u32>,
 }
 
 fn handshake_response_bytes() -> BytesMut {
@@ -70,6 +80,41 @@ fn active_consumer_change_frame(handle: ConsumerHandle, is_active: bool) -> Byte
     };
     let mut buf = BytesMut::new();
     encode_command(&mut buf, &cmd).expect("encode CommandActiveConsumerChange");
+    buf
+}
+
+fn chunk_message_frame(handle: ConsumerHandle, chunk_id: i32, payload: &[u8]) -> BytesMut {
+    let command = pb::BaseCommand {
+        r#type: pb::base_command::Type::Message as i32,
+        message: Some(pb::CommandMessage {
+            consumer_id: handle.0,
+            message_id: pb::MessageIdData {
+                ledger_id: 13,
+                entry_id: u64::try_from(chunk_id).expect("non-negative chunk id"),
+                partition: None,
+                batch_index: None,
+                ack_set: vec![],
+                batch_size: None,
+                first_chunk_message_id: None,
+            },
+            redelivery_count: Some(0),
+            ack_set: vec![],
+            consumer_epoch: None,
+        }),
+        ..Default::default()
+    };
+    let metadata = pb::MessageMetadata {
+        producer_name: "chunk-flow-producer".to_owned(),
+        sequence_id: 7,
+        publish_time: 1_700_000_000_000,
+        uuid: Some("chunk-flow".to_owned()),
+        num_chunks_from_msg: Some(3),
+        chunk_id: Some(chunk_id),
+        total_chunk_msg_size: Some(6),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_payload(&mut buf, &command, &metadata, payload).expect("encode chunk frame");
     buf
 }
 
@@ -161,6 +206,58 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
     }
 }
 
+/// Drive the issue-#331 accepted-chunk trace through one engine connection.
+fn lock_and_run_chunk_flow(conn: &mut Connection, t0: Instant) -> ChunkFlowReaction {
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    let _ = conn.poll_event();
+
+    let request_id = conn.peek_next_request_id_for_test();
+    let handle = conn.subscribe(SubscribeRequest {
+        topic: "persistent://public/default/chunk-flow-equiv".to_owned(),
+        subscription: "sub-chunk-flow-equiv".to_owned(),
+        sub_type: pb::command_subscribe::SubType::Failover,
+        receiver_queue_size: CHUNK_RQ,
+        ..Default::default()
+    });
+    let success = pb::BaseCommand {
+        r#type: pb::base_command::Type::Success as i32,
+        success: Some(pb::CommandSuccess {
+            request_id,
+            schema: None,
+        }),
+        ..Default::default()
+    };
+    let mut success_frame = BytesMut::new();
+    encode_command(&mut success_frame, &success).expect("encode CommandSuccess");
+    conn.handle_bytes(t0, &success_frame).expect("Success");
+    let _ = conn.poll_event();
+    let _ = conn.poll_transmit();
+
+    conn.initial_flow(handle);
+    let _ = conn.poll_transmit();
+
+    let mut grants_after_chunks = Vec::new();
+    for (chunk_id, body) in [(0, b"aa".as_slice()), (2, b"cc"), (1, b"bb")] {
+        let frame = chunk_message_frame(handle, chunk_id, body);
+        conn.handle_bytes(t0, &frame).expect("deliver chunk");
+        grants_after_chunks.push(drain_flow_grants(conn, handle));
+    }
+
+    let queue_len_before_pop = conn.consumer_queue_len(handle);
+    let message = conn.pop_message(handle).expect("reassembled message");
+    let payload = message.payload.to_vec();
+    let grants_after_pop = drain_flow_grants(conn, handle);
+
+    ChunkFlowReaction {
+        grants_after_chunks,
+        queue_len_before_pop,
+        payload,
+        grants_after_pop,
+    }
+}
+
 #[test]
 fn failover_active_reflow_event_streams_agree() {
     let t0 = Instant::now();
@@ -197,5 +294,35 @@ fn failover_active_reflow_event_streams_agree() {
         tokio_reaction, expected,
         "promotion must re-arm exactly one flow of {RQ} permits and not double-flow on a \
          redundant promotion, got {tokio_reaction:?}"
+    );
+}
+
+#[test]
+fn chunk_flow_replenishment_event_streams_agree() {
+    let t0 = Instant::now();
+
+    let tokio_reaction = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        lock_and_run_chunk_flow(&mut conn, t0)
+    };
+    let moonpool_reaction = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        lock_and_run_chunk_flow(&mut conn, t0)
+    };
+
+    assert_eq!(
+        tokio_reaction, moonpool_reaction,
+        "tokio and moonpool engines diverged on accepted chunk permit replenishment"
+    );
+    assert_eq!(
+        tokio_reaction,
+        ChunkFlowReaction {
+            grants_after_chunks: vec![vec![1], vec![1], vec![]],
+            queue_len_before_pop: 1,
+            payload: b"aabbcc".to_vec(),
+            grants_after_pop: vec![1],
+        },
     );
 }

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Chunked-consumer flow replenishment:** accepted incomplete PIP-37 chunks now repay their broker permits immediately, matching Java's per-chunk accounting and preventing queue-2,000 consumers from reaching zero permits below the logical-message refill threshold. (#331; ADR-0076)
+
 ## [1.2.1] - 2026-07-06
 
 ### Added

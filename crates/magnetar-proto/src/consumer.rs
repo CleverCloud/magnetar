@@ -798,6 +798,10 @@ impl ConsumerState {
         })
     }
 
+    fn record_broker_permit_consumed(&mut self) {
+        self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+    }
+
     /// Account for one broker-side ledger entry that the conn-level filter has decided to
     /// drop before reaching the user (PIP-33 replicated-subscription markers; any future
     /// drop-on-receive sentinel). The broker consumed one permit when it dispatched the
@@ -808,7 +812,7 @@ impl ConsumerState {
     /// Intentionally **does not** increment the user-visible `total_msgs_received` /
     /// `total_bytes_received` counters: markers are not user messages.
     pub fn record_marker_consumed(&mut self) {
-        self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+        self.record_broker_permit_consumed();
     }
 
     /// Force an initial flow for the current receiver-queue target.
@@ -946,7 +950,7 @@ impl ConsumerState {
         // Issue #301: keep the buffered-queue-bytes counter in lock-step with
         // the enqueue bump in `classify_and_queue`.
         self.queued_bytes = self.queued_bytes.saturating_sub(msg.payload.len() as u64);
-        self.consumed_since_flow = self.consumed_since_flow.saturating_add(1);
+        self.record_broker_permit_consumed();
         let latency_ms = u64::try_from(msg.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(h) = self.receive_latency_hist.as_mut() {
             h.saturating_record(latency_ms);
@@ -1262,6 +1266,7 @@ impl ConsumerState {
                     "chunk buffered for reassembly",
                 );
                 if entry.received_chunks < entry.expected_chunks {
+                    self.record_broker_permit_consumed();
                     return Ok(DeliverOutcome::Buffered);
                 }
                 // All chunks present — assemble. Take the buffer out by value
