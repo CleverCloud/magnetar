@@ -223,7 +223,7 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
         )
         .with_env_var(
             "PULSAR_PREFIX_brokerClientAuthenticationParameters",
-            format!("token:{}", &admin_token),
+            format!("token:{admin_token}"),
         )
         .with_cmd(vec![
             "bin/pulsar".to_owned(),
