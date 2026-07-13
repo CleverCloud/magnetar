@@ -4,8 +4,8 @@
 //! `magnetar-runtime-moonpool/tests/consumer_flow_control_edge.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): three `#[test]` functions here mirror the
-//! moonpool file's three.
+//! (`check-runtime-test-parity`): four `#[test]` functions here mirror the
+//! moonpool file's four.
 //!
 //! ## What this pins
 //!
@@ -18,7 +18,7 @@
 //! runtime drives; the moonpool sibling pins the same behaviour under the
 //! deterministic-simulation engine.
 //!
-//! ## Shape (both `#[test]` functions)
+//! ## Shape (all four `#[test]` functions)
 //!
 //! 1. Handshake at `t0`, subscribe with a small `receiver_queue_size`, ack the subscribe, and force
 //!    the initial flow — the broker is granted exactly `receiver_queue_size` permits.
@@ -34,7 +34,8 @@
 //! half-threshold floors to 1 so every pop owes a flow) covering the `max(1)`
 //! branch in [`ConsumerState::maybe_flow`]. The third (issue #307) pins the
 //! Failover-promotion re-flow: a subscribed-but-zero-permit consumer promoted
-//! to active re-arms its flow so `receive()` does not starve forever.
+//! to active re-arms its flow so `receive()` does not starve forever. The
+//! fourth pins permit conservation across accepted out-of-order chunks.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -143,6 +144,47 @@ fn message_frame(
     };
     let mut frame = BytesMut::new();
     encode_payload(&mut frame, &msg_cmd, &metadata, payload).expect("encode message frame");
+    frame
+}
+
+/// Build one chunk entry for a three-chunk logical message. Each chunk uses a
+/// distinct broker entry id while the shared UUID binds them for reassembly.
+fn chunk_message_frame(
+    handle: magnetar_proto::ConsumerHandle,
+    chunk_id: i32,
+    payload: &[u8],
+) -> BytesMut {
+    let msg_cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Message as i32,
+        message: Some(pb::CommandMessage {
+            consumer_id: handle.0,
+            message_id: pb::MessageIdData {
+                ledger_id: 13,
+                entry_id: u64::try_from(chunk_id).expect("non-negative chunk id"),
+                partition: None,
+                batch_index: None,
+                ack_set: vec![],
+                batch_size: None,
+                first_chunk_message_id: None,
+            },
+            redelivery_count: Some(0),
+            ack_set: vec![],
+            consumer_epoch: None,
+        }),
+        ..Default::default()
+    };
+    let metadata = pb::MessageMetadata {
+        producer_name: "chunk-flow-producer".to_owned(),
+        sequence_id: 7,
+        publish_time: 1_700_000_000_000,
+        uuid: Some("chunk-flow".to_owned()),
+        num_chunks_from_msg: Some(3),
+        chunk_id: Some(chunk_id),
+        total_chunk_msg_size: Some(6),
+        ..Default::default()
+    };
+    let mut frame = BytesMut::new();
+    encode_payload(&mut frame, &msg_cmd, &metadata, payload).expect("encode chunk frame");
     frame
 }
 
@@ -384,6 +426,36 @@ fn flow_control_single_permit_window_never_underruns() {
         total_replenished, WINDOWS as u32,
         "each of the {WINDOWS} single-message windows replenished exactly one permit",
     );
+}
+
+/// Pulsar spends one broker permit per chunk entry. Accepted incomplete chunks
+/// must therefore replenish flow before the logical message is reassembled;
+/// the completing chunk remains tied to the eventual user-visible pop.
+#[test]
+fn accepted_incomplete_chunks_replenish_flow_before_reassembly() {
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let handle = open_consumer(&shared, "persistent://public/default/chunk-flow", 2, t0);
+
+    let mut grants = Vec::new();
+    for (chunk_id, body) in [(0, b"aa".as_slice()), (2, b"cc"), (1, b"bb")] {
+        let frame = chunk_message_frame(handle, chunk_id, body);
+        let mut conn = shared.inner.lock();
+        conn.handle_bytes(t0, &frame).expect("deliver chunk");
+        grants.push(drain_flow_permits(&mut conn.poll_transmit()));
+    }
+    assert_eq!(grants, vec![vec![1], vec![1], vec![]]);
+    assert_eq!(shared.inner.lock().consumer_queue_len(handle), 1);
+
+    let (message, mut out) = {
+        let mut conn = shared.inner.lock();
+        (
+            conn.pop_message(handle).expect("reassembled message"),
+            conn.poll_transmit(),
+        )
+    };
+    assert_eq!(message.payload.as_ref(), b"aabbcc");
+    assert_eq!(drain_flow_permits(&mut out), vec![1]);
 }
 
 /// Subscribe a `Failover` consumer and ack the subscribe so it is registered
