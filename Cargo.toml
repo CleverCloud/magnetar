@@ -86,7 +86,7 @@ tokio-rustls         = { version = "^0.26.4", default-features = false }
 rustls-openssl       = { version = "^0.3.1", default-features = false }
 
 # Compression — Pulsar's four codecs
-lz4_flex   = { version = "^0.13.1", default-features = false, features = ["std"] }
+lz4_flex   = { version = "^0.14.0", default-features = false, features = ["std"] }
 zstd       = { version = "^0.13.3", default-features = false }
 snap       = "^1.1.1"
 flate2     = { version = "^1.1.9", default-features = false, features = ["zlib"] }
