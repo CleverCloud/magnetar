@@ -1775,7 +1775,7 @@ dependencies = [
  "magnetar-proto",
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
- "moonpool-core",
+ "moonpool-core 0.8.0",
  "parking_lot",
  "prost",
  "tokio",
@@ -1800,7 +1800,7 @@ dependencies = [
  "magnetar-proto",
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
- "moonpool-core",
+ "moonpool-core 0.8.0",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -1875,7 +1875,7 @@ dependencies = [
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
- "moonpool-core",
+ "moonpool-core 0.8.0",
  "moonpool-sim",
  "parking_lot",
  "prost",
@@ -2027,6 +2027,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "moonpool-core"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74f8ae55d00f1a2cf54b4442b31507f100dc29997a86c834912645d42262660e"
+dependencies = [
+ "futures",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "moonpool-explorer"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2044,7 +2060,7 @@ dependencies = [
  "async-trait",
  "crc32c",
  "futures",
- "moonpool-core",
+ "moonpool-core 0.7.0",
  "moonpool-explorer",
  "parking_lot",
  "rand 0.10.1",

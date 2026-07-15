@@ -133,7 +133,7 @@ libgssapi  = { version = "^0.11.0", default-features = false }
 # no-progress detector work previously consumed from git (ADR-0056). The
 # lockfile stays the reproducibility anchor for deterministic `(commit, seed)`
 # replay under `--locked` validation (ADR-0036).
-moonpool-core = "^0.7.0"
+moonpool-core = "^0.8.0"
 # moonpool-sim provides the deterministic SimProviders used by the
 # differential harness chaos pack (ADR-0024). It is pinned in lockstep with
 # moonpool-core because moonpool publishes the crates as one compatible set.
