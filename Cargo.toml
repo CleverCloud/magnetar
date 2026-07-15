@@ -137,7 +137,7 @@ moonpool-core = "^0.7.0"
 # moonpool-sim provides the deterministic SimProviders used by the
 # differential harness chaos pack (ADR-0024). It is pinned in lockstep with
 # moonpool-core because moonpool publishes the crates as one compatible set.
-moonpool-sim = "^0.7.0"
+moonpool-sim = "^0.8.0"
 
 # Admin REST + CLI. The TLS sub-feature (`rustls` vs `rustls-no-provider`,
 # renamed from `rustls-tls` / `rustls-tls-no-provider` in reqwest 0.13) is

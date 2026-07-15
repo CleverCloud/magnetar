@@ -194,6 +194,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-task"
+version = "4.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1775,7 +1781,7 @@ dependencies = [
  "magnetar-proto",
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
- "moonpool-core",
+ "moonpool-core 0.7.0",
  "parking_lot",
  "prost",
  "tokio",
@@ -1800,7 +1806,7 @@ dependencies = [
  "magnetar-proto",
  "magnetar-runtime-moonpool",
  "magnetar-runtime-tokio",
- "moonpool-core",
+ "moonpool-core 0.7.0",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -1875,7 +1881,7 @@ dependencies = [
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
- "moonpool-core",
+ "moonpool-core 0.7.0",
  "moonpool-sim",
  "parking_lot",
  "prost",
@@ -2011,6 +2017,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "moonpool-assertions"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0ea826729eebb7e2638ddb2c2b2972f416d3f759a4e16b8fef2efe8d4f55f98"
+
+[[package]]
 name = "moonpool-core"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2027,24 +2039,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "moonpool-explorer"
-version = "0.7.0"
+name = "moonpool-core"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de939f010a7c69e9bbf76b48071e048f5f1cba5c0a77c093f17dac9fba3d9c72"
+checksum = "74f8ae55d00f1a2cf54b4442b31507f100dc29997a86c834912645d42262660e"
+dependencies = [
+ "futures",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "moonpool-explorer"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80a771616f8cb7f611f5444ca6198734a3c0f9ab75b8f658de80b5b29cb0d67e"
 dependencies = [
  "libc",
+ "moonpool-assertions",
 ]
 
 [[package]]
 name = "moonpool-sim"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51c61ed0aaaae2c33f79a434ac75bc06fab9a9e68ce6c74195f8b657cd3a72a7"
+checksum = "a4d0754f5fd083baec1631cf90fbc8e51b444a4f086b0f0eae4d4d428efd29e5"
 dependencies = [
+ "async-task",
  "async-trait",
  "crc32c",
  "futures",
- "moonpool-core",
+ "moonpool-assertions",
+ "moonpool-core 0.8.0",
  "moonpool-explorer",
  "parking_lot",
  "rand 0.10.1",
@@ -2052,12 +2083,9 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "valuable",
- "valuable-serde",
 ]
 
 [[package]]
@@ -3506,7 +3534,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -3878,16 +3905,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "valuable-serde"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee0548edecd1b907be7e67789923b7d02275b9ba4a33ebc33300e2c947a8cb1"
-dependencies = [
- "serde",
- "valuable",
 ]
 
 [[package]]
