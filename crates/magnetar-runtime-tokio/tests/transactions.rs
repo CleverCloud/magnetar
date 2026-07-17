@@ -123,7 +123,7 @@ async fn new_txn_returns_broker_assigned_txn_id() {
     let at = Instant::now();
     let mut conn = handshake_complete(at);
 
-    let request_id = conn.new_txn(Duration::from_secs(60));
+    let request_id = conn.new_txn(Duration::from_mins(1));
     let frame = new_txn_response_bytes(request_id.0, 0x11, 0x22);
     conn.handle_bytes(at, &frame).expect("apply NewTxnResponse");
     let outcome = conn

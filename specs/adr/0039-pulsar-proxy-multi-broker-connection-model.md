@@ -1,6 +1,6 @@
 # ADR-0039 — Per-broker connection pool for the Apache Pulsar Proxy
 
-- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing)
+- **Status**: Accepted (amended by [ADR-0045](0045-proxy-to-broker-url-host-port-format.md), `proxy_to_broker_url` wire-format portion; amended 2026-06-01 — multi-broker DIRECT routing; amended 2026-06-14 — redirect-target dialing; amended by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md), Moonpool runtime implementation)
 - **Date**: 2026-05-27
 - **Decider**: Florentin Dubois
 - **Tags**: architecture, proxy, lookup, connection-pool, runtime
@@ -28,6 +28,10 @@ instance"` and bouncing retries (HIGH-1 from the lookup multi-agent
 > - The Context paragraph "the `Redirected` outcome surfaces a `tracing::warn!(...)` and the `Connect` outcome drops the `proxy_through_service_url` flag" no longer described the shipped code: after the lookup multi-agent review, the engines carried a **hard `Err` BUG-arm** on `Redirected` (tokio `client.rs`, moonpool `client.rs`), not a `tracing::warn!`. That BUG-arm is now replaced by the driveable redirect-dial consumer. The `Connect`-flag-drop claim was already superseded by the 2026-06-01 amendment.
 > - The §3 framing "the moonpool engine falls back to the bootstrap until the moonpool flavour of `ProxyConnectionPool` lands" no longer applies to the redirect path: the moonpool `ProxyConnectionPool` (`crates/magnetar-runtime-moonpool/src/pool.rs`) is the path that dials the redirect target, so the moonpool engine dials redirect targets the same way the tokio engine does (verified by the two-broker dial parity test in `crates/magnetar-differential/tests/lookup_redirect_chain_equivalence.rs`).
 > - The "Multi-broker DIRECT routing (2026-06-01)" section's parenthetical "the proto layer chases redirect chains internally; the surfaced URL is the terminal hop" no longer describes `Client::lookup_topic`: the proto layer no longer chases — `lookup_topic` now drives the dial loop itself (consuming a driveable `Redirected`, dialing the target, re-issuing there) and returns the connection the final lookup landed on alongside the `LookupTarget`.
+
+> **Amendment (2026-07-16, [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md)).** The proxy connection model, pool key, and single-flight ownership remain unchanged.
+> The Moonpool-specific implementation described in "Send propagation — the load-bearing detail" is historical: Moonpool 0.8 makes provider futures `Send`, runs `SimProviders` tasks on its seeded executor, and requires provider-native task, time, and `moonpool_core::select!` boundaries.
+> Current pool dials also own a provider-native connect-plus-handshake deadline and a cancellation/completion handshake so `Client::close` waits for pending work to terminate.
 
 ## Context
 

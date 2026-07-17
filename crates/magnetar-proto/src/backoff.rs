@@ -28,10 +28,10 @@ use core::time::Duration;
 pub const DEFAULT_INITIAL: Duration = Duration::from_millis(100);
 
 /// Default max delay (60 s).
-pub const DEFAULT_MAX: Duration = Duration::from_secs(60);
+pub const DEFAULT_MAX: Duration = Duration::from_mins(1);
 
 /// Default mandatory-stop window (30 min).
-pub const DEFAULT_MANDATORY_STOP: Duration = Duration::from_secs(60 * 30);
+pub const DEFAULT_MANDATORY_STOP: Duration = Duration::from_mins(30);
 
 /// Truncated-exponential backoff with deterministic jitter.
 #[derive(Debug, Clone)]
@@ -215,8 +215,8 @@ mod tests {
     fn first_call_returns_initial_within_jitter() {
         let mut b = Backoff::new(
             Duration::from_millis(100),
-            Duration::from_secs(60),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(1),
+            Duration::from_mins(30),
             42,
         );
         let d = b.next();
@@ -229,7 +229,7 @@ mod tests {
         let mut b = Backoff::new(
             Duration::from_millis(100),
             Duration::from_secs(1),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(30),
             1,
         );
         let mut last = Duration::ZERO;
@@ -248,7 +248,7 @@ mod tests {
         let mut b = Backoff::new(
             Duration::from_millis(100),
             Duration::from_secs(1),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(30),
             1,
         );
         for _ in 0..5 {
@@ -269,7 +269,7 @@ mod tests {
         let mut b = Backoff::new(
             Duration::from_millis(100),
             Duration::from_secs(1),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(30),
             1,
         );
         let first = b.next();
@@ -293,8 +293,8 @@ mod tests {
     fn buggified_next_scales_by_half_at_rng_zero() {
         let mut b = Backoff::new(
             Duration::from_secs(10),
-            Duration::from_secs(60),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(1),
+            Duration::from_mins(30),
             // Tip: the base-jitter PRNG (`rng_state`) is independent
             // of the buggify RNG, so we still get a deterministic
             // jitter on top — the skew applies to the post-jitter
@@ -319,8 +319,8 @@ mod tests {
     fn buggified_next_scales_by_two_at_rng_top() {
         let mut b = Backoff::new(
             Duration::from_secs(10),
-            Duration::from_secs(60),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(1),
+            Duration::from_mins(30),
             7,
         );
         let counter = std::sync::Arc::new(parking_lot::Mutex::new(0_u64));
@@ -349,8 +349,8 @@ mod tests {
     fn buggified_next_skips_skew_when_roll_above_threshold() {
         let mut b = Backoff::new(
             Duration::from_secs(10),
-            Duration::from_secs(60),
-            Duration::from_secs(60 * 30),
+            Duration::from_mins(1),
+            Duration::from_mins(30),
             7,
         );
         // 9_999 % 10_000 = 9_999 → roll = 0.9999, well above 0.05.

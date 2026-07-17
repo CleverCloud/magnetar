@@ -222,14 +222,14 @@ mod tests {
     fn multiplier_backoff_grows_then_clamps() {
         let b = MultiplierRedeliveryBackoff {
             min_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             multiplier: 2.0,
         };
         assert_eq!(b.delay_for(0), Duration::from_millis(100));
         assert_eq!(b.delay_for(1), Duration::from_millis(200));
         assert_eq!(b.delay_for(3), Duration::from_millis(800));
         // Far past the ceiling — clamps to max_delay.
-        assert_eq!(b.delay_for(40), Duration::from_secs(60));
+        assert_eq!(b.delay_for(40), Duration::from_mins(1));
     }
 
     #[test]
@@ -299,7 +299,7 @@ mod tests {
     fn multiplier_with_unity_stays_at_min() {
         let b = MultiplierRedeliveryBackoff {
             min_delay: Duration::from_millis(200),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             multiplier: 1.0,
         };
         for n in 0..10u32 {
@@ -311,7 +311,7 @@ mod tests {
     fn multiplier_zero_count_returns_min() {
         let b = MultiplierRedeliveryBackoff {
             min_delay: Duration::from_millis(750),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             multiplier: 2.0,
         };
         assert_eq!(b.delay_for(0), Duration::from_millis(750));

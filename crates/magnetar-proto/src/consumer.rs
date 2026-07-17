@@ -470,7 +470,7 @@ pub const DEFAULT_MAX_PENDING_CHUNKED_MESSAGE: usize = 10;
 /// Default for [`ConsumerState::expire_time_of_incomplete_chunked_message`].
 /// Mirrors Java `expireTimeOfIncompleteChunkedMessageMillis = 60_000` (1 minute).
 pub const DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE: std::time::Duration =
-    std::time::Duration::from_secs(60);
+    std::time::Duration::from_mins(1);
 
 /// Depth-axis hard cap on a single chunked message's advertised total chunk
 /// count (`num_chunks_from_msg`). A hostile/buggy broker can advertise a `total`
@@ -2253,7 +2253,7 @@ mod tests {
         let _ = c.initial_flow();
         assert_eq!(
             c.expire_time_of_incomplete_chunked_message,
-            Some(std::time::Duration::from_secs(60)),
+            Some(std::time::Duration::from_mins(1)),
             "Java-matching 60s default"
         );
 
@@ -2264,7 +2264,7 @@ mod tests {
         let deadline = c
             .next_chunk_expiry_deadline()
             .expect("an incomplete buffer must expose an expiry deadline");
-        assert_eq!(deadline, t0 + std::time::Duration::from_secs(60));
+        assert_eq!(deadline, t0 + std::time::Duration::from_mins(1));
 
         // A sweep before the deadline is a no-op.
         c.sweep_expired_chunks(t0 + std::time::Duration::from_secs(59));

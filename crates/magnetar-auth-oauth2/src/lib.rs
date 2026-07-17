@@ -514,7 +514,7 @@ fn deadline_from_expires_in(now: Instant, expires_in: u64) -> Instant {
                 expires_in,
                 "IDP-advertised expires_in overflows Instant; falling back to 1h safe default",
             );
-            now + Duration::from_secs(3600)
+            now + Duration::from_hours(1)
         })
 }
 
@@ -653,7 +653,7 @@ mod tests {
         let bytes = bytes::Bytes::from_static(b"cached-jwt");
         *flow.cache.lock() = Some(super::CachedToken {
             access_token: bytes.clone(),
-            deadline: clock.now() + Duration::from_secs(120),
+            deadline: clock.now() + Duration::from_mins(2),
         });
 
         assert!(
@@ -671,7 +671,7 @@ mod tests {
 
         // Advance to inside the leeway window (deadline - REFRESH_LEEWAY + 1s) and expect a
         // refresh to be required.
-        let advance = Duration::from_secs(120)
+        let advance = Duration::from_mins(2)
             .checked_sub(REFRESH_LEEWAY)
             .expect("test leeway < deadline")
             + Duration::from_secs(1);
@@ -700,7 +700,7 @@ mod tests {
         let flow = build_flow(clock.clone());
         *flow.cache.lock() = Some(super::CachedToken {
             access_token: bytes::Bytes::from_static(b"top-secret-jwt"),
-            deadline: clock.now() + Duration::from_secs(60),
+            deadline: clock.now() + Duration::from_mins(1),
         });
         let rendered = format!("{flow:?}");
         assert!(!rendered.contains("super-secret"), "rendered={rendered}");
@@ -783,11 +783,11 @@ mod tests {
         // overflow inside `Instant::add`.
         let deadline = super::deadline_from_expires_in(now, u64::MAX);
         // Fallback is `now + 3600s`, which is always representable.
-        let expected = now + Duration::from_secs(3600);
+        let expected = now + Duration::from_hours(1);
         assert_eq!(deadline, expected, "u64::MAX must clamp to 1h default");
 
         // Sanity: a normal in-range value still produces the obvious deadline.
         let normal = super::deadline_from_expires_in(now, 60);
-        assert_eq!(normal, now + Duration::from_secs(60));
+        assert_eq!(normal, now + Duration::from_mins(1));
     }
 }

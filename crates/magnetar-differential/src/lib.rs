@@ -21,17 +21,13 @@
 //! to drive the four golden traces shipped alongside the harness; new
 //! traces extend the broker as needed.
 //!
-//! ## Why both engines run on `TokioProviders`
+//! ## Why the differential Moonpool leg uses `TokioProviders`
 //!
-//! `moonpool-sim` (the deterministic-chaos provider bundle) is not yet
-//! a workspace dependency — only [`moonpool_core`] is. With
-//! `TokioProviders` plugged in, the moonpool engine still drives the
-//! same façade types (`Client<P>`, `Producer<P>`, `Consumer<P>`) the
-//! sim path uses, so the harness exercises the engine surface that
-//! diverges between tokio and moonpool (memory-limit policies, future
-//! shapes, `_providers: PhantomData` plumbing, generic bounds, …).
-//! Swapping in a real sim bundle is a one-line change once we vendor
-//! it.
+//! Both differential legs talk to the same real in-process broker on an ambient Tokio runtime.
+//! `TokioProviders` therefore isolates engine-surface differences while keeping the broker,
+//! network, and wall-clock environment shared.
+//! The Moonpool runtime's native deterministic-executor contract is exercised separately by the
+//! `magnetar-runtime-moonpool` `SimProviders` chaos suite.
 
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
@@ -54,8 +50,7 @@ pub use crate::trace::{Event, EventStream, Op, Trace};
 /// Wall-clock anti-hang backstop for the differential equivalence runners.
 ///
 /// The differential harness runs BOTH engine legs on the real tokio clock
-/// (`TokioProviders`; moonpool-sim's virtual-clock providers are not yet a
-/// workspace dep — see the module docs above), so every `tokio::time::timeout`
+/// (`TokioProviders`; see the module docs above), so every `tokio::time::timeout`
 /// guarding a runner leg is a real wall-clock guard. This constant is an
 /// **anti-hang backstop, not a timing assertion**: a leg that genuinely wedges
 /// still fails the suite — just later, never silently. It is sized generously so
@@ -68,4 +63,4 @@ pub use crate::trace::{Event, EventStream, Op, Trace};
 /// forever-wedges. Unifying them behind one generous constant kills that flake
 /// class while keeping a finite deadlock backstop. Do NOT re-tighten this to
 /// "make the tests faster".
-pub const HANG_GUARD: Duration = Duration::from_secs(60);
+pub const HANG_GUARD: Duration = Duration::from_mins(1);

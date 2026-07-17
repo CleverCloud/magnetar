@@ -31,8 +31,7 @@ The two engines (`magnetar-runtime-tokio`, `magnetar-runtime-moonpool`) sit behi
 
 ## Non-negotiable invariants
 
-These are the **workspace-wide rules**.
-The protocol-correctness subset (CRC32C, no-panics-in-proto, schema parity, etc.) overlaps with [`GUIDELINES.md`](GUIDELINES.md), which is the binding spec for wire-format and code rules; the test-policy + lock-ordering items here are workspace-process additions enforced via xtask.
+These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C, no-panics-in-proto, schema parity, etc.) overlaps with [`GUIDELINES.md`](GUIDELINES.md), which is the binding spec for wire-format and code rules; the test-policy + lock-ordering items here are workspace-process additions enforced via xtask.
 
 1. **No channels.** `tokio::sync::{mpsc,broadcast,watch,oneshot}`, `std::sync::mpsc`, `crossbeam-channel`, `flume`, `async-channel`, `kanal`, `postage`, `tachyonix`, `thingbuf` — banned everywhere.
    Replace with `Arc<parking_lot::Mutex<...>>` + `tokio::sync::Notify` + `core::task::Waker` slabs inside the state machine.
@@ -137,11 +136,12 @@ cargo test --workspace --all-features
 # `.github/workflows/moonpool-seed-sweep.yml`.
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
-    --all-features --locked -- --quiet \
+    --no-default-features --features crypto-aws-lc-rs \
+    --locked -- --quiet \
     || { echo "seed $seed FAILED"; exit 1; }
 done
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
+RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps --locked
 # xtask gates — invoke via `cargo run -p xtask --` (there is no `cargo xtask` alias).
 cargo run -p xtask -- check-no-channels         # banned-channel grep

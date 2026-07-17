@@ -71,8 +71,7 @@ Feature flags on `magnetar` gate which engine and which auth providers compile i
 
 ### Sans-io invariants
 
-The crate split is enforced, not aspirational.
-Each rule below is wired into a CI gate and has a corresponding ADR.
+The crate split is enforced, not aspirational. Each rule below is wired into a CI gate and has a corresponding ADR.
 
 | Invariant                                                            | ADR                                                                                                              | Enforcement                                                                                         |
 | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -363,11 +362,10 @@ The driver-to-driver communication path is _also_ not a channel — it is a sing
 `Notify` is permitted because it has no queue and no payload — it is an async condvar, not a channel.
 If even `Notify` feels too channel-flavoured, a `parking_lot::Condvar + Mutex<bool>` is the documented fallback.
 
-**Enroll-before-drain wakeup discipline.**
-Every `Notify` the driver pulses with `notify_waiters()` — `driver_waker`, `topic_list_notify`, `replicated_subscription_marker_notify`, `scalable_notify` — stores **no permit**: it only wakes waiters enrolled at the instant it fires.
+**Enroll-before-drain wakeup discipline.** Every `Notify` the driver pulses with `notify_waiters()` — `driver_waker`, `topic_list_notify`, `replicated_subscription_marker_notify`, `scalable_notify` — stores **no permit**: it only wakes waiters enrolled at the instant it fires.
 So every accessor that parks on one of these (`Client::await_reconnect_or_terminal`, `next_topic_list_change`, `next_replicated_subscription_marker`, `next_scalable_event`) MUST arm its `Notified` future — create it and call `enable()` — **before** it drains the buffer and re-checks `is_closed()`, then `await` the pre-armed future.
 The reverse (drain → check → `notified().await`) leaves a window in which the driver can push an item and `notify_waiters()` between the empty-check and the (too-late) enrollment, losing the wakeup and hanging the accessor forever.
-This is enforced 1:1 across both engines; the marker accessor's missing enrollment was the latent §5.1 lost-wakeup race (the same shape already fixed for `SubscribeAckedFut`).
+This is enforced 1:1 across both engines; the marker accessor's missing enrollment was the latent §5.1 lost-wakeup race (the same shape already fixed for the subscribe-readiness waiter).
 
 ### Reference
 
@@ -388,7 +386,7 @@ The pattern is the same one [`quinn`] _would_ be using if it didn't ship its own
 | `tokio::sync::Notify`                                        | `ConnectionShared.driver_waker`, `topic_list_notify`                                                                                                                            | Single-cell async wake-up. Not a channel.                                                                                                                                        |
 | `std::sync::atomic::*`                                       | stats + state flags                                                                                                                                                             | Lock-free counters.                                                                                                                                                              |
 | `core::task::Waker` slab                                     | `magnetar-proto::Connection.pending_ops`                                                                                                                                        | Future completion.                                                                                                                                                               |
-| `tokio::select!`                                             | driver loop                                                                                                                                                                     | Control-flow multiplexing. Not a channel.                                                                                                                                        |
+| `tokio::select!` / `moonpool_core::select!`                  | tokio / Moonpool driver loops respectively                                                                                                                                      | Control-flow multiplexing. Moonpool's fair branch order is seed-driven; `biased;` preserves explicit protocol priority. Not a channel.                                           |
 | `Arc<T>`                                                     | `ConnectionShared`, `Arc<ProducerSlot>` / `Arc<ConsumerSlot>` on `Producer` / `Consumer`, `MessageEncryptor`, `MessageDecryptor`, `AuthProvider`, `MessageRouter`, interceptors | Cheap clone-and-share.                                                                                                                                                           |
 | `arc_swap::ArcSwap`                                          | rare config-rotation slots                                                                                                                                                      | Lock-free swap.                                                                                                                                                                  |
 | `slab::Slab`                                                 | per-future Waker keyspace                                                                                                                                                       | O(1) insertion + removal.                                                                                                                                                        |
@@ -562,14 +560,14 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
                                 └──────────────┬──────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
-                                │  (4) tokio::select! { biased │
+                                │  (4) runtime select! biased  │
                                 └──────────────┬──────────────┘
                                                │
               ┌────────────────────────────────┼────────────────────────────────┐
               │                                │                                │
               ▼                                ▼                                ▼
    ┌─────────────────────────┐     ┌──────────────────────┐     ┌─────────────────────────┐
-   │ socket.read_buf(&buf)   │     │ shared.driver_waker  │     │ sleep_until(deadline)   │
+   │ socket.read_buf(&buf)   │     │ shared.driver_waker  │     │ runtime timer deadline  │
    │   (polled FIRST —        │     │   .notified()        │     │   on tick -> handle_   │
    │   receipt fairness)      │     │   (user enqueued     │     │   timeout(now)           │
    │   on Ok(0) -> PeerClosed │     │   a send/ack/etc.)   │     │                         │
@@ -590,7 +588,9 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
 
 ### Read fairness
 
-The `select!` keeps `biased;` — a non-biased `tokio::select!` chooses arms via an uncontrolled thread-local RNG, which would break the moonpool engine's bit-for-bit reproducibility — but the **inbound read arm is polled FIRST**, before the `driver_waker` arm.
+The tokio driver uses `tokio::select!`; the Moonpool driver uses `moonpool_core::select!`, whose fair branch offset is derived from the simulation seed.
+Both keep `biased;` because ADR-0070 requires a fixed **inbound-read-first** priority before the `driver_waker` arm.
+An unbiased Moonpool selection would remain reproducible, but it would rotate that protocol priority instead of guaranteeing receipt fairness.
 Every `Producer::send` pulses `driver_waker.notify_one()`, so under sustained publish load a waker permit is almost always pending on loop entry; polling the waker arm first would let the outbound path starve inbound `CommandSendReceipt` reads, inflating `send→ack` latency under load while the broker acks in milliseconds (issue #303).
 The outbound path is not starved by giving reads priority: `poll_transmit` + `write_all` run at the TOP of every loop iteration (step (1)/(2) above) regardless of which `select!` arm wins, so each tick still flushes pending sends.
 The read arm is cancel-safe — bytes land in the persistent `read_buf` and are consumed via `split()` only after the arm wins — so the reorder drops no bytes.
@@ -1019,7 +1019,7 @@ Source: [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/prod
                                    returns the next deadline
                                              │
                                              ▼
-                                   driver sleep_until fires
+                                   driver runtime timer fires
                                              │
                                              ▼
                                    Connection::handle_timeout
@@ -1251,7 +1251,8 @@ Pass-2 (ADR-0037, commit `4a29ba9`) extended `ConsumerApi` with the 17 trait met
 Key properties:
 
 - The engine is generic over `moonpool_core::Providers`, which bundles `NetworkProvider`, `TimeProvider`, `TaskProvider`, `RandomProvider`, `StorageProvider`.
-  Plug `TokioProviders` for production-style runs against a real broker; plug a `moonpool-sim` bundle for reproducible chaos under a seed.
+  Plug `TokioProviders` for production-style runs against a real broker; plug `moonpool_sim::SimProviders` for Moonpool 0.8's native seeded executor, virtual clock, simulated network/storage, and reproducible chaos.
+- Provider-generic tasks, timers, and concurrent waits use `TaskProvider`, `TimeProvider`, and `moonpool_core::select!`; the simulation path does not require an ambient Tokio runtime ([ADR-0078](specs/adr/0078-adopt-moonpool-0-8-native-deterministic-runtime.md)).
 - The driver consumes the same `magnetar-proto::Connection` state machine as the tokio engine — the differences are which byte pipe carries the I/O and which clock source the engine snapshots into `Connection::send(now, …)` / `flush_producer(now, …)` and into the `with_wall_clock_provider` slot.
 - TLS handshakes survive chaos with the same determinism as `magnetar-proto` itself — the adapter never blocks on a network call inside `process_new_packets`; reads and writes go through the byte pipe under simulation control.
 
@@ -1412,11 +1413,25 @@ rebuild_producers() / rebuild_consumers() -> re-emit every still-open
 
 User futures stay live across the migration.
 `Connection::reset()` fails every pending **request** (lookup, partitioned-metadata, seek, ack, transaction round-trip) with `OpOutcome::SessionLost`, but treats in-flight **publishes** specially: it snapshots them and `rebuild_producers()` re-issues them on the new session **without** a `SessionLost` outcome, so the user's `SendFut` stays pending and resolves transparently when the replayed receipt lands (Stage 3 transparent at-least-once replay; mirrors Java `ProducerImpl#resendMessages`).
-A lookup behind `subscribe` / `open_producer` severed by the reset is likewise re-issued transparently — the engine's `lookup_topic` parks on `ConnectionShared::await_reconnect_or_terminal` and re-runs the `CommandLookupTopic` against the fresh session, bounded by `MAX_LOOKUP_SESSION_REISSUES`, surfacing `PeerClosed` only if the supervisor gives up (`no_driver` latched). See [ADR-0060](specs/adr/0060-lookup-retry-on-session-lost.md) (lookup) and [ADR-0059](specs/adr/0059-terminal-fast-fail-new-ops.md) (the `no_driver` terminal latch).
+A lookup behind `subscribe` / `open_producer` severed by the reset is likewise re-issued transparently — the engine's `lookup_topic` parks on `ConnectionShared::await_reconnect_or_terminal` and re-runs the `CommandLookupTopic` against the fresh session, bounded by `MAX_LOOKUP_SESSION_REISSUES`, surfacing `PeerClosed` only if the supervisor gives up (`no_driver` latched).
+See [ADR-0060](specs/adr/0060-lookup-retry-on-session-lost.md) (lookup) and [ADR-0059](specs/adr/0059-terminal-fast-fail-new-ops.md) (the `no_driver` terminal latch).
 
-**Lookup redirect dialing** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-06-14 amendment). A `CommandLookupTopic` resolves to one of three terminal outcomes on its request-id: `Connect` (route the data ops here), `Failed`, or `Redirected` (this broker is not the bundle owner). The sans-io core never chases a redirect itself — that would mean dialing a socket, forbidden in `magnetar-proto` ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md)). Instead it surfaces a **driveable** `LookupOutcome::Redirected { broker_service_url, broker_service_url_tls, authoritative, hops_remaining }`, and the engine's `lookup_topic` loop dials the redirect-target broker (reusing `resolve_direct_broker` / the per-broker `ProxyConnectionPool`, no new connection machinery; the dial awaits **outside** any proto/connection lock per [ADR-0038](specs/adr/0038-split-connection-mutex.md) and uses no channel per [ADR-0003](specs/adr/0003-no-channels-rule.md)) and re-issues the lookup THERE via `Connection::lookup_redirect`. This mirrors Java `BinaryProtoLookupService#findBroker` recursing on `getConnection(redirectAddress)`. The chase used to run inside `magnetar-proto` (re-encoding `CommandLookupTopic` on the bootstrap socket), which re-asked the same non-owner broker and looped to the cap on a multi-broker cluster. The `MAX_LOOKUP_REDIRECTS` cap is enforced end-to-end: the proto translate-layer floor (`Failed` at zero), a proto-side clamp in `lookup_redirect` (a buggy engine cannot inflate the carried `hops_remaining`), and an engine guard that refuses to dial a `Redirected` with no budget left and surfaces the same synthetic cap `Failed`. When the resolved owner answers `Connect` with no advertised URL, the data ops ride the connection the lookup landed on (the dialed target), not the bootstrap.
+**Lookup redirect dialing** ([ADR-0039](specs/adr/0039-pulsar-proxy-multi-broker-connection-model.md), 2026-06-14 amendment).
+A `CommandLookupTopic` resolves to one of three terminal outcomes on its request-id: `Connect` (route the data ops here), `Failed`, or `Redirected` (this broker is not the bundle owner).
+The sans-io core never chases a redirect itself — that would mean dialing a socket, forbidden in `magnetar-proto` ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md)).
+Instead it surfaces a **driveable** `LookupOutcome::Redirected { broker_service_url, broker_service_url_tls, authoritative, hops_remaining }`, and the engine's `lookup_topic` loop dials the redirect-target broker (reusing `resolve_direct_broker` / the per-broker `ProxyConnectionPool`, no new connection machinery; the dial awaits **outside** any proto/connection lock per [ADR-0038](specs/adr/0038-split-connection-mutex.md) and uses no channel per [ADR-0003](specs/adr/0003-no-channels-rule.md)) and re-issues the lookup THERE via `Connection::lookup_redirect`.
+This mirrors Java `BinaryProtoLookupService#findBroker` recursing on `getConnection(redirectAddress)`.
+The chase used to run inside `magnetar-proto` (re-encoding `CommandLookupTopic` on the bootstrap socket), which re-asked the same non-owner broker and looped to the cap on a multi-broker cluster.
+The `MAX_LOOKUP_REDIRECTS` cap is enforced end-to-end: the proto translate-layer floor (`Failed` at zero), a proto-side clamp in `lookup_redirect` (a buggy engine cannot inflate the carried `hops_remaining`), and an engine guard that refuses to dial a `Redirected` with no budget left and surfaces the same synthetic cap `Failed`.
+When the resolved owner answers `Connect` with no advertised URL, the data ops ride the connection the lookup landed on (the dialed target), not the bootstrap.
 
-**Connections per broker** ([ADR-0073](specs/adr/0073-connections-per-broker.md), issue #314). By default magnetar opens **one** connection per broker, so every producer and consumer for that broker shares one TCP connection — `Client::resolve_target` returns one `Arc<ConnectionShared>` per `(logical, physical)`. `ClientBuilder::connections_per_broker(n)` (Java `ClientBuilder#connectionsPerBroker`) lifts that to `n`: the per-broker pool key gains a `connection_index ∈ [0, n)` (`(logical, physical)` → `(logical, physical, index)`), and `resolve_target` round-robins the index across producers AND consumers via an `AtomicUsize` cursor — one chokepoint, so both data-plane surfaces fan out. The bootstrap connection serves index `0`; indices `1..n` are lazy pool siblings (`get_or_open_bootstrap_sibling`) that dial the bootstrap's physical address and replicate its CONNECT. The round-robin is a plain atomic counter, **not** Java's random key, so the spread is deterministic and the moonpool engine mirrors it bit-for-bit ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md), differential `EventStream` parity). The knob is runtime-only — it never reaches the sans-io core ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md)); lookups and redirect dials always pin index `0` (they never consume a fan-out slot), and a `from_socket` client with no pool clamps to one connection. This complements [ADR-0070](specs/adr/0070-driver-read-arm-fairness.md) (which fixed per-connection `send→ack` latency) by letting a logical producer fleet use more than one connection's worth of send pipeline, instead of applications hand-rolling a pool of `PulsarClient`s.
+**Connections per broker** ([ADR-0073](specs/adr/0073-connections-per-broker.md), issue #314).
+By default magnetar opens **one** connection per broker, so every producer and consumer for that broker shares one TCP connection — `Client::resolve_target` returns one `Arc<ConnectionShared>` per `(logical, physical)`.
+`ClientBuilder::connections_per_broker(n)` (Java `ClientBuilder#connectionsPerBroker`) lifts that to `n`: the per-broker pool key gains a `connection_index ∈ [0, n)` (`(logical, physical)` → `(logical, physical, index)`), and `resolve_target` round-robins the index across producers AND consumers via an `AtomicUsize` cursor — one chokepoint, so both data-plane surfaces fan out.
+The bootstrap connection serves index `0`; indices `1..n` are lazy pool siblings (`get_or_open_bootstrap_sibling`) that dial the bootstrap's physical address and replicate its CONNECT.
+The round-robin is a plain atomic counter, **not** Java's random key, so the spread is deterministic and the moonpool engine mirrors it bit-for-bit ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md), differential `EventStream` parity).
+The knob is runtime-only — it never reaches the sans-io core ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md)); lookups and redirect dials always pin index `0` (they never consume a fan-out slot), and a `from_socket` client with no pool clamps to one connection.
+This complements [ADR-0070](specs/adr/0070-driver-read-arm-fairness.md) (which fixed per-connection `send→ack` latency) by letting a logical producer fleet use more than one connection's worth of send pipeline, instead of applications hand-rolling a pool of `PulsarClient`s.
 
 ---
 
@@ -1567,13 +1582,13 @@ High-level summary:
 - **Unit + integration**: `cargo test --workspace --all-features`.
   Every sans-io behavior is exercised by feeding bytes, asserting events / transmit / state.
   Trackers ship 13 ported behavioral cases from Java's `UnAckedMessageTrackerTest` + `AckGroupingTrackerTest`; the producer ships 6 ported cases from `BatchMessageContainerImplTest`.
-- **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): the moonpool engine drives the supervised reconnect path, PIP-121, PIP-188, virtual-clock timers, and OAuth2 refresh edges under reproducible seeds.
+- **Deterministic chaos** ([`crates/magnetar-runtime-moonpool/tests/`](crates/magnetar-runtime-moonpool/tests/)): `SimProviders` runs the Moonpool engine on its native seeded executor and drives supervised reconnect, PIP-121, PIP-188, virtual-clock timers, and structured-trace invariants under reproducible seeds.
 - **Differential equivalence** ([`crates/magnetar-differential/tests/`](crates/magnetar-differential/tests/)): tokio + moonpool engines run the same `Trace` against a scripted in-process broker; user-visible `EventStream`s must agree.
-- **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): gated on `--features e2e` + `#[ignore = "e2e: requires Docker"]`.
+- **End-to-end** ([`crates/magnetar/tests/e2e_*.rs`](crates/magnetar/tests/)): regular tests with no feature gate and no `#[ignore]` ([ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md)); Docker is the runtime prerequisite.
   Spins `apachepulsar/pulsar:4.0.4` via `testcontainers`.
   Covers schemas, DLQ, batching+chunking, interceptors, transactions, subscription types, partitioned, compacted+TableView, encryption, OAuth2, DNS resolver, force unsubscribe, memory limit, pattern auto-reconcile, supervised reconnect, rolling stats, per-partition seek, PIP-121 cluster failover.
 
-Run them: `cargo test --workspace --features e2e -- --include-ignored` (requires Docker).
+Run them with the regular workspace test command: `cargo test --workspace --all-features --locked` (requires Docker).
 
 ### Mutation testing (scoped)
 
@@ -1595,7 +1610,7 @@ Round-trip-encodes `BaseCommand` shapes and asserts re-decode equality.
 
 ## Build & validation
 
-Stable Rust **1.88** (workspace MSRV in `rust-toolchain.toml` — see ADR-0042).
+Stable Rust **1.91** (workspace `rust-version` in `Cargo.toml`; see [ADR-0079](specs/adr/0079-raise-msrv-to-rust-1-91.md)).
 
 ### Per-commit chain
 
@@ -1605,7 +1620,7 @@ cargo clippy --workspace --all-features -- -D warnings
 cargo +nightly fmt --check
 cargo test --workspace
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
+RUSTDOCFLAGS="-D warnings" \
   cargo doc --no-deps --all-features --workspace --locked
 ```
 

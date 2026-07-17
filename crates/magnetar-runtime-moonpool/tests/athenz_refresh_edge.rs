@@ -145,7 +145,7 @@ async fn athenz_token_refresh_fires_exactly_at_virtual_deadline() {
 
     // Cross the refresh boundary (deadline + 1s).
     let boundary = t0
-        + Duration::from_secs(3_600)
+        + Duration::from_hours(1)
             .checked_sub(DEFAULT_REFRESH_MARGIN)
             .expect("ttl > margin")
         + Duration::from_secs(1);

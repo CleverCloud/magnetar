@@ -65,7 +65,7 @@ async fn start_pulsar() -> TestResult<(String, String, testcontainers::Container
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -143,7 +143,7 @@ async fn verify_final_clone_drop(client: &PulsarClient, admin: &AdminClient) -> 
         .subscription_type(SubType::Exclusive)
         .durable(true)
         .name(DROP_CONSUMER_NAME)
-        .ack_group_time(Duration::from_secs(60))
+        .ack_group_time(Duration::from_mins(1))
         .subscribe()
         .await?;
     wait_for_consumer_presence(

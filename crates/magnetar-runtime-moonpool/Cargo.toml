@@ -49,7 +49,7 @@ buggify          = ["magnetar-proto/buggify"]
 magnetar-proto = { workspace = true }
 bytes          = { workspace = true }
 # `futures::io::{AsyncRead,AsyncWrite}Ext` drive moonpool's futures-io
-# `TcpStream` (moonpool 0.7 switched off raw tokio-io). `std` gates the
+# `TcpStream` (moonpool 0.8 uses futures-io rather than raw tokio-io). `std` gates the
 # `futures::io` module; the workspace dep is `default-features = false`.
 futures        = { workspace = true, features = ["std"] }
 moonpool-core  = { workspace = true }
@@ -74,18 +74,10 @@ tokio-util     = { workspace = true }
 # minimum Pulsar wire subset. See ADR-0026 §D2.
 moonpool-sim   = { workspace = true }
 async-trait    = { workspace = true }
-# moonpool 0.7 replaced the legacy `StateHandle` timeline with plain-`tracing`
-# capture (`SimulationLayer`): `tests/sim_chaos.rs`'s in-sim broker emits
-# correctness facts via `tracing::info!(capture = true, event = valuable(&..))`
-# and the invariants read them back through `serde`-deserialised `TrailQuery`
-# views. The `valuable` field shim needs `tracing/valuable`; `valuable` itself
-# supplies the `#[derive(Valuable)]`; `serde` round-trips the payload. All
-# test-only — the `tracing/valuable` feature is unified into the test build but
-# never changes the published crate's behaviour. `valuable` pins to 0.1 to
-# match moonpool-sim's own dependency.
-tracing        = { workspace = true, features = ["valuable"] }
-valuable       = { version = "0.1", default-features = false, features = ["derive"] }
-serde          = { workspace = true }
+# Moonpool 0.8 captures named, flat `tracing` events inside actor spans and
+# exposes them through `TraceQuery`; no unstable tracing cfg or Valuable/Serde
+# payload bridge is required.
+tracing        = { workspace = true }
 # SASL Kerberos integration test driver. `magnetar-auth-sasl` ships
 # `ScriptedGssapiClient` without enabling the `kerberos` feature so this
 # dev-dep does NOT pull libgssapi into the build (ADR-0029 + ADR-0024 §3).

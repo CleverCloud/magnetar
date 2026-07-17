@@ -138,8 +138,8 @@ impl<P: Providers> Transport<P> {
         // instead of parking forever, surfacing as `Io(TimedOut)` for the
         // caller's retry/backoff to act on. (ADR-0052)
         let connect_fut = network.connect(addr);
-        tokio::pin!(connect_fut);
-        let stream = tokio::select! {
+        let mut connect_fut = std::pin::pin!(connect_fut);
+        let stream = moonpool_core::select! {
             biased;
             res = &mut connect_fut => res,
             _ = time.sleep(connect_timeout) => Err(io::Error::new(

@@ -107,9 +107,8 @@ enum RetryRequest {
 /// We use [`magnetar_proto::Connection::poll_event_if`] with an explicit
 /// allow-list rather than draining the whole queue: an unconditional
 /// `poll_event` loop would silently consume the `ProducerReady` /
-/// `SubscribeAcked` events that user futures (`ProducerReadyFut`, the
-/// moonpool consumer's subscribe wait) are parked on and stall every
-/// open-producer / subscribe round-trip.
+/// `SubscribeAcked` events that producer/subscribe readiness waiters are
+/// parked on and stall every open-producer / subscribe round-trip.
 ///
 /// Transient producer-open / subscribe rejections are NOT actioned inline:
 /// this function is non-generic and has no provider access, and the retry
@@ -819,9 +818,11 @@ where
         // outcomes are already in place when a fresh op observes the latch.
         // 1:1 with the tokio engine.
         driver_shared.mark_no_driver();
-        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
-        // park on `driver_waker`, not the waker slab, so they observe the
-        // freshly-queued `Closed` event and stop waiting.
+        // Wake event-stream waiters so they observe the freshly-queued
+        // `Closed` event and stop waiting.
+        driver_shared.event_notify().notify_waiters();
+        // Preserve the terminal driver wake for any runtime task that is
+        // already waiting for a final shared-state transition.
         driver_shared.driver_waker.notify_waiters();
         *result_for_task.result.lock() = Some(outcome);
         // `notify_one` (not `notify_waiters`) so a `join()` that registers
@@ -887,8 +888,10 @@ where
         // entry-point guards. Set AFTER `fail_all_pending`. 1:1 with the tokio
         // engine.
         driver_shared.mark_no_driver();
-        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
-        // park on `driver_waker`, not the waker slab.
+        // Wake event-stream waiters so they observe terminal slot outcomes.
+        driver_shared.event_notify().notify_waiters();
+        // Preserve the terminal driver wake for any runtime task that is
+        // already waiting for a final shared-state transition.
         driver_shared.driver_waker.notify_waiters();
         *result_for_task.result.lock() = Some(outcome);
         result_for_task.done.notify_one();
@@ -1208,9 +1211,9 @@ fn strip_url_to_host_port(raw: &str) -> Option<String> {
 ///   lock, then `write_all` to the socket.
 /// - **Read path**: read directly into a `BytesMut` and hand the slice to the state machine.
 ///   Partial frames stay in the state machine's internal `inbound` buffer.
-/// - **Timeout**: `Connection::poll_timeout` returns the next deadline, if any. We `tokio::select!`
-///   against `time.sleep(remaining)`. If no deadline is set, that arm is replaced by a `pending`
-///   future.
+/// - **Timeout**: `Connection::poll_timeout` returns the next deadline, if any. We use
+///   [`moonpool_core::select!`] against `time.sleep(remaining)`. If no deadline is set, that arm is
+///   replaced by a `pending` future.
 /// - **Rebuild on reconnect**: after each successful `handle_bytes`, if `shared.pending_rebuild` is
 ///   set and the state machine has transitioned to `Connected`, replay every still-open producer +
 ///   consumer via `rebuild_producers` / `rebuild_consumers`. The CAS ensures the replay fires
@@ -1328,7 +1331,7 @@ where
         //    injection).
         let sleep_dur = deadline.map(|t| t.saturating_duration_since(shared.now_instant()));
 
-        tokio::select! {
+        moonpool_core::select! {
             // ADR-0070 read-fairness (issue #303): under a sustained `send`
             // burst every `Producer::send` pulses `driver_waker.notify_one()`,
             // so a waker permit is almost always pending on loop entry. With
@@ -1478,9 +1481,12 @@ where
                 for req in retries {
                     spawn_retry_leg::<P>(&shared, &time, &task, req);
                 }
-                // Wake event-stream-watching futures (e.g. `ProducerReadyFut`)
-                // that parked on `driver_waker.notified()` so they re-poll and
-                // observe the freshly-pushed event.
+                // Wake application futures that parked on the dedicated event
+                // notification so they observe the freshly-pushed event.
+                shared.event_notify().notify_waiters();
+                // Preserve the existing shared-state wake for `flush()` and
+                // other observers that re-check connection state after inbound
+                // receipts. Readiness waiters no longer consume these permits.
                 shared.driver_waker.notify_waiters();
             }
 

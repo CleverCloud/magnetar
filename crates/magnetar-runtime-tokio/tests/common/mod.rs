@@ -41,7 +41,7 @@ use magnetar_proto::{encode_command, pb};
 /// and deliberately-tight fast-path bounds (`from_secs(2)`) — keep their own
 /// short, intentional durations. Do NOT re-tighten this to "make the tests
 /// faster".
-pub const HANG_GUARD: Duration = Duration::from_secs(60);
+pub const HANG_GUARD: Duration = Duration::from_mins(1);
 
 /// Build a synthetic `CommandConnected` frame matching the production
 /// engine's expectations. Mirrors the moonpool-side helper so the two

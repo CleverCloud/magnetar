@@ -762,7 +762,7 @@ const SIM_BROKER_PORT: u16 = 6650;
 /// advances virtual time under the single-threaded sim runtime) would wedge
 /// the run regardless. Pure function of the simulated schedule → never
 /// perturbs replay determinism (ADR-0011).
-const SIM_RUN_TIME_BUDGET: Duration = Duration::from_secs(120);
+const SIM_RUN_TIME_BUDGET: Duration = Duration::from_mins(2);
 
 /// Shared script state for the in-sim broker, mirroring [`Gating`] but
 /// `Mutex`-guarded so the broker session tasks (spawned on the sim
@@ -813,7 +813,7 @@ impl Workload for SimBrokerWorkload {
         // gated on the handshake actually completing inside `sim_session`.
         let session_role = Arc::new(Mutex::new(0u32));
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {

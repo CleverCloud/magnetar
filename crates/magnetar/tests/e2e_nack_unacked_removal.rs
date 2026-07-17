@@ -61,7 +61,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -114,7 +114,7 @@ async fn e2e_nack_with_ack_timeout_redelivers_once() -> Result<(), Box<dyn std::
         .subscription("magnetar-nack-unacked-sub")
         .subscription_type(SubType::Shared)
         .negative_ack_redelivery_delay(Duration::from_secs(1))
-        .ack_timeout(Duration::from_secs(60))
+        .ack_timeout(Duration::from_mins(1))
         .initial_position(InitialPosition::Earliest)
         .subscribe()
         .await?;

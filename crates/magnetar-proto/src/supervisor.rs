@@ -90,8 +90,8 @@ impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
             initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(60),
-            mandatory_stop: Duration::from_secs(60 * 60),
+            max_backoff: Duration::from_mins(1),
+            mandatory_stop: Duration::from_hours(1),
             max_attempts: None,
             anti_thrash_threshold: None,
             drop_grace: Duration::from_millis(500),
@@ -173,7 +173,7 @@ mod tests {
     fn default_is_infinite_with_sensible_caps() {
         let cfg = SupervisorConfig::default();
         assert_eq!(cfg.initial_backoff, Duration::from_millis(100));
-        assert_eq!(cfg.max_backoff, Duration::from_secs(60));
+        assert_eq!(cfg.max_backoff, Duration::from_mins(1));
         assert!(
             cfg.max_attempts.is_none(),
             "default reconnect must be infinite"
@@ -185,7 +185,7 @@ mod tests {
         let cfg = SupervisorConfig {
             initial_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(30),
-            mandatory_stop: Duration::from_secs(120),
+            mandatory_stop: Duration::from_mins(2),
             max_attempts: Some(5),
             ..SupervisorConfig::default()
         };
@@ -224,7 +224,7 @@ mod tests {
         );
         assert!(cfg.should_reset_backoff(Duration::from_millis(501)));
         assert!(cfg.should_reset_backoff(Duration::from_secs(1)));
-        assert!(cfg.should_reset_backoff(Duration::from_secs(3600)));
+        assert!(cfg.should_reset_backoff(Duration::from_hours(1)));
     }
 
     #[test]
@@ -248,8 +248,8 @@ mod tests {
     fn supervisor_storm_schedule_grows_geometrically_without_reset() {
         let cfg = SupervisorConfig {
             initial_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(60),
-            mandatory_stop: Duration::from_secs(60 * 60),
+            max_backoff: Duration::from_mins(1),
+            mandatory_stop: Duration::from_hours(1),
             drop_grace: Duration::from_millis(500),
             ..SupervisorConfig::default()
         };
@@ -399,7 +399,7 @@ mod tests {
         let cfg = SupervisorConfig {
             initial_backoff: Duration::from_millis(123),
             max_backoff: Duration::from_secs(10),
-            mandatory_stop: Duration::from_secs(60),
+            mandatory_stop: Duration::from_mins(1),
             max_attempts: None,
             ..SupervisorConfig::default()
         };

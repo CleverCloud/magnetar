@@ -60,13 +60,13 @@ pub mod zts;
 /// is within this window of its expiry. Matches the Athenz Java client's
 /// 5-minute default (ADR-0030).
 #[cfg(feature = "zts")]
-pub const DEFAULT_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(300);
+pub const DEFAULT_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Default lifetime stamped into the signed JWT's `exp` claim (the
 /// assertion the ZTS endpoint verifies, distinct from the role token's
 /// own TTL which the server controls).
 #[cfg(feature = "zts")]
-pub const DEFAULT_JWT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const DEFAULT_JWT_TTL: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Wall-clock provider — the sans-io `SystemTime` injection point
 /// ([ADR-0011]). Production passes [`std::time::SystemTime::now`];
@@ -375,7 +375,7 @@ fn refresh_at_from_expires_in(
             expires_in,
             "ZTS-advertised expires_in overflows Instant; falling back to 1h safe default",
         );
-        now + std::time::Duration::from_secs(3600)
+        now + std::time::Duration::from_hours(1)
     })
 }
 
@@ -592,9 +592,9 @@ mod tests {
     #[test]
     fn refresh_at_from_expires_in_clamps_u64_max() {
         let now = std::time::Instant::now();
-        let margin = std::time::Duration::from_secs(300);
+        let margin = std::time::Duration::from_mins(5);
         let refresh_at = super::refresh_at_from_expires_in(now, u64::MAX, margin);
-        let expected = now + std::time::Duration::from_secs(3600);
+        let expected = now + std::time::Duration::from_hours(1);
         assert_eq!(
             refresh_at, expected,
             "u64::MAX expires_in must clamp to the 1h fallback"
@@ -602,13 +602,13 @@ mod tests {
 
         // Sanity: a normal in-range value still yields the obvious window.
         let refresh_at_normal = super::refresh_at_from_expires_in(now, 600, margin);
-        let expected_normal = now + std::time::Duration::from_secs(600 - 300);
+        let expected_normal = now + std::time::Duration::from_mins(5);
         assert_eq!(refresh_at_normal, expected_normal);
 
         // Margin >= ttl: helper falls back to `now + ttl` (no negative window).
         let refresh_at_short =
-            super::refresh_at_from_expires_in(now, 60, std::time::Duration::from_secs(120));
-        assert_eq!(refresh_at_short, now + std::time::Duration::from_secs(60));
+            super::refresh_at_from_expires_in(now, 60, std::time::Duration::from_mins(2));
+        assert_eq!(refresh_at_short, now + std::time::Duration::from_mins(1));
     }
 
     #[test]

@@ -18,8 +18,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings --cfg tokio_unstable --cfg tracing_unstable"
-  RUSTDOCFLAGS: "-D warnings --cfg tokio_unstable --cfg tracing_unstable"
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 5
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -318,10 +318,10 @@ jobs:
       - run: cargo run --manifest-path xtask/Cargo.toml -- check-log-fields
 
   msrv:
-    name: msrv (1.88)
+    name: msrv (1.91)
     # Pin-check against the workspace MSRV declared in `Cargo.toml`
-    # (`[workspace.package] rust-version = "1.88"`, ADR-0007 — bumped from 1.85 in chore(deps) refresh; rationale: let-chain stabilization in 1.88 used at `magnetar-proto/src/conn.rs`). Builds
-    # the whole workspace with `--all-features` on Rust 1.88 so that
+    # (`[workspace.package] rust-version = "1.91"`). Builds the whole
+    # workspace with `--all-features` on Rust 1.91 so that
     # accidental use of newer language or `std` features fails CI rather
     # than slipping into a release. Mirrors the `build` job but with the
     # toolchain pinned exactly to the MSRV, not the rolling stable.
@@ -331,7 +331,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       # ADR-0029: `auth-sasl-kerberos` → `libgssapi` needs MIT KRB5
       # headers under `--all-features`.

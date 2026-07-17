@@ -118,18 +118,18 @@ const ISSUE_309_REGRESSION_SEED: u64 = 0xb895_b56a_297d_2e6e;
 /// orchestrator's no-progress detector instead of burning a wall-clock core.
 /// Pure function of the simulated schedule → never perturbs replay determinism
 /// (ADR-0011, ADR-0036).
-const RUN_TIME_BUDGET: Duration = Duration::from_secs(120);
+const RUN_TIME_BUDGET: Duration = Duration::from_mins(2);
 
 /// Tight per-attempt connect timeout so a probabilistic connect-*hang* on the
 /// pooled dial surfaces as a bounded `Io(TimedOut)` quickly and is re-dialled,
 /// rather than parking the whole operation budget on one hung attempt.
 const TIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Generous total operation budget for the pooled dial. The pool wraps the
-/// per-broker dial in this budget (`pool.rs` `get_or_open`); it must exceed the
+/// Generous total operation budget for the pooled dial. The spawned pool task wraps the
+/// per-broker connect + handshake in this budget; it must exceed the
 /// worst-case sum of recovered connect-hangs so the pinned connection always
 /// establishes within it. Virtual time → no wall-clock cost.
-const GENEROUS_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+const GENEROUS_OPERATION_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// High retry backstop so the count half of the dual cap never trips before a
 /// transient connect-hang is recovered (the proxy stays bound all run).
@@ -146,6 +146,8 @@ struct SessionRecord {
     /// All non-CONNECT frame kinds the session received, in arrival order.
     frames: Vec<i32>,
 }
+
+type SessionLog = Arc<Mutex<Vec<Arc<Mutex<SessionRecord>>>>>;
 
 /// Outcome the client workload records, one per simulation iteration. The
 /// lifecycle claim — asserted in the TEST BODY after `run()` returns, not in
@@ -170,7 +172,7 @@ enum LifecycleOutcome {
 /// synthetic `broker_service_url`, forcing the runtime to open a *second*,
 /// pinned pool connection. It serves `CommandProducer` on the pinned session.
 struct ProxyWorkload {
-    sessions: Arc<Mutex<Vec<SessionRecord>>>,
+    sessions: SessionLog,
 }
 
 #[async_trait]
@@ -191,17 +193,17 @@ impl Workload for ProxyWorkload {
         let sessions = self.sessions.clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _peer)) => {
-                            let session_idx = {
+                            let (session_idx, session) = {
                                 let mut s = sessions.lock();
-                                s.push(SessionRecord::default());
-                                s.len() - 1
+                                let session = Arc::new(Mutex::new(SessionRecord::default()));
+                                s.push(session.clone());
+                                (s.len() - 1, session)
                             };
-                            let sessions_for_task = sessions.clone();
                             // Spawn the session so the accept loop keeps
                             // servicing the pinned pool dial (and any
                             // supervised re-dial after a connect-fault).
@@ -209,7 +211,7 @@ impl Workload for ProxyWorkload {
                             // cooperative shutdown is driven by the peer
                             // closing the socket / `ctx.shutdown()`.
                             let _handle = task.spawn_task("proxy-session", async move {
-                                let _ = handle_session(stream, sessions_for_task, session_idx).await;
+                                let _ = handle_session(stream, session, session_idx).await;
                             });
                         }
                         Err(_) => return Ok(()),
@@ -225,7 +227,7 @@ impl Workload for ProxyWorkload {
 /// when the peer closes (the close-driven half of the lifecycle).
 async fn handle_session<S>(
     mut stream: S,
-    sessions: Arc<Mutex<Vec<SessionRecord>>>,
+    session: Arc<Mutex<SessionRecord>>,
     session_idx: usize,
 ) -> SimulationResult<()>
 where
@@ -251,12 +253,13 @@ where
                 Some(pb::base_command::Type::Connect)
             ) {
                 if let Some(c) = &frame.command.connect {
-                    sessions.lock()[session_idx]
+                    session
+                        .lock()
                         .connect_proxy_to_broker_url
                         .clone_from(&c.proxy_to_broker_url);
                 }
             } else {
-                sessions.lock()[session_idx].frames.push(kind);
+                session.lock().frames.push(kind);
             }
 
             handle_frame(&frame, &mut out_buf, session_idx);
@@ -359,15 +362,12 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, session_idx: 
 /// `run()` returns (a `Workload::check` `Err` only logs and never fails the
 /// run, so the load-bearing assertions live in the test, not in `check`).
 struct ClientWorkload {
-    sessions: Arc<Mutex<Vec<SessionRecord>>>,
+    sessions: SessionLog,
     outcomes: Arc<Mutex<Vec<LifecycleOutcome>>>,
 }
 
 impl ClientWorkload {
-    fn new(
-        sessions: Arc<Mutex<Vec<SessionRecord>>>,
-        outcomes: Arc<Mutex<Vec<LifecycleOutcome>>>,
-    ) -> Self {
+    fn new(sessions: SessionLog, outcomes: Arc<Mutex<Vec<LifecycleOutcome>>>) -> Self {
         Self { sessions, outcomes }
     }
 }
@@ -434,7 +434,12 @@ impl Workload for ClientWorkload {
                 // drains the proxy pool (ADR-0039): every pooled
                 // `EntryState::Ready` connection is closed and its supervised
                 // driver joined. Returning at all is the clean-teardown proof.
-                let sessions = self.sessions.lock().clone();
+                let sessions = self
+                    .sessions
+                    .lock()
+                    .iter()
+                    .map(|session| session.lock().clone())
+                    .collect();
                 drop(producer);
                 client.close().await;
                 LifecycleOutcome::PooledThenClean { sessions }
@@ -575,7 +580,7 @@ fn assert_every_iteration_terminated(
 /// clean teardown; `run()` returning at all proves termination.
 #[test]
 fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_smoke() {
-    let sessions = Arc::new(Mutex::new(Vec::<SessionRecord>::new()));
+    let sessions: SessionLog = Arc::new(Mutex::new(Vec::new()));
     let outcomes = Arc::new(Mutex::new(Vec::<LifecycleOutcome>::new()));
     let report = SimulationBuilder::new()
         .run_time_budget(RUN_TIME_BUDGET)
@@ -594,6 +599,10 @@ fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_smoke() {
         report.iterations, 1,
         "expected exactly one iteration to be dispatched and terminate: {report:?}",
     );
+    assert_eq!(
+        report.failed_runs, 0,
+        "session tasks must not panic or fail behind the outer test: {report:?}",
+    );
     assert_every_iteration_pooled_then_clean(&outcomes, 1);
 }
 
@@ -609,7 +618,7 @@ fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_smoke() {
 /// tail.
 #[test]
 fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_sweep_8_seeds() {
-    let sessions = Arc::new(Mutex::new(Vec::<SessionRecord>::new()));
+    let sessions: SessionLog = Arc::new(Mutex::new(Vec::new()));
     let outcomes = Arc::new(Mutex::new(Vec::<LifecycleOutcome>::new()));
     let mut seeds = vec![ISSUE_309_REGRESSION_SEED];
     seeds.extend(sweep_seeds(8));
@@ -626,6 +635,10 @@ fn moonpool_pooled_proxy_connection_opens_and_tears_down_clean_sweep_8_seeds() {
     assert_eq!(
         report.iterations, iterations,
         "every seed must be dispatched and terminate (no silent hang): {report:?}",
+    );
+    assert_eq!(
+        report.failed_runs, 0,
+        "session tasks must not panic or fail behind the outer test: {report:?}",
     );
     assert_every_iteration_terminated(&outcomes, iterations);
 }

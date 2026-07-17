@@ -240,7 +240,7 @@ impl<P: Providers> AutoClusterFailover<P> {
                     // races the tick wins. Sleeping first matches the tokio
                     // engine (first probe runs on tick 2); under sim the sleep
                     // is virtual.
-                    tokio::select! {
+                    moonpool_core::select! {
                         biased;
                         () = stop_for_task.notified() => return,
                         slept = time.sleep(interval) => {
@@ -264,7 +264,7 @@ impl<P: Providers> AutoClusterFailover<P> {
                         // `abort()`/drop mid-probe would not be observed until
                         // the probe resolves — leaking the prober. `biased` so a
                         // pending stop wins over a just-ready probe.
-                        let healthy = tokio::select! {
+                        let healthy = moonpool_core::select! {
                             biased;
                             () = stop_for_task.notified() => return,
                             healthy = poll_fn(|cx| probe.poll_probe(url, deadline, cx)) => healthy,
@@ -378,10 +378,9 @@ impl<P: Providers> ServiceUrlProvider for AutoClusterFailover<P> {
 ///
 /// The sans-io [`HealthProbe`] trait is
 /// `poll_probe(...) -> Poll<bool>`, not `async fn probe(...)`. Bridging
-/// the moonpool single-threaded `?Send` providers into the synchronous
-/// poll contract requires owning per-endpoint state across multiple polls
-/// without holding a non-`Send` future across an `.await`. The
-/// `ProbeSlot` pattern stores the verdict + the parked
+/// Moonpool's asynchronous provider operations into the synchronous poll
+/// contract requires owning per-endpoint state across multiple polls.
+/// The `ProbeSlot` pattern stores the verdict + the parked
 /// [`Waker`] in a [`parking_lot::Mutex`]; the spawned task writes the
 /// verdict and wakes the parked waker through a
 /// [`tokio::sync::Notify`]-free path (we wake the [`Waker`] directly to
@@ -747,12 +746,10 @@ mod tests {
     /// `failover_switches_on_unhealthy_primary` — same probe shape, same
     /// expectations, but driven through the moonpool task provider.
     ///
-    /// Real-time scheduling: the moonpool task provider uses
-    /// `tokio::task::spawn_local`, which interacts awkwardly with
-    /// `tokio::time::pause` + `advance` (the spawn_local task often
-    /// doesn't observe the time advance until well after the test
-    /// future has resumed). Real time is short, deterministic enough at
-    /// this scale, and exercises the production scheduling path.
+    /// Real-time scheduling: this test uses `TokioProviders` and checks policy output rather than
+    /// virtual-time scheduler behavior.
+    /// A short real tick exercises the production scheduling path without coupling the assertion
+    /// to paused-clock polling details.
     #[tokio::test(flavor = "current_thread")]
     async fn failover_switches_on_unhealthy_primary() {
         #[derive(Debug)]

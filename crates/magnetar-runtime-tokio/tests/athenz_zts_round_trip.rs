@@ -160,7 +160,7 @@ async fn athenz_provider_cache_absorbs_second_call_within_window() {
     let t0 = Instant::now();
     provider.ensure_role_token(t0).await.expect("first");
     provider
-        .ensure_role_token(t0 + Duration::from_secs(60))
+        .ensure_role_token(t0 + Duration::from_mins(1))
         .await
         .expect("second (cache hit)");
 

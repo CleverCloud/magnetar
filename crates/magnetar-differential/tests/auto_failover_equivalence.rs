@@ -19,9 +19,9 @@
 //! After every tick, snapshot both engines' `active_index()`. Assert the
 //! two snapshot sequences match — every transition, in order.
 //!
-//! The probe loops run against the host wall-clock at a short tick;
-//! both engines share the same [`tokio::time`] view inside the same
-//! `LocalSet`. See [`TICK`] for the rationale on real-time vs virtual.
+//! The probe loops run against the host wall-clock at a short tick.
+//! Both engines share the same [`tokio::time`] view through `TokioProviders`; see [`TICK`] for
+//! the rationale on real-time versus virtual time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,13 +34,11 @@ use moonpool_core::TokioProviders;
 const PRIMARY: &str = "pulsar://primary:6650";
 const STANDBY: &str = "pulsar://standby:6650";
 /// Real-time tick — see the equivalent constants in the per-engine
-/// integration tests. We intentionally avoid `tokio::time::pause` here
-/// because the tokio and moonpool engines spawn their probe loops on
-/// different task primitives (`tokio::spawn` vs `spawn_local`), and the
-/// paused-clock + `advance` pattern wakes them with different timing
-/// fidelity. Real time is honest, deterministic enough at this scale,
-/// and lets the assertion focus on the policy contract rather than
-/// scheduler behaviour.
+/// integration tests.
+/// We intentionally avoid `tokio::time::pause` because this test compares policy output, not
+/// virtual-time scheduler behavior.
+/// A real short tick keeps both `TokioProviders`-backed loops on the same clock and lets the
+/// assertion focus on the active-URL contract.
 const TICK: Duration = Duration::from_millis(40);
 
 /// Probe whose primary verdict follows a scripted sequence; the standby
@@ -137,7 +135,7 @@ async fn tokio_and_moonpool_observe_same_active_index_sequence() {
 
             tokio_handle.abort();
             // The moonpool engine's `FailoverProbeHandle` exposes a cooperative
-            // `abort()` (moonpool main's `TaskProvider::JoinHandle` has no
+            // `abort()` (Moonpool 0.8's `TaskProvider::JoinHandle` has no
             // task-level cancel), symmetric with the tokio handle above.
             moonpool_handle.abort();
         })

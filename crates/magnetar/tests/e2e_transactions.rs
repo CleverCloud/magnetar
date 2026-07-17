@@ -75,7 +75,7 @@ async fn start_pulsar_with_txn() -> Result<
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
-        .with_startup_timeout(Duration::from_secs(180))
+        .with_startup_timeout(Duration::from_mins(3))
         // Transactions require three things the default standalone image
         // does not wire up:
         //   1. `transactionCoordinatorEnabled=true` in `standalone.conf`,

@@ -203,7 +203,7 @@ fn supervisor_with_anti_thrash() -> SupervisorConfig {
         // suite, yet long enough that the redial body dominates.
         initial_backoff: Duration::from_millis(5),
         max_backoff: Duration::from_millis(40),
-        mandatory_stop: Duration::from_secs(60),
+        mandatory_stop: Duration::from_mins(1),
         max_attempts: Some(64),
         anti_thrash_threshold: Some(AntiThrashThreshold {
             successful_attaches: 3,

@@ -609,8 +609,8 @@ where
         // AFTER `fail_all_pending` so the slot `closed` flags + terminal
         // outcomes are already in place when a fresh op observes the latch.
         shared.mark_no_driver();
-        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
-        // park on `driver_waker` rather than the waker slab.
+        // Wake producer/subscribe readiness waiters that park on
+        // `driver_waker` rather than the waker slab.
         shared.driver_waker.notify_waiters();
         outcome
     });
@@ -650,8 +650,8 @@ pub(crate) fn spawn_supervised(
         // reconnect never reaches this point. New ops issued after this fast
         // fail at the entry-point guards. Set AFTER `fail_all_pending`.
         driver_shared.mark_no_driver();
-        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
-        // park on `driver_waker` rather than the waker slab.
+        // Wake producer/subscribe readiness waiters that park on
+        // `driver_waker` rather than the waker slab.
         driver_shared.driver_waker.notify_waiters();
         outcome
     });

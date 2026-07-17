@@ -114,7 +114,7 @@ async fn start_pulsar()
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;

@@ -295,7 +295,7 @@ async fn e2e_athenz_zts_expiry_aware_refresh_fires_on_near_expiry()
     // A second ensure well inside the window is absorbed by the cache —
     // no extra ZTS round-trip.
     provider
-        .ensure_role_token(t0 + Duration::from_secs(60))
+        .ensure_role_token(t0 + Duration::from_mins(1))
         .await?;
     assert_eq!(provider.initial()?.as_ref(), b"athenz-role-token-first");
 

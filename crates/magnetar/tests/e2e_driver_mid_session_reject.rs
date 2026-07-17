@@ -82,7 +82,7 @@ async fn start_pulsar()
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -437,7 +437,7 @@ async fn e2e_producer_open_gives_up_with_error_when_bundle_never_served()
     // push the bounded window past two minutes, so the outer timeout is only the
     // anti-hang backstop, not the expected duration.
     let topic = "persistent://public/default/magnetar-e2e-giveup-302";
-    let result = tokio::time::timeout(Duration::from_secs(240), client.producer(topic).create())
+    let result = tokio::time::timeout(Duration::from_mins(4), client.producer(topic).create())
         .await
         .expect("open_producer must RESOLVE (with Err) after the transient give-up, not hang");
     assert!(

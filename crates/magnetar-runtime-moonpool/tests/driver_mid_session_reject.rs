@@ -168,7 +168,7 @@ impl Workload for BrokerWorkload {
         let task = ctx.providers().task().clone();
         let time = ctx.providers().time().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {

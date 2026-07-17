@@ -1040,10 +1040,10 @@ impl Connection {
             self.wake_for_request(rid);
         }
 
-        // (6) Queue a `Closed` event. Event-stream waiters
-        // (`ProducerReadyFut` / `SubscribeAckedFut`) park on the event queue +
-        // `driver_waker`, NOT the waker slab, so the `Closed` event is the only
-        // thing that unblocks them on a terminal drop.
+        // (6) Queue a `Closed` event. Producer/subscribe readiness waiters park
+        // on the event queue plus a runtime notification, NOT the waker slab,
+        // so the `Closed` event is the only thing that unblocks them on a
+        // terminal drop.
         self.events.push_back(ConnectionEvent::Closed {
             reason: Some(reason.to_owned()),
         });
@@ -11099,7 +11099,7 @@ mod consumer_close_contract_tests {
                 subscription: format!("close-ack-order-{forget}"),
                 receiver_queue_size: 16,
                 durable: true,
-                ack_group_time: Some(Duration::from_secs(60)),
+                ack_group_time: Some(Duration::from_mins(1)),
                 ..Default::default()
             });
             let _ = conn.poll_transmit();

@@ -1099,8 +1099,8 @@ mod tests {
             Some(Duration::from_millis(1))
         );
         assert_eq!(
-            normalise(Duration::from_secs(60)),
-            Some(Duration::from_secs(60))
+            normalise(Duration::from_mins(1)),
+            Some(Duration::from_mins(1))
         );
     }
 

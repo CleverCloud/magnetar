@@ -141,7 +141,7 @@ Outside a git checkout (e.g. released tarballs) the SHA is `unknown` and the dir
 
   ```
   magnetarctl 0.1.0-dev.0 (a1b2c3d4e5f6-dirty)
-  built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
+  built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
   features: +default
   pulsar wire protocol: v21
   os: linux · report bugs at https://github.com/CleverCloud/magnetar
@@ -442,8 +442,7 @@ A `file://` URL is **read by the broker** from its local filesystem, not from th
 
 ### `admin sources` / `admin sinks` (V3)
 
-Pulsar IO connectors — Sources pull data **into** Pulsar from external systems, Sinks push topic data **out**.
-Same verb taxonomy for both families.
+Pulsar IO connectors — Sources pull data **into** Pulsar from external systems, Sinks push topic data **out**. Same verb taxonomy for both families.
 
 | Command (substitute `sources` / `sinks` for `<x>`)                                                                        | REST endpoint                                              |
 | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |

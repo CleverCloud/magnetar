@@ -84,7 +84,7 @@ async fn start_standalone() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -115,7 +115,7 @@ async fn start_proxy(
     let container = GenericImage::new(image_repo(), image_tag())
         .with_exposed_port(ContainerPort::Tcp(PROXY_BINARY_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Started ProxyService at"))
-        .with_startup_timeout(Duration::from_secs(60))
+        .with_startup_timeout(Duration::from_mins(1))
         .with_env_var("PULSAR_PREFIX_zookeeperServers", &zk_servers)
         .with_env_var("PULSAR_PREFIX_configurationStoreServers", &zk_servers)
         .with_env_var("PULSAR_PREFIX_servicePort", PROXY_BINARY_PORT.to_string())

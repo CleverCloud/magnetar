@@ -79,7 +79,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -99,7 +99,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
     SupervisorConfig {
         initial_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(5),
-        mandatory_stop: Duration::from_secs(180),
+        mandatory_stop: Duration::from_mins(3),
         max_attempts: None,
         ..SupervisorConfig::default()
     }
@@ -136,7 +136,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     let client = PulsarClient::builder()
         .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
-        .operation_timeout(Duration::from_secs(60))
+        .operation_timeout(Duration::from_mins(1))
         .build()
         .await?;
 
@@ -224,7 +224,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
 
     // The supervisor + rebuild path re-subscribes the consumer; the
     // message above must arrive without us re-creating the handle.
-    let post = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    let post = tokio::time::timeout(Duration::from_mins(1), consumer.receive()).await??;
     assert_eq!(
         post.payload.as_ref(),
         payload.as_slice(),
@@ -264,7 +264,7 @@ async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
     let client = PulsarClient::builder()
         .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
-        .operation_timeout(Duration::from_secs(60))
+        .operation_timeout(Duration::from_mins(1))
         .build()
         .await?;
 
@@ -301,7 +301,7 @@ async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
     let recv_task = {
         let consumer = consumer.clone();
         tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(120), consumer.receive())
+            tokio::time::timeout(Duration::from_mins(2), consumer.receive())
                 .await
                 .map_err(|_| "outstanding receive() did not resolve after supervised reconnect")?
                 .map_err(|e| {
@@ -397,7 +397,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     let client = PulsarClient::builder()
         .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
-        .operation_timeout(Duration::from_secs(120))
+        .operation_timeout(Duration::from_mins(2))
         .build()
         .await?;
 
@@ -470,7 +470,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     // Each `SendFut` MUST resolve `Ok(_)` — no `Err` surfaces to the caller.
     // Stage 3 transparent replay = the user's future never observed the reset.
     for (i, fut) in send_futs.into_iter().enumerate() {
-        let outcome = tokio::time::timeout(Duration::from_secs(120), fut)
+        let outcome = tokio::time::timeout(Duration::from_mins(2), fut)
             .await
             .unwrap_or_else(|_| panic!("send {i} did not resolve within 2 min"))?;
         if let Err(e) = outcome.as_ref() {
@@ -483,7 +483,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     // persisted a publish before the disconnect; at-least-once semantics).
     // We assert that at minimum every replay-{i} payload arrives.
     let mut received: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     while received.len() < n && std::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await {
             Ok(Ok(msg)) => {
@@ -556,7 +556,7 @@ async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
 
     let config = magnetar_proto::ConnectionConfig {
         supervisor: Some(supervisor_for_e2e()),
-        operation_timeout: Duration::from_secs(120),
+        operation_timeout: Duration::from_mins(2),
         ..Default::default()
     };
     let runtime_client = MoonpoolClient::connect_plain_supervised(
@@ -682,7 +682,7 @@ async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
     let client = PulsarClient::builder()
         .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
-        .operation_timeout(Duration::from_secs(120))
+        .operation_timeout(Duration::from_mins(2))
         .build()
         .await?;
 
@@ -776,7 +776,7 @@ async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
     producer
         .send(OutgoingMessage::with_payload(b"after-reconnect-newtopic".to_vec()).into())
         .await?;
-    let got = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    let got = tokio::time::timeout(Duration::from_mins(1), consumer.receive()).await??;
     assert_eq!(
         got.payload.as_ref(),
         b"after-reconnect-newtopic",

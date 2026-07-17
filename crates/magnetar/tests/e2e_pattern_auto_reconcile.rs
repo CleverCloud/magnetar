@@ -58,7 +58,7 @@ async fn start_pulsar() -> Result<
         .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         // The test pattern uses a UUID suffix that pushes the regex past the
         // broker's default `subscriptionPatternMaxLength=50` limit. Bump it
         // via PULSAR_PREFIX_; the image's CMD is `sh` (no entrypoint that

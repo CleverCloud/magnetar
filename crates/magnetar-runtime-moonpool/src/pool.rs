@@ -28,28 +28,25 @@
 //! [`LookupOutcome::Connect { proxy_through_service_url, .. }`] +
 //! [`ConnectionConfig::proxy_to_broker_url`].
 //!
-//! # `Send` propagation on the moonpool path
+//! # Provider-native single-flight dialing
 //!
-//! `moonpool_core::NetworkProvider` is declared `#[async_trait(?Send)]`
-//! (single-core design — moonpool-core 0.6.0 `src/network.rs:14`). A naïve
-//! `network.connect(...).await` directly inside `get_or_open` would break
-//! `Send` propagation up to the facade's `CreateProducerApi` /
-//! `SubscribeApi` traits (`Pin<Box<dyn Future + Send>>` — see
-//! `crates/magnetar/src/engine/mod.rs`). To keep the outer future `Send`,
-//! [`get_or_open`] off-loads the dial + handshake + driver-spawn into a task
-//! created via [`moonpool_core::TaskProvider::spawn_task`] (which uses
-//! `spawn_local` internally — no `Send` bound on the spawned future). The
-//! outer future only awaits a [`tokio::sync::Notify`] and reads an
-//! `Arc<Mutex<Option<Result<...>>>>` slot, all of which are `Send`.
+//! Moonpool 0.8 requires provider futures to be `Send`.
+//! [`get_or_open`] still assigns the dial, handshake, and supervised-driver creation to one
+//! [`moonpool_core::TaskProvider::spawn_task`] task so concurrent callers share one pending result.
+//! `TokioProviders` schedules that task through Tokio; `moonpool_sim::SimProviders` schedules it
+//! on Moonpool's seeded deterministic executor.
+//! Waiting callers park on [`tokio::sync::Notify`] and read the published
+//! `Arc<Mutex<Option<Result<...>>>>` slot.
 //!
 //! [`LookupOutcome::Connect { proxy_through_service_url, .. }`]: magnetar_proto::event::LookupOutcome::Connect
 //! [`ConnectionConfig::proxy_to_broker_url`]: magnetar_proto::ConnectionConfig::proxy_to_broker_url
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use magnetar_proto::ConnectionConfig;
-use moonpool_core::{Providers, TaskProvider, TimeProvider};
+use moonpool_core::{Providers, TaskProvider, TimeError, TimeProvider};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -131,6 +128,9 @@ type DialOutcome = Result<Arc<ConnectionShared>, EngineError>;
 struct PendingDial {
     notify: Arc<Notify>,
     result: Arc<Mutex<Option<Arc<DialOutcome>>>>,
+    cancel: Arc<Notify>,
+    completed: Arc<Notify>,
+    is_complete: Arc<AtomicBool>,
 }
 
 impl PendingDial {
@@ -138,6 +138,9 @@ impl PendingDial {
         Self {
             notify: Arc::new(Notify::new()),
             result: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(Notify::new()),
+            completed: Arc::new(Notify::new()),
+            is_complete: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -145,7 +148,40 @@ impl PendingDial {
         Self {
             notify: self.notify.clone(),
             result: self.result.clone(),
+            cancel: self.cancel.clone(),
+            completed: self.completed.clone(),
+            is_complete: self.is_complete.clone(),
         }
+    }
+
+    fn mark_complete(&self) {
+        self.is_complete.store(true, Ordering::Release);
+        self.completed.notify_waiters();
+    }
+
+    async fn cancel_and_wait(&self) {
+        let completed = self.completed.notified();
+        let mut completed = std::pin::pin!(completed);
+        completed.as_mut().enable();
+        self.cancel.notify_one();
+        if !self.is_complete.load(Ordering::Acquire) {
+            completed.await;
+        }
+    }
+}
+
+struct PendingCompletion(PendingDial);
+
+impl Drop for PendingCompletion {
+    fn drop(&mut self) {
+        {
+            let mut result = self.0.result.lock();
+            if result.is_none() {
+                *result = Some(Arc::new(Err(EngineError::PeerClosed)));
+            }
+        }
+        self.0.notify.notify_waiters();
+        self.0.mark_complete();
     }
 }
 
@@ -170,6 +206,9 @@ enum EntryState {
 /// [`magnetar_runtime_tokio::pool::ProxyConnectionPool`].
 pub(crate) struct ProxyConnectionPool<P: Providers> {
     factory: ConnectionFactory<P>,
+    /// Latched before close drains the map so detached dial tasks cannot
+    /// promote a late success back into a closed pool.
+    closed: AtomicBool,
     /// `parking_lot::Mutex` per ADR-0003 / repo convention. Critical sections
     /// are short (HashMap mutations + clones of `Arc<EntryState>`).
     entries: Mutex<HashMap<PoolKey, Arc<EntryState>>>,
@@ -180,6 +219,7 @@ impl<P: Providers> std::fmt::Debug for ProxyConnectionPool<P> {
         let snapshot: Vec<_> = self.entries.lock().keys().cloned().collect();
         f.debug_struct("ProxyConnectionPool")
             .field("factory", &self.factory)
+            .field("closed", &self.closed.load(Ordering::Acquire))
             .field("entries", &snapshot)
             .finish()
     }
@@ -189,6 +229,7 @@ impl<P: Providers> ProxyConnectionPool<P> {
     pub(crate) fn new(factory: ConnectionFactory<P>) -> Arc<Self> {
         Arc::new(Self {
             factory,
+            closed: AtomicBool::new(false),
             entries: Mutex::new(HashMap::new()),
         })
     }
@@ -212,25 +253,33 @@ impl<P: Providers> ProxyConnectionPool<P> {
 impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
     /// Close every pool entry. Idempotent.
     pub(crate) async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         // Snapshot under-lock so we don't hold the lock across `.await`.
         let drained: Vec<Arc<EntryState>> = self.entries.lock().drain().map(|(_, v)| v).collect();
         for state in drained {
-            if let EntryState::Ready { shared, driver } = &*state {
-                {
-                    let mut conn = shared.inner.lock();
-                    conn.close();
+            match &*state {
+                EntryState::Ready { shared, driver } => {
+                    {
+                        let mut conn = shared.inner.lock();
+                        conn.close();
+                    }
+                    shared.driver_waker.notify_one();
+                    let handle = driver.lock().take();
+                    if let Some(handle) = handle {
+                        let _ = handle.join().await;
+                    }
                 }
-                shared.driver_waker.notify_one();
-                let handle = driver.lock().take();
-                if let Some(handle) = handle {
-                    let _ = handle.join().await;
+                EntryState::Pending(pending) => {
+                    {
+                        let mut result = pending.result.lock();
+                        if result.is_none() {
+                            *result = Some(Arc::new(Err(EngineError::PeerClosed)));
+                        }
+                    }
+                    pending.notify.notify_waiters();
+                    pending.cancel_and_wait().await;
                 }
             }
-            // `Pending` entries: the spawned dial task owns its
-            // half-built state; dropping the entry here is sufficient
-            // because `close()` is called from `Client::close` after the
-            // bootstrap is torn down — the proxy will fail any in-flight
-            // handshake, and the dial task's error path evicts the slot.
         }
     }
 }
@@ -259,14 +308,11 @@ impl<P: Providers + Send + Sync> ProxyConnectionPool<P> {
 /// Concurrency: if two callers race for the same key, only one dial task
 /// is spawned; the loser awaits the winner's [`PendingDial`].
 ///
-/// # Send-safety
+/// # Task ownership
 ///
-/// This future stays `Send` even though `network.connect(...)` is `?Send`:
-/// the dial work is hoisted into a task spawned via
-/// [`TaskProvider::spawn_task`], which uses `spawn_local` and therefore
-/// imposes no `Send` bound on the spawned future. The outer future only
-/// awaits `Notify` + reads a `Mutex<Option<...>>` slot. See the module
-/// header for the full justification.
+/// The dial work runs in one [`TaskProvider::spawn_task`] task.
+/// The outer future awaits `Notify` and reads the shared result slot, so racing callers observe
+/// one connection attempt and one published outcome.
 ///
 /// Taking the pool by `Arc<...>` (rather than `&self`) lets the spawned
 /// dial task keep the pool alive without borrowing through a method
@@ -286,6 +332,9 @@ where
     // Fast path or race-resolution decision under the lock.
     let pending = {
         let mut entries = pool.entries.lock();
+        if pool.closed.load(Ordering::Acquire) {
+            return Err(EngineError::PeerClosed);
+        }
         if let Some(state) = entries.get(&key).cloned() {
             match &*state {
                 EntryState::Ready { shared, .. } => return Ok(shared.clone()),
@@ -294,6 +343,7 @@ where
         } else {
             let pending = PendingDial::new();
             let handles = pending.handles();
+            let entry = Arc::new(EntryState::Pending(pending));
             // State-consistency mirror of the tokio pool's insert site
             // (`magnetar_runtime_tokio::pool::ProxyConnectionPool::get_or_open`):
             // we reach this arm only inside the `else` of the `get(&key)` miss,
@@ -303,7 +353,7 @@ where
             // same key (a pool-bookkeeping bug) and would orphan the clobbered
             // entry's `PendingDial`/`Ready` state. Cannot fire on legitimate
             // broker/wire input — pure map bookkeeping under the same lock.
-            let clobbered = entries.insert(key.clone(), Arc::new(EntryState::Pending(pending)));
+            let clobbered = entries.insert(key.clone(), entry.clone());
             debug_assert!(
                 clobbered.is_none(),
                 "pool entry insert clobbered a live entry — double registration for one key"
@@ -314,42 +364,27 @@ where
                 physical.to_owned(),
                 proxy_to_broker_url,
                 key.clone(),
+                entry,
                 handles.handles(),
             );
             handles
         }
     };
 
-    // Park until the dial task publishes the outcome, bounded by the
-    // operation timeout (ADR-0052). A pool dial whose supervised connection
-    // storms on a moonpool-sim connect-hang (or a real broker that never
-    // finishes establishing) must surface as a timeout ERROR to the caller —
-    // so the workload/operation terminates — instead of parking forever. The
-    // deadline is driven by the engine `TimeProvider` (virtual time under
-    // moonpool, ADR-0011), so it fires deterministically and never depends on
-    // wall-clock. Java parity: this is `operationTimeoutMs` bounding the
-    // operation, NOT the connection (a flaky connection keeps reconnecting).
-    let time = pool.factory.providers.time();
-    let op_timeout = pool.factory.bootstrap_config.operation_timeout;
-    let deadline = time.sleep(op_timeout);
-    tokio::pin!(deadline);
+    // The spawned dial owns the single operation-timeout deadline so timing
+    // out also drops the in-flight transport instead of merely abandoning a
+    // detached task. Waiters only park on the published result.
     loop {
+        let notified = pending.notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
         if let Some(outcome) = pending.result.lock().as_ref().map(Arc::clone) {
             return match &*outcome {
                 Ok(shared) => Ok(shared.clone()),
                 Err(err) => Err(clone_engine_error(err)),
             };
         }
-        tokio::select! {
-            biased;
-            () = pending.notify.notified() => {}
-            _ = &mut deadline => {
-                return Err(EngineError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("pool dial to {physical} exceeded operation_timeout ({op_timeout:?})"),
-                )));
-            }
-        }
+        notified.await;
     }
 }
 
@@ -376,65 +411,123 @@ where
     get_or_open(pool, &authority, &authority, proxy, index).await
 }
 
-/// Spawn the dial + handshake + supervised-driver task. The task runs on
-/// the moonpool [`TaskProvider`] (single-thread `spawn_local` semantics),
-/// so the `?Send` `network.connect(...)` inside [`build_entry_async`]
-/// doesn't propagate back to the caller's future.
+/// Spawn the dial + handshake + supervised-driver task through the Moonpool [`TaskProvider`].
+///
+/// `TokioProviders` uses Tokio; `moonpool_sim::SimProviders` uses Moonpool's deterministic
+/// executor.
 fn spawn_dial<P>(
     pool: Arc<ProxyConnectionPool<P>>,
     physical: String,
     proxy_to_broker_url: Option<String>,
     key: PoolKey,
+    expected_entry: Arc<EntryState>,
     pending: PendingDial,
 ) where
     P: Providers + Send + Sync,
 {
     let factory = pool.factory.clone();
     let task = pool.factory.providers.task().clone();
-    // `spawn_task` returns a `JoinHandle<()>`; we deliberately detach the
-    // task — its lifetime is bound by the pool's `Arc<...>` and the
-    // outcome it produces is delivered to waiters via `pending.notify`
-    // and the entries-map promotion below. Drop, don't `.await`.
+    // The provider join handle remains detached, but `PendingDial` carries a
+    // cancellation/completion handshake. `close()` cancels and awaits that
+    // completion, while the provider-owned operation timeout bounds abandoned
+    // waiters and stalled handshakes.
     let _detached = task.spawn_task("magnetar-moonpool-pool-dial", async move {
-        let outcome = build_entry_async::<P>(&factory, &physical, proxy_to_broker_url).await;
-        // Publish the outcome to waiters BEFORE swapping the entry-state
-        // to Ready/Removed, so a freshly-polling waiter sees the slot
-        // populated either via the `notify` wake-up (parked waiters) or
-        // on its first peek (waiters that arrived after `notify_waiters`
-        // already fired).
-        let outcome_for_waiters: Arc<DialOutcome> = Arc::new(match &outcome {
-            Ok((shared, _)) => Ok(shared.clone()),
-            Err(err) => Err(clone_engine_error(err)),
-        });
-        *pending.result.lock() = Some(outcome_for_waiters);
+        let _completion = PendingCompletion(pending.handles());
+        let time = factory.providers.time().clone();
+        let operation_timeout = factory.bootstrap_config.operation_timeout;
+        let build = time.timeout(
+            operation_timeout,
+            build_entry_async::<P>(&factory, &physical, proxy_to_broker_url),
+        );
+        let mut build = std::pin::pin!(build);
+        let cancelled = pending.cancel.notified();
+        let mut cancelled = std::pin::pin!(cancelled);
+        cancelled.as_mut().enable();
+        let outcome = moonpool_core::select! {
+            biased;
+            () = &mut cancelled => Err(EngineError::PeerClosed),
+            timed = &mut build => match timed {
+                Ok(outcome) => outcome,
+                Err(TimeError::Elapsed) => Err(EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "pool dial to {physical} exceeded operation_timeout \
+                         ({operation_timeout:?})"
+                    ),
+                ))),
+                Err(TimeError::Shutdown) => Err(EngineError::PeerClosed),
+            },
+        };
+        let mut orphaned_success = None;
+        let published = {
+            let mut map = pool.entries.lock();
+            let is_current_generation = map
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &expected_entry));
+            let may_promote = is_current_generation && !pool.closed.load(Ordering::Acquire);
+
+            match outcome {
+                Ok((shared, driver)) if may_promote => {
+                    let waiter_shared = shared.clone();
+                    map.insert(
+                        key,
+                        Arc::new(EntryState::Ready {
+                            shared,
+                            driver: Mutex::new(Some(driver)),
+                        }),
+                    );
+                    Ok(waiter_shared)
+                }
+                Ok(pair) => {
+                    if is_current_generation {
+                        map.remove(&key);
+                    }
+                    orphaned_success = Some(pair);
+                    Err(EngineError::PeerClosed)
+                }
+                Err(err) if may_promote => {
+                    map.remove(&key);
+                    Err(clone_engine_error(&err))
+                }
+                Err(_) => {
+                    if is_current_generation {
+                        map.remove(&key);
+                    }
+                    Err(EngineError::PeerClosed)
+                }
+            }
+        };
+
+        // `close()` may already have published `PeerClosed`; never overwrite
+        // that terminal result with a late dial outcome.
+        {
+            let mut result = pending.result.lock();
+            if result.is_none() {
+                *result = Some(Arc::new(published));
+            }
+        }
         pending.notify.notify_waiters();
 
-        // Promote the entry from Pending → Ready, or evict on error so a
-        // subsequent `open_producer` / `subscribe` call re-dials instead of
-        // forever returning the same cached error. Mirrors the implicit
-        // behaviour the tokio engine gets from `build_entry` running inside
-        // `get_or_open` (no entry is registered on failure paths).
-        let mut map = pool.entries.lock();
-        if let Ok((shared, driver)) = outcome {
-            map.insert(
-                key,
-                Arc::new(EntryState::Ready {
-                    shared,
-                    driver: Mutex::new(Some(driver)),
-                }),
-            );
-        } else {
-            map.remove(&key);
+        // A successful dial that lost the generation race (most importantly,
+        // one completing after `close()`) owns a live supervised driver that
+        // is no longer reachable through the map. Shut it down here instead
+        // of leaking the connection or letting it outlive the pool.
+        if let Some((shared, driver)) = orphaned_success {
+            {
+                let mut conn = shared.inner.lock();
+                conn.close();
+            }
+            shared.driver_waker.notify_one();
+            let _ = driver.join().await;
         }
     });
 }
 
-/// Internal: dial + handshake + spawn supervised driver. Returns the
-/// `(shared, driver)` pair the pool entry will own. This function is `?Send`
-/// because `Transport::connect_with_resolver` calls `network.connect(...)`,
-/// which moonpool declares `#[async_trait(?Send)]`. It is therefore only
-/// called from inside a `spawn_task`-spawned task whose future is not
-/// required to be `Send`.
+/// Internal: dial + handshake + spawn the supervised driver.
+///
+/// Returns the `(shared, driver)` pair the pool entry will own.
+/// Moonpool 0.8 provider futures are `Send`, so this function can run through either
+/// `TokioTaskProvider` or `SimTaskProvider`.
 ///
 /// `physical` is the `host:port` we dial; `proxy_to_broker_url` is what we
 /// put on `CommandConnect.proxy_to_broker_url` (proxy path) or `None` for
@@ -473,15 +566,9 @@ async fn build_entry_async<P: Providers>(
     .await?;
 
     let shared = make_shared_with_providers::<P>(&factory.providers, cfg);
-    // `None` — do NOT arm a second handshake deadline here. The pool dial's
-    // post-handshake wait is already bounded by `await_ready`'s
-    // `time.sleep(operation_timeout)` deadline (this same module), so a
-    // broker that accepts the SYN and never replies to CONNECT already
-    // surfaces a bounded timeout to the waiter. Arming a second
-    // `TimeProvider::sleep` inside `handshake_plain` would add a redundant
-    // timer event to the deterministic moonpool schedule on every pooled
-    // dial — the exact schedule-perturbation ADR-0052 warns against — so the
-    // pool path leans on the single `await_ready` deadline already in place.
+    // `None` — the spawned task wraps this whole build in the single
+    // provider-owned operation timeout, so handshake reads remain bounded
+    // without arming a second timer inside `handshake_plain`.
     handshake_plain::<P>(
         &shared,
         &mut transport,
@@ -555,10 +642,33 @@ mod tests {
     // integration test (`tests/proxy_multi_conn.rs`) — adding extra moonpool-only
     // unit tests here would trip the ADR-0024 parity gate.
 
-    #[test]
-    fn fresh_pool_is_empty() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_pool_is_empty() {
         let pool = ProxyConnectionPool::new(dummy_factory());
         assert_eq!(pool.len(), 0);
+
+        // Closing a pool with an in-flight dial must publish a terminal
+        // outcome to every waiter instead of silently dropping the map entry
+        // and leaving the detached dial able to resurrect it later.
+        let pending = PendingDial::new();
+        let result = pending.result.clone();
+        let worker = pending.handles();
+        let worker_task = tokio::spawn(async move {
+            worker.cancel.notified().await;
+            worker.mark_complete();
+        });
+        pool.entries.lock().insert(
+            ("logical".to_owned(), "physical".to_owned(), 0),
+            Arc::new(EntryState::Pending(pending)),
+        );
+        pool.close().await;
+        worker_task.await.expect("pending worker exits on cancel");
+        let outcome = result
+            .lock()
+            .as_ref()
+            .cloned()
+            .expect("pool close must resolve pending dials");
+        assert!(matches!(&*outcome, Err(EngineError::PeerClosed)));
     }
 
     #[test]

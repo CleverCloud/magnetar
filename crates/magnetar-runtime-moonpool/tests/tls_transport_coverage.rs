@@ -260,10 +260,9 @@ async fn spawn_drop_after_tls_fixture() -> TlsFixture {
 /// 5. TLS `Transport::read_buf` (pulls + decrypts the broker's `CONNECTED`).
 /// 6. `Transport::shutdown` (run on driver drop at end-of-scope).
 ///
-/// The driver task is spawned via `TokioTaskProvider`'s `spawn_local`,
-/// so the test runs inside a `LocalSet` on the current-thread runtime
-/// — mirrors every other moonpool integration test that crosses the
-/// engine boundary.
+/// `TokioProviders` spawns the driver through `tokio::spawn`.
+/// The existing `LocalSet` keeps this fixture's current-thread test structure but is not a
+/// Moonpool 0.8 runtime requirement.
 #[tokio::test(flavor = "current_thread")]
 async fn connect_tls_completes_handshake_then_drives_pulsar_connected() {
     let local = tokio::task::LocalSet::new();

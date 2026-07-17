@@ -54,7 +54,7 @@ use url::Url;
 /// Default request timeout. Mirrors `PulsarAdminBuilder` Java default of 60s
 /// (see `pulsar-client-admin/src/main/java/org/apache/pulsar/client/admin/internal/
 /// PulsarAdminBuilderImpl.java`).
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Longer per-call timeout for `*_create_with_url` / `*_update_with_url`
 /// endpoints. The broker fetches the package from the supplied URL
@@ -66,7 +66,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// 5 min matches the Java admin client's read-timeout for register
 /// paths.
-pub const PACKAGE_REGISTER_TIMEOUT: Duration = Duration::from_secs(300);
+pub const PACKAGE_REGISTER_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Authentication strategy used by the admin client.
 ///

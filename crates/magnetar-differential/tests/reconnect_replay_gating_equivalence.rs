@@ -189,8 +189,8 @@ async fn drop_redial_replay_is_equivalent_across_engines() {
 /// the lookup-then-retry leg (re-lookup → `retry_producer_open` → ack)
 /// before the replayed publish can land. The tokio engine has always consumed
 /// `ProducerOpenFailedTransient`; the moonpool driver wired the matching arms into the
-/// moonpool driver (through the injected `TimeProvider` + `TaskProvider`, so
-/// the retry's detached-task serialization MATCHES tokio's `tokio::spawn`).
+/// moonpool driver through the injected `TimeProvider` + `TaskProvider`, so
+/// the retry keeps the same detached-task ordering as the tokio engine.
 ///
 /// The equivalence claim is the strongest the harness offers: the two
 /// [`EventStream`]s must compare equal **in order**, not merely as a set. A

@@ -9,7 +9,7 @@ Each is a normal `cargo test` target — the difference is which dependencies it
 | ---------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | ---------- |
 | **Unit**                     | `crates/<crate>/src/**` in `#[cfg(test)] mod tests` blocks                              | none                                                                                                                                                                                                                       | nothing                                                               | yes        |
 | **Integration**              | `crates/<crate>/tests/*.rs`                                                             | none                                                                                                                                                                                                                       | nothing                                                               | yes        |
-| **Deterministic chaos**      | [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/) | `--features crypto-aws-lc-rs` (or any single `crypto-*` provider — per-package `--all-features` would pull `crypto-fips` and its native toolchain)                                                                         | nothing (virtual everything)                                          | yes        |
+| **Deterministic chaos**      | [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/) | `--no-default-features --features crypto-aws-lc-rs` (or another single `crypto-*` provider — per-package `--all-features` also pulls `crypto-fips`)                                                                        | nothing external; `SimProviders` virtualises executor, time, and I/O  | yes        |
 | **Differential equivalence** | [`crates/magnetar-differential/tests/`](../crates/magnetar-differential/tests/)         | When run with `--workspace`, use the routine feature subset (see [Running each category](#running-each-category)); when run standalone (`-p magnetar-differential`), forward a crypto provider feature to the runtime deps | nothing                                                               | yes        |
 | **End-to-end (e2e)**         | [`crates/magnetar/tests/e2e_*.rs`](../crates/magnetar/tests/)                           | none (ADR-0046 — runs as a regular `cargo test`)                                                                                                                                                                           | Docker + `apachepulsar/pulsar:4.0.4` (host or CI runner must have it) | yes        |
 
@@ -31,13 +31,15 @@ cargo test --workspace --no-default-features --features "$FEATURES" --locked
 # Moonpool deterministic-simulation suite (single seed; default).
 # Per-package `--all-features` would activate `crypto-fips` and need
 # a native FIPS toolchain — use a single provider feature instead.
-cargo test -p magnetar-runtime-moonpool --features crypto-aws-lc-rs --locked
+cargo test -p magnetar-runtime-moonpool \
+  --no-default-features --features crypto-aws-lc-rs --locked
 
 # Same, swept across seeds 1..32 (local pre-flight; CI runs a 128-random-seed
 # sweep daily — see .github/workflows/moonpool-seed-sweep.yml / ADR-0036).
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
-    --features crypto-aws-lc-rs --locked -- --quiet || echo "seed $seed FAILED"
+    --no-default-features --features crypto-aws-lc-rs \
+    --locked -- --quiet || { echo "seed $seed FAILED"; exit 1; }
 done
 
 # Differential equivalence harness. The crate has no crypto features
@@ -95,7 +97,9 @@ No external services required; everything stays in-process.
 ## Deterministic chaos pack
 
 Lives in [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/).
-Targets the supervised reconnect path, the PIP-121 + PIP-188 reconnection flows, virtual-clock timers, and OAuth2 token refresh edges.
+The `SimProviders` suites run on Moonpool 0.8's native seeded executor without an ambient Tokio runtime.
+They route tasks, time, network I/O, and concurrent selection through the provider boundary, and `sim_chaos.rs` asserts invariants over named flat `tracing` events queried through `TraceQuery`.
+The pack targets the supervised reconnect path, PIP-121 + PIP-188 reconnection flows, virtual-clock timers, and OAuth2 token refresh edges.
 The supervised reconnect body (anti-thrash cooldown + multi-attempt redial) is exercised by [`supervised_redial.rs`](../crates/magnetar-runtime-moonpool/tests/supervised_redial.rs) — a `SimProviders` drop → accept → drop → accept fixture paired 1:1 with the real-loopback tokio mirror [`crates/magnetar-runtime-tokio/tests/supervised_redial.rs`](../crates/magnetar-runtime-tokio/tests/supervised_redial.rs).
 See [`moonpool-engine.md#deterministic-chaos-pack`](moonpool-engine.md#deterministic-chaos-pack) for the per-scenario breakdown.
 

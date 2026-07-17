@@ -106,7 +106,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_env_var("PULSAR_MEM", "-Xms256m -Xmx512m")
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
@@ -126,7 +126,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
     SupervisorConfig {
         initial_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(5),
-        mandatory_stop: Duration::from_secs(180),
+        mandatory_stop: Duration::from_mins(3),
         max_attempts: None,
         ..SupervisorConfig::default()
     }
@@ -145,7 +145,7 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     let client = PulsarClient::builder()
         .service_url_provider(provider)
         .enable_reconnect(supervisor_for_e2e())
-        .operation_timeout(Duration::from_secs(60))
+        .operation_timeout(Duration::from_mins(1))
         .build()
         .await?;
 
@@ -258,7 +258,7 @@ async fn e2e_controlled_cluster_failover_manual_swap() -> Result<(), Box<dyn std
     // `initial_flow`), so broker-B pushes the buffered message without us
     // re-creating the handle. Mirrors the `e2e_reconnect.rs` hard assertion.
     tracing::info!("awaiting post-failover consumer.receive (60s budget)");
-    let post = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    let post = tokio::time::timeout(Duration::from_mins(1), consumer.receive()).await??;
     tracing::info!("post-failover consumer.receive returned");
     assert_eq!(
         post.payload.as_ref(),

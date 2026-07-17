@@ -627,7 +627,7 @@ impl<P: Providers> Producer<P> {
                 return Ok(());
             }
             let notified = self.shared.driver_waker.notified();
-            tokio::pin!(notified);
+            let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
             notified.await;
         }
@@ -1043,8 +1043,8 @@ impl Drop for RequestFut {
     }
 }
 
-/// Future that drives the connection's semantic event queue until the
-/// expected [`ConnectionEvent::ProducerReady`] (or a terminal
+/// Drive the connection's semantic event queue until the expected
+/// [`ConnectionEvent::ProducerReady`] (or a terminal
 /// `ProducerClosedByBroker` / `Closed`) lands for the given handle.
 ///
 /// Mirrors the tokio engine's `EventWaitFut::ProducerReady`. Unlike
@@ -1053,71 +1053,61 @@ impl Drop for RequestFut {
 /// from any request-correlated outcome — the sans-io layer surfaces it
 /// as `ProducerReady`.
 ///
-/// Each `Pending` return spawns a helper that awaits
-/// `driver_waker.notified()` and wakes the caller; on the next poll (or
-/// on drop) the previous helper is aborted. Without that abort, the
-/// stale helper from an earlier poll lingers on
-/// `driver_waker.notified()` and competes with the driver loop for
-/// `notify_one` permits emitted by user-facing futures.
-struct ProducerReadyFut {
-    shared: Arc<ConnectionShared>,
+/// The notification is armed before the queue is inspected, preventing a
+/// driver event between the empty check and the await from being lost.
+async fn wait_producer_ready(
+    shared: &Arc<ConnectionShared>,
     handle: ProducerHandle,
-    helper: Option<tokio::task::JoinHandle<()>>,
-}
+) -> Result<(), ClientError> {
+    loop {
+        let notified = shared.event_notify().notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
 
-impl Drop for ProducerReadyFut {
-    fn drop(&mut self) {
-        if let Some(h) = self.helper.take() {
-            h.abort();
-        }
-    }
-}
-
-impl Future for ProducerReadyFut {
-    type Output = Result<(), ClientError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut conn = this.shared.inner.lock();
-        loop {
-            match conn.poll_event() {
-                Some(ConnectionEvent::ProducerReady { handle, .. }) => {
-                    if handle == this.handle {
-                        return Poll::Ready(Ok(()));
-                    }
+        {
+            let mut conn = shared.inner.lock();
+            let event = conn.poll_event_if(|event| match event {
+                ConnectionEvent::ProducerReady {
+                    handle: event_handle,
+                    ..
                 }
+                | ConnectionEvent::ProducerClosedByBroker {
+                    handle: event_handle,
+                    ..
+                }
+                | ConnectionEvent::ProducerOpenFailed {
+                    handle: event_handle,
+                    ..
+                } => *event_handle == handle,
+                ConnectionEvent::Closed { .. } => true,
+                _ => false,
+            });
+            match event {
+                Some(ConnectionEvent::ProducerReady { .. }) => return Ok(()),
                 Some(ConnectionEvent::ProducerClosedByBroker {
-                    handle,
+                    handle: event_handle,
                     assigned_broker_service_url,
                 }) => {
-                    if handle == this.handle {
-                        // Broker-forced close — degraded-but-recovering
-                        // (warn! per ADR-0054 §2.1); the open future
-                        // surfaces `Closed` and the caller decides. Mirror
-                        // of the tokio engine's `EventWaitFut` arm.
-                        let topic = conn
-                            .producer(handle)
-                            .map(|s| s.identity.topic.clone())
-                            .unwrap_or_default();
-                        tracing::warn!(
-                            handle = ?handle,
-                            topic = %topic,
-                            assigned_broker_service_url = assigned_broker_service_url
-                                .as_deref()
-                                .map(crate::log_fields::truncate_broker_str),
-                            "broker closed producer while waiting for ProducerReady"
-                        );
-                        return Poll::Ready(Err(ClientError::Closed));
-                    }
+                    // Broker-forced close — degraded-but-recovering
+                    // (warn! per ADR-0054 §2.1); the open future
+                    // surfaces `Closed` and the caller decides. Mirror
+                    // of the tokio engine's `EventWaitFut` arm.
+                    let topic = conn
+                        .producer(event_handle)
+                        .map(|s| s.identity.topic.clone())
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        handle = ?event_handle,
+                        topic = %topic,
+                        assigned_broker_service_url = assigned_broker_service_url
+                            .as_deref()
+                            .map(crate::log_fields::truncate_broker_str),
+                        "broker closed producer while waiting for ProducerReady"
+                    );
+                    return Err(ClientError::Closed);
                 }
-                Some(ConnectionEvent::ProducerOpenFailed {
-                    handle,
-                    code,
-                    message,
-                }) => {
-                    if handle == this.handle {
-                        return Poll::Ready(Err(ClientError::Broker { code, message }));
-                    }
+                Some(ConnectionEvent::ProducerOpenFailed { code, message, .. }) => {
+                    return Err(ClientError::Broker { code, message });
                 }
                 Some(ConnectionEvent::Closed { reason }) => {
                     // Connection-level close while a producer-open future was
@@ -1134,44 +1124,21 @@ impl Future for ProducerReadyFut {
                             .map(crate::log_fields::truncate_broker_str),
                         "connection closed while waiting for producer readiness"
                     );
-                    return Poll::Ready(Err(match reason {
+                    return Err(match reason {
                         Some(_) => ClientError::PeerClosed,
                         None => ClientError::Closed,
-                    }));
+                    });
                 }
-                Some(_) => {} // ignore unrelated events
-                None => break,
+                Some(_) => unreachable!("poll_event_if returned an unselected event"),
+                None => {}
+            }
+
+            if conn.is_closed() {
+                return Err(ClientError::Closed);
             }
         }
-        drop(conn);
-
-        // We have no per-event waker slot in the sans-io layer; park on the
-        // driver waker. Every inbound batch ends with the driver looping
-        // back to `select!`, which gives any pending `notified()` a chance
-        // to fire as the next loop tick.
-        if let Some(prev) = this.helper.take() {
-            prev.abort();
-        }
-        let waker = cx.waker().clone();
-        let shared = this.shared.clone();
-        this.helper = Some(tokio::spawn(async move {
-            shared.driver_waker.notified().await;
-            waker.wake();
-        }));
-        Poll::Pending
+        notified.await;
     }
-}
-
-async fn wait_producer_ready(
-    shared: &Arc<ConnectionShared>,
-    handle: ProducerHandle,
-) -> Result<(), ClientError> {
-    ProducerReadyFut {
-        shared: shared.clone(),
-        handle,
-        helper: None,
-    }
-    .await
 }
 
 #[cfg(test)]
@@ -1507,6 +1474,9 @@ mod tests {
     /// share the same handle.
     #[test]
     fn producer_clones_share_handle() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll};
+
         let shared = handshake_complete_shared();
         let handle = {
             let mut conn = shared.inner.lock();
@@ -1521,6 +1491,64 @@ mod tests {
         let clone = producer.clone();
         assert_eq!(producer.handle(), clone.handle());
         assert_eq!(producer.compression(), clone.compression());
+
+        // Moonpool 0.8 drives `SimProviders` workloads on its own executor,
+        // with no ambient Tokio runtime. A producer-open waiter must therefore
+        // be able to park without spawning a Tokio helper task.
+        let pending_shared = ConnectionShared::new(ConnectionConfig::default());
+        let mut future = Box::pin(super::wait_producer_ready(
+            &pending_shared,
+            ProducerHandle(0),
+        ));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+        // Two concurrent producer-open waiters must not consume each other's
+        // readiness events. Queue the second producer's acknowledgement first,
+        // wait for the first producer, then confirm the second waiter can still
+        // observe its already-queued event.
+        let shared = handshake_complete_shared();
+        let (first, second) = {
+            let mut conn = shared.inner.lock();
+            let first = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/ready-first".to_owned(),
+                ..Default::default()
+            });
+            let second = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/ready-second".to_owned(),
+                ..Default::default()
+            });
+            (first, second)
+        };
+        for request_id in [1, 0] {
+            let command = pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id,
+                    producer_name: format!("producer-{request_id}"),
+                    last_sequence_id: Some(-1),
+                    schema_version: None,
+                    producer_ready: Some(true),
+                    topic_epoch: Some(0),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &command).expect("encode CommandProducerSuccess");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("handle CommandProducerSuccess");
+        }
+        futures::executor::block_on(super::wait_producer_ready(&shared, first))
+            .expect("first producer becomes ready");
+        let mut second_wait = Box::pin(super::wait_producer_ready(&shared, second));
+        assert!(
+            matches!(second_wait.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "first waiter must leave the second producer's event queued"
+        );
     }
 
     /// `Client::open_producer` against `TokioProviders` resolves at the

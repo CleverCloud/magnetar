@@ -48,49 +48,58 @@ use moonpool_core::{
 };
 use moonpool_sim::providers::SimProviders;
 use moonpool_sim::{
-    Invariant, SimContext, SimulationBuilder, SimulationError, SimulationResult, TrailQuery,
-    TrailQueryExt, Workload, WorkloadTopology, assert_always,
+    Invariant, SimContext, SimulationBuilder, SimulationError, SimulationResult, TraceQuery,
+    Workload, WorkloadTopology, assert_always,
 };
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use valuable::Valuable;
 
 mod common;
 use common::sweep_seeds;
 
-/// Trail names shared by the in-sim broker (emitter) and the invariants
-/// (consumers). moonpool main replaced the legacy `StateHandle` timeline
-/// with plain-`tracing` capture: the broker emits correctness facts via
-/// [`emit_event`] (a `tracing::info!(capture = true, …)` shim mirroring
-/// `SimContext::emit`, usable from spawned session tasks that don't hold a
-/// `&SimContext`); invariants scan them via [`TrailQuery::since`].
-const SENDS_TRAIL: &str = "broker_sends";
-const DELIVERS_TRAIL: &str = "broker_delivers";
-const ACKS_TRAIL: &str = "broker_acks";
-/// Client-side trails for the per-handle resolution invariant
+/// Stable event names shared by the in-sim actors (emitters) and invariants
+/// (consumers). Moonpool 0.8 captures named, flat `tracing` events inside an
+/// actor span carrying `ip`; invariants scan them via [`TraceQuery::since`].
+const SEND_EVENT_NAME: &str = "broker_sends";
+const DELIVER_EVENT_NAME: &str = "broker_delivers";
+const ACK_EVENT_NAME: &str = "broker_acks";
+/// Client-side event names for the per-handle resolution invariant
 /// (`TigerBeetle` pattern, follow-on to ADR-0048's swizzle workload).
-/// Every `producer.send(msg)` call writes one `SENDS_STARTED_TRAIL`
-/// entry and exactly one matching `SENDS_RESOLVED_TRAIL` entry; the
+/// Every `producer.send(msg)` call writes one `SEND_STARTED_EVENT_NAME`
+/// event and exactly one matching `SEND_RESOLVED_EVENT_NAME` event; the
 /// [`HandleResolutionInvariant`] asserts the bijection.
-const SENDS_STARTED_TRAIL: &str = "client_sends_started";
-const SENDS_RESOLVED_TRAIL: &str = "client_sends_resolved";
+const SEND_STARTED_EVENT_NAME: &str = "client_sends_started";
+const SEND_RESOLVED_EVENT_NAME: &str = "client_sends_resolved";
 
-/// Emit a captured correctness fact on `trail`, mirroring
-/// [`SimContext::emit`] but callable from a spawned session task that only
-/// carries a `source` string (the broker's sim IP) rather than a
-/// `&SimContext`. The `capture = true` marker is what
-/// `moonpool_sim::SimulationLayer` keys on.
-fn emit_event<T: Valuable + Serialize>(trail: &'static str, source: &str, event: &T) {
-    tracing::info!(
-        capture = true,
-        trail = trail,
-        source = source,
-        event = tracing::field::valuable(event),
-    );
+/// Emit-side contract for a captured correctness fact.
+trait CapturedEvent {
+    fn emit(&self, source: &str);
+}
+
+/// Emit a named correctness event inside an actor span carrying the simulator
+/// IP. Spawned tasks do not inherit the workload span, so each event enters its
+/// own span before emission to preserve source attribution.
+fn emit_event<E: CapturedEvent>(source: &str, event: &E) {
+    event.emit(source);
+}
+
+fn in_actor_span(source: &str, emit: impl FnOnce()) {
+    let span = tracing::info_span!("sim_actor", ip = %source);
+    let _entered = span.enter();
+    emit();
+}
+
+fn required_u64(event: &moonpool_sim::TraceEvent, field: &str) -> u64 {
+    event
+        .u64(field)
+        .expect("captured event must contain the requested u64 field")
+}
+
+fn trace_occurs_before(first_seq: u64, second_seq: u64) -> bool {
+    first_seq < second_seq
 }
 
 /// Single-`poll_read` helper mirroring `src/transport.rs::read_into` — the
-/// in-sim broker reads off a `futures::io` stream (moonpool main dropped
+/// in-sim broker reads off a `futures::io` stream (Moonpool 0.8 uses no
 /// raw tokio-io), where `AsyncReadExt::read` returns `0` on EOF and there is
 /// no `read_buf`. Appends what was read into `buf` and returns the count.
 async fn read_into<S: AsyncRead + Unpin>(
@@ -179,7 +188,7 @@ where
         tokio::pin!(attempt);
         let timeout = time.sleep(ATTEMPT_TIMEOUT);
         tokio::pin!(timeout);
-        match tokio::select! {
+        match moonpool_core::select! {
             result = &mut attempt => result,
             _ = &mut timeout => {
                 last_err = Some(format!("setup attempt timed out after {ATTEMPT_TIMEOUT:?}"));
@@ -216,7 +225,7 @@ where
     T: TimeProvider,
 {
     retry_setup(time, || async {
-        tokio::time::timeout(
+        time.timeout(
             Duration::from_secs(30),
             Client::connect_plain_supervised(engine, addr, config.clone(), None, None),
         )
@@ -264,13 +273,13 @@ impl Workload for BrokerWorkload {
         let counter = self.sessions_accepted.clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_core::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _peer)) => {
                             *counter.lock() += 1;
-                            // moonpool main's `TaskProvider::JoinHandle` is an
+                            // Moonpool 0.8's `TaskProvider::JoinHandle` is an
                             // opaque `Future` with no `abort()`; we spawn the
                             // session via `spawn_task` (the Send-bounded sim
                             // spawn that replaced `spawn_local`) and drop the
@@ -325,15 +334,17 @@ impl Workload for ClientWorkload {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
 
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
         // Supervised connect (ADR-0055 §3): the handshake rides out a
         // bit-flip-induced terminal drop via reconnect instead of failing the
         // post-handshake `is_connected()` gate on the plain driver's exit.
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
-        )
-        .await
-        .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?;
+        let result = time
+            .timeout(
+                Duration::from_secs(30),
+                Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
+            )
+            .await
+            .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?;
 
         let outcome = match result {
             Ok(client) => {
@@ -351,7 +362,7 @@ impl Workload for ClientWorkload {
         // `Workload::check()` `Err` is only logged (run_check_phase) and never
         // flips `failed_runs`, so the mirror check() below cannot fail the
         // test on its own. (The connect *timeout* is already gated above via
-        // the `?` on the `tokio::time::timeout`; this catches the rarer
+        // the `?` on the provider timeout; this catches the rarer
         // connected-but-not-in-Connected-state case.)
         let gate = match &outcome {
             HandshakeOutcome::Connected => Ok(()),
@@ -569,9 +580,9 @@ fn _topology_compiles(t: WorkloadTopology) -> WorkloadTopology {
 // The handshake-only broker above exercises CONNECT / PING / LOOKUP /
 // PRODUCER / CLOSE_*. The stateful broker below extends that surface
 // with SEND → SEND_RECEIPT, SUBSCRIBE → SUCCESS, FLOW accounting, push
-// MESSAGE delivery, ACK → ACK_RESPONSE. It emits typed timeline events
-// (`SendEvent`, `DeliverEvent`, `AckEvent`) so invariants can read
-// them via `StateHandle::timeline::<T>(key)`.
+// MESSAGE delivery, ACK → ACK_RESPONSE. It emits named, flat trace events
+// (`SendEvent`, `DeliverEvent`, `AckEvent` on the write side) so invariants
+// can read them through `TraceQuery`.
 //
 // Invariant cadence follows the research synthesis:
 //   - Continuous, cursor-incremental `Invariant` impls registered via
@@ -583,11 +594,8 @@ fn _topology_compiles(t: WorkloadTopology) -> WorkloadTopology {
 // =============================================================================
 
 /// Captured fact: producer sent a message. Emitted by the broker on every
-/// `CommandSend` it accepts. The `Valuable + Serialize + Deserialize`
-/// derives are mandated by moonpool main's capture model — the payload
-/// round-trips through `valuable-serde` → `serde_json::Value` → typed
-/// invariant view (see [`TrailQueryExt::since`]).
-#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+/// `CommandSend` it accepts.
+#[derive(Clone, Debug)]
 #[allow(clippy::struct_field_names)]
 struct SendEvent {
     producer_id: u64,
@@ -597,7 +605,7 @@ struct SendEvent {
 }
 
 /// Captured fact: broker pushed a message to a consumer's queue.
-#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[allow(clippy::struct_field_names)]
 struct DeliverEvent {
     consumer_id: u64,
@@ -606,7 +614,7 @@ struct DeliverEvent {
 }
 
 /// Captured fact: client acked a message.
-#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 #[allow(clippy::struct_field_names)]
 struct AckEvent {
     consumer_id: u64,
@@ -620,7 +628,7 @@ struct AckEvent {
 /// [`HandleResolutionInvariant`] asserts the bijection per the
 /// `TigerBeetle` "every operation resolves" rule (see
 /// `docs/simulation-deepening-plan.md` §P5).
-#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct SendStartedEvent {
     producer_handle: u64,
     send_index: u64,
@@ -632,29 +640,94 @@ struct SendStartedEvent {
 /// `kind` is one of [`SEND_RESOLUTION_SENT`],
 /// [`SEND_RESOLUTION_SESSION_LOST`], [`SEND_RESOLUTION_MEMORY_LIMIT`].
 /// Any other value (or a missing event for a started send) breaches
-/// [`HandleResolutionInvariant`]. We model the kind as a plain `u8`
-/// rather than a typed enum so the `Valuable` round-trip through
-/// `serde_json::Value` stays free of enum-tag fragility.
-#[derive(Clone, Debug, Valuable, Serialize, Deserialize)]
+/// [`HandleResolutionInvariant`]. We model the kind as a plain `u64`
+/// rather than a typed enum because the flat trace representation stores
+/// numeric fields directly.
+#[derive(Clone, Debug)]
 struct SendResolvedEvent {
     producer_handle: u64,
     send_index: u64,
-    kind: u8,
+    kind: u64,
 }
 
-const SEND_RESOLUTION_SENT: u8 = 1;
-const SEND_RESOLUTION_SESSION_LOST: u8 = 2;
-const SEND_RESOLUTION_MEMORY_LIMIT: u8 = 3;
+impl CapturedEvent for SendEvent {
+    fn emit(&self, source: &str) {
+        in_actor_span(source, || {
+            tracing::info!(
+                producer_id = self.producer_id,
+                sequence_id = self.sequence_id,
+                ledger_id = self.ledger_id,
+                entry_id = self.entry_id,
+                "broker_sends"
+            );
+        });
+    }
+}
+
+impl CapturedEvent for DeliverEvent {
+    fn emit(&self, source: &str) {
+        in_actor_span(source, || {
+            tracing::info!(
+                consumer_id = self.consumer_id,
+                ledger_id = self.ledger_id,
+                entry_id = self.entry_id,
+                "broker_delivers"
+            );
+        });
+    }
+}
+
+impl CapturedEvent for AckEvent {
+    fn emit(&self, source: &str) {
+        in_actor_span(source, || {
+            tracing::info!(
+                consumer_id = self.consumer_id,
+                ledger_id = self.ledger_id,
+                entry_id = self.entry_id,
+                "broker_acks"
+            );
+        });
+    }
+}
+
+impl CapturedEvent for SendStartedEvent {
+    fn emit(&self, source: &str) {
+        in_actor_span(source, || {
+            tracing::info!(
+                producer_handle = self.producer_handle,
+                send_index = self.send_index,
+                "client_sends_started"
+            );
+        });
+    }
+}
+
+impl CapturedEvent for SendResolvedEvent {
+    fn emit(&self, source: &str) {
+        in_actor_span(source, || {
+            tracing::info!(
+                producer_handle = self.producer_handle,
+                send_index = self.send_index,
+                kind = self.kind,
+                "client_sends_resolved"
+            );
+        });
+    }
+}
+
+const SEND_RESOLUTION_SENT: u64 = 1;
+const SEND_RESOLUTION_SESSION_LOST: u64 = 2;
+const SEND_RESOLUTION_MEMORY_LIMIT: u64 = 3;
 
 /// Map a producer-send outcome onto one of the [`SEND_RESOLUTION_*`]
 /// markers, or `None` when the future is still pending at the workload's
 /// timeout. `None` means *don't emit a resolved event* —
 /// the [`HandleResolutionInvariant`] then surfaces the unresolved
-/// send as "pending forever" via the workload's final-trail count
+/// send as "pending forever" via the workload's final-event count
 /// check.
 fn classify_send_outcome(
     outcome: Option<&Result<magnetar_proto::MessageId, magnetar_runtime_moonpool::ClientError>>,
-) -> Option<u8> {
+) -> Option<u64> {
     match outcome {
         Some(Ok(_)) => Some(SEND_RESOLUTION_SENT),
         Some(Err(magnetar_runtime_moonpool::ClientError::Engine(
@@ -820,15 +893,15 @@ impl Workload for StatefulBrokerWorkload {
             .await
             .map_err(|e| SimulationError::InvalidState(format!("broker bind: {e}")))?;
 
-        // moonpool main captures correctness facts via `tracing` events,
-        // not the legacy `StateHandle` timeline; sessions only need the
-        // broker's sim IP as the `source` tag.
+        // Moonpool 0.8 captures correctness facts via named `tracing` events
+        // inside actor spans; sessions carry the broker's sim IP so spawned
+        // tasks can restore that attribution when they emit.
         let source = ctx.my_ip().to_owned();
         let shutdown = ctx.shutdown().clone();
         let task = ctx.providers().task().clone();
         let time = ctx.providers().time().clone();
         loop {
-            tokio::select! {
+            moonpool_core::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -899,7 +972,7 @@ where
         // uses (ADR-0011 — no host wall-clock read).
         let tick = time.sleep(Duration::from_millis(5));
         tokio::pin!(tick);
-        tokio::select! {
+        moonpool_core::select! {
             biased;
             read = read_into(&mut stream, &mut read_buf) => {
                 match read {
@@ -970,16 +1043,15 @@ fn handle_stateful_frame(
                         (eid, true)
                     }
                 };
-                // Record the SENDS_TRAIL fact only for a genuinely-NEW
+                // Record the `SEND_EVENT_NAME` fact only for a genuinely-NEW
                 // acceptance. A replayed publish carries the same
                 // `sequence_id` the broker already accepted; re-emitting the
-                // trail event would make `MonotonicMsgIdInvariant` see a
+                // trace event would make `MonotonicMsgIdInvariant` see a
                 // non-strictly-increasing sequence id (`prev == got`). The
                 // receipt below still goes out on both paths — the client's
                 // replayed SendFut must resolve.
                 if is_new {
                     emit_event(
-                        SENDS_TRAIL,
                         source,
                         &SendEvent {
                             producer_id: s.producer_id,
@@ -1046,7 +1118,6 @@ fn handle_stateful_frame(
                 }
                 for mid in &a.message_id {
                     emit_event(
-                        ACKS_TRAIL,
                         source,
                         &AckEvent {
                             consumer_id: a.consumer_id,
@@ -1084,7 +1155,6 @@ fn push_pending_messages(
     for (cid, msgs) in to_push {
         for m in msgs {
             emit_event(
-                DELIVERS_TRAIL,
                 source,
                 &DeliverEvent {
                     consumer_id: cid,
@@ -1246,11 +1316,10 @@ impl Invariant for MonotonicMsgIdInvariant {
         self.last_seq.borrow_mut().clear();
     }
 
-    fn observe(&self, q: &dyn TrailQuery, _sim_time_ms: u64) {
-        let entries = q.since::<SendEvent>(SENDS_TRAIL, &self.cursor);
-        for entry in entries {
-            let pid = entry.event.producer_id;
-            let cur = entry.event.sequence_id;
+    fn observe(&self, q: &dyn TraceQuery, _sim_time_ms: u64) {
+        for event in q.since(SEND_EVENT_NAME, &self.cursor) {
+            let pid = required_u64(&event, "producer_id");
+            let cur = required_u64(&event, "sequence_id");
             let prev = self.last_seq.borrow().get(&pid).copied();
             if let Some(p) = prev {
                 assert_always!(
@@ -1266,8 +1335,8 @@ impl Invariant for MonotonicMsgIdInvariant {
 /// Per-handle resolution invariant — `TigerBeetle`'s "every operation
 /// resolves" rule applied to `producer.send` (see
 /// `docs/simulation-deepening-plan.md` §P5). Every entry in the
-/// `client_sends_started` trail must pair with **exactly one** entry
-/// in the `client_sends_resolved` trail sharing the same
+/// `client_sends_started` event must pair with **exactly one** entry
+/// in the `client_sends_resolved` event stream sharing the same
 /// `(producer_handle, send_index)` key, and the resolved kind must be
 /// one of `Sent` / `SessionLost` / `MemoryLimitExceeded`.
 ///
@@ -1278,11 +1347,11 @@ impl Invariant for MonotonicMsgIdInvariant {
 /// Liveness ("pending forever" — a started send that never resolves)
 /// is asserted in the *workload-side* completion check rather than
 /// here because cursor-incremental `Invariant::observe` can only see
-/// what landed in the trails by the time it runs; a pending future
+/// what landed in the trace by the time it runs; a pending future
 /// has not yet emitted any resolution, which would falsely trigger
 /// here. The workload only declares completion after every send has
 /// either resolved or its task been polled to completion, so the
-/// trail counts match at the post-iteration `check()` boundary.
+/// event counts match at the post-iteration `check()` boundary.
 struct HandleResolutionInvariant {
     started_cursor: Cell<usize>,
     resolved_cursor: Cell<usize>,
@@ -1312,21 +1381,27 @@ impl Invariant for HandleResolutionInvariant {
         self.resolution_count.borrow_mut().clear();
     }
 
-    fn observe(&self, q: &dyn TrailQuery, _sim_time_ms: u64) {
+    fn observe(&self, q: &dyn TraceQuery, _sim_time_ms: u64) {
         // Drain new started events first — bookkeeping only, no
         // assertion (a started send that hasn't resolved yet is a
         // legitimate in-flight state).
-        for entry in q.since::<SendStartedEvent>(SENDS_STARTED_TRAIL, &self.started_cursor) {
+        for event in q.since(SEND_STARTED_EVENT_NAME, &self.started_cursor) {
             self.resolution_count
                 .borrow_mut()
-                .entry((entry.event.producer_handle, entry.event.send_index))
+                .entry((
+                    required_u64(&event, "producer_handle"),
+                    required_u64(&event, "send_index"),
+                ))
                 .or_insert(0);
         }
         // Walk resolved entries; assert the kind is allowed and the
         // resolution count doesn't double-fire.
-        for entry in q.since::<SendResolvedEvent>(SENDS_RESOLVED_TRAIL, &self.resolved_cursor) {
-            let key = (entry.event.producer_handle, entry.event.send_index);
-            let kind = entry.event.kind;
+        for event in q.since(SEND_RESOLVED_EVENT_NAME, &self.resolved_cursor) {
+            let key = (
+                required_u64(&event, "producer_handle"),
+                required_u64(&event, "send_index"),
+            );
+            let kind = required_u64(&event, "kind");
             assert_always!(
                 matches!(
                     kind,
@@ -1358,7 +1433,7 @@ impl Invariant for HandleResolutionInvariant {
 /// a message it never delivered.
 struct AckAfterReceiveInvariant {
     ack_cursor: Cell<usize>,
-    delivered: RefCell<HashSet<(u64, u64, u64)>>,
+    delivered: RefCell<HashMap<(u64, u64, u64), u64>>,
     deliver_cursor: Cell<usize>,
 }
 
@@ -1366,7 +1441,7 @@ impl Default for AckAfterReceiveInvariant {
     fn default() -> Self {
         Self {
             ack_cursor: Cell::new(0),
-            delivered: RefCell::new(HashSet::new()),
+            delivered: RefCell::new(HashMap::new()),
             deliver_cursor: Cell::new(0),
         }
     }
@@ -1383,27 +1458,33 @@ impl Invariant for AckAfterReceiveInvariant {
         self.delivered.borrow_mut().clear();
     }
 
-    fn observe(&self, q: &dyn TrailQuery, _sim_time_ms: u64) {
+    fn observe(&self, q: &dyn TraceQuery, _sim_time_ms: u64) {
         // Drain new deliveries into the seen-set first.
-        for entry in q.since::<DeliverEvent>(DELIVERS_TRAIL, &self.deliver_cursor) {
-            self.delivered.borrow_mut().insert((
-                entry.event.consumer_id,
-                entry.event.ledger_id,
-                entry.event.entry_id,
-            ));
+        for event in q.since(DELIVER_EVENT_NAME, &self.deliver_cursor) {
+            let key = (
+                required_u64(&event, "consumer_id"),
+                required_u64(&event, "ledger_id"),
+                required_u64(&event, "entry_id"),
+            );
+            self.delivered
+                .borrow_mut()
+                .entry(key)
+                .and_modify(|seq| *seq = (*seq).min(event.seq))
+                .or_insert(event.seq);
         }
         // Now check each new ack against the seen-set.
-        for entry in q.since::<AckEvent>(ACKS_TRAIL, &self.ack_cursor) {
+        for event in q.since(ACK_EVENT_NAME, &self.ack_cursor) {
             let key = (
-                entry.event.consumer_id,
-                entry.event.ledger_id,
-                entry.event.entry_id,
+                required_u64(&event, "consumer_id"),
+                required_u64(&event, "ledger_id"),
+                required_u64(&event, "entry_id"),
             );
+            let delivery_seq = self.delivered.borrow().get(&key).copied();
             assert_always!(
-                self.delivered.borrow().contains(&key),
+                delivery_seq.is_some_and(|seq| trace_occurs_before(seq, event.seq)),
                 format!(
-                    "ack for never-delivered message: consumer={} ({}, {})",
-                    key.0, key.1, key.2
+                    "ack precedes delivery: consumer={} ({}, {}), ack_seq={}, delivery_seq={delivery_seq:?}",
+                    key.0, key.1, key.2, event.seq
                 )
             );
         }
@@ -1415,7 +1496,7 @@ impl Invariant for AckAfterReceiveInvariant {
 /// invariant is currently a strict no-dup-after-ack check.)
 struct NoDupOnAckedInvariant {
     cursor: Cell<usize>,
-    acked: RefCell<HashSet<(u64, u64, u64)>>,
+    acked: RefCell<HashMap<(u64, u64, u64), u64>>,
     delivered_after_ack_seen: Cell<bool>,
 }
 
@@ -1423,7 +1504,7 @@ impl Default for NoDupOnAckedInvariant {
     fn default() -> Self {
         Self {
             cursor: Cell::new(0),
-            acked: RefCell::new(HashSet::new()),
+            acked: RefCell::new(HashMap::new()),
             delivered_after_ack_seen: Cell::new(false),
         }
     }
@@ -1440,28 +1521,36 @@ impl Invariant for NoDupOnAckedInvariant {
         self.delivered_after_ack_seen.set(false);
     }
 
-    fn observe(&self, q: &dyn TrailQuery, _sim_time_ms: u64) {
+    fn observe(&self, q: &dyn TraceQuery, _sim_time_ms: u64) {
         // Refresh the acked set — full re-scan (acks are sparse; the
         // simplicity is worth more than an incremental cursor here).
-        for entry in q.snapshot::<AckEvent>(ACKS_TRAIL) {
-            self.acked.borrow_mut().insert((
-                entry.event.consumer_id,
-                entry.event.ledger_id,
-                entry.event.entry_id,
-            ));
-        }
-        // Walk new deliveries; assert none of them are in the acked set.
-        for entry in q.since::<DeliverEvent>(DELIVERS_TRAIL, &self.cursor) {
+        for event in q.snapshot(ACK_EVENT_NAME) {
             let key = (
-                entry.event.consumer_id,
-                entry.event.ledger_id,
-                entry.event.entry_id,
+                required_u64(&event, "consumer_id"),
+                required_u64(&event, "ledger_id"),
+                required_u64(&event, "entry_id"),
             );
+            self.acked
+                .borrow_mut()
+                .entry(key)
+                .and_modify(|seq| *seq = (*seq).min(event.seq))
+                .or_insert(event.seq);
+        }
+        // Walk new deliveries; only an acknowledgement with a lower global
+        // trace sequence proves this delivery is a redelivery. An ack that
+        // appears later in the same observation batch is legitimate.
+        for event in q.since(DELIVER_EVENT_NAME, &self.cursor) {
+            let key = (
+                required_u64(&event, "consumer_id"),
+                required_u64(&event, "ledger_id"),
+                required_u64(&event, "entry_id"),
+            );
+            let ack_seq = self.acked.borrow().get(&key).copied();
             assert_always!(
-                !self.acked.borrow().contains(&key),
+                !ack_seq.is_some_and(|seq| trace_occurs_before(seq, event.seq)),
                 format!(
-                    "broker redelivered acked message: consumer={} ({}, {})",
-                    key.0, key.1, key.2
+                    "broker redelivered acked message: consumer={} ({}, {}), delivery_seq={}, ack_seq={ack_seq:?}",
+                    key.0, key.1, key.2, event.seq
                 )
             );
         }
@@ -1478,7 +1567,7 @@ const PRODUCE_COUNT: u32 = 8;
 
 /// Explicit per-send timeout for the produce/consume chaos workload.
 ///
-/// Shorter than both the per-send `tokio::time::timeout(5s)` await guard and
+/// Shorter than both the per-send provider timeout (5s) await guard and
 /// the `CHAOS_RUN_TIME_BUDGET` (30s virtual seconds), so a send whose
 /// `CommandSendReceipt` the default-network bit-flip chaos corrupts/drops in
 /// flight (the receipt carries no CRC32C, unlike a `CommandSend` payload —
@@ -1495,7 +1584,7 @@ const PRODUCE_COUNT: u32 = 8;
 const CHAOS_PRODUCE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ProducerConsumerWorkload {
-    // moonpool main's `Workload` is `Send + Sync` (was `?Send`); the
+    // Moonpool 0.8's `Workload` is `Send + Sync`; the
     // per-run scratch state migrates `Rc<RefCell<…>>` → `Arc<Mutex<…>>`
     // and `Cell<bool>` → `AtomicBool` so the workload future is `Send`.
     sent: Arc<Mutex<Vec<u32>>>,
@@ -1525,19 +1614,19 @@ impl Workload for ProducerConsumerWorkload {
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time_provider_setup = ctx.providers().time().clone();
 
         // Supervised connect (ADR-0055 §3): a bit-flip-induced terminal drop is
         // recovered by reconnect + replay against the persistent broker, rather
         // than killing the plain driver and stranding the un-acked tail.
-        let client = tokio::time::timeout(
-            Duration::from_secs(30),
-            Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
-        )
-        .await
-        .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?
-        .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
-
-        let time_provider_setup = ctx.providers().time().clone();
+        let client = time_provider_setup
+            .timeout(
+                Duration::from_secs(30),
+                Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
+            )
+            .await
+            .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?
+            .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
 
         // Open consumer first so it's ready to receive before we publish.
         // `retry_setup` re-issues the op across a transient chaos drop (a
@@ -1581,18 +1670,17 @@ impl Workload for ProducerConsumerWorkload {
                 source_message_id: None,
             };
             emit_event(
-                SENDS_STARTED_TRAIL,
                 &client_source,
                 &SendStartedEvent {
                     producer_handle,
                     send_index: u64::from(i),
                 },
             );
-            let send_result =
-                tokio::time::timeout(Duration::from_secs(5), producer.send(msg)).await;
+            let send_result = time_provider_setup
+                .timeout(Duration::from_secs(5), producer.send(msg))
+                .await;
             if let Some(kind) = classify_send_outcome(send_result.as_ref().ok()) {
                 emit_event(
-                    SENDS_RESOLVED_TRAIL,
                     &client_source,
                     &SendResolvedEvent {
                         producer_handle,
@@ -1617,7 +1705,9 @@ impl Workload for ProducerConsumerWorkload {
             if self.received.lock().len() >= PRODUCE_COUNT as usize {
                 break;
             }
-            let recv = tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await;
+            let recv = time_provider_setup
+                .timeout(Duration::from_secs(10), consumer.receive())
+                .await;
             let Ok(Ok(msg)) = recv else {
                 break;
             };
@@ -1693,7 +1783,7 @@ fn sim_chaos_produce_consume_with_invariants() {
     // no-dup-on-acked) are *safety* properties: any breach lands in
     // `assertion_violations` (an `assert_always!` failure). Assert that's
     // empty — this is what proves the `tracing`-capture pipeline genuinely
-    // observed the broker's emitted facts (a silently-empty trail would
+    // observed the broker's emitted facts (a silently-empty event stream would
     // also pass, but the sweep below + `successful_runs >= 1` rule that
     // out by requiring at least one fully-delivered at-least-once run).
     assert!(
@@ -1730,14 +1820,18 @@ fn sim_chaos_produce_consume_sweep_16_seeds() {
     assert!(report.successful_runs >= 1, "report: {report:?}");
 }
 
-/// Regression for the moonpool `SubscribeAckedFut` parking bug
+/// Regression for the Moonpool subscribe-readiness parking bug
 /// (seed `2` deterministic hang). `Notified::enable()` used to be called
 /// on a stack-pinned future that was then dropped before `notify_waiters()`
-/// fired — fixed by spawning a helper task. Pin a specific failing seed
-/// so the regression remains tied to the original reproducer.
+/// fired; the waiter now keeps an armed future alive on the dedicated event
+/// notification. Pin a specific failing seed so the regression remains tied
+/// to the original reproducer.
 #[test]
 fn sim_chaos_seed_2_does_not_hang() {
-    let _ = SimulationBuilder::new()
+    assert!(trace_occurs_before(1, 2));
+    assert!(!trace_occurs_before(2, 1));
+
+    let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(StatefulBrokerWorkload::new())
         .workload(ProducerConsumerWorkload::new())
@@ -1748,6 +1842,12 @@ fn sim_chaos_seed_2_does_not_hang() {
         .set_debug_seeds(vec![2])
         .set_iterations(1)
         .run();
+    assert!(
+        report.assertion_violations.is_empty(),
+        "invariant violation(s): {report:?}"
+    );
+    assert_eq!(report.successful_runs, 1, "report: {report:?}");
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
 }
 
 // =============================================================================
@@ -1808,7 +1908,7 @@ impl Workload for DropsTcpAfterCreate {
         let providers = ctx.providers().clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_core::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -1963,7 +2063,7 @@ impl Workload for AntiThrashClientWorkload {
             supervisor: Some(magnetar_proto::SupervisorConfig {
                 initial_backoff: Duration::from_millis(10),
                 max_backoff: Duration::from_millis(50),
-                mandatory_stop: Duration::from_secs(60),
+                mandatory_stop: Duration::from_mins(1),
                 max_attempts: Some(32),
                 anti_thrash_threshold: Some(magnetar_proto::AntiThrashThreshold {
                     successful_attaches: 3,
@@ -1996,7 +2096,7 @@ impl Workload for AntiThrashClientWorkload {
             tokio::pin!(connect);
             let timeout = time.sleep(Duration::from_secs(20));
             tokio::pin!(timeout);
-            tokio::select! {
+            moonpool_core::select! {
                 result = &mut connect => Some(result),
                 _ = &mut timeout => None,
             }
@@ -2027,7 +2127,7 @@ impl Workload for AntiThrashClientWorkload {
             tokio::pin!(open);
             let timeout = time.sleep(Duration::from_secs(5));
             tokio::pin!(timeout);
-            tokio::select! {
+            moonpool_core::select! {
                 result = &mut open => Some(result),
                 _ = &mut timeout => None,
             }
@@ -2170,6 +2270,7 @@ fn sim_chaos_anti_thrash_drops_tcp_after_create_sweep_16_seeds() {
 // =============================================================================
 
 const PROXY_ADVERTISED_BROKER_URL: &str = "pulsar://broker-sim.proxy.internal:6650";
+const PROXY_ADVERTISED_BROKER_AUTHORITY: &str = "broker-sim.proxy.internal:6650";
 
 #[derive(Clone, Debug, Default)]
 struct ProxySessionRecord {
@@ -2206,7 +2307,7 @@ impl Workload for ProxyThroughBroker {
         let sessions = self.sessions.clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_core::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -2340,6 +2441,7 @@ fn emit_proxy_lookup(out: &mut BytesMut, request_id: u64, proxy_through: bool) {
 /// arrived on the right socket).
 struct ProxyClientWorkload {
     sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
+    diagnostics: Arc<Mutex<Vec<String>>>,
     /// Set to true when the client confirms the proxy multi-conn path
     /// was exercised end-to-end (2 sessions, pinned CONNECT carried
     /// `proxy_to_broker_url`).
@@ -2347,9 +2449,13 @@ struct ProxyClientWorkload {
 }
 
 impl ProxyClientWorkload {
-    fn new(sessions: Arc<Mutex<Vec<ProxySessionRecord>>>) -> Self {
+    fn new(
+        sessions: Arc<Mutex<Vec<ProxySessionRecord>>>,
+        diagnostics: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
         Self {
             sessions,
+            diagnostics,
             success: Arc::new(Mutex::new(false)),
         }
     }
@@ -2367,9 +2473,16 @@ impl Workload for ProxyClientWorkload {
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
 
         // Supervised connect → pool is enabled (ADR-0039).
         let cfg = ConnectionConfig {
+            // Moonpool's default network can deterministically hang a connect
+            // attempt. Keep the per-attempt cap short enough that the real
+            // retry loop is exercised inside the operation budget instead of
+            // letting this test's outer guard collide with the first attempt.
+            connect_timeout: Duration::from_millis(500),
+            operation_timeout: Duration::from_secs(10),
             supervisor: Some(magnetar_proto::SupervisorConfig {
                 initial_backoff: Duration::from_millis(10),
                 max_backoff: Duration::from_secs(1),
@@ -2380,43 +2493,58 @@ impl Workload for ProxyClientWorkload {
             ..ConnectionConfig::default()
         };
 
-        let connect_res = tokio::time::timeout(
-            Duration::from_secs(10),
-            Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
-        )
-        .await;
-        let Ok(Ok(client)) = connect_res else {
-            return Ok(());
+        let connect_res = time
+            .timeout(
+                Duration::from_secs(11),
+                Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+            )
+            .await;
+        let client = match connect_res {
+            Ok(Ok(client)) => client,
+            Ok(Err(err)) => {
+                let diagnostic = format!("proxy bootstrap connect failed: {err:?}");
+                self.diagnostics.lock().push(diagnostic.clone());
+                return Err(SimulationError::InvalidState(diagnostic));
+            }
+            Err(err) => {
+                let diagnostic = format!("proxy bootstrap connect guard elapsed: {err:?}");
+                self.diagnostics.lock().push(diagnostic.clone());
+                return Err(SimulationError::InvalidState(diagnostic));
+            }
         };
 
-        let open_res = tokio::time::timeout(
-            Duration::from_secs(10),
-            client.open_producer(magnetar_proto::CreateProducerRequest {
-                topic: "persistent://public/default/sim-proxy-multi-conn".to_owned(),
-                ..Default::default()
-            }),
-        )
-        .await;
+        let open_res = time
+            .timeout(
+                Duration::from_secs(11),
+                client.open_producer(magnetar_proto::CreateProducerRequest {
+                    topic: "persistent://public/default/sim-proxy-multi-conn".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await;
 
-        // ADR-0039 moonpool follow-up: the per-broker proxy pool dial is not yet wired on
-        // moonpool because `NetworkProvider` is `#[async_trait(?Send)]`. The runtime
-        // currently DETECTS `proxy_through_service_url = true` from the lookup response
-        // and surfaces `ClientError::ProxyUnsupportedOnUnsupervisedClient` — the assertion
-        // is that the error path was hit, NOT that the multi-conn flow completed.
-        let proxy_unsupported = matches!(
-            open_res,
-            Ok(Err(
-                magnetar_runtime_moonpool::ClientError::ProxyUnsupportedOnUnsupervisedClient { .. }
-            )),
-        );
-        // Bootstrap session should be observed with `proxy_to_broker_url = None` (no
-        // pinned session because we didn't open one).
+        let producer_opened = matches!(open_res, Ok(Ok(_)));
+        let producer_outcome = match &open_res {
+            Ok(Ok(_)) => "opened".to_owned(),
+            Ok(Err(err)) => format!("error: {err:?}"),
+            Err(err) => format!("timeout-provider error: {err:?}"),
+        };
         let snapshot = self.sessions.lock().clone();
-        let bootstrap_clean = snapshot
-            .first()
-            .is_some_and(|s| s.connect_proxy_to_broker_url.is_none());
+        let bootstrap_clean = snapshot.first().is_some_and(|session| {
+            session.connect_proxy_to_broker_url.is_none()
+                && session
+                    .frames
+                    .contains(&(pb::base_command::Type::Lookup as i32))
+        });
+        let pinned_clean = snapshot.iter().skip(1).any(|session| {
+            session.connect_proxy_to_broker_url.as_deref()
+                == Some(PROXY_ADVERTISED_BROKER_AUTHORITY)
+                && session
+                    .frames
+                    .contains(&(pb::base_command::Type::Producer as i32))
+        });
 
-        if proxy_unsupported && bootstrap_clean {
+        if producer_opened && bootstrap_clean && pinned_clean {
             *self.success.lock() = true;
         }
 
@@ -2426,26 +2554,26 @@ impl Workload for ProxyClientWorkload {
         // below stays for inspection.
         if !*self.success.lock() {
             let snapshot = self.sessions.lock().clone();
-            return Err(SimulationError::InvalidState(format!(
-                "proxy_through detection on moonpool: expected \
-                 ProxyUnsupportedOnUnsupervisedClient + clean bootstrap; sessions={snapshot:?}"
-            )));
+            let diagnostic = format!(
+                "proxy pool did not open a producer through a clean bootstrap + pinned session; \
+                 producer_opened={producer_opened}, producer_outcome={producer_outcome}, \
+                 sessions={snapshot:?}"
+            );
+            self.diagnostics.lock().push(diagnostic.clone());
+            return Err(SimulationError::InvalidState(diagnostic));
         }
         Ok(())
     }
 
     async fn check(&mut self, _ctx: &SimContext) -> SimulationResult<()> {
         let success = *self.success.lock();
-        if !success {
-            let snapshot = self.sessions.lock().clone();
-            return Err(SimulationError::InvalidState(format!(
-                "proxy_through detection on moonpool: expected \
-                 ProxyUnsupportedOnUnsupervisedClient + clean bootstrap; sessions={snapshot:?}",
-            )));
-        }
-        // Reset for the next sweep iteration.
         *self.success.lock() = false;
         self.sessions.lock().clear();
+        if !success {
+            return Err(SimulationError::InvalidState(
+                "proxy pool did not retain the successful pinned-session shape".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -2453,15 +2581,28 @@ impl Workload for ProxyClientWorkload {
 #[test]
 fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
     let sessions = Arc::new(Mutex::new(Vec::<ProxySessionRecord>::new()));
-    let _ = SimulationBuilder::new()
+    let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+    let report = SimulationBuilder::new()
         .run_time_budget(CHAOS_RUN_TIME_BUDGET)
         .workload(ProxyThroughBroker {
             sessions: sessions.clone(),
         })
-        .workload(ProxyClientWorkload::new(sessions))
+        .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
         .set_debug_seeds(sweep_seeds(8))
         .set_iterations(8)
         .run();
+    assert_eq!(
+        report.successful_runs,
+        8,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+    assert_eq!(
+        report.failed_runs,
+        0,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
 }
 
 // =============================================================================
@@ -2625,7 +2766,7 @@ impl Workload for SwizzleClogBrokerWorkload {
         // controller moved its own `time` into its task above).
         let time_for_sessions = ctx.providers().time().clone();
         loop {
-            tokio::select! {
+            moonpool_core::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -2683,7 +2824,7 @@ async fn swizzle_controller<T, R>(
         }
         let wait = time.sleep(Duration::from_millis(10));
         tokio::pin!(wait);
-        tokio::select! {
+        moonpool_core::select! {
             () = shutdown.cancelled() => return,
             _ = &mut wait => {}
         }
@@ -2745,7 +2886,7 @@ async fn swizzle_controller<T, R>(
     // Hold the clog for the configured window.
     let clog_window = time.sleep(Duration::from_millis(clog_duration_ms));
     tokio::pin!(clog_window);
-    tokio::select! {
+    moonpool_core::select! {
         () = shutdown.cancelled() => return,
         _ = &mut clog_window => {}
     }
@@ -2760,7 +2901,7 @@ async fn swizzle_controller<T, R>(
         }
         let restore_step = time.sleep(Duration::from_millis(5));
         tokio::pin!(restore_step);
-        tokio::select! {
+        moonpool_core::select! {
             () = shutdown.cancelled() => return,
             _ = &mut restore_step => {}
         }
@@ -2858,7 +2999,7 @@ where
         // delivers the queued tail after a clog lifts with no inbound traffic.
         let tick = time.sleep(Duration::from_millis(5));
         tokio::pin!(tick);
-        tokio::select! {
+        moonpool_core::select! {
             biased;
             () = shutdown.cancelled() => return Ok(()),
             read = read_into(&mut stream, &mut read_buf) => {
@@ -2887,7 +3028,6 @@ fn push_pending_messages_excluding(
     for (cid, msgs) in to_push {
         for m in msgs {
             emit_event(
-                DELIVERS_TRAIL,
                 source,
                 &DeliverEvent {
                     consumer_id: cid,
@@ -3041,7 +3181,7 @@ impl Workload for SwizzleClogClientWorkload {
         .map_err(|e| SimulationError::InvalidState(format!("open_producer: {e:?}")))?;
 
         // Publish first so the ledger grows while the swizzle window
-        // is still open. Emit started/resolved trail events so the
+        // is still open. Emit started/resolved trace events so the
         // `HandleResolutionInvariant` can assert every send resolves
         // to exactly one of Sent / SessionLost / MemoryLimitExceeded.
         let client_source = ctx.my_ip().to_owned();
@@ -3057,7 +3197,6 @@ impl Workload for SwizzleClogClientWorkload {
                 source_message_id: None,
             };
             emit_event(
-                SENDS_STARTED_TRAIL,
                 &client_source,
                 &SendStartedEvent {
                     producer_handle,
@@ -3068,14 +3207,13 @@ impl Workload for SwizzleClogClientWorkload {
             tokio::pin!(send_timeout);
             let send = producer.send(msg);
             tokio::pin!(send);
-            let send_result = tokio::select! {
+            let send_result = moonpool_core::select! {
                 biased;
                 result = &mut send => Some(result),
                 _ = &mut send_timeout => None,
             };
             if let Some(kind) = classify_send_outcome(send_result.as_ref()) {
                 emit_event(
-                    SENDS_RESOLVED_TRAIL,
                     &client_source,
                     &SendResolvedEvent {
                         producer_handle,
@@ -3098,6 +3236,7 @@ impl Workload for SwizzleClogClientWorkload {
         let mut drain_handles = Vec::with_capacity(consumers.len());
         let received_per_consumer = self.received_per_consumer.clone();
         let time_provider = ctx.providers().time().clone();
+        let task_provider = ctx.providers().task().clone();
         let shutdown = ctx.shutdown().clone();
         // Re-arm broker-side permits while the drain phase is live. The initial
         // subscribe-time FLOW, or a one-shot replacement, can be the single frame
@@ -3114,7 +3253,7 @@ impl Workload for SwizzleClogClientWorkload {
         let shared_for_flow = client.shared().clone();
         let time_for_flow = time_provider.clone();
         let flow_shutdown_for_task = flow_shutdown.clone();
-        let flow_pump = tokio::spawn(async move {
+        let flow_pump = task_provider.spawn_task("swizzle-flow-pump", async move {
             loop {
                 {
                     let mut conn = shared_for_flow.inner.lock();
@@ -3127,7 +3266,7 @@ impl Workload for SwizzleClogClientWorkload {
                 shared_for_flow.driver_waker.notify_one();
                 let wait = time_for_flow.sleep(Duration::from_millis(50));
                 tokio::pin!(wait);
-                tokio::select! {
+                moonpool_core::select! {
                     () = flow_shutdown_for_task.cancelled() => break,
                     _ = &mut wait => {}
                 }
@@ -3137,7 +3276,7 @@ impl Workload for SwizzleClogClientWorkload {
             let received_for_task = received_per_consumer.clone();
             let time_for_task = time_provider.clone();
             let shutdown_for_task = shutdown.clone();
-            let handle = tokio::spawn(async move {
+            let handle = task_provider.spawn_task("swizzle-consumer-drain", async move {
                 let cid = idx as u64;
                 let mut got = Vec::new();
                 // Dedup by `(ledger_id, entry_id)` (ADR-0055 §2): a supervised
@@ -3154,7 +3293,7 @@ impl Workload for SwizzleClogClientWorkload {
                     }
                     let timer = time_for_task.sleep(drain_budget);
                     tokio::pin!(timer);
-                    let msg = tokio::select! {
+                    let msg = moonpool_core::select! {
                         biased;
                         () = shutdown_for_task.cancelled() => break,
                         m = consumer.receive() => m,

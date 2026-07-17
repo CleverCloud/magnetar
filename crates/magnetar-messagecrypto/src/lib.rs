@@ -37,7 +37,7 @@ const AES_GCM_TAG_LEN: usize = 16;
 const ALGO_NAME: &str = "AES_GCM_256";
 
 /// Default data-key TTL (mirrors `MessageCryptoBc.java:90`'s 4-hour rotation).
-pub const DEFAULT_DATA_KEY_TTL: Duration = Duration::from_secs(4 * 60 * 60);
+pub const DEFAULT_DATA_KEY_TTL: Duration = Duration::from_hours(4);
 
 /// Look up RSA public/private keys by logical name.
 pub trait CryptoKeyReader: Send + Sync + std::fmt::Debug {
@@ -531,7 +531,7 @@ mod tests {
         let crypto = MessageCrypto::with_ttl_and_clock(
             r,
             vec!["alice".into()],
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             clock,
         )
         .expect("crypto");
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(first_key, still_first, "should not rotate within TTL");
 
         // Step past TTL — must rotate.
-        *cell.lock().unwrap() = anchor + Duration::from_secs(120);
+        *cell.lock().unwrap() = anchor + Duration::from_mins(2);
         let _ = crypto.encrypt(b"hello", &mut md).expect("encrypt");
         let after_rotate = crypto.state.lock().wrapped[0].1.clone();
         assert_ne!(

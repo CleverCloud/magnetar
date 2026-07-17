@@ -10,7 +10,7 @@
 //! enrollment was lost and the accessor hung forever. The fix arms the
 //! `Notified` future *before* the drain (the enroll-before-drain idiom shared
 //! with `ConnectionShared::await_reconnect_or_terminal` and the
-//! `SubscribeAckedFut` parking-bug fix), mirrored 1:1 across both engines.
+//! subscribe-readiness parking-bug fix), mirrored 1:1 across both engines.
 //!
 //! Two layers of coverage:
 //!

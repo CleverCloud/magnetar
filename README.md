@@ -2,13 +2,9 @@
 
 > A blazing-fast, async, sans-io Apache Pulsar client for Rust.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](rust-toolchain.toml)
-[![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status)
-[![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.91-orange.svg)](specs/adr/0079-raise-msrv-to-rust-1-91.md) [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#status) [![Pulsar](https://img.shields.io/badge/Pulsar-4.0%2B-2bc56b.svg)](#supported-broker-versions)
 
-> **Status: stable (1.2.2).**
-> Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
+> **Status: stable (1.2.2).** Full Apache Pulsar Java-client parity with a sans-io protocol core and two interchangeable engines — a production tokio engine (usable end-to-end, with supervised reconnect + transparent producer/consumer rebuild) and a deterministic-simulation moonpool engine (client/producer/consumer).
 > The public API follows Semantic Versioning.
 > PIP-460 scalable topics and the CLI `produce`/`consume` subcommands remain experimental / not-yet-implemented and are excluded from the 1.0 stability promise.
 
@@ -16,29 +12,23 @@
 
 ## What is magnetar?
 
-Magnetar is a from-scratch Apache Pulsar client driver written in Rust. It
-mirrors the surface area of the Apache Pulsar Java client and adds two
-properties that the Java client cannot reach:
+Magnetar is a from-scratch Apache Pulsar client driver written in Rust.
+It mirrors the surface area of the Apache Pulsar Java client and adds two properties that the Java client cannot reach:
 
-1. **Sans-io core.** The protocol state machine ([`magnetar-proto`]) is a pure,
-   `quinn-proto`-style state machine — `handle_bytes` in, `poll_transmit` out,
-   `poll_event` for semantic events, `poll_timeout` for timers. Zero I/O
-   dependencies. No `tokio`. No `async`. No sockets. It is feed-only.
-2. **Multiple swappable engines.** The same sans-io state machine is driven by
-   a production tokio engine ([`magnetar-runtime-tokio`]) and by a deterministic
-   simulation engine ([`magnetar-runtime-moonpool`]) for chaos testing of
-   reconnects, partitions, and TLS handshake reorderings under reproducible
-   seeds.
+1. **Sans-io core.** The protocol state machine ([`magnetar-proto`]) is a pure, `quinn-proto`-style state machine — `handle_bytes` in, `poll_transmit` out, `poll_event` for semantic events, `poll_timeout` for timers.
+   Zero I/O dependencies.
+   No `tokio`.
+   No `async`.
+   No sockets.
+   It is feed-only.
+2. **Multiple swappable engines.** The same sans-io state machine is driven by a production tokio engine ([`magnetar-runtime-tokio`]) and by a deterministic simulation engine ([`magnetar-runtime-moonpool`]) for chaos testing of reconnects, partitions, and TLS handshake reorderings under reproducible seeds.
 
-The architecture explicitly bans channels (`mpsc`, `broadcast`, `watch`,
-`oneshot`, `crossbeam-channel`, `flume`, `async-channel`, …). The wake-up
-mechanism is `Arc<parking_lot::Mutex<State>>` plus `tokio::sync::Notify` plus
-`core::task::Waker` slabs inside the state machine. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full rationale.
+The architecture explicitly bans channels (`mpsc`, `broadcast`, `watch`, `oneshot`, `crossbeam-channel`, `flume`, `async-channel`, …).
+The wake-up mechanism is `Arc<parking_lot::Mutex<State>>` plus `tokio::sync::Notify` plus `core::task::Waker` slabs inside the state machine.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full rationale.
 
-Magnetar is independent of the existing `pulsar-rs` crate — it shares neither
-code nor dependencies. The goal is feature-complete parity with the Apache
-Pulsar Java client.
+Magnetar is independent of the existing `pulsar-rs` crate — it shares neither code nor dependencies.
+The goal is feature-complete parity with the Apache Pulsar Java client.
 
 [`magnetar-proto`]: crates/magnetar-proto
 [`magnetar-runtime-tokio`]: crates/magnetar-runtime-tokio
@@ -48,57 +38,24 @@ Pulsar Java client.
 
 ## Features at a glance
 
-- **Protocol coverage**: producer, consumer, reader, partitioned producer,
-  partitioned consumer, multi-topics consumer, pattern (regex) consumer,
-  table view, transactions.
-- **PIPs implemented or partially wired**: PIP-4 (end-to-end encryption),
-  PIP-30 / PIP-292 (in-band `AUTH_CHALLENGE` refresh), PIP-31 (transactions),
-  PIP-37 (chunking — bounded consumer-side reassembly, cap 10 / 60s expiry, matching Java — plus redelivery backoff), PIP-54 (partial-batch ACK),
-  PIP-74 (auto-scaled receiver queue — pluggable `ReceiverQueuePolicy`, `Fixed` default / opt-in `Auto`), PIP-87
-  (AutoConsumeSchema broker lookup), PIP-90 (broker-entry metadata),
-  PIP-121 (cluster failover — `ServiceUrlProvider` + `ControlledClusterFailover`
-  - `AutoClusterFailover`), PIP-145 (regex topic discovery), PIP-188
-    (`TOPIC_MIGRATED` with supervised reconnect), PIP-313 (force unsubscribe).
+- **Protocol coverage**: producer, consumer, reader, partitioned producer, partitioned consumer, multi-topics consumer, pattern (regex) consumer, table view, transactions.
+- **PIPs implemented or partially wired**: PIP-4 (end-to-end encryption), PIP-30 / PIP-292 (in-band `AUTH_CHALLENGE` refresh), PIP-31 (transactions), PIP-37 (chunking — bounded consumer-side reassembly, cap 10 / 60s expiry, matching Java — plus redelivery backoff), PIP-54 (partial-batch ACK), PIP-74 (auto-scaled receiver queue — pluggable `ReceiverQueuePolicy`, `Fixed` default / opt-in `Auto`), PIP-87 (AutoConsumeSchema broker lookup), PIP-90 (broker-entry metadata), PIP-121 (cluster failover — `ServiceUrlProvider` + `ControlledClusterFailover`
+  - `AutoClusterFailover`), PIP-145 (regex topic discovery), PIP-188 (`TOPIC_MIGRATED` with supervised reconnect), PIP-313 (force unsubscribe).
     See [Supported PIPs](#supported-pips).
-- **Resilience**: supervised reconnect with `Connection::reset` (Stage 2) +
-  transparent producer / consumer rebuild via `rebuild_producers` /
-  `rebuild_consumers` (Stage 3) + `memory_limit` runtime enforcement (Java
-  `MemoryLimitPolicy::FailImmediately`) + global publish-bytes accounting via
-  `AtomicU64` CAS in `Producer::send` with release on `Drop`.
+- **Resilience**: supervised reconnect with `Connection::reset` (Stage 2) + transparent producer / consumer rebuild via `rebuild_producers` / `rebuild_consumers` (Stage 3) + `memory_limit` runtime enforcement (Java `MemoryLimitPolicy::FailImmediately`) + global publish-bytes accounting via `AtomicU64` CAS in `Producer::send` with release on `Drop`.
 - **Observability**: cumulative counters + `hdrhistogram` p50/p99/max latency
   - rolling-window msgs/sec + bytes/sec rates (`record_rate_window`).
-    OpenTelemetry context propagation (`traceparent`/`tracestate` via message
-    properties, `feature = "opentelemetry"`, ADR-0053).
-- **Transports**: TCP, TLS 1.3 (`rustls`-only — no `native-tls`,
-  no `openssl`), binary proxy (`proxy_to_broker_url`), pluggable DNS
-  (`DnsResolver` trait + `TokioDnsResolver` default routed through
-  `Transport::connect`).
-- **TLS knobs**: `tls_trust_certs_file_path`, `tls_allow_insecure_connection`
-  (blanket override), `tls_hostname_verification_enable(false)` paired with a
-  PEM trust store (chain-on / hostname-off via custom rustls verifier).
-- **Schemas**: bytes, string, JSON, Avro, Protobuf, Protobuf-native,
-  KeyValue, Auto-consume, Auto-produce-bytes, plus the full primitive
-  family — Int8, Int16, Int32, Int64, Float, Double, Bool, Date, Time,
-  Timestamp, LocalDate, LocalTime, Instant, LocalDateTime.
+    OpenTelemetry context propagation (`traceparent`/`tracestate` via message properties, `feature = "opentelemetry"`, ADR-0053).
+- **Transports**: TCP, TLS 1.3 (`rustls`-only — no `native-tls`, no `openssl`), binary proxy (`proxy_to_broker_url`), pluggable DNS (`DnsResolver` trait + `TokioDnsResolver` default routed through `Transport::connect`).
+- **TLS knobs**: `tls_trust_certs_file_path`, `tls_allow_insecure_connection` (blanket override), `tls_hostname_verification_enable(false)` paired with a PEM trust store (chain-on / hostname-off via custom rustls verifier).
+- **Schemas**: bytes, string, JSON, Avro, Protobuf, Protobuf-native, KeyValue, Auto-consume, Auto-produce-bytes, plus the full primitive family — Int8, Int16, Int32, Int64, Float, Double, Bool, Date, Time, Timestamp, LocalDate, LocalTime, Instant, LocalDateTime.
 - **Compression**: LZ4, ZSTD, Snappy, ZLIB.
-- **Auth providers**: token, mTLS (the two stock providers in
-  `magnetar-proto::auth`), OAuth2 `ClientCredentialsFlow` (working — fetches
-  - caches + auto-refreshes JWTs against a standard OIDC token endpoint),
-    SASL `PLAIN` (RFC 4616, working), SASL Kerberos / GSSAPI via `libgssapi`
-    under the `auth-sasl-kerberos` feature (working — multi-round
-    `AUTH_CHALLENGE` initiate loop), Athenz with a pre-fetched role token
-    (`AthenzProvider::with_role_token`, working), and the opt-in Athenz ZTS
-    round-trip (`auth-athenz-zts`, working via `AthenzProvider::with_default_signer`
-    or a custom `zts::JwtSigner` / `zts::ZtsClient`).
-- **Trackers**: ack grouping, unacked-message tracker (ack timeout +
-  redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff`
-  (PIP-37), batch-index ACK set (PIP-54).
+- **Auth providers**: token, mTLS (the two stock providers in `magnetar-proto::auth`), OAuth2 `ClientCredentialsFlow` (working — fetches
+  - caches + auto-refreshes JWTs against a standard OIDC token endpoint), SASL `PLAIN` (RFC 4616, working), SASL Kerberos / GSSAPI via `libgssapi` under the `auth-sasl-kerberos` feature (working — multi-round `AUTH_CHALLENGE` initiate loop), Athenz with a pre-fetched role token (`AthenzProvider::with_role_token`, working), and the opt-in Athenz ZTS round-trip (`auth-athenz-zts`, working via `AthenzProvider::with_default_signer` or a custom `zts::JwtSigner` / `zts::ZtsClient`).
+- **Trackers**: ack grouping, unacked-message tracker (ack timeout + redelivery), negative-ack tracker with `MultiplierRedeliveryBackoff` (PIP-37), batch-index ACK set (PIP-54).
 - **Interceptors**: `ProducerInterceptor` + `ConsumerInterceptor` SPIs.
-- **Admin REST client**: a `reqwest`-backed admin client lives in
-  `magnetar-admin`.
-- **CLI**: `magnetarctl` binary in the `magnetarctl` crate covers admin
-  lookups and stats today; data-plane subcommands (produce / consume /
-  inspect) are in progress.
+- **Admin REST client**: a `reqwest`-backed admin client lives in `magnetar-admin`.
+- **CLI**: `magnetarctl` binary in the `magnetarctl` crate covers admin lookups and stats today; data-plane subcommands (produce / consume / inspect) are in progress.
 
 ---
 
@@ -122,7 +79,8 @@ Or pin the tagged release via Git:
 magnetar-driver = { git = "https://github.com/CleverCloud/magnetar", tag = "v1.2.2" }
 ```
 
-The default feature set enables the tokio engine. The feature flags catalog:
+The default feature set enables the tokio engine.
+The feature flags catalog:
 
 | Flag                 | Default | Effect                                                                                                                                                                                                                                                                                                                                   |
 | -------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -137,8 +95,8 @@ The default feature set enables the tokio engine. The feature flags catalog:
 | `encryption`         | no      | Pulls in `magnetar-messagecrypto` plus the PIP-4 bridge type.                                                                                                                                                                                                                                                                            |
 
 <!-- `e2e` and `e2e-multi-cluster` features removed per ADR-0046: the
-end-to-end suite runs as a regular `cargo test` with no feature gate
-and no `#[ignore]`. Docker on the host is the only prerequisite. -->
+end-to-end suite runs as a regular `cargo test` with no feature gate and no `#[ignore]`.
+Docker on the host is the only prerequisite. -->
 
 | `experimental-v5-client` | no | Enables the PIP-466 V5 wrapper surface (`magnetar::v5`) over the v4 wire commands. |
 | `scalable-topics` | no | Enables the experimental PIP-460 scalable-topic scaffold (`topic://`, DAG watch, StreamConsumer, `topic-info`). |
@@ -164,18 +122,14 @@ The workspace ships twelve crates:
 | `magnetar-auth-athenz`      | Athenz auth provider.                                                                                                               |
 | `magnetar-messagecrypto`    | PIP-4 end-to-end encryption (AES-GCM via `aws-lc-rs`).                                                                              |
 
-`xtask` is a workspace member but is **not published** — it hosts build
-helpers (`protoc` codegen, e2e driver, dependency audits).
+`xtask` is a workspace member but is **not published** — it hosts build helpers (`protoc` codegen, e2e driver, dependency audits).
 
 ---
 
 ## TLS crypto provider
 
-The rustls crypto backend is selected at compile time via four
-mutually-pluggable Cargo features on the `magnetar` façade. The wire
-protocol — TLS 1.3 (default) / TLS 1.2 — is identical across every
-provider; what differs is the audited / FIPS-validated / post-quantum
-posture of the underlying primitives.
+The rustls crypto backend is selected at compile time via four mutually-pluggable Cargo features on the `magnetar` façade.
+The wire protocol — TLS 1.3 (default) / TLS 1.2 — is identical across every provider; what differs is the audited / FIPS-validated / post-quantum posture of the underlying primitives.
 
 | Feature            | Backend         | Post-quantum KEX     | FIPS validated           | Pure Rust | Default |
 | ------------------ | --------------- | -------------------- | ------------------------ | --------- | ------- |
@@ -199,43 +153,34 @@ cargo build -p magnetar-driver --no-default-features --features tokio,crypto-fip
 cargo build -p magnetarctl --no-default-features --features crypto-ring
 ```
 
-Under `cargo build --workspace --all-features` the compile-time cfg
-cascade resolves to aws-lc-rs (highest priority). Single-provider builds
-go through `cargo run -p xtask -- check-crypto-matrix`. A single
-`compile_error!` fires if no `crypto-*` feature is enabled.
+Under `cargo build --workspace --all-features` the compile-time cfg cascade resolves to aws-lc-rs (highest priority).
+Single-provider builds go through `cargo run -p xtask -- check-crypto-matrix`.
+A single `compile_error!` fires if no `crypto-*` feature is enabled.
 
-The `crypto-aws-lc-rs` default picks up rustls 0.23's built-in
-`prefer-post-quantum` feature, so the wire client negotiates the
-X25519MLKEM768 hybrid key exchange with brokers that support it.
+The `crypto-aws-lc-rs` default picks up rustls 0.23's built-in `prefer-post-quantum` feature, so the wire client negotiates the X25519MLKEM768 hybrid key exchange with brokers that support it.
 
-`openssl` / `openssl-sys` are admitted only as transitive deps of
-`rustls-openssl`; the rest of [ADR-0005](specs/adr/0005-rustls-only-tls.md)
-(no `native-tls`, rustls everywhere) stays in force. See
-[ADR-0035](specs/adr/0035-pluggable-crypto-provider.md) for the binding
-decision.
+`openssl` / `openssl-sys` are admitted only as transitive deps of `rustls-openssl`; the rest of [ADR-0005](specs/adr/0005-rustls-only-tls.md) (no `native-tls`, rustls everywhere) stays in force.
+See [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md) for the binding decision.
 
 ---
 
 ## Build metadata (`magnetarctl --version`)
 
-The `magnetarctl` binary exposes a sozu / systemd-style identification
-banner:
+The `magnetarctl` binary exposes a sozu / systemd-style identification banner:
 
 ```
 $ magnetarctl --version
 magnetarctl 1.2.2 (a1b2c3d4e5f6)
-built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.88.0 (…) · target=x86_64-unknown-linux-gnu
+built 2026-05-26T14:32:11Z · profile=release · rustc=rustc 1.91.0 (…) · target=x86_64-unknown-linux-gnu
 features: +default
 pulsar wire protocol: v21
 os: linux · report bugs at https://github.com/CleverCloud/magnetar
 ```
 
-- `-V` prints a single-line, never-colorized form:
-  `magnetarctl 1.2.2 (sha)`.
+- `-V` prints a single-line, never-colorized form: `magnetarctl 1.2.2 (sha)`.
 - `--version` prints the multi-line form above, colorized on a TTY.
   `NO_COLOR=1` or piping suppresses ANSI (https://no-color.org).
-- `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for
-  reproducible builds.
+- `SOURCE_DATE_EPOCH=<unix-seconds>` pins the build timestamp for reproducible builds.
 
 Full reference: [`docs/cli.md`](docs/cli.md).
 
@@ -243,9 +188,8 @@ Full reference: [`docs/cli.md`](docs/cli.md).
 
 ## Quickstart
 
-The high-level `PulsarClient` builder is the public entry point. It wires the
-tokio engine to the sans-io state machine and gives you producer / consumer /
-reader / table-view / partitioned / multi-topics / pattern builders.
+The high-level `PulsarClient` builder is the public entry point.
+It wires the tokio engine to the sans-io state machine and gives you producer / consumer / reader / table-view / partitioned / multi-topics / pattern builders.
 
 ### Producer + consumer round trip
 
@@ -435,7 +379,7 @@ let client = PulsarClient::builder()
 // open the transaction-coordinator-backed transaction
 let runtime_client = /* obtain magnetar_runtime_tokio::Client */
 #   unreachable!();
-let txn = runtime_client.new_txn(Duration::from_secs(60)).await?;
+let txn = runtime_client.new_txn(Duration::from_mins(1)).await?;
 
 let producer = client
     .producer("persistent://public/default/orders")
@@ -493,10 +437,9 @@ println!("acked at {id:?}");
 
 ## Java client parity matrix
 
-A check (`✅`) is a working public-API surface backed by code in the
-workspace. A flag (`🟡`) means partial — a working subset; check
-[ARCHITECTURE.md](ARCHITECTURE.md) for the open gaps. A cross (`❌`) is a
-known-missing feature.
+A check (`✅`) is a working public-API surface backed by code in the workspace.
+A flag (`🟡`) means partial — a working subset; check [ARCHITECTURE.md](ARCHITECTURE.md) for the open gaps.
+A cross (`❌`) is a known-missing feature.
 
 ### Producer
 
@@ -504,7 +447,7 @@ known-missing feature.
 | -------------------------------------------------------- | ---- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `send(...)` / `sendAsync(...)`                           | ✅   | ✅       | `Producer::send` returns a `SendFut`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Producer name                                            | ✅   | ✅       | `ProducerBuilder::name`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Compression (LZ4, ZSTD, Snappy, ZLIB, NONE)              | ✅   | ✅       | `ProducerBuilder::compression`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Compression (LZ4, ZSTD, Snappy, ZLIB, NONE)              | ✅   | ✅       | `ProducerBuilder::compression`. The production tokio engine supports all listed codecs; the Moonpool engine currently accepts only `NONE` and rejects non-`None` compression until its provider-native codec path lands.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Batching (`BatchMessageContainerImpl`)                   | ✅   | ✅       | `ProducerBuilder::batching` (max-msgs + max-bytes).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `batchingMaxPublishDelay` flush timer                    | ✅   | ✅       | `ProducerBuilder::batching_max_publish_delay`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Chunking (PIP-37)                                        | ✅   | ✅       | `ProducerBuilder::chunking`. Chunks-never-batched enforced. Consumer-side reassembly is bounded (`ConsumerBuilder::max_pending_chunked_message` default 10, `expire_time_of_incomplete_chunked_message` default 60s, `auto_ack_oldest_chunked_message_on_queue_full` default false), matching the Java client; the oldest incomplete message is evicted on cap breach and stale buffers are swept on the timeout tick, so a broker streaming distinct-UUID first chunks cannot grow the reassembly map without bound. Accepted incomplete chunks also use Java-compatible per-chunk flow replenishment, repaying each consumed broker permit before logical-message reassembly completes. |
@@ -728,34 +671,18 @@ known-missing feature.
 
 ### Open structural gaps
 
-- **Moonpool engine parity.** Java parity is fully satisfied by the
-  tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md));
-  the façade's dependent surfaces are engine-generic through ADR-0026 §D1
-  extension traits. Producers, consumers, readers, partitioned
-  producer/consumer, multi-topics, pattern consumers, TableView,
-  transactions, and typed schema builders all dispatch through
-  `impl<E: Engine> PulsarClient<E>` where the selected runtime implements
-  the matching `*Api` trait. Per-feature, per-engine status lives in the
-  [parity matrix above](#java-client-parity-matrix).
-- **PIP-460 scalable topics** ship as an experimental scaffold behind
-  `feature = "scalable-topics"` (default off); the in-process four-layer
-  test suite is the binding gate. e2e against a real broker waits for an
-  upstream Pulsar release that ships PIP-460 (currently `Draft`, targeting
-  Pulsar 5.0 LTS).
-- **PIP-466 V5 surface** ships as an experimental, engine-generic wrapper
-  behind `feature = "experimental-v5-client"` (default off). No wire
-  change — it wraps the v4 surface.
-- **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616) under
-  the default `auth-sasl` feature, and Kerberos/GSSAPI via `libgssapi`
-  under the `auth-sasl-kerberos` feature. The multi-round
-  `AUTH_CHALLENGE` exchange threads through
-  `AuthProvider::respond_to_challenge`. The four sans-io test layers
-  drive a deterministic `ScriptedGssapiClient`; the e2e layer runs
-  against a Dockerised KDC. See
-  [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md).
-- **Athenz** ships both the pre-fetched role-token path and the opt-in
-  ZTS round-trip (`auth-athenz-zts`). Production-style ZMS+ZTS+certificate
-  bootstrap remains out of scope for the local fixture.
+- **Moonpool compression parity.** Java parity is fully satisfied by the tokio engine ([ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
+  The façade's producer, consumer, reader, partitioned, multi-topics, pattern, TableView, transaction, and typed-schema surfaces are engine-generic, but the Moonpool producer still rejects non-`None` compression.
+  Per-feature, per-engine status lives in the [parity matrix above](#java-client-parity-matrix), with runtime details in [`docs/moonpool-engine.md`](docs/moonpool-engine.md).
+- **PIP-460 scalable topics** ship as an experimental scaffold behind `feature = "scalable-topics"` (default off); the in-process four-layer test suite is the binding gate. e2e against a real broker waits for an upstream Pulsar release that ships PIP-460 (currently `Draft`, targeting Pulsar 5.0 LTS).
+- **PIP-466 V5 surface** ships as an experimental, engine-generic wrapper behind `feature = "experimental-v5-client"` (default off).
+  No wire change — it wraps the v4 surface.
+- **SASL** ships both mechanisms end-to-end: `PLAIN` (RFC 4616) under the default `auth-sasl` feature, and Kerberos/GSSAPI via `libgssapi` under the `auth-sasl-kerberos` feature.
+  The multi-round `AUTH_CHALLENGE` exchange threads through `AuthProvider::respond_to_challenge`.
+  The four sans-io test layers drive a deterministic `ScriptedGssapiClient`; the e2e layer runs against a Dockerised KDC.
+  See [ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md).
+- **Athenz** ships both the pre-fetched role-token path and the opt-in ZTS round-trip (`auth-athenz-zts`).
+  Production-style ZMS+ZTS+certificate bootstrap remains out of scope for the local fixture.
 
 ---
 
@@ -798,68 +725,46 @@ The [parity matrix above](#java-client-parity-matrix) is the per-feature, per-en
 
 ### `magnetar-runtime-tokio` — production (default)
 
-- TLS via [`tokio-rustls`](https://crates.io/crates/tokio-rustls) (ring
-  backend); no `native-tls`, no `openssl`.
-- One driver task per connection — see
-  [ARCHITECTURE.md §"The driver loop"](ARCHITECTURE.md#the-driver-loop).
-- The user-facing futures (`Consumer::receive`, `Producer::send`, …) lock
-  the shared state machine, register their `Waker` in a slab, and wait. The
-  driver picks them up as the matching `OpOutcome` lands.
-- This is what `magnetar::PulsarClient` wires by default
-  (`PulsarClient<TokioEngine>`).
+- TLS via [`tokio-rustls`](https://crates.io/crates/tokio-rustls) (ring backend); no `native-tls`, no `openssl`.
+- One driver task per connection — see [ARCHITECTURE.md §"The driver loop"](ARCHITECTURE.md#the-driver-loop).
+- The user-facing futures (`Consumer::receive`, `Producer::send`, …) lock the shared state machine, register their `Waker` in a slab, and wait.
+  The driver picks them up as the matching `OpOutcome` lands.
+- This is what `magnetar::PulsarClient` wires by default (`PulsarClient<TokioEngine>`).
 
 ### `magnetar-runtime-moonpool` — deterministic simulation
 
-- Drives the same sans-io state machine as the tokio engine over
-  `moonpool_core::Providers` (a bundle of `NetworkProvider`,
-  `TimeProvider`, `TaskProvider`, `RandomProvider`, `StorageProvider`).
-  Plug `TokioProviders` for production-style runs against a real broker,
-  or a `moonpool-sim` provider bundle for reproducible chaos under a seed.
-- TLS uses a local `rustls::ClientConnection` adapter
-  ([`tls.rs`](crates/magnetar-runtime-moonpool/src/tls.rs)) that drives
-  `read_tls` / `process_new_packets` / `write_tls` over the moonpool byte
-  pipe — the handshake stays deterministic under chaos.
-- See [`docs/moonpool-engine.md`](docs/moonpool-engine.md) for the
-  engine's surface, supervised reconnect, chaos test pack, and the
-  tokio ↔ moonpool differential equivalence harness.
+- Drives the same sans-io state machine as the tokio engine over `moonpool_core::Providers` (a bundle of `NetworkProvider`, `TimeProvider`, `TaskProvider`, `RandomProvider`, `StorageProvider`).
+  Plug `TokioProviders` for production-style runs against a real broker, or `moonpool_sim::SimProviders` for Moonpool 0.8's native seeded executor, virtual clock, simulated network/storage, and reproducible chaos without an ambient Tokio runtime.
+- Provider-generic tasks, timers, and concurrent waits use `TaskProvider`, `TimeProvider`, and `moonpool_core::select!`; simulation observability uses named flat `tracing` events queried through `TraceQuery` ([ADR-0078](specs/adr/0078-adopt-moonpool-0-8-native-deterministic-runtime.md)).
+- TLS uses a local `rustls::ClientConnection` adapter ([`tls.rs`](crates/magnetar-runtime-moonpool/src/tls.rs)) that drives `read_tls` / `process_new_packets` / `write_tls` over the moonpool byte pipe — the handshake stays deterministic under chaos.
+- See [`docs/moonpool-engine.md`](docs/moonpool-engine.md) for the engine's surface, supervised reconnect, chaos test pack, and the tokio ↔ moonpool differential equivalence harness.
 
 ---
 
 ## Supported broker versions
 
-- **Pulsar 4.0+** (LTS). The CONNECT frame advertises `ProtocolVersion::V21`
-  and the connection falls back to whichever lower version the broker
-  reports on `CONNECTED`.
+- **Pulsar 4.0+** (LTS).
+  The CONNECT frame advertises `ProtocolVersion::V21` and the connection falls back to whichever lower version the broker reports on `CONNECTED`.
 - The end-to-end suite runs against `apachepulsar/pulsar:4.0.4`.
 
 ---
 
 ## Status
 
-Magnetar targets a feature-complete Apache Pulsar driver with full
-Java-client parity, driven by two interchangeable engines (production
-tokio + deterministic-simulation moonpool) over the same sans-io
-protocol state machine ([ADR-0010](specs/adr/0010-v0-1-full-java-parity.md),
-[ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)). Java
-parity is satisfied on the tokio engine; the moonpool engine is on the
-same trajectory and the differential harness enforces tokio ↔ moonpool
-`EventStream` equivalence.
+Magnetar targets a feature-complete Apache Pulsar driver with full Java-client parity over a shared sans-io protocol state machine ([ADR-0010](specs/adr/0010-v0-1-full-java-parity.md), [ADR-0019](specs/adr/0019-engine-scope-and-moonpool-parity.md)).
+Java parity is satisfied by the production tokio engine.
+The deterministic-simulation Moonpool engine shares the generic façade and differential `EventStream` contract, with the compression limitation documented above.
 
 The bulk of the parity matrix above ships on `main`, including:
 
 - **PIP-180** shadow topic ([ADR-0033](specs/adr/0033-pip-180-shadow-topic-scope.md)).
 - **PIP-33** replicated subscriptions ([ADR-0034](specs/adr/0034-pip-33-replicated-subscriptions-scope.md)).
 - **SASL Kerberos / GSSAPI** ([ADR-0029](specs/adr/0029-sasl-kerberos-gssapi-scope.md)).
-- **Pluggable rustls crypto provider** (aws-lc-rs / ring / openssl / fips —
-  [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)).
+- **Pluggable rustls crypto provider** (aws-lc-rs / ring / openssl / fips — [ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)).
 - **Daily 128-random-seed moonpool sweep** ([ADR-0036](specs/adr/0036-moonpool-seed-sweep-daily-random.md)).
-- **Anti-thrash supervised reconnect policy** (opt-in,
-  [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
+- **Anti-thrash supervised reconnect policy** (opt-in, [ADR-0028](specs/adr/0028-supervised-reconnect-anti-thrash-policy.md)).
 
-Known open work is narrow and tracked in
-[`docs/follow-ups.md`](docs/follow-ups.md): PIP-460 e2e waits for a
-Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few
-simulation / test-harness gaps remain.
+Known open work is narrow and tracked in [`docs/follow-ups.md`](docs/follow-ups.md): PIP-460 e2e waits for a Pulsar 5.0 RC that pins the scalable-topic wire commands, and a few simulation / test-harness gaps remain.
 
 The public API is stable as of `1.0.0` and follows Semantic Versioning; the experimental surfaces noted above (PIP-460 scalable topics, the CLI `produce`/`consume` subcommands) are excluded from that guarantee.
 
@@ -867,7 +772,7 @@ The public API is stable as of `1.0.0` and follows Semantic Versioning; the expe
 
 ## Validation
 
-The whole workspace builds against stable Rust 1.88.
+The whole workspace builds against stable Rust 1.91 ([ADR-0079](specs/adr/0079-raise-msrv-to-rust-1-91.md)).
 
 ```sh
 # Build / lint / format
@@ -882,14 +787,12 @@ cargo test --workspace
 cargo deny check
 
 # Docs
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
+RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-End-to-end tests against a real broker run as part of
-`cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`,
-no `#[ignore]`). Docker is the only prerequisite; the suite spins
-`pulsar:4.0.4` via `testcontainers-rs`.
+End-to-end tests against a real broker run as part of `cargo test --workspace --all-features` (ADR-0046 — no `--features e2e`, no `#[ignore]`).
+Docker is the only prerequisite; the suite spins `pulsar:4.0.4` via `testcontainers-rs`.
 
 Additional `xtask` checks specific to the sans-io invariants:
 
@@ -903,10 +806,7 @@ cargo run -p xtask -- codegen --check     # asserts proto codegen has no drift
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The project vendors
-a verbatim copy of the Apache Pulsar wire protocol definition
-(`PulsarApi.proto`, `PulsarMarkers.proto`), released by the Apache Software
-Foundation under Apache-2.0.
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+The project vendors a verbatim copy of the Apache Pulsar wire protocol definition (`PulsarApi.proto`, `PulsarMarkers.proto`), released by the Apache Software Foundation under Apache-2.0.
 
-See [GUIDELINES.md](GUIDELINES.md) and [CONTRIBUTING.md](CONTRIBUTING.md) for
-project conventions before sending a patch.
+See [GUIDELINES.md](GUIDELINES.md) and [CONTRIBUTING.md](CONTRIBUTING.md) for project conventions before sending a patch.
