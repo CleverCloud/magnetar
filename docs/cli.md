@@ -108,8 +108,7 @@ pulsarctl stores no binary-protocol (`pulsar://`) URL, so when a context is acti
 | `http://host[:port]`       | `pulsar://host:6650`     |
 | `https://host[:port]`      | `pulsar+ssl://host:6651` |
 
-This is a best-effort heuristic — many deployments (incl.
-Clever Cloud behind the Pulsar Proxy) expose the binary protocol on a different host/port, so an explicit `--service-url` / `MAGNETAR_SERVICE_URL` always wins, and the derived value is logged at startup so a wrong guess is visible.
+This is a best-effort heuristic — many deployments (incl. Clever Cloud behind the Pulsar Proxy) expose the binary protocol on a different host/port, so an explicit `--service-url` / `MAGNETAR_SERVICE_URL` always wins, and the derived value is logged at startup so a wrong guess is visible.
 
 ## Quickstart against a local broker
 
