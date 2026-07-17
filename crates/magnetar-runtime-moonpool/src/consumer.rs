@@ -134,8 +134,9 @@ impl Drop for ConsumerCloseGuard {
             return;
         }
         {
+            let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_consumer_forget(self.handle);
+            let _ = conn.close_consumer_forget(self.handle, now);
         }
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -762,6 +763,7 @@ impl<P: Providers> Consumer<P> {
                 }
                 PostProcessOutcome::Discard => {
                     // Ack and continue — the caller should never see this message.
+                    let now = self.shared.now_instant();
                     let mut conn = self.shared.inner.lock();
                     let _ = conn.ack(
                         self.handle,
@@ -771,6 +773,7 @@ impl<P: Providers> Consumer<P> {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        now,
                     );
                     // Drop the connection lock before notifying the driver (lock-ordering:
                     // global → per-slot, and `notify_one` must never run under the conn lock).
@@ -936,6 +939,8 @@ impl<P: Providers> Consumer<P> {
             ack_type = ?ack_type,
             "ack enqueued"
         );
+        // ADR-0011: engine-supplied clock; see `ack_grouped`.
+        let now = self.shared.now_instant();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.ack(
@@ -946,6 +951,7 @@ impl<P: Providers> Consumer<P> {
                     properties,
                     txn_id,
                 },
+                now,
             )
         };
         self.shared.driver_waker.notify_one();
@@ -1288,8 +1294,9 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn close(self) -> Result<(), ClientError> {
         let request_id = {
+            let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
-            conn.close_consumer(self.handle)
+            conn.close_consumer(self.handle, now)
         };
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -1684,6 +1691,7 @@ impl Future for ReceiveFut {
                         // to try the next queued message. Mirrors Java's
                         // `ConsumerImpl#decryptPayloadIfNeeded` which calls `discardMessage(...)`
                         // (an explicit ack) when the policy is `DISCARD`.
+                        let now = shared.now_instant();
                         let mut conn = shared.inner.lock();
                         let _ = conn.ack(
                             handle,
@@ -1693,6 +1701,7 @@ impl Future for ReceiveFut {
                                 properties: Vec::new(),
                                 txn_id: None,
                             },
+                            now,
                         );
                         drop(conn);
                         shared.driver_waker.notify_one();

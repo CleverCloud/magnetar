@@ -752,6 +752,14 @@ pub enum OpOutcome {
 The slab maps `PendingOpKey -> Waker` + `PendingOpKey -> OpOutcome`.
 A future registers its waker via `Connection::register_waker(key, waker)` and consumes the outcome via `Connection::take_outcome(key)`.
 
+**Ack deadline (issue #346).** `PendingRequestKind::Ack` (the `Request(RequestId)` variant's payload when the pending op is a `CommandAck`) carries an `enqueued_at: Instant` alongside the `ConsumerHandle`, stamped by `Connection::ack`'s injected `now` parameter (ADR-0011).
+Two independent mechanisms resolve a pending ack that would otherwise park its `RequestFut` forever:
+
+1. **Same-broker `CloseConsumer` orphan sweep** — the close-handler's same-broker arm (`assigned_broker_service_url = None`, the #307 root cause) collects every `PendingRequestKind::Ack` entry for the torn-down handle and fails it immediately (`OpOutcome::Error{code: -1, message: "ack orphaned by broker consumer close"}`) before `resubscribe_consumer_after_broker_close` re-attaches a fresh consumer id — the broker will never answer a `CommandAck` addressed to a consumer id it has already forgotten.
+2. **`ack_response_timeout` backstop** — a connection-wide `ConnectionConfig::ack_response_timeout: Option<Duration>` (default `Some(30s)`, mirroring the `send_timeout` Java-parity default; `None` disables it) bounds every pending ack regardless of cause. `poll_timeout` folds `enqueued_at + ack_response_timeout` over every `PendingRequestKind::Ack` entry into the driver's next wake-up; `handle_timeout` reaps any that crossed the deadline with the same `Error{code: -1, ..}` shape (`message: "ack timeout"`). Skipped entirely when the knob is `None`, so a disabled backstop contributes no deadline and no spurious driver wakeups (load-bearing for moonpool determinism).
+
+Both mechanisms mirror the pre-existing per-producer `send_timeout` sweep in shape (two-phase collect-then-mutate over the pending map, then wake + record the outcome), and both also bump `ConsumerState::total_acks_failed` and push a `ConnectionEvent::AckResponse { request_id: Some(rid), result: Err(..) }` so the failure is observable through the same seams a real broker-rejected ack would use.
+
 ### Producer / consumer states
 
 `ProducerState` lives at [`crates/magnetar-proto/src/producer.rs`](crates/magnetar-proto/src/producer.rs).

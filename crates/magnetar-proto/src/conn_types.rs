@@ -269,6 +269,25 @@ pub struct ConnectionConfig {
     ///
     /// See [`RedirectUrlAllowList`] for the threat-model rationale.
     pub redirect_url_allow_list: Option<RedirectUrlAllowList>,
+    /// Backstop deadline for an in-flight ack (`Connection::ack` and its
+    /// grouped/chunk-auto-ack internal callers) that never gets a
+    /// `CommandAckResponse`. `handle_timeout` reaps any ack whose
+    /// `enqueued_at + ack_response_timeout` has elapsed with a synthetic
+    /// `code=-1, message="ack timeout"` error, mirroring the `send_timeout`
+    /// shape (ADR-0072). Default `Some(30 s)` — Java-parity canonical
+    /// default (mirrors [`CreateProducerRequest::send_timeout`](Self)'s
+    /// 30 s default, #304). `None` disables the backstop entirely: no
+    /// deadline is ever computed by `poll_timeout` and no spurious wakeups
+    /// are scheduled (load-bearing for moonpool determinism — an armed
+    /// deadline that never fires would still perturb the simulated clock's
+    /// wake schedule).
+    ///
+    /// This is independent of the issue #346 same-broker `CloseConsumer`
+    /// sweep, which fails orphaned acks immediately rather than waiting out
+    /// this deadline; the backstop only matters when the broker goes silent
+    /// without ever tearing the consumer down (e.g. a dropped
+    /// `CommandAckResponse` on an otherwise healthy connection).
+    pub ack_response_timeout: Option<Duration>,
 }
 
 /// Policy applied when the configured global publish memory budget is
@@ -315,6 +334,10 @@ impl Default for ConnectionConfig {
             memory_limit_policy: MemoryLimitPolicy::FailImmediately,
             max_pending_lookups: 0,
             redirect_url_allow_list: None,
+            // Java-parity canonical default (#304 / ADR-0072 send_timeout mirror): an
+            // ack whose CommandAckResponse never arrives fails deterministically after
+            // 30s instead of hanging the caller's `ack().await` forever.
+            ack_response_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -412,6 +435,46 @@ mod redirect_url_allow_list_tests {
         assert!(!list.is_allowed("http://broker.example.com:6650"));
         assert!(!list.is_allowed("tcp://broker.example.com:6650"));
         assert!(!list.is_allowed("javascript:broker.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod ack_response_timeout_config_tests {
+    //! Pins the [`ConnectionConfig::ack_response_timeout`] default and its
+    //! `None`-disables round trip through `Clone` (issue #346). The
+    //! runtime-side wiring (`handle_timeout` reap sweep, `poll_timeout`
+    //! deadline) is exercised by `magnetar-proto`'s
+    //! `consumer_close_contract_tests` and the cross-runtime ladder in
+    //! `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` /
+    //! `magnetar-differential`.
+
+    use core::time::Duration;
+
+    use super::ConnectionConfig;
+
+    #[test]
+    fn default_ack_response_timeout_matches_send_timeout_java_parity() {
+        let cfg = ConnectionConfig::default();
+        assert_eq!(
+            cfg.ack_response_timeout,
+            Some(Duration::from_secs(30)),
+            "ack_response_timeout default must be Some(30s), mirroring the #304 \
+             send_timeout Java-parity default (ADR-0072)",
+        );
+    }
+
+    #[test]
+    fn ack_response_timeout_none_disables_and_round_trips_through_clone() {
+        let cfg = ConnectionConfig {
+            ack_response_timeout: None,
+            ..ConnectionConfig::default()
+        };
+        let cloned = cfg.clone();
+        assert_eq!(
+            cloned.ack_response_timeout, None,
+            "None must survive Clone unchanged — the engines clone the config \
+             at each dial site",
+        );
     }
 }
 

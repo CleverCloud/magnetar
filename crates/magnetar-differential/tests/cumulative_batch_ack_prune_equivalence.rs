@@ -172,6 +172,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Vec<usize> {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                t0,
             );
             let _ = conn.poll_transmit();
             trajectory.push(gauge(conn));

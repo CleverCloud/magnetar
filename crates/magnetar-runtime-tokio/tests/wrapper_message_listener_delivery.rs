@@ -312,7 +312,7 @@ fn wrapper_listener_drain_stops_cleanly_on_child_close() {
     // Close child A the way a façade per-topic `Consumer::close()` does.
     {
         let mut conn = shared.inner.lock();
-        let _request_id = conn.close_consumer(handle_a);
+        let _request_id = conn.close_consumer(handle_a, t0);
         let _ = conn.poll_transmit();
     }
 

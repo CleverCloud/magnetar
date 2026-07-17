@@ -24,6 +24,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   New `ConsumerState::receive_latency_histogram` / `ProducerState::send_latency_histogram` accessors expose each child's raw latency distribution, and new `ConsumerStats::fold` / `ProducerStats::fold` associated functions (exhaustive per-field destructuring, so a future field addition is a compile error until this fold picks a rule for it) aggregate every child snapshot: the cumulative totals sum (saturating), the rolling rates sum as `f64`, `*_latency_max_ms` is the exact max, and `*_latency_p50_ms`/`p99_ms` are recomputed from a real `hdrhistogram::Histogram::add` merge of every child's histogram — summing or maxing percentiles directly is not statistically sound.
   Both `ConsumerApi` and `ProducerApi` gain a `{receive,send}_latency_histogram` accessor (implemented on both the tokio and moonpool engines) so the façade rewrites are thin collect-then-fold wrappers.
   (#347)
+- **Ack orphaned by same-broker `CloseConsumer` + no deadline:** a same-broker bundle reassignment (`CommandCloseConsumer` with `assigned_broker_service_url = None`, the #307 root cause) tears the old consumer id down without ever answering an ack in flight against it, parking the caller's `ack().await` forever.
+  The close-handler now fails every pending ack for the torn-down handle immediately (`code: -1, message: "ack orphaned by broker consumer close"`) before the in-place re-subscribe runs.
+  As a generic backstop for any other cause of a dropped `CommandAckResponse`, `Connection::ack` now takes an injected `now: Instant` (ADR-0011) and a new `ConnectionConfig::ack_response_timeout` knob (default `Some(30s)`, mirroring the #304 `send_timeout` default; `None` disables it) reaps a pending ack whose response never arrives, mirroring the existing `send_timeout` sweep.
+  **BREAKING CHANGE** (`magnetar-proto` only): `Connection::ack`, `Connection::close_consumer`, and `Connection::close_consumer_forget` are `pub fn` and now take an additional `now: Instant` parameter — any direct caller of these sans-io APIs (outside the `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` engines, which are updated in this changeset) must pass the current instant at the call site.
+  The `magnetar`/`magnetar-driver` façade and `magnetar_runtime_{tokio,moonpool}::Consumer::{ack,close}` are unaffected — their own signatures are unchanged.
+  (#346)
 
 ## [1.2.2] - 2026-07-13
 

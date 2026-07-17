@@ -167,6 +167,7 @@ fn cumulative_only_acking_keeps_batch_ack_tracker_bounded() {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                t0,
             );
             let _ = conn.poll_transmit();
             // The #326 bound: a cumulative ack at the consume front empties the

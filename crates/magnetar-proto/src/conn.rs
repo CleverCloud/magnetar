@@ -275,6 +275,12 @@ enum PendingRequestKind {
     },
     Ack {
         handle: ConsumerHandle,
+        /// Injected-clock (ADR-0011) timestamp `Connection::ack` recorded this
+        /// request at. Feeds the `ack_response_timeout` backstop deadline
+        /// (`poll_timeout` / `handle_timeout`, issue #346) — a `CommandAck`
+        /// whose response never arrives is reaped once
+        /// `enqueued_at + ack_response_timeout` elapses.
+        enqueued_at: Instant,
     },
     ProducerClose {
         handle: ProducerHandle,
@@ -2737,7 +2743,7 @@ impl Connection {
                 if let Some(rid) = request_id {
                     let kind = self.pending_requests.remove(&rid);
                     if result.is_err() {
-                        if let Some(PendingRequestKind::Ack { handle }) = kind {
+                        if let Some(PendingRequestKind::Ack { handle, .. }) = kind {
                             if let Some(slot) = self.consumers.get(&handle) {
                                 let mut consumer = slot.state.lock();
                                 consumer.total_acks_failed =
@@ -2988,6 +2994,56 @@ impl Connection {
                 // is left untouched — that consumer is supposed to reconnect on
                 // the new URL, not re-subscribe on this socket.
                 if close.assigned_broker_service_url.is_none() {
+                    // Issue #346: an ack in flight when the broker tears this
+                    // consumer's dispatcher down is orphaned — the old consumer id
+                    // is gone, so no `CommandAckResponse` for it will EVER arrive on
+                    // this connection; `resubscribe_consumer_after_broker_close`
+                    // below attaches a FRESH consumer id via `CommandSubscribe`
+                    // (see the #307 ROOT CAUSE comment above). Fail every pending
+                    // ack for `handle` fast, right here, so the caller's
+                    // `ack().await` resolves immediately instead of parking until
+                    // the `ack_response_timeout` backstop (or, if that knob is
+                    // disabled, forever).
+                    //
+                    // MUST run before `resubscribe_consumer_after_broker_close` —
+                    // that helper early-returns on `closed` /
+                    // `terminal_failure.is_some()` / `pending_seek.is_some()` /
+                    // `flow_on_subscribe_ack`, any of which would otherwise skip
+                    // this sweep entirely on some re-attach paths.
+                    //
+                    // Two-phase collect-then-mutate (mirrors the send-timeout sweep
+                    // shape in `handle_timeout`) avoids mutating `pending_requests`
+                    // while iterating it.
+                    let orphaned_acks: Vec<RequestId> = self
+                        .pending_requests
+                        .iter()
+                        .filter_map(|(rid, kind)| match kind {
+                            PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
+                            _ => None,
+                        })
+                        .collect();
+                    for rid in orphaned_acks {
+                        self.pending_requests.remove(&rid);
+                        let message = "ack orphaned by broker consumer close".to_owned();
+                        self.outcomes.insert(
+                            PendingOpKey::Request(rid),
+                            OpOutcome::Error {
+                                request_id: rid,
+                                code: -1,
+                                message: message.clone(),
+                            },
+                        );
+                        self.wake_for_request(rid);
+                        if let Some(slot) = self.consumers.get(&handle) {
+                            let mut consumer = slot.state.lock();
+                            consumer.total_acks_failed =
+                                consumer.total_acks_failed.saturating_add(1);
+                        }
+                        self.events.push_back(ConnectionEvent::AckResponse {
+                            request_id: Some(rid),
+                            result: Err(message),
+                        });
+                    }
                     // Same-broker bundle reassignment: re-subscribe in place and
                     // DO NOT surface a `ConsumerClosedByBroker` event — the
                     // re-attach is transparent to the runtime (which would
@@ -3600,6 +3656,19 @@ impl Connection {
                 consider(d);
             }
         }
+        // Issue #346: surface the earliest pending-ack deadline
+        // (`enqueued_at + ack_response_timeout`) so the driver schedules a
+        // deterministic wake for `handle_timeout`'s reap sweep. Skipped
+        // entirely when the knob is `None` (disabled) — no spurious wakeups,
+        // load-bearing for moonpool determinism (an armed-but-never-firing
+        // deadline would still perturb the simulated wake schedule).
+        if let Some(timeout) = self.config.ack_response_timeout {
+            for kind in self.pending_requests.values() {
+                if let PendingRequestKind::Ack { enqueued_at, .. } = kind {
+                    consider(crate::time::deadline_with_clamp(*enqueued_at, timeout));
+                }
+            }
+        }
         next
     }
 
@@ -3742,6 +3811,7 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                now,
             );
         }
         // Flush the ack-grouping tracker. The actions go through the shared dispatcher
@@ -3749,7 +3819,7 @@ impl Connection {
         // routed back through the existing pending-requests slot, but no user future is
         // tied to it (ack_grouped_* is fire-and-forget).
         if !ack_actions.is_empty() {
-            self.dispatch_ack_actions(ack_actions);
+            self.dispatch_ack_actions(ack_actions, now);
         }
 
         // Per-producer batch flush sweep — Java `ProducerBuilder#batchingMaxPublishDelay`.
@@ -3808,6 +3878,53 @@ impl Connection {
                 code: -1,
                 message: "send timeout".to_owned(),
             });
+        }
+
+        // Issue #346: `ack_response_timeout` backstop — reap any pending ack
+        // whose `enqueued_at + ack_response_timeout` has elapsed. This is the
+        // generic backstop for a broker that goes silent without ever
+        // tearing the consumer down (dropped `CommandAckResponse` on an
+        // otherwise healthy connection); the same-broker `CloseConsumer`
+        // sweep above handles the fast-path for the broker-torn-the-consumer-
+        // down case. Two-phase collect-then-mutate, same shape as the
+        // send-timeout sweep above. Skipped entirely when the knob is
+        // disabled (`None`) — `poll_timeout` never arms a deadline in that
+        // case either, so this loop is then a guaranteed no-op.
+        if let Some(timeout) = self.config.ack_response_timeout {
+            let expired_acks: Vec<(RequestId, ConsumerHandle)> = self
+                .pending_requests
+                .iter()
+                .filter_map(|(rid, kind)| match kind {
+                    PendingRequestKind::Ack {
+                        handle,
+                        enqueued_at,
+                    } if now >= crate::time::deadline_with_clamp(*enqueued_at, timeout) => {
+                        Some((*rid, *handle))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (rid, handle) in expired_acks {
+                self.pending_requests.remove(&rid);
+                let message = "ack timeout".to_owned();
+                self.outcomes.insert(
+                    PendingOpKey::Request(rid),
+                    OpOutcome::Error {
+                        request_id: rid,
+                        code: -1,
+                        message: message.clone(),
+                    },
+                );
+                self.wake_for_request(rid);
+                if let Some(slot) = self.consumers.get(&handle) {
+                    let mut consumer = slot.state.lock();
+                    consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+                }
+                self.events.push_back(ConnectionEvent::AckResponse {
+                    request_id: Some(rid),
+                    result: Err(message),
+                });
+            }
         }
     }
 
@@ -4520,7 +4637,7 @@ impl Connection {
     }
 
     /// Acknowledge messages.
-    pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest) -> RequestId {
+    pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest, now: Instant) -> RequestId {
         let request_id = self.alloc_request_id();
         let n_ids = ack.message_ids.len() as u64;
         // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
@@ -4630,8 +4747,13 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        self.pending_requests
-            .insert(request_id, PendingRequestKind::Ack { handle });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::Ack {
+                handle,
+                enqueued_at: now,
+            },
+        );
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
             consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
@@ -4660,7 +4782,7 @@ impl Connection {
                 .map(|t| t.add_individual(message_id, now))
         });
         if let Some(actions) = actions {
-            self.dispatch_ack_actions(actions);
+            self.dispatch_ack_actions(actions, now);
         } else {
             let _ = self.ack(
                 handle,
@@ -4670,6 +4792,7 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                now,
             );
         }
     }
@@ -4690,7 +4813,7 @@ impl Connection {
                 .map(|t| t.add_cumulative(message_id, now))
         });
         if let Some(actions) = actions {
-            self.dispatch_ack_actions(actions);
+            self.dispatch_ack_actions(actions, now);
         } else {
             let _ = self.ack(
                 handle,
@@ -4700,11 +4823,12 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                now,
             );
         }
     }
 
-    fn dispatch_ack_actions(&mut self, actions: Vec<crate::trackers::AckAction>) {
+    fn dispatch_ack_actions(&mut self, actions: Vec<crate::trackers::AckAction>, now: Instant) {
         for action in actions {
             match action {
                 crate::trackers::AckAction::SendIndividualAck {
@@ -4719,6 +4843,7 @@ impl Connection {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        now,
                     );
                 }
                 crate::trackers::AckAction::SendCumulativeAck { handle, message_id } => {
@@ -4730,6 +4855,7 @@ impl Connection {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        now,
                     );
                 }
             }
@@ -5358,18 +5484,28 @@ impl Connection {
     /// Close a consumer. The caller is expected to await the broker ack via
     /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
     /// with [`Self::take_outcome`].
-    pub fn close_consumer(&mut self, handle: ConsumerHandle) -> RequestId {
-        self.close_consumer_inner(handle, false)
+    ///
+    /// `now` (ADR-0011 clock injection) is only consumed when this consumer
+    /// has a non-empty ack-grouping tracker to flush — the flush routes
+    /// through [`Self::ack`], which stamps the flushed `CommandAck`'s
+    /// `enqueued_at` for the `ack_response_timeout` backstop (issue #346).
+    pub fn close_consumer(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
+        self.close_consumer_inner(handle, false, now)
     }
 
     /// Fire-and-forget variant of [`Self::close_consumer`] for the engines'
     /// last-clone drop guard. The broker ack is consumed in-place because no
     /// waiter exists to drain it.
-    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle) -> RequestId {
-        self.close_consumer_inner(handle, true)
+    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
+        self.close_consumer_inner(handle, true, now)
     }
 
-    fn close_consumer_inner(&mut self, handle: ConsumerHandle, forget: bool) -> RequestId {
+    fn close_consumer_inner(
+        &mut self,
+        handle: ConsumerHandle,
+        forget: bool,
+        now: Instant,
+    ) -> RequestId {
         let ack_actions = self.consumers.get(&handle).and_then(|slot| {
             slot.state
                 .lock()
@@ -5378,7 +5514,7 @@ impl Connection {
                 .map(crate::trackers::AckGroupingTracker::flush)
         });
         if let Some(actions) = ack_actions {
-            self.dispatch_ack_actions(actions);
+            self.dispatch_ack_actions(actions, now);
         }
 
         let request_id = self.alloc_request_id();
@@ -8026,6 +8162,7 @@ mod conn_state_tests {
                 properties: Vec::new(),
                 txn_id: None,
             },
+            Instant::now(),
         );
         let _ = drain_outbound_commands(&mut conn);
 
@@ -10937,6 +11074,353 @@ mod conn_state_tests {
     }
 
     // -------------------------------------------------------------------
+    // Issue #346 — ack orphaned by same-broker CloseConsumer + no deadline.
+    //
+    // Two complementary fixes: (1) the same-broker CloseConsumer arm above
+    // fails every pending ack for the torn-down handle immediately (fast
+    // path); (2) `ack_response_timeout` is a generic backstop that reaps a
+    // pending ack whose CommandAckResponse never arrives for ANY reason
+    // (broker silently drops it, etc.), independent of a CloseConsumer ever
+    // landing.
+    // -------------------------------------------------------------------
+
+    /// Primary sweep (fast path): an ack in flight when the broker tears this
+    /// consumer's dispatcher down via a same-broker `CommandCloseConsumer`
+    /// (`assigned_broker_service_url = None`) is orphaned — the old consumer
+    /// id is gone, so no `CommandAckResponse` for it will ever arrive on this
+    /// connection (`resubscribe_consumer_after_broker_close` attaches a FRESH
+    /// id). The close-handler sweep must fail the pending ack immediately
+    /// with `Error{code: -1, message: "ack orphaned by broker consumer
+    /// close"}` instead of leaving it parked until the `ack_response_timeout`
+    /// backstop (or forever, if that knob is disabled).
+    #[test]
+    fn ack_orphaned_by_same_broker_close_fails_fast() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker_inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&waker_inner).into();
+
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        let key = PendingOpKey::Request(rid);
+        conn.register_waker(key, waker.clone());
+        assert!(
+            conn.has_pending_request_for_test(rid),
+            "the ack must be pending before the close frame lands"
+        );
+
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0 + Duration::from_millis(1), &close)
+            .expect("handle broker close");
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Error {
+                request_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(request_id, rid);
+                assert_eq!(code, -1, "orphaned-ack uses the -1 sentinel");
+                assert_eq!(message, "ack orphaned by broker consumer close");
+            }
+            other => panic!("expected an orphaned-ack Error outcome, got {other:?}"),
+        }
+        assert!(
+            !conn.has_pending_request_for_test(rid),
+            "the orphaned ack must drain out of pending_requests"
+        );
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "the parked waker must be woken exactly once"
+        );
+        assert_eq!(
+            conn.consumer_stats(handle)
+                .expect("consumer stats")
+                .total_acks_failed,
+            1,
+            "the orphaned ack must bump total_acks_failed"
+        );
+    }
+
+    /// Backstop deadline: an ack whose `CommandAckResponse` never arrives (the
+    /// broker goes silent without ever tearing the consumer down) must not
+    /// hang the caller's `ack().await` forever. Once the INJECTED clock
+    /// (ADR-0011) crosses `enqueued_at + ack_response_timeout`,
+    /// `handle_timeout`'s reap sweep resolves the pending ack with
+    /// `code=-1, "ack timeout"` and wakes the parked waker. Mirrors the
+    /// `default_send_timeout_fires_when_receipt_lost` shape (this file).
+    #[test]
+    fn pending_ack_deadline_reaps_when_broker_silent() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker_inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&waker_inner).into();
+
+        assert_eq!(
+            ConnectionConfig::default().ack_response_timeout,
+            Some(Duration::from_secs(30)),
+            "ack_response_timeout default must be 30s (Java-parity, mirrors the #304 \
+             send_timeout default, ADR-0072)"
+        );
+
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 2,
+            entry_id: 2,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+        let key = PendingOpKey::Request(rid);
+        conn.register_waker(key, waker.clone());
+
+        assert!(
+            conn.poll_timeout().is_some(),
+            "a wake-up deadline must be scheduled while an ack is pending"
+        );
+
+        // Just BEFORE the deadline: no timeout, no wake, no outcome.
+        conn.handle_timeout(t0 + Duration::from_secs(29));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no ack-timeout outcome before the 30s deadline"
+        );
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            0,
+            "waker must not fire before the deadline"
+        );
+
+        // Past the deadline: the sweep resolves the ack with a timeout error
+        // and wakes the parked waker.
+        conn.handle_timeout(t0 + Duration::from_secs(31));
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Error {
+                request_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(request_id, rid);
+                assert_eq!(code, -1, "ack-timeout uses the -1 sentinel");
+                assert_eq!(message, "ack timeout");
+            }
+            other => panic!("expected an ack-timeout Error outcome, got {other:?}"),
+        }
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "the parked waker must be woken exactly once on timeout"
+        );
+        assert!(
+            !conn.has_pending_request_for_test(rid),
+            "the timed-out ack must drain out of pending_requests"
+        );
+    }
+
+    /// `ack_response_timeout: None` disables the backstop entirely: an ack
+    /// left pending is never reaped no matter how far the injected clock
+    /// advances, and it contributes no deadline to `poll_timeout` (load-
+    /// bearing for moonpool determinism — an armed-but-never-firing deadline
+    /// would still perturb the simulated wake schedule).
+    #[test]
+    fn disabled_ack_timeout_never_reaps() {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                ack_response_timeout: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/ack-timeout-disabled".to_owned(),
+            subscription: "sub-ack-timeout-disabled".to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+
+        let before = conn.poll_timeout();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 3,
+            entry_id: 3,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        assert_eq!(
+            conn.poll_timeout(),
+            before,
+            "a disabled ack_response_timeout must not perturb poll_timeout — the pending \
+             ack contributes no deadline"
+        );
+
+        conn.handle_timeout(t0 + Duration::from_hours(1));
+        assert!(
+            conn.has_pending_request_for_test(rid),
+            "a disabled ack_response_timeout must never reap the pending ack"
+        );
+        let key = PendingOpKey::Request(rid);
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no outcome must materialize for a disabled-timeout ack"
+        );
+    }
+
+    /// No-false-positive companion to `pending_ack_deadline_reaps_when_broker_silent`:
+    /// an ack whose `CommandAckResponse` lands BEFORE the deadline resolves
+    /// normally with a `Success` outcome, and ticking `handle_timeout` well
+    /// past the default 30s deadline afterwards must not spuriously re-fire —
+    /// the entry already drained out of `pending_requests` on the real
+    /// response.
+    #[test]
+    fn ack_response_before_deadline_resolves_normally() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 4,
+            entry_id: 4,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        // Broker acks well within the 30s window.
+        let ack_response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(rid.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack_response).expect("encode CommandAckResponse");
+        conn.handle_bytes(t0 + Duration::from_secs(1), &buf)
+            .expect("handle AckResponse");
+
+        let key = PendingOpKey::Request(rid);
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Success { request_id }) => assert_eq!(request_id, rid),
+            other => {
+                panic!("expected a Success outcome for the timely ack response, got {other:?}")
+            }
+        }
+
+        // Well past the default 30s deadline: the reap sweep must be a no-op
+        // — the entry already drained out of pending_requests when the real
+        // response landed.
+        conn.handle_timeout(t0 + Duration::from_hours(1));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no stale ack-timeout outcome must appear after the real response already resolved it"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // Issue #301 — pluggable receiver-queue policy, connection-driven adjust.
     //
     // The `Auto` policy ticks from `handle_timeout`'s injected `now`; a grown
@@ -12011,6 +12495,7 @@ mod conn_state_tests {
                 properties: Vec::new(),
                 txn_id: None,
             },
+            t0,
         );
         assert_eq!(
             batch_tracker_keys(&conn, handle),
@@ -12047,6 +12532,7 @@ mod conn_state_tests {
                         properties: Vec::new(),
                         txn_id: None,
                     },
+                    t0,
                 );
                 assert_eq!(
                     batch_tracker_keys(&conn, handle),
@@ -12335,7 +12821,7 @@ mod consumer_close_contract_tests {
         let slot = conn.consumer(handle).expect("slot exists").clone();
         assert!(!slot.state.lock().closed, "fresh consumer must be open");
 
-        let _request_id = conn.close_consumer(handle);
+        let _request_id = conn.close_consumer(handle, now);
 
         assert!(
             slot.state.lock().closed,
@@ -12350,7 +12836,7 @@ mod consumer_close_contract_tests {
         let handle = subscribe(&mut conn, "close-frame");
         let _ = conn.poll_transmit();
 
-        let _request_id = conn.close_consumer(handle);
+        let _request_id = conn.close_consumer(handle, now);
 
         assert_eq!(
             drain_command_types(&mut conn),
@@ -12386,9 +12872,9 @@ mod consumer_close_contract_tests {
             conn.ack_grouped_individual(handle, message_id, now);
 
             if forget {
-                let _request_id = conn.close_consumer_forget(handle);
+                let _request_id = conn.close_consumer_forget(handle, now);
             } else {
-                let _request_id = conn.close_consumer(handle);
+                let _request_id = conn.close_consumer(handle, now);
             }
 
             assert_eq!(
@@ -12409,7 +12895,7 @@ mod consumer_close_contract_tests {
         let handle = subscribe(&mut conn, "forget-success");
         let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         assert!(
             slot.state.lock().closed,
             "forget variant must still flip the closed flag synchronously"
@@ -12429,7 +12915,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-error");
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         ack_error(&mut conn, request_id.0, now);
 
         assert!(
@@ -12445,7 +12931,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-reset");
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         conn.reset();
 
         assert!(
@@ -12461,7 +12947,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-fail-all");
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         conn.fail_all_pending("synthetic terminal drop");
 
         assert!(
@@ -12477,7 +12963,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "awaited-close");
 
-        let request_id = conn.close_consumer(handle);
+        let request_id = conn.close_consumer(handle, now);
         ack_success(&mut conn, request_id.0, now);
 
         assert!(

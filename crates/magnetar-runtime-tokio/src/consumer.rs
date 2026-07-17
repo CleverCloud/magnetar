@@ -93,7 +93,7 @@ impl Drop for ConsumerCloseGuard {
         }
         {
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_consumer_forget(self.handle);
+            let _ = conn.close_consumer_forget(self.handle, std::time::Instant::now());
         }
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -460,6 +460,10 @@ impl Consumer {
             "ack enqueued"
         );
         let shared = self.shared.clone();
+        // ADR-0011: host clock snapshot at the call site — the tokio engine has
+        // no virtual clock to inject (see `negative_ack` above for the same
+        // pattern).
+        let now = std::time::Instant::now();
         let request_id = {
             let mut conn = shared.inner.lock();
             conn.ack(
@@ -470,6 +474,7 @@ impl Consumer {
                     properties,
                     txn_id,
                 },
+                now,
             )
         };
         shared.driver_waker.notify_one();
@@ -801,7 +806,7 @@ impl Consumer {
     pub async fn close(self) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
-            conn.close_consumer(self.handle)
+            conn.close_consumer(self.handle, std::time::Instant::now())
         };
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -1240,6 +1245,7 @@ impl Consumer {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        std::time::Instant::now(),
                     );
                     drop(conn);
                     self.shared.driver_waker.notify_one();
@@ -1527,6 +1533,7 @@ impl Future for ReceiveFut {
                                     properties: Vec::new(),
                                     txn_id: None,
                                 },
+                                std::time::Instant::now(),
                             );
                             drop(conn);
                             shared.driver_waker.notify_one();
