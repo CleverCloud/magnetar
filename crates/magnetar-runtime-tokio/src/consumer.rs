@@ -1665,24 +1665,20 @@ impl Future for ActiveChangeFut {
         if let Some(old_key) = this.slab_key.take() {
             conn.cancel_consumer_active_change_waker(handle, old_key);
         }
-        if let Some(key) = conn.register_consumer_active_change_waker(handle, cx.waker().clone()) {
-            // Close the race where a transition is recorded between the pop
-            // check above and the slab insert.
-            if let Some(active) = conn.pop_consumer_active_change(handle) {
-                conn.cancel_consumer_active_change_waker(handle, key);
-                return Poll::Ready(Ok(active));
-            }
-            if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
-                conn.cancel_consumer_active_change_waker(handle, key);
-                return Poll::Ready(Err(ClientError::Closed));
-            }
-            this.slab_key = Some(key);
-            drop(conn);
-            return Poll::Pending;
-        }
-        // Consumer was removed in the meantime; surface as closed on the next poll.
+        let key = conn.register_consumer_active_change_waker(handle, cx.waker().clone());
         drop(conn);
-        cx.waker().wake_by_ref();
+        // The connection lock is held from the pop check through the
+        // registration above, so no transition, close, or removal can
+        // interleave within this poll: the terminal check proves the handle
+        // exists, and registration on a live handle cannot fail
+        // (`register_consumer_active_change_waker` returns `None` only for an
+        // absent handle, which `consumer_handle_is_terminal` reports as
+        // terminal).
+        debug_assert!(
+            key.is_some(),
+            "active-change waker registration failed for a live handle"
+        );
+        this.slab_key = key;
         Poll::Pending
     }
 }

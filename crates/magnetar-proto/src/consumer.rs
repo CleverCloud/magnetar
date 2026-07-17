@@ -191,10 +191,10 @@ pub struct ConsumerState {
     /// branch) by the identical delta. Decremented by exactly one (saturating) per dispatch
     /// unit as it arrives:
     ///
-    /// - Once per delivered logical message in [`Self::classify_and_queue`] — covers a plain
-    ///   message, each batch member, and the chunk-completing logical message. Unconditional
-    ///   across both the queued and dead-lettered branches: the broker already spent one permit
-    ///   dispatching the entry regardless of where the client routes it afterward.
+    /// - Once per delivered logical message in `classify_and_queue` — covers a plain message, each
+    ///   batch member, and the chunk-completing logical message. Unconditional across both the
+    ///   queued and dead-lettered branches: the broker already spent one permit dispatching the
+    ///   entry regardless of where the client routes it afterward.
     /// - Once per incomplete chunk buffered in [`Self::deliver`] (the chunk has not yet reached
     ///   `classify_and_queue` — reassembly is still pending — but the broker already dispatched
     ///   it).
@@ -1748,7 +1748,7 @@ impl ConsumerState {
     /// bounded [`Self::active_changes`] ring (dropping the oldest entry once
     /// [`ACTIVE_CHANGES_CAP`] is reached), then drains and wakes every parked
     /// [`Self::active_change_wakers`] entry — the same drain-all fan-out
-    /// semantic [`Self::wake_receivers`] uses.
+    /// semantic `wake_receivers` uses.
     pub fn record_active_change(&mut self, active: bool) {
         self.is_active = Some(active);
         if self.active_changes.len() >= ACTIVE_CHANGES_CAP {

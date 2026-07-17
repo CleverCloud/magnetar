@@ -14,11 +14,21 @@
 //! façade-level futures, not proto-level state. Identical scenario names and
 //! count to the tokio file keeps `cargo xtask check-runtime-test-parity` 1:1
 //! (ADR-0024).
+//!
+//! Scenario 3 (`next_active_change_manual_poll_covers_repark_and_drop_cancel`)
+//! adds a manual `Future::poll` drive of the private `ActiveChangeFut`
+//! (reached only via the opaque `impl Future` `next_active_change()`
+//! returns) so the re-park ("refresh the slab registration") branch and the
+//! drop-while-parked cancel branch are hit deterministically — letting the
+//! tokio executor pick when/how often `.await` polls a future cannot
+//! guarantee either branch runs.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
 
+use std::future::Future;
 use std::sync::Arc;
+use std::task::{Context, Wake};
 
 use bytes::BytesMut;
 use magnetar_proto::{
@@ -29,6 +39,22 @@ use moonpool_core::TokioProviders;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+
+/// Counting waker — records wake calls (unused by the manual-poll assertions
+/// below, but a real, inert `Waker` is still required to build a `Context`).
+/// Mirrors the helper in `marker_lost_wakeup.rs`.
+struct CountingWaker {
+    woken: std::sync::atomic::AtomicUsize,
+}
+
+impl Wake for CountingWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -370,6 +396,79 @@ async fn next_active_change_resolves_err_after_close() {
         matches!(result, Err(ClientError::Closed)),
         "a next_active_change() parked before close must resolve Err(Closed), got {result:?}"
     );
+
+    client.close().await;
+}
+
+/// Scenario 3: manually driving `Future::poll` on the future
+/// `next_active_change()` returns exercises two branches `.await` cannot
+/// reliably hit:
+///
+/// - polling a second time while still parked (nothing buffered, not terminal) takes the "refresh
+///   the slab registration" path — the previously-installed waker slot is evicted and a fresh one
+///   installed;
+/// - dropping the future while parked (a registered slab slot, never resolved) exercises
+///   `ActiveChangeFut::drop`'s cancel path.
+///
+/// The broker never emits `CommandActiveConsumerChange`, so every poll
+/// parks — deterministic by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_active_change_manual_poll_covers_repark_and_drop_cancel() {
+    let addr = spawn_close_only_broker().await;
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    let consumer = tokio::time::timeout(
+        HANG_GUARD,
+        client.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/consumer-active-change-manual-poll-mp".to_owned(),
+            subscription: "consumer-active-change-manual-poll-mp".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Failover,
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe did not time out")
+    .expect("subscribe ok");
+
+    let waker = Arc::new(CountingWaker {
+        woken: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let std_waker: std::task::Waker = waker.into();
+    let mut cx = Context::from_waker(&std_waker);
+
+    // `Box::pin` (not `std::pin::pin!`) is required here: `pin!` produces a
+    // `Pin<&mut T>` borrowing a hidden stack local, so `drop(fut)` below
+    // would only drop the reference, not the future — the whole point of
+    // this scenario is to actually invoke `ActiveChangeFut::drop`.
+    let mut fut = Box::pin(consumer.next_active_change());
+
+    // First poll: nothing buffered yet, not terminal -> registers a fresh
+    // waker slot and parks.
+    assert!(
+        fut.as_mut().poll(&mut cx).is_pending(),
+        "first poll must park: no buffered transition, broker never promotes/demotes"
+    );
+
+    // Second poll while still parked with nothing having changed: hits the
+    // "refresh the slab registration" branch (evict the old slot, install a
+    // new one) before parking again.
+    assert!(
+        fut.as_mut().poll(&mut cx).is_pending(),
+        "second poll while parked must also park (still nothing buffered)"
+    );
+
+    // Drop while parked: `slab_key` is `Some`, so `Drop` must evict the
+    // still-registered waker slot.
+    drop(fut);
 
     client.close().await;
 }
