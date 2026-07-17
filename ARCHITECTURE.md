@@ -525,6 +525,26 @@ A completed explicit close marks the slot closed and suppresses a later drop clo
 The final-clone path is best-effort rather than confirmation-bearing: callers that must know the broker acknowledged resource release use explicit `close().await`.
 This is Rust RAII and pulsar-rs migration parity, beyond Java abandonment semantics; it does not claim that Java garbage collection closes consumers.
 
+### Consumer flow-permit accounting (issue #349, ADR-0082)
+
+Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permit counters, split because they answer different questions.
+
+- **`granted_permits: u32`** — a purely ADDITIVE record of every permit granted to the broker since the last zeroing (subscribe, reconnect reset, terminal subscribe failure, same-broker `CommandCloseConsumer`).
+  Bumped at the three grant sites (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth branch); never decremented by dispatch.
+  Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`) and `adjust_receiver_queue`'s want-have delta both need exactly that, so both keep reading this field.
+- **`permit_balance: u32`** — the REAL broker-side balance: `granted_permits` minus one unit per broker dispatch unit that has actually arrived.
+  Incremented at the same three grant sites, by the identical delta.
+  Decremented by exactly one (`saturating_sub`) per dispatch unit: once per delivered logical message in `classify_and_queue` (a plain message, each batch member, or the chunk-completing logical message — unconditionally across the queued and dead-lettered branches, since the broker already spent the permit either way), once per incomplete chunk buffered in `deliver`, and once per PIP-33 marker in `record_marker_consumed`.
+  Force-zeroed everywhere `granted_permits` is zeroed, so the two never drift apart at a churn boundary.
+
+`flow_stats` feeds `permit_balance` — not `granted_permits` — into `FlowStats::available_permits`, the signal [`Auto::adjust`](../crates/magnetar-proto/src/receiver_queue.rs) uses to detect starvation.
+Before this split, the single additive field never registered a genuine dispatch-driven starvation (issue #349): `Auto` never scaled up under real load.
+
+`adjust_receiver_queue` also gates on `granted_permits == 0` before computing anything: a zero grant mirror only occurs right after a reset / terminal-failure / same-broker `CloseConsumer` zeroing — a churn window, not load starvation — so the tick is skipped entirely rather than let the policy misread it and grow (or emit a `CommandFlow` the broker would drop against a torn-down consumer id).
+
+`Connection::consumer_available_permits()` (and the façade's `Consumer::available_permits()` chain on both engines) intentionally keeps reading `granted_permits` — unchanged, additive semantics; extending Java-parity (a genuinely decrementing counter) to that public accessor is a separate, unscoped change.
+See [ADR-0082](specs/adr/0082-consumer-permit-balance-split.md).
+
 ---
 
 ## The driver loop

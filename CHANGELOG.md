@@ -17,6 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **`Auto` receiver-queue policy never scaled up under real load:** the consumer's permit mirror (`ConsumerState::available_permits`) was purely additive — bumped on every grant but never decremented as messages actually arrived — so the `FlowStats::available_permits == 0` starvation signal `Auto::adjust` needs was reachable only via a churn-window reset, never via a broker genuinely exhausting its grant.
+  The field is now split: `ConsumerState::granted_permits` (renamed, semantics unchanged — the additive grant mirror the #307 failover-reflow gate and the want-have delta still use) and a new `ConsumerState::permit_balance` (the REAL balance: grants minus one unit per broker dispatch — plain message, batch member, chunk, or PIP-33 marker), which `flow_stats` now feeds into `FlowStats::available_permits`.
+  A new churn-window guard skips the adjust tick entirely when `granted_permits == 0` (reset / terminal-failure / same-broker `CloseConsumer`), so that window is never mistaken for load starvation.
+  `Auto::adjust` itself is unchanged — only the signal it was fed was wrong.
+  (#349; ADR-0082)
 - **Consumer final-clone resource release:** dropping the last clone of a consumer now stages a best-effort `CloseConsumer` and wakes the existing driver, allowing ownership-driven teardown to unregister the broker-side consumer when the frame reaches the broker and is accepted.
   Intermediate clone drops leave surviving consumers usable, explicit `close().await` remains the reliable acknowledgement-bearing path, and forgotten close responses never accumulate undrained outcomes.
   (#342; ADR-0077)

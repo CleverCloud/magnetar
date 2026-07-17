@@ -173,9 +173,39 @@ pub struct ConsumerState {
     /// first. Drives the [`Self::next_adjust_deadline`] schedule. Never
     /// `Instant::now()` (ADR-0011) — set from `handle_timeout`'s `now`.
     pub(crate) last_adjust_at: Option<std::time::Instant>,
-    /// Number of permits the broker currently has us at (i.e., messages the broker may still
-    /// push to us without our explicit consent).
-    pub available_permits: u32,
+    /// Cumulative permits GRANTED to the broker since the last zeroing (subscribe, reconnect
+    /// reset, terminal subscribe failure, same-broker `CloseConsumer`). Issue #349: this is a
+    /// purely ADDITIVE mirror — it is bumped at every grant site (`initial_flow`, `maybe_flow`,
+    /// the growth branch of `adjust_receiver_queue`) but is NEVER decremented as messages
+    /// actually arrive, so it does not track the broker's REAL outstanding grant. It is still
+    /// the right register for "how much have we told the broker it may use": the #307
+    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta both need exactly
+    /// that question answered, and this additive counter answers it correctly. For the REAL,
+    /// decrementing balance — the starvation signal
+    /// [`crate::receiver_queue::FlowStats::available_permits`] needs — see
+    /// [`Self::permit_balance`].
+    pub granted_permits: u32,
+    /// REAL broker-side permit balance: `granted_permits` minus one unit per broker dispatch
+    /// unit that has actually arrived (issue #349). Incremented at the same three grant sites
+    /// as `granted_permits` (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth
+    /// branch) by the identical delta. Decremented by exactly one (saturating) per dispatch
+    /// unit as it arrives:
+    ///
+    /// - Once per delivered logical message in [`Self::classify_and_queue`] — covers a plain
+    ///   message, each batch member, and the chunk-completing logical message. Unconditional
+    ///   across both the queued and dead-lettered branches: the broker already spent one permit
+    ///   dispatching the entry regardless of where the client routes it afterward.
+    /// - Once per incomplete chunk buffered in [`Self::deliver`] (the chunk has not yet reached
+    ///   `classify_and_queue` — reassembly is still pending — but the broker already dispatched
+    ///   it).
+    /// - Once per PIP-33 marker in [`Self::record_marker_consumed`].
+    ///
+    /// Force-zeroed everywhere `granted_permits` is zeroed so the two counters never drift apart
+    /// at a churn boundary. `flow_stats` feeds this — not `granted_permits` — into
+    /// [`crate::receiver_queue::FlowStats::available_permits`], so `0` is now a genuine
+    /// starvation signal instead of the never-decrementing mirror `granted_permits` was before
+    /// this split.
+    pub permit_balance: u32,
     /// Number of permits we've consumed since the last flow command. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
@@ -715,7 +745,8 @@ impl ConsumerState {
             queued_bytes: 0,
             adjust_interval,
             last_adjust_at: None,
-            available_permits: 0,
+            granted_permits: 0,
+            permit_balance: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
             chunk_reassembly: HashMap::new(),
@@ -934,7 +965,8 @@ impl ConsumerState {
         }
         let permits = self.consumed_since_flow;
         self.consumed_since_flow = 0;
-        self.available_permits = self.available_permits.saturating_add(permits);
+        self.granted_permits = self.granted_permits.saturating_add(permits);
+        self.permit_balance = self.permit_balance.saturating_add(permits);
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
@@ -956,6 +988,11 @@ impl ConsumerState {
     /// `total_bytes_received` counters: markers are not user messages.
     pub fn record_marker_consumed(&mut self) {
         self.record_broker_permit_consumed();
+        // Issue #349: a marker is one broker-dispatched unit too — decrement the
+        // REAL balance directly (not through `record_broker_permit_consumed`,
+        // which only tracks the pop-driven `consumed_since_flow` counter, the
+        // wrong site for the live balance).
+        self.permit_balance = self.permit_balance.saturating_sub(1);
     }
 
     /// Force an initial flow for the current receiver-queue target.
@@ -968,7 +1005,8 @@ impl ConsumerState {
     /// grants the policy's CURRENT target rather than a stale raw value.
     pub fn initial_flow(&mut self) -> pb::CommandFlow {
         let permits = self.receiver_queue_size as u32;
-        self.available_permits = permits;
+        self.granted_permits = permits;
+        self.permit_balance = permits;
         self.consumed_since_flow = 0;
         pb::CommandFlow {
             consumer_id: self.handle.0,
@@ -990,7 +1028,10 @@ impl ConsumerState {
         crate::receiver_queue::FlowStats {
             current_queue_size: self.receiver_queue_size,
             queued_messages: self.queue.len(),
-            available_permits: self.available_permits,
+            // Issue #349: feed the REAL decrementing balance, not the
+            // purely-additive `granted_permits` mirror, so `0` here is a
+            // genuine starvation signal (see `Self::permit_balance`'s doc).
+            available_permits: self.permit_balance,
             consume_rate_msgs_per_s: self.current_msgs_per_sec,
             avg_message_bytes,
             in_flight_bytes: self.queued_bytes,
@@ -1002,8 +1043,8 @@ impl ConsumerState {
     /// target via `policy.adjust(&FlowStats)` and reconciles the broker grant:
     ///
     /// - **Grow** (`new > current`): the broker has fewer permits than the new target wants, so
-    ///   emit an incremental `CommandFlow` for the delta and bump `available_permits`. This is what
-    ///   keeps a starving consumer fed.
+    ///   emit an incremental `CommandFlow` for the delta and bump both `granted_permits` and
+    ///   `permit_balance`. This is what keeps a starving consumer fed.
     /// - **Shrink / hold** (`new <= current`): permits already granted to the broker cannot be
     ///   un-granted, so emit nothing — the surplus drains naturally as messages arrive and
     ///   `maybe_flow` simply asks for less next time (its threshold is `new / 2`).
@@ -1029,6 +1070,16 @@ impl ConsumerState {
         {
             return None;
         }
+        // Issue #349 churn-window guard: `granted_permits == 0` only occurs
+        // right after a reset / terminal-failure / same-broker
+        // `CloseConsumer` zeroing — there is no outstanding grant for the
+        // broker to have dispatched against, so a zero `permit_balance` here
+        // reflects the churn window, not load starvation. Skip the tick
+        // entirely rather than let the policy misread it and grow (or emit a
+        // flow the broker would drop against a torn-down consumer id).
+        if self.granted_permits == 0 {
+            return None;
+        }
         let stats = self.flow_stats(partitions);
         let new_target = self.policy.adjust(&stats).max(1);
         let current = self.receiver_queue_size;
@@ -1042,12 +1093,13 @@ impl ConsumerState {
         // Grow: top the broker's grant up to the new target with an incremental
         // flow for the delta the broker does not yet have.
         let want = new_target as u32;
-        let have = self.available_permits;
+        let have = self.granted_permits;
         let delta = want.saturating_sub(have);
         if delta == 0 {
             return None;
         }
-        self.available_permits = self.available_permits.saturating_add(delta);
+        self.granted_permits = self.granted_permits.saturating_add(delta);
+        self.permit_balance = self.permit_balance.saturating_add(delta);
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: delta,
@@ -1410,6 +1462,13 @@ impl ConsumerState {
                 );
                 if entry.received_chunks < entry.expected_chunks {
                     self.record_broker_permit_consumed();
+                    // Issue #349: this chunk is one dispatch unit even though
+                    // it never reaches `classify_and_queue` (reassembly is
+                    // still pending) — decrement the REAL balance directly
+                    // rather than through `record_broker_permit_consumed`
+                    // (which only tracks the pop-driven `consumed_since_flow`
+                    // counter, the wrong site for the live balance).
+                    self.permit_balance = self.permit_balance.saturating_sub(1);
                     return Ok(DeliverOutcome::Buffered);
                 }
                 // All chunks present — assemble. Take the buffer out by value
@@ -1553,6 +1612,14 @@ impl ConsumerState {
         now: std::time::Instant,
     ) -> DeliverOutcome {
         let payload_len = msg.payload.len();
+        // Issue #349: `classify_and_queue` is called exactly once per
+        // broker dispatch unit — once for a plain message, once per batch
+        // member (the `deliver` batch loop), and once for the chunk-
+        // completing logical message. Decrement the REAL balance
+        // unconditionally, before the queued-vs-dead-lettered branch below:
+        // the broker already spent one permit dispatching this entry
+        // regardless of which branch the client routes it into.
+        self.permit_balance = self.permit_balance.saturating_sub(1);
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
             self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
             self.dead_letter_pending.push(msg);
@@ -1670,7 +1737,8 @@ mod tests {
         let f = c.initial_flow();
         assert_eq!(f.consumer_id, 1);
         assert_eq!(f.message_permits, 100);
-        assert_eq!(c.available_permits, 100);
+        assert_eq!(c.granted_permits, 100);
+        assert_eq!(c.permit_balance, 100);
     }
 
     #[test]
@@ -1804,6 +1872,161 @@ mod tests {
             .unwrap();
         assert!(c.queue.is_empty());
         assert_eq!(c.dead_letter_pending.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #349 — `permit_balance` dispatch-unit accounting.
+    //
+    // The broker debits one permit per *message unit* dispatched: K for a
+    // K-message batch entry, one per PIP-37 chunk, one per PIP-33 marker.
+    // These four tests pin the exact decrement count per shape.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_normal() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.deliver(
+            &message_cmd(0),
+            metadata(1),
+            None,
+            Bytes::from_static(b"x"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.permit_balance, 99,
+            "one plain single message consumes exactly one dispatch unit"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_batch() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+
+        // Build a batch payload: two singles with their length-prefixed metadata
+        // (mirrors `batch_message_explodes`).
+        let mut buf = bytes::BytesMut::new();
+        for payload in [b"a".as_ref(), b"bb".as_ref()] {
+            let sm = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            let sm_len = sm.encoded_len();
+            buf.extend_from_slice(&(sm_len as u32).to_be_bytes());
+            sm.encode(&mut buf).unwrap();
+            buf.extend_from_slice(payload);
+        }
+
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                metadata(2),
+                None,
+                buf.freeze(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 2),
+            other => panic!("expected Delivered(2), got {other:?}"),
+        }
+        assert_eq!(
+            c.permit_balance, 98,
+            "a K=2 batch entry consumes exactly K=2 dispatch units"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_chunk() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+
+        let make_chunk = |idx: i32, payload: &'static [u8]| {
+            let mut meta = pb::MessageMetadata {
+                producer_name: "p".to_owned(),
+                sequence_id: 1,
+                publish_time: 1_700_000_000,
+                ..Default::default()
+            };
+            meta.num_chunks_from_msg = Some(3);
+            meta.chunk_id = Some(idx);
+            meta.uuid = Some("u-shape".to_owned());
+            meta.total_chunk_msg_size = Some(6);
+            (meta, Bytes::from_static(payload))
+        };
+
+        let (m0, p0) = make_chunk(0, b"aa");
+        c.deliver(&message_cmd(0), m0, None, p0, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(
+            c.permit_balance, 99,
+            "the first (incomplete) chunk consumes one dispatch unit"
+        );
+
+        let (m1, p1) = make_chunk(1, b"bb");
+        c.deliver(&message_cmd(0), m1, None, p1, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(
+            c.permit_balance, 98,
+            "the second (incomplete) chunk consumes one dispatch unit"
+        );
+
+        let (m2, p2) = make_chunk(2, b"cc");
+        let outcome = c
+            .deliver(&message_cmd(0), m2, None, p2, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { .. }));
+        assert_eq!(
+            c.permit_balance, 97,
+            "the completing (3rd) chunk consumes the final dispatch unit — an \
+             N=3-chunk message decrements exactly N=3 total"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_marker() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.record_marker_consumed();
+        assert_eq!(
+            c.permit_balance, 99,
+            "one PIP-33 marker consumes exactly one dispatch unit"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_for_dlq_routed_message_too() {
+        // The dead-letter branch of `classify_and_queue` is still one broker
+        // dispatch unit — the broker already spent the permit dispatching
+        // the entry, regardless of whether the client routes it to the user
+        // queue or diverts it to the DLQ pending list on this arrival.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        c.max_redeliver_count = 2;
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.deliver(
+            &message_cmd(5),
+            metadata(1),
+            None,
+            Bytes::from_static(b"poison"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.dead_letter_pending.len(),
+            1,
+            "routed to DLQ, not the queue"
+        );
+        assert_eq!(
+            c.permit_balance, 99,
+            "a DLQ-routed message still consumes exactly one dispatch unit"
+        );
     }
 
     #[test]

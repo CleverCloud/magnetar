@@ -827,7 +827,8 @@ impl Connection {
             let mut consumer = slot.state.lock();
             consumer.queue.clear();
             consumer.pending_seek = None;
-            consumer.available_permits = 0;
+            consumer.granted_permits = 0;
+            consumer.permit_balance = 0;
             consumer.consumed_since_flow = 0;
             consumer.dead_letter_pending.clear();
             consumer.batch_ack_tracker.clear();
@@ -1178,7 +1179,7 @@ impl Connection {
     /// so [`Self::consumer_handle_is_terminal`] returns `true` for this handle,
     /// drains + wakes every parked `receive()` waker so the future re-polls and
     /// resolves `Err` (instead of blocking forever on a subscription that will
-    /// never reattach — `available_permits` stays `0`), drops the per-session
+    /// never reattach — `granted_permits`/`permit_balance` stay `0`), drops the per-session
     /// subscribe request so a reconnect rebuild does not re-attach it, and
     /// pushes a [`ConnectionEvent::SubscribeFailed`] so an open future parked on
     /// the event stream also observes the terminal disposition.
@@ -1217,7 +1218,8 @@ impl Connection {
             Some(slot) => {
                 let mut c = slot.state.lock();
                 c.terminal_failure = Some(reason.to_owned());
-                c.available_permits = 0;
+                c.granted_permits = 0;
+                c.permit_balance = 0;
                 c.receive_wakers.drain().collect()
             }
             None => Vec::new(),
@@ -2952,9 +2954,12 @@ impl Connection {
                 // Issue #307: the broker tearing the dispatcher down resets its
                 // side of the flow-control window — the re-created consumer
                 // starts at `availablePermits = 0`. Re-sync the client's permit
-                // MIRROR to 0 here so it tracks broker reality. Without this the
-                // mirror stays stale (it is purely additive on the client side;
-                // `available_permits` is never decremented as messages arrive).
+                // MIRRORS to 0 here so they track broker reality. Without this
+                // `granted_permits` stays stale (it is purely additive on the
+                // client side; it is never decremented as messages arrive).
+                // Issue #349: `permit_balance` (the REAL, decrementing balance)
+                // is zeroed in lock-step for the same reason — this is a churn
+                // boundary, not a natural drain, so both mirrors reset together.
                 // `consumed_since_flow` is reset in lock-step so the
                 // `maybe_flow` threshold restarts cleanly once flow is re-armed
                 // (mirrors the `reset` re-attach path, which zeroes both). The
@@ -2963,7 +2968,8 @@ impl Connection {
                 // (the #65 / `duringSeek` invariant).
                 if let Some(slot) = self.consumers.get(&handle) {
                     let mut consumer = slot.state.lock();
-                    consumer.available_permits = 0;
+                    consumer.granted_permits = 0;
+                    consumer.permit_balance = 0;
                     consumer.consumed_since_flow = 0;
                 }
                 // Issue #307 ROOT CAUSE: a broker-initiated `CommandCloseConsumer`
@@ -3099,14 +3105,17 @@ impl Connection {
                 // permits, nothing else re-issues flow — `initial_flow` only
                 // runs at subscribe time / re-attach ack, and `maybe_flow`
                 // only fires once messages have been consumed (which can never
-                // happen at `available_permits == 0`, since the broker pushes
+                // happen at `granted_permits == 0`, since the broker pushes
                 // nothing). Such a promoted-but-starved consumer would block
                 // `receive()` forever with a non-empty broker backlog. Re-arm
                 // flow exactly once on promotion.
                 //
                 // Guarded so an already-fed consumer is left untouched (no
-                // double-flow): only when `available_permits == 0`, and only
-                // when the consumer is in a dispatch-eligible state — not
+                // double-flow): only when `granted_permits == 0` — issue #349
+                // kept this gate on the additive grant mirror (not
+                // `permit_balance`), the same "has the broker been told it may
+                // use anything yet" question the want-have delta answers — and
+                // only when the consumer is in a dispatch-eligible state — not
                 // user-closed, not paused, no in-flight seek freezing the
                 // queue, not terminal, and not mid-re-attach (the re-attach
                 // gate at the `Success` arm owns that flow). The predicate read
@@ -3115,7 +3124,7 @@ impl Connection {
                 let needs_reflow = active
                     && self.consumers.get(&handle).is_some_and(|slot| {
                         let consumer = slot.state.lock();
-                        consumer.available_permits == 0
+                        consumer.granted_permits == 0
                             && !consumer.closed
                             && !consumer.paused
                             && consumer.pending_seek.is_none()
@@ -4488,11 +4497,19 @@ impl Connection {
     /// Number of dispatch permits the consumer still has with the broker — i.e. messages
     /// it has authorised the broker to push without an explicit `CommandFlow`. Returns `0`
     /// for unknown handles. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    ///
+    /// Issue #349 scope note: this reads [`crate::consumer::ConsumerState::granted_permits`]
+    /// (the additive grant mirror), unchanged by the permit-balance split — out of scope per
+    /// the issue's four locked design items, which name only
+    /// [`crate::receiver_queue::FlowStats::available_permits`]. For the REAL, decrementing
+    /// balance see [`crate::consumer::ConsumerState::permit_balance`]; extending Java-parity
+    /// (a genuinely decrementing counter) to this public accessor is a separate, unscoped
+    /// change.
     #[must_use]
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
         self.consumers
             .get(&handle)
-            .map_or(0, |slot| slot.state.lock().available_permits)
+            .map_or(0, |slot| slot.state.lock().granted_permits)
     }
 
     /// The consumer's CURRENT receiver-queue target (issue #301). For the
@@ -11479,17 +11496,22 @@ mod conn_state_tests {
 
     #[test]
     fn auto_policy_grows_target_under_starvation_and_emits_incremental_flow() {
-        // With the broker holding zero permits (starvation) and the byte budget
-        // wide open, the adjust tick doubles the target and emits an incremental
+        // Issue #349: the broker's real permit BALANCE is drained by genuine
+        // dispatch (not a synthetic field write) and the byte budget is wide
+        // open — the adjust tick doubles the target and emits an incremental
         // flow for the delta.
         let interval = Duration::from_secs(1);
         let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
         let t0 = Instant::now();
 
-        // Drain the broker's grant to zero so `available_permits == 0` is the
-        // observed signal at tick time.
-        if let Some(slot) = conn.consumers.get(&handle) {
-            slot.state.lock().available_permits = 0;
+        // Drain the broker-side permit BALANCE via real dispatch — 100
+        // single-message deliveries against the 100-permit initial grant —
+        // so `available_permits == 0` is the genuine starvation signal at
+        // tick time, not a manually-zeroed mirror.
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
         }
 
         // First tick arms the adjust clock (no adjust yet).
@@ -11511,8 +11533,10 @@ mod conn_state_tests {
         let flow = drain_command_flow(&mut conn, handle)
             .expect("growing the target emits an incremental flow");
         assert_eq!(
-            flow.message_permits, 200,
-            "the broker had zero permits, so the delta tops it up to the new target"
+            flow.message_permits, 100,
+            "the broker had already been granted 100 permits (untouched by dispatch — \
+             `granted_permits` is a purely additive mirror); the delta tops it up from \
+             100 to the new 200 target"
         );
         assert_eq!(
             conn.consumer_available_permits(handle),
@@ -11546,13 +11570,17 @@ mod conn_state_tests {
     #[test]
     fn fixed_policy_default_never_adjusts() {
         // The default `Fixed` policy disables auto-adjust: no adjust deadline is
-        // surfaced and the target never moves even under starvation.
+        // surfaced and the target never moves even under genuine dispatch-driven
+        // starvation (real deliveries draining the permit balance to zero, not a
+        // synthetic field write).
         let (mut conn, handle) = handshake_subscribe_failover(); // receiver_queue_size: 100, Fixed
         let _ = conn.initial_flow(handle);
         let _ = conn.poll_transmit();
         let t0 = Instant::now();
-        if let Some(slot) = conn.consumers.get(&handle) {
-            slot.state.lock().available_permits = 0;
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
         }
         // Many ticks: a Fixed consumer never grows and never flows from adjust.
         for i in 0..10u32 {
@@ -11566,6 +11594,92 @@ mod conn_state_tests {
         assert!(
             drain_command_flow(&mut conn, handle).is_none(),
             "Fixed default never emits an adjust-driven flow"
+        );
+    }
+
+    #[test]
+    fn auto_policy_grows_under_real_dispatch_starvation() {
+        // Issue #349 regression: before the permit-balance split, the
+        // permit mirror was purely additive (grants only, never decremented
+        // as messages actually arrived), so a REAL dispatch-driven
+        // starvation never registered as zero and `Auto` could never
+        // observe the starvation signal it needs to grow. This test drives
+        // genuine message deliveries — not a synthetic field write — until
+        // the broker-side permit balance is truly exhausted, then asserts
+        // the adjust tick grows the target and emits an incremental flow.
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
+        let t0 = Instant::now();
+
+        // Real dispatch-unit starvation: deliver exactly the 100 permits'
+        // worth of single messages the initial flow granted, so the REAL
+        // balance drains to zero — no manual field write anywhere.
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
+        }
+
+        // First tick arms the schedule (no adjust yet).
+        conn.handle_timeout(t0);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "the arming tick does not itself adjust"
+        );
+
+        // Second tick, one interval later: real dispatch-driven starvation
+        // must be observed and must double the target.
+        conn.handle_timeout(t0 + interval);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "real dispatch-driven starvation must double the target (issue #349)"
+        );
+        let flow = drain_command_flow(&mut conn, handle)
+            .expect("growing the target under real starvation must emit an incremental flow");
+        assert_eq!(
+            flow.message_permits, 100,
+            "the broker had already been granted 100 permits (untouched by dispatch); \
+             the delta tops it up from 100 to the new 200 target"
+        );
+    }
+
+    #[test]
+    fn adjust_skips_growth_during_churn_window() {
+        // Issue #349 churn-window guard: a same-broker `CloseConsumer`
+        // zeroes the permit mirror as part of the #307 re-attach dance —
+        // that zero means "no outstanding grant to have starved against",
+        // NOT "the user is falling behind". Without the guard, an adjust
+        // tick landing in this window would misread the churn-zeroed
+        // balance as starvation and grow the target / emit a flow the
+        // broker would drop (it no longer knows this consumer id until the
+        // resubscribe's `Success` lands).
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
+        let t0 = Instant::now();
+
+        // Arm the adjust schedule before the churn event.
+        conn.handle_timeout(t0);
+        let _ = conn.poll_transmit();
+
+        // Same-broker bundle reassignment: the broker tears the consumer
+        // down and re-subscribes it in place, zeroing the permit mirror.
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0, &close).expect("handle broker close");
+        let _ = conn.poll_transmit();
+
+        // Tick past the adjust interval while sitting in the churn window.
+        conn.handle_timeout(t0 + interval);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "a churn-window tick must not grow the target"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "a churn-window tick must not emit an adjust-driven flow"
         );
     }
 

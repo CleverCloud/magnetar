@@ -242,10 +242,14 @@ impl Consumer {
     /// it has authorised the broker to push without an explicit `CommandFlow`. Mirrors
     /// Java `ConsumerBase#getAvailablePermits`.
     ///
+    /// Issue #349 scope note: reads `ConsumerState::granted_permits` (the additive grant
+    /// mirror), unchanged by the permit-balance split — out of scope per the issue's four
+    /// locked design items, which name only `FlowStats::available_permits`.
+    ///
     /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
-        self.slot.state.lock().available_permits
+        self.slot.state.lock().granted_permits
     }
 
     /// This consumer's CURRENT receiver-queue target (issue #301). For the
@@ -2689,9 +2693,13 @@ mod tests {
             let _ = conn.initial_flow(handle);
             // Seed at the floor.
             assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
-            // Drain the broker's grant so the tick observes starvation.
-            if let Some(slot) = conn.consumer(handle) {
-                slot.state.lock().available_permits = 0;
+            // Issue #349: drain the broker-side permit BALANCE via real
+            // dispatch — 100 single-message deliveries against the
+            // 100-permit initial grant — so the tick observes genuine
+            // starvation, not a synthetic field write.
+            for i in 0..100u64 {
+                let frame = command_message_bytes(handle.0, i, format!("m{i}").as_bytes());
+                conn.handle_bytes(t0, &frame).expect("deliver message");
             }
             // First tick arms the schedule; the second runs the adjust.
             conn.handle_timeout(t0);
