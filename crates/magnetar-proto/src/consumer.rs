@@ -416,6 +416,34 @@ pub struct ConsumerState {
     /// when the inbound entry's [`pb::MessageMetadata::replicated_from`] is
     /// also populated.
     pub shadow_metadata: Option<ShadowTopicMetadata>,
+    /// Last broker-reported Failover active/standby state (issue #348). `None`
+    /// until the first `CommandActiveConsumerChange` lands for this consumer;
+    /// thereafter mirrors the most recent `is_active` the broker sent. Set by
+    /// [`Self::record_active_change`], which also pushes the value onto
+    /// [`Self::active_changes`] and wakes every parked
+    /// [`Self::active_change_wakers`] entry. Mirrors Java
+    /// `ConsumerEventListener#becameActive` / `becameInactive` — the runtime
+    /// engines surface transitions via `Consumer::is_active` /
+    /// `Consumer::next_active_change`.
+    pub is_active: Option<bool>,
+    /// Bounded FIFO of not-yet-observed active/standby transitions, capped at
+    /// [`ACTIVE_CHANGES_CAP`] (oldest dropped on overflow — issue #348). Each
+    /// runtime `next_active_change()` future pops one entry per resolution via
+    /// [`Self::pop_active_change`]; [`Self::record_active_change`] pushes.
+    /// Mirrors [`Self::queue`]'s bounded-buffer shape, but for the much
+    /// lower-cardinality active-change signal (a Failover flip happens at most
+    /// a handful of times per session, so 32 is a generous cap — this exists
+    /// only to bound memory against a pathological broker, not because
+    /// legitimate traffic ever approaches it).
+    pub active_changes: VecDeque<bool>,
+    /// Per-consumer waker slab for parked `next_active_change()` futures
+    /// (issue #348). Mirrors [`Self::receive_wakers`] exactly: each in-flight
+    /// future registers a `Waker` via [`Self::register_active_change_waker`]
+    /// and evicts it on `Drop` via [`Self::cancel_active_change_waker`]; a
+    /// new recorded transition (or a terminal close) drains and wakes every
+    /// parked slot. Not a channel — a `Slab<Waker>` is the canonical
+    /// no-channel wake pattern (ADR-0003).
+    pub active_change_wakers: Slab<Waker>,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -619,6 +647,14 @@ impl ConsumerStats {
 /// `ConsumerConfigurationData#maxPendingChunkedMessage = 10`.
 pub const DEFAULT_MAX_PENDING_CHUNKED_MESSAGE: usize = 10;
 
+/// Bound on [`ConsumerState::active_changes`] (issue #348). A Failover
+/// promotion/demotion is a rare, broker-scheduled event — this cap exists
+/// only to bound memory against a pathological/hostile broker flooding
+/// `CommandActiveConsumerChange`, not because legitimate traffic approaches
+/// it. Overflow drops the oldest entry (matches the ring semantics
+/// documented on [`ConsumerState::active_changes`]).
+pub const ACTIVE_CHANGES_CAP: usize = 32;
+
 /// Default for [`ConsumerState::expire_time_of_incomplete_chunked_message`].
 /// Mirrors Java `expireTimeOfIncompleteChunkedMessageMillis = 60_000` (1 minute).
 pub const DEFAULT_EXPIRE_TIME_OF_INCOMPLETE_CHUNKED_MESSAGE: std::time::Duration =
@@ -795,6 +831,9 @@ impl ConsumerState {
             current_msgs_per_sec: 0.0,
             current_bytes_per_sec: 0.0,
             shadow_metadata: None,
+            is_active: None,
+            active_changes: VecDeque::new(),
+            active_change_wakers: Slab::new(),
         }
     }
 
@@ -1698,6 +1737,60 @@ impl ConsumerState {
     pub fn close(&mut self) {
         self.closed = true;
         self.wake_receivers();
+        // Issue #348: a `next_active_change()` future already parked when the
+        // user closes the consumer must resolve promptly instead of hanging
+        // forever — mirror the receive-waker wake above exactly.
+        self.wake_active_change_waiters();
+    }
+
+    /// Record a broker-reported Failover active/standby transition (issue
+    /// #348). Sets [`Self::is_active`] to the new state, pushes it onto the
+    /// bounded [`Self::active_changes`] ring (dropping the oldest entry once
+    /// [`ACTIVE_CHANGES_CAP`] is reached), then drains and wakes every parked
+    /// [`Self::active_change_wakers`] entry — the same drain-all fan-out
+    /// semantic [`Self::wake_receivers`] uses.
+    pub fn record_active_change(&mut self, active: bool) {
+        self.is_active = Some(active);
+        if self.active_changes.len() >= ACTIVE_CHANGES_CAP {
+            self.active_changes.pop_front();
+        }
+        self.active_changes.push_back(active);
+        self.wake_active_change_waiters();
+    }
+
+    /// Pop the oldest not-yet-observed active-change transition, if any.
+    /// Mirrors [`Self::pop_message`]'s FIFO-front semantics.
+    pub fn pop_active_change(&mut self) -> Option<bool> {
+        self.active_changes.pop_front()
+    }
+
+    /// Register a waker that fires when a new active-change transition is
+    /// recorded or the consumer reaches a terminal state. Returns a slab key
+    /// the caller MUST pass to [`Self::cancel_active_change_waker`] if the
+    /// future is dropped before observing the wake. Mirrors
+    /// [`Self::register_receive_waker`].
+    pub fn register_active_change_waker(&mut self, waker: Waker) -> usize {
+        self.active_change_wakers.insert(waker)
+    }
+
+    /// Evict a previously-registered active-change waker. Idempotent — a
+    /// missing slot is a no-op (a concurrent wake may already have drained
+    /// it). Mirrors [`Self::cancel_receive_waker`].
+    pub fn cancel_active_change_waker(&mut self, slab_key: usize) {
+        if self.active_change_wakers.contains(slab_key) {
+            self.active_change_wakers.remove(slab_key);
+        }
+    }
+
+    /// Drain every parked active-change waker and wake it. Mirrors
+    /// [`Self::wake_receivers`] exactly — drain-all rather than wake-one, so
+    /// every concurrent `next_active_change()` future re-polls and the first
+    /// to acquire the connection lock pops the transition.
+    fn wake_active_change_waiters(&mut self) {
+        let wakers: Vec<Waker> = self.active_change_wakers.drain().collect();
+        for w in wakers {
+            w.wake();
+        }
     }
 }
 

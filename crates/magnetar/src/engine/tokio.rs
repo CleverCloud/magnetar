@@ -506,6 +506,16 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
         magnetar_runtime_tokio::Consumer::receive_latency_histogram(self)
     }
 
+    fn is_active(&self) -> Option<bool> {
+        magnetar_runtime_tokio::Consumer::is_active(self)
+    }
+
+    fn next_active_change(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_tokio::Consumer::next_active_change(self))
+    }
+
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         magnetar_runtime_tokio::Consumer::last_disconnected_timestamp(self)
     }

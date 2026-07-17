@@ -493,6 +493,24 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// distribution a sound merge needs.
     fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>>;
 
+    /// Last broker-reported Failover active/standby state (issue #348).
+    /// `None` until the first `CommandActiveConsumerChange` lands for this
+    /// consumer (e.g. a `Shared` / `Exclusive` subscription never receives
+    /// it). Mirrors the implicit state Java's `ConsumerEventListener`
+    /// callbacks track.
+    fn is_active(&self) -> Option<bool>;
+
+    /// Resolve the next not-yet-observed Failover active/standby transition.
+    /// Backs [`crate::spawn_consumer_event_listener`] — the poller awaits
+    /// this in a loop and turns each `Ok(bool)` into a
+    /// [`crate::ConsumerEvent::BecameActive`] /
+    /// [`crate::ConsumerEvent::BecameInactive`] callback. Resolves the same
+    /// error [`Self::receive`] does once the consumer reaches a terminal
+    /// state with no unobserved transition buffered.
+    fn next_active_change(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>>;
+
     /// Wall-clock timestamp of the last broker disconnection observed
     /// by this consumer's connection, or `None` if no disconnect has
     /// happened yet. Mirrors Java

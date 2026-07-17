@@ -352,6 +352,34 @@ impl<P: Providers> Consumer<P> {
         self.stats().total_msgs_received > 0
     }
 
+    /// Last broker-reported Failover active/standby state (issue #348).
+    /// `None` until the first `CommandActiveConsumerChange` lands for this
+    /// consumer (e.g. a `Shared` / `Exclusive` subscription never receives
+    /// the command). 1:1 with the tokio engine.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn is_active(&self) -> Option<bool> {
+        self.slot.state.lock().is_active
+    }
+
+    /// Resolve the next not-yet-observed Failover active/standby transition
+    /// (issue #348). Mirrors [`Self::receive`]'s waker-slab parking pattern.
+    /// 1:1 with the tokio engine.
+    ///
+    /// # Errors
+    /// Resolves the same error [`Self::receive`] does once the consumer
+    /// reaches a terminal state (closed, or a per-handle terminal subscribe
+    /// failure) with no unobserved transition buffered.
+    pub async fn next_active_change(&self) -> Result<bool, ClientError> {
+        ActiveChangeFut {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            slab_key: None,
+        }
+        .await
+    }
+
     /// Returns `true` if this consumer is currently paused (no automatic
     /// flow refills until [`Self::resume`]). Returns `false` for
     /// closed/unknown handles. Mirrors Java `Consumer#isPaused` (Pulsar
@@ -1747,6 +1775,80 @@ impl Future for ReceiveFut {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
+    }
+}
+
+/// Future returned by [`Consumer::next_active_change`] (issue #348). Parks on
+/// the per-consumer active-change waker slab exposed by
+/// [`magnetar_proto::Connection::register_consumer_active_change_waker`]
+/// until a transition is recorded or the consumer reaches a terminal state.
+///
+/// On drop the future evicts its slab slot via
+/// [`magnetar_proto::Connection::cancel_consumer_active_change_waker`] so
+/// cancelled waits don't leak entries until the next transition. 1:1 mirror
+/// of `magnetar_runtime_tokio::consumer::ActiveChangeFut`.
+struct ActiveChangeFut {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    /// Slab key of the currently-installed waker, if any.
+    slab_key: Option<usize>,
+}
+
+impl Drop for ActiveChangeFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            let mut conn = self.shared.inner.lock();
+            conn.cancel_consumer_active_change_waker(self.handle, key);
+        }
+    }
+}
+
+impl Future for ActiveChangeFut {
+    type Output = Result<bool, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let handle = this.handle;
+        let shared = this.shared.clone();
+        let mut conn = shared.inner.lock();
+        if let Some(active) = conn.pop_consumer_active_change(handle) {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_active_change_waker(handle, key);
+            }
+            return Poll::Ready(Ok(active));
+        }
+        // Genuinely-terminal state with no buffered transition → resolve Err.
+        // Same terminal-vs-recoverable distinction as `ReceiveFut` (issue
+        // #299). 1:1 with the tokio engine.
+        if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
+            if let Some(old_key) = this.slab_key.take() {
+                conn.cancel_consumer_active_change_waker(handle, old_key);
+            }
+            return Poll::Ready(Err(ClientError::Closed));
+        }
+        // Refresh the slab registration so the current task is the one woken.
+        if let Some(old_key) = this.slab_key.take() {
+            conn.cancel_consumer_active_change_waker(handle, old_key);
+        }
+        if let Some(key) = conn.register_consumer_active_change_waker(handle, cx.waker().clone()) {
+            // Close the race where a transition is recorded between the pop
+            // check above and the slab insert.
+            if let Some(active) = conn.pop_consumer_active_change(handle) {
+                conn.cancel_consumer_active_change_waker(handle, key);
+                return Poll::Ready(Ok(active));
+            }
+            if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
+                conn.cancel_consumer_active_change_waker(handle, key);
+                return Poll::Ready(Err(ClientError::Closed));
+            }
+            this.slab_key = Some(key);
+            drop(conn);
+            return Poll::Pending;
+        }
+        // Consumer was removed in the meantime; surface as closed on the next poll.
+        drop(conn);
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

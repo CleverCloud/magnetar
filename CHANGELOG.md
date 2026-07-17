@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   One provider-backed `OperationDeadline` spans every setup stage and composite child, preserving the newest retryable broker error if a later deadline fires.
   Tokio and Moonpool share the policy with injected-time parity.
   ([#343](https://github.com/CleverCloud/magnetar/issues/343), ADR-0080)
+- **`ConsumerEventListener` (Failover becameActive/becameInactive parity):** `ConsumerBuilder::consumer_event_listener(...)` + `subscribe_with_event_listener()` mirror Java's `ConsumerBuilder#consumerEventListener`. `ConsumerEvent::{BecameActive,BecameInactive}` fires from a detached poller task, sequentially, once per broker `CommandActiveConsumerChange` — the same push-delivery poller shape ADR-0064's `MessageListener` uses, driving the new `Consumer::next_active_change()` future instead of `receive()`. `Consumer::is_active()` exposes the last-reported state synchronously (`None` until the first transition). Proto-side, `ConsumerState` gains a bounded per-slot active-change ring (`ACTIVE_CHANGES_CAP = 32`, oldest dropped) recorded under the SAME per-slot lock the #307 reflow predicate already holds — one lock acquisition, not two. Also closes a latent leak: `ConnectionEvent::ActiveConsumerChanged` previously accumulated unbounded in the proto event queue (neither driver drained it); it is now silently consumed like `ChecksumMismatch`.
+  (#348; ADR-0081)
 
 ### Fixed
 

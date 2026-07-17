@@ -1026,13 +1026,25 @@ impl Connection {
         // (4) Wake every in-flight receive so it observes the terminal drop and
         // returns an error (the engine's receive future re-polls, sees
         // `!is_connected()` after the paired `mark_disconnected`, and errors).
-        // Drop the slot lock BEFORE waking.
+        // Drop the slot lock BEFORE waking. Issue #348: a parked
+        // `next_active_change()` future is a terminal-close observer too —
+        // wake its waker slab in the same pass so it resolves promptly
+        // instead of hanging forever.
         for slot in self.consumers.values() {
-            let wakers: Vec<std::task::Waker> = {
+            let (receive_wakers, active_change_wakers): (
+                Vec<std::task::Waker>,
+                Vec<std::task::Waker>,
+            ) = {
                 let mut consumer = slot.state.lock();
-                consumer.receive_wakers.drain().collect()
+                (
+                    consumer.receive_wakers.drain().collect(),
+                    consumer.active_change_wakers.drain().collect(),
+                )
             };
-            for w in wakers {
+            for w in receive_wakers {
+                w.wake();
+            }
+            for w in active_change_wakers {
                 w.wake();
             }
         }
@@ -1213,18 +1225,28 @@ impl Connection {
         reason: &str,
     ) {
         // Set the terminal marker + drain the parked receive wakers under the
-        // slot lock, then wake them outside it.
-        let wakers: Vec<std::task::Waker> = match self.consumers.get(&handle) {
-            Some(slot) => {
-                let mut c = slot.state.lock();
-                c.terminal_failure = Some(reason.to_owned());
-                c.granted_permits = 0;
-                c.permit_balance = 0;
-                c.receive_wakers.drain().collect()
-            }
-            None => Vec::new(),
-        };
+        // slot lock, then wake them outside it. Issue #348: also drain the
+        // active-change wakers in the same pass — a parked
+        // `next_active_change()` future must observe this terminal failure
+        // exactly like `receive()` does.
+        let (wakers, active_change_wakers): (Vec<std::task::Waker>, Vec<std::task::Waker>) =
+            match self.consumers.get(&handle) {
+                Some(slot) => {
+                    let mut c = slot.state.lock();
+                    c.terminal_failure = Some(reason.to_owned());
+                    c.granted_permits = 0;
+                    c.permit_balance = 0;
+                    (
+                        c.receive_wakers.drain().collect(),
+                        c.active_change_wakers.drain().collect(),
+                    )
+                }
+                None => (Vec::new(), Vec::new()),
+            };
         for w in wakers {
+            w.wake();
+        }
+        for w in active_change_wakers {
             w.wake();
         }
         // Drop the per-session subscribe request so a reconnect rebuild does
@@ -3100,6 +3122,13 @@ impl Connection {
                 let active = acc.is_active.unwrap_or(false);
                 self.events
                     .push_back(ConnectionEvent::ActiveConsumerChanged { handle, active });
+                // Issue #348: record the transition into the per-slot
+                // active-change ring (`is_active` + `active_changes` +
+                // waker fan-out) under the SAME per-slot lock acquisition
+                // the #307 reflow predicate below reads — one lock section
+                // for record + predicate, dropped before `initial_flow`
+                // re-acquires it (ADR-0038 lock ordering).
+                //
                 // Failover re-arm (issue #307): when a standby consumer is
                 // promoted to active and is sitting at zero broker-side
                 // permits, nothing else re-issues flow — `initial_flow` only
@@ -3121,16 +3150,17 @@ impl Connection {
                 // gate at the `Success` arm owns that flow). The predicate read
                 // takes only the per-slot lock and is dropped before
                 // `initial_flow` re-acquires it (ADR-0038 lock ordering).
-                let needs_reflow = active
-                    && self.consumers.get(&handle).is_some_and(|slot| {
-                        let consumer = slot.state.lock();
-                        consumer.granted_permits == 0
-                            && !consumer.closed
-                            && !consumer.paused
-                            && consumer.pending_seek.is_none()
-                            && !consumer.reached_end_of_topic
-                            && !consumer.flow_on_subscribe_ack
-                    });
+                let needs_reflow = self.consumers.get(&handle).is_some_and(|slot| {
+                    let mut consumer = slot.state.lock();
+                    consumer.record_active_change(active);
+                    active
+                        && consumer.granted_permits == 0
+                        && !consumer.closed
+                        && !consumer.paused
+                        && consumer.pending_seek.is_none()
+                        && !consumer.reached_end_of_topic
+                        && !consumer.flow_on_subscribe_ack
+                });
                 if needs_reflow {
                     let _ = self.initial_flow(handle);
                     tracing::debug!(
@@ -4510,6 +4540,20 @@ impl Connection {
         self.consumers
             .get(&handle)
             .map_or(0, |slot| slot.state.lock().granted_permits)
+    }
+
+    /// Last broker-reported Failover active/standby state for `handle`
+    /// (issue #348). `None` for an unknown handle OR a consumer that has
+    /// never received a `CommandActiveConsumerChange` (e.g. a `Shared` /
+    /// `Exclusive` subscription, which the broker never sends the command
+    /// for). Mirrors Java `ConsumerEventListener`'s implicit state — the
+    /// runtime `Consumer::is_active()` accessor reads this via the per-slot
+    /// lock, no global lock required.
+    #[must_use]
+    pub fn consumer_is_active(&self, handle: ConsumerHandle) -> Option<bool> {
+        self.consumers
+            .get(&handle)
+            .and_then(|slot| slot.state.lock().is_active)
     }
 
     /// The consumer's CURRENT receiver-queue target (issue #301). For the
@@ -5920,6 +5964,41 @@ impl Connection {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().cancel_receive_waker(slab_key);
         }
+    }
+
+    /// Register a per-consumer active-change waker (issue #348). Returns
+    /// `Some(slab_key)` if the consumer is alive (the caller MUST evict the
+    /// slot via [`Self::cancel_consumer_active_change_waker`] on drop), or
+    /// `None` if the consumer has been closed in the meantime. Mirrors
+    /// [`Self::register_consumer_receive_waker`].
+    pub fn register_consumer_active_change_waker(
+        &mut self,
+        handle: ConsumerHandle,
+        waker: Waker,
+    ) -> Option<usize> {
+        let slot = self.consumers.get(&handle)?;
+        Some(slot.state.lock().register_active_change_waker(waker))
+    }
+
+    /// Evict a previously-registered per-consumer active-change waker.
+    /// Idempotent — safe to call from a `Drop` impl even if the consumer has
+    /// been removed or the slot already drained. Mirrors
+    /// [`Self::cancel_consumer_receive_waker`].
+    pub fn cancel_consumer_active_change_waker(&mut self, handle: ConsumerHandle, slab_key: usize) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().cancel_active_change_waker(slab_key);
+        }
+    }
+
+    /// Pop the oldest not-yet-observed active-change transition for `handle`
+    /// (issue #348). Returns `None` for an unknown handle or an empty ring.
+    /// Mirrors [`Self::pop_message`].
+    pub fn pop_consumer_active_change(&mut self, handle: ConsumerHandle) -> Option<bool> {
+        self.consumers
+            .get(&handle)?
+            .state
+            .lock()
+            .pop_active_change()
     }
 
     /// Drain a single message from the given consumer's queue.
@@ -10815,6 +10894,13 @@ mod conn_state_tests {
         let flow = drain_command_flow(&mut conn, handle).expect("CommandFlow emitted on promotion");
         assert_eq!(flow.message_permits, 100);
 
+        // Issue #348: the per-slot active-state surface reflects the promotion.
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active must track the broker-reported promotion"
+        );
+
         // The ActiveConsumerChanged event is still surfaced.
         let mut saw_event = false;
         while let Some(ev) = conn.poll_event() {
@@ -10849,6 +10935,11 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no extra CommandFlow when permits are already outstanding"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active must track the broker-reported redundant promotion"
+        );
     }
 
     #[test]
@@ -10874,6 +10965,11 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow for a paused consumer"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active tracks the broker report independently of the reflow gate"
+        );
     }
 
     #[test]
@@ -10897,6 +10993,11 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow for a closed consumer"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active tracks the broker report independently of the reflow gate"
+        );
     }
 
     #[test]
@@ -10919,6 +11020,85 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow on demotion"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(false),
+            "consumer_is_active must track the broker-reported demotion"
+        );
+    }
+
+    /// Issue #348: a recorded active-change transition is poppable exactly
+    /// once via [`Connection::pop_consumer_active_change`], mirroring
+    /// `pop_message`'s single-consumption semantics.
+    #[test]
+    fn active_change_recorded_and_poppable() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+
+        let frame = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        assert_eq!(
+            conn.pop_consumer_active_change(handle),
+            Some(true),
+            "the recorded transition must be poppable"
+        );
+        assert_eq!(
+            conn.pop_consumer_active_change(handle),
+            None,
+            "a popped transition is consumed — the ring drains once"
+        );
+    }
+
+    /// Issue #348: the `active_changes` ring is capped at `ACTIVE_CHANGES_CAP`
+    /// (32) — pushing a 33rd transition drops the oldest, not the newest.
+    #[test]
+    fn active_change_ring_caps_at_32_dropping_oldest() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+
+        let pushed: Vec<bool> = (0..33u32).map(|i| i % 2 == 0).collect();
+        for &active in &pushed {
+            let frame = active_consumer_change_frame(handle, active);
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle active-change");
+        }
+
+        let mut drained = Vec::new();
+        while let Some(active) = conn.pop_consumer_active_change(handle) {
+            drained.push(active);
+        }
+
+        assert_eq!(drained.len(), 32, "the ring caps at ACTIVE_CHANGES_CAP");
+        assert_eq!(
+            drained,
+            pushed[1..],
+            "the OLDEST transition (index 0) is dropped, the rest survive in order"
+        );
+    }
+
+    /// Issue #348: `consumer_is_active` mirrors the last broker report —
+    /// `None` before any `CommandActiveConsumerChange`, then flips with each
+    /// subsequent frame regardless of direction.
+    #[test]
+    fn is_active_tracks_last_broker_report() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            None,
+            "no active-change frame observed yet"
+        );
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle active-change (promote)");
+        assert_eq!(conn.consumer_is_active(handle), Some(true));
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, false))
+            .expect("handle active-change (demote)");
+        assert_eq!(conn.consumer_is_active(handle), Some(false));
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle active-change (re-promote)");
+        assert_eq!(conn.consumer_is_active(handle), Some(true));
     }
 
     /// Drain the next `CommandSubscribe` for `handle` out of the outbound

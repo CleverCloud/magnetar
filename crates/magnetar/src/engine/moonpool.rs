@@ -688,6 +688,18 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
         magnetar_runtime_moonpool::Consumer::receive_latency_histogram(self)
     }
 
+    fn is_active(&self) -> Option<bool> {
+        magnetar_runtime_moonpool::Consumer::is_active(self)
+    }
+
+    fn next_active_change(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::next_active_change(
+            self,
+        ))
+    }
+
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {
         magnetar_runtime_moonpool::Consumer::last_disconnected_timestamp(self)
     }

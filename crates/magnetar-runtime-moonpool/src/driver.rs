@@ -169,6 +169,7 @@ fn handle_pending_events(
                     | ConnectionEvent::RedirectUrlRejected { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
                     | ConnectionEvent::ChecksumMismatch { .. }
+                    | ConnectionEvent::ActiveConsumerChanged { .. }
                     | ConnectionEvent::LookupResponse {
                         result: magnetar_proto::LookupOutcome::Redirected { .. },
                         ..
@@ -372,7 +373,15 @@ fn handle_pending_events(
             // `LookupOutcome::Redirected` — the `poll_event_if` predicate
             // above admits no other lookup result. Mirror of the tokio
             // driver.
+            //
+            // `ActiveConsumerChanged` (issue #348) is drained the same way:
+            // the real per-slot active-state surface (`Consumer::is_active` /
+            // `next_active_change`) is fed directly by the proto layer's
+            // `record_active_change` under the per-slot lock, NOT by this
+            // event queue — draining it here only stops it from piling up
+            // unbounded in the proto queue, which nothing else polls.
             ConnectionEvent::ChecksumMismatch { .. } => {}
+            ConnectionEvent::ActiveConsumerChanged { .. } => {}
             ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }

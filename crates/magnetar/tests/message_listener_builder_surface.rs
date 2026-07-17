@@ -288,3 +288,56 @@ async fn message_listener_wired_on_wrapper_builders() {
         "missing listener must be a Config error on the pattern builder, got: {pattern_err:?}"
     );
 }
+
+/// Companion pin for `ConsumerBuilder::consumer_event_listener` (issue #348,
+/// ADR-0081) — the same completeness contract as
+/// `message_listener_wired_on_single_topic_and_typed_builders`, adapted to
+/// the `#[doc(hidden)]` `has_event_listener_for_test()` seam and the
+/// `subscribe_with_event_listener()` missing-listener guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consumer_event_listener_wired_on_base_builder() {
+    let addr = spawn_fake_broker().await;
+    let client = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        PulsarClient::builder()
+            .service_url(format!("pulsar://{addr}"))
+            .build(),
+    )
+    .await
+    .expect("connect did not time out")
+    .expect("connect ok");
+
+    let noop: magnetar::ConsumerEventListener = Arc::new(|_e: magnetar::ConsumerEvent| {});
+    let base = client
+        .consumer("persistent://public/default/cel-base")
+        .subscription("g")
+        .subscription_type(SubType::Failover)
+        .consumer_event_listener(noop);
+    assert!(
+        base.has_event_listener_for_test(),
+        "ConsumerBuilder::consumer_event_listener must set the event-listener slot"
+    );
+
+    // Default builder (no setter) has no event listener.
+    assert!(
+        !client
+            .consumer("persistent://public/default/cel-base-default")
+            .subscription("g")
+            .has_event_listener_for_test(),
+        "a ConsumerBuilder without consumer_event_listener() has no event listener"
+    );
+
+    // subscribe_with_event_listener() with no listener fails fast with
+    // `PulsarError::Config` — the guard runs before any wire call.
+    let err = client
+        .consumer("persistent://public/default/cel-nolistener")
+        .subscription("g")
+        .subscription_type(SubType::Failover)
+        .subscribe_with_event_listener()
+        .await
+        .expect_err("subscribe_with_event_listener with no listener must error");
+    assert!(
+        matches!(err, PulsarError::Config(_)),
+        "missing event listener must be a Config error, got: {err:?}"
+    );
+}

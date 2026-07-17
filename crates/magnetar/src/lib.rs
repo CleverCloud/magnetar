@@ -113,7 +113,8 @@ pub use client::{
 pub use client_builder::ClientBuilder;
 #[cfg(feature = "tokio")]
 pub use consumer_listener::{
-    MessageListener, MessageListenerHandle, WrapperMessageListener, WrapperReceiver,
+    ConsumerEvent, ConsumerEventListener, ConsumerEventListenerHandle, MessageListener,
+    MessageListenerHandle, WrapperMessageListener, WrapperReceiver, spawn_consumer_event_listener,
     spawn_message_listener, spawn_wrapper_message_listener,
 };
 #[cfg(feature = "tokio")]

@@ -80,6 +80,30 @@
 //! creates every child — initial or later-discovered — with its own
 //! `messageListener` set to `null` (`getInternalConsumerConfig`), routing all
 //! delivery through the parent's listener.
+//!
+//! ## `ConsumerEventListener` (issue #348, ADR-0081)
+//!
+//! A second, unrelated push surface lives in this module: [`ConsumerEvent`],
+//! [`ConsumerEventListener`], and [`spawn_consumer_event_listener`] mirror
+//! Java `ConsumerEventListener#becameActive` and `#becameInactive` — the
+//! Failover subscription active/standby callback, NOT message delivery. The
+//! shape is the same poller pattern as [`spawn_message_listener`]
+//! (`tokio::spawn`ed `loop { await; callback }`, no channel, engine-generic
+//! over `C: ConsumerApi + Clone`), driving
+//! [`crate::ConsumerApi::next_active_change`] instead of
+//! [`crate::ConsumerApi::receive`]. The builder-surface twin of
+//! `message_listener(...)` and `subscribe_with_listener()` is
+//! `ConsumerBuilder::consumer_event_listener(...)` together with
+//! `subscribe_with_event_listener()`, which moves the consumer into the
+//! event poller the same way — each `subscribe_with_*` terminal attaches
+//! only its own listener kind (mirroring how the plain `subscribe()`
+//! ignores a configured `message_listener`). A caller that wants both a
+//! message listener AND a consumer event listener on the same consumer
+//! subscribes once (pull-mode), clones the consumer, and passes one clone to
+//! each of [`spawn_message_listener`] and [`spawn_consumer_event_listener`]
+//! directly — the same "clone to run two independent loops over the same
+//! handle" pattern [`spawn_message_listener`]'s own doc recommends for the
+//! ack side-channel.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -295,6 +319,122 @@ pub trait WrapperReceiver: Clone + Send + Sync + 'static {
 /// re-snapshots and starts draining the new child. An empty wrapper (e.g. a
 /// pattern with no current match) parks on the membership signal instead of
 /// spinning on the empty-set error.
+/// Event surfaced by a push-delivery [`ConsumerEventListener`] (issue #348).
+/// Mirrors Java `ConsumerEventListener#becameActive(Consumer, int)` /
+/// `becameInactive(Consumer, int)` — the Failover subscription
+/// active-consumer transitions. magnetar drops the `partitionId` argument
+/// (single-topic consumers only; a partitioned consumer's per-partition
+/// event listener is attached per child, so the topic/partition is already
+/// implicit in which consumer's listener fired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsumerEvent {
+    /// This consumer was promoted to the active Failover consumer.
+    BecameActive,
+    /// This consumer was demoted to Failover stand-by.
+    BecameInactive,
+}
+
+/// Callback fired for every Failover active/standby transition observed by a
+/// push-mode consumer event listener. Mirrors [`MessageListener`]'s shape —
+/// a **synchronous** callback, invoked sequentially from the poller task.
+/// Mirrors Java `ConsumerEventListener#becameActive` /
+/// `#becameInactive`, collapsed into one callback taking [`ConsumerEvent`]
+/// (no consumer/partition argument — hold a clone of your consumer in the
+/// closure if you need to act on it, the same convention
+/// [`MessageListener`] uses).
+pub type ConsumerEventListener = Arc<dyn Fn(ConsumerEvent) + Send + Sync>;
+
+/// Owns the background poller task driving a [`ConsumerEventListener`].
+/// Structurally identical to [`MessageListenerHandle`] — dropping the handle
+/// aborts the poller; [`Self::close`] awaits a clean stop.
+///
+/// The poller terminates on its own when an explicit or terminal remote
+/// close makes [`crate::ConsumerApi::next_active_change`] return an error.
+pub struct ConsumerEventListenerHandle {
+    handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for ConsumerEventListenerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let running = self
+            .handle
+            .try_lock()
+            .is_ok_and(|g| g.as_ref().is_some_and(|h| !h.is_finished()));
+        f.debug_struct("ConsumerEventListenerHandle")
+            .field("running", &running)
+            .finish()
+    }
+}
+
+impl Drop for ConsumerEventListenerHandle {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.handle.try_lock() {
+            if let Some(h) = g.take() {
+                h.abort();
+            }
+        }
+    }
+}
+
+impl ConsumerEventListenerHandle {
+    /// `true` while the poller task is still running. Flips to `false` once
+    /// the consumer reaches a terminal state (the loop broke) or the handle
+    /// has been [`Self::close`]d / dropped.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.handle
+            .try_lock()
+            .is_ok_and(|g| g.as_ref().is_some_and(|h| !h.is_finished()))
+    }
+
+    /// Stop the poller task and wait for it to unwind. Idempotent — a second
+    /// call (or a call after the consumer already terminated the loop) is a
+    /// no-op.
+    pub async fn close(&self) {
+        let mut g = self.handle.lock().await;
+        if let Some(h) = g.take() {
+            h.abort();
+            let _ = h.await;
+        }
+    }
+}
+
+/// Attach a [`ConsumerEventListener`] to an already-subscribed `consumer`,
+/// returning the owning [`ConsumerEventListenerHandle`]. The poller drives
+/// `consumer.next_active_change()` in a loop and invokes `listener` once per
+/// transition — [`ConsumerEvent::BecameActive`] for `Ok(true)`,
+/// [`ConsumerEvent::BecameInactive`] for `Ok(false)` — stopping cleanly the
+/// first time the future resolves `Err` (closed / terminally-disconnected
+/// consumer).
+///
+/// Engine-generic: `C: ConsumerApi + Clone` resolves to
+/// `magnetar_runtime_tokio::Consumer` or `magnetar_runtime_moonpool::Consumer<P>`,
+/// exactly like [`spawn_message_listener`]. No channel (ADR-0003), no extra
+/// lock (ADR-0038 — the loop takes only what `next_active_change()` already
+/// takes), no host-clock read (ADR-0011). The callback runs **only** inside
+/// this detached poller task, never under any lock.
+pub fn spawn_consumer_event_listener<C: crate::ConsumerApi + Clone>(
+    consumer: C,
+    listener: ConsumerEventListener,
+) -> ConsumerEventListenerHandle {
+    let join = tokio::spawn(async move {
+        loop {
+            let Ok(active) = crate::ConsumerApi::next_active_change(&consumer).await else {
+                // Consumer closed / connection terminally lost: stop cleanly.
+                break;
+            };
+            listener(if active {
+                ConsumerEvent::BecameActive
+            } else {
+                ConsumerEvent::BecameInactive
+            });
+        }
+    });
+    ConsumerEventListenerHandle {
+        handle: tokio::sync::Mutex::new(Some(join)),
+    }
+}
+
 pub fn spawn_wrapper_message_listener<R: WrapperReceiver>(
     receiver: R,
     listener: WrapperMessageListener,
