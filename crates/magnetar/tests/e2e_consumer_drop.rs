@@ -7,6 +7,8 @@
 //! client and shared connection remain alive. Reopening the same name and subscription on that
 //! client, then receiving a message, proves the connection remains usable and the broker-side
 //! consumer registration was released.
+//! The drop path also buffers a grouped acknowledgement before releasing the final clone and
+//! verifies that same-subscription recreation does not redeliver the acknowledged message.
 //! The explicit-close baseline additionally proves that closing through one clone and dropping the
 //! final clone keeps broker state absent and same-name recreation usable. Exact one-frame dedup is
 //! asserted by the paired runtime `consumer_drop_close.rs` tests because topic stats cannot count
@@ -141,6 +143,7 @@ async fn verify_final_clone_drop(client: &PulsarClient, admin: &AdminClient) -> 
         .subscription_type(SubType::Exclusive)
         .durable(true)
         .name(DROP_CONSUMER_NAME)
+        .ack_group_time(Duration::from_secs(60))
         .subscribe()
         .await?;
     wait_for_consumer_presence(
@@ -151,6 +154,14 @@ async fn verify_final_clone_drop(client: &PulsarClient, admin: &AdminClient) -> 
         true,
     )
     .await?;
+
+    let producer = client.producer(&drop_topic).create().await?;
+    producer
+        .send_bytes(b"consumer-drop-before-close".to_vec())
+        .await?;
+    let message = tokio::time::timeout(Duration::from_secs(10), consumer.receive()).await??;
+    assert_eq!(message.payload.as_ref(), b"consumer-drop-before-close");
+    consumer.ack_grouped(message.message_id);
 
     // Release the final clone without `close().await` while `client` remains alive.
     drop(consumer);
@@ -180,7 +191,19 @@ async fn verify_final_clone_drop(client: &PulsarClient, admin: &AdminClient) -> 
     )
     .await?;
 
-    let producer = client.producer(&drop_topic).create().await?;
+    match tokio::time::timeout(Duration::from_secs(1), recreated.receive()).await {
+        Err(_) => {}
+        Ok(Ok(message)) => {
+            return Err(format!(
+                "grouped acknowledgement was lost during consumer drop; recreated consumer \
+                 received payload {:?}",
+                message.payload
+            )
+            .into());
+        }
+        Ok(Err(error)) => return Err(error.into()),
+    }
+
     producer
         .send_bytes(b"consumer-drop-round-trip".to_vec())
         .await?;

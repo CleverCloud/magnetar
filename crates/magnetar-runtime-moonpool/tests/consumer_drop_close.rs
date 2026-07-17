@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    ConnectionConfig, FrameError, SubscribeRequest, decode_one, encode_command, pb,
+    ConnectionConfig, FrameError, MessageId, SubscribeRequest, decode_one, encode_command, pb,
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::TokioProviders;
@@ -209,11 +209,21 @@ async fn drop_last_clone_enqueues_close_consumer() {
                     subscription: "drop-last-clone".to_owned(),
                     receiver_queue_size: 16,
                     durable: true,
+                    ack_group_time: Some(Duration::from_secs(60)),
                     ..Default::default()
                 })
                 .await
                 .expect("subscribe ok");
             assert_eq!(close_consumer_count(&log), 0, "no close before drop");
+            consumer.ack_grouped(MessageId {
+                ledger_id: 7,
+                entry_id: 11,
+                partition: -1,
+                batch_index: -1,
+                batch_size: 0,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            });
 
             drop(consumer);
 
@@ -233,6 +243,21 @@ async fn drop_last_clone_enqueues_close_consumer() {
                 1,
                 "last-clone drop must enqueue exactly one CloseConsumer"
             );
+            {
+                let frames = log.lock();
+                let ack_position = frames
+                    .iter()
+                    .position(|kind| *kind == pb::base_command::Type::Ack as i32)
+                    .expect("drop close must flush the grouped acknowledgement");
+                let close_position = frames
+                    .iter()
+                    .position(|kind| *kind == pb::base_command::Type::CloseConsumer as i32)
+                    .expect("drop close must reach the broker");
+                assert!(
+                    ack_position < close_position,
+                    "grouped Ack must precede CloseConsumer, frames: {frames:?}"
+                );
+            }
             barrier.close().await.expect("barrier close ok");
             client.close().await;
         })

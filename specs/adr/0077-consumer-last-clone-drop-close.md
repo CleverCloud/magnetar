@@ -33,6 +33,8 @@ Dropping the last clone of a runtime `Consumer` synchronously stages a best-effo
 - If the connection has reached the terminal no-driver state, the guard is a no-op because no task remains to flush staged bytes.
 - `Connection::close_consumer_forget` registers `PendingRequestKind::ConsumerCloseForgotten`.
   Broker success consumes that request in place, and broker rejection emits a bounded structured warning under [ADR-0054](0054-logging-policy.md); neither path creates an undrained `OpOutcome`.
+- Before either awaited or forgotten close encodes `CommandCloseConsumer`, the protocol layer flushes any pending `AckGroupingTracker` actions and dispatches their `CommandAck` frames.
+  The slot lock is released before dispatch, preserving global-to-per-slot lock ordering while guaranteeing `Ack < CloseConsumer` wire order.
 - Connection reset and terminal `fail_all_pending` cleanup also discard forgotten producer and consumer closes without materializing outcomes.
 - Explicit `Consumer::close().await` remains the reliable path.
   It awaits the broker acknowledgement and returns broker or terminal errors to the caller.
@@ -50,6 +52,7 @@ This deliberately mirrors the producer last-clone lifecycle from [ADR-0057](0057
   Applications that require confirmation must call and await `close()`.
 - A process exit, runtime teardown, terminal driver failure, or socket failure may prevent the staged close from reaching the broker; the broker then cleans the resource when the connection disappears.
 - The protocol layer has separate awaited and forgotten consumer-close entry points, sharing the wire operation while keeping their completion bookkeeping distinct.
+- Buffered grouped acknowledgements are emitted before consumer teardown, so a durable subscription cursor is not lost merely because the grouping deadline extends past the consumer lifetime.
 - Both runtime engines intentionally carry mirrored guards because their `ConnectionShared` types are concrete engine-specific types.
 - The behavior follows [ADR-0054](0054-logging-policy.md) for structured lifecycle diagnostics and [ADR-0057](0057-producer-last-clone-drop-close.md) for the established last-clone RAII pattern.
 
@@ -57,10 +60,10 @@ This deliberately mirrors the producer last-clone lifecycle from [ADR-0057](0057
 
 The change ships with the five behavioral layers required by [ADR-0024](0024-cross-runtime-test-and-coverage-policy.md).
 
-- The `#[cfg(test)]` unit-test module in `crates/magnetar-proto/src/conn.rs` verifies awaited and forgotten close bookkeeping, including reset and terminal cleanup.
-- `crates/magnetar-runtime-{tokio,moonpool}/tests/consumer_drop_close.rs` verify final-clone close, intermediate-clone safety, continued use by a surviving clone, and explicit-close deduplication.
-- `crates/magnetar-differential/tests/consumer_drop_equivalence.rs` verifies identical Tokio and Moonpool event streams and `Subscribe < CloseConsumer < Subscribe < CloseConsumer < Send` wire ordering.
-- `crates/magnetar/tests/e2e_consumer_drop.rs` verifies against Pulsar 4.0.4 that final-clone drop unregisters the consumer while the client remains alive, same-name recreation succeeds, and explicit close remains the confirmation-bearing baseline.
+- The `#[cfg(test)]` unit-test module in `crates/magnetar-proto/src/conn.rs` verifies awaited and forgotten close bookkeeping, including grouped-ack flush ordering, reset, and terminal cleanup.
+- `crates/magnetar-runtime-{tokio,moonpool}/tests/consumer_drop_close.rs` verify final-clone close, grouped `Ack < CloseConsumer` ordering, intermediate-clone safety, continued use by a surviving clone, and explicit-close deduplication.
+- `crates/magnetar-differential/tests/consumer_drop_equivalence.rs` verifies identical Tokio and Moonpool event streams and two `Subscribe < Ack < CloseConsumer` wire sequences followed by the barrier send.
+- `crates/magnetar/tests/e2e_consumer_drop.rs` verifies against Pulsar 4.0.4 that final-clone drop unregisters the consumer while the client remains alive, flushes a buffered grouped acknowledgement without redelivery after same-subscription recreation, and preserves explicit close as the confirmation-bearing baseline.
 
 ## References
 

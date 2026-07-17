@@ -4827,6 +4827,17 @@ impl Connection {
     }
 
     fn close_consumer_inner(&mut self, handle: ConsumerHandle, forget: bool) -> RequestId {
+        let ack_actions = self.consumers.get(&handle).and_then(|slot| {
+            slot.state
+                .lock()
+                .ack_tracker
+                .as_mut()
+                .map(crate::trackers::AckGroupingTracker::flush)
+        });
+        if let Some(actions) = ack_actions {
+            self.dispatch_ack_actions(actions);
+        }
+
         let request_id = self.alloc_request_id();
         let cmd = pb::CommandCloseConsumer {
             consumer_id: handle.0,
@@ -11066,6 +11077,49 @@ mod consumer_close_contract_tests {
             vec![pb::base_command::Type::CloseConsumer as i32],
             "close_consumer must stage exactly one CloseConsumer frame"
         );
+    }
+
+    #[test]
+    fn close_consumer_flushes_grouped_acks_before_close_frame() {
+        let message_id = MessageId {
+            ledger_id: 7,
+            entry_id: 11,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+
+        for forget in [false, true] {
+            let now = Instant::now();
+            let mut conn = handshake_complete(now);
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/close-ack-order-{forget}"),
+                subscription: format!("close-ack-order-{forget}"),
+                receiver_queue_size: 16,
+                durable: true,
+                ack_group_time: Some(Duration::from_secs(60)),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            conn.ack_grouped_individual(handle, message_id, now);
+
+            if forget {
+                let _request_id = conn.close_consumer_forget(handle);
+            } else {
+                let _request_id = conn.close_consumer(handle);
+            }
+
+            assert_eq!(
+                drain_command_types(&mut conn),
+                vec![
+                    pb::base_command::Type::Ack as i32,
+                    pb::base_command::Type::CloseConsumer as i32,
+                ],
+                "{forget:?} close must flush grouped acknowledgements before CloseConsumer"
+            );
+        }
     }
 
     #[test]
