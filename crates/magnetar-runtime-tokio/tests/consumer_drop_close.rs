@@ -204,7 +204,7 @@ async fn drop_last_clone_enqueues_close_consumer() {
             subscription: "drop-last-clone".to_owned(),
             receiver_queue_size: 16,
             durable: true,
-            ack_group_time: Some(Duration::from_secs(60)),
+            ack_group_time: Some(Duration::from_mins(1)),
             ..Default::default()
         })
         .await

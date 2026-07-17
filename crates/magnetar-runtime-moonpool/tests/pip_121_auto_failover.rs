@@ -19,9 +19,9 @@
 //! `SimProviders` therefore drives it on Moonpool 0.8's native deterministic executor and virtual
 //! clock, while this focused policy test uses `TokioProviders` on the production-shaped path.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use magnetar_proto::{HealthProbe, ServiceUrlProvider};
@@ -47,6 +47,10 @@ struct ScriptedProbe {
     primary_script: Vec<bool>,
     /// Monotonic counter — bumped on every probe of the primary URL.
     primary_calls: AtomicUsize,
+    /// Number of primary probes the test has explicitly permitted.
+    allowed_primary_calls: AtomicUsize,
+    /// Wake the provider-spawned task when the test permits its next probe.
+    primary_waker: Mutex<Option<Waker>>,
 }
 
 impl ScriptedProbe {
@@ -54,13 +58,44 @@ impl ScriptedProbe {
         Self {
             primary_script,
             primary_calls: AtomicUsize::new(0),
+            allowed_primary_calls: AtomicUsize::new(0),
+            primary_waker: Mutex::new(None),
         }
+    }
+
+    fn allow_next_primary_probe(&self) {
+        self.allowed_primary_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(waker) = self
+            .primary_waker
+            .lock()
+            .expect("primary probe waker mutex poisoned")
+            .take()
+        {
+            waker.wake();
+        }
+    }
+
+    fn primary_call_count(&self) -> usize {
+        self.primary_calls.load(Ordering::SeqCst)
     }
 }
 
 impl HealthProbe for ScriptedProbe {
-    fn poll_probe(&self, endpoint: &str, _deadline: Instant, _cx: &mut Context<'_>) -> Poll<bool> {
+    fn poll_probe(&self, endpoint: &str, _deadline: Instant, cx: &mut Context<'_>) -> Poll<bool> {
         if endpoint.contains("primary") {
+            let completed = self.primary_calls.load(Ordering::SeqCst);
+            if completed >= self.allowed_primary_calls.load(Ordering::SeqCst) {
+                let mut primary_waker = self
+                    .primary_waker
+                    .lock()
+                    .expect("primary probe waker mutex poisoned");
+                let completed = self.primary_calls.load(Ordering::SeqCst);
+                if completed >= self.allowed_primary_calls.load(Ordering::SeqCst) {
+                    *primary_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+
             let idx = self.primary_calls.fetch_add(1, Ordering::SeqCst);
             let verdict = *self
                 .primary_script
@@ -97,42 +132,58 @@ async fn probe_loop_flips_active_url_in_sync_with_scripted_verdicts() {
 
             let handle = failover.start(&providers, TICK);
 
-            // Inline ticking. Each step waits one full `TICK` plus slack, then yields so the
-            // provider-spawned probe loop can complete its `time.sleep` and `poll_fn` await
-            // points before the assertion samples the active URL.
-            let tick = |label: &'static str| {
+            // Permit exactly one fresh primary probe per step, then wait for both the probe and
+            // its active-index update. The timeout bounds failure duration; elapsed wall time is
+            // not part of the success condition.
+            let tick =
+                |expected_primary_calls: usize, expected_active: usize, label: &'static str| {
                 let f = &failover;
+                let probe = Arc::clone(&probe);
                 async move {
-                    // Sleep slightly longer than one TICK so the probe
-                    // loop's sleep elapses, the loop body runs, and the
-                    // next sleep is entered before we snapshot. Real
-                    // time (not virtual) — see the TICK const for the
-                    // rationale.
-                    tokio::time::sleep(TICK + Duration::from_millis(10)).await;
+                    probe.allow_next_primary_probe();
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            let probe_completed =
+                                probe.primary_call_count() == expected_primary_calls;
+                            let active_matches = f.active_index() == expected_active;
+                            if probe_completed && active_matches {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out waiting for primary probe {expected_primary_calls} with active index {expected_active}; observed {} calls and active index {}",
+                            probe.primary_call_count(),
+                            f.active_index(),
+                        )
+                    });
                     tracing::debug!(label, active = f.active_index(), "tick observed");
                 }
             };
 
             // Tick 1: primary healthy.
-            tick("tick-1").await;
+            tick(1, 0, "tick-1").await;
             assert_eq!(failover.active_index(), 0);
             assert_eq!(failover.get_service_url(), PRIMARY);
 
             // Tick 2: primary unhealthy → switch to standby.
-            tick("tick-2").await;
+            tick(2, 1, "tick-2").await;
             assert_eq!(failover.active_index(), 1);
             assert_eq!(failover.get_service_url(), STANDBY);
 
             // Tick 3: primary healthy → switch back.
-            tick("tick-3").await;
+            tick(3, 0, "tick-3").await;
             assert_eq!(failover.active_index(), 0);
 
             // Tick 4: primary unhealthy → switch to standby.
-            tick("tick-4").await;
+            tick(4, 1, "tick-4").await;
             assert_eq!(failover.active_index(), 1);
 
             // Tick 5: primary still unhealthy → stays on standby.
-            tick("tick-5").await;
+            tick(5, 1, "tick-5").await;
             assert_eq!(failover.active_index(), 1);
 
             // moonpool main's `TaskProvider::JoinHandle` is an opaque

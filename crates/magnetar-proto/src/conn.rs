@@ -11099,7 +11099,7 @@ mod consumer_close_contract_tests {
                 subscription: format!("close-ack-order-{forget}"),
                 receiver_queue_size: 16,
                 durable: true,
-                ack_group_time: Some(Duration::from_secs(60)),
+                ack_group_time: Some(Duration::from_mins(1)),
                 ..Default::default()
             });
             let _ = conn.poll_transmit();

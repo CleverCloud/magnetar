@@ -61,7 +61,7 @@ async fn run_tokio_grouped_ack_drop(pulsar_url: &str) {
     let consumer = client
         .subscribe(subscribe_request(
             "grouped-ack",
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
         ))
         .await
         .expect("tokio grouped-ack subscribe");
@@ -84,7 +84,7 @@ async fn run_moonpool_grouped_ack_drop(host_port: &str) {
     let consumer = client
         .subscribe(subscribe_request(
             "grouped-ack",
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
         ))
         .await
         .expect("moonpool grouped-ack subscribe");

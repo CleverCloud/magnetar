@@ -16,9 +16,9 @@
 //! `AutoClusterFailover` + `TokioHealthProbe`.
 
 use std::future::poll_fn;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use magnetar_proto::{HealthProbe, ServiceUrlProvider};
@@ -42,6 +42,61 @@ struct ConstProbe(bool);
 impl HealthProbe for ConstProbe {
     fn poll_probe(&self, _endpoint: &str, _deadline: Instant, _cx: &mut Context<'_>) -> Poll<bool> {
         Poll::Ready(self.0)
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedProbe {
+    primary_script: Vec<bool>,
+    primary_calls: AtomicUsize,
+    allowed_primary_calls: AtomicUsize,
+    primary_waker: Mutex<Option<Waker>>,
+}
+
+impl ScriptedProbe {
+    fn allow_next_primary_probe(&self) {
+        self.allowed_primary_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(waker) = self
+            .primary_waker
+            .lock()
+            .expect("primary probe waker mutex poisoned")
+            .take()
+        {
+            waker.wake();
+        }
+    }
+
+    fn primary_call_count(&self) -> usize {
+        self.primary_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl HealthProbe for ScriptedProbe {
+    fn poll_probe(&self, endpoint: &str, _deadline: Instant, cx: &mut Context<'_>) -> Poll<bool> {
+        if endpoint.contains("primary") {
+            let completed = self.primary_calls.load(Ordering::SeqCst);
+            if completed >= self.allowed_primary_calls.load(Ordering::SeqCst) {
+                let mut primary_waker = self
+                    .primary_waker
+                    .lock()
+                    .expect("primary probe waker mutex poisoned");
+                let completed = self.primary_calls.load(Ordering::SeqCst);
+                if completed >= self.allowed_primary_calls.load(Ordering::SeqCst) {
+                    *primary_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+
+            let idx = self.primary_calls.fetch_add(1, Ordering::SeqCst);
+            let verdict = *self
+                .primary_script
+                .get(idx)
+                .or_else(|| self.primary_script.last())
+                .unwrap_or(&true);
+            Poll::Ready(verdict)
+        } else {
+            Poll::Ready(true)
+        }
     }
 }
 
@@ -80,63 +135,62 @@ fn initial_active_is_primary() {
 /// trajectory.
 #[tokio::test(flavor = "current_thread")]
 async fn probe_loop_flips_active_url_in_sync_with_scripted_verdicts() {
-    #[derive(Debug)]
-    struct ScriptedProbe {
-        primary_script: Vec<bool>,
-        primary_calls: AtomicUsize,
-    }
-    impl HealthProbe for ScriptedProbe {
-        fn poll_probe(
-            &self,
-            endpoint: &str,
-            _deadline: Instant,
-            _cx: &mut Context<'_>,
-        ) -> Poll<bool> {
-            if endpoint.contains("primary") {
-                let idx = self.primary_calls.fetch_add(1, Ordering::SeqCst);
-                let v = *self
-                    .primary_script
-                    .get(idx)
-                    .or_else(|| self.primary_script.last())
-                    .unwrap_or(&true);
-                Poll::Ready(v)
-            } else {
-                Poll::Ready(true)
-            }
-        }
-    }
-
     let probe = Arc::new(ScriptedProbe {
         primary_script: vec![true, false, true, false, false],
         primary_calls: AtomicUsize::new(0),
+        allowed_primary_calls: AtomicUsize::new(0),
+        primary_waker: Mutex::new(None),
     });
     let f = AutoClusterFailover::new(vec![PRIMARY.to_owned(), STANDBY.to_owned()], probe.clone());
     let handle = f.start(TICK);
 
-    let tick = || async {
-        tokio::time::sleep(TICK + Duration::from_millis(10)).await;
+    let tick = |expected_primary_calls: usize, expected_active: usize| {
+        let f = &f;
+        let probe = Arc::clone(&probe);
+        async move {
+            probe.allow_next_primary_probe();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let probe_completed =
+                        probe.primary_call_count() == expected_primary_calls;
+                    let active_matches = f.active_index() == expected_active;
+                    if probe_completed && active_matches {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for primary probe {expected_primary_calls} with active index {expected_active}; observed {} calls and active index {}",
+                    probe.primary_call_count(),
+                    f.active_index(),
+                )
+            });
+        }
     };
 
     // Tick 1: primary healthy.
-    tick().await;
+    tick(1, 0).await;
     assert_eq!(f.active_index(), 0);
     assert_eq!(f.get_service_url(), PRIMARY);
 
     // Tick 2: primary unhealthy → standby.
-    tick().await;
+    tick(2, 1).await;
     assert_eq!(f.active_index(), 1);
     assert_eq!(f.get_service_url(), STANDBY);
 
     // Tick 3: primary healthy → failback.
-    tick().await;
+    tick(3, 0).await;
     assert_eq!(f.active_index(), 0);
 
     // Tick 4: primary unhealthy → standby again.
-    tick().await;
+    tick(4, 1).await;
     assert_eq!(f.active_index(), 1);
 
     // Tick 5: primary still unhealthy → stay on standby.
-    tick().await;
+    tick(5, 1).await;
     assert_eq!(f.active_index(), 1);
 
     handle.abort();
