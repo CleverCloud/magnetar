@@ -93,3 +93,83 @@ green replay: the per-PR seed-replay re-validates the ADR-0038 fix. Also
 pinned by the sim_chaos_swizzle_clog_sweep_16_seeds debug-seed set.
 Discovery issue #136 (closed resolved).
 """
+
+[[seed]]
+value        = "0x99982158c6713f4d"
+discovered   = "2026-07-14"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29309119821"
+commit_sha   = "1dc22a4edc830a0d4c6a71c07bc310d81905185c"
+test_name    = "sim_delayed_marker_is_observed_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/333"
+note         = """
+Derived sub-seed 9389367787558182825 (splitmix64 index 8 of 16 from
+common::sweep_seeds) drove the connection pool's Pending-dial entry
+into one of two pre-a2c56b3 notify gaps in pool.rs, 1dc22a4: either
+close() dropping a Pending entry from the map without ever touching its
+notify/result (lines 214-233, unconditional for every close-while-
+dialing), or the detached dial task (spawn_dial, lines 391-427) being
+torn down before reaching its own notify_waiters() call. Both orphan
+the waiter with zero pending events anywhere in the simulated world.
+moonpool-sim's DeadlockDetector (orchestrator.rs) declared a hard
+deadlock rather than a timeout, producing an empty individual_metrics /
+all-zero SimulationReport with no per-workload error text.
+
+FIXED by a2c56b3 (moonpool 0.8 migration): PendingDial gains
+cancel/completed/is_complete + cancel_and_wait(); a new PendingCompletion
+RAII guard guarantees notify_waiters() fires exactly once regardless of
+how the dial task exits, closing both gaps. See ADR-0078. RETAINED as a
+regression anchor — do NOT remove on a green replay. Verified passing at
+a2c56b3 alone (bisected against 1dc22a4..HEAD) and at current HEAD
+(8208901).
+"""
+
+[[seed]]
+value        = "0x9cde5c15b066e674"
+discovered   = "2026-07-14"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29309119821"
+commit_sha   = "1dc22a4edc830a0d4c6a71c07bc310d81905185c"
+test_name    = "sim_chaos_produce_consume_with_invariants"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/334"
+note         = """
+Derived sub-seed 7979414505181618604 (common::sweep_seeds(1)) drove the
+same pre-a2c56b3 connection-pool race as #333/#335, but manifested as
+silent message loss rather than a deadlock: the pre-fix promote/evict
+block in spawn_dial (pool.rs:417-427, 1dc22a4) had no generation check,
+so a late-completing (stale) dial could silently clobber a newer live
+pool entry with no error surfaced to the in-flight sender. Symptom:
+"at-least-once violated: sent {..} but missing {..}" from
+ProducerConsumerWorkload's run()/check() (sim_chaos.rs:1703).
+
+FIXED by a2c56b3: the promote/evict block gained an explicit
+is_current_generation / may_promote check (Arc::ptr_eq against the
+expected entry) before any map mutation, plus explicit teardown of an
+"orphaned success" that won the dial but lost the generation race. See
+ADR-0078. RETAINED as a regression anchor — do NOT remove on a green
+replay. Verified passing at a2c56b3 alone (bisected against
+1dc22a4..HEAD) and at current HEAD (8208901).
+"""
+
+[[seed]]
+value        = "0xf7c3b076d9d0abc9"
+discovered   = "2026-07-14"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29309119821"
+commit_sha   = "1dc22a4edc830a0d4c6a71c07bc310d81905185c"
+test_name    = "sim_delayed_marker_is_observed_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/335"
+note         = """
+Same failure signature and same root cause as #333 (see that entry):
+scheduler deadlock via the pre-a2c56b3 Pending-dial notify gap in
+pool.rs (close()-drops-Pending-without-notifying, and/or detached-dial-
+task torn down before its own notify_waiters() call — both closed by
+the same a2c56b3 PendingCompletion guard). Derived sub-seed
+6474957585546944945, confirmed index 0 of 16 (splitmix64) — the
+report's iterations: 1 shows the sim failed on the very first sub-seed
+and early-exited immediately.
+
+FIXED by a2c56b3. See ADR-0078. RETAINED as a regression anchor — do NOT
+remove on a green replay. Verified passing at a2c56b3 alone (bisected
+against 1dc22a4..HEAD) and at current HEAD (8208901).
+"""
