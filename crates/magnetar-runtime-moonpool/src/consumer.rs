@@ -15,8 +15,9 @@
 //! - [`Consumer::negative_ack`] — fire-and-forget redelivery request.
 //! - [`Consumer::seek_to_message`] / [`Consumer::seek_to_timestamp`] — cursor reset to a message id
 //!   or publish timestamp (millis since epoch).
-//! - [`Consumer::close`] — request-id-correlated close, joins implicitly with the connection-level
-//!   driver still alive.
+//! - [`Consumer::close`] — request-id-correlated reliable close that awaits the broker
+//!   acknowledgement; dropping the final clone separately stages a best-effort close through the
+//!   existing driver.
 //! - [`Consumer::topic`] / [`Consumer::subscription`] / [`Consumer::is_closed`] — cheap accessors
 //!   that consult the sans-io state machine.
 //! - [`Consumer::pause`] / [`Consumer::resume`] — local flow-control gate.
@@ -69,6 +70,15 @@ use crate::{ConnectionShared, TopicListChange};
 /// `slot.state.lock()`. Operations that drive protocol I/O (`receive`,
 /// `ack`, `seek`, `close`, …) take `shared.inner.lock()`. Acquisition order:
 /// **global → per-slot, never the reverse**.
+///
+/// # Lifecycle
+///
+/// [`Self::close`] is the reliable shutdown path: it consumes the handle,
+/// waits for the broker acknowledgement, and returns any close error.
+/// If callers instead drop every clone, the final clone synchronously stages
+/// a best-effort `CloseConsumer` and wakes the existing driver. Dropping an
+/// intermediate clone does not close the consumer, and a terminal connection
+/// with no remaining driver stages nothing.
 pub struct Consumer<P: Providers> {
     shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
@@ -79,6 +89,8 @@ pub struct Consumer<P: Providers> {
     /// through this hook before yielding it to the user. 1:1 mirror of
     /// `magnetar_runtime_tokio::Consumer::decryptor`.
     decryptor: Option<Arc<dyn MessageDecryptor>>,
+    /// Last-clone close guard shared by every `Consumer` clone.
+    close_guard: Arc<ConsumerCloseGuard>,
     /// Held only so `Consumer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers — the consumer just talks to the shared state.
@@ -92,8 +104,43 @@ impl<P: Providers> Clone for Consumer<P> {
             handle: self.handle,
             slot: self.slot.clone(),
             decryptor: self.decryptor.clone(),
+            close_guard: self.close_guard.clone(),
             _providers: std::marker::PhantomData,
         }
+    }
+}
+
+/// RAII guard arming a best-effort `CommandCloseConsumer` on last-clone
+/// drop. The explicit [`Consumer::close`] path remains confirmation-bearing.
+#[derive(Debug)]
+struct ConsumerCloseGuard {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    slot: Arc<magnetar_proto::ConsumerSlot>,
+}
+
+impl Drop for ConsumerCloseGuard {
+    fn drop(&mut self) {
+        if self.shared.is_no_driver() {
+            return;
+        }
+        // ADR-0038: release the per-slot probe before taking the global
+        // Connection mutex. The locks are sequential, never nested.
+        let already_closed = self.slot.state.lock().closed;
+        if already_closed {
+            return;
+        }
+        {
+            let mut conn = self.shared.inner.lock();
+            let _ = conn.close_consumer_forget(self.handle);
+        }
+        self.shared.driver_waker.notify_one();
+        tracing::debug!(
+            topic = %self.slot.identity.topic,
+            subscription = %self.slot.identity.subscription,
+            handle = ?self.handle,
+            "consumer dropped without explicit close — best-effort CloseConsumer enqueued"
+        );
     }
 }
 
@@ -106,6 +153,28 @@ impl<P: Providers> std::fmt::Debug for Consumer<P> {
 }
 
 impl<P: Providers> Consumer<P> {
+    /// Assemble a consumer handle and arm its last-clone close guard.
+    fn assemble(
+        shared: Arc<ConnectionShared>,
+        handle: ConsumerHandle,
+        slot: Arc<magnetar_proto::ConsumerSlot>,
+        decryptor: Option<Arc<dyn MessageDecryptor>>,
+    ) -> Self {
+        let close_guard = Arc::new(ConsumerCloseGuard {
+            shared: shared.clone(),
+            handle,
+            slot: slot.clone(),
+        });
+        Self {
+            shared,
+            handle,
+            slot,
+            decryptor,
+            close_guard,
+            _providers: std::marker::PhantomData,
+        }
+    }
+
     /// The protocol-layer consumer handle this façade wraps. Useful in tests
     /// and instrumentation.
     #[must_use]
@@ -1175,9 +1244,14 @@ impl<P: Providers> Consumer<P> {
         }
     }
 
-    /// Close this consumer. Resolves when the broker acks the close. After
-    /// this resolves the consumer handle is invalidated — calling any other
-    /// method on this `Consumer` is a no-op or returns an empty value.
+    /// Reliably close this consumer.
+    ///
+    /// Consumes the handle, wakes the connection driver, and resolves only
+    /// after the broker acknowledges `CloseConsumer`. After this resolves,
+    /// the consumer handle is invalidated.
+    ///
+    /// Dropping the final clone is a separate best-effort safety net: it
+    /// stages the close without waiting and cannot report broker errors.
     ///
     /// Does not tear down the underlying connection-level driver; that is
     /// owned by the [`Client`] which spawned this consumer.
@@ -1297,13 +1371,7 @@ impl<P: Providers + Send + Sync> Client<P> {
             "consumer subscribed"
         );
 
-        Ok(Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor,
-            _providers: std::marker::PhantomData,
-        })
+        Ok(Consumer::assemble(shared, handle, slot, decryptor))
     }
 }
 
@@ -1657,7 +1725,9 @@ mod tests {
     use std::time::Instant;
 
     use bytes::BytesMut;
-    use magnetar_proto::{ConnectionConfig, SubscribeRequest, encode_command, encode_payload, pb};
+    use magnetar_proto::{
+        ConnectionConfig, SubscribeRequest, decode_one, encode_command, encode_payload, pb,
+    };
     use moonpool_core::TokioProviders;
 
     use super::{Consumer, ReceiveFut};
@@ -1856,13 +1926,7 @@ mod tests {
         slot: Arc<magnetar_proto::ConsumerSlot>,
         decryptor: Arc<dyn crate::crypto::MessageDecryptor>,
     ) -> Consumer<TokioProviders> {
-        Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: Some(decryptor),
-            _providers: std::marker::PhantomData,
-        }
+        Consumer::assemble(shared, handle, slot, Some(decryptor))
     }
 
     /// Happy path: a decryptor that reverses the XOR ciphertext yields the
@@ -1946,13 +2010,7 @@ mod tests {
     async fn receive_encrypted_without_decryptor_fails() {
         let (shared, handle, slot) =
             subscribe_with_encrypted_message(magnetar_proto::CryptoFailureAction::Fail, b"secret");
-        let consumer: Consumer<TokioProviders> = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-            _providers: std::marker::PhantomData,
-        };
+        let consumer: Consumer<TokioProviders> = Consumer::assemble(shared, handle, slot, None);
         let res = consumer.receive().await;
         match res {
             Err(ClientError::Other(msg)) => {
@@ -1975,10 +2033,50 @@ mod tests {
         );
         let consumer = consumer_with_decryptor(shared, handle, slot, Arc::new(XorDecryptor));
         let clone = consumer.clone();
+        assert!(
+            Arc::ptr_eq(&consumer.close_guard, &clone.close_guard),
+            "clones must share one last-clone close guard"
+        );
         // The clone carries the same decryptor, so it decrypts the queued
         // message back to the original plaintext.
         let msg = clone.receive().await.expect("clone decrypts");
         assert_eq!(msg.payload.as_ref(), b"clone-secret");
+    }
+
+    #[test]
+    fn drop_after_no_driver_stages_no_close_consumer() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/no-driver-drop".to_owned(),
+                subscription: "no-driver-drop".to_owned(),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            handle
+        };
+        let slot = shared
+            .inner
+            .lock()
+            .consumer(handle)
+            .cloned()
+            .expect("test consumer slot must exist");
+        let consumer: Consumer<TokioProviders> =
+            Consumer::assemble(shared.clone(), handle, slot, None);
+
+        shared.mark_no_driver();
+        drop(consumer);
+
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::CloseConsumer as i32,
+                "no driver remains to flush a drop-triggered CloseConsumer"
+            );
+        }
     }
 
     /// Build an encrypted `CommandMessage` whose `encryption_keys[0].key` carries a custom
@@ -2214,13 +2312,7 @@ mod tests {
                     ),
                 )
             });
-        Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-            _providers: std::marker::PhantomData,
-        }
+        Consumer::assemble(shared, handle, slot, None)
     }
 
     /// `Client::subscribe` is generic over `P: Providers` — confirm the

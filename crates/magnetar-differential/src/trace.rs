@@ -9,11 +9,11 @@
 //! produced by the tokio and moonpool runners.
 //!
 //! Op surface is intentionally tight: `Send`, `Recv`, `Ack`, `Nack`,
-//! `Seek`, `Close`, plus partition-aware siblings `SendPartition`,
-//! `RecvPartition`, `AckPartition`, `SeekPartition` for the
-//! partitioned-topic traces. Extend it as new differential coverage
-//! lands; keep every variant **observable** so the equivalence check
-//! stays meaningful.
+//! `Seek`, `Close`, last-clone producer/consumer drops, plus
+//! partition-aware siblings `SendPartition`, `RecvPartition`,
+//! `AckPartition`, `SeekPartition` for the partitioned-topic traces.
+//! Extend it as new differential coverage lands; keep every variant
+//! **observable** so the equivalence check stays meaningful.
 
 use std::time::Duration;
 
@@ -67,6 +67,13 @@ pub enum Op {
     /// [`Event::SendError`] with kind `producer-dropped` on both
     /// engines.
     DropProducer,
+    /// Drop every clone of the trace's consumer WITHOUT an explicit
+    /// `close().await`. Exercises the engines' last-clone drop guard
+    /// (issue #342): the guard enqueues a best-effort
+    /// `CommandCloseConsumer`, observable on the scripted broker's
+    /// frame log. A subsequent consumer operation lazily opens a
+    /// replacement consumer on the same topic and subscription.
+    DropConsumer,
     /// Send to a specific partition of [`Trace::topic`]. Internally the
     /// runner opens (or reuses) a producer bound to
     /// `<trace.topic>-partition-N`, mirroring Java's
@@ -210,6 +217,11 @@ pub enum Event {
     /// drop guard) — assert it via
     /// [`crate::broker::ScriptedBroker::frame_log_snapshot`].
     ProducerDropped,
+    /// `DropConsumer` released every clone of the consumer. The
+    /// broker-side `CloseConsumer` is asynchronous (fire-and-forget
+    /// drop guard) — assert it via
+    /// [`crate::broker::ScriptedBroker::frame_log_snapshot`].
+    ConsumerDropped,
     /// `SendPartition` succeeded; broker assigned [`MessageId`] on the
     /// given partition.
     SentPartition {

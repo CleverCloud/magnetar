@@ -33,10 +33,11 @@
 //! - **No auto-ack.** The callback is responsible for acking (positive ack, cumulative ack, or
 //!   nack) — same contract as Java's `MessageListener`, which hands you the `Consumer` so you ack
 //!   explicitly. The poller never acks on the callback's behalf.
-//! - **Clean shutdown.** When the consumer is closed or dropped, `receive()` resolves with an error
-//!   and the poller loop breaks — the task ends without a panic. Dropping the returned
-//!   [`MessageListenerHandle`] (or calling [`MessageListenerHandle::close`]) aborts the task
-//!   eagerly.
+//! - **Clean shutdown.** An explicit or terminal remote consumer close makes `receive()` resolve
+//!   with an error, so the poller loop ends without a panic. Dropping the returned
+//!   [`MessageListenerHandle`] (or calling [`MessageListenerHandle::close`]) aborts the poller;
+//!   task unwinding then drops its owned consumer clone. That clone triggers a best-effort close
+//!   only if it is the final clone. Dropping an intermediate consumer clone does nothing.
 //!
 //! ## Pull / push are mutually exclusive
 //!
@@ -103,9 +104,11 @@ pub type MessageListener = Arc<dyn Fn(&IncomingMessage) + Send + Sync>;
 /// lifetime semantics of [`crate::TableView`]'s drain task: dropping the handle
 /// aborts the poller; [`Self::close`] awaits a clean stop.
 ///
-/// The poller terminates on its own when the underlying consumer is closed
-/// (`receive()` returns an error) — so a dropped handle whose consumer is
-/// already gone simply observes an already-finished task.
+/// The poller terminates on its own when an explicit or terminal remote close
+/// makes `receive()` return an error. Dropping this handle aborts the poller,
+/// then task unwinding drops its owned consumer clone. That clone triggers a
+/// best-effort close only when it is the final clone; if other consumer clones
+/// remain, this drop stages no close.
 pub struct MessageListenerHandle {
     handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -175,8 +178,10 @@ impl MessageListenerHandle {
 /// `magnetar_runtime_moonpool::Consumer<P>`. The task is a bare
 /// `loop { receive(); callback }` — no channel, no extra lock, no host-clock
 /// read (ADR-0003 / ADR-0011 / ADR-0038 all preserved). The loop breaks the
-/// first time `receive()` errors, which is how a closed/dropped consumer signals
-/// "no more messages" — giving clean, panic-free shutdown.
+/// first time an explicit or terminal remote close makes `receive()` return an
+/// error. Dropping the returned handle instead aborts the poller and drops this
+/// task's owned consumer clone; only a final clone triggers the best-effort
+/// consumer close.
 pub fn spawn_message_listener<C: crate::ConsumerApi + Clone>(
     consumer: C,
     listener: MessageListener,

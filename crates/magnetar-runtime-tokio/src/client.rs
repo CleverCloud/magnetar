@@ -1441,12 +1441,7 @@ impl Client {
             "consumer subscribed"
         );
 
-        Ok(Consumer {
-            shared: target_shared,
-            handle,
-            slot,
-            decryptor,
-        })
+        Ok(Consumer::assemble(target_shared, handle, slot, decryptor))
     }
 
     /// Close the connection. Sends `CommandCloseConnection`-style state-machine close on the

@@ -190,6 +190,44 @@ fn close_producer_forget_records_no_outcome_on_broker_error() {
     );
 }
 
+#[test]
+fn close_producer_forget_records_no_outcome_on_reset() {
+    let now = Instant::now();
+    let mut conn = handshake_complete(now);
+    let handle = conn.create_producer(CreateProducerRequest {
+        topic: "persistent://public/default/forget-reset".to_owned(),
+        ..Default::default()
+    });
+
+    let request_id = conn.close_producer_forget(handle);
+    conn.reset();
+
+    assert!(
+        conn.take_outcome(PendingOpKey::Request(request_id))
+            .is_none(),
+        "reset must not materialize an outcome for a forgotten close"
+    );
+}
+
+#[test]
+fn close_producer_forget_records_no_outcome_on_fail_all_pending() {
+    let now = Instant::now();
+    let mut conn = handshake_complete(now);
+    let handle = conn.create_producer(CreateProducerRequest {
+        topic: "persistent://public/default/forget-fail-all".to_owned(),
+        ..Default::default()
+    });
+
+    let request_id = conn.close_producer_forget(handle);
+    conn.fail_all_pending("synthetic terminal drop");
+
+    assert!(
+        conn.take_outcome(PendingOpKey::Request(request_id))
+            .is_none(),
+        "fail_all_pending must not materialize an outcome for a forgotten close"
+    );
+}
+
 /// Contrast: the awaited `close_producer` path must keep recording its
 /// outcome — that entry is exactly what the engines' `RequestFut`
 /// drains via `take_outcome`.
