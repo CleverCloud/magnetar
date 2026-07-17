@@ -306,6 +306,10 @@ impl ProducerApi for magnetar_runtime_tokio::Producer {
         magnetar_runtime_tokio::Producer::stats(self)
     }
 
+    fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        magnetar_runtime_tokio::Producer::send_latency_histogram(self)
+    }
+
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(magnetar_runtime_tokio::Producer::close(self))
     }
@@ -496,6 +500,10 @@ impl ConsumerApi for magnetar_runtime_tokio::Consumer {
 
     fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
         magnetar_runtime_tokio::Consumer::stats(self)
+    }
+
+    fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        magnetar_runtime_tokio::Consumer::receive_latency_histogram(self)
     }
 
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {

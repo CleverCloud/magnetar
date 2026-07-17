@@ -52,6 +52,11 @@ bytes          = { workspace = true }
 # `TcpStream` (moonpool 0.8 uses futures-io rather than raw tokio-io). `std` gates the
 # `futures::io` module; the workspace dep is `default-features = false`.
 futures        = { workspace = true, features = ["std"] }
+# Already a workspace dep of `magnetar-proto`; wired in here so
+# `Consumer::receive_latency_histogram` / `Producer::send_latency_histogram`
+# (issue #347) can name `hdrhistogram::Histogram<u64>` in their own public
+# signatures. No new crate enters the dependency graph.
+hdrhistogram   = { workspace = true }
 moonpool-core  = { workspace = true }
 parking_lot    = { workspace = true }
 rustls         = { workspace = true }

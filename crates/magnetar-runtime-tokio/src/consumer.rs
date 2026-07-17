@@ -851,6 +851,20 @@ impl Consumer {
         self.slot.state.lock().stats()
     }
 
+    /// Clone of this consumer's live receive-latency histogram (issue #347).
+    /// `None` if the histogram was never initialised (constructor failure,
+    /// statically impossible). Backs the façade's `ConsumerApi::
+    /// receive_latency_histogram` — used by `MultiTopicsConsumer::
+    /// aggregate_stats` / `PartitionedConsumer::aggregate_stats` (in the
+    /// `magnetar` façade crate) to merge several consumers' distributions
+    /// via [`magnetar_proto::ConsumerStats::fold`].
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.slot.state.lock().receive_latency_histogram()
+    }
+
     /// Capture a rolling-window sample for this consumer. Mirrors Java
     /// `ConsumerStatsRecorderImpl#updateNumMsgsReceived` — call periodically (e.g.
     /// once per second) to refresh [`magnetar_proto::ConsumerStats::msgs_per_sec`]

@@ -317,6 +317,19 @@ impl<P: Providers> Producer<P> {
         self.slot.state.lock().stats()
     }
 
+    /// Clone of this producer's live send-latency histogram (issue #347).
+    /// `None` if the histogram was never initialised (constructor failure,
+    /// statically impossible). Backs the façade's `ProducerApi::
+    /// send_latency_histogram` — used by `PartitionedProducer::
+    /// aggregate_stats` (in the `magnetar` façade crate) to merge several
+    /// producers' distributions via [`magnetar_proto::producer::ProducerStats::fold`].
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.slot.state.lock().send_latency_histogram()
+    }
+
     /// Enqueue a send. The returned future resolves when the broker
     /// acknowledges the publish (a `CommandSendReceipt`) or rejects it (a
     /// `CommandSendError`).

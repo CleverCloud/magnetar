@@ -310,6 +310,16 @@ pub trait ProducerApi: 'static + Send + Sync {
     /// producer handle is no longer registered.
     fn stats(&self) -> magnetar_proto::producer::ProducerStats;
 
+    /// Clone of this producer's live send-latency histogram (issue #347).
+    /// `None` if the producer handle is no longer registered or the
+    /// histogram was never initialised. Used by
+    /// [`crate::PartitionedProducer::aggregate_stats`] to merge several
+    /// producers' distributions via
+    /// [`magnetar_proto::producer::ProducerStats::fold`] — `stats()` alone
+    /// only carries the three pre-computed percentiles, not the
+    /// distribution a sound merge needs.
+    fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>>;
+
     /// Consume the producer and tear down the broker-side resource
     /// (`CommandCloseProducer`). Mirrors Java `Producer#close`.
     /// Both runtime types implement close by consuming `self`; the
@@ -471,6 +481,17 @@ pub trait ConsumerApi: 'static + Send + Sync {
     /// `Consumer#getStats`. Returns a zeroed snapshot if the consumer
     /// handle is no longer registered.
     fn stats(&self) -> magnetar_proto::consumer::ConsumerStats;
+
+    /// Clone of this consumer's live receive-latency histogram (issue
+    /// #347). `None` if the consumer handle is no longer registered or the
+    /// histogram was never initialised. Used by
+    /// [`crate::MultiTopicsConsumer::aggregate_stats`] (and, via the
+    /// `PartitionedConsumer` alias, `PartitionedConsumer::aggregate_stats`)
+    /// to merge several consumers' distributions via
+    /// [`magnetar_proto::consumer::ConsumerStats::fold`] — `stats()` alone
+    /// only carries the three pre-computed percentiles, not the
+    /// distribution a sound merge needs.
+    fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>>;
 
     /// Wall-clock timestamp of the last broker disconnection observed
     /// by this consumer's connection, or `None` if no disconnect has

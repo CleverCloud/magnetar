@@ -620,6 +620,19 @@ impl Producer {
         self.slot.state.lock().stats()
     }
 
+    /// Clone of this producer's live send-latency histogram (issue #347).
+    /// `None` if the histogram was never initialised (constructor failure,
+    /// statically impossible). Backs the façade's `ProducerApi::
+    /// send_latency_histogram` — used by `PartitionedProducer::
+    /// aggregate_stats` (in the `magnetar` façade crate) to merge several
+    /// producers' distributions via [`magnetar_proto::ProducerStats::fold`].
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.slot.state.lock().send_latency_histogram()
+    }
+
     /// Capture a rolling-window sample for this producer. Mirrors Java
     /// `ProducerStatsRecorderImpl#updateNumMsgsSent` — call periodically (e.g. once
     /// per second) to refresh [`magnetar_proto::ProducerStats::msgs_per_sec`] and

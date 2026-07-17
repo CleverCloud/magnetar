@@ -20,6 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Consumer final-clone resource release:** dropping the last clone of a consumer now stages a best-effort `CloseConsumer` and wakes the existing driver, allowing ownership-driven teardown to unregister the broker-side consumer when the frame reaches the broker and is accepted.
   Intermediate clone drops leave surviving consumers usable, explicit `close().await` remains the reliable acknowledgement-bearing path, and forgotten close responses never accumulate undrained outcomes.
   (#342; ADR-0077)
+- **`aggregate_stats()` no longer zeroes the rate, latency-percentile, and `pending_batch_acks` fields:** `MultiTopicsConsumer::aggregate_stats` / `PartitionedConsumer::aggregate_stats` and `PartitionedProducer::aggregate_stats` previously summed only a handful of cumulative totals, silently leaving `msgs_per_sec`, `bytes_per_sec`, `receive_latency_p50_ms`/`p99_ms`, `send_latency_p50_ms`/`p99_ms`, and `pending_batch_acks` at their zeroed default regardless of the children's real values.
+  New `ConsumerState::receive_latency_histogram` / `ProducerState::send_latency_histogram` accessors expose each child's raw latency distribution, and new `ConsumerStats::fold` / `ProducerStats::fold` associated functions (exhaustive per-field destructuring, so a future field addition is a compile error until this fold picks a rule for it) aggregate every child snapshot: the cumulative totals sum (saturating), the rolling rates sum as `f64`, `*_latency_max_ms` is the exact max, and `*_latency_p50_ms`/`p99_ms` are recomputed from a real `hdrhistogram::Histogram::add` merge of every child's histogram — summing or maxing percentiles directly is not statistically sound.
+  Both `ConsumerApi` and `ProducerApi` gain a `{receive,send}_latency_histogram` accessor (implemented on both the tokio and moonpool engines) so the façade rewrites are thin collect-then-fold wrappers.
+  (#347)
 
 ## [1.2.2] - 2026-07-13
 

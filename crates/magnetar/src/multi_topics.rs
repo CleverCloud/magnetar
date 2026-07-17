@@ -438,29 +438,33 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
             .min()
     }
 
-    /// Aggregate cumulative stats across all child consumers. Sums the totals; useful
-    /// for monitoring fan-in throughput on the multi-topic / partitioned scope.
+    /// Aggregate cumulative stats across all child consumers (issue #347).
+    /// Thin wrapper over [`magnetar_proto::ConsumerStats::fold`] — collects
+    /// each child's `(stats(), receive_latency_histogram())` snapshot (taken
+    /// under the same lock acquisition so they're consistent with each
+    /// other) and folds them per that function's documented per-field rule:
+    /// the six cumulative totals + `pending_batch_acks` sum; `msgs_per_sec`
+    /// / `bytes_per_sec` sum as f64 (fan-in throughput); `receive_latency_max_ms`
+    /// is the exact max; `receive_latency_p50_ms` / `receive_latency_p99_ms`
+    /// are recomputed from a REAL merge of every child's receive-latency
+    /// histogram — summing or maxing percentiles directly (the previous
+    /// implementation's bug: those three fields, plus `msgs_per_sec` /
+    /// `bytes_per_sec` / `pending_batch_acks`, were silently left at their
+    /// `ConsumerStats::default()` zero) is not statistically sound.
+    ///
+    /// Applies equally to [`crate::PartitionedConsumer`] (a
+    /// `MultiTopicsConsumer` type alias) since it shares this
+    /// implementation.
     #[must_use]
     pub fn aggregate_stats(&self) -> magnetar_proto::ConsumerStats {
-        let mut agg = magnetar_proto::ConsumerStats::default();
-        for nc in self.inner.consumers.lock().iter() {
-            let s = nc.consumer.stats();
-            agg.total_msgs_received = agg
-                .total_msgs_received
-                .saturating_add(s.total_msgs_received);
-            agg.total_bytes_received = agg
-                .total_bytes_received
-                .saturating_add(s.total_bytes_received);
-            agg.total_acks_sent = agg.total_acks_sent.saturating_add(s.total_acks_sent);
-            agg.total_acks_failed = agg.total_acks_failed.saturating_add(s.total_acks_failed);
-            agg.total_msgs_dead_lettered = agg
-                .total_msgs_dead_lettered
-                .saturating_add(s.total_msgs_dead_lettered);
-            agg.total_chunked_msgs_received = agg
-                .total_chunked_msgs_received
-                .saturating_add(s.total_chunked_msgs_received);
-        }
-        agg
+        let children: Vec<_> = self
+            .inner
+            .consumers
+            .lock()
+            .iter()
+            .map(|nc| (nc.consumer.stats(), nc.consumer.receive_latency_histogram()))
+            .collect();
+        magnetar_proto::ConsumerStats::fold(children)
     }
 
     /// Sum of buffered messages across every child consumer's receiver queue. Mirrors

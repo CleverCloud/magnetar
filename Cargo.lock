@@ -1767,6 +1767,7 @@ version = "1.2.2"
 dependencies = [
  "async-trait",
  "bytes",
+ "hdrhistogram",
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
@@ -1788,6 +1789,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "hdrhistogram",
  "magnetar-admin",
  "magnetar-auth-athenz",
  "magnetar-auth-oauth2",
@@ -1869,6 +1871,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "hdrhistogram",
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",
  "magnetar-proto",
@@ -1894,6 +1897,7 @@ version = "1.2.2"
 dependencies = [
  "bytes",
  "flate2",
+ "hdrhistogram",
  "lz4_flex",
  "magnetar-auth-athenz",
  "magnetar-auth-sasl",

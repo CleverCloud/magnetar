@@ -484,6 +484,107 @@ pub struct ConsumerStats {
     pub pending_batch_acks: usize,
 }
 
+impl ConsumerStats {
+    /// Fold cumulative stats snapshots from multiple child consumers (e.g.
+    /// `MultiTopicsConsumer` / `PartitionedConsumer` fan-in) into one
+    /// aggregate `ConsumerStats` (issue #347). Java has no equivalent
+    /// aggregate type — `PartitionedConsumerImpl` doesn't expose a stats
+    /// getter at all — so this is a magnetar-specific convenience, but each
+    /// field's math mirrors the Java semantics for the underlying counter.
+    ///
+    /// Each `(ConsumerStats, Option<Histogram<u64>>)` pair is one child's
+    /// [`ConsumerState::stats`] snapshot plus (ideally taken at the same
+    /// instant) its [`ConsumerState::receive_latency_histogram`] clone —
+    /// the histogram is required separately because `ConsumerStats` only
+    /// carries the three pre-computed percentiles, not the distribution a
+    /// sound merge needs.
+    ///
+    /// Per-field aggregation rule — each is applied inside an **exhaustive**
+    /// destructure of the child `ConsumerStats` below, so adding a field to
+    /// this struct is a compile error here until this fold picks a rule for
+    /// it:
+    /// - the six cumulative totals + `pending_batch_acks` — **saturating sum** (never wrap into
+    ///   overflow noise).
+    /// - `msgs_per_sec` / `bytes_per_sec` — **f64 sum** (the aggregate throughput observed across
+    ///   every child is the sum of the per-child rates — fan-in, not an average).
+    /// - `receive_latency_max_ms` — **exact max** across children; this is a plain stats-field
+    ///   rule, independent of whether a histogram was supplied.
+    /// - `receive_latency_p50_ms` / `receive_latency_p99_ms` — **recomputed from the merged
+    ///   histogram** (`hdrhistogram::Histogram::add` over every supplied child histogram, then
+    ///   re-queried at the same quantiles). Percentiles do not compose under per-child summing or
+    ///   maxing — merging the underlying distributions is the only statistically sound way to
+    ///   compute the aggregate percentile. `0` when no child supplied a histogram.
+    #[must_use]
+    pub fn fold(
+        children: impl IntoIterator<Item = (ConsumerStats, Option<hdrhistogram::Histogram<u64>>)>,
+    ) -> ConsumerStats {
+        let mut agg = ConsumerStats::default();
+        let mut merged_hist: Option<hdrhistogram::Histogram<u64>> = None;
+
+        for (stats, hist) in children {
+            // Exhaustive destructure: a future `ConsumerStats` field
+            // addition is a compile error here until this fold picks an
+            // aggregation rule for it.
+            let ConsumerStats {
+                total_msgs_received,
+                total_bytes_received,
+                total_acks_sent,
+                total_acks_failed,
+                total_msgs_dead_lettered,
+                total_chunked_msgs_received,
+                // Recomputed below from the merged histogram — a child's own
+                // percentile fields are not composable and must be ignored.
+                receive_latency_p50_ms: _,
+                receive_latency_p99_ms: _,
+                receive_latency_max_ms,
+                msgs_per_sec,
+                bytes_per_sec,
+                pending_batch_acks,
+            } = stats;
+
+            agg.total_msgs_received = agg.total_msgs_received.saturating_add(total_msgs_received);
+            agg.total_bytes_received = agg
+                .total_bytes_received
+                .saturating_add(total_bytes_received);
+            agg.total_acks_sent = agg.total_acks_sent.saturating_add(total_acks_sent);
+            agg.total_acks_failed = agg.total_acks_failed.saturating_add(total_acks_failed);
+            agg.total_msgs_dead_lettered = agg
+                .total_msgs_dead_lettered
+                .saturating_add(total_msgs_dead_lettered);
+            agg.total_chunked_msgs_received = agg
+                .total_chunked_msgs_received
+                .saturating_add(total_chunked_msgs_received);
+            agg.pending_batch_acks = agg.pending_batch_acks.saturating_add(pending_batch_acks);
+            agg.msgs_per_sec += msgs_per_sec;
+            agg.bytes_per_sec += bytes_per_sec;
+            agg.receive_latency_max_ms = agg.receive_latency_max_ms.max(receive_latency_max_ms);
+
+            if let Some(h) = hist {
+                match merged_hist.as_mut() {
+                    Some(merged) => {
+                        if let Err(err) = merged.add(&h) {
+                            tracing::warn!(
+                                error = %err,
+                                "ConsumerStats::fold: hdrhistogram merge rejected a child \
+                                 histogram (auto-resize should make this unreachable); \
+                                 dropping its contribution to the merged percentiles"
+                            );
+                        }
+                    }
+                    None => merged_hist = Some(h),
+                }
+            }
+        }
+
+        if let Some(h) = merged_hist.as_ref().filter(|h| !h.is_empty()) {
+            agg.receive_latency_p50_ms = h.value_at_quantile(0.50);
+            agg.receive_latency_p99_ms = h.value_at_quantile(0.99);
+        }
+
+        agg
+    }
+}
+
 /// Default for [`ConsumerState::max_pending_chunked_message`]. Mirrors Java
 /// `ConsumerConfigurationData#maxPendingChunkedMessage = 10`.
 pub const DEFAULT_MAX_PENDING_CHUNKED_MESSAGE: usize = 10;
@@ -804,6 +905,20 @@ impl ConsumerState {
             return 0;
         }
         h.max()
+    }
+
+    /// Clone of the live receive-latency histogram (issue #347). For callers
+    /// that need the raw distribution rather than the three pre-computed
+    /// percentiles [`Self::stats`] exposes — primarily
+    /// [`ConsumerStats::fold`], which merges several consumers' histograms
+    /// via `hdrhistogram::Histogram::add` to compute a statistically sound
+    /// aggregate percentile (percentiles do not compose under per-child
+    /// summing or maxing, only a real histogram merge is). `None` when the
+    /// histogram was never initialised (constructor failure, statically
+    /// impossible — invariant #6).
+    #[must_use]
+    pub fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.receive_latency_hist.clone()
     }
 
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
@@ -1858,6 +1973,169 @@ mod tests {
         assert!(c.receive_latency_max_ms() >= 1);
         let stats = c.stats();
         assert_eq!(stats.receive_latency_max_ms, c.receive_latency_max_ms());
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #347: aggregate_stats zeroes fields. `ConsumerState::
+    // receive_latency_histogram` exposes the raw distribution so
+    // `ConsumerStats::fold` can merge several consumers' histograms into a
+    // statistically sound aggregate percentile (percentiles don't compose
+    // under per-child summing or maxing — only a real histogram merge is
+    // sound).
+    // ---------------------------------------------------------------------
+
+    /// [`ConsumerState::receive_latency_histogram`] hands back a clone of the
+    /// live `receive_latency_hist` — independent of further mutation on the
+    /// source consumer — for callers (the engine `ConsumerApi::
+    /// receive_latency_histogram` accessor, `ConsumerStats::fold`) that need
+    /// the raw distribution rather than the three pre-computed percentiles
+    /// `stats()` exposes.
+    #[test]
+    fn receive_latency_histogram_accessor_returns_clone_of_recorded_samples() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert!(
+            c.receive_latency_histogram().is_none_or(|h| h.is_empty()),
+            "no samples recorded yet"
+        );
+
+        let hist = c
+            .receive_latency_hist
+            .as_mut()
+            .expect("receive_latency_hist initialised");
+        for v in [10u64, 20, 30] {
+            hist.saturating_record(v);
+        }
+
+        let snapshot = c
+            .receive_latency_histogram()
+            .expect("histogram present after recording");
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot.value_at_quantile(1.0), 30);
+
+        // Mutate the live histogram after the snapshot was taken — the clone
+        // must not retroactively observe it (proves it's a real clone, not a
+        // shared reference / view).
+        c.receive_latency_hist
+            .as_mut()
+            .expect("still initialised")
+            .saturating_record(999);
+        assert_eq!(
+            snapshot.len(),
+            3,
+            "snapshot must be independent of later recordings on the source consumer"
+        );
+    }
+
+    /// `ConsumerStats::fold` propagates every field per its documented rule:
+    /// the six cumulative totals + `pending_batch_acks` sum (saturating);
+    /// `msgs_per_sec` / `bytes_per_sec` sum as f64; `receive_latency_max_ms`
+    /// is the exact max; `receive_latency_p50_ms` / `receive_latency_p99_ms`
+    /// are recomputed from the REAL merged histogram, not from either
+    /// child's own (here deliberately stale) percentile fields.
+    ///
+    /// Two children with a clean 60/40 sample split at two widely-separated
+    /// latencies (10ms / 500ms) make the merged percentiles unambiguous:
+    /// the merged p50 falls within the 60-sample low cluster (10ms) and the
+    /// merged p99 falls within the 40-sample high cluster (500ms) — neither
+    /// matches either child's stale field, and neither is a sum/max of the
+    /// children's own percentile fields (which would be 555/666 or 444).
+    #[test]
+    fn consumer_stats_fold_propagates_every_field() {
+        let mut hist1 = hdrhistogram::Histogram::<u64>::new(3).expect("histogram");
+        for _ in 0..60 {
+            hist1.saturating_record(10);
+        }
+        let mut hist2 = hdrhistogram::Histogram::<u64>::new(3).expect("histogram");
+        for _ in 0..40 {
+            hist2.saturating_record(500);
+        }
+
+        let s1 = ConsumerStats {
+            total_msgs_received: 100,
+            total_bytes_received: 1_000,
+            total_acks_sent: 90,
+            total_acks_failed: 1,
+            total_msgs_dead_lettered: 2,
+            total_chunked_msgs_received: 3,
+            // Deliberately stale/wrong — fold must ignore these and recompute
+            // from the merged histogram instead.
+            receive_latency_p50_ms: 111,
+            receive_latency_p99_ms: 222,
+            receive_latency_max_ms: 10,
+            msgs_per_sec: 5.5,
+            bytes_per_sec: 55.5,
+            pending_batch_acks: 4,
+        };
+        let s2 = ConsumerStats {
+            total_msgs_received: 20,
+            total_bytes_received: 200,
+            total_acks_sent: 15,
+            total_acks_failed: 0,
+            total_msgs_dead_lettered: 0,
+            total_chunked_msgs_received: 1,
+            receive_latency_p50_ms: 333,
+            receive_latency_p99_ms: 444,
+            receive_latency_max_ms: 500,
+            msgs_per_sec: 1.5,
+            bytes_per_sec: 15.0,
+            pending_batch_acks: 6,
+        };
+
+        let folded = ConsumerStats::fold([(s1, Some(hist1)), (s2, Some(hist2))]);
+
+        assert_eq!(folded.total_msgs_received, 120);
+        assert_eq!(folded.total_bytes_received, 1_200);
+        assert_eq!(folded.total_acks_sent, 105);
+        assert_eq!(folded.total_acks_failed, 1);
+        assert_eq!(folded.total_msgs_dead_lettered, 2);
+        assert_eq!(folded.total_chunked_msgs_received, 4);
+        assert_eq!(
+            folded.receive_latency_max_ms, 500,
+            "max is the exact max across children, never summed"
+        );
+        assert!((folded.msgs_per_sec - 7.0).abs() < f64::EPSILON);
+        assert!((folded.bytes_per_sec - 70.5).abs() < f64::EPSILON);
+        assert_eq!(folded.pending_batch_acks, 10);
+
+        assert_eq!(
+            folded.receive_latency_p50_ms, 10,
+            "merged p50 must land in the 60-sample low cluster, not either \
+             child's stale field"
+        );
+        assert_eq!(
+            folded.receive_latency_p99_ms, 500,
+            "merged p99 must land in the 40-sample high cluster (real \
+             histogram merge), not a sum/max of the children's own stale \
+             percentile fields"
+        );
+    }
+
+    /// When no child supplies a histogram, `fold` still sums the totals and
+    /// takes the exact max of `receive_latency_max_ms` (a plain stats-field
+    /// rule, independent of the histogram), but the percentiles — which can
+    /// ONLY come from a real histogram merge — read zero.
+    #[test]
+    fn consumer_stats_fold_with_no_histograms_yields_zero_percentiles() {
+        let s1 = ConsumerStats {
+            total_msgs_received: 5,
+            receive_latency_max_ms: 15,
+            ..ConsumerStats::default()
+        };
+        let s2 = ConsumerStats {
+            total_msgs_received: 7,
+            receive_latency_max_ms: 25,
+            ..ConsumerStats::default()
+        };
+
+        let folded = ConsumerStats::fold([(s1, None), (s2, None)]);
+
+        assert_eq!(folded.total_msgs_received, 12);
+        assert_eq!(
+            folded.receive_latency_max_ms, 25,
+            "max is a stats-field rule, unaffected by histogram absence"
+        );
+        assert_eq!(folded.receive_latency_p50_ms, 0);
+        assert_eq!(folded.receive_latency_p99_ms, 0);
     }
 
     // ---------------------------------------------------------------------
