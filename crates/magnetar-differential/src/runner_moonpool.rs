@@ -97,6 +97,8 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
             .await?,
     );
 
+    // `Option` also lets `Op::DropConsumer` release the final clone and
+    // a later consumer op reopen it as an ordering barrier.
     let mut consumer: Option<Consumer<TokioProviders>> = None;
 
     // Per-partition producers + consumers, opened lazily on first
@@ -301,6 +303,16 @@ async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventSt
                     drop(p);
                 }
                 stream.push(Event::ProducerDropped);
+            }
+            Op::DropConsumer => {
+                // Release every clone WITHOUT close().await — exercises
+                // the engines' last-clone drop guard (issue #342). The
+                // broker-side CloseConsumer is asserted out-of-band via
+                // `ScriptedBroker::frame_log_snapshot`.
+                if let Some(c) = consumer.take() {
+                    drop(c);
+                }
+                stream.push(Event::ConsumerDropped);
             }
             Op::Close => {
                 if let Some(c) = consumer.take() {

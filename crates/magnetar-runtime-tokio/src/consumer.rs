@@ -30,7 +30,16 @@ use crate::error::ClientError;
 /// Operations that drive protocol I/O (`receive`, `ack`, `seek`, `close`)
 /// still take `shared.inner.lock()`. Acquisition order: **global → per-slot,
 /// never the reverse**.
-#[derive(Debug, Clone)]
+///
+/// # Lifecycle
+///
+/// [`Self::close`] is the reliable shutdown path: it consumes the handle,
+/// waits for the broker acknowledgement, and returns any close error.
+/// If callers instead drop every clone, the final clone synchronously stages
+/// a best-effort `CloseConsumer` and wakes the existing driver. Dropping an
+/// intermediate clone does not close the consumer, and a terminal connection
+/// with no remaining driver stages nothing.
+#[derive(Debug)]
 pub struct Consumer {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) handle: ConsumerHandle,
@@ -41,9 +50,83 @@ pub struct Consumer {
     /// `MessageMetadata.encryption_keys` set, the consumer hands the ciphertext through
     /// this hook before yielding it to the user.
     pub(crate) decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
+    /// Last-clone close guard shared by every `Consumer` clone.
+    pub(crate) close_guard: Arc<ConsumerCloseGuard>,
+}
+
+impl Clone for Consumer {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            slot: self.slot.clone(),
+            decryptor: self.decryptor.clone(),
+            close_guard: self.close_guard.clone(),
+        }
+    }
+}
+
+/// RAII guard arming a best-effort `CommandCloseConsumer` on last-clone
+/// drop.
+///
+/// Explicit [`Consumer::close`] remains the reliable path because it awaits
+/// the broker acknowledgement. This guard only stages the close frame and
+/// wakes the existing driver; the protocol layer consumes the response
+/// in-place because no waiter exists.
+#[derive(Debug)]
+pub(crate) struct ConsumerCloseGuard {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    slot: Arc<magnetar_proto::ConsumerSlot>,
+}
+
+impl Drop for ConsumerCloseGuard {
+    fn drop(&mut self) {
+        if self.shared.is_no_driver() {
+            return;
+        }
+        // ADR-0038: release the per-slot probe before taking the global
+        // Connection mutex. The locks are sequential, never nested.
+        let already_closed = self.slot.state.lock().closed;
+        if already_closed {
+            return;
+        }
+        {
+            let mut conn = self.shared.inner.lock();
+            let _ = conn.close_consumer_forget(self.handle);
+        }
+        self.shared.driver_waker.notify_one();
+        tracing::debug!(
+            topic = %self.slot.identity.topic,
+            subscription = %self.slot.identity.subscription,
+            handle = ?self.handle,
+            "consumer dropped without explicit close — best-effort CloseConsumer enqueued"
+        );
+    }
 }
 
 impl Consumer {
+    /// Assemble a consumer handle and arm its last-clone close guard.
+    pub(crate) fn assemble(
+        shared: Arc<ConnectionShared>,
+        handle: ConsumerHandle,
+        slot: Arc<magnetar_proto::ConsumerSlot>,
+        decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
+    ) -> Self {
+        let close_guard = Arc::new(ConsumerCloseGuard {
+            shared: shared.clone(),
+            handle,
+            slot: slot.clone(),
+        });
+        Self {
+            shared,
+            handle,
+            slot,
+            decryptor,
+            close_guard,
+        }
+    }
+
     /// The protocol-layer consumer handle this façade wraps.
     pub fn handle(&self) -> ConsumerHandle {
         self.handle
@@ -700,7 +783,14 @@ impl Consumer {
         }
     }
 
-    /// Close this consumer. Resolves when the broker acks the close.
+    /// Reliably close this consumer.
+    ///
+    /// Consumes the handle, wakes the connection driver, and resolves only
+    /// after the broker acknowledges `CloseConsumer`. This confirmation-bearing
+    /// path is preferred whenever resource release must be observed.
+    ///
+    /// Dropping the final clone is a separate best-effort safety net: it
+    /// stages the close without waiting and cannot report broker errors.
     pub async fn close(self) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
@@ -1499,10 +1589,13 @@ fn message_id_greater(lhs: &MessageId, rhs: &MessageId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Instant;
 
     use bytes::BytesMut;
-    use magnetar_proto::{ConnectionConfig, SubscribeRequest, encode_command, encode_payload, pb};
+    use magnetar_proto::{
+        ConnectionConfig, SubscribeRequest, decode_one, encode_command, encode_payload, pb,
+    };
 
     use super::Consumer;
     use crate::ConnectionShared;
@@ -1687,12 +1780,12 @@ mod tests {
             magnetar_proto::CryptoFailureAction::Fail,
             b"top-secret",
         );
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
-        };
+            Some(std::sync::Arc::new(XorDecryptor)),
+        );
         let msg = consumer.receive().await.expect("decrypted receive");
         assert_eq!(msg.payload.as_ref(), b"top-secret");
     }
@@ -1706,12 +1799,12 @@ mod tests {
             magnetar_proto::CryptoFailureAction::Fail,
             b"opaque",
         );
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(AlwaysFailDecryptor)),
-        };
+            Some(std::sync::Arc::new(AlwaysFailDecryptor)),
+        );
         let res = consumer.receive().await;
         assert!(
             matches!(res, Err(ClientError::Other(_))),
@@ -1730,12 +1823,12 @@ mod tests {
             magnetar_proto::CryptoFailureAction::Consume,
             plaintext,
         );
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(AlwaysFailDecryptor)),
-        };
+            Some(std::sync::Arc::new(AlwaysFailDecryptor)),
+        );
         let msg = consumer
             .receive()
             .await
@@ -1761,12 +1854,12 @@ mod tests {
             magnetar_proto::CryptoFailureAction::Discard,
             b"undecryptable",
         );
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(AlwaysFailDecryptor)),
-        };
+            Some(std::sync::Arc::new(AlwaysFailDecryptor)),
+        );
         let got = consumer
             .receive_with_timeout(std::time::Duration::from_millis(200))
             .await
@@ -1787,12 +1880,7 @@ mod tests {
             magnetar_proto::CryptoFailureAction::Fail,
             b"secret",
         );
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         let res = consumer.receive().await;
         match res {
             Err(ClientError::Other(msg)) => {
@@ -1814,15 +1902,49 @@ mod tests {
             magnetar_proto::CryptoFailureAction::Fail,
             b"clone-secret",
         );
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
-        };
+            Some(std::sync::Arc::new(XorDecryptor)),
+        );
         let clone = consumer.clone();
+        assert!(
+            Arc::ptr_eq(&consumer.close_guard, &clone.close_guard),
+            "clones must share one last-clone close guard"
+        );
         let msg = clone.receive().await.expect("clone decrypts");
         assert_eq!(msg.payload.as_ref(), b"clone-secret");
+    }
+
+    #[test]
+    fn drop_after_no_driver_stages_no_close_consumer() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/no-driver-drop".to_owned(),
+                subscription: "no-driver-drop".to_owned(),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            handle
+        };
+        let slot = consumer_slot_for(&shared, handle);
+        let consumer = Consumer::assemble(shared.clone(), handle, slot, None);
+
+        shared.mark_no_driver();
+        drop(consumer);
+
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::CloseConsumer as i32,
+                "no driver remains to flush a drop-triggered CloseConsumer"
+            );
+        }
     }
 
     fn handshake_complete_shared() -> std::sync::Arc<ConnectionShared> {
@@ -1876,12 +1998,7 @@ mod tests {
             })
         };
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         assert!(
             consumer.drain_messages(0).is_empty(),
             "max=0 must short-circuit to an empty vec"
@@ -1894,12 +2011,12 @@ mod tests {
         // consumer), `drain_messages` returns an empty `Vec` rather than panicking.
         let shared = ConnectionShared::new(ConnectionConfig::default());
         let bogus_handle = magnetar_proto::ConsumerHandle(9999);
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
-            handle: bogus_handle,
-            slot: stub_consumer_slot_for_test(bogus_handle),
-            decryptor: None,
-        };
+            bogus_handle,
+            stub_consumer_slot_for_test(bogus_handle),
+            None,
+        );
         assert!(consumer.drain_messages(10).is_empty());
     }
 
@@ -1951,12 +2068,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
 
         let request_id = shared.inner.lock().peek_next_request_id_for_test();
         let response_schema = pb::Schema {
@@ -2018,12 +2135,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
 
         let request_id = shared.inner.lock().peek_next_request_id_for_test();
         let injector_shared = shared.clone();
@@ -2094,12 +2211,7 @@ mod tests {
         }
 
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
 
         for cap in [0_usize, 1, 3, 100] {
             let drained = consumer.drain_messages(cap);
@@ -2129,12 +2241,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
 
         // Spawn two parallel receive tasks before any message arrives so
         // both park on the slab.
@@ -2196,12 +2308,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
 
         let c1 = consumer.clone();
         let task = tokio::spawn(async move { c1.receive().await });
@@ -2259,12 +2371,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         consumer.ack_grouped(magnetar_proto::MessageId {
             ledger_id: 1,
             entry_id: 0,
@@ -2290,12 +2402,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         consumer.ack_grouped_cumulative(magnetar_proto::MessageId {
             ledger_id: 1,
             entry_id: 5,
@@ -2324,12 +2436,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         let txn = magnetar_proto::TxnId {
             most_sig_bits: 1,
             least_sig_bits: 2,
@@ -2363,12 +2475,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         let txn = magnetar_proto::TxnId {
             most_sig_bits: 1,
             least_sig_bits: 2,
@@ -2404,12 +2516,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         assert_eq!(consumer.available_in_queue(), 0);
 
         {
@@ -2424,12 +2536,7 @@ mod tests {
         assert!(depth <= 3, "queue depth must not exceed delivered count");
 
         let bogus = magnetar_proto::ConsumerHandle(9999);
-        let closed = Consumer {
-            shared,
-            handle: bogus,
-            slot: stub_consumer_slot_for_test(bogus),
-            decryptor: None,
-        };
+        let closed = Consumer::assemble(shared, bogus, stub_consumer_slot_for_test(bogus), None);
         assert_eq!(closed.available_in_queue(), 0);
     }
 
@@ -2445,12 +2552,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         // Right after subscribe, before the initial flow is granted, the
         // counter is zero.
         assert_eq!(consumer.available_permits(), 0);
@@ -2462,12 +2569,7 @@ mod tests {
         assert_eq!(consumer.available_permits(), 64);
 
         let bogus = magnetar_proto::ConsumerHandle(9999);
-        let closed = Consumer {
-            shared,
-            handle: bogus,
-            slot: stub_consumer_slot_for_test(bogus),
-            decryptor: None,
-        };
+        let closed = Consumer::assemble(shared, bogus, stub_consumer_slot_for_test(bogus), None);
         assert_eq!(closed.available_permits(), 0);
     }
 
@@ -2530,12 +2632,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         assert!(
             !consumer.has_received_any_message(),
             "fresh consumer must report no messages received",
@@ -2565,12 +2667,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
+        let consumer = Consumer::assemble(
+            shared.clone(),
             handle,
-            slot: consumer_slot_for(&shared, handle),
-            decryptor: None,
-        };
+            consumer_slot_for(&shared, handle),
+            None,
+        );
         assert!(!consumer.is_paused(), "default state is unpaused");
         consumer.pause();
         assert!(consumer.is_paused(), "after pause()");
@@ -2578,12 +2680,7 @@ mod tests {
         assert!(!consumer.is_paused(), "after resume()");
 
         let bogus = magnetar_proto::ConsumerHandle(9999);
-        let closed = Consumer {
-            shared,
-            handle: bogus,
-            slot: stub_consumer_slot_for_test(bogus),
-            decryptor: None,
-        };
+        let closed = Consumer::assemble(shared, bogus, stub_consumer_slot_for_test(bogus), None);
         assert!(!closed.is_paused());
     }
 
@@ -2599,12 +2696,7 @@ mod tests {
             })
         };
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         assert!(
             !consumer.has_reached_end_of_topic(),
             "default state is not end-of-topic",
@@ -2624,12 +2716,7 @@ mod tests {
             })
         };
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         let result = consumer
             .receive_with_timeout(std::time::Duration::from_millis(50))
             .await
@@ -2658,12 +2745,7 @@ mod tests {
                 .expect("handle CommandMessage");
         }
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         let result = consumer
             .receive_with_timeout(std::time::Duration::from_secs(2))
             .await
@@ -2692,12 +2774,7 @@ mod tests {
             }
         }
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         let drained = consumer
             .receive_batch(10, std::time::Duration::from_secs(2))
             .await
@@ -2806,12 +2883,12 @@ mod tests {
             }
         }
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
-        };
+            Some(std::sync::Arc::new(XorDecryptor)),
+        );
         let batch = consumer
             .receive_batch(10, std::time::Duration::from_secs(2))
             .await
@@ -2868,12 +2945,12 @@ mod tests {
             .expect("handle msg 2");
         }
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(SelectiveDecryptor)),
-        };
+            Some(std::sync::Arc::new(SelectiveDecryptor)),
+        );
         let batch = consumer
             .receive_batch(10, std::time::Duration::from_secs(2))
             .await
@@ -2908,12 +2985,7 @@ mod tests {
             })
         };
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         let zero_msgs = consumer
             .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_secs(60))
             .await
@@ -2941,12 +3013,12 @@ mod tests {
                     ..Default::default()
                 })
             };
-            let consumer = Consumer {
-                shared: shared.clone(),
+            let consumer = Consumer::assemble(
+                shared.clone(),
                 handle,
-                slot: consumer_slot_for(&shared, handle),
-                decryptor: None,
-            };
+                consumer_slot_for(&shared, handle),
+                None,
+            );
 
             let request_id = shared.inner.lock().peek_next_request_id_for_test();
             let inj_shared = shared.clone();
@@ -3011,12 +3083,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
-            handle: consumer_handle,
-            slot: consumer_slot_for(&shared, consumer_handle),
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(
+            shared.clone(),
+            consumer_handle,
+            consumer_slot_for(&shared, consumer_handle),
+            None,
+        );
         let producer_slot = shared
             .inner
             .lock()
@@ -3065,12 +3137,12 @@ mod tests {
                 ..Default::default()
             })
         };
-        let consumer = Consumer {
-            shared: shared.clone(),
-            handle: consumer_handle,
-            slot: consumer_slot_for(&shared, consumer_handle),
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(
+            shared.clone(),
+            consumer_handle,
+            consumer_slot_for(&shared, consumer_handle),
+            None,
+        );
         let producer_slot = shared
             .inner
             .lock()
@@ -3204,12 +3276,12 @@ mod tests {
         }
 
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
+        let consumer = Consumer::assemble(
             shared,
             handle,
             slot,
-            decryptor: Some(std::sync::Arc::new(XorDecryptor)),
-        };
+            Some(std::sync::Arc::new(XorDecryptor)),
+        );
         let msg = consumer
             .receive()
             .await
@@ -3235,12 +3307,7 @@ mod tests {
             })
         };
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared,
-            handle,
-            slot,
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared, handle, slot, None);
         assert!(
             consumer.drain_dead_letter().is_empty(),
             "no messages have been flagged for DLQ yet",
@@ -3279,12 +3346,7 @@ mod tests {
             })
         };
         let slot = consumer_slot_for(&shared, handle);
-        let consumer = Consumer {
-            shared: shared.clone(),
-            handle,
-            slot: slot.clone(),
-            decryptor: None,
-        };
+        let consumer = Consumer::assemble(shared.clone(), handle, slot.clone(), None);
 
         // Simulate the close-race: another (cloned) handle ran `close()` and
         // flipped the per-slot `closed` bit + drained wakers BEFORE we ever

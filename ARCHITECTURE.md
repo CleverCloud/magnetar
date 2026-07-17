@@ -137,7 +137,9 @@ The schedule API lives on the relevant builder (`PartitionedProducerBuilder::aut
 `ConsumerBuilder::message_listener(...)` + `subscribe_with_listener()` (and the `TypedConsumerBuilder` twin) flip a consumer from pull to push, mirroring Java `ConsumerBuilder#messageListener` ([ADR-0064](specs/adr/0064-consumer-message-listener-push-delivery.md)).
 The mechanism is the same `tokio::spawn`ed `loop { receive(); callback }` background task `TableView::listen` uses (`crates/magnetar/src/table_view.rs` `spawn_drain`), generalised in `crates/magnetar/src/consumer_listener.rs` over `C: ConsumerApi + Clone` so the tokio and moonpool consumers share one poller.
 It stays out of `magnetar-proto` (which cannot spawn tasks or invoke callbacks): the poller lives entirely in the façade and drives the engine's existing `receive()`, which already parks on the per-consumer `Notify` / `Waker` slab inside the sans-io state machine — no channel (ADR-0003), no new lock (ADR-0038), no host-clock read (ADR-0011).
-Delivery is sequential and in order, the callback acks explicitly (the poller never auto-acks), and the task ends cleanly when `receive()` errors (closed consumer) or the returned `MessageListenerHandle` is dropped.
+Delivery is sequential and in order, and the callback acks explicitly (the poller never auto-acks).
+An explicit or terminal remote close ends the task when `receive()` returns an error.
+Dropping the returned `MessageListenerHandle` instead aborts the poller and drops its owned consumer clone; only the final clone stages the best-effort close.
 
 The same push surface extends to the wrapper consumers — `MultiTopicsConsumer`, `PartitionedConsumer`, `PatternConsumer` — via a second poller (`spawn_wrapper_message_listener`) generic over the `WrapperReceiver` trait, since those are not `ConsumerApi` (their `receive()` yields a topic-tagged message).
 Its callback is `Fn(&str, &IncomingMessage)`: the originating topic is the extra argument so the callback can route an explicit ack to the right child.
@@ -505,6 +507,25 @@ Two close paths exist, with different reliability contracts.
 
 The guard is the one `Drop` impl that touches both lock tiers: it probes `slot.state.lock().closed`, **releases** that guard, then takes the global connection mutex — sequential acquisition, never nested, so the ADR-0038 global→per-slot order is respected.
 The `closed`-flag dedup covers only a preceding completed client-initiated close; broker-initiated detach keeps `closed = false` on purpose (re-attach on PIP-188 migration / failover), so a drop after broker detach emits one redundant — and broker-tolerated — `CloseProducer`.
+
+### Consumer close semantics (ADR-0077)
+
+Consumer close has the same two reliability tiers as producer close, with one guard shared by every clone of a logical consumer.
+
+- **Explicit `Consumer::close().await`** — the reliable path.
+  Enqueues `CommandCloseConsumer` via `Connection::close_consumer`, wakes the driver, awaits the broker acknowledgement, and returns broker or terminal errors to the caller.
+- **Last-clone drop (RAII)** — the safety net.
+  Every `Consumer` clone shares one `Arc<ConsumerCloseGuard>`; the final clone stages `Connection::close_consumer_forget` synchronously and wakes the existing driver without spawning or blocking.
+  Dropping an intermediate clone only decrements the guard `Arc`, so surviving handles remain usable.
+
+The forgotten request is registered as `ConsumerCloseForgotten`.
+Broker success consumes it in place, broker error emits a bounded structured warning, and connection reset or terminal cleanup discards it without creating an `OpOutcome` that no future could drain.
+If the connection is already in its terminal no-driver state, the guard stages nothing because no task remains to flush the bytes.
+
+The guard first probes `slot.state.lock().closed`, releases that guard, and only then takes the global connection mutex, preserving ADR-0038's lock ordering.
+A completed explicit close marks the slot closed and suppresses a later drop close.
+The final-clone path is best-effort rather than confirmation-bearing: callers that must know the broker acknowledged resource release use explicit `close().await`.
+This is Rust RAII and pulsar-rs migration parity, beyond Java abandonment semantics; it does not claim that Java garbage collection closes consumers.
 
 ---
 

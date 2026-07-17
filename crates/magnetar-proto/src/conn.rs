@@ -318,6 +318,13 @@ enum PendingRequestKind {
     ConsumerClose {
         handle: ConsumerHandle,
     },
+    /// Fire-and-forget close issued by the engines' last-clone drop guard.
+    /// No `RequestFut` will ever drain the broker's ack, so the
+    /// `Success`/`Error` handlers consume it in-place rather than leaking an
+    /// [`OpOutcome`] entry.
+    ConsumerCloseForgotten {
+        handle: ConsumerHandle,
+    },
     TopicWatcher {
         watcher_id: u64,
     },
@@ -720,20 +727,24 @@ impl Connection {
     pub fn reset(&mut self) {
         self.session_epoch = self.session_epoch.wrapping_add(1);
 
-        // (2) Fail every pending request and wake its waiter.
-        let pending_request_keys: Vec<PendingOpKey> = self
-            .pending_requests
-            .keys()
-            .copied()
-            .map(PendingOpKey::Request)
-            .collect();
-        for key in pending_request_keys {
+        // (2) Fail every pending request and wake its waiter. Forgotten
+        // producer/consumer closes have no waiter by construction, so consume
+        // them without materializing an undrainable outcome.
+        for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
+            let key = PendingOpKey::Request(request_id);
+            if matches!(
+                kind,
+                PendingRequestKind::ProducerCloseForgotten { .. }
+                    | PendingRequestKind::ConsumerCloseForgotten { .. }
+            ) {
+                let _ = self.wakers.remove(&key);
+                continue;
+            }
             self.outcomes.insert(key, OpOutcome::SessionLost { key });
             if let Some(w) = self.wakers.remove(&key) {
                 w.wake();
             }
         }
-        self.pending_requests.clear();
 
         // (3) Snapshot every in-flight publish so [`rebuild_producers`] can replay it on
         // the freshly-handshaked session. We pluck the wakers out of each `OpSend` (so we
@@ -916,14 +927,19 @@ impl Connection {
     /// dropped BEFORE the user wakers fire, so a waker that re-enters the
     /// connection cannot deadlock.
     pub fn fail_all_pending(&mut self, reason: &str) {
-        // (1) Terminate every pending request and wake its waiter.
-        let pending_request_keys: Vec<PendingOpKey> = self
-            .pending_requests
-            .keys()
-            .copied()
-            .map(PendingOpKey::Request)
-            .collect();
-        for key in pending_request_keys {
+        // (1) Terminate every pending request and wake its waiter. Forgotten
+        // producer/consumer closes have no waiter by construction, so consume
+        // them without materializing an undrainable outcome.
+        for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
+            let key = PendingOpKey::Request(request_id);
+            if matches!(
+                kind,
+                PendingRequestKind::ProducerCloseForgotten { .. }
+                    | PendingRequestKind::ConsumerCloseForgotten { .. }
+            ) {
+                let _ = self.wakers.remove(&key);
+                continue;
+            }
             self.outcomes.insert(
                 key,
                 OpOutcome::Terminal {
@@ -935,7 +951,6 @@ impl Connection {
                 w.wake();
             }
         }
-        self.pending_requests.clear();
 
         // (2) Terminate every in-flight publish. Drain each producer's pending
         // `OpSend`s WITHOUT a replay snapshot (there is no session to replay
@@ -1995,23 +2010,34 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation("missing CommandSuccess"))?;
                 let request_id = RequestId(ok.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                if let Some(PendingRequestKind::ProducerCloseForgotten { handle }) = kind {
-                    // Fire-and-forget drop-close: no waiter will ever drain
-                    // this outcome — recording it would leak one permanent
-                    // `outcomes` entry per dropped producer (issue #241's
-                    // continuous-eviction workload). Consume the ack here.
-                    tracing::debug!(
-                        target: "magnetar_proto::conn",
-                        handle = ?handle,
-                        request_id = ?request_id,
-                        "fire-and-forget producer close acked by broker"
-                    );
-                } else {
-                    self.outcomes.insert(
-                        PendingOpKey::Request(request_id),
-                        OpOutcome::Success { request_id },
-                    );
-                    self.wake_for_request(request_id);
+                match kind {
+                    Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
+                        // Fire-and-forget drop-close: no waiter will ever drain
+                        // this outcome — recording it would leak one permanent
+                        // `outcomes` entry per dropped producer (issue #241's
+                        // continuous-eviction workload). Consume the ack here.
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            "fire-and-forget producer close acked by broker"
+                        );
+                    }
+                    Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            "fire-and-forget consumer close acked by broker"
+                        );
+                    }
+                    _ => {
+                        self.outcomes.insert(
+                            PendingOpKey::Request(request_id),
+                            OpOutcome::Success { request_id },
+                        );
+                        self.wake_for_request(request_id);
+                    }
                 }
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
                     self.events
@@ -2095,30 +2121,45 @@ impl Connection {
                 }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
-                if let Some(PendingRequestKind::ProducerCloseForgotten { handle }) = kind {
-                    // Fire-and-forget drop-close: no waiter exists, so an
-                    // `OpOutcome::Error` would leak (see the `Success` arm).
-                    // Surface the rejection to operators instead — a broker
-                    // rejecting a close storm (overload, fencing) must stay
-                    // diagnosable (issue #241).
-                    tracing::warn!(
-                        target: "magnetar_proto::conn",
-                        handle = ?handle,
-                        request_id = ?request_id,
-                        code = err.error,
-                        message = %err.message,
-                        "broker rejected fire-and-forget producer close (producer dropped without explicit close)"
-                    );
-                } else {
-                    self.outcomes.insert(
-                        PendingOpKey::Request(request_id),
-                        OpOutcome::Error {
-                            request_id,
-                            code: err.error,
-                            message: err.message.clone(),
-                        },
-                    );
-                    self.wake_for_request(request_id);
+                match kind {
+                    Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
+                        let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
+                        // Fire-and-forget drop-close: no waiter exists, so an
+                        // `OpOutcome::Error` would leak (see the `Success` arm).
+                        // Surface the rejection to operators instead — a broker
+                        // rejecting a close storm (overload, fencing) must stay
+                        // diagnosable (issue #241).
+                        tracing::warn!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            code = err.error,
+                            message = %bounded_message,
+                            "broker rejected fire-and-forget producer close (producer dropped without explicit close)"
+                        );
+                    }
+                    Some(PendingRequestKind::ConsumerCloseForgotten { handle }) => {
+                        let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
+                        tracing::warn!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            code = err.error,
+                            message = %bounded_message,
+                            "broker rejected fire-and-forget consumer close (consumer dropped without explicit close)"
+                        );
+                    }
+                    _ => {
+                        self.outcomes.insert(
+                            PendingOpKey::Request(request_id),
+                            OpOutcome::Error {
+                                request_id,
+                                code: err.error,
+                                message: err.message.clone(),
+                            },
+                        );
+                        self.wake_for_request(request_id);
+                    }
                 }
                 // When the failing request id correlates with a pending producer-open /
                 // consumer-subscribe, surface a typed failure event so event-stream waiters
@@ -4771,8 +4812,32 @@ impl Connection {
         request_id
     }
 
-    /// Close a consumer.
+    /// Close a consumer. The caller is expected to await the broker ack via
+    /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
+    /// with [`Self::take_outcome`].
     pub fn close_consumer(&mut self, handle: ConsumerHandle) -> RequestId {
+        self.close_consumer_inner(handle, false)
+    }
+
+    /// Fire-and-forget variant of [`Self::close_consumer`] for the engines'
+    /// last-clone drop guard. The broker ack is consumed in-place because no
+    /// waiter exists to drain it.
+    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle) -> RequestId {
+        self.close_consumer_inner(handle, true)
+    }
+
+    fn close_consumer_inner(&mut self, handle: ConsumerHandle, forget: bool) -> RequestId {
+        let ack_actions = self.consumers.get(&handle).and_then(|slot| {
+            slot.state
+                .lock()
+                .ack_tracker
+                .as_mut()
+                .map(crate::trackers::AckGroupingTracker::flush)
+        });
+        if let Some(actions) = ack_actions {
+            self.dispatch_ack_actions(actions);
+        }
+
         let request_id = self.alloc_request_id();
         let cmd = pb::CommandCloseConsumer {
             consumer_id: handle.0,
@@ -4789,8 +4854,12 @@ impl Connection {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().close();
         }
-        self.pending_requests
-            .insert(request_id, PendingRequestKind::ConsumerClose { handle });
+        let kind = if forget {
+            PendingRequestKind::ConsumerCloseForgotten { handle }
+        } else {
+            PendingRequestKind::ConsumerClose { handle }
+        };
+        self.pending_requests.insert(request_id, kind);
         request_id
     }
 
@@ -10898,6 +10967,244 @@ mod scalable_conn_tests {
         // Post-split DAG: parent gone, two children present.
         let snap = conn.dag_snapshot(sid).expect("session still open");
         assert_eq!(snap.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod consumer_close_contract_tests {
+    use super::*;
+    use crate::frame::{decode_one, encode_command};
+
+    fn handshake_complete(now: Instant) -> Connection {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("begin_handshake");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &connected).expect("encode connected");
+        conn.handle_bytes(now, &buf).expect("apply connected");
+        let _ = conn.poll_transmit();
+        conn
+    }
+
+    fn subscribe(conn: &mut Connection, suffix: &str) -> ConsumerHandle {
+        conn.subscribe(SubscribeRequest {
+            topic: format!("persistent://public/default/{suffix}"),
+            subscription: suffix.to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        })
+    }
+
+    fn drain_command_types(conn: &mut Connection) -> Vec<i32> {
+        let mut bytes = conn.poll_transmit();
+        let mut kinds = Vec::new();
+        while !bytes.is_empty() {
+            let frame = decode_one(&mut bytes).expect("staged frame must decode");
+            kinds.push(frame.command.r#type);
+        }
+        kinds
+    }
+
+    fn ack_success(conn: &mut Connection, request_id: u64, now: Instant) {
+        let ack = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack).expect("encode Success");
+        conn.handle_bytes(now, &buf).expect("apply Success");
+    }
+
+    fn ack_error(conn: &mut Connection, request_id: u64, now: Instant) {
+        let err = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "synthetic close rejection".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &err).expect("encode Error");
+        conn.handle_bytes(now, &buf).expect("apply Error");
+    }
+
+    #[test]
+    fn close_consumer_marks_slot_closed_synchronously() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "close-sync");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+        assert!(!slot.state.lock().closed, "fresh consumer must be open");
+
+        let _request_id = conn.close_consumer(handle);
+
+        assert!(
+            slot.state.lock().closed,
+            "closed flag must flip synchronously inside close_consumer"
+        );
+    }
+
+    #[test]
+    fn close_consumer_stages_close_frame() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "close-frame");
+        let _ = conn.poll_transmit();
+
+        let _request_id = conn.close_consumer(handle);
+
+        assert_eq!(
+            drain_command_types(&mut conn),
+            vec![pb::base_command::Type::CloseConsumer as i32],
+            "close_consumer must stage exactly one CloseConsumer frame"
+        );
+    }
+
+    #[test]
+    fn close_consumer_flushes_grouped_acks_before_close_frame() {
+        let message_id = MessageId {
+            ledger_id: 7,
+            entry_id: 11,
+            partition: -1,
+            batch_index: -1,
+            batch_size: 0,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+
+        for forget in [false, true] {
+            let now = Instant::now();
+            let mut conn = handshake_complete(now);
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: format!("persistent://public/default/close-ack-order-{forget}"),
+                subscription: format!("close-ack-order-{forget}"),
+                receiver_queue_size: 16,
+                durable: true,
+                ack_group_time: Some(Duration::from_secs(60)),
+                ..Default::default()
+            });
+            let _ = conn.poll_transmit();
+            conn.ack_grouped_individual(handle, message_id, now);
+
+            if forget {
+                let _request_id = conn.close_consumer_forget(handle);
+            } else {
+                let _request_id = conn.close_consumer(handle);
+            }
+
+            assert_eq!(
+                drain_command_types(&mut conn),
+                vec![
+                    pb::base_command::Type::Ack as i32,
+                    pb::base_command::Type::CloseConsumer as i32,
+                ],
+                "{forget:?} close must flush grouped acknowledgements before CloseConsumer"
+            );
+        }
+    }
+
+    #[test]
+    fn close_consumer_forget_records_no_outcome_on_success() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "forget-success");
+        let slot = conn.consumer(handle).expect("slot exists").clone();
+
+        let request_id = conn.close_consumer_forget(handle);
+        assert!(
+            slot.state.lock().closed,
+            "forget variant must still flip the closed flag synchronously"
+        );
+        ack_success(&mut conn, request_id.0, now);
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "fire-and-forget close ack must be consumed in-place, not recorded"
+        );
+    }
+
+    #[test]
+    fn close_consumer_forget_records_no_outcome_on_broker_error() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "forget-error");
+
+        let request_id = conn.close_consumer_forget(handle);
+        ack_error(&mut conn, request_id.0, now);
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "rejected fire-and-forget close must not leak an OpOutcome entry"
+        );
+    }
+
+    #[test]
+    fn close_consumer_forget_records_no_outcome_on_reset() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "forget-reset");
+
+        let request_id = conn.close_consumer_forget(handle);
+        conn.reset();
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "reset must not materialize an outcome for a forgotten close"
+        );
+    }
+
+    #[test]
+    fn close_consumer_forget_records_no_outcome_on_fail_all_pending() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "forget-fail-all");
+
+        let request_id = conn.close_consumer_forget(handle);
+        conn.fail_all_pending("synthetic terminal drop");
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "fail_all_pending must not materialize an outcome for a forgotten close"
+        );
+    }
+
+    #[test]
+    fn close_consumer_awaited_still_records_outcome() {
+        let now = Instant::now();
+        let mut conn = handshake_complete(now);
+        let handle = subscribe(&mut conn, "awaited-close");
+
+        let request_id = conn.close_consumer(handle);
+        ack_success(&mut conn, request_id.0, now);
+
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_some(),
+            "awaited close must record the outcome its RequestFut drains"
+        );
     }
 }
 

@@ -621,9 +621,14 @@ pub trait ConsumerApi: 'static + Send + Sync {
         delay: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
 
-    /// Consume the consumer and tear down the broker-side resource
-    /// (`CommandCloseConsumer`). Mirrors Java `Consumer#close`. Both
-    /// runtime types implement close by consuming `self`.
+    /// Consume the consumer and reliably tear down the broker-side resource
+    /// (`CommandCloseConsumer`). Mirrors Java `Consumer#close`: both runtime
+    /// implementations await the broker acknowledgement and return close
+    /// errors through the future.
+    ///
+    /// Dropping the final runtime consumer clone is a distinct best-effort
+    /// safety net that cannot report acknowledgement or failure. Generic
+    /// code that requires confirmed release must call and await this method.
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>>
     where
         Self: Sized;

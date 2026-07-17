@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Consumer final-clone resource release:** dropping the last clone of a consumer now stages a best-effort `CloseConsumer` and wakes the existing driver, allowing ownership-driven teardown to unregister the broker-side consumer when the frame reaches the broker and is accepted.
+  Intermediate clone drops leave surviving consumers usable, explicit `close().await` remains the reliable acknowledgement-bearing path, and forgotten close responses never accumulate undrained outcomes.
+  (#342; ADR-0077)
+
 ## [1.2.2] - 2026-07-13
 
 ### Fixed
