@@ -1,6 +1,6 @@
 # ADR-0056 — Re-pin moonpool to crates.io `0.7.0`
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR-0078](0078-adopt-moonpool-0-8-native-deterministic-runtime.md)
 - **Date**: 2026-06-10
 - **Decider**: Florentin Dubois
 - **Tags**: dependencies, moonpool, supply-chain, process

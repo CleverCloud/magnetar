@@ -8,7 +8,7 @@
 //! kept 1:1 with the tokio layer).
 //!
 //! The single per-connection driver task multiplexes the outbound write path
-//! and the inbound read path in one `tokio::select! { biased; … }`. Every
+//! and the inbound read path in one `moonpool_core::select! { biased; … }`. Every
 //! `Producer::send` pulses `shared.driver_waker.notify_one()`, so under
 //! sustained publish load a waker permit is almost always pending on loop
 //! entry. The pre-fix arm order polled the `driver_waker` arm FIRST, so when a
@@ -18,7 +18,7 @@
 //!
 //! The fix (driver.rs) reorders the `select!` so the inbound read arm is polled
 //! FIRST while keeping `biased;`. Keeping `biased;` is REQUIRED here: a
-//! non-biased `tokio::select!` picks arms via an uncontrolled thread-local RNG,
+//! non-biased select picks arms via an uncontrolled thread-local RNG,
 //! which would break the bit-for-bit reproducibility this engine guarantees —
 //! that constraint is exactly why the fix is a deterministic *reorder* and not
 //! "drop the bias".
@@ -240,7 +240,7 @@ impl Workload for ReceiptBroker {
         let handled = self.sessions_handled.clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 inbound = listener.accept() => {
                     match inbound {
@@ -297,25 +297,28 @@ impl Workload for PressureClient {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
         let time = ctx.providers().time().clone();
+        let task = ctx.providers().task().clone();
 
-        let connect = tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
-        )
-        .await;
+        let connect = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+            )
+            .await;
         let Ok(Ok(client)) = connect else {
             self.obs.lock().last_error = Some(format!("connect_plain failed: {connect:?}"));
             return Ok(());
         };
 
-        let producer = match tokio::time::timeout(
-            Duration::from_secs(20),
-            client.open_producer(CreateProducerRequest {
-                topic: "persistent://public/default/read-fairness".to_owned(),
-                ..Default::default()
-            }),
-        )
-        .await
+        let producer = match time
+            .timeout(
+                Duration::from_secs(20),
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/read-fairness".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await
         {
             Ok(Ok(p)) => p,
             other => {
@@ -331,13 +334,16 @@ impl Workload for PressureClient {
         // flag lets the loop terminate so the handle joins cleanly at the end.
         let shared = client.shared().clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let pressure = ctx.providers().task().spawn_task("driver-waker-pressure", {
+        let pressure_time = time.clone();
+        let pressure = task.spawn_task("driver-waker-pressure", {
             let shared = shared.clone();
             let stop = stop.clone();
             async move {
                 while !stop.load(Ordering::Relaxed) {
                     shared.driver_waker.notify_one();
-                    tokio::task::yield_now().await;
+                    if pressure_time.sleep(Duration::from_millis(1)).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -355,40 +361,41 @@ impl Workload for PressureClient {
         // Drive virtual time forward in small ticks so the driver loop iterates
         // under sustained waker pressure. With the fix the receipt resolves on
         // the first read-arm win; without it, the budget expires.
-        let resolved = tokio::time::timeout(Duration::from_secs(30), async {
-            tokio::pin!(send_fut);
-            for _ in 0..64 {
-                tokio::task::yield_now().await;
-            }
-            for _ in 0..50 {
-                tokio::select! {
-                    biased;
-                    result = &mut send_fut => return Some(result),
-                    slept = time.sleep(Duration::from_millis(100)) => {
-                        if slept.is_err() {
-                            break;
-                        }
-                        for _ in 0..16 {
-                            tokio::task::yield_now().await;
+        let resolved = time
+            .timeout(Duration::from_secs(30), async {
+                tokio::pin!(send_fut);
+                for _ in 0..64 {
+                    task.yield_now().await;
+                }
+                for _ in 0..50 {
+                    moonpool_sim::select! {
+                        biased;
+                        result = &mut send_fut => return Some(result),
+                        slept = time.sleep(Duration::from_millis(100)) => {
+                            if slept.is_err() {
+                                break;
+                            }
+                            for _ in 0..16 {
+                                task.yield_now().await;
+                            }
                         }
                     }
                 }
-            }
-            tokio::select! {
-                biased;
-                result = &mut send_fut => Some(result),
-                () = tokio::task::yield_now() => None,
-            }
-        })
-        .await
-        .unwrap_or(None);
+                moonpool_sim::select! {
+                    biased;
+                    result = &mut send_fut => Some(result),
+                    () = task.yield_now() => None,
+                }
+            })
+            .await
+            .unwrap_or(None);
 
         let t_after = time.now();
         stop.store(true, Ordering::Relaxed);
         // Let the pressure loop observe the stop flag and exit, then join it so
         // no task is left running into the next iteration.
         for _ in 0..4 {
-            tokio::task::yield_now().await;
+            task.yield_now().await;
         }
         let _ = pressure.await;
         let mut obs = self.obs.lock();

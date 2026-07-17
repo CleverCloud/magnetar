@@ -28,7 +28,7 @@ use magnetar_runtime_tokio::ConnectionShared;
 fn supervisor_with_grace(grace: Duration) -> SupervisorConfig {
     SupervisorConfig {
         initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(60),
+        max_backoff: Duration::from_mins(1),
         drop_grace: grace,
         ..SupervisorConfig::default()
     }

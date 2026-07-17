@@ -128,7 +128,7 @@ impl AuthProvider for VirtualOAuthProvider {
 fn oauth_token_refresh_fires_exactly_at_virtual_deadline() {
     let t0 = Instant::now();
     let clock = VirtualClock::new(t0);
-    let provider = VirtualOAuthProvider::new(clock.clone(), Duration::from_secs(3600));
+    let provider = VirtualOAuthProvider::new(clock.clone(), Duration::from_hours(1));
 
     // First call at virtual t0 → cold cache, must fetch a fresh token.
     let token_a = provider.initial().expect("initial @ t0");
@@ -188,7 +188,7 @@ fn oauth_provider_threaded_through_connection_shared() {
     let t0 = Instant::now();
     let clock = VirtualClock::new(t0);
     let provider: Arc<dyn AuthProvider> =
-        Arc::new(VirtualOAuthProvider::new(clock, Duration::from_secs(3600)));
+        Arc::new(VirtualOAuthProvider::new(clock, Duration::from_hours(1)));
     let shared = magnetar_runtime_moonpool::ConnectionShared::with_auth(
         magnetar_proto::ConnectionConfig::default(),
         Some(provider),

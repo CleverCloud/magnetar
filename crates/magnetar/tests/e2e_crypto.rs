@@ -77,7 +77,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -437,7 +437,7 @@ async fn e2e_crypto_with_chunking() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     producer.close().await?;
 
-    let msg = tokio::time::timeout(Duration::from_secs(120), consumer.receive()).await??;
+    let msg = tokio::time::timeout(Duration::from_mins(2), consumer.receive()).await??;
     assert_eq!(
         msg.payload.len(),
         payload_size,

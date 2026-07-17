@@ -1088,7 +1088,7 @@ mod tests {
         let c2 = counter.clone();
         let mut handle2 = <TokioEngine as Engine>::spawn(async move {
             // Sleep forever — abort wins.
-            ::tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            ::tokio::time::sleep(std::time::Duration::from_hours(1)).await;
             c2.fetch_add(1, Ordering::SeqCst);
         });
         <TokioEngine as Engine>::abort_task(&mut handle2);
@@ -1144,7 +1144,7 @@ mod tests {
 
         let c2 = counter.clone();
         let mut handle2 = <E as Engine>::spawn(async move {
-            ::tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            ::tokio::time::sleep(std::time::Duration::from_hours(1)).await;
             c2.fetch_add(1, Ordering::SeqCst);
         });
         <E as Engine>::abort_task(&mut handle2);

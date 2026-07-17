@@ -73,7 +73,7 @@ let producer = client
 let stream = client
     .stream_consumer("persistent://public/default/topic")
     .subscription("my-sub")
-    .negative_ack_redelivery_delay(Duration::from_secs(60))
+    .negative_ack_redelivery_delay(Duration::from_mins(1))
     .ack_timeout(Some(Duration::from_secs(30)))
     .subscribe()
     .await?;

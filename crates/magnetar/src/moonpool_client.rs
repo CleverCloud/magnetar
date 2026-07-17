@@ -46,6 +46,26 @@ impl<P: Providers> PulsarClient<MoonpoolEngine<P>> {
         }
     }
 
+    /// Construct a moonpool-backed façade while binding consumer deadlines
+    /// to the supplied provider bundle.
+    ///
+    /// Use this entry for `moonpool_sim::SimProviders` or another custom
+    /// provider implementation. [`Self::from_moonpool`] retains its
+    /// Tokio-backed convenience behaviour for compatibility.
+    #[must_use]
+    pub fn from_moonpool_with_providers(
+        shared: Arc<magnetar_runtime_moonpool::ConnectionShared>,
+        driver: magnetar_runtime_moonpool::DriverHandle,
+        providers: &P,
+    ) -> Self {
+        Self {
+            inner: magnetar_runtime_moonpool::Client::from_parts_with_providers(
+                shared, driver, providers,
+            ),
+            memory_limit: None,
+        }
+    }
+
     /// Construct directly from an already-built moonpool runtime client.
     /// Useful when callers want to drive
     /// [`magnetar_runtime_moonpool::Client::connect_plain`] themselves and

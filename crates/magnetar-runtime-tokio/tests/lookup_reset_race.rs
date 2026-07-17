@@ -233,7 +233,7 @@ fn supervisor(max_attempts: Option<u32>) -> SupervisorConfig {
     SupervisorConfig {
         initial_backoff: Duration::from_millis(2),
         max_backoff: Duration::from_millis(20),
-        mandatory_stop: Duration::from_secs(60),
+        mandatory_stop: Duration::from_mins(1),
         max_attempts,
         anti_thrash_threshold: Some(AntiThrashThreshold {
             successful_attaches: 8,

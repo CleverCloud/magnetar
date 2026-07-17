@@ -18,13 +18,13 @@
 //! - `Arc<parking_lot::Mutex<Connection>>` holds the sans-io state machine,
 //! - a single-cell [`tokio::sync::Notify`] (`driver_waker`) signals the driver when user-facing
 //!   futures enqueue fresh work,
-//! - the driver loop runs as a spawned tokio task that selects over `driver_waker.notified()`,
-//!   `transport.read_buf(...)`, and a timer driven by [`moonpool_core::TimeProvider::sleep`].
+//! - the driver loop is spawned through [`moonpool_core::TaskProvider::spawn_task`] and waits with
+//!   [`moonpool_core::select!`] over `driver_waker.notified()`, `transport.read_buf(...)`, and a
+//!   timer driven by [`moonpool_core::TimeProvider::sleep`].
 //!
-//! Because the driver still uses `tokio::spawn` and `tokio::select!`, both
-//! the production and simulation modes rely on a tokio runtime — the
-//! determinism comes from substituting the providers, not from replacing
-//! tokio.
+//! `TokioProviders` maps those operations to Tokio.
+//! `moonpool_sim::SimProviders` maps them to Moonpool 0.8's seeded deterministic executor,
+//! virtual clock, and simulated network, so simulation does not require an ambient Tokio runtime.
 //!
 //! ## TLS
 //!
@@ -74,6 +74,8 @@ pub mod tls;
 pub mod tls_crypto;
 mod transport;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Waker;
@@ -98,7 +100,7 @@ use magnetar_proto::{Connection, ConnectionConfig};
 ///
 /// [`AutoClusterFailover`]: crate::auto_cluster_failover::AutoClusterFailover
 pub use magnetar_proto::{ControlledClusterFailover, ServiceUrlProvider, StaticServiceUrlProvider};
-use moonpool_core::{Providers, TimeProvider};
+use moonpool_core::{Providers, TimeError, TimeProvider};
 use parking_lot::Mutex;
 use slab::Slab;
 use tokio::sync::Notify;
@@ -110,6 +112,23 @@ pub use crate::dns::{DnsResolveFuture, DnsResolver, StaticDnsResolver, arc_dns_r
 pub use crate::driver::DriverHandle;
 pub use crate::producer::{Producer, SendFut};
 use crate::transport::Transport;
+
+pub(crate) type SleepFuture = Pin<Box<dyn Future<Output = Result<(), TimeError>> + Send + 'static>>;
+pub(crate) type SleepProvider = dyn Fn(Duration) -> SleepFuture + Send + Sync + 'static;
+
+pub(crate) fn sleep_provider_from_time<T>(time: T) -> Arc<SleepProvider>
+where
+    T: TimeProvider + Clone + Send + Sync + 'static,
+{
+    Arc::new(move |duration| {
+        let time = time.clone();
+        Box::pin(async move { time.sleep(duration).await })
+    })
+}
+
+pub(crate) fn tokio_sleep_provider() -> Arc<SleepProvider> {
+    sleep_provider_from_time(moonpool_core::TokioTimeProvider::new())
+}
 
 /// Default wall-clock epoch used by deterministic-sim callers that pin a
 /// fixed base via [`ConnectionShared::with_auth_and_wall_clock_base`].
@@ -198,8 +217,12 @@ pub struct ConnectionShared {
     pub auth_provider: Option<Arc<dyn magnetar_proto::AuthProvider>>,
     /// PIP-145 topic-list-watcher deltas pushed here by the driver.
     pub topic_list_changes: Mutex<std::collections::VecDeque<TopicListChange>>,
-    /// Wakeup for `next_topic_list_change` futures. Notified after every
-    /// push to [`Self::topic_list_changes`].
+    /// Wakeup for `next_topic_list_change` futures and the internal
+    /// application-side protocol-event waiters.
+    ///
+    /// Reusing this existing non-driver notification preserves the public
+    /// `ConnectionShared` field layout while keeping readiness waiters from
+    /// consuming [`Self::driver_waker`] permits.
     pub topic_list_notify: Notify,
     /// PIP-33 replicated-subscription marker observations. Mirrors the tokio
     /// engine's identically-named buffer. The driver drains
@@ -281,7 +304,7 @@ pub struct ConnectionShared {
     /// `parking_lot::Mutex`, the canonical no-channel wake pattern (see
     /// [ADR-0003](https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0003-no-channels-rule.md)).
     ///
-    /// Under `moonpool_core::SimProviders` the drain visits slab slots in
+    /// Under `moonpool_sim::SimProviders` the drain visits slab slots in
     /// insertion order (slab free-list FIFO), but `core::task::Waker::wake`
     /// hands off to the wrapping `Providers::task` runtime so re-poll
     /// ordering is ultimately the simulator's call. Tests should depend on
@@ -306,10 +329,8 @@ pub struct ConnectionShared {
     /// read by the proto-layer wall-clock closure passed into
     /// [`Connection::new`] in [`Self::with_auth`].
     ///
-    /// `AtomicU64` is `Send + Sync` regardless of the surrounding
-    /// `P::Time` impl, which is what lets this bridge work under
-    /// `SimProviders` (whose `SimTimeProvider` holds
-    /// `Weak<RefCell<…>>` and is structurally `!Send + !Sync`).
+    /// `AtomicU64` gives the sans-io closure a lock-free snapshot while
+    /// Moonpool 0.8's `TimeProvider: Send + Sync` advances it from the driver.
     pub wall_clock_ms: Arc<AtomicU64>,
     /// Pluggable monotonic-clock provider for callers that hand `Instant`
     /// values into the sans-io state machine
@@ -433,7 +454,7 @@ impl ConnectionShared {
             // Arm the wakeup BEFORE inspecting state so a transition that lands
             // between the check and the await is captured by this `Notified`.
             let notified = self.driver_waker.notified();
-            tokio::pin!(notified);
+            let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
 
             {
@@ -567,6 +588,10 @@ impl ConnectionShared {
     #[must_use]
     pub fn now_wall_clock_ms(&self) -> u64 {
         self.wall_clock_ms.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn event_notify(&self) -> &Notify {
+        &self.topic_list_notify
     }
 
     /// Construct with a custom monotonic-clock provider in addition to
@@ -742,7 +767,7 @@ impl ConnectionShared {
     /// `drain_memory_wakers` exactly.
     ///
     /// Drain order is slab insertion order (FIFO over the free-list).
-    /// Under `moonpool_core::SimProviders` the resulting re-poll order is
+    /// Under `moonpool_sim::SimProviders` the resulting re-poll order is
     /// the simulator's call — `Waker::wake` hands off to the task
     /// provider, which schedules the woken tasks per its policy. Tests
     /// must depend on *eventual* progress (every parked send eventually
@@ -903,8 +928,10 @@ pub enum EngineError {
     },
 }
 
-/// moonpool-backed engine handle. Generic over the [`Providers`] bundle so
-/// callers can plug in `TokioProviders` (production) or a sim bundle (tests).
+/// Moonpool-backed engine handle.
+///
+/// Generic over the [`Providers`] bundle so callers can use `TokioProviders` for real-network
+/// execution or `moonpool_sim::SimProviders` for deterministic simulation.
 pub struct MoonpoolEngine<P: Providers> {
     providers: P,
 }
@@ -1263,20 +1290,18 @@ fn connect_backoff(attempt: u32) -> Duration {
 /// `CommandConnect` (moonpool-sim's connect-hang fault, or a wedged real
 /// broker) would otherwise park the `read_buf` loop below forever. When
 /// `Some`, we arm **one** `TimeProvider::sleep` deadline before the loop and
-/// poll it via `select!` across iterations — mirroring the pool's
-/// `await_ready` shape (`pool.rs`). Arming a fresh `sleep` per iteration
+/// poll it via `select!` across iterations — mirroring the pool dial task's
+/// single outer operation deadline (`pool.rs`). Arming a fresh `sleep` per iteration
 /// would schedule a `Timer` event every handshake and perturb the
 /// deterministic moonpool schedule (the ADR-0052 footgun); the
 /// single-deadline shape leaves replay bit-for-bit. The cap surfaces as
 /// `EngineError::Io(TimedOut)` — Java `operationTimeoutMs` parity.
 ///
 /// `bound` is `None` on the **pool** path (`build_entry_async`), where the
-/// caller's wait is *already* bounded by `await_ready`'s
-/// `time.sleep(operation_timeout)` deadline (`pool.rs`). Arming a *second*
-/// `TimeProvider::sleep` here would add a redundant timer event to the
-/// deterministic schedule on every pooled dial — exactly the
-/// schedule-perturbation ADR-0052 warns against — so the pool path passes
-/// `None` and leans on the single `await_ready` deadline already in place.
+/// spawned dial task wraps the complete connect + handshake future in one
+/// `TimeProvider::timeout(operation_timeout)` call.
+/// Arming a second deadline here would add a redundant timer event to the deterministic schedule
+/// on every pooled dial, so the pool path passes `None`.
 pub(crate) async fn handshake_plain<P: Providers>(
     shared: &Arc<ConnectionShared>,
     transport: &mut Transport<P>,
@@ -1379,7 +1404,7 @@ pub(crate) async fn handshake_plain<P: Providers>(
         // pool path, already bounded by `await_ready`), read without a second
         // timer so the deterministic schedule is left untouched.
         let n = if let Some(deadline) = deadline.as_mut() {
-            tokio::select! {
+            moonpool_core::select! {
                 biased;
                 r = transport.read_buf(&mut read_buf) => r?,
                 _ = deadline => {

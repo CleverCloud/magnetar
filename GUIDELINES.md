@@ -30,7 +30,7 @@ The driver dispatches wakers as events arrive.
 
 - Producer-to-driver path → `Arc<parking_lot::Mutex<ConnectionShared>>` + `tokio::sync::Notify`.
 - Future completion → in-state `Waker` slabs keyed by `op_id` / `sequence_id` / `request_id`.
-- Inter-task multiplexing → `tokio::select!` (control-flow, not a channel).
+- Inter-task multiplexing → the owning runtime's `select!` (`tokio::select!` in the tokio engine, `moonpool_core::select!` in provider-generic Moonpool code); this is control flow, not a channel.
 - Enforcement → `cargo deny check` bans the crates; `clippy.toml`'s `disallowed-types` covers `tokio::sync::*` channel paths; `xtask check-no-channels` greps `src/**` as belt-and-braces.
 
 ## I/O isolation
@@ -112,8 +112,7 @@ Hard requirement in local + CI.
 **Runtime parity** — `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep **strict 1:1 test count** (`#[test]`
 
 - `#[tokio::test]` + `#[moonpool::test]`).
-  Enforced by
-  `cargo xtask check-runtime-test-parity`.
+  Enforced by `cargo xtask check-runtime-test-parity`.
   Hard requirement.
 
 **Seed sweep** — the local validation pass runs `MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool` for `seed ∈ 1..32` to catch seed-dependent flakiness in the deterministic-simulation suite.

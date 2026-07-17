@@ -106,7 +106,7 @@ Lives in `crates/magnetar/src/v5/mapping.rs` (NEW) as a documented set of `const
 | `send_timeout: Duration`                  | `producer.send_timeout_ms: u64`                          | `Duration::from_secs(30)` | `as_millis() as u64`. |
 | `max_pending_messages: Option<usize>`     | `producer.max_pending_messages: usize` (`0 = unlimited`) | `Some(1000)`              | `None → 0`.           |
 | `subscription_initial_position: Position` | `consumer.initial_position`                              | `Latest`                  | Direct.               |
-| `negative_ack_redelivery_delay: Duration` | `consumer.negative_ack_redelivery_delay_ms`              | `Duration::from_secs(60)` | `as_millis() as u64`. |
+| `negative_ack_redelivery_delay: Duration` | `consumer.negative_ack_redelivery_delay_ms`              | `Duration::from_mins(1)`  | `as_millis() as u64`. |
 | `ack_timeout: Option<Duration>`           | `consumer.ack_timeout_ms` (`0 = disabled`)               | `None`                    | `None → 0`.           |
 | `receiver_queue_size: usize`              | same                                                     | `1000`                    | Direct.               |
 

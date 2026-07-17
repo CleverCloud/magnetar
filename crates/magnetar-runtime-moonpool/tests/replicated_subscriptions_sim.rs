@@ -117,7 +117,7 @@ impl Workload for DelayedMarkerBroker {
         let task = ctx.providers().task().clone();
         let time = ctx.providers().time().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -200,7 +200,7 @@ where
         // (ADR-0011 — no host wall-clock read).
         let tick = time.sleep(Duration::from_millis(2));
         tokio::pin!(tick);
-        tokio::select! {
+        moonpool_sim::select! {
             biased;
             read = read_into(&mut stream, &mut read_buf) => {
                 match read {
@@ -421,8 +421,9 @@ impl Workload for MarkerClientWorkload {
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
 
-        let result = self.drive(&engine, &addr).await;
+        let result = self.drive(&engine, &addr, &time).await;
         // Both `Observed` and `Severed` are bounded outcomes — the run
         // terminated. Only a genuine lost-wakeup hang (or a wrong-kind marker)
         // returns `Err` and fails the run. Record which seeds actually proved
@@ -484,42 +485,46 @@ fn sim_connect_config() -> ConnectionConfig {
 }
 
 impl MarkerClientWorkload {
-    async fn drive<P>(
+    async fn drive<P, T>(
         &self,
         engine: &MoonpoolEngine<P>,
         addr: &str,
+        time: &T,
     ) -> Result<MarkerOutcome, String>
     where
         P: Providers,
+        T: TimeProvider,
     {
         // Connect + subscribe can both be severed by the default-network
         // bit-flip chaos (a corrupted control-command frame → broker drop →
         // `PeerClosed`). Those are bounded `Severed` outcomes, not failures —
         // the lost-wakeup window is only entered *after* a clean subscribe.
-        let connect = tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_plain(engine, addr, sim_connect_config()),
-        )
-        .await
-        .map_err(|_| "connect timed out".to_owned())?;
+        let connect = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain(engine, addr, sim_connect_config()),
+            )
+            .await
+            .map_err(|_| "connect timed out".to_owned())?;
         let client = match connect {
             Ok(client) => client,
             Err(e) => return Ok(MarkerOutcome::Severed(format!("connect: {e:?}"))),
         };
 
-        let subscribe = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.subscribe(SubscribeRequest {
-                topic: TOPIC.to_owned(),
-                subscription: SUBSCRIPTION.to_owned(),
-                receiver_queue_size: 32,
-                durable: true,
-                replicate_subscription_state: Some(true),
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|_| "subscribe timed out".to_owned())?;
+        let subscribe = time
+            .timeout(
+                Duration::from_secs(5),
+                client.subscribe(SubscribeRequest {
+                    topic: TOPIC.to_owned(),
+                    subscription: SUBSCRIPTION.to_owned(),
+                    receiver_queue_size: 32,
+                    durable: true,
+                    replicate_subscription_state: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|_| "subscribe timed out".to_owned())?;
         if let Err(e) = subscribe {
             return Ok(MarkerOutcome::Severed(format!("subscribe: {e:?}")));
         }
@@ -536,12 +541,13 @@ impl MarkerClientWorkload {
         // `Err`). A connection severed by chaos *after* parking resolves the
         // accessor to `None` (closed before the marker arrived) — still a
         // bounded `Severed` outcome, not a hang.
-        let Some(observed) = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.next_replicated_subscription_marker(),
-        )
-        .await
-        .map_err(|_| "next_replicated_subscription_marker hung (lost wakeup)".to_owned())?
+        let Some(observed) = time
+            .timeout(
+                Duration::from_secs(15),
+                client.next_replicated_subscription_marker(),
+            )
+            .await
+            .map_err(|_| "next_replicated_subscription_marker hung (lost wakeup)".to_owned())?
         else {
             return Ok(MarkerOutcome::Severed(
                 "connection closed before marker arrived".to_owned(),

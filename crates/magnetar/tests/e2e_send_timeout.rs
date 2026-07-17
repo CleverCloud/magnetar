@@ -87,7 +87,7 @@ async fn start_pulsar()
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -176,7 +176,7 @@ async fn e2e_send_timeout_fires_when_receipt_lost() -> Result<(), Box<dyn std::e
     // send and mask the timeout we are asserting.
     let client = PulsarClient::builder()
         .service_url(service_url)
-        .operation_timeout(Duration::from_secs(60))
+        .operation_timeout(Duration::from_mins(1))
         .build()
         .await?;
 

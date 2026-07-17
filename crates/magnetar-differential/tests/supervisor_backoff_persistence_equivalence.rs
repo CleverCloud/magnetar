@@ -53,8 +53,8 @@ fn tokio_and_moonpool_engines_agree_on_storm_schedule() {
     // diverge as soon as the two engines drift.
     let cfg = SupervisorConfig {
         initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(60),
-        mandatory_stop: Duration::from_secs(60 * 60),
+        max_backoff: Duration::from_mins(1),
+        mandatory_stop: Duration::from_hours(1),
         drop_grace: Duration::from_millis(500),
         ..SupervisorConfig::default()
     };
@@ -122,8 +122,8 @@ fn tokio_and_moonpool_engines_agree_on_give_up_sequence() {
     // hoisting it) would diverge here.
     let cfg = SupervisorConfig {
         initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(60),
-        mandatory_stop: Duration::from_secs(60 * 60),
+        max_backoff: Duration::from_mins(1),
+        mandatory_stop: Duration::from_hours(1),
         drop_grace: Duration::from_millis(500),
         max_attempts: Some(3),
         ..SupervisorConfig::default()

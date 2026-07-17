@@ -77,7 +77,7 @@ async fn start_kdc()
         .with_wait_for(WaitFor::message_on_stdout(
             "running without any HTTP authentication checking",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_env_var("KRB5_REALM", "EXAMPLE.COM")
         .with_env_var("KRB5_KDC", "kdc.example.com")
         .with_env_var("KRB5_PASS", "magnetar-e2e-admin-password")

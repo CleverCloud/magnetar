@@ -7,20 +7,13 @@
 //! [`moonpool_core::TokioProviders`] and returns the resulting
 //! [`EventStream`].
 //!
-//! The engine work runs directly on the ambient tokio runtime — no
-//! [`tokio::task::LocalSet`] wrapper. moonpool's [`TokioProviders`]
-//! `TaskProvider` is now `Send`-bound: `spawn_task<F>` requires
-//! `F: Future<Output = ()> + Send + 'static` and spawns via
-//! `tokio::task::Builder::new().spawn(...)` (a plain `tokio::spawn`,
-//! NOT `spawn_local`). The driver task therefore runs on any tokio
-//! runtime — including the `flavor = "current_thread"` runtimes the
-//! differential tests use — and is woken normally by the sans-io waker
-//! slab. The old `LocalSet` + `Kicker` pump were dead weight tied to a
-//! stale `spawn_local` premise and have been removed.
-//!
-//! When `moonpool-sim`'s provider bundle becomes a workspace dep,
-//! plug it in here as a sibling `run_with_sim_providers` entry point
-//! that takes a seed.
+//! The engine work runs directly on the ambient Tokio runtime.
+//! Moonpool 0.8's [`TokioProviders`] task provider is `Send`-bound and delegates to
+//! `tokio::spawn`, so the driver runs normally on both current-thread and multi-thread Tokio
+//! runtimes.
+//! Native deterministic-executor coverage belongs to the runtime crate's `SimProviders` chaos
+//! suite; this runner intentionally keeps both differential legs on the same real network and
+//! wall clock.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -43,12 +36,9 @@ fn partition_topic(base: &str, partition: i32) -> String {
 /// (e.g. `127.0.0.1:7654`). Note: the moonpool engine takes a bare
 /// `host:port` string, NOT a `pulsar://` URL.
 ///
-/// The engine work awaits directly on the ambient tokio runtime — there
-/// is no [`tokio::task::LocalSet`] wrapper and no periodic pump. moonpool's
-/// [`TokioProviders`] `TaskProvider` is `Send`-bound and spawns the driver
-/// via `tokio::task::Builder::new().spawn(...)` (a plain `tokio::spawn`,
-/// not `spawn_local`), so the driver task runs and is woken normally on the
-/// `flavor = "current_thread"` runtimes the differential tests use.
+/// The engine work awaits directly on the ambient Tokio runtime.
+/// Moonpool 0.8's [`TokioProviders`] task provider is `Send`-bound and uses `tokio::spawn`, so the
+/// driver task is woken normally by the sans-io waker slab.
 ///
 /// # Errors
 /// Returns the last engine-level error if the initial connect /

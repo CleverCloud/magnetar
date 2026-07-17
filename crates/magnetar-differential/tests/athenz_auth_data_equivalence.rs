@@ -124,7 +124,7 @@ fn build_provider(wall_secs: u64) -> (AthenzProvider, Arc<ScriptedZts>) {
         .wall_clock(Arc::new(move || {
             UNIX_EPOCH + Duration::from_secs(wall.load(Ordering::SeqCst))
         }))
-        .refresh_margin(Duration::from_secs(300))
+        .refresh_margin(Duration::from_mins(5))
         .build()
         .expect("build provider");
     (provider, zts)

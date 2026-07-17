@@ -126,7 +126,7 @@ impl Workload for BrokerWorkload {
         let shutdown = ctx.shutdown().clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -391,7 +391,7 @@ impl Workload for SilentBrokerWorkload {
         let shutdown = ctx.shutdown().clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {

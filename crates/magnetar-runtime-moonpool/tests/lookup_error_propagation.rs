@@ -45,7 +45,7 @@ use magnetar_proto::{
     encode_command, pb,
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
-use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait};
+use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TimeProvider};
 use moonpool_sim::{SimContext, SimulationBuilder, SimulationError, SimulationResult, Workload};
 use parking_lot::Mutex;
 
@@ -262,7 +262,7 @@ impl Workload for LookupBroker {
             },
         };
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 accepted = listener.accept() => {
                     match accepted {
@@ -326,6 +326,7 @@ impl Workload for LookupErrorClient {
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
 
         // A timeout here means the sim budget never delivered the resolution;
         // the sweep-level assertion is the authoritative gate. No
@@ -335,11 +336,12 @@ impl Workload for LookupErrorClient {
         // stopped firing.
         match self.drive {
             ClientDrive::RawLookup => {
-                let connect = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
-                )
-                .await;
+                let connect = time
+                    .timeout(
+                        Duration::from_secs(20),
+                        Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+                    )
+                    .await;
                 let Ok(Ok(client)) = connect else {
                     return Ok(());
                 };
@@ -355,11 +357,12 @@ impl Workload for LookupErrorClient {
                     supervisor: Some(SupervisorConfig::default()),
                     ..ConnectionConfig::default()
                 };
-                let connect = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
-                )
-                .await;
+                let connect = time
+                    .timeout(
+                        Duration::from_secs(20),
+                        Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+                    )
+                    .await;
                 let Ok(Ok(client)) = connect else {
                     return Ok(());
                 };

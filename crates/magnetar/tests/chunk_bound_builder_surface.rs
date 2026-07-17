@@ -134,7 +134,7 @@ async fn all_five_consumer_builders_thread_chunk_bounds() {
     assert!(!default_req.auto_ack_oldest_chunked_message_on_queue_full);
     assert_eq!(
         default_req.expire_time_of_incomplete_chunked_message,
-        Some(Duration::from_secs(60))
+        Some(Duration::from_mins(1))
     );
 
     // 2. TypedConsumerBuilder.

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// `Instant`. One hour is well past any reasonable Pulsar-side timeout
 /// (default send-timeout is 30 s; default ack-timeout is 0 s "disabled"
 /// or O(seconds) when enabled).
-pub const OVERFLOW_FALLBACK: Duration = Duration::from_secs(3600);
+pub const OVERFLOW_FALLBACK: Duration = Duration::from_hours(1);
 
 /// `base + delta`, clamped to `base + OVERFLOW_FALLBACK` when the
 /// addition would overflow `Instant`. Never panics, mirroring the
@@ -71,6 +71,6 @@ mod tests {
     /// as the canonical overflow witness — verified above.
     #[test]
     fn clamp_horizon_is_one_hour() {
-        assert_eq!(OVERFLOW_FALLBACK, Duration::from_secs(3600));
+        assert_eq!(OVERFLOW_FALLBACK, Duration::from_hours(1));
     }
 }

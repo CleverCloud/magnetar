@@ -2987,12 +2987,12 @@ mod tests {
         let slot = consumer_slot_for(&shared, handle);
         let consumer = Consumer::assemble(shared, handle, slot, None);
         let zero_msgs = consumer
-            .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_secs(60))
+            .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_mins(1))
             .await
             .expect("ok");
         assert!(zero_msgs.is_empty());
         let zero_bytes = consumer
-            .receive_batch_with_bytes_cap(10, 0, std::time::Duration::from_secs(60))
+            .receive_batch_with_bytes_cap(10, 0, std::time::Duration::from_mins(1))
             .await
             .expect("ok");
         assert!(zero_bytes.is_empty());

@@ -54,7 +54,7 @@ use moonpool_core::Providers;
 
 use crate::client::{Client, ClientError};
 use crate::crypto::MessageDecryptor;
-use crate::{ConnectionShared, TopicListChange};
+use crate::{ConnectionShared, SleepProvider, TopicListChange};
 
 /// User-facing consumer handle for the moonpool engine.
 ///
@@ -91,6 +91,8 @@ pub struct Consumer<P: Providers> {
     decryptor: Option<Arc<dyn MessageDecryptor>>,
     /// Last-clone close guard shared by every `Consumer` clone.
     close_guard: Arc<ConsumerCloseGuard>,
+    /// Type-erased `P::Time` sleep function inherited from the client.
+    sleep_provider: Arc<SleepProvider>,
     /// Held only so `Consumer` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers — the consumer just talks to the shared state.
@@ -105,6 +107,7 @@ impl<P: Providers> Clone for Consumer<P> {
             slot: self.slot.clone(),
             decryptor: self.decryptor.clone(),
             close_guard: self.close_guard.clone(),
+            sleep_provider: self.sleep_provider.clone(),
             _providers: std::marker::PhantomData,
         }
     }
@@ -159,6 +162,7 @@ impl<P: Providers> Consumer<P> {
         handle: ConsumerHandle,
         slot: Arc<magnetar_proto::ConsumerSlot>,
         decryptor: Option<Arc<dyn MessageDecryptor>>,
+        sleep_provider: Arc<SleepProvider>,
     ) -> Self {
         let close_guard = Arc::new(ConsumerCloseGuard {
             shared: shared.clone(),
@@ -171,6 +175,7 @@ impl<P: Providers> Consumer<P> {
             slot,
             decryptor,
             close_guard,
+            sleep_provider,
             _providers: std::marker::PhantomData,
         }
     }
@@ -639,12 +644,9 @@ impl<P: Providers> Consumer<P> {
     /// the deadline elapses with no message. Mirrors Java
     /// `Consumer#receive(int timeout, TimeUnit unit)`.
     ///
-    /// The timeout source is `tokio::time::timeout`, which under
-    /// `TokioProviders` measures wall time. Under
-    /// `moonpool_core::SimProviders` the timeout is still wall-time —
-    /// pass-2 of the engine-generic surface lift will route this through
-    /// `Providers::time` for full sim-determinism. Today's behavior matches
-    /// the tokio engine's `Consumer::receive_with_timeout`.
+    /// The deadline is driven by the connection's Moonpool
+    /// [`moonpool_core::TimeProvider`]: wall time under `TokioProviders` and
+    /// virtual time under `SimProviders`.
     ///
     /// # Errors
     /// Propagates [`Self::receive`] errors. The timeout case returns
@@ -654,10 +656,17 @@ impl<P: Providers> Consumer<P> {
         &self,
         timeout: std::time::Duration,
     ) -> Result<Option<IncomingMessage>, ClientError> {
-        match tokio::time::timeout(timeout, self.receive()).await {
-            Ok(Ok(msg)) => Ok(Some(msg)),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Ok(None),
+        let receive = self.receive();
+        let sleep = (self.sleep_provider)(timeout);
+        let mut receive = std::pin::pin!(receive);
+        let mut sleep = std::pin::pin!(sleep);
+        moonpool_core::select! {
+            biased;
+            result = &mut receive => result.map(Some),
+            result = &mut sleep => match result {
+                Ok(()) | Err(moonpool_core::TimeError::Elapsed) => Ok(None),
+                Err(moonpool_core::TimeError::Shutdown) => Err(ClientError::Closed),
+            },
         }
     }
 
@@ -699,11 +708,8 @@ impl<P: Providers> Consumer<P> {
         if max_messages == 0 || max_bytes == 0 {
             return Ok(Vec::new());
         }
-        let first = tokio::time::timeout(max_wait, self.receive()).await;
-        let first = match first {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(Vec::new()),
+        let Some(first) = self.receive_with_timeout(max_wait).await? else {
+            return Ok(Vec::new());
         };
         let mut acc_bytes = first.payload.len();
         let mut out = Vec::with_capacity(max_messages.min(64));
@@ -1339,12 +1345,7 @@ impl<P: Providers + Send + Sync> Client<P> {
             (handle, slot)
         };
         shared.driver_waker.notify_one();
-        SubscribeAckedFut {
-            shared: shared.clone(),
-            handle,
-            helper: None,
-        }
-        .await?;
+        wait_subscribe_acked(&shared, handle).await?;
 
         // Feed an initial flow so the broker starts delivering. `initial_flow`
         // returns `None` when there is no consumer state; we still send an
@@ -1371,7 +1372,13 @@ impl<P: Providers + Send + Sync> Client<P> {
             "consumer subscribed"
         );
 
-        Ok(Consumer::assemble(shared, handle, slot, decryptor))
+        Ok(Consumer::assemble(
+            shared,
+            handle,
+            slot,
+            decryptor,
+            self.sleep_provider(),
+        ))
     }
 }
 
@@ -1583,67 +1590,55 @@ impl Future for ReceiveFut {
     }
 }
 
-/// Future that resolves once the broker has acked the subscribe for the
-/// given [`ConsumerHandle`]. Drains `ConnectionEvent`s from the queue looking
-/// for [`ConnectionEvent::SubscribeAcked`].
+/// Resolve once the broker has acked the subscribe for the given
+/// [`ConsumerHandle`].
 ///
-/// Parking shape: each `Pending` return spawns a helper that awaits
-/// `driver_waker.notified()` and wakes the caller. The previous inline
-/// `enable()` pattern raced with `notify_waiters()` (the `Notified` was
-/// dropped before any waker was stored), which deterministically hung
-/// whenever the broker's `Success` reply arrived after the future's first
-/// poll. The spawned helper closes that race because its `Notified` future
-/// stays alive — but only one helper at a time. We track the current helper
-/// in `helper` and abort the previous one on every re-poll (and on drop)
-/// so a stale helper from an earlier poll can't steal a `notify_one`
-/// permit that the user intended for the driver loop. Without that abort
-/// the post-`SubscribeAcked` `initial_flow + flow + notify_one` sequence
-/// could race the dead helper to the permit, leaving the freshly-queued
-/// FLOW frame sitting in `outbound` while the driver stayed parked.
-struct SubscribeAckedFut {
-    shared: Arc<ConnectionShared>,
+/// The event notification is armed before the queue is inspected, preventing
+/// a driver event between the empty check and the await from being lost.
+async fn wait_subscribe_acked(
+    shared: &Arc<ConnectionShared>,
     handle: ConsumerHandle,
-    helper: Option<tokio::task::JoinHandle<()>>,
-}
+) -> Result<(), ClientError> {
+    loop {
+        let notified = shared.event_notify().notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
 
-impl Drop for SubscribeAckedFut {
-    fn drop(&mut self) {
-        if let Some(h) = self.helper.take() {
-            h.abort();
-        }
-    }
-}
-
-impl Future for SubscribeAckedFut {
-    type Output = Result<(), ClientError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        // Fast-path: if the consumer is already registered as "ready" (i.e.
-        // `consumer_is_closed` is false and the consumer state exists), we
-        // can return immediately. The protocol layer marks the state alive
-        // synchronously inside `subscribe()`, so the SubscribeAcked event is
-        // really only needed to wait for the broker's CommandSuccess.
         {
-            let mut conn = this.shared.inner.lock();
+            let mut conn = shared.inner.lock();
             // Inspect events looking for our SubscribeAcked.
             loop {
-                match conn.poll_event() {
-                    Some(ConnectionEvent::SubscribeAcked { handle }) if handle == this.handle => {
-                        return Poll::Ready(Ok(()));
+                let event = conn.poll_event_if(|event| match event {
+                    ConnectionEvent::SubscribeAcked {
+                        handle: event_handle,
                     }
+                    | ConnectionEvent::ConsumerClosedByBroker {
+                        handle: event_handle,
+                        ..
+                    }
+                    | ConnectionEvent::SubscribeFailed {
+                        handle: event_handle,
+                        ..
+                    } => *event_handle == handle,
+                    ConnectionEvent::TopicListChanged { .. } | ConnectionEvent::Closed { .. } => {
+                        true
+                    }
+                    _ => false,
+                });
+                match event {
+                    Some(ConnectionEvent::SubscribeAcked { handle: _ }) => return Ok(()),
                     Some(ConnectionEvent::ConsumerClosedByBroker {
-                        handle,
+                        handle: event_handle,
                         assigned_broker_service_url,
-                    }) if handle == this.handle => {
+                    }) => {
                         // Broker-forced close — warn! per ADR-0054 §2.1.
                         // Mirror of the tokio engine's `EventWaitFut` arm.
                         let (topic, subscription) = conn
-                            .consumer(handle)
+                            .consumer(event_handle)
                             .map(|s| (s.identity.topic.clone(), s.identity.subscription.clone()))
                             .unwrap_or_default();
                         tracing::warn!(
-                            handle = ?handle,
+                            handle = ?event_handle,
                             topic = %topic,
                             subscription = %subscription,
                             assigned_broker_service_url = assigned_broker_service_url
@@ -1651,24 +1646,24 @@ impl Future for SubscribeAckedFut {
                                 .map(crate::log_fields::truncate_broker_str),
                             "broker closed consumer while waiting for SubscribeAcked"
                         );
-                        return Poll::Ready(Err(ClientError::Closed));
+                        return Err(ClientError::Closed);
                     }
                     Some(ConnectionEvent::SubscribeFailed {
-                        handle,
+                        handle: _,
                         code,
                         message,
-                    }) if handle == this.handle => {
-                        return Poll::Ready(Err(ClientError::Broker { code, message }));
+                    }) => {
+                        return Err(ClientError::Broker { code, message });
                     }
                     Some(ConnectionEvent::TopicListChanged { added, removed }) => {
                         // Forward to the per-client buffer + waker so we don't
                         // accidentally swallow a PIP-145 delta while waiting
                         // for a subscribe ack.
-                        this.shared
+                        shared
                             .topic_list_changes
                             .lock()
                             .push_back(TopicListChange { added, removed });
-                        this.shared.topic_list_notify.notify_waiters();
+                        shared.topic_list_notify.notify_waiters();
                     }
                     Some(ConnectionEvent::Closed { reason }) => {
                         // Connection-level close while a subscribe future was
@@ -1686,36 +1681,21 @@ impl Future for SubscribeAckedFut {
                                 .map(crate::log_fields::truncate_broker_str),
                             "connection closed while waiting for consumer readiness"
                         );
-                        return Poll::Ready(Err(match reason {
+                        return Err(match reason {
                             Some(_) => ClientError::PeerClosed,
                             None => ClientError::Closed,
-                        }));
+                        });
                     }
-                    Some(_) => {} // ignore unrelated events
+                    Some(_) => unreachable!("poll_event_if returned an unselected event"),
                     None => break,
                 }
             }
 
             if conn.is_closed() {
-                return Poll::Ready(Err(ClientError::Closed));
+                return Err(ClientError::Closed);
             }
         }
-
-        // Park on the driver wakeup. The driver notifies after any inbound
-        // bytes are processed. Abort any prior helper before spawning a new
-        // one — otherwise the stale helper from an earlier poll lingers on
-        // `driver_waker.notified()` and competes with the driver itself for
-        // `notify_one` permits emitted by user-facing futures.
-        if let Some(prev) = this.helper.take() {
-            prev.abort();
-        }
-        let waker = cx.waker().clone();
-        let shared = this.shared.clone();
-        this.helper = Some(tokio::spawn(async move {
-            shared.driver_waker.notified().await;
-            waker.wake();
-        }));
-        Poll::Pending
+        notified.await;
     }
 }
 
@@ -1926,7 +1906,13 @@ mod tests {
         slot: Arc<magnetar_proto::ConsumerSlot>,
         decryptor: Arc<dyn crate::crypto::MessageDecryptor>,
     ) -> Consumer<TokioProviders> {
-        Consumer::assemble(shared, handle, slot, Some(decryptor))
+        Consumer::assemble(
+            shared,
+            handle,
+            slot,
+            Some(decryptor),
+            crate::tokio_sleep_provider(),
+        )
     }
 
     /// Happy path: a decryptor that reverses the XOR ciphertext yields the
@@ -2010,7 +1996,8 @@ mod tests {
     async fn receive_encrypted_without_decryptor_fails() {
         let (shared, handle, slot) =
             subscribe_with_encrypted_message(magnetar_proto::CryptoFailureAction::Fail, b"secret");
-        let consumer: Consumer<TokioProviders> = Consumer::assemble(shared, handle, slot, None);
+        let consumer: Consumer<TokioProviders> =
+            Consumer::assemble(shared, handle, slot, None, crate::tokio_sleep_provider());
         let res = consumer.receive().await;
         match res {
             Err(ClientError::Other(msg)) => {
@@ -2062,8 +2049,13 @@ mod tests {
             .consumer(handle)
             .cloned()
             .expect("test consumer slot must exist");
-        let consumer: Consumer<TokioProviders> =
-            Consumer::assemble(shared.clone(), handle, slot, None);
+        let consumer: Consumer<TokioProviders> = Consumer::assemble(
+            shared.clone(),
+            handle,
+            slot,
+            None,
+            crate::tokio_sleep_provider(),
+        );
 
         shared.mark_no_driver();
         drop(consumer);
@@ -2312,7 +2304,7 @@ mod tests {
                     ),
                 )
             });
-        Consumer::assemble(shared, handle, slot, None)
+        Consumer::assemble(shared, handle, slot, None, crate::tokio_sleep_provider())
     }
 
     /// `Client::subscribe` is generic over `P: Providers` — confirm the
@@ -2323,6 +2315,11 @@ mod tests {
     #[test]
     #[allow(clippy::let_underscore_future, clippy::no_effect_underscore_binding)]
     fn subscribe_compiles_against_tokio_providers() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll};
+
+        use magnetar_proto::types::ConsumerHandle;
+
         let providers = TokioProviders::new();
         let engine = MoonpoolEngine::new(providers);
         let _fut_client =
@@ -2330,6 +2327,78 @@ mod tests {
         // Reference `SubscribeRequest::default` to confirm the type is
         // re-exported via `magnetar_proto`.
         let _req = SubscribeRequest::default();
+
+        // Moonpool 0.8 drives `SimProviders` workloads on its own executor.
+        // Subscribe readiness must park without spawning a Tokio helper task.
+        let pending_shared = ConnectionShared::new(ConnectionConfig::default());
+        let mut future = Box::pin(super::wait_subscribe_acked(
+            &pending_shared,
+            ConsumerHandle(0),
+        ));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+
+        // Two concurrent subscribe waiters must not consume each other's
+        // acknowledgements. Queue the second acknowledgement first, resolve
+        // the first waiter, then confirm the second event remains available.
+        let shared = handshake_complete_shared();
+        let (first, second) = {
+            let mut conn = shared.inner.lock();
+            let first = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/sub-ready-first".to_owned(),
+                subscription: "s-first".to_owned(),
+                ..Default::default()
+            });
+            let second = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/sub-ready-second".to_owned(),
+                subscription: "s-second".to_owned(),
+                ..Default::default()
+            });
+            (first, second)
+        };
+        for request_id in [1, 0] {
+            let command = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &command).expect("encode CommandSuccess");
+            shared
+                .inner
+                .lock()
+                .handle_bytes(Instant::now(), &frame)
+                .expect("handle CommandSuccess");
+        }
+        futures::executor::block_on(super::wait_subscribe_acked(&shared, first))
+            .expect("first subscription becomes ready");
+        let mut second_wait = Box::pin(super::wait_subscribe_acked(&shared, second));
+        assert!(
+            matches!(second_wait.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "first waiter must leave the second subscription's event queued"
+        );
+
+        // User-facing receive deadlines must likewise use the injected
+        // Moonpool time provider and resolve without a Tokio reactor.
+        let sleep_provider: Arc<crate::SleepProvider> =
+            Arc::new(|_| Box::pin(async { Ok(()) }) as crate::SleepFuture);
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let handle = shared.inner.lock().subscribe(SubscribeRequest {
+            topic: "persistent://public/default/recv-provider-timeout".to_owned(),
+            subscription: "s".to_owned(),
+            ..Default::default()
+        });
+        let mut consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
+        consumer.sleep_provider = sleep_provider;
+        let result = futures::executor::block_on(
+            consumer.receive_with_timeout(std::time::Duration::from_secs(1)),
+        )
+        .expect("injected timeout must resolve without Tokio");
+        assert!(result.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2557,7 +2626,7 @@ mod tests {
 
     /// Regression for the CLI "consume hangs against fresh broker" bug: when the broker
     /// rejects a subscribe with a PERMANENT `CommandError` (e.g.
-    /// `AuthorizationError`), the moonpool engine's `SubscribeAckedFut` must surface
+    /// `AuthorizationError`), the moonpool engine's subscribe waiter must surface
     /// a `ClientError::Broker` rather than parking on the driver waker forever.
     /// Mirrors the proto-level permanent-failure test. Transient codes
     /// (`ServiceNotReady` / `MetadataError` / `TopicNotFound`) hit the retry path
@@ -2603,14 +2672,12 @@ mod tests {
                 .expect("handle CommandError");
         }
 
-        let fut = super::SubscribeAckedFut {
-            shared: shared.clone(),
-            handle,
-            helper: None,
-        };
-        let res = tokio::time::timeout(Duration::from_secs(2), fut)
-            .await
-            .expect("subscribe-acked future must resolve (regression: previously hung)");
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::wait_subscribe_acked(&shared, handle),
+        )
+        .await
+        .expect("subscribe-acked future must resolve (regression: previously hung)");
         match res {
             Err(crate::ClientError::Broker { code, message }) => {
                 assert_eq!(code, pb::ServerError::AuthorizationError as i32);
@@ -3047,13 +3114,13 @@ mod tests {
         let consumer: Consumer<TokioProviders> = make_consumer(shared, handle);
         // max_messages=0 → empty without waiting.
         let zero_msgs = consumer
-            .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_secs(60))
+            .receive_batch_with_bytes_cap(0, 1024, std::time::Duration::from_mins(1))
             .await
             .expect("ok");
         assert!(zero_msgs.is_empty());
         // max_bytes=0 → empty without waiting.
         let zero_bytes = consumer
-            .receive_batch_with_bytes_cap(10, 0, std::time::Duration::from_secs(60))
+            .receive_batch_with_bytes_cap(10, 0, std::time::Duration::from_mins(1))
             .await
             .expect("ok");
         assert!(zero_bytes.is_empty());

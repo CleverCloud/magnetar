@@ -203,7 +203,7 @@ async fn start_pulsar_with_token_auth_and_replicator_role() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(180))
+        .with_startup_timeout(Duration::from_mins(3))
         // Token-auth provider + secret-key + admin super-user role.
         // `brokerClientAuthenticationPlugin` + `brokerClientAuthenticationParameters`
         // are required so the broker's internal admin client (used by

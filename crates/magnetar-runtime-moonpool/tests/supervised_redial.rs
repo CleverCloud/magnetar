@@ -247,7 +247,7 @@ impl Workload for DropAcceptCycleBroker {
         let providers = ctx.providers().clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 inbound = listener.accept() => {
                     match inbound {
@@ -314,7 +314,7 @@ impl Workload for SupervisedRedialClientWorkload {
                 // redial cycles plus the anti-thrash cooldown sleep.
                 initial_backoff: Duration::from_millis(5),
                 max_backoff: Duration::from_millis(40),
-                mandatory_stop: Duration::from_secs(60),
+                mandatory_stop: Duration::from_mins(1),
                 // Bounded so the redial loop's `max_attempts` give-up arm is
                 // reachable on slow seeds, yet high enough that the happy
                 // multi-redial path dominates.
@@ -339,11 +339,14 @@ impl Workload for SupervisedRedialClientWorkload {
         // `#[test]` is the authoritative gate. If the handshake never lands
         // on a given seed, just return cleanly and let the cross-iteration
         // totals decide.
-        let connect_res = tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
-        )
-        .await;
+        let time = ctx.providers().time().clone();
+        let task = ctx.providers().task().clone();
+        let connect_res = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+            )
+            .await;
         let Ok(Ok(client)) = connect_res else {
             return Ok(());
         };
@@ -354,14 +357,15 @@ impl Workload for SupervisedRedialClientWorkload {
         // the redial loop body + reset/resume tail run repeatedly and the
         // anti-thrash cooldown arms.
         for _ in 0..12u32 {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(800),
-                client.open_producer(CreateProducerRequest {
-                    topic: "persistent://public/default/sim-supervised-redial".to_owned(),
-                    ..Default::default()
-                }),
-            )
-            .await;
+            let _ = time
+                .timeout(
+                    Duration::from_millis(800),
+                    client.open_producer(CreateProducerRequest {
+                        topic: "persistent://public/default/sim-supervised-redial".to_owned(),
+                        ..Default::default()
+                    }),
+                )
+                .await;
 
             // Pump the spawned supervised-driver task so it observes the
             // broker's post-ProducerSuccess drop and walks its reconnect body
@@ -370,7 +374,7 @@ impl Workload for SupervisedRedialClientWorkload {
             // driver task is still parked; interleaving yields keeps the
             // scheduler pumping both tasks.
             for _ in 0..64 {
-                tokio::task::yield_now().await;
+                task.yield_now().await;
             }
             let _ = ctx
                 .providers()

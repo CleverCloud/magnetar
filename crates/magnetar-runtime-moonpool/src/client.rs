@@ -6,17 +6,11 @@
 //! [`moonpool_core::Providers`] so the same façade runs on production tokio
 //! sockets and on a `moonpool-sim` deterministic substrate.
 //!
-//! ## M2 surface
-//!
-//! - [`Client::connect_plain`] — TCP-only handshake.
-//! - [`Client::close`] / [`Client::is_closed`] / [`Client::is_connected`].
-//! - [`Client::lookup_topic`] — `CommandLookupTopic` round-trip.
-//! - [`Client::partitioned_topic_metadata`] — partition count.
-//! - [`Client::watch_topic_list`] — PIP-145 watcher subscribe (initial snapshot).
-//! - [`Client::next_topic_list_change`] — PIP-145 watcher delta stream.
-//!
-//! Producer / Consumer façades land in M3 / M4. TLS and reconnect land in
-//! later milestones.
+//! The surface includes plain and supervised connections, lookup and partition metadata,
+//! producer and consumer creation, topic-list watching, transactions, proxy routing, and clean
+//! shutdown.
+//! Provider-generic operations use Moonpool task, time, and network providers so the same client
+//! runs on `TokioProviders` and `moonpool_sim::SimProviders`.
 //!
 //! ## No-channels invariant
 //!
@@ -40,7 +34,10 @@ use parking_lot::Mutex;
 
 use crate::driver::DriverHandle;
 use crate::pool::ProxyConnectionPool;
-use crate::{ConnectionShared, EngineError, MoonpoolEngine, TopicListChange};
+use crate::{
+    ConnectionShared, EngineError, MoonpoolEngine, SleepProvider, TopicListChange,
+    sleep_provider_from_time, tokio_sleep_provider,
+};
 
 /// Engine-layer error surfaced by [`Client`]. Wraps [`EngineError`] with a
 /// dedicated `Broker` variant for request-correlated server errors so the
@@ -127,6 +124,10 @@ pub struct Client<P: Providers> {
     /// so the spread is deterministic under `moonpool-sim` and matches the tokio
     /// engine bit-for-bit (ADR-0011, differential parity).
     connection_rr: AtomicUsize,
+    /// Runtime-owned deadline provider inherited by every consumer opened
+    /// through this client. Kept out of the public `ConnectionShared` layout
+    /// so provider selection remains an engine concern.
+    sleep_provider: Arc<SleepProvider>,
     /// Held only so `Client` is generic over `P` without leaking the
     /// driver-handle type parameter. The driver itself has already consumed
     /// the providers.
@@ -180,6 +181,7 @@ impl<P: Providers> Client<P> {
         shared: Arc<ConnectionShared>,
         driver: DriverHandle,
         pool: Option<Arc<ProxyConnectionPool<P>>>,
+        sleep_provider: Arc<SleepProvider>,
     ) -> Self {
         Self {
             shared,
@@ -187,6 +189,7 @@ impl<P: Providers> Client<P> {
             pool,
             connections_per_broker: 1,
             connection_rr: AtomicUsize::new(0),
+            sleep_provider,
             _providers: std::marker::PhantomData,
         }
     }
@@ -211,9 +214,11 @@ impl<P: Providers> Client<P> {
         config: ConnectionConfig,
     ) -> Result<Self, ClientError> {
         let (shared, driver) = engine.connect_plain(addr, config).await?;
-        // Route through `from_parts` — `connect_plain` is exactly "wrap the
-        // (shared, driver) pair from a plain dial into a pool-less Client".
-        Ok(Self::from_parts(shared, driver))
+        Ok(Self::from_parts_with_providers(
+            shared,
+            driver,
+            engine.providers(),
+        ))
     }
 
     /// Connect via the supervised driver. When [`ConnectionConfig::supervisor`]
@@ -259,7 +264,12 @@ impl<P: Providers> Client<P> {
             dns_resolver,
         };
         let pool = ProxyConnectionPool::new(factory);
-        Ok(Self::assemble(shared, driver, Some(pool)))
+        Ok(Self::assemble(
+            shared,
+            driver,
+            Some(pool),
+            sleep_provider_from_time(engine.providers().time().clone()),
+        ))
     }
 
     /// Wrap an existing `(shared, driver)` pair produced by
@@ -274,7 +284,27 @@ impl<P: Providers> Client<P> {
     /// against a hand-rolled connection).
     #[must_use]
     pub fn from_parts(shared: Arc<ConnectionShared>, driver: DriverHandle) -> Self {
-        Self::assemble(shared, driver, None)
+        Self::assemble(shared, driver, None, tokio_sleep_provider())
+    }
+
+    /// Wrap an existing `(shared, driver)` pair and bind user-facing
+    /// deadlines to the supplied Moonpool provider bundle.
+    ///
+    /// Use this constructor for `SimProviders` or any custom provider
+    /// implementation. [`Self::from_parts`] remains the convenience path for
+    /// Tokio-backed callers and therefore installs a [`moonpool_core::TokioTimeProvider`].
+    #[must_use]
+    pub fn from_parts_with_providers(
+        shared: Arc<ConnectionShared>,
+        driver: DriverHandle,
+        providers: &P,
+    ) -> Self {
+        Self::assemble(
+            shared,
+            driver,
+            None,
+            sleep_provider_from_time(providers.time().clone()),
+        )
     }
 
     /// Surrender the driver handle, leaving the [`Client`] without a
@@ -291,6 +321,10 @@ impl<P: Providers> Client<P> {
     #[must_use]
     pub fn shared(&self) -> &Arc<ConnectionShared> {
         &self.shared
+    }
+
+    pub(crate) fn sleep_provider(&self) -> Arc<SleepProvider> {
+        self.sleep_provider.clone()
     }
 
     /// `true` while the underlying broker connection is in
@@ -529,17 +563,12 @@ impl<P: Providers> Client<P> {
     ///   `(broker_url, bootstrap host:port)` with `CommandConnect.proxy_to_broker_url =
     ///   Some(broker_url)`.
     ///
-    /// **Send-safety on moonpool**: `moonpool_core::NetworkProvider` is
-    /// declared `#[async_trait(?Send)]` (single-core design), so dialling a
-    /// fresh pool entry inside this future body would break the
-    /// `Pin<Box<dyn Future + Send>>` pin on the facade's
-    /// [`crate::CreateProducerApi`] / [`crate::SubscribeApi`] trait methods.
-    /// The pool side-steps that by hoisting the dial into a task spawned via
-    /// [`moonpool_core::TaskProvider::spawn_task`] (which uses
-    /// `spawn_local` — no `Send` bound on the spawned future); this function
-    /// only `.await`s a [`tokio::sync::Notify`] and a `Mutex<Option<...>>`
-    /// slot, both of which are `Send`. See `crate::pool::get_or_open` for
-    /// the full mechanism.
+    /// **Provider-native single-flight dialing**: Moonpool 0.8 makes network-provider futures
+    /// `Send`.
+    /// The pool still owns each dial in one [`moonpool_core::TaskProvider::spawn_task`] task so
+    /// racing producer or consumer opens share the same pending result under both
+    /// `TokioProviders` and `moonpool_sim::SimProviders`.
+    /// This future awaits only the published result; see `crate::pool::get_or_open`.
     pub(crate) async fn resolve_target(
         &self,
         target: &LookupTarget,
@@ -956,7 +985,7 @@ impl<P: Providers> Client<P> {
     /// `replicated_subscription_marker_notify.notify_waiters()`, which stores no permit)
     /// between the drain and the park is captured by this already-armed waiter rather than
     /// lost. The previous drain-then-`notified().await` shape hung whenever the marker
-    /// landed in that gap (same race fixed for `SubscribeAckedFut`).
+    /// landed in that gap (same race fixed for the subscribe-readiness waiter).
     /// No channel (ADR-0003), no virtual-clock read (ADR-0011). 1:1 mirror of the tokio
     /// engine.
     pub async fn next_replicated_subscription_marker(
@@ -966,7 +995,7 @@ impl<P: Providers> Client<P> {
             // Arm the wakeup BEFORE inspecting the buffer so a marker pushed
             // between the drain and the park is captured by this `Notified`.
             let notified = self.shared.replicated_subscription_marker_notify.notified();
-            tokio::pin!(notified);
+            let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
 
             if let Some(marker) = self

@@ -73,7 +73,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -117,7 +117,7 @@ async fn e2e_cumulative_only_acking_keeps_batch_ack_tracker_bounded()
     let producer = client
         .producer(topic.clone())
         .batching(BATCH_SIZE, 1_000_000)
-        .batching_max_publish_delay(Duration::from_secs(60))
+        .batching_max_publish_delay(Duration::from_mins(1))
         .create()
         .await?;
     for entry in 0..ENTRIES {

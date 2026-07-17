@@ -188,9 +188,8 @@ async fn run_tokio_arm(pulsar_url: &str, action: CryptoFailureAction, arm: &str)
 
 /// Drive `send → receive` for one arm against the moonpool engine.
 ///
-/// No [`tokio::task::LocalSet`] / `Kicker` pump: moonpool main (rev `3863d1d`)
-/// spawns the driver via a `Send`-bound `TaskProvider`, so a parked
-/// `consumer.receive()` is woken normally on the ambient runtime.
+/// Moonpool 0.8's `TokioProviders` spawns the driver through a `Send`-bound
+/// `TaskProvider`, so a parked `consumer.receive()` is woken normally on the ambient runtime.
 async fn run_moonpool_arm(host_port: &str, action: CryptoFailureAction, arm: &str) -> String {
     use magnetar_runtime_moonpool::{Client, MessageDecryptor, MessageEncryptor, MoonpoolEngine};
     use moonpool_core::TokioProviders;

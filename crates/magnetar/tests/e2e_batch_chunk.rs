@@ -79,7 +79,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -105,7 +105,7 @@ async fn start_small_message_pulsar() -> Result<
             "Created namespace public/default",
         ))
         .with_env_var("PULSAR_PREFIX_maxMessageSize", "8192")
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd([
             "bash",
             "-lc",
@@ -147,7 +147,7 @@ async fn e2e_producer_batching_flushes_on_max_msgs() -> Result<(), Box<dyn std::
     let producer = client
         .producer(&topic)
         .batching(5, 1_000_000)
-        .batching_max_publish_delay(Duration::from_secs(60))
+        .batching_max_publish_delay(Duration::from_mins(1))
         .create()
         .await?;
     let payloads: Vec<Vec<u8>> = (0..5)
@@ -288,7 +288,7 @@ async fn e2e_chunked_message_round_trip() -> Result<(), Box<dyn std::error::Erro
         .await?;
     producer.close().await?;
 
-    let msg = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    let msg = tokio::time::timeout(Duration::from_mins(1), consumer.receive()).await??;
     assert_eq!(
         msg.payload.len(),
         payload_size,
@@ -337,7 +337,7 @@ async fn e2e_bounded_chunk_round_trip() -> Result<(), Box<dyn std::error::Error>
         // Java-matching consumer-side chunk bounds, explicitly set.
         .max_pending_chunked_message(10)
         .auto_ack_oldest_chunked_message_on_queue_full(false)
-        .expire_time_of_incomplete_chunked_message(Duration::from_secs(60))
+        .expire_time_of_incomplete_chunked_message(Duration::from_mins(1))
         .subscribe()
         .await?;
 
@@ -346,7 +346,7 @@ async fn e2e_bounded_chunk_round_trip() -> Result<(), Box<dyn std::error::Error>
         .await?;
     producer.close().await?;
 
-    let msg = tokio::time::timeout(Duration::from_secs(60), consumer.receive()).await??;
+    let msg = tokio::time::timeout(Duration::from_mins(1), consumer.receive()).await??;
     assert_eq!(
         msg.payload.len(),
         payload_size,
@@ -387,7 +387,7 @@ async fn publish_issue_331_backlog(
         let producer = publisher_client
             .producer(child_topic)
             .batching(100, 4_096)
-            .batching_max_publish_delay(Duration::from_secs(60))
+            .batching_max_publish_delay(Duration::from_mins(1))
             .create()
             .await?;
         for wave in 0..(SMALL_MESSAGES / 100) {
@@ -488,7 +488,7 @@ async fn receive_issue_331_partitions(
         receive_issue_331_partition(partition, consumer, &received_counts[partition])
     });
 
-    match tokio::time::timeout(Duration::from_secs(60), join_all(receive_futures)).await {
+    match tokio::time::timeout(Duration::from_mins(1), join_all(receive_futures)).await {
         Ok(results) => results,
         Err(_) => (0..PARTITIONS)
             .map(|partition| {

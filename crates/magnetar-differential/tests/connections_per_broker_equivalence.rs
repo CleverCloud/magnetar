@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-const HANG_GUARD: Duration = Duration::from_secs(60);
+const HANG_GUARD: Duration = Duration::from_mins(1);
 const FANOUT: usize = 3;
 
 /// Per-session frame-kind log. One session == one TCP connection the client
@@ -284,8 +284,9 @@ async fn moonpool_layout() -> Vec<usize> {
 async fn connections_per_broker_fanout_is_engine_equivalent() {
     let tokio_layout = tokio_layout().await;
 
-    // The moonpool engine's pool dial hoists onto `spawn_local`, so its leg must
-    // run inside a `LocalSet`.
+    // Retain the test's existing `LocalSet` wrapper to keep the two runner legs structurally
+    // isolated. Moonpool 0.8 does not require it; `TokioProviders` delegates Send-bound tasks to
+    // `tokio::spawn`.
     let local = tokio::task::LocalSet::new();
     let moonpool_layout = local.run_until(moonpool_layout()).await;
 

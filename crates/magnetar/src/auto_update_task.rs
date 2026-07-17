@@ -170,7 +170,7 @@ mod tests {
     async fn initial_partitions_seeds_observed_counter() {
         let task = spawn_auto_update_task(
             "persistent://public/default/seed-test".to_owned(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             7,
         );
         assert_eq!(task.observed_partitions.load(Ordering::Relaxed), 7);

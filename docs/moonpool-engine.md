@@ -1,32 +1,51 @@
 # Moonpool Engine
 
-[`magnetar-runtime-moonpool`](../crates/magnetar-runtime-moonpool) is the deterministic-simulation engine.
-It drives the same sans-io `magnetar-proto::Connection` state machine as the tokio engine; only the I/O and clock plumbing differs.
+[`magnetar-runtime-moonpool`](../crates/magnetar-runtime-moonpool) is the provider-generic engine used for deterministic simulation.
+It drives the same sans-io `magnetar-proto::Connection` state machine as the tokio engine while routing networking, time, task scheduling, randomness, and storage through Moonpool providers.
 
-This document covers the engine's surface, supervised reconnect path, TLS adapter, chaos test pack, and the differential equivalence harness that proves it stays in lockstep with the tokio engine.
+This document is the canonical description of the Moonpool 0.8 runtime boundary, engine surface, TLS adapter, deterministic chaos pack, and differential equivalence harness.
 
 For the production engine and the workspace-wide architecture, see [`../ARCHITECTURE.md`](../ARCHITECTURE.md) (its [Overview](../ARCHITECTURE.md#overview) section is the 10-minute read).
 
 ## What moonpool is
 
-[`moonpool-sim`](https://crates.io/crates/moonpool-sim) is a deterministic simulation engine.
+[`moonpool-sim`](https://crates.io/crates/moonpool-sim) 0.8 is a deterministic simulation engine with a single-threaded seeded executor.
 Application code talks to [`moonpool_core::Providers`], a bundle of:
 
 - `NetworkProvider` — TCP-shaped byte pipes.
 - `TimeProvider` — virtual or wall-clock time.
-- `TaskProvider` — task spawning.
+- `TaskProvider` — Tokio or deterministic-executor task spawning.
 - `RandomProvider` — seeded RNG.
 - `StorageProvider` — file I/O.
 
 Under simulation each provider is virtualised so a given seed replays bit-for-bit.
 `magnetar-runtime-moonpool` plugs the engine onto a `Providers` bundle of the caller's choosing:
 
-| Provider bundle                   | Use                                                                                   |
-| --------------------------------- | ------------------------------------------------------------------------------------- |
-| [`moonpool_core::TokioProviders`] | Production-style runs against a real broker. Wall-clock time, real network, real RNG. |
-| `moonpool-sim::SimProviders`      | Reproducible chaos under a seed. Virtual clock, scripted network, seeded RNG.         |
+| Provider bundle                   | Task execution                           | Time and I/O                                        | Use                                                  |
+| --------------------------------- | ---------------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
+| [`moonpool_core::TokioProviders`] | Ambient Tokio runtime                    | Wall clock, real network, host storage, real RNG    | Production-style and differential real-broker runs.  |
+| `moonpool_sim::SimProviders`      | Moonpool's seeded deterministic executor | Virtual clock, scripted network/storage, seeded RNG | Reproducible chaos without an ambient Tokio runtime. |
 
-The crate has no `moonpool-sim` dependency itself — the sim bundle is plugged in by the caller.
+The published library target depends on `moonpool-core`; the crate's test suite adds `moonpool-sim` as a development dependency and plugs `SimProviders` into the same engine.
+
+## Determinism boundary
+
+[ADR-0078](../specs/adr/0078-adopt-moonpool-0-8-native-deterministic-runtime.md) makes the provider boundary authoritative for code that runs under either provider bundle.
+
+- Runtime tasks are spawned through `TaskProvider::spawn_task`.
+- Sleeps and timeouts run through `TimeProvider::sleep` or `TimeProvider::timeout`.
+- Concurrent waits use `moonpool_core::select!`.
+  Its fair form draws the starting branch from Moonpool's seeded source; `biased;` keeps explicit source order where protocol fairness or shutdown priority requires it.
+- Network connects and byte streams come from `NetworkProvider`.
+- `tokio::sync::Notify` remains the payload-free wakeup primitive, but no provider-generic path depends on a Tokio reactor merely to park or wake a future.
+  Application-side readiness waits reuse the existing `topic_list_notify` wake bus so they cannot consume driver permits and the public `ConnectionShared` field layout remains source-compatible.
+
+`TokioProviders` intentionally maps those operations to Tokio.
+`SimProviders` maps them to Moonpool's native executor, virtual clock, and simulated network, so the same `(commit, seed)` replays task interleavings, timer races, network faults, and fair selection order.
+
+Simulation observability uses the production `tracing` vocabulary.
+Actors emit constant-name events with flat structured fields inside a span carrying `ip`; invariants read `TraceEvent` values through `TraceQuery::since` or `TraceQuery::snapshot`.
+Moonpool 0.8 therefore requires no `TrailQuery`, `TrailQueryExt`, `Valuable`, or Serde payload bridge.
 
 ## Engine surface
 
@@ -41,6 +60,9 @@ The crate has no `moonpool-sim` dependency itself — the sim bundle is plugged 
 | `connect_plain_supervised(addr, config, service_url_provider, reconnect)` | Plain TCP wrapped in the supervised reconnect loop.                                                           |
 
 The user-facing client lives at [`magnetar-runtime-moonpool::Client<P>`](../crates/magnetar-runtime-moonpool/src/client.rs), mirroring the tokio engine's `Client` surface: `connect_plain`, `connect_plain_supervised`, partitioned-metadata lookup, transaction coordinator helpers, `is_connected`, `close`.
+`Client::from_parts` remains the Tokio-backed convenience constructor for an externally-created `(ConnectionShared, DriverHandle)` pair.
+Deterministic simulation and custom provider users must call `Client::from_parts_with_providers` so consumer receive deadlines inherit `P::Time` instead of an ambient Tokio clock.
+The provider-owned sleep function lives in the private `Client` / `Consumer` runtime state rather than in the public `ConnectionShared` layout.
 
 At the façade layer the engine is selected via the `Engine` marker trait, so `PulsarClient<MoonpoolEngine<P>>` is the canonical public type ([ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md)).
 The higher-level façade surfaces (partitioned, multi-topics, pattern, reader, table-view, transactions, typed schemas) were lifted to be engine-generic over `E: Engine`, so they build on both engines; only a few narrow tokio-only specialisations remain.
@@ -55,13 +77,18 @@ The pool is populated only when the client is built via [`Client::connect_plain_
 The [`Client::resolve_target`](../crates/magnetar-runtime-moonpool/src/client.rs) hook then routes any `LookupOutcome::Connect { proxy_through_service_url = true, .. }` to the pool via the `pool::get_or_open(Arc<Self>, logical_broker_url)` async free function, which:
 
 1. Probes the entries map; on a hit, returns the cached `Ready` entry.
-2. On a miss, installs a `Pending(PendingDial)` slot and spawns the dial work via [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task) — necessary because `NetworkProvider::connect` can be `?Send` on some moonpool-core releases and the producer / consumer open path needs to stay `Send` for the facade's `CreateProducerApi` / `SubscribeApi` traits.
+2. On a miss, installs a `Pending(PendingDial)` slot and spawns one dial through [`TaskProvider::spawn_task`](https://docs.rs/moonpool-core/latest/moonpool_core/task/trait.TaskProvider.html#tymethod.spawn_task).
+   This keeps the single-flight ownership model identical under `TokioProviders` and `SimProviders` while racing callers await the same result.
 3. The spawned dial task runs `network.connect` → `handshake_plain` → `spawn_supervised`, then publishes the `Arc<Result<Arc<ConnectionShared>, EngineError>>` into the `PendingDial::result` slot and fans the result out via `Notify::notify_waiters`.
    Racing waiters all `Arc::clone` the same outcome.
-4. The dial task promotes the entry from `Pending` to `Ready { shared, driver }` on success, or evicts it on failure so the next caller redials.
+4. The dial task promotes the entry only when the map still contains the identical `Pending` generation and the pool is open; stale or post-close successes are closed and joined instead of replacing a newer entry.
+5. A normal failure evicts only its own generation so a detached older task cannot remove a newer dial.
+6. The spawned task owns the single provider-native `operation_timeout` around connect plus handshake, so a silent peer terminates the task and drops its socket instead of timing out only the caller.
 
 `Client::close` drains every `Ready` pool entry's supervised driver in addition to the bootstrap.
-`Pending` entries are dropped without explicit abort — the close path tears down the bootstrap first, the proxy fails any in-flight handshake, and the dial task's error path evicts the slot.
+`Pending` entries resolve their waiters with `EngineError::PeerClosed`.
+Close signals the pending dial's cancellation notification and awaits its completion notification before returning.
+The latched closed state and generation check prevent any detached dial from resurrecting the entry; a late successful connection is closed and its driver is joined by the dial task.
 
 Per-broker `ConnectionConfig.proxy_to_broker_url` is set on the **cloned** config inside `build_entry_async`; the bootstrap config itself stays untouched, so the bootstrap connection's `CommandConnect` omits the field (matching the Java client + Pulsar Proxy contract).
 
@@ -88,7 +115,8 @@ Equivalence is asserted through the differential harness per [ADR-0024](../specs
 ## Transport + vectored writes
 
 The engine's transport adapter ([`crates/magnetar-runtime-moonpool/src/transport.rs`](../crates/magnetar-runtime-moonpool/src/transport.rs)) drives the `moonpool_core::NetworkProvider::TcpStream` directly.
-As of moonpool `0.7.0` (consumed from crates.io per [ADR-0056](../specs/adr/0056-moonpool-0-7-crates-io-repin.md)) that stream bounds on the **`futures::io::{AsyncRead, AsyncWrite}`** ext traits rather than `tokio::io` — `TokioNetworkProvider` wraps its `tokio::net::TcpStream` in [`tokio_util::compat::Compat`](https://docs.rs/tokio-util/latest/tokio_util/compat/struct.Compat.html) to bridge the two ecosystems.
+Moonpool 0.8's stream bounds use the **`futures::io::{AsyncRead, AsyncWrite}`** traits rather than `tokio::io` ([ADR-0078](../specs/adr/0078-adopt-moonpool-0-8-native-deterministic-runtime.md)).
+`TokioNetworkProvider` wraps its `tokio::net::TcpStream` in [`tokio_util::compat::Compat`](https://docs.rs/tokio-util/latest/tokio_util/compat/struct.Compat.html) to bridge the two ecosystems.
 The transport adapter therefore imports the `futures::io` ext traits (`AsyncReadExt` / `AsyncWriteExt`) accordingly.
 
 The read side carries a **reusable heap-backed scratch** (`read_scratch`, a `Box<[u8]>` of `TLS_WIRE_BUFFER` bytes allocated once per `Transport` via `new_read_scratch()`): `read_into` lands wire bytes into it / the caller's spare capacity instead of heap-allocating a fresh 16 KiB buffer on every read.
@@ -112,7 +140,7 @@ The moonpool driver loop mirrors the tokio supervisor exactly.
 See [`../ARCHITECTURE.md#the-driver-loop`](../ARCHITECTURE.md#the-driver-loop) for the shared algorithm.
 Specifics for the moonpool engine:
 
-- Backoff is driven by `moonpool_core::TimeProvider::sleep_until` — under `SimProviders` this advances the virtual clock deterministically.
+- Backoff is driven by `moonpool_core::TimeProvider::sleep` — under `SimProviders` the deterministic executor advances the virtual clock to the next scheduled event.
 - DNS is re-resolved on every attempt through the injected `DnsResolver`.
   The crate ships `StaticDnsResolver` and an `arc_dns_resolver` helper.
 - The `ServiceUrlProvider` is consulted on every attempt before `Transport::connect`, so `ControlledClusterFailover` plugs straight in (see PIP-121 below).
@@ -165,6 +193,8 @@ See [ADR-0018](../specs/adr/0018-pip-188-reconnect-on-migrate.md).
 
 [`crates/magnetar-runtime-moonpool/tests/`](../crates/magnetar-runtime-moonpool/tests/) ships a chaos test pack that exercises the supervisor + reconnect + PIP-121 + PIP-188 paths under deterministic seeds.
 Tests are normal `cargo test` integration targets — no Docker, no live broker.
+The `sim_chaos.rs` workload runs inside Moonpool's native deterministic executor and asserts invariants over named flat `tracing` events captured by `TraceQuery`.
+Cross-event temporal invariants compare `TraceEvent::seq`, the global per-seed sequence, rather than relying on the order in which per-name snapshots are queried.
 
 | Scenario                                                                                                         | Test                                                                                                                                                                                        |
 | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -193,7 +223,9 @@ Reproduce a flaky run under a specific seed:
 
 ```bash
 MOONPOOL_SEED=0xdeadbeefcafebabe \
-  cargo test -p magnetar-runtime-moonpool --all-features --locked -- --nocapture
+  cargo test -p magnetar-runtime-moonpool \
+    --no-default-features --features crypto-aws-lc-rs \
+    --locked -- --nocapture
 ```
 
 Sweep a range of seeds locally:
@@ -201,7 +233,8 @@ Sweep a range of seeds locally:
 ```bash
 for seed in $(seq 1 32); do
   MOONPOOL_SEED=$seed cargo test -p magnetar-runtime-moonpool \
-    --all-features --locked -- --quiet || echo "seed $seed FAILED"
+    --no-default-features --features crypto-aws-lc-rs \
+    --locked -- --quiet || { echo "seed $seed FAILED"; exit 1; }
 done
 ```
 
@@ -231,25 +264,21 @@ The harness components:
 | [`tests/failover_active_reflow_equivalence.rs`](../crates/magnetar-differential/tests/failover_active_reflow_equivalence.rs)                       | Failover active-promotion flow rearming plus accepted incomplete PIP-37 chunk-flow replenishment parity.                                                                                                                                                                                                                                                       |
 | [`tests/nack_unacked_removal_equivalence.rs`](../crates/magnetar-differential/tests/nack_unacked_removal_equivalence.rs)                           | Nacked ids dropped from the ack-timeout tracker (no double redelivery) parity.                                                                                                                                                                                                                                                                                 |
 
-The moonpool runner uses `TokioProviders` rather than `SimProviders`.
-`moonpool-sim` is now a workspace dependency (pulled in for the chaos pack from crates.io `0.7.0` — [ADR-0056](../specs/adr/0056-moonpool-0-7-crates-io-repin.md)).
-The harness still exercises the engine surface that diverges between tokio and moonpool (memory-limit policy plumbing, future shapes, generic bounds) which is the load-bearing part for equivalence.
+The differential runner intentionally uses `TokioProviders` rather than `SimProviders` because both legs talk to the same real in-process broker on the same wall-clock runtime.
+The separate `SimProviders` chaos pack exercises Moonpool's deterministic executor, virtual clock, and simulated network.
+Together they distinguish user-visible cross-engine equivalence from simulation-scheduler coverage.
 
 Equivalence holds across the vectored-write change because the comparison is on wire bytes + user-visible events, not syscall shape: under `TokioProviders` the moonpool transport's `Compat` stream does not forward vectored writes (it collapses the `Vectored` segment list to a single buffer write — see [Transport + vectored writes](#transport--vectored-writes)), so it emits byte-identical wire output to the tokio engine's `write_all`.
 The segment-granular delivery events are a `SimProviders`-only refinement and do not perturb the `TokioProviders`-backed differential trace.
 
-The harness ships per [ADR-0019](../specs/adr/0019-engine-scope-and-moonpool-parity.md) M8.
-The moonpool runner awaits the engine work directly — no `tokio::task::LocalSet` wrapper and no periodic pump.
-Moonpool `0.7.0` ships a `Send`-bound `TaskProvider::spawn_task` (`TokioProviders` wires `TokioTaskProvider`, which spawns via `tokio::task::Builder::new().spawn(...)`, **not** `spawn_local`), so the driver task runs on the ambient runtime and a parked `consumer.receive()` is woken normally through its `Notify`/`Waker` slab.
-The earlier `LocalSet` + 25 ms `Kicker` pump were tied to a stale `spawn_local` premise and have been removed.
+The Moonpool runner awaits engine work directly on the ambient Tokio runtime.
+Moonpool 0.8's `TokioTaskProvider` uses `tokio::spawn`, while `SimTaskProvider` uses Moonpool's deterministic executor; both satisfy the same `Send`-bound `TaskProvider` contract.
 
 ## What is _not_ yet exercised under simulation
 
 - **Property-based seed sweeps** in per-PR CI: the per-PR pipeline runs the test binary on the moonpool default seed only.
   Multi-seed scheduling is covered by the daily 128-random-seed sweep ([ADR-0036](../specs/adr/0036-moonpool-seed-sweep-daily-random.md)), not by per-PR CI.
 - **Adversarial in-handshake byte mutation** under `SimProviders` network chaos is not yet swept; corrupt-record rejection is covered by `tls_handshake_chaos.rs` on both engines (1:1), but mutating handshake bytes mid-flight as a network-chaos scenario is open work.
-- **Transparent in-flight publish replay** across reconnect: the sans-io machinery is there (`Connection::reset`, epoch bump, rebuild plumbing) but the engine surfaces `OpOutcome::SessionLost` rather than re-queueing the unconfirmed sends.
-  Stage 3 follow-up.
 
 When one of these items moves from "known gap" to "ready to dispatch", it is added to [`follow-ups.md`](follow-ups.md) with the standard **Gap** / **Why it stays open** / `/goal` entry shape.
 

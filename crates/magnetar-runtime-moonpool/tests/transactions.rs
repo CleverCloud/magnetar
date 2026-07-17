@@ -28,7 +28,7 @@ async fn new_txn_returns_broker_assigned_txn_id() {
 
     let request_id = {
         let mut conn = shared.inner.lock();
-        conn.new_txn(Duration::from_secs(60))
+        conn.new_txn(Duration::from_mins(1))
     };
     // Synthesize the broker's CommandNewTxnResponse and feed it back.
     let frame = new_txn_response_bytes(request_id.0, 0x11, 0x22);

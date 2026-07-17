@@ -65,7 +65,7 @@ async fn start_pulsar() -> Result<
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -110,7 +110,7 @@ async fn e2e_v5_produce_consume_roundtrip() -> Result<(), Box<dyn std::error::Er
         .subscription("magnetar-v5-e2e")
         .initial_position(V5SubscriptionInitialPosition::Earliest)
         .ack_timeout(Some(Duration::from_secs(30)))
-        .negative_ack_redelivery_delay(Duration::from_secs(60))
+        .negative_ack_redelivery_delay(Duration::from_mins(1))
         .subscribe()
         .await?;
 

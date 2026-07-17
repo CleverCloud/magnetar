@@ -11,7 +11,7 @@
 //! drain and its (too-late) enrollment was lost and the accessor hung. The fix
 //! arms the `Notified` *before* the drain (the enroll-before-drain idiom shared
 //! with `ConnectionShared::await_reconnect_or_terminal` and the
-//! `SubscribeAckedFut` fix), mirrored 1:1 across both engines.
+//! subscribe-readiness fix), mirrored 1:1 across both engines.
 //!
 //! The deterministic `SimProviders` coverage of the marker-observation path
 //! lives in `replicated_subscriptions_sim.rs`; this file carries the

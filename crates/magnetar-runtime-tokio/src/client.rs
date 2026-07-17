@@ -1203,7 +1203,7 @@ impl Client {
     /// `replicated_subscription_marker_notify.notify_waiters()`, which stores no permit)
     /// between the drain and the park is captured by this already-armed waiter rather than
     /// lost. The previous drain-then-`notified().await` shape hung whenever the marker
-    /// landed in that gap (same race fixed for `SubscribeAckedFut`).
+    /// landed in that gap (same race fixed for the subscribe-readiness waiter).
     /// No channel (ADR-0003), no host-clock read (ADR-0011).
     pub async fn next_replicated_subscription_marker(
         &self,

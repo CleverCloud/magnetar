@@ -36,7 +36,7 @@ pub const DEFAULT_ACK_TIMEOUT: Option<Duration> = None;
 
 /// V5 default `negative_ack_redelivery_delay`. Mirrors Java V5
 /// `ConsumerBuilder#negativeAckRedeliveryDelay(60s)`.
-pub const DEFAULT_NEGATIVE_ACK_REDELIVERY_DELAY: Duration = Duration::from_secs(60);
+pub const DEFAULT_NEGATIVE_ACK_REDELIVERY_DELAY: Duration = Duration::from_mins(1);
 
 /// V5 default `receiver_queue_size`. Mirrors Java V5
 /// `ConsumerBuilder#receiverQueueSize(1000)`.
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(DEFAULT_ACK_TIMEOUT, None);
         assert_eq!(
             DEFAULT_NEGATIVE_ACK_REDELIVERY_DELAY,
-            Duration::from_secs(60)
+            Duration::from_mins(1)
         );
         assert_eq!(DEFAULT_RECEIVER_QUEUE_SIZE, 1000);
     }
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(ack_timeout_to_ms(None), 0);
         assert_eq!(ack_timeout_to_ms(Some(Duration::from_millis(750))), 750);
         assert_eq!(
-            negative_ack_redelivery_delay_to_ms(Duration::from_secs(60)),
+            negative_ack_redelivery_delay_to_ms(Duration::from_mins(1)),
             60_000
         );
     }

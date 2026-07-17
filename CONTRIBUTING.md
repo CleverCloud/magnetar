@@ -2,8 +2,8 @@
 
 ## Toolchain
 
-- Rust **stable ≥ 1.88** (edition 2024).
-  `rust-toolchain.toml` pins this.
+- Rust **stable ≥ 1.91** (edition 2024; [ADR-0079](specs/adr/0079-raise-msrv-to-rust-1-91.md)).
+  `Cargo.toml` declares the minimum; `rust-toolchain.toml` selects the rolling stable toolchain for development.
 - Rust **nightly** is needed only for `cargo +nightly fmt` (unstable rustfmt features).
 - **`protoc` ≥ 3.19** if you re-run `xtask codegen`.
   End users don't need it — generated code is committed to `crates/magnetar-proto/src/pb/`.
@@ -24,7 +24,7 @@ cargo clippy --workspace --no-default-features --features "$FEATURES" --all-targ
 cargo build --workspace --no-default-features --features "$FEATURES"
 cargo test --workspace --no-default-features --features "$FEATURES" --locked
 cargo deny check
-RUSTDOCFLAGS="-D warnings --cfg tokio_unstable --cfg tracing_unstable" \
+RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked
 cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)

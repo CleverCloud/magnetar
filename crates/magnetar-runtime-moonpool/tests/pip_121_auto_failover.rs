@@ -13,15 +13,11 @@
 //! side in isolation so a moonpool-specific regression surfaces here
 //! without dragging in the tokio engine.
 //!
-//! Why this is moonpool territory: the probe loop is driven by
-//! [`moonpool_core::TaskProvider::spawn_task`] + virtual-clock
-//! [`moonpool_core::TimeProvider::sleep`], so seed-controlled `sim`
-//! providers will tick this deterministically. `TokioProviders` +
-//! `tokio::time::pause` is the production-shaped substitute we run here
-//! because `moonpool-sim` is not yet a workspace dependency
-//! (see `crates/magnetar-runtime-moonpool/src/lib.rs` for the standing
-//! plumbing decision); the failover semantics tested here are identical
-//! either way.
+//! Why this is Moonpool territory: the probe loop is driven by
+//! [`moonpool_core::TaskProvider::spawn_task`] and
+//! [`moonpool_core::TimeProvider::sleep`].
+//! `SimProviders` therefore drives it on Moonpool 0.8's native deterministic executor and virtual
+//! clock, while this focused policy test uses `TokioProviders` on the production-shaped path.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,10 +31,8 @@ use moonpool_core::TokioProviders;
 const PRIMARY: &str = "pulsar://primary:6650";
 const STANDBY: &str = "pulsar://standby:6650";
 /// Short tick so the test runs in real time without slowing the suite.
-/// Real-time sleeps are necessary because `tokio::time::pause` interacts
-/// awkwardly with the `TokioTaskProvider`'s `spawn_local` wrapper —
-/// timer firings race the test future and the test would need fragile
-/// extra-yield gymnastics. Real-time is honest and predictable here.
+/// This test checks failover policy output on `TokioProviders`; deterministic-executor and virtual
+/// clock behavior is covered by the `SimProviders` chaos suite.
 const TICK: Duration = Duration::from_millis(40);
 
 /// Synthetic probe whose verdict for the primary URL flips through a
@@ -103,15 +97,9 @@ async fn probe_loop_flips_active_url_in_sync_with_scripted_verdicts() {
 
             let handle = failover.start(&providers, TICK);
 
-            // Inline ticking. Each step advances the virtual clock by
-            // one full `TICK` (plus a small slack), then yields a
-            // handful of times so the moonpool task-provider's
-            // `spawn_local` wrapper has a chance to run the probe-loop
-            // body to completion. A single `yield_now` is sometimes
-            // enough, but the wrapper adds a tracing-span await and the
-            // probe loop itself has multiple `.await` points
-            // (`time.sleep`, `poll_fn`), so we loosen the bound to keep
-            // the test robust.
+            // Inline ticking. Each step waits one full `TICK` plus slack, then yields so the
+            // provider-spawned probe loop can complete its `time.sleep` and `poll_fn` await
+            // points before the assertion samples the active URL.
             let tick = |label: &'static str| {
                 let f = &failover;
                 async move {

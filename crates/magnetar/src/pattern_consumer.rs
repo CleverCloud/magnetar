@@ -1027,7 +1027,7 @@ mod tests {
 
         let consumer_for_task = consumer.clone();
         let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_hours(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Mirror `start_auto_reconcile`: consume the immediate first tick, then loop
             // on the long interval and exit only when the set has become non-empty and

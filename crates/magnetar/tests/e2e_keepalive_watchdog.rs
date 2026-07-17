@@ -88,7 +88,7 @@ async fn start_pulsar()
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(120))
+        .with_startup_timeout(Duration::from_mins(2))
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;
@@ -103,7 +103,7 @@ fn supervisor_for_e2e() -> SupervisorConfig {
     SupervisorConfig {
         initial_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(2),
-        mandatory_stop: Duration::from_secs(120),
+        mandatory_stop: Duration::from_mins(2),
         max_attempts: None,
         ..SupervisorConfig::default()
     }
@@ -191,7 +191,7 @@ async fn e2e_keepalive_watchdog_recovers_from_silent_peer() -> Result<(), Box<dy
         .service_url(service_url)
         .keepalive(KEEPALIVE)
         .enable_reconnect(supervisor_for_e2e())
-        .operation_timeout(Duration::from_secs(60))
+        .operation_timeout(Duration::from_mins(1))
         .build()
         .await?;
 

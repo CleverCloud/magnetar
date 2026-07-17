@@ -2695,7 +2695,7 @@ mod tests {
         assert!(deadline > now);
         // 1 day from now is comfortably past the 1-hour horizon and
         // comfortably under any conceivable `Instant` boundary.
-        assert!(deadline < now + std::time::Duration::from_secs(86_400));
+        assert!(deadline < now + std::time::Duration::from_hours(24));
 
         // The drain side must also accept `Duration::MAX` without panic.
         let drained = p.drain_timed_out_sends(now);

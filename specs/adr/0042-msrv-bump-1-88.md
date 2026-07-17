@@ -1,6 +1,6 @@
 # ADR-0042 — Bump MSRV to Rust 1.88 (`let_chains`)
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR-0079](0079-raise-msrv-to-rust-1-91.md)
 - **Date**: 2026-05-26
 - **Decider**: Florentin Dubois
 - **Tags**: toolchain, msrv

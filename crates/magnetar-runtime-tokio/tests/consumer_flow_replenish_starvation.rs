@@ -72,7 +72,7 @@ const RECV_GUARD: Duration = Duration::from_secs(10);
 /// docs).
 fn long_keepalive_config() -> ConnectionConfig {
     ConnectionConfig {
-        keepalive_interval: Duration::from_secs(3600),
+        keepalive_interval: Duration::from_hours(1),
         ..Default::default()
     }
 }

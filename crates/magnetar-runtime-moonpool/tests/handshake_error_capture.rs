@@ -27,7 +27,7 @@ use bytes::BytesMut;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
 use magnetar_runtime_moonpool::{Client, ClientError, EngineError, MoonpoolEngine};
-use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait};
+use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TimeProvider};
 use moonpool_sim::providers::SimProviders;
 use moonpool_sim::{SimContext, SimulationBuilder, SimulationError, SimulationResult, Workload};
 use parking_lot::Mutex;
@@ -151,7 +151,7 @@ impl Workload for RejectHandshakeBroker {
         let handled = self.sessions_handled.clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 inbound = listener.accept() => {
                     match inbound {
@@ -211,16 +211,18 @@ impl Workload for HandshakeFailureClient {
             .ok_or_else(|| SimulationError::InvalidState("broker peer missing".into()))?;
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
+        let time = ctx.providers().time().clone();
 
         // Connect_plain (NOT supervised) — the handshake future surfaces the
         // error directly to the caller. A timeout here means the sim budget
         // never delivered the rejection; the sweep-level assertion is the
         // authoritative gate.
-        let connect = tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
-        )
-        .await;
+        let connect = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain(&engine, &addr, ConnectionConfig::default()),
+            )
+            .await;
         let Ok(result) = connect else {
             return Ok(());
         };

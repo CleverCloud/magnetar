@@ -151,12 +151,9 @@ async fn run_tokio(pulsar_url: &str) -> EventStream {
 
 /// Run the encrypted round-trip against the moonpool engine.
 ///
-/// No [`tokio::task::LocalSet`] / `Kicker` pump is needed: moonpool main
-/// (rev `3863d1d`) ships a `Send`-bound `TaskProvider` whose `spawn_task`
-/// goes through `tokio::task::Builder::new().spawn(...)`, so the driver
-/// task spawned inside `connect_plain` runs on the ambient tokio runtime
-/// and a parked `consumer.receive()` is woken normally via the sans-io
-/// waker slab.
+/// Moonpool 0.8's `TokioProviders` uses a `Send`-bound `TaskProvider` backed by
+/// `tokio::spawn`, so the driver runs on the ambient Tokio runtime and a parked
+/// `consumer.receive()` is woken through the sans-io waker slab.
 async fn run_moonpool(host_port: &str) -> EventStream {
     use magnetar_runtime_moonpool::{Client, MessageDecryptor, MessageEncryptor, MoonpoolEngine};
     use moonpool_core::TokioProviders;

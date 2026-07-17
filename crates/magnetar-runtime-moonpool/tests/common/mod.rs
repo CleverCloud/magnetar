@@ -54,7 +54,7 @@ use magnetar_runtime_moonpool::ConnectionShared;
 /// behaviour under test (negative assertions, fail-fast bounds, deliberately
 /// tight `from_secs(2)` fast-path bounds) keep their own short durations. Do
 /// NOT re-tighten this to "make the tests faster".
-pub const HANG_GUARD: Duration = Duration::from_secs(60);
+pub const HANG_GUARD: Duration = Duration::from_mins(1);
 
 /// Derive `count` deterministic `u64` seeds from the outer `MOONPOOL_SEED`
 /// env var (default `0x4242_4242_4242_4242` when unset).

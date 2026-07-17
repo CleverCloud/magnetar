@@ -88,7 +88,7 @@ async fn start_pulsar_with_token_auth()
         .with_wait_for(WaitFor::message_on_stdout(
             "Created namespace public/default",
         ))
-        .with_startup_timeout(Duration::from_secs(180))
+        .with_startup_timeout(Duration::from_mins(3))
         // Token-auth on. The broker's internal `brokerClient*` is given a
         // dummy admin token signed with `TOKEN_SECRET` so the standalone
         // bootstrap path (which creates `public/default`) can authenticate

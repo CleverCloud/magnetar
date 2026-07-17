@@ -41,9 +41,8 @@
 //!   never time out and the test would fail. The fix routes the driver's `now` through
 //!   `shared.now_instant()` too, so the comparison is consistent across virtual time and the send
 //!   times out promptly.
-//! - The test's host wall-clock budget (the outer `tokio::time::timeout`) is generous (30s) but
-//!   bounds the run regardless of seed. Virtual time advances inside the budget via cooperative
-//!   `time.sleep` ticks.
+//! - The test's outer injected-clock timeout is generous (30s) but bounds the run regardless of
+//!   seed. Virtual time advances inside the budget via cooperative `time.sleep` ticks.
 //!
 //! Pairs 1:1 with the tokio mirror
 //! `crates/magnetar-runtime-tokio/tests/virtual_clock_driver_loop.rs`
@@ -226,7 +225,7 @@ impl Workload for SendTimeoutBroker {
         let handled = self.sessions_handled.clone();
         let task = ctx.providers().task().clone();
         loop {
-            tokio::select! {
+            moonpool_sim::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 inbound = listener.accept() => {
                     match inbound {
@@ -304,7 +303,7 @@ impl SendTimeoutClient {
     /// producer uses the explicit value or the 30s default (ADR-0072).
     fn connect_config(&self) -> ConnectionConfig {
         ConnectionConfig {
-            keepalive_interval: self.effective_timeout() + Duration::from_secs(120),
+            keepalive_interval: self.effective_timeout() + Duration::from_mins(2),
             ..ConnectionConfig::default()
         }
     }
@@ -323,12 +322,14 @@ impl Workload for SendTimeoutClient {
         let addr = format!("{broker_ip}:{BROKER_PORT}");
         let engine = MoonpoolEngine::new(ctx.providers().clone());
         let time = ctx.providers().time().clone();
+        let task = ctx.providers().task().clone();
 
-        let connect = tokio::time::timeout(
-            Duration::from_secs(20),
-            Client::connect_plain(&engine, &addr, self.connect_config()),
-        )
-        .await;
+        let connect = time
+            .timeout(
+                Duration::from_secs(20),
+                Client::connect_plain(&engine, &addr, self.connect_config()),
+            )
+            .await;
         let Ok(Ok(client)) = connect else {
             self.obs.lock().last_error = Some(format!("connect_plain failed: {connect:?}"));
             return Ok(());
@@ -354,16 +355,16 @@ impl Workload for SendTimeoutClient {
         if let Some(explicit) = self.send_timeout {
             open_req.send_timeout = Some(explicit);
         }
-        let producer =
-            match tokio::time::timeout(Duration::from_secs(20), client.open_producer(open_req))
-                .await
-            {
-                Ok(Ok(p)) => p,
-                other => {
-                    self.obs.lock().last_error = Some(format!("open_producer failed: {other:?}"));
-                    return Ok(());
-                }
-            };
+        let producer = match time
+            .timeout(Duration::from_secs(20), client.open_producer(open_req))
+            .await
+        {
+            Ok(Ok(p)) => p,
+            other => {
+                self.obs.lock().last_error = Some(format!("open_producer failed: {other:?}"));
+                return Ok(());
+            }
+        };
 
         // Capture virtual-time anchor BEFORE the send. We compare to
         // `time.now()` after the future resolves to assert the timeout
@@ -385,21 +386,21 @@ impl Workload for SendTimeoutClient {
         // deadline. We interleave virtual sleeps with task yields so the
         // sim scheduler keeps pumping the driver task. The virtual-sleep
         // budget covers the effective deadline (explicit or the 30s default)
-        // plus a margin for the timer-wheel resolution. The outer
-        // `tokio::time::timeout` (host) is the safety budget.
+        // plus a margin for the timer-wheel resolution. The outer injected
+        // `TimeProvider::timeout` is the safety budget.
         let drive_secs = self.effective_timeout().as_secs().saturating_add(8);
         // The outer guard must be comfortably ABOVE the effective deadline so it
         // never races the send-timeout firing (the default case deadline is 30s,
         // so a fixed 30s guard would fire simultaneously with the timeout).
         let outer_budget = self.effective_timeout() + Duration::from_secs(30);
-        let resolved: Option<Result<magnetar_proto::MessageId, ClientError>> =
-            tokio::time::timeout(outer_budget, async {
+        let resolved: Option<Result<magnetar_proto::MessageId, ClientError>> = time
+            .timeout(outer_budget, async {
                 tokio::pin!(send_fut);
                 for _ in 0..32 {
-                    tokio::task::yield_now().await;
+                    task.yield_now().await;
                 }
                 for _ in 0..drive_secs {
-                    tokio::select! {
+                    moonpool_sim::select! {
                         biased;
                         result = &mut send_fut => return Some(result),
                         slept = time.sleep(Duration::from_secs(1)) => {
@@ -410,16 +411,16 @@ impl Workload for SendTimeoutClient {
                                 break;
                             }
                             for _ in 0..32 {
-                                tokio::task::yield_now().await;
+                                task.yield_now().await;
                             }
                         }
                     }
                 }
                 // Give the resolved future one final poll opportunity.
-                tokio::select! {
+                moonpool_sim::select! {
                     biased;
                     result = &mut send_fut => Some(result),
-                    () = tokio::task::yield_now() => None,
+                    () = task.yield_now() => None,
                 }
             })
             .await

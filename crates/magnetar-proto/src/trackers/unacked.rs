@@ -243,7 +243,7 @@ mod tests {
         let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::ZERO);
         assert!(t.is_disabled());
         t.add(mid(1), Instant::now());
-        assert!(t.poll(Instant::now() + Duration::from_secs(60)).is_empty());
+        assert!(t.poll(Instant::now() + Duration::from_mins(1)).is_empty());
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
         // redelivery_count = 0 and 200ms for redelivery_count = 1.
         let backoff = MultiplierRedeliveryBackoff {
             min_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             multiplier: 2.0,
         };
         let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_secs(1))
@@ -312,7 +312,7 @@ mod tests {
     fn backoff_remove_cancels_redelivery() {
         let backoff = MultiplierRedeliveryBackoff {
             min_delay: Duration::from_millis(50),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             multiplier: 2.0,
         };
         let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_secs(1))
@@ -339,7 +339,7 @@ mod tests {
     fn next_deadline_picks_earliest_across_paths() {
         let backoff = MultiplierRedeliveryBackoff {
             min_delay: Duration::from_millis(20),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             multiplier: 2.0,
         };
         let mut t = UnackedMessageTracker::new(ConsumerHandle(1), Duration::from_secs(1))
@@ -450,6 +450,6 @@ mod tests {
         t.add(mid(1), Instant::now());
         t.remove(&mid(1));
         t.remove(&mid(999));
-        assert!(t.poll(Instant::now() + Duration::from_secs(60)).is_empty());
+        assert!(t.poll(Instant::now() + Duration::from_mins(1)).is_empty());
     }
 }
