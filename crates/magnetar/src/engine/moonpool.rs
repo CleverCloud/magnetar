@@ -20,8 +20,8 @@ use std::time::Duration;
 
 #[cfg(feature = "tokio")]
 use super::{
-    BrokerMetadataApi, ConsumerApi, CreateProducerApi, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
-    SubscribeApi, TopicListChange, WatchTopicListFut,
+    BrokerMetadataApi, ConsumerApi, CreateProducerApi, OperationDeadline, ProducerApi,
+    ReceiveBatchFut, ReceiveOptFut, SubscribeApi, TopicListChange, WatchTopicListFut,
 };
 use super::{Engine, MessageDecryptorApi, MessageEncryptorApi, TransactionApi};
 
@@ -380,6 +380,26 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
         Box::pin(magnetar_runtime_moonpool::Client::partitioned_topic_metadata(self, topic))
     }
 
+    fn new_metadata_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::new(magnetar_runtime_moonpool::Client::operation_timer(self))
+    }
+
+    fn partitioned_topic_metadata_with_deadline<'a>(
+        &'a self,
+        topic: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_moonpool::Client::partitioned_topic_metadata_with_operation_deadline(
+                self,
+                topic,
+                timer,
+                last_broker_error,
+            ),
+        )
+    }
+
     fn watch_topic_list<'a>(
         &'a self,
         namespace: &'a str,
@@ -388,6 +408,24 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> BrokerMetadataApi
         Box::pin(magnetar_runtime_moonpool::Client::watch_topic_list(
             self, namespace, pattern,
         ))
+    }
+
+    fn watch_topic_list_with_deadline<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListFut<'a, Self> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_moonpool::Client::watch_topic_list_with_operation_deadline(
+                self,
+                namespace,
+                pattern,
+                timer,
+                last_broker_error,
+            ),
+        )
     }
 
     fn poll_topic_list_change(&self) -> Option<TopicListChange> {
@@ -411,6 +449,27 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> SubscribeApi
     ) -> Pin<Box<dyn Future<Output = Result<Self::Consumer, Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_moonpool::Client::subscribe(self, req))
     }
+
+    fn new_subscribe_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::new(magnetar_runtime_moonpool::Client::operation_timer(self))
+    }
+
+    fn subscribe_with_deadline<'a>(
+        &'a self,
+        req: magnetar_proto::SubscribeRequest,
+        deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Consumer, Self::Error>> + Send + 'a>> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_moonpool::Client::subscribe_with_operation_deadline(
+                self,
+                req,
+                None,
+                timer,
+                last_broker_error,
+            ),
+        )
+    }
 }
 
 #[cfg(feature = "tokio")]
@@ -425,6 +484,27 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> CreateProducerApi
         req: magnetar_proto::CreateProducerRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Producer, Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_moonpool::Client::open_producer(self, req))
+    }
+
+    fn new_producer_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::new(magnetar_runtime_moonpool::Client::operation_timer(self))
+    }
+
+    fn open_producer_with_deadline<'a>(
+        &'a self,
+        req: magnetar_proto::CreateProducerRequest,
+        deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Producer, Self::Error>> + Send + 'a>> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_moonpool::Client::open_producer_with_operation_deadline(
+                self,
+                req,
+                None,
+                timer,
+                last_broker_error,
+            ),
+        )
     }
 }
 

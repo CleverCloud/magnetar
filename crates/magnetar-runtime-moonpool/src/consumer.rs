@@ -52,9 +52,9 @@ use magnetar_proto::{
 };
 use moonpool_core::Providers;
 
-use crate::client::{Client, ClientError};
+use crate::client::{Client, ClientError, operation_deadline_error, operation_deadline_expired};
 use crate::crypto::MessageDecryptor;
-use crate::{ConnectionShared, SleepProvider, TopicListChange};
+use crate::{ConnectionShared, SleepProvider};
 
 /// User-facing consumer handle for the moonpool engine.
 ///
@@ -137,6 +137,7 @@ impl Drop for ConsumerCloseGuard {
             let mut conn = self.shared.inner.lock();
             let _ = conn.close_consumer_forget(self.handle);
         }
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         tracing::debug!(
             topic = %self.slot.identity.topic,
@@ -1009,8 +1010,9 @@ impl<P: Providers> Consumer<P> {
 
     /// Unsubscribe — tear down this consumer's subscription on the broker
     /// (deletes the cursor, not just the consumer handle). Mirrors Java
-    /// `Consumer#unsubscribe`. Callers typically follow with
-    /// [`Self::close`].
+    /// `Consumer#unsubscribe`. After a successful call the consumer is
+    /// unusable; a broker rejection leaves it available and restores any
+    /// interrupted reattachment retry.
     ///
     /// `force=true` (PIP-313) drops the subscription even when other
     /// consumers are still attached to the same subscription name. Signature
@@ -1024,16 +1026,21 @@ impl<P: Providers> Consumer<P> {
     pub async fn unsubscribe(&self, force: bool) -> Result<(), ClientError> {
         let request_id = {
             let mut conn = self.shared.inner.lock();
-            conn.unsubscribe(self.handle, force)
+            conn.try_unsubscribe(self.handle, force)
+                .ok_or_else(|| ClientError::Other("unsubscribe already in progress".to_owned()))?
         };
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
             request_id,
         }
         .await;
+        self.shared.operation_cancel_notify.notify_waiters();
         match outcome {
             OpOutcome::Success { .. } => {
+                // The proto layer owns lifecycle finalization so cancellation
+                // of this future cannot strand the consumer in Closing.
                 // Lifecycle record (ADR-0054).
                 tracing::info!(
                     topic = %self.slot.identity.topic,
@@ -1270,6 +1277,7 @@ impl<P: Providers> Consumer<P> {
             let mut conn = self.shared.inner.lock();
             conn.close_consumer(self.handle)
         };
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
@@ -1309,8 +1317,13 @@ impl<P: Providers + Send + Sync> Client<P> {
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
     /// - [`ClientError::PeerClosed`] on a TERMINAL connection drop before the subscribe acked
     ///   (ADR-0055 §1); a user-requested graceful close surfaces [`ClientError::Closed`].
+    /// - [`ClientError::Broker`] after retryable broker refusals exhaust `OperationRetryConfig`.
+    /// - [`ClientError::Other`] when the deadline expires before any broker error is recorded.
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer<P>, ClientError> {
-        self.subscribe_with(req, None).await
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.subscribe_with_operation_deadline(req, None, deadline.as_mut(), &mut last_broker_error)
+            .await
     }
 
     /// Same as [`Self::subscribe`] but with an optional PIP-4 decryption hook.
@@ -1320,65 +1333,182 @@ impl<P: Providers + Send + Sync> Client<P> {
     /// - [`ClientError::Closed`] if the broker closed the consumer mid-handshake.
     /// - [`ClientError::PeerClosed`] on a TERMINAL connection drop before the subscribe acked
     ///   (ADR-0055 §1); a user-requested graceful close surfaces [`ClientError::Closed`].
+    /// - [`ClientError::Broker`] after retryable broker refusals exhaust `OperationRetryConfig`.
     pub async fn subscribe_with(
         &self,
         req: SubscribeRequest,
         decryptor: Option<Arc<dyn MessageDecryptor>>,
     ) -> Result<Consumer<P>, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.subscribe_with_operation_deadline(
+            req,
+            decryptor,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware subscribe seam used by the engine-generic façade.
+    #[doc(hidden)]
+    pub async fn subscribe_with_operation_deadline(
+        &self,
+        req: SubscribeRequest,
+        decryptor: Option<Arc<dyn MessageDecryptor>>,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<Consumer<P>, ClientError> {
         // See `Client::open_producer`: subscribe also needs lookup-driven bundle
         // activation. Mirrors `magnetar-runtime-tokio`'s `Client::subscribe_with`. On a
         // client built via `connect_plain_supervised`, ADR-0039 proxy routing fans the
         // `Proxy` branch through the per-broker pool inside `Client::resolve_target`.
-        let (target, landed_on) = self.lookup_topic_target(&req.topic).await?;
-        let shared = self.resolve_target(&target, &landed_on, &req.topic).await?;
-        // ADR-0059: fast-fail if the resolved data-plane
-        // connection is already terminal with no driver, before registering a
-        // doomed `CommandSubscribe`. 1:1 with the tokio engine.
-        shared.fail_if_no_driver()?;
-        let (handle, slot) = {
-            let mut conn = shared.inner.lock();
-            let handle = conn.subscribe(req);
-            let slot = conn
-                .consumer(handle)
-                .cloned()
-                .expect("just-created consumer slot must exist");
-            (handle, slot)
-        };
-        shared.driver_waker.notify_one();
-        wait_subscribe_acked(&shared, handle).await?;
-
-        // Feed an initial flow so the broker starts delivering. `initial_flow`
-        // returns `None` when there is no consumer state; we still send an
-        // explicit FLOW with the policy's CURRENT target as a safety net.
-        // Issue #301: read the live target from the slot (`policy.initial()`
-        // after construction) rather than the raw `req.receiver_queue_size`, so
-        // an `Auto` policy is not double-granted a stale raw value. 1:1 with the
-        // tokio engine.
-        {
-            let mut conn = shared.inner.lock();
-            let _ = conn.initial_flow(handle);
-            let initial_target = slot.state.lock().receiver_queue_size;
-            if initial_target > 0 {
-                conn.flow(handle, initial_target as u32);
+        let retry_config = self.shared().inner.lock().operation_retry_config().clone();
+        let mut attachment_failures = 0_u32;
+        loop {
+            let (target, landed_on) = self
+                .lookup_topic_target_with_operation_deadline(
+                    &req.topic,
+                    deadline.as_mut(),
+                    last_broker_error,
+                )
+                .await?;
+            let shared = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "consumer target resolution",
+                        last_broker_error.clone(),
+                    ));
+                }
+                result = self.resolve_target(&target, &landed_on, &req.topic) => result?,
+            };
+            shared.fail_if_no_driver()?;
+            if operation_deadline_expired(deadline.as_mut()) {
+                return Err(operation_deadline_error(
+                    "consumer subscribe",
+                    last_broker_error.clone(),
+                ));
+            }
+            let (handle, slot) = {
+                let mut conn = shared.inner.lock();
+                let handle = conn.subscribe(req.clone());
+                let slot = conn
+                    .consumer(handle)
+                    .cloned()
+                    .expect("just-created consumer slot must exist");
+                (handle, slot)
+            };
+            shared.driver_waker.notify_one();
+            let mut guard = PendingConsumerSubscribeGuard::new(shared.clone(), handle);
+            let acked = SubscribeAckedFut {
+                shared: shared.clone(),
+                handle,
+                accept_prior_attachment: true,
+                expected_waiter_id: None,
+                notification: None,
+            };
+            tokio::pin!(acked);
+            let ack_result = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    let last = shared
+                        .inner
+                        .lock()
+                        .consumer_last_subscribe_error(handle)
+                        .or_else(|| last_broker_error.clone());
+                    Err(operation_deadline_error("consumer subscribe", last))
+                }
+                result = acked.as_mut() => result,
+            };
+            match ack_result {
+                Ok(()) => {
+                    guard.disarm();
+                    {
+                        let mut conn = shared.inner.lock();
+                        let _ = conn.initial_flow(handle);
+                        let initial_target = slot.state.lock().receiver_queue_size;
+                        if initial_target > 0 {
+                            conn.flow(handle, initial_target as u32);
+                        }
+                    }
+                    shared.driver_waker.notify_one();
+                    tracing::info!(
+                        topic = %slot.identity.topic,
+                        subscription = %slot.identity.subscription,
+                        handle = ?handle,
+                        "consumer subscribed"
+                    );
+                    return Ok(Consumer::assemble(
+                        shared,
+                        handle,
+                        slot,
+                        decryptor,
+                        self.sleep_provider(),
+                    ));
+                }
+                Err(ClientError::Broker { code, message })
+                    if magnetar_proto::is_retryable_broker_error(
+                        magnetar_proto::OperationKind::Subscribe,
+                        code,
+                    ) =>
+                {
+                    *last_broker_error = Some((code, message.clone()));
+                    attachment_failures = attachment_failures.saturating_add(1);
+                    if !retry_config.should_retry_after_failure(attachment_failures) {
+                        return Err(ClientError::Broker { code, message });
+                    }
+                    drop(guard);
+                    let sleep_provider = self.sleep_provider();
+                    let mut sleep =
+                        sleep_provider(retry_config.delay_after_failure(attachment_failures));
+                    moonpool_core::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "consumer subscribe retry",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        _ = sleep.as_mut() => {}
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
-        shared.driver_waker.notify_one();
+    }
+}
 
-        // Lifecycle record (ADR-0054).
-        tracing::info!(
-            topic = %slot.identity.topic,
-            subscription = %slot.identity.subscription,
-            handle = ?handle,
-            "consumer subscribed"
-        );
+struct PendingConsumerSubscribeGuard {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    armed: bool,
+}
 
-        Ok(Consumer::assemble(
+impl PendingConsumerSubscribeGuard {
+    fn new(shared: Arc<ConnectionShared>, handle: ConsumerHandle) -> Self {
+        Self {
             shared,
             handle,
-            slot,
-            decryptor,
-            self.sleep_provider(),
-        ))
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingConsumerSubscribeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared
+                .inner
+                .lock()
+                .cancel_consumer_subscribe(self.handle);
+            self.shared.operation_cancel_notify.notify_waiters();
+            self.shared.driver_waker.notify_one();
+        }
     }
 }
 
@@ -1405,15 +1535,18 @@ impl Future for RequestFut {
 }
 
 impl Drop for RequestFut {
-    /// Drop-time cleanup: clear our entry from the connection's waker slab so
-    /// a cancelled consumer-side request future (seek, get-last-msg-id, ack
-    /// receipt, etc.) does not leak a [`std::task::Waker`] in the slab.
+    /// Drop-time cleanup: clear our entry from the connection's waker slab and
+    /// discard an outcome that may have landed immediately before cancellation
+    /// so a cancelled consumer-side request future (seek, get-last-msg-id, ack
+    /// receipt, etc.) leaves neither surface behind.
     /// Mirrors the tokio engine's
     /// [`magnetar_runtime_tokio::consumer::RequestFut::drop`]. Lookup
     /// multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
     fn drop(&mut self) {
         let key = PendingOpKey::Request(self.request_id);
-        self.shared.inner.lock().unregister_waker(key);
+        let mut conn = self.shared.inner.lock();
+        conn.unregister_waker(key);
+        let _ = conn.take_outcome(key);
     }
 }
 
@@ -1590,55 +1723,72 @@ impl Future for ReceiveFut {
     }
 }
 
-/// Resolve once the broker has acked the subscribe for the given
-/// [`ConsumerHandle`].
+/// Future that resolves once the broker has acked the subscribe for the
+/// given [`ConsumerHandle`]. It selectively removes events for this handle;
+/// concurrent consumers' events remain queued for their owning waiters.
 ///
-/// The event notification is armed before the queue is inspected, preventing
-/// a driver event between the empty check and the await from being lost.
-async fn wait_subscribe_acked(
-    shared: &Arc<ConnectionShared>,
+/// The dedicated event notification is owned and polled before connection
+/// state is inspected. It therefore remains registered across `Pending` and
+/// cannot miss a driver `notify_waiters()` that races with the state check.
+/// Keeping it separate from `driver_waker` also prevents this waiter from
+/// consuming outbound-work permits intended for the driver loop.
+struct SubscribeAckedFut {
+    shared: Arc<ConnectionShared>,
     handle: ConsumerHandle,
-) -> Result<(), ClientError> {
-    loop {
-        let notified = shared.event_notify().notified();
-        let mut notified = std::pin::pin!(notified);
-        notified.as_mut().enable();
+    accept_prior_attachment: bool,
+    expected_waiter_id: Option<RequestId>,
+    notification: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+}
 
-        {
-            let mut conn = shared.inner.lock();
+impl Future for SubscribeAckedFut {
+    type Output = Result<(), ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let notification = this
+                .notification
+                .get_or_insert_with(|| Box::pin(this.shared.event_waker.clone().notified_owned()));
+            let notified = notification.as_mut().poll(cx);
+
+            let mut conn = this.shared.inner.lock();
             // Inspect events looking for our SubscribeAcked.
             loop {
-                let event = conn.poll_event_if(|event| match event {
-                    ConnectionEvent::SubscribeAcked {
-                        handle: event_handle,
+                match conn.poll_event_if(|event| {
+                    matches!(
+                        event,
+                        ConnectionEvent::SubscribeAcked { handle }
+                            if *handle == this.handle
+                    ) || matches!(
+                        event,
+                        ConnectionEvent::ConsumerClosedByBroker { handle, .. }
+                            | ConnectionEvent::SubscribeFailed { handle, .. }
+                            if *handle == this.handle
+                    )
+                }) {
+                    Some(ConnectionEvent::SubscribeAcked { handle }) if handle == this.handle => {
+                        let completed = match this.expected_waiter_id {
+                            Some(waiter_id) => {
+                                conn.consume_consumer_subscribe_waiter_completion(handle, waiter_id)
+                            }
+                            None => conn.consume_initial_consumer_subscribe_completion(handle),
+                        };
+                        if completed {
+                            return Poll::Ready(Ok(()));
+                        }
                     }
-                    | ConnectionEvent::ConsumerClosedByBroker {
-                        handle: event_handle,
-                        ..
-                    }
-                    | ConnectionEvent::SubscribeFailed {
-                        handle: event_handle,
-                        ..
-                    } => *event_handle == handle,
-                    ConnectionEvent::TopicListChanged { .. } | ConnectionEvent::Closed { .. } => {
-                        true
-                    }
-                    _ => false,
-                });
-                match event {
-                    Some(ConnectionEvent::SubscribeAcked { handle: _ }) => return Ok(()),
                     Some(ConnectionEvent::ConsumerClosedByBroker {
-                        handle: event_handle,
+                        handle,
                         assigned_broker_service_url,
-                    }) => {
+                    }) if handle == this.handle => {
                         // Broker-forced close — warn! per ADR-0054 §2.1.
                         // Mirror of the tokio engine's `EventWaitFut` arm.
                         let (topic, subscription) = conn
-                            .consumer(event_handle)
+                            .consumer(handle)
                             .map(|s| (s.identity.topic.clone(), s.identity.subscription.clone()))
                             .unwrap_or_default();
                         tracing::warn!(
-                            handle = ?event_handle,
+                            handle = ?handle,
                             topic = %topic,
                             subscription = %subscription,
                             assigned_broker_service_url = assigned_broker_service_url
@@ -1646,62 +1796,87 @@ async fn wait_subscribe_acked(
                                 .map(crate::log_fields::truncate_broker_str),
                             "broker closed consumer while waiting for SubscribeAcked"
                         );
-                        return Err(ClientError::Closed);
+                        return Poll::Ready(Err(ClientError::Closed));
                     }
                     Some(ConnectionEvent::SubscribeFailed {
-                        handle: _,
+                        handle,
                         code,
                         message,
-                    }) => {
-                        return Err(ClientError::Broker { code, message });
+                    }) if handle == this.handle => {
+                        return Poll::Ready(Err(ClientError::Broker { code, message }));
                     }
-                    Some(ConnectionEvent::TopicListChanged { added, removed }) => {
-                        // Forward to the per-client buffer + waker so we don't
-                        // accidentally swallow a PIP-145 delta while waiting
-                        // for a subscribe ack.
-                        shared
-                            .topic_list_changes
-                            .lock()
-                            .push_back(TopicListChange { added, removed });
-                        shared.topic_list_notify.notify_waiters();
-                    }
-                    Some(ConnectionEvent::Closed { reason }) => {
-                        // Connection-level close while a subscribe future was
-                        // parked. ADR-0055 §1: a TERMINAL drop
-                        // (`fail_all_pending`, which carries a `reason`) must
-                        // unblock the waiter with the terminal `PeerClosed`,
-                        // mirroring the tokio engine and the request / send /
-                        // receive surfaces — not a generic `Other`. A
-                        // user-requested graceful `close()` (reason `None`)
-                        // keeps the `Closed` mapping. warn! per ADR-0054 §2.1;
-                        // `reason` is broker-controlled text.
-                        tracing::warn!(
-                            reason = reason
-                                .as_deref()
-                                .map(crate::log_fields::truncate_broker_str),
-                            "connection closed while waiting for consumer readiness"
-                        );
-                        return Err(match reason {
-                            Some(_) => ClientError::PeerClosed,
-                            None => ClientError::Closed,
-                        });
-                    }
-                    Some(_) => unreachable!("poll_event_if returned an unselected event"),
+                    Some(_) => {}
                     None => break,
                 }
             }
 
-            if conn.is_closed() {
-                return Err(ClientError::Closed);
+            let completed = match this.expected_waiter_id {
+                Some(waiter_id) => {
+                    conn.consume_consumer_subscribe_waiter_completion(this.handle, waiter_id)
+                }
+                None => {
+                    this.accept_prior_attachment
+                        && conn.consume_initial_consumer_subscribe_completion(this.handle)
+                }
+            };
+            if completed {
+                return Poll::Ready(Ok(()));
             }
+
+            if conn.consumer_handle_is_terminal(this.handle) || this.shared.is_no_driver() {
+                return Poll::Ready(Err(if this.shared.is_no_driver() {
+                    ClientError::PeerClosed
+                } else {
+                    ClientError::Closed
+                }));
+            }
+            drop(conn);
+
+            if notified.is_pending() {
+                return Poll::Pending;
+            }
+            this.notification = None;
         }
-        notified.await;
+    }
+}
+
+impl Drop for SubscribeAckedFut {
+    fn drop(&mut self) {
+        let Some(waiter_id) = self.expected_waiter_id else {
+            return;
+        };
+        let changed = self
+            .shared
+            .inner
+            .lock()
+            .abandon_consumer_subscribe_waiter(self.handle, waiter_id);
+        if changed {
+            self.shared.driver_waker.notify_one();
+        }
     }
 }
 
 #[cfg(test)]
+async fn wait_subscribe_acked(
+    shared: &Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+) -> Result<(), ClientError> {
+    SubscribeAckedFut {
+        shared: shared.clone(),
+        handle,
+        accept_prior_attachment: false,
+        expected_waiter_id: None,
+        notification: None,
+    }
+    .await
+}
+
+#[cfg(test)]
 mod tests {
+    use std::future::Future as _;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake};
     use std::time::Instant;
 
     use bytes::BytesMut;
@@ -1713,6 +1888,549 @@ mod tests {
     use super::{Consumer, ReceiveFut};
     use crate::client::{Client, ClientError};
     use crate::{ConnectionShared, MoonpoolEngine};
+
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_waiter_registers_before_returning_pending() {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest {
+            topic: "persistent://public/default/pending-waiter-registration".to_owned(),
+            subscription: "pending-waiter-registration".to_owned(),
+            ..Default::default()
+        });
+        let mut future = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: true,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        shared.event_waker.notify_waiters();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+
+        let shared = handshake_complete_shared();
+        let (first, second, second_request_id) = {
+            let mut conn = shared.inner.lock();
+            let first = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/first-concurrent-consumer".to_owned(),
+                subscription: "first-concurrent-consumer".to_owned(),
+                ..Default::default()
+            });
+            let second_request_id = conn.peek_next_request_id_for_test();
+            let second = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/second-concurrent-consumer".to_owned(),
+                subscription: "second-concurrent-consumer".to_owned(),
+                ..Default::default()
+            });
+            (first, second, second_request_id)
+        };
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: second_request_id,
+                error: pb::ServerError::AuthorizationError as i32,
+                message: "second consumer denied".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &error).expect("encode CommandError");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandError");
+        let mut first_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle: first,
+            accept_prior_attachment: true,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        let mut second_waiter = Box::pin(super::SubscribeAckedFut {
+            shared,
+            handle: second,
+            accept_prior_attachment: true,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        assert!(first_waiter.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            second_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ClientError::Broker { code, ref message }))
+                if code == pb::ServerError::AuthorizationError as i32
+                    && message == "second consumer denied"
+        ));
+
+        let shared = handshake_complete_supervised_shared();
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/subscribe-acked-before-seek".to_owned(),
+                subscription: "subscribe-acked-before-seek".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode CommandSuccess");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandSuccess");
+        let mut initial_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: true,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        assert!(matches!(
+            initial_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let mut reattach_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        assert!(
+            reattach_waiter.as_mut().poll(&mut cx).is_pending(),
+            "the initial waiter must consume its ack so a seek cannot reuse the stale event"
+        );
+        drop(reattach_waiter);
+
+        let (background_request_id, seek_request_id) = {
+            let mut conn = shared.inner.lock();
+            let background_request_id = conn
+                .rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("background reattach request");
+            let seek_request_id = conn
+                .resubscribe_consumer_after_seek(handle)
+                .expect("seek reattach request");
+            (background_request_id, seek_request_id)
+        };
+        let background_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: background_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &background_success).expect("encode background success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle background success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Flow as i32,
+                "an older background ack must not release seek flow"
+            );
+        }
+        let mut seek_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: Some(seek_request_id),
+            notification: None,
+        });
+        assert!(
+            seek_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a seek waiter must not consume an unattended background reattach ack"
+        );
+        let seek_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: seek_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &seek_success).expect("encode seek success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle seek success");
+        shared.inner.lock().mark_disconnected();
+        assert!(
+            seek_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a supervised transport failure must not terminate the seek waiter"
+        );
+        shared.inner.lock().reset();
+        assert!(
+            seek_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a reset must not expose an old-session seek completion"
+        );
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("restart handshake");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode reconnect CommandConnected");
+        let rebuilt_request_id = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect handshake");
+            conn.rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("rebuilt subscribe request")
+        };
+        let rebuilt_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: rebuilt_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &rebuilt_success).expect("encode rebuilt success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle rebuilt success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Flow as i32,
+                "reset/rebuild must preserve user-owned seek flow"
+            );
+        }
+        assert!(matches!(
+            seek_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let retry_waiter_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("retry-owned seek subscribe");
+        let mut retry_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: Some(retry_waiter_id),
+            notification: None,
+        });
+        let retry_error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: retry_waiter_id.0,
+                error: pb::ServerError::ServiceNotReady as i32,
+                message: "retry seek subscribe".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &retry_error).expect("encode retry error");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle retry error");
+        assert!(retry_waiter.as_mut().poll(&mut cx).is_pending());
+        let retry_request_id = shared
+            .inner
+            .lock()
+            .retry_consumer_subscribe_if_current(handle, retry_waiter_id)
+            .expect("replacement subscribe request");
+        let retry_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: retry_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &retry_success).expect("encode retry success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle retry success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Flow as i32,
+                "retry replacement must preserve user-owned seek flow"
+            );
+        }
+        assert!(matches!(
+            retry_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let cancelled_waiter_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("cancelled seek subscribe");
+        let cancelled_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: Some(cancelled_waiter_id),
+            notification: None,
+        });
+        drop(cancelled_waiter);
+        let cancelled_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: cancelled_waiter_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &cancelled_success).expect("encode cancelled success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle cancelled success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        let mut saw_flow = false;
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            saw_flow |= frame.command.r#type == pb::base_command::Type::Flow as i32;
+        }
+        assert!(
+            saw_flow,
+            "cancelling a seek waiter must transfer its active subscribe to flow ownership"
+        );
+
+        let disconnected_waiter_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("disconnect-cancelled seek subscribe");
+        let disconnected_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: Some(disconnected_waiter_id),
+            notification: None,
+        });
+        let disconnected_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: disconnected_waiter_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &disconnected_success)
+            .expect("encode disconnect-cancelled success");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle disconnect-cancelled success");
+            conn.mark_disconnected();
+            conn.reset();
+        }
+        drop(disconnected_waiter);
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("restart handshake after waiter cancellation");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode reconnect CommandConnected");
+        let rebuilt_request_id = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect after waiter cancellation");
+            conn.rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("rebuilt flow-owned subscribe request")
+        };
+        let rebuilt_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: rebuilt_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &rebuilt_success).expect("encode flow-owned rebuilt success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle flow-owned rebuilt success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        let mut saw_flow = false;
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            saw_flow |= frame.command.r#type == pb::base_command::Type::Flow as i32;
+        }
+        assert!(
+            saw_flow,
+            "cancelling during reconnect must transfer the rebuilt subscribe to flow ownership"
+        );
+
+        let shared = handshake_complete_shared();
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/subscribe-acked-before-reset".to_owned(),
+                subscription: "subscribe-acked-before-reset".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode CommandSuccess");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle CommandSuccess");
+            conn.reset();
+        }
+        let mut initial_waiter = Box::pin(super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: true,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        assert!(
+            initial_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a reset must not expose an old-session initial subscribe completion"
+        );
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("restart handshake");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode reconnect CommandConnected");
+        let rebuilt_request_id = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect handshake");
+            conn.rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("rebuilt subscribe request")
+        };
+        let rebuilt_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: rebuilt_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &rebuilt_success).expect("encode rebuilt success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle rebuilt success");
+        assert!(matches!(
+            initial_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let mut reattach_waiter = Box::pin(super::SubscribeAckedFut {
+            shared,
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: None,
+            notification: None,
+        });
+        assert!(
+            reattach_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a seek/re-subscribe waiter must still require its fresh acknowledgement"
+        );
+    }
 
     /// ADR-0053 §D2 — the reconsume / DLQ-republish property merge replaces an
     /// inbound key (e.g. a re-injected OTel `traceparent`) in place rather than
@@ -1804,7 +2522,18 @@ mod tests {
     }
 
     fn handshake_complete_shared() -> Arc<ConnectionShared> {
-        let shared = ConnectionShared::new(ConnectionConfig::default());
+        handshake_complete_shared_with_config(ConnectionConfig::default())
+    }
+
+    fn handshake_complete_supervised_shared() -> Arc<ConnectionShared> {
+        handshake_complete_shared_with_config(ConnectionConfig {
+            supervisor: Some(magnetar_proto::SupervisorConfig::default()),
+            ..ConnectionConfig::default()
+        })
+    }
+
+    fn handshake_complete_shared_with_config(config: ConnectionConfig) -> Arc<ConnectionShared> {
+        let shared = ConnectionShared::new(config);
         {
             let mut conn = shared.inner.lock();
             conn.begin_handshake().expect("handshake");
@@ -1813,6 +2542,64 @@ mod tests {
                 .expect("connected");
         }
         shared
+    }
+
+    fn established_consumer_with_failed_retry(
+        shared: &Arc<ConnectionShared>,
+        topic: &str,
+    ) -> (
+        magnetar_proto::ConsumerHandle,
+        Arc<magnetar_proto::ConsumerSlot>,
+        magnetar_proto::RequestId,
+    ) {
+        let mut conn = shared.inner.lock();
+        let initial_request_id = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: topic.to_owned(),
+            subscription: "s".to_owned(),
+            ..Default::default()
+        });
+        let slot = conn.consumer(handle).expect("consumer slot").clone();
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: initial_request_id,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        magnetar_proto::encode_command(&mut frame, &success)
+            .expect("encode initial subscribe success");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("establish consumer");
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+
+        conn.reset();
+        conn.begin_handshake().expect("restart handshake");
+        let frame = handshake_response_bytes();
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("complete reconnect handshake");
+        while conn.poll_event().is_some() {}
+        let failed_request_id = conn.rebuild_consumers()[0];
+        let transient_error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: failed_request_id.0,
+                error: pb::ServerError::ConsumerBusy as i32,
+                message: "retry later".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        magnetar_proto::encode_command(&mut frame, &transient_error)
+            .expect("encode transient error");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("schedule established retry");
+        assert!(conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
+        let _ = conn.poll_transmit();
+        (handle, slot, failed_request_id)
     }
 
     const XOR_KEY: u8 = 0x5A;
@@ -2318,8 +3105,6 @@ mod tests {
         use std::future::Future as _;
         use std::task::{Context, Poll};
 
-        use magnetar_proto::types::ConsumerHandle;
-
         let providers = TokioProviders::new();
         let engine = MoonpoolEngine::new(providers);
         let _fut_client =
@@ -2330,11 +3115,13 @@ mod tests {
 
         // Moonpool 0.8 drives `SimProviders` workloads on its own executor.
         // Subscribe readiness must park without spawning a Tokio helper task.
-        let pending_shared = ConnectionShared::new(ConnectionConfig::default());
-        let mut future = Box::pin(super::wait_subscribe_acked(
-            &pending_shared,
-            ConsumerHandle(0),
-        ));
+        let pending_shared = handshake_complete_shared();
+        let pending_handle = pending_shared.inner.lock().subscribe(SubscribeRequest {
+            topic: "persistent://public/default/sub-ready-pending".to_owned(),
+            subscription: "s-pending".to_owned(),
+            ..Default::default()
+        });
+        let mut future = Box::pin(super::wait_subscribe_acked(&pending_shared, pending_handle));
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -2628,9 +3415,9 @@ mod tests {
     /// rejects a subscribe with a PERMANENT `CommandError` (e.g.
     /// `AuthorizationError`), the moonpool engine's subscribe waiter must surface
     /// a `ClientError::Broker` rather than parking on the driver waker forever.
-    /// Mirrors the proto-level permanent-failure test. Transient codes
-    /// (`ServiceNotReady` / `MetadataError` / `TopicNotFound`) hit the retry path
-    /// instead.
+    /// Mirrors the proto-level permanent-failure test. Retryable codes such as
+    /// `ServiceNotReady`, `MetadataError`, and `PersistenceError` hit the retry
+    /// path instead; `TopicNotFound` is terminal under ADR-0080.
     #[tokio::test(flavor = "current_thread")]
     async fn subscribe_acked_fut_surfaces_broker_error() {
         use std::time::Duration;
@@ -2672,12 +3459,16 @@ mod tests {
                 .expect("handle CommandError");
         }
 
-        let res = tokio::time::timeout(
-            Duration::from_secs(2),
-            super::wait_subscribe_acked(&shared, handle),
-        )
-        .await
-        .expect("subscribe-acked future must resolve (regression: previously hung)");
+        let fut = super::SubscribeAckedFut {
+            shared: shared.clone(),
+            handle,
+            accept_prior_attachment: false,
+            expected_waiter_id: None,
+            notification: None,
+        };
+        let res = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("subscribe-acked future must resolve (regression: previously hung)");
         match res {
             Err(crate::ClientError::Broker { code, message }) => {
                 assert_eq!(code, pb::ServerError::AuthorizationError as i32);
@@ -3182,6 +3973,386 @@ mod tests {
                 .expect("unsubscribe must resolve on CommandSuccess");
             inj.await.expect("injector completes");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_unsubscribe_cancels_established_retry_generation() {
+        let shared = handshake_complete_shared();
+        let (handle, slot, failed_request_id) = {
+            let mut conn = shared.inner.lock();
+            let initial_request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/unsubscribe-cancels-retry".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            });
+            let slot = conn.consumer(handle).expect("consumer slot").clone();
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id: initial_request_id,
+                    schema: None,
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            magnetar_proto::encode_command(&mut frame, &success)
+                .expect("encode initial subscribe success");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish consumer");
+            assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+            while conn.poll_event().is_some() {}
+
+            conn.reset();
+            conn.begin_handshake().expect("restart handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect handshake");
+            while conn.poll_event().is_some() {}
+            let failed_request_id = conn.rebuild_consumers()[0];
+            let transient_error = pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: failed_request_id.0,
+                    error: pb::ServerError::ConsumerBusy as i32,
+                    message: "retry later".to_owned(),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            magnetar_proto::encode_command(&mut frame, &transient_error)
+                .expect("encode transient error");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("schedule established retry");
+            assert!(conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
+            let _ = conn.poll_transmit();
+            (handle, slot, failed_request_id)
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        assert!(Arc::ptr_eq(&consumer.slot, &slot));
+
+        let unsubscribe_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let injector_shared = shared.clone();
+        let injector =
+            tokio::spawn(async move {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                    if injector_shared.inner.lock().has_pending_request_for_test(
+                        magnetar_proto::RequestId(unsubscribe_request_id),
+                    ) {
+                        let (late_retry, mut outbound) = {
+                            let mut conn = injector_shared.inner.lock();
+                            let late_retry =
+                                conn.retry_consumer_subscribe_if_current(handle, failed_request_id);
+                            (late_retry, conn.poll_transmit())
+                        };
+                        let mut saw_unsubscribe = false;
+                        let mut saw_subscribe = false;
+                        while !outbound.is_empty() {
+                            let frame = decode_one(&mut outbound).expect("decode staged command");
+                            saw_unsubscribe |=
+                                frame.command.r#type == pb::base_command::Type::Unsubscribe as i32;
+                            saw_subscribe |=
+                                frame.command.r#type == pb::base_command::Type::Subscribe as i32;
+                        }
+                        let success = pb::BaseCommand {
+                            r#type: pb::base_command::Type::Success as i32,
+                            success: Some(pb::CommandSuccess {
+                                request_id: unsubscribe_request_id,
+                                schema: None,
+                            }),
+                            ..Default::default()
+                        };
+                        let mut frame = BytesMut::new();
+                        magnetar_proto::encode_command(&mut frame, &success)
+                            .expect("encode unsubscribe success");
+                        injector_shared
+                            .inner
+                            .lock()
+                            .handle_bytes(Instant::now(), &frame)
+                            .expect("handle unsubscribe success");
+                        return (late_retry, saw_unsubscribe, saw_subscribe);
+                    }
+                }
+                panic!("pending unsubscribe request never registered");
+            });
+
+        consumer
+            .unsubscribe(false)
+            .await
+            .expect("unsubscribe must resolve on CommandSuccess");
+        let (late_retry, saw_unsubscribe, saw_subscribe) =
+            injector.await.expect("injector completes");
+
+        assert!(saw_unsubscribe, "unsubscribe command must be staged");
+        assert_eq!(
+            late_retry, None,
+            "an in-flight unsubscribe must invalidate the retry generation"
+        );
+        assert!(
+            !saw_subscribe,
+            "no CommandSubscribe may be staged after CommandUnsubscribe"
+        );
+
+        assert!(
+            consumer.is_closed(),
+            "unsubscribe must close the local handle"
+        );
+        let mut conn = shared.inner.lock();
+        assert!(!conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
+        assert_eq!(
+            conn.retry_consumer_subscribe_if_current(handle, failed_request_id),
+            None,
+            "a detached retry must not recreate the deleted subscription"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_unsubscribe_restores_established_retry_generation() {
+        let shared = handshake_complete_shared();
+        let (handle, slot, failed_request_id) = established_consumer_with_failed_retry(
+            &shared,
+            "persistent://public/default/unsubscribe-restores-retry",
+        );
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        assert!(Arc::ptr_eq(&consumer.slot, &slot));
+
+        let unsubscribe_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let injector_shared = shared.clone();
+        let injector =
+            tokio::spawn(async move {
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                    if injector_shared.inner.lock().has_pending_request_for_test(
+                        magnetar_proto::RequestId(unsubscribe_request_id),
+                    ) {
+                        let late_retry = injector_shared
+                            .inner
+                            .lock()
+                            .retry_consumer_subscribe_if_current(handle, failed_request_id);
+                        let error = pb::BaseCommand {
+                            r#type: pb::base_command::Type::Error as i32,
+                            error: Some(pb::CommandError {
+                                request_id: unsubscribe_request_id,
+                                error: pb::ServerError::MetadataError as i32,
+                                message: "unsubscribe rejected".to_owned(),
+                            }),
+                            ..Default::default()
+                        };
+                        let mut frame = BytesMut::new();
+                        magnetar_proto::encode_command(&mut frame, &error)
+                            .expect("encode unsubscribe error");
+                        injector_shared
+                            .inner
+                            .lock()
+                            .handle_bytes(Instant::now(), &frame)
+                            .expect("handle unsubscribe error");
+                        return late_retry;
+                    }
+                }
+                panic!("pending unsubscribe request never registered");
+            });
+
+        let result = consumer.unsubscribe(false).await;
+        let late_retry = injector.await.expect("injector completes");
+
+        assert!(matches!(
+            result,
+            Err(ClientError::Broker { code, .. })
+                if code == pb::ServerError::MetadataError as i32
+        ));
+        assert_eq!(late_retry, None);
+        assert!(
+            !consumer.is_closed(),
+            "a rejected unsubscribe must restore the consumer to a usable state"
+        );
+        let mut outbound = shared.inner.lock().poll_transmit();
+        let mut saw_subscribe = false;
+        while !outbound.is_empty() {
+            let frame = decode_one(&mut outbound).expect("decode recovery command");
+            saw_subscribe |= frame.command.r#type == pb::base_command::Type::Subscribe as i32;
+        }
+        assert!(
+            saw_subscribe,
+            "unsubscribe rejection must re-arm the interrupted attachment"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_unsubscribe_future_does_not_suspend_established_retry() {
+        let shared = handshake_complete_shared();
+        let (handle, slot, failed_request_id) = established_consumer_with_failed_retry(
+            &shared,
+            "persistent://public/default/dropped-unsubscribe-restores-retry",
+        );
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        assert!(Arc::ptr_eq(&consumer.slot, &slot));
+        let unsubscribe_request_id = shared.inner.lock().peek_next_request_id_for_test();
+
+        let task_consumer = consumer.clone();
+        let task = tokio::spawn(async move { task_consumer.unsubscribe(false).await });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(unsubscribe_request_id))
+            {
+                break;
+            }
+        }
+        assert!(
+            shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(unsubscribe_request_id)),
+            "unsubscribe request must be pending before cancellation"
+        );
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("unsubscribe task must be cancelled")
+                .is_cancelled()
+        );
+
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: unsubscribe_request_id,
+                error: pb::ServerError::MetadataError as i32,
+                message: "unsubscribe rejected after waiter cancellation".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        magnetar_proto::encode_command(&mut frame, &error).expect("encode unsubscribe error");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle unsubscribe error");
+
+        let mut conn = shared.inner.lock();
+        let resumed_request_id =
+            magnetar_proto::RequestId(conn.peek_next_request_id_for_test() - 1);
+        assert_ne!(resumed_request_id, failed_request_id);
+        assert!(conn.consumer_subscribe_retry_is_current(handle, resumed_request_id));
+        let mut outbound = conn.poll_transmit();
+        let mut saw_subscribe = false;
+        while !outbound.is_empty() {
+            let frame = decode_one(&mut outbound).expect("decode recovery command");
+            saw_subscribe |= frame.command.r#type == pb::base_command::Type::Subscribe as i32;
+        }
+        assert!(
+            saw_subscribe,
+            "broker rejection must restore retry ownership even without a waiter"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_response_before_cancellation_does_not_leak_outcome() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/unsubscribe-response-cancel-race".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let unsubscribe_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let task = tokio::spawn(async move { consumer.unsubscribe(false).await });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(unsubscribe_request_id))
+            {
+                break;
+            }
+        }
+
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: unsubscribe_request_id,
+                error: pb::ServerError::MetadataError as i32,
+                message: "unsubscribe rejected before waiter cancellation".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        magnetar_proto::encode_command(&mut frame, &error).expect("encode unsubscribe error");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle unsubscribe error");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("unsubscribe task must be cancelled")
+                .is_cancelled()
+        );
+
+        assert!(
+            shared
+                .inner
+                .lock()
+                .take_outcome(magnetar_proto::PendingOpKey::Request(
+                    magnetar_proto::RequestId(unsubscribe_request_id)
+                ))
+                .is_none(),
+            "response-before-cancellation must not leave an undrainable outcome"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlapping_unsubscribe_is_rejected_without_staging_a_second_request() {
+        let shared = handshake_complete_shared();
+        let handle = {
+            let mut conn = shared.inner.lock();
+            conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/overlapping-unsubscribe".to_owned(),
+                subscription: "s".to_owned(),
+                ..Default::default()
+            })
+        };
+        let consumer: Consumer<TokioProviders> = make_consumer(shared.clone(), handle);
+        let first_request_id = shared.inner.lock().peek_next_request_id_for_test();
+        let first_consumer = consumer.clone();
+        let first = tokio::spawn(async move { first_consumer.unsubscribe(false).await });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(magnetar_proto::RequestId(first_request_id))
+            {
+                break;
+            }
+        }
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            consumer.unsubscribe(false),
+        )
+        .await
+        .expect("overlapping unsubscribe must fail immediately");
+        assert!(matches!(
+            second,
+            Err(ClientError::Other(message)) if message == "unsubscribe already in progress"
+        ));
+        assert_eq!(
+            shared.inner.lock().peek_next_request_id_for_test(),
+            first_request_id + 1,
+            "rejected overlap must not allocate or stage a second request"
+        );
+
+        first.abort();
+        let _ = first.await;
     }
 
     #[tokio::test(flavor = "current_thread")]

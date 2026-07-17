@@ -1,6 +1,6 @@
 # ADR-0069 — Bounded transient producer-open / subscribe retry + recoverable-vs-terminal receive gating
 
-- **Status**: Accepted
+- **Status**: Accepted; fixed retry policy superseded by ADR-0080, receive gating retained
 - **Date**: 2026-06-22
 - **Decider**: Florentin Dubois
 - **Tags**: reconnect, resilience, runtime, sans-io
@@ -27,6 +27,9 @@ For consumers, a given-up retry left `available_permits = 0`, so `receive()` blo
 The two fixes interlock: #302 introduces a genuine terminal-failure surface, and #299's receive guard must let that terminal surface through while re-parking during a recoverable reconnect window.
 
 ## Decision
+
+> The fixed retry count, backoff, and error classification in §1 describe the historical ADR-0069 implementation and are superseded by ADR-0080.
+> The terminal failure surfaces in §2 and recoverable receive gating in §3 remain binding.
 
 ### 1. Bounded transient-open retry with a per-handle attempt counter (sans-io)
 

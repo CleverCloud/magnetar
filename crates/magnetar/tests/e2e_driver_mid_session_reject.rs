@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use magnetar::proto::pb::command_subscribe::{InitialPosition, SubType};
-use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
+use magnetar::{OperationRetryConfig, OutgoingMessage, PulsarClient, SupervisorConfig};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -291,14 +291,19 @@ async fn e2e_client_survives_malformed_mid_session_frame() -> Result<(), Box<dyn
 /// (correlated with the open's `request_id`) straight back to the client — the
 /// "bundle not served, please redo the lookup" disposition. The real broker
 /// never sees the open, so the bundle is never served and the client's bounded
-/// transient-retry loop spins until the proto budget
-/// (`MAX_TRANSIENT_OPEN_RETRIES`) is exhausted and the open is terminalized.
+/// transient-retry loop spins until its configured retry count is exhausted
+/// and the open is terminalized.
 ///
 /// The client writer is shared behind an `Arc<Mutex<...>>` so BOTH directions
 /// can write to the client: the broker→client copy forwards real broker frames,
 /// and the client→broker parser forges the transient error directly to the
 /// client for each open it swallows.
-async fn splice_with_producer_open_poison(inbound: TcpStream, outbound: TcpStream) {
+async fn splice_with_producer_open_poison(
+    inbound: TcpStream,
+    outbound: TcpStream,
+    reject_all: bool,
+    rejected_once: Arc<AtomicBool>,
+) {
     use std::sync::Arc;
 
     use bytes::BytesMut;
@@ -347,13 +352,22 @@ async fn splice_with_producer_open_poison(inbound: TcpStream, outbound: TcpStrea
                 if let (Ok(pb::base_command::Type::Producer), Some(p)) = (
                     pb::base_command::Type::try_from(frame.command.r#type),
                     frame.command.producer.as_ref(),
-                ) {
+                ) && (reject_all || !rejected_once.swap(true, Ordering::SeqCst))
+                {
                     let err = pb::BaseCommand {
                         r#type: pb::base_command::Type::Error as i32,
                         error: Some(pb::CommandError {
                             request_id: p.request_id,
-                            error: pb::ServerError::ServiceNotReady as i32,
-                            message: "bundle not served; please redo the lookup".to_owned(),
+                            error: if reject_all {
+                                pb::ServerError::ServiceNotReady as i32
+                            } else {
+                                pb::ServerError::ProducerBusy as i32
+                            },
+                            message: if reject_all {
+                                "bundle not served; please redo the lookup".to_owned()
+                            } else {
+                                "producer owner is moving".to_owned()
+                            },
                         }),
                         ..Default::default()
                     };
@@ -387,20 +401,24 @@ async fn splice_with_producer_open_poison(inbound: TcpStream, outbound: TcpStrea
 async fn spawn_producer_open_poison_gate(
     broker_host: String,
     broker_port: u16,
+    reject_all: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let gate_addr = listener.local_addr()?;
+    let rejected_once = Arc::new(AtomicBool::new(false));
     tokio::spawn(async move {
         loop {
             let Ok((inbound, _peer)) = listener.accept().await else {
                 return;
             };
             let host = broker_host.clone();
+            let rejected_once = rejected_once.clone();
             tokio::spawn(async move {
                 let Ok(outbound) = TcpStream::connect((host.as_str(), broker_port)).await else {
                     return;
                 };
-                splice_with_producer_open_poison(inbound, outbound).await;
+                splice_with_producer_open_poison(inbound, outbound, reject_all, rejected_once)
+                    .await;
             });
         }
     });
@@ -417,7 +435,7 @@ async fn spawn_producer_open_poison_gate(
 async fn e2e_producer_open_gives_up_with_error_when_bundle_never_served()
 -> Result<(), Box<dyn std::error::Error>> {
     let (broker_host, broker_port, _container) = start_pulsar().await?;
-    let gate_host_port = spawn_producer_open_poison_gate(broker_host, broker_port).await?;
+    let gate_host_port = spawn_producer_open_poison_gate(broker_host, broker_port, true).await?;
     let service_url = format!("pulsar://{gate_host_port}");
 
     let client = tokio::time::timeout(
@@ -425,19 +443,23 @@ async fn e2e_producer_open_gives_up_with_error_when_bundle_never_served()
         PulsarClient::builder()
             .service_url(service_url)
             .enable_reconnect(SupervisorConfig::default())
+            .operation_timeout(Duration::from_secs(10))
+            .operation_retry(OperationRetryConfig {
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+                max_retries: Some(2),
+            })
             .build(),
     )
     .await
     .expect("client build must not exceed the test guard")
     .expect("client must connect through the gate");
 
-    // The open must RESOLVE with Err, not hang. The bounded retry loop spins
-    // through the gate's transient rejects, then the proto budget terminalizes
-    // the open. Each retry also performs a broker lookup; slow CI runners can
-    // push the bounded window past two minutes, so the outer timeout is only the
-    // anti-hang backstop, not the expected duration.
+    // The open must RESOLVE with Err, not hang. The configured retry loop spins
+    // through the gate's transient rejects, then the client-owned budget ends
+    // the open.
     let topic = "persistent://public/default/magnetar-e2e-giveup-302";
-    let result = tokio::time::timeout(Duration::from_mins(4), client.producer(topic).create())
+    let result = tokio::time::timeout(Duration::from_secs(15), client.producer(topic).create())
         .await
         .expect("open_producer must RESOLVE (with Err) after the transient give-up, not hang");
     assert!(
@@ -446,6 +468,43 @@ async fn e2e_producer_open_gives_up_with_error_when_bundle_never_served()
          (issue #302); got {result:?}"
     );
 
+    client.close().await;
+    Ok(())
+}
+
+/// Issue #343 end-to-end: the gate rejects only the first producer-open with
+/// `ProducerBusy`, then forwards the configured retry to the real broker.
+/// The public builder policy must turn that transient reply into a delayed
+/// success instead of surfacing the first error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_operation_retry_recovers_first_producer_open_rejection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (broker_host, broker_port, _container) = start_pulsar().await?;
+    let gate_host_port = spawn_producer_open_poison_gate(broker_host, broker_port, false).await?;
+    let service_url = format!("pulsar://{gate_host_port}");
+
+    let client = tokio::time::timeout(
+        Duration::from_secs(40),
+        PulsarClient::builder()
+            .service_url(service_url)
+            .operation_timeout(Duration::from_secs(10))
+            .operation_retry(OperationRetryConfig {
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+                max_retries: Some(1),
+            })
+            .build(),
+    )
+    .await
+    .expect("client build must not exceed the test guard")
+    .expect("client must connect through the gate");
+
+    let topic = "persistent://public/default/magnetar-e2e-operation-retry-343";
+    let producer = tokio::time::timeout(Duration::from_secs(20), client.producer(topic).create())
+        .await
+        .expect("producer create must remain bounded")
+        .expect("the retry after ProducerBusy must reach the real broker");
+    producer.close().await?;
     client.close().await;
     Ok(())
 }

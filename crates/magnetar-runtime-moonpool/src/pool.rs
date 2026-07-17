@@ -69,6 +69,9 @@ pub(crate) struct ConnectionFactory<P: Providers> {
     /// Template `ConnectionConfig`. Cloned per entry; `proxy_to_broker_url`
     /// is overwritten with the logical broker URL before handshake.
     pub(crate) bootstrap_config: ConnectionConfig,
+    /// Runtime-owned operation retry policy, separate from the public
+    /// `ConnectionConfig` source-compatible surface.
+    pub(crate) operation_retry: Arc<Mutex<magnetar_proto::OperationRetryConfig>>,
     /// Moonpool providers — the pool re-uses them to spawn the per-entry
     /// supervised driver. `Providers` is `Clone` so a fresh snapshot per
     /// entry is cheap.
@@ -214,6 +217,12 @@ pub(crate) struct ProxyConnectionPool<P: Providers> {
     entries: Mutex<HashMap<PoolKey, Arc<EntryState>>>,
 }
 
+impl<P: Providers> ProxyConnectionPool<P> {
+    pub(crate) fn set_operation_retry_config(&self, config: magnetar_proto::OperationRetryConfig) {
+        *self.factory.operation_retry.lock() = config;
+    }
+}
+
 impl<P: Providers> std::fmt::Debug for ProxyConnectionPool<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snapshot: Vec<_> = self.entries.lock().keys().cloned().collect();
@@ -327,13 +336,17 @@ pub(crate) async fn get_or_open<P>(
 where
     P: Providers + Send + Sync,
 {
+    if pool.closed.load(Ordering::Acquire) {
+        return Err(pool_closed_error());
+    }
+
     let key: PoolKey = (logical.to_owned(), physical.to_owned(), index);
 
     // Fast path or race-resolution decision under the lock.
     let pending = {
         let mut entries = pool.entries.lock();
         if pool.closed.load(Ordering::Acquire) {
-            return Err(EngineError::PeerClosed);
+            return Err(pool_closed_error());
         }
         if let Some(state) = entries.get(&key).cloned() {
             match &*state {
@@ -566,6 +579,10 @@ async fn build_entry_async<P: Providers>(
     .await?;
 
     let shared = make_shared_with_providers::<P>(&factory.providers, cfg);
+    shared
+        .inner
+        .lock()
+        .set_operation_retry_config(factory.operation_retry.lock().clone());
     // `None` — the spawned task wraps this whole build in the single
     // provider-owned operation timeout, so handshake reads remain bounded
     // without arming a second timer inside `handshake_plain`.
@@ -588,6 +605,10 @@ async fn build_entry_async<P: Providers>(
         spawn_supervised_driver::<P>(shared.clone(), transport, ctx, factory.providers.clone());
 
     Ok((shared, driver))
+}
+
+fn pool_closed_error() -> EngineError {
+    EngineError::Config("connection pool is closed".to_owned())
 }
 
 /// `EngineError` is not `Clone` (it carries `io::Error` which isn't either),
@@ -630,6 +651,7 @@ mod tests {
                 operation_timeout: Duration::from_secs(30),
                 ..ConnectionConfig::default()
             },
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
             providers: TokioProviders::new(),
             service_url_provider: None,
             dns_resolver: None,

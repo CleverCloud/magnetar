@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use super::{
     BrokerMetadataApi, ConsumerApi, CreateProducerApi, Engine, MessageDecryptorApi,
-    MessageEncryptorApi, ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi,
-    TopicListChange, TransactionApi, WatchTopicListFut,
+    MessageEncryptorApi, OperationDeadline, ProducerApi, ReceiveBatchFut, ReceiveOptFut,
+    SubscribeApi, TopicListChange, TransactionApi, WatchTopicListFut,
 };
 
 /// Zero-sized marker for the tokio production engine. Default `E` on
@@ -136,6 +136,26 @@ impl BrokerMetadataApi for magnetar_runtime_tokio::Client {
         ))
     }
 
+    fn new_metadata_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::new(magnetar_runtime_tokio::Client::operation_timer(self))
+    }
+
+    fn partitioned_topic_metadata_with_deadline<'a>(
+        &'a self,
+        topic: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_tokio::Client::partitioned_topic_metadata_with_operation_deadline(
+                self,
+                topic,
+                timer,
+                last_broker_error,
+            ),
+        )
+    }
+
     fn watch_topic_list<'a>(
         &'a self,
         namespace: &'a str,
@@ -144,6 +164,24 @@ impl BrokerMetadataApi for magnetar_runtime_tokio::Client {
         Box::pin(magnetar_runtime_tokio::Client::watch_topic_list(
             self, namespace, pattern,
         ))
+    }
+
+    fn watch_topic_list_with_deadline<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+        deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListFut<'a, Self> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_tokio::Client::watch_topic_list_with_operation_deadline(
+                self,
+                namespace,
+                pattern,
+                timer,
+                last_broker_error,
+            ),
+        )
     }
 
     fn poll_topic_list_change(&self) -> Option<TopicListChange> {
@@ -164,6 +202,27 @@ impl SubscribeApi for magnetar_runtime_tokio::Client {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Consumer, Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_tokio::Client::subscribe(self, req))
     }
+
+    fn new_subscribe_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::new(magnetar_runtime_tokio::Client::operation_timer(self))
+    }
+
+    fn subscribe_with_deadline<'a>(
+        &'a self,
+        req: magnetar_proto::SubscribeRequest,
+        deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Consumer, Self::Error>> + Send + 'a>> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_tokio::Client::subscribe_with_operation_deadline(
+                self,
+                req,
+                None,
+                timer,
+                last_broker_error,
+            ),
+        )
+    }
 }
 
 impl CreateProducerApi for magnetar_runtime_tokio::Client {
@@ -175,6 +234,27 @@ impl CreateProducerApi for magnetar_runtime_tokio::Client {
         req: magnetar_proto::CreateProducerRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Producer, Self::Error>> + Send + '_>> {
         Box::pin(magnetar_runtime_tokio::Client::open_producer(self, req))
+    }
+
+    fn new_producer_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::new(magnetar_runtime_tokio::Client::operation_timer(self))
+    }
+
+    fn open_producer_with_deadline<'a>(
+        &'a self,
+        req: magnetar_proto::CreateProducerRequest,
+        deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Producer, Self::Error>> + Send + 'a>> {
+        let (timer, last_broker_error) = deadline.parts();
+        Box::pin(
+            magnetar_runtime_tokio::Client::open_producer_with_operation_deadline(
+                self,
+                req,
+                None,
+                timer,
+                last_broker_error,
+            ),
+        )
     }
 }
 

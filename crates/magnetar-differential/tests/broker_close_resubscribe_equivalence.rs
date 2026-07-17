@@ -161,6 +161,10 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
     let handle: ConsumerHandle = conn.subscribe(req);
     feed_success(conn, subscribe_rid, t0);
     let _ = conn.poll_event();
+    assert!(
+        conn.consume_initial_consumer_subscribe_completion(handle),
+        "initial subscribe waiter completion must be consumed before exercising transparent re-attachment"
+    );
 
     // Arm the initial flow so the consumer holds permits — the running, active
     // state the broker close hits in production.

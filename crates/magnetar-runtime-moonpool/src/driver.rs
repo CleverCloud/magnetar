@@ -55,7 +55,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use magnetar_proto::{ConnectionEvent, ConsumerHandle, OpOutcome, PendingOpKey, ProducerHandle};
+use magnetar_proto::{
+    ConnectionEvent, ConsumerHandle, DriverRetry, OpOutcome, PendingOpKey, ProducerHandle,
+    RequestId,
+};
 use moonpool_core::{Providers, TaskProvider, TimeProvider};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -73,15 +76,6 @@ const READ_BUFFER_CAPACITY: usize = 64 * 1024;
 /// receipt path a chance to run.
 const DRIVER_WRITE_BUDGET_BYTES: usize = 256 * 1024;
 
-/// Initial delay before the FIRST transient producer-open / subscribe retry
-/// leg re-issues its lookup, mirroring the tokio engine's same initial sleep
-/// (`magnetar-runtime-tokio/src/driver.rs`). [`transient_retry_delay`] seeds a
-/// [`magnetar_proto::Backoff`] from this value and doubles it on each repeated
-/// transient rejection (issue #302). Scheduled through the injected
-/// [`TimeProvider`] — never a host clock — so under `SimProviders` the retry
-/// fires at a deterministic point in virtual time (ADR-0011).
-const TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(2);
-
 /// A transient broker rejection that the driver must answer with a delayed
 /// lookup-then-retry leg. Drained out of [`handle_pending_events`] (which is
 /// non-generic and has no provider access) so the generic
@@ -93,10 +87,10 @@ const TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(2);
 enum RetryRequest {
     /// The broker bounced a `CommandProducer` with a transient code; re-run
     /// lookup, then [`magnetar_proto::Connection::retry_producer_open`].
-    Producer(ProducerHandle),
+    Producer(ProducerHandle, RequestId),
     /// The broker bounced a `CommandSubscribe` with a transient code; re-run
     /// lookup, then [`magnetar_proto::Connection::retry_consumer_subscribe`].
-    Consumer(ConsumerHandle),
+    Consumer(ConsumerHandle, RequestId),
 }
 
 /// Drain the connection's semantic event queue of events the *driver* must
@@ -122,6 +116,39 @@ fn handle_pending_events(
     shared: &Arc<ConnectionShared>,
     retries: &mut Vec<RetryRequest>,
 ) -> Result<(), EngineError> {
+    while let Some(retry) = shared.inner.lock().poll_driver_retry() {
+        match retry {
+            DriverRetry::Producer {
+                handle,
+                failed_request_id,
+                code,
+                message,
+            } => {
+                tracing::warn!(
+                    ?handle,
+                    code,
+                    message = crate::log_fields::truncate_broker_str(&message),
+                    "producer-open transient error; scheduling lookup + retry"
+                );
+                retries.push(RetryRequest::Producer(handle, failed_request_id));
+            }
+            DriverRetry::Consumer {
+                handle,
+                failed_request_id,
+                code,
+                message,
+            } => {
+                tracing::warn!(
+                    ?handle,
+                    code,
+                    message = crate::log_fields::truncate_broker_str(&message),
+                    "consumer-subscribe transient error; scheduling lookup + retry"
+                );
+                retries.push(RetryRequest::Consumer(handle, failed_request_id));
+            }
+            _ => {}
+        }
+    }
     loop {
         let event = shared.inner.lock().poll_event_if(|ev| {
             #[cfg(feature = "scalable-topics")]
@@ -140,8 +167,6 @@ fn handle_pending_events(
                     | ConnectionEvent::TopicListChanged { .. }
                     | ConnectionEvent::TopicMigrated { .. }
                     | ConnectionEvent::RedirectUrlRejected { .. }
-                    | ConnectionEvent::ProducerOpenFailedTransient { .. }
-                    | ConnectionEvent::SubscribeFailedTransient { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
                     | ConnectionEvent::ChecksumMismatch { .. }
                     | ConnectionEvent::LookupResponse {
@@ -274,52 +299,6 @@ fn handle_pending_events(
                     "PIP-188: broker requested topic migration; resetting connection".to_owned(),
                 ));
             }
-            ConnectionEvent::ProducerOpenFailedTransient {
-                handle,
-                code,
-                message,
-            } => {
-                // Broker bounced the `CommandProducer` with a transient code
-                // (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) — the
-                // typical post-`docker restart` window where the namespace
-                // bundle hasn't been re-acquired yet. Pulsar's recommended
-                // recovery is "Please redo the lookup": a fresh
-                // `CommandLookupTopic` makes the broker (re)acquire bundle
-                // ownership, after which the `CommandProducer` retry succeeds.
-                // The producer state is RETAINED by the proto layer, so the
-                // user's open / send futures stay pending across the retry.
-                // Mirror of the tokio driver.
-                //
-                // `warn!` per ADR-0054 §2.1: degraded-but-recovering background
-                // retry, not surfaced as `Err` to any caller while it retries.
-                // The broker `message` is hostile-peer-controlled, so it is
-                // truncated before landing in the field (ADR-0054 broker-string
-                // sanitisation).
-                tracing::warn!(
-                    ?handle,
-                    code,
-                    message = crate::log_fields::truncate_broker_str(&message),
-                    "producer-open transient error; scheduling lookup + retry"
-                );
-                retries.push(RetryRequest::Producer(handle));
-            }
-            ConnectionEvent::SubscribeFailedTransient {
-                handle,
-                code,
-                message,
-            } => {
-                // Consumer-side companion to the producer-open transient arm
-                // above. `warn!` per ADR-0054 §2.1 (same level rule); the
-                // broker `message` is truncated (ADR-0054). Mirror of the tokio
-                // driver.
-                tracing::warn!(
-                    ?handle,
-                    code,
-                    message = crate::log_fields::truncate_broker_str(&message),
-                    "consumer-subscribe transient error; scheduling lookup + retry"
-                );
-                retries.push(RetryRequest::Consumer(handle));
-            }
             // PIP-460 (ADR-0031): mirror the tokio driver's scalable-event
             // drain into the per-client buffer + wake `next_scalable_event`.
             #[cfg(feature = "scalable-topics")]
@@ -401,9 +380,8 @@ fn handle_pending_events(
 }
 
 /// Dispatch one [`RetryRequest`] as a detached task on the engine's
-/// [`TaskProvider`]. The task sleeps `TRANSIENT_RETRY_DELAY` on the injected
-/// [`TimeProvider`] (NEVER a host clock — the whole point of routing through
-/// the provider is determinism under `SimProviders`, ADR-0011), re-runs
+/// [`TaskProvider`]. The task sleeps for the configured operation-retry delay
+/// on the injected [`TimeProvider`] (never a host clock), re-runs
 /// lookup so the broker re-acquires bundle ownership, then calls the proto
 /// targeted-retry API (`retry_producer_open` / `retry_consumer_subscribe`).
 ///
@@ -422,48 +400,65 @@ fn spawn_retry_leg<P>(
     let shared = shared.clone();
     let time = time.clone();
     let _detached = task.spawn_task("magnetar-moonpool-transient-retry", async move {
-        // Exponential backoff sized off the proto-tracked attempt counter
-        // (issue #302) — 1:1 with the tokio engine's `transient_retry_delay`
-        // (ADR-0024). The pre-fix code slept a fixed `TRANSIENT_RETRY_DELAY` on
-        // the single attempt it made before giving up forever. The sleep MUST
-        // run on the INJECTED `time` provider (never a host clock) so the retry
-        // fires at a deterministic point in virtual time (ADR-0011). The proto
-        // layer terminalizes the open / subscribe once the counter crosses
-        // `MAX_TRANSIENT_OPEN_RETRIES`, waking the parked send / receive.
-        let attempts = {
+        let delay = {
             let conn = shared.inner.lock();
-            match req {
-                RetryRequest::Producer(handle) => conn.producer_transient_open_attempts(handle),
-                RetryRequest::Consumer(handle) => {
+            let failures = match req {
+                RetryRequest::Producer(handle, _) => conn.producer_transient_open_attempts(handle),
+                RetryRequest::Consumer(handle, _) => {
                     conn.consumer_transient_subscribe_attempts(handle)
                 }
-            }
+            };
+            conn.operation_retry_config().delay_after_failure(failures)
         };
-        let _ = time.sleep(transient_retry_delay(attempts)).await;
-        let topic = {
-            let conn = shared.inner.lock();
-            match req {
-                RetryRequest::Producer(handle) => conn.producer_topic(handle).map(str::to_owned),
-                RetryRequest::Consumer(handle) => conn.consumer_topic(handle).map(str::to_owned),
-            }
-        };
+        if !wait_retry_delay(&shared, &time, req, delay).await {
+            return;
+        }
+        let topic = retry_request_topic(&shared.inner.lock(), req);
         // The handle was closed / removed between the broker error and this
         // retry — nothing to re-attach.
         let Some(topic) = topic else { return };
-        if !lookup_then(&shared, &topic).await {
+        if !lookup_then(&shared, &time, &topic, req).await {
             return;
         }
         let request_id = {
             let mut conn = shared.inner.lock();
             match req {
-                RetryRequest::Producer(handle) => conn.retry_producer_open(handle),
-                RetryRequest::Consumer(handle) => conn.retry_consumer_subscribe(handle),
+                RetryRequest::Producer(handle, failed_request_id) => {
+                    conn.retry_producer_open_if_current(handle, failed_request_id)
+                }
+                RetryRequest::Consumer(handle, failed_request_id) => {
+                    conn.retry_consumer_subscribe_if_current(handle, failed_request_id)
+                }
             }
         };
         if request_id.is_some() {
             shared.driver_waker.notify_one();
         }
     });
+}
+
+fn retry_request_topic(conn: &magnetar_proto::Connection, req: RetryRequest) -> Option<String> {
+    if !conn.is_connected() {
+        return None;
+    }
+    match req {
+        RetryRequest::Producer(handle, failed_request_id)
+            if conn.producer_open_retry_is_current(handle, failed_request_id) =>
+        {
+            conn.producer_topic(handle).map(str::to_owned)
+        }
+        RetryRequest::Consumer(handle, failed_request_id)
+            if conn.consumer_subscribe_retry_is_current(handle, failed_request_id) =>
+        {
+            conn.consumer_topic(handle).map(str::to_owned)
+        }
+        RetryRequest::Producer(_, _) | RetryRequest::Consumer(_, _) => None,
+    }
+}
+
+pub(crate) fn notify_retry_generation_replaced(shared: &Arc<ConnectionShared>) {
+    shared.operation_cancel_notify.notify_waiters();
+    shared.driver_waker.notify_one();
 }
 
 struct PendingDriverWrite {
@@ -553,66 +548,158 @@ impl PendingDriverWrite {
 }
 
 /// Issue a `CommandLookupTopic` and await the broker's
-/// `CommandLookupTopicResponse` / `CommandError`. Returns `true` when the
-/// lookup landed any outcome (the actual broker disposition is logged but
-/// ignored — the caller's next step is a `retry_*` that re-fails if the
-/// bundle is still not served). Used by the transient-error retry leg
-/// ([`spawn_retry_leg`]) to force the broker to (re)acquire namespace bundle
-/// ownership before re-attaching the producer / consumer. Mirror of the tokio
-/// engine's `lookup_then`.
+/// `CommandLookupTopicResponse` / `CommandError`. Returns `true` only after a
+/// usable `Connect` outcome. Retryable lookup failures are re-issued under the
+/// configured operation policy; a terminal failure terminalizes the opening
+/// handle with the exact broker code/message and returns `false`. Mirror of the
+/// tokio engine's `lookup_then`.
 ///
 /// Self-contained `OpOutcome` await (rather than reaching for the
 /// module-private `client::RequestFut`): the lookup request id is registered
 /// against the proto waker slab, parked on the driver waker, and unregistered
 /// on drop so a severed session leaves no dangling `Waker`.
-/// Exponential-backoff delay for the `attempts`-th transient producer-open /
-/// subscribe retry (issue #302). 1:1 with the tokio engine's
-/// `transient_retry_delay` (ADR-0024): steps a fresh
-/// [`magnetar_proto::Backoff`] `attempts` times so each successive transient
-/// rejection waits longer, bounded by `Backoff`'s `max`. The leg sleeps this
-/// duration on the INJECTED [`TimeProvider`] so the schedule is deterministic
-/// under `SimProviders` (ADR-0011). `attempts` is the proto-tracked counter
-/// (`1` on the first rejection); a `0` is treated as the first step.
-fn transient_retry_delay(attempts: u32) -> Duration {
-    // Seed the schedule from `TRANSIENT_RETRY_DELAY` (the pre-fix fixed delay,
-    // now the FIRST step) so attempt #1 keeps the original cadence and later
-    // attempts grow. `max` is `TRANSIENT_RETRY_DELAY * 4` (8s) so the
-    // worst-case per-attempt sleep stays bounded; the `mandatory_stop` window
-    // is left at the `Backoff` default (it is not exercised within the attempt
-    // cap). 1:1 with the tokio engine.
-    let mut backoff = magnetar_proto::Backoff::new(
-        TRANSIENT_RETRY_DELAY,
-        TRANSIENT_RETRY_DELAY.saturating_mul(4),
-        magnetar_proto::backoff::DEFAULT_MANDATORY_STOP,
-        0,
-    );
-    let mut delay = backoff.next();
-    for _ in 1..attempts {
-        delay = backoff.next();
+async fn lookup_then<T: TimeProvider>(
+    shared: &Arc<ConnectionShared>,
+    time: &T,
+    topic: &str,
+    req: RetryRequest,
+) -> bool {
+    let retry_config = shared.inner.lock().operation_retry_config().clone();
+    let mut failures = 0_u32;
+    loop {
+        let request_id = {
+            let mut conn = shared.inner.lock();
+            if retry_request_topic(&conn, req).is_none() {
+                return false;
+            }
+            conn.lookup(topic, false)
+        };
+        shared.driver_waker.notify_one();
+        let outcome_fut = LookupRetryFut {
+            shared: shared.clone(),
+            key: PendingOpKey::Request(request_id),
+        };
+        tokio::pin!(outcome_fut);
+        let outcome = loop {
+            let cancelled = shared.operation_cancel_notify.notified();
+            tokio::pin!(cancelled);
+            cancelled.as_mut().enable();
+            if retry_request_topic(&shared.inner.lock(), req).is_none() {
+                return false;
+            }
+            moonpool_core::select! {
+                biased;
+                () = cancelled.as_mut() => {}
+                outcome = outcome_fut.as_mut() => break outcome,
+            }
+        };
+        if retry_request_topic(&shared.inner.lock(), req).is_none() {
+            return false;
+        }
+        match outcome {
+            OpOutcome::LookupResponse {
+                outcome: magnetar_proto::LookupOutcome::Connect { .. },
+                ..
+            } => {
+                tracing::debug!(%topic, "retry-path lookup resolved");
+                return true;
+            }
+            OpOutcome::LookupResponse {
+                outcome: magnetar_proto::LookupOutcome::Failed { code, message },
+                ..
+            }
+            | OpOutcome::Error { code, message, .. } => {
+                failures = failures.saturating_add(1);
+                if magnetar_proto::is_retryable_broker_error(
+                    magnetar_proto::OperationKind::Lookup,
+                    code,
+                ) && retry_config.should_retry_after_failure(failures)
+                {
+                    let delay = retry_config.delay_after_failure(failures);
+                    tracing::debug!(
+                        %topic,
+                        code,
+                        failures,
+                        ?delay,
+                        "retry-path lookup rejected transiently; re-issuing"
+                    );
+                    if !wait_retry_delay(shared, time, req, delay).await {
+                        return false;
+                    }
+                    continue;
+                }
+                terminalize_retry_request(shared, req, code, &message);
+                return false;
+            }
+            OpOutcome::LookupResponse {
+                outcome: magnetar_proto::LookupOutcome::Redirected { .. },
+                ..
+            } => {
+                terminalize_retry_request(
+                    shared,
+                    req,
+                    magnetar_proto::pb::ServerError::MetadataError as i32,
+                    "retry-path lookup redirected to another broker",
+                );
+                return false;
+            }
+            other => {
+                tracing::warn!(?other, %topic, "retry-path lookup landed unexpected outcome");
+                return false;
+            }
+        }
     }
-    delay
 }
 
-async fn lookup_then(shared: &Arc<ConnectionShared>, topic: &str) -> bool {
-    let request_id = {
-        let mut conn = shared.inner.lock();
-        conn.lookup(topic, false)
-    };
-    shared.driver_waker.notify_one();
-    let outcome = LookupRetryFut {
-        shared: shared.clone(),
-        key: PendingOpKey::Request(request_id),
+async fn wait_retry_delay<T: TimeProvider>(
+    shared: &Arc<ConnectionShared>,
+    time: &T,
+    req: RetryRequest,
+    delay: std::time::Duration,
+) -> bool {
+    let sleep = time.sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        let cancelled = shared.operation_cancel_notify.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        if retry_request_topic(&shared.inner.lock(), req).is_none() {
+            return false;
+        }
+        moonpool_core::select! {
+            biased;
+            () = cancelled.as_mut() => {}
+            _ = sleep.as_mut() => {
+                return retry_request_topic(&shared.inner.lock(), req).is_some();
+            }
+        }
     }
-    .await;
-    if matches!(
-        &outcome,
-        OpOutcome::LookupResponse { .. } | OpOutcome::Error { .. }
-    ) {
-        tracing::debug!(?outcome, %topic, "retry-path lookup completed");
-        true
-    } else {
-        tracing::warn!(?outcome, %topic, "retry-path lookup landed unexpected outcome");
-        false
+}
+
+fn terminalize_retry_request(
+    shared: &Arc<ConnectionShared>,
+    req: RetryRequest,
+    code: i32,
+    message: &str,
+) {
+    let terminalized = {
+        let mut conn = shared.inner.lock();
+        if retry_request_topic(&conn, req).is_none() {
+            false
+        } else {
+            match req {
+                RetryRequest::Producer(handle, _) => {
+                    conn.fail_producer_open_with_broker_error(handle, code, message);
+                }
+                RetryRequest::Consumer(handle, _) => {
+                    conn.fail_consumer_subscribe_with_broker_error(handle, code, message);
+                }
+            }
+            true
+        }
+    };
+    if terminalized {
+        shared.driver_waker.notify_one();
     }
 }
 
@@ -648,7 +735,11 @@ impl Drop for LookupRetryFut {
     /// [`magnetar_proto::Connection::reset`]) does not leave a dangling
     /// [`core::task::Waker`] behind. Mirrors the engine's `RequestFut::drop`.
     fn drop(&mut self) {
-        self.shared.inner.lock().unregister_waker(self.key);
+        if let PendingOpKey::Request(request_id) = self.key {
+            self.shared.inner.lock().cancel_request(request_id);
+        } else {
+            self.shared.inner.lock().unregister_waker(self.key);
+        }
     }
 }
 
@@ -818,11 +909,10 @@ where
         // outcomes are already in place when a fresh op observes the latch.
         // 1:1 with the tokio engine.
         driver_shared.mark_no_driver();
-        // Wake event-stream waiters so they observe the freshly-queued
-        // `Closed` event and stop waiting.
-        driver_shared.event_notify().notify_waiters();
-        // Preserve the terminal driver wake for any runtime task that is
-        // already waiting for a final shared-state transition.
+        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
+        // park on the dedicated event waker, not the proto waker slab, so they
+        // observe the terminal connection state and stop waiting.
+        driver_shared.event_waker.notify_waiters();
         driver_shared.driver_waker.notify_waiters();
         *result_for_task.result.lock() = Some(outcome);
         // `notify_one` (not `notify_waiters`) so a `join()` that registers
@@ -888,10 +978,9 @@ where
         // entry-point guards. Set AFTER `fail_all_pending`. 1:1 with the tokio
         // engine.
         driver_shared.mark_no_driver();
-        // Wake event-stream waiters so they observe terminal slot outcomes.
-        driver_shared.event_notify().notify_waiters();
-        // Preserve the terminal driver wake for any runtime task that is
-        // already waiting for a final shared-state transition.
+        // Wake event-stream waiters (ProducerReadyFut / SubscribeAckedFut) that
+        // park on the dedicated event waker, not the proto waker slab.
+        driver_shared.event_waker.notify_waiters();
         driver_shared.driver_waker.notify_waiters();
         *result_for_task.result.lock() = Some(outcome);
         result_for_task.done.notify_one();
@@ -1160,7 +1249,7 @@ where
         shared
             .pending_rebuild
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        shared.driver_waker.notify_one();
+        notify_retry_generation_replaced(&shared);
 
         transport = new_transport;
         // ADR-0011: virtual-clock-anchored timestamp; pairs with the
@@ -1458,6 +1547,7 @@ where
                             let consumers = conn.rebuild_consumers();
                             (producers.len(), consumers.len())
                         };
+                        notify_retry_generation_replaced(&shared);
                         tracing::info!(
                             producers = n_p,
                             consumers = n_c,
@@ -1481,12 +1571,10 @@ where
                 for req in retries {
                     spawn_retry_leg::<P>(&shared, &time, &task, req);
                 }
-                // Wake application futures that parked on the dedicated event
-                // notification so they observe the freshly-pushed event.
-                shared.event_notify().notify_waiters();
-                // Preserve the existing shared-state wake for `flush()` and
-                // other observers that re-check connection state after inbound
-                // receipts. Readiness waiters no longer consume these permits.
+                // Wake event-stream-watching futures (e.g. `ProducerReadyFut`)
+                // through their dedicated event waker so they re-poll without
+                // competing with the driver for outbound-work permits.
+                shared.event_waker.notify_waiters();
                 shared.driver_waker.notify_waiters();
             }
 
@@ -1537,16 +1625,620 @@ async fn sleep_or_pending<P: Providers>(time: &P::Time, dur: Option<Duration>) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::future::Future as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
 
     use bytes::{Bytes, BytesMut};
-    use magnetar_proto::{ConnectionConfig, ConnectionEvent, ProducerHandle, encode_command, pb};
+    use magnetar_proto::types::CompressionKind;
+    use magnetar_proto::{
+        ConnectionConfig, ConnectionEvent, CreateProducerRequest, OpOutcome, OperationRetryConfig,
+        PendingOpKey, ProducerHandle, SubscribeRequest, decode_one, encode_command, pb,
+    };
+    use moonpool_core::{Providers as _, TokioProviders};
 
     use super::{
-        DRIVER_WRITE_BUDGET_BYTES, PendingDriverWrite, handle_pending_events,
-        strip_url_to_host_port,
+        DRIVER_WRITE_BUDGET_BYTES, PendingDriverWrite, RetryRequest, handle_pending_events,
+        lookup_then, notify_retry_generation_replaced, spawn_retry_leg, strip_url_to_host_port,
+        terminalize_retry_request,
     };
+    use crate::producer::Producer;
     use crate::{ConnectionShared, EngineError};
+
+    #[test]
+    fn permanent_reattachment_errors_wake_established_operation_waiters() {
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        conn.begin_handshake().expect("handshake");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode CommandConnected");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("complete handshake");
+        while conn.poll_event().is_some() {}
+
+        let producer_request_id = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/permanent-reattach-producer".to_owned(),
+            ..Default::default()
+        });
+        let producer_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id: producer_request_id,
+                producer_name: "producer".to_owned(),
+                last_sequence_id: Some(-1),
+                producer_ready: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &producer_success).expect("encode ProducerSuccess");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("establish producer");
+        while conn.poll_event().is_some() {}
+
+        let consumer_request_id = conn.peek_next_request_id_for_test();
+        let consumer = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/permanent-reattach-consumer".to_owned(),
+            subscription: "permanent-reattach".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        let subscribe_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: consumer_request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &subscribe_success).expect("encode CommandSuccess");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("establish consumer");
+        while conn.poll_event().is_some() {}
+
+        let snapshot_sequence_id = conn
+            .send(
+                producer,
+                magnetar_proto::producer::OutgoingMessage {
+                    payload: Bytes::from_static(b"before-reset"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 12,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send before reset");
+        let reset_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let reset_waker: Waker = Arc::clone(&reset_counter).into();
+        conn.register_waker(
+            PendingOpKey::Send(producer, snapshot_sequence_id),
+            reset_waker,
+        );
+        conn.reset();
+        assert_eq!(reset_counter.0.load(Ordering::SeqCst), 1);
+        let snapshot_terminal_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let snapshot_terminal_waker: Waker = Arc::clone(&snapshot_terminal_counter).into();
+        conn.register_waker(
+            PendingOpKey::Send(producer, snapshot_sequence_id),
+            snapshot_terminal_waker,
+        );
+        conn.begin_handshake().expect("re-handshake");
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode CommandConnected");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("complete reconnect handshake");
+        while conn.poll_event().is_some() {}
+        let producer_retry = conn.rebuild_producers()[0];
+        let consumer_retry = conn.rebuild_consumers()[0];
+
+        let sequence_id = conn
+            .send(
+                producer,
+                magnetar_proto::producer::OutgoingMessage {
+                    payload: Bytes::from_static(b"pending"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 7,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send during producer reattachment");
+        let send_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let send_waker: Waker = Arc::clone(&send_counter).into();
+        conn.register_waker(PendingOpKey::Send(producer, sequence_id), send_waker);
+        let receive_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let receive_waker: Waker = Arc::clone(&receive_counter).into();
+        conn.register_consumer_receive_waker(consumer, receive_waker)
+            .expect("register receive waker during consumer reattachment");
+
+        for request_id in [producer_retry, consumer_retry] {
+            let error = pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: request_id.0,
+                    error: pb::ServerError::TopicNotFound as i32,
+                    message: "topic was deleted".to_owned(),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &error).expect("encode CommandError");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle terminal reattachment error");
+        }
+
+        assert_eq!(send_counter.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, sequence_id)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+        assert_eq!(snapshot_terminal_counter.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, snapshot_sequence_id)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+        assert_eq!(receive_counter.0.load(Ordering::SeqCst), 1);
+        assert!(conn.consumer(consumer).is_some());
+        assert!(conn.consumer_handle_is_terminal(consumer));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_established_handle_cancels_blackholed_retry_lookup() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, slot, request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+            let request_id = magnetar_proto::RequestId(conn.peek_next_request_id_for_test());
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/blackholed-retry-drop".to_owned(),
+                ..Default::default()
+            });
+            let slot = conn.producer(handle).expect("producer slot").clone();
+            (handle, slot, request_id)
+        };
+        let producer = Producer::<TokioProviders>::assemble(
+            shared.clone(),
+            handle,
+            slot,
+            CompressionKind::None,
+            None,
+        );
+        let providers = TokioProviders::new();
+        let time = providers.time().clone();
+        let mut lookup = Box::pin(lookup_then(
+            &shared,
+            &time,
+            "persistent://public/default/blackholed-retry-drop",
+            RetryRequest::Producer(handle, request_id),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(lookup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        drop(producer);
+
+        let completed = tokio::time::timeout(Duration::from_millis(100), lookup)
+            .await
+            .expect("dropping the handle must wake the blackholed lookup");
+        assert!(!completed, "a closed handle must cancel its retry lookup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_established_handle_cancels_initial_retry_backoff() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, slot, failed_request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.set_operation_retry_config(OperationRetryConfig {
+                initial_backoff: Duration::from_secs(30),
+                max_backoff: Duration::from_secs(30),
+                max_retries: Some(1),
+            });
+            conn.begin_handshake().expect("begin handshake");
+            let connected = pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "magnetar-test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &connected).expect("encode CommandConnected");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+            let producer_request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/retry-backoff-drop".to_owned(),
+                ..Default::default()
+            });
+            let slot = conn.producer(handle).expect("producer slot").clone();
+            let producer_success = pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id: producer_request_id,
+                    producer_name: "producer".to_owned(),
+                    last_sequence_id: Some(-1),
+                    producer_ready: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &producer_success).expect("encode ProducerSuccess");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish producer");
+            while conn.poll_event().is_some() {}
+            conn.reset();
+            conn.begin_handshake().expect("restart handshake");
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &connected).expect("encode CommandConnected");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect handshake");
+            while conn.poll_event().is_some() {}
+            let failed_request_id = conn.rebuild_producers()[0];
+            let transient_error = pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: failed_request_id.0,
+                    error: pb::ServerError::ProducerBusy as i32,
+                    message: "retry later".to_owned(),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &transient_error).expect("encode transient error");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("schedule established retry");
+            (handle, slot, failed_request_id)
+        };
+        let producer = Producer::<TokioProviders>::assemble(
+            shared.clone(),
+            handle,
+            slot,
+            CompressionKind::None,
+            None,
+        );
+        let providers = TokioProviders::new();
+        let time = providers.time().clone();
+        let task = providers.task().clone();
+        let weak = Arc::downgrade(&shared);
+        spawn_retry_leg::<TokioProviders>(
+            &shared,
+            &time,
+            &task,
+            RetryRequest::Producer(handle, failed_request_id),
+        );
+
+        drop(producer);
+        drop(shared);
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the handle must cancel the initial retry backoff");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_lookup_does_not_emit_before_reconnect_handshake_completes() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+            let request_id = magnetar_proto::RequestId(conn.peek_next_request_id_for_test());
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/retry-before-reconnect-handshake".to_owned(),
+                subscription: "retry-before-reconnect-handshake".to_owned(),
+                ..Default::default()
+            });
+            conn.reset();
+            conn.begin_handshake().expect("restart handshake");
+            (handle, request_id)
+        };
+        let providers = TokioProviders::new();
+        let time = providers.time().clone();
+
+        let completed = tokio::time::timeout(
+            Duration::from_millis(100),
+            lookup_then(
+                &shared,
+                &time,
+                "persistent://public/default/retry-before-reconnect-handshake",
+                RetryRequest::Consumer(handle, request_id),
+            ),
+        )
+        .await
+        .expect("a pre-handshake retry lookup must cancel instead of parking");
+        assert!(!completed);
+
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Lookup as i32,
+                "no data-plane lookup may precede CommandConnected"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseding_consumer_generation_cancels_blackholed_retry_lookup() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+            let request_id = magnetar_proto::RequestId(conn.peek_next_request_id_for_test());
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/superseded-blackholed-retry".to_owned(),
+                subscription: "superseded-blackholed-retry".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        let providers = TokioProviders::new();
+        let time = providers.time().clone();
+        let lookup_request_id =
+            magnetar_proto::RequestId(shared.inner.lock().peek_next_request_id_for_test());
+        let mut lookup = Box::pin(lookup_then(
+            &shared,
+            &time,
+            "persistent://public/default/superseded-blackholed-retry",
+            RetryRequest::Consumer(handle, request_id),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(lookup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(lookup_request_id)
+        );
+
+        shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("replacement subscribe generation");
+        notify_retry_generation_replaced(&shared);
+
+        let completed = tokio::time::timeout(Duration::from_millis(100), lookup)
+            .await
+            .expect("generation replacement must wake the blackholed lookup");
+        assert!(!completed);
+        assert!(
+            !shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(lookup_request_id),
+            "cancelled retry lookup must unregister its pending request"
+        );
+    }
+
+    #[test]
+    fn superseded_consumer_retry_lookup_cannot_terminalize_current_generation() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, superseded_request_id, current_request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            let connected = pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "magnetar-test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &connected).expect("encode CommandConnected");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+
+            let initial_request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/superseded-retry-lookup".to_owned(),
+                subscription: "superseded-retry-lookup".to_owned(),
+                ..Default::default()
+            });
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::Success as i32,
+                success: Some(pb::CommandSuccess {
+                    request_id: initial_request_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode initial success");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish consumer");
+
+            let superseded_request_id = conn
+                .resubscribe_consumer_after_seek(handle)
+                .expect("superseded subscribe generation");
+            let current_request_id = conn
+                .resubscribe_consumer_after_seek(handle)
+                .expect("current subscribe generation");
+            (handle, superseded_request_id, current_request_id)
+        };
+
+        terminalize_retry_request(
+            &shared,
+            RetryRequest::Consumer(handle, superseded_request_id),
+            pb::ServerError::AuthorizationError as i32,
+            "stale retry lookup denied",
+        );
+
+        let mut conn = shared.inner.lock();
+        assert!(
+            !conn.consumer_handle_is_terminal(handle),
+            "a terminal lookup from the superseded retry must not kill the current generation"
+        );
+        assert!(
+            conn.retry_consumer_subscribe_if_current(handle, current_request_id)
+                .is_some(),
+            "the current generation must remain retryable"
+        );
+    }
+
+    #[test]
+    fn superseded_producer_retry_lookup_cannot_terminalize_current_generation() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, superseded_request_id, current_request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/superseded-producer-retry".to_owned(),
+                ..Default::default()
+            });
+            let success = pb::BaseCommand {
+                r#type: pb::base_command::Type::ProducerSuccess as i32,
+                producer_success: Some(pb::CommandProducerSuccess {
+                    request_id,
+                    producer_name: "producer".to_owned(),
+                    last_sequence_id: Some(-1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &success).expect("encode ProducerSuccess");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("establish producer");
+            let superseded_request_id = conn
+                .rebuild_producers()
+                .into_iter()
+                .next()
+                .expect("superseded producer generation");
+            let current_request_id = conn
+                .rebuild_producers()
+                .into_iter()
+                .next()
+                .expect("current producer generation");
+            (handle, superseded_request_id, current_request_id)
+        };
+
+        terminalize_retry_request(
+            &shared,
+            RetryRequest::Producer(handle, superseded_request_id),
+            pb::ServerError::AuthorizationError as i32,
+            "stale producer retry lookup denied",
+        );
+
+        let mut conn = shared.inner.lock();
+        assert!(
+            !conn.producer_is_closed(handle),
+            "a terminal lookup from the superseded retry must not kill the current producer generation"
+        );
+        assert!(
+            conn.retry_producer_open_if_current(handle, current_request_id)
+                .is_some(),
+            "the current producer generation must remain retryable"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn superseding_producer_generation_cancels_blackholed_retry_lookup() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            let frame = handshake_response_bytes();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+            let request_id = magnetar_proto::RequestId(conn.peek_next_request_id_for_test());
+            let handle = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/superseded-producer-blackhole".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        let providers = TokioProviders::new();
+        let time = providers.time().clone();
+        let lookup_request_id =
+            magnetar_proto::RequestId(shared.inner.lock().peek_next_request_id_for_test());
+        let mut lookup = Box::pin(lookup_then(
+            &shared,
+            &time,
+            "persistent://public/default/superseded-producer-blackhole",
+            RetryRequest::Producer(handle, request_id),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(lookup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        shared.inner.lock().rebuild_producers();
+        notify_retry_generation_replaced(&shared);
+
+        let completed = tokio::time::timeout(Duration::from_millis(100), lookup)
+            .await
+            .expect("producer generation replacement must wake the blackholed lookup");
+        assert!(!completed);
+        assert!(
+            !shared
+                .inner
+                .lock()
+                .has_pending_request_for_test(lookup_request_id),
+            "cancelled producer retry lookup must unregister its pending request"
+        );
+    }
 
     /// Build a synthetic `CommandConnected` frame for use in tests that need
     /// the state machine past handshake without running an engine.

@@ -25,6 +25,38 @@ use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, Sequenc
 /// `ServerError` code and broker-supplied message on failure (e.g. `TopicNotFound`).
 pub type GetSchemaResult = Result<(pb::Schema, Option<Bytes>), (i32, String)>;
 
+/// Generation context for retry work owned by a runtime driver.
+///
+/// This is an internal seam between `magnetar-proto` and the built-in runtime
+/// crates. Applications should consume [`ConnectionEvent`] instead.
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum DriverRetry {
+    /// Retry an established producer attachment.
+    Producer {
+        /// Producer whose attachment failed.
+        handle: ProducerHandle,
+        /// Exact failed wire generation.
+        failed_request_id: RequestId,
+        /// Pulsar wire-protocol `ServerError` code.
+        code: i32,
+        /// Broker-provided diagnostic.
+        message: String,
+    },
+    /// Retry an established consumer attachment.
+    Consumer {
+        /// Consumer whose attachment failed.
+        handle: ConsumerHandle,
+        /// Exact failed wire generation.
+        failed_request_id: RequestId,
+        /// Pulsar wire-protocol `ServerError` code.
+        code: i32,
+        /// Broker-provided diagnostic.
+        message: String,
+    },
+}
+
 /// Result variants of one round-trip against the Transaction Coordinator.
 ///
 /// Mirrors PIP-31's response set. The `Result` shape carries either the
@@ -93,14 +125,15 @@ pub enum ConnectionEvent {
         message: String,
     },
 
-    /// The broker rejected a `CommandProducer` with a TRANSIENT error code (e.g.
-    /// `ServiceNotReady`, `MetadataError`, `TopicNotFound`) — typically a
-    /// post-restart broker whose namespace bundle hasn't been re-acquired yet.
-    /// Unlike [`Self::ProducerOpenFailed`], the producer state is NOT dropped: the
-    /// runtime is expected to back off and call
-    /// [`crate::Connection::retry_producer_open`] to retry the attach. Mirrors
-    /// Java `ProducerImpl.handleProducerCreationError` retrying on the same
-    /// codes.
+    /// An established producer's reattachment was rejected with a retryable
+    /// ADR-0080 code.
+    ///
+    /// This event is emitted only after the producer has attached successfully
+    /// at least once. The state is retained and the runtime driver must back
+    /// off, re-run lookup, and call
+    /// [`crate::Connection::retry_producer_open`]. A provisional first-open
+    /// rejection instead emits [`Self::ProducerOpenFailed`] and is retried by
+    /// the routing-aware client.
     ProducerOpenFailedTransient {
         /// The producer that failed to open.
         handle: ProducerHandle,
@@ -131,10 +164,14 @@ pub enum ConnectionEvent {
         message: String,
     },
 
-    /// Consumer-side companion to [`Self::ProducerOpenFailedTransient`]. The
-    /// broker rejected `CommandSubscribe` with a transient code; the consumer
-    /// state is retained and the runtime should retry via
-    /// [`crate::Connection::retry_consumer_subscribe`] after a backoff.
+    /// Established-consumer companion to
+    /// [`Self::ProducerOpenFailedTransient`].
+    ///
+    /// The consumer has attached successfully at least once, so its state is
+    /// retained for driver-owned reattachment through
+    /// [`crate::Connection::retry_consumer_subscribe`]. A provisional
+    /// subscribe rejection emits [`Self::SubscribeFailed`] and is retried by
+    /// the routing-aware client.
     SubscribeFailedTransient {
         /// The consumer that failed to subscribe.
         handle: ConsumerHandle,

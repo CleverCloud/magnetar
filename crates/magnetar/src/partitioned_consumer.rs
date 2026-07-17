@@ -394,10 +394,22 @@ where
     pub async fn subscribe(
         self,
     ) -> Result<PartitionedConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
+        let mut deadline =
+            crate::SubscribeApi::new_subscribe_operation_deadline(&self.client.inner);
+        self.subscribe_with_deadline(&mut deadline).await
+    }
+
+    async fn subscribe_with_deadline(
+        self,
+        deadline: &mut crate::OperationDeadline,
+    ) -> Result<PartitionedConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
         let subscription = self
             .subscription
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;
-        let partitions = self.client.partitions_for_topic(&self.topic).await?;
+        let partitions = self
+            .client
+            .partitions_for_topic_with_deadline(&self.topic, deadline)
+            .await?;
         let topics: Vec<String> = if partitions == 0 {
             vec![self.topic.clone()]
         } else {
@@ -477,7 +489,7 @@ where
         if let Some(listener) = self.listener {
             builder = builder.message_listener(listener);
         }
-        builder.subscribe().await
+        builder.subscribe_with_deadline(deadline).await
     }
 }
 

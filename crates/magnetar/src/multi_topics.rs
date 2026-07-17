@@ -1212,6 +1212,15 @@ where
     pub async fn subscribe(
         self,
     ) -> Result<MultiTopicsConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
+        let mut deadline =
+            crate::SubscribeApi::new_subscribe_operation_deadline(&self.client.inner);
+        self.subscribe_with_deadline(&mut deadline).await
+    }
+
+    pub(crate) async fn subscribe_with_deadline(
+        self,
+        deadline: &mut crate::OperationDeadline,
+    ) -> Result<MultiTopicsConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
         let subscription = self
             .subscription
             .ok_or_else(|| PulsarError::Config("subscription name is required".to_owned()))?;
@@ -1255,7 +1264,7 @@ where
             Vec::with_capacity(self.topics.len());
         for topic in &self.topics {
             let builder = template.apply(self.client.consumer(topic.clone()));
-            let result = builder.subscribe().await;
+            let result = builder.subscribe_with_deadline(deadline).await;
             match result {
                 Ok(c) => consumers.push(NamedConsumer {
                     topic: topic.clone(),

@@ -1065,9 +1065,23 @@ where
     ///
     /// Returns [`PulsarError::Other`] if the broker refuses the metadata lookup.
     pub async fn partitions_for_topic(&self, topic: &str) -> Result<u32> {
-        crate::BrokerMetadataApi::partitioned_topic_metadata(&self.inner, topic)
+        let mut deadline = crate::BrokerMetadataApi::new_metadata_operation_deadline(&self.inner);
+        self.partitions_for_topic_with_deadline(topic, &mut deadline)
             .await
-            .map_err(|err| PulsarError::Other(format!("partitions_for_topic: {err}")))
+    }
+
+    pub(crate) async fn partitions_for_topic_with_deadline(
+        &self,
+        topic: &str,
+        deadline: &mut crate::OperationDeadline,
+    ) -> Result<u32> {
+        crate::BrokerMetadataApi::partitioned_topic_metadata_with_deadline(
+            &self.inner,
+            topic,
+            deadline,
+        )
+        .await
+        .map_err(|err| PulsarError::Other(format!("partitions_for_topic: {err}")))
     }
 
     /// Subscribe to a topic-list watcher and return the initial topic snapshot for the
@@ -1080,9 +1094,25 @@ where
     ///
     /// Returns [`PulsarError::Other`] if the broker refuses the watch.
     pub async fn topic_list_snapshot(&self, namespace: &str, pattern: &str) -> Result<Vec<String>> {
-        crate::BrokerMetadataApi::watch_topic_list(&self.inner, namespace, pattern)
+        let mut deadline = crate::BrokerMetadataApi::new_metadata_operation_deadline(&self.inner);
+        self.topic_list_snapshot_with_deadline(namespace, pattern, &mut deadline)
             .await
-            .map_err(|err| PulsarError::Other(format!("topic_list_snapshot: {err}")))
+    }
+
+    pub(crate) async fn topic_list_snapshot_with_deadline(
+        &self,
+        namespace: &str,
+        pattern: &str,
+        deadline: &mut crate::OperationDeadline,
+    ) -> Result<Vec<String>> {
+        crate::BrokerMetadataApi::watch_topic_list_with_deadline(
+            &self.inner,
+            namespace,
+            pattern,
+            deadline,
+        )
+        .await
+        .map_err(|err| PulsarError::Other(format!("topic_list_snapshot: {err}")))
     }
 }
 

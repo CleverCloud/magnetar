@@ -4,8 +4,8 @@
 //!
 //! Mirror of `magnetar-runtime-moonpool/tests/lookup_error_propagation.rs`
 //! (deterministic simulation). Maintains the tokio ↔ moonpool 1:1 test count
-//! required by ADR-0024 (`check-runtime-test-parity`): two `#[tokio::test]`
-//! functions here mirror the moonpool file's two `#[test]` functions.
+//! required by ADR-0024 (`check-runtime-test-parity`): five `#[tokio::test]`
+//! functions here mirror the moonpool file's five `#[test]` functions.
 //!
 //! ## Coverage gap this pins
 //!
@@ -31,9 +31,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use bytes::BytesMut;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, FrameError, decode_one, encode_command, pb,
+    ConnectionConfig, CreateProducerRequest, FrameError, OperationRetryConfig, decode_one,
+    encode_command, pb,
 };
 use magnetar_runtime_tokio::{Client, ClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,6 +63,14 @@ const FAILED_MESSAGE: &str = "topic does not exist";
 enum LookupBehavior {
     /// Answer the LOOKUP with `LookupType::Failed { error, message }`.
     Failed,
+    /// Reject the first LOOKUP with `ServiceNotReady`, then resolve it and
+    /// acknowledge the producer open. The counter records wire attempts.
+    RetryableThenConnect { attempts: Arc<AtomicUsize> },
+    /// Reject the first partition-metadata request with `ServiceNotReady`,
+    /// then return a partition count. The counter records wire attempts.
+    MetadataRetryableThenSuccess { attempts: Arc<AtomicUsize> },
+    /// Reject every lookup with `ServiceNotReady`.
+    AlwaysRetryableLookup { attempts: Arc<AtomicUsize> },
     /// Answer *every* LOOKUP with `LookupType::Redirect` advertising the
     /// carried URL (the broker's own address — so the engine's dial loop
     /// re-issues on the bootstrap via bootstrap-equality and the redirect cap
@@ -132,89 +145,327 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, behavior: &Lo
         return;
     };
     match kind {
-        pb::base_command::Type::Connect => {
-            let cmd = pb::BaseCommand {
-                r#type: pb::base_command::Type::Connected as i32,
-                connected: Some(pb::CommandConnected {
-                    server_version: "magnetar-test-broker".to_owned(),
-                    protocol_version: Some(21),
-                    max_message_size: Some(5 * 1024 * 1024),
-                    feature_flags: Some(pb::FeatureFlags::default()),
-                }),
-                ..Default::default()
-            };
-            let _ = encode_command(out, &cmd);
-        }
-        pb::base_command::Type::Ping => {
-            let cmd = pb::BaseCommand {
-                r#type: pb::base_command::Type::Pong as i32,
-                pong: Some(pb::CommandPong {}),
-                ..Default::default()
-            };
-            let _ = encode_command(out, &cmd);
-        }
+        pb::base_command::Type::Connect => emit_connected(out),
+        pb::base_command::Type::Ping => emit_pong(out),
         pb::base_command::Type::Lookup => {
-            if let Some(l) = &frame.command.lookup_topic {
-                let response = match behavior {
-                    LookupBehavior::Failed => pb::CommandLookupTopicResponse {
-                        broker_service_url: None,
-                        broker_service_url_tls: None,
-                        response: Some(
-                            pb::command_lookup_topic_response::LookupType::Failed as i32,
-                        ),
-                        request_id: l.request_id,
-                        authoritative: Some(true),
-                        error: Some(FAILED_CODE),
-                        message: Some(FAILED_MESSAGE.to_owned()),
-                        proxy_through_service_url: Some(false),
-                    },
-                    LookupBehavior::AlwaysRedirect { redirect_url } => {
-                        pb::CommandLookupTopicResponse {
-                            broker_service_url: Some(redirect_url.clone()),
-                            broker_service_url_tls: None,
-                            response: Some(
-                                pb::command_lookup_topic_response::LookupType::Redirect as i32,
-                            ),
-                            request_id: l.request_id,
-                            authoritative: Some(true),
-                            error: None,
-                            message: None,
-                            proxy_through_service_url: Some(false),
-                        }
-                    }
-                };
+            if let Some(lookup) = &frame.command.lookup_topic {
                 let cmd = pb::BaseCommand {
                     r#type: pb::base_command::Type::LookupResponse as i32,
-                    lookup_topic_response: Some(response),
+                    lookup_topic_response: Some(lookup_response(lookup.request_id, behavior)),
                     ..Default::default()
                 };
                 let _ = encode_command(out, &cmd);
             }
         }
         pb::base_command::Type::PartitionedMetadata => {
-            // `open_producer` issues this before the LOOKUP — answer
-            // non-partitioned so it proceeds to the redirect-driving lookup.
-            if let Some(m) = &frame.command.partition_metadata {
-                let cmd = pb::BaseCommand {
-                    r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
-                    partition_metadata_response: Some(
-                        pb::CommandPartitionedTopicMetadataResponse {
-                            partitions: Some(0),
-                            request_id: m.request_id,
-                            response: Some(
-                                pb::command_partitioned_topic_metadata_response::LookupType::Success
-                                    as i32,
-                            ),
-                            error: None,
-                            message: None,
-                        },
-                    ),
-                    ..Default::default()
-                };
-                let _ = encode_command(out, &cmd);
+            emit_partitioned_metadata(frame, out, behavior);
+        }
+        pb::base_command::Type::Producer => emit_producer_success(frame, out),
+        _ => {}
+    }
+}
+
+fn emit_connected(out: &mut BytesMut) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Connected as i32,
+        connected: Some(pb::CommandConnected {
+            server_version: "magnetar-test-broker".to_owned(),
+            protocol_version: Some(21),
+            max_message_size: Some(5 * 1024 * 1024),
+            feature_flags: Some(pb::FeatureFlags::default()),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_pong(out: &mut BytesMut) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Pong as i32,
+        pong: Some(pb::CommandPong {}),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn lookup_response(request_id: u64, behavior: &LookupBehavior) -> pb::CommandLookupTopicResponse {
+    let connect = || pb::CommandLookupTopicResponse {
+        broker_service_url: None,
+        broker_service_url_tls: None,
+        response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+        request_id,
+        authoritative: Some(true),
+        error: None,
+        message: None,
+        proxy_through_service_url: Some(false),
+    };
+    match behavior {
+        LookupBehavior::Failed => pb::CommandLookupTopicResponse {
+            response: Some(pb::command_lookup_topic_response::LookupType::Failed as i32),
+            error: Some(FAILED_CODE),
+            message: Some(FAILED_MESSAGE.to_owned()),
+            ..connect()
+        },
+        LookupBehavior::RetryableThenConnect { attempts } => {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                pb::CommandLookupTopicResponse {
+                    response: Some(pb::command_lookup_topic_response::LookupType::Failed as i32),
+                    error: Some(pb::ServerError::ServiceNotReady as i32),
+                    message: Some("bundle is loading".to_owned()),
+                    ..connect()
+                }
+            } else {
+                connect()
             }
         }
-        _ => {}
+        LookupBehavior::MetadataRetryableThenSuccess { .. } => connect(),
+        LookupBehavior::AlwaysRetryableLookup { attempts } => {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            pb::CommandLookupTopicResponse {
+                response: Some(pb::command_lookup_topic_response::LookupType::Failed as i32),
+                error: Some(pb::ServerError::ServiceNotReady as i32),
+                message: Some("bundle is still loading".to_owned()),
+                ..connect()
+            }
+        }
+        LookupBehavior::AlwaysRedirect { redirect_url } => pb::CommandLookupTopicResponse {
+            broker_service_url: Some(redirect_url.clone()),
+            response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+            ..connect()
+        },
+    }
+}
+
+fn emit_partitioned_metadata(
+    frame: &magnetar_proto::Frame,
+    out: &mut BytesMut,
+    behavior: &LookupBehavior,
+) {
+    let Some(metadata) = &frame.command.partition_metadata else {
+        return;
+    };
+    let (partitions, response, error, message) = match behavior {
+        LookupBehavior::MetadataRetryableThenSuccess { attempts }
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 =>
+        {
+            (
+                0,
+                pb::command_partitioned_topic_metadata_response::LookupType::Failed as i32,
+                Some(pb::ServerError::ServiceNotReady as i32),
+                Some("metadata store is loading".to_owned()),
+            )
+        }
+        LookupBehavior::MetadataRetryableThenSuccess { .. } => (
+            3,
+            pb::command_partitioned_topic_metadata_response::LookupType::Success as i32,
+            None,
+            None,
+        ),
+        _ => (
+            0,
+            pb::command_partitioned_topic_metadata_response::LookupType::Success as i32,
+            None,
+            None,
+        ),
+    };
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::PartitionedMetadataResponse as i32,
+        partition_metadata_response: Some(pb::CommandPartitionedTopicMetadataResponse {
+            partitions: Some(partitions),
+            request_id: metadata.request_id,
+            response: Some(response),
+            error,
+            message,
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_producer_success(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
+    let Some(producer) = &frame.command.producer else {
+        return;
+    };
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::ProducerSuccess as i32,
+        producer_success: Some(pb::CommandProducerSuccess {
+            request_id: producer.request_id,
+            producer_name: "lookup-retry-test".to_owned(),
+            last_sequence_id: Some(-1),
+            schema_version: None,
+            topic_epoch: Some(0),
+            producer_ready: Some(true),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+/// An already-ready deadline wins before the first wire command is enqueued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_expired_deadline_does_not_enqueue_lookup() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let url = spawn_lookup_broker(LookupBehavior::AlwaysRetryableLookup {
+        attempts: attempts.clone(),
+    })
+    .await;
+    let client = Client::connect(&url, ConnectionConfig::default())
+        .await
+        .expect("connect ok");
+    let mut deadline = Box::pin(async {});
+    let mut last_broker_error = None;
+
+    let err = client
+        .open_producer_with_operation_deadline(
+            CreateProducerRequest {
+                topic: TOPIC.to_owned(),
+                ..Default::default()
+            },
+            None,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+        .expect_err("an already-expired deadline must fail before enqueue");
+    assert!(matches!(err, ClientError::Timeout(_)), "got {err:?}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "deadline preflight must prevent the first lookup command"
+    );
+
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+}
+
+/// The total operation deadline wins while the retry is sleeping: no second
+/// lookup reaches the wire, and the last broker error is preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_lookup_deadline_during_backoff_returns_last_error_without_reissue() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let url = spawn_lookup_broker(LookupBehavior::AlwaysRetryableLookup {
+        attempts: attempts.clone(),
+    })
+    .await;
+    let config = ConnectionConfig {
+        operation_timeout: Duration::from_millis(5),
+        ..ConnectionConfig::default()
+    };
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
+        .await
+        .expect("connect did not time out")
+        .expect("connect ok")
+        .with_operation_retry(OperationRetryConfig {
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(50),
+            max_retries: Some(1),
+        });
+
+    let err = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("operation deadline did not resolve open_producer")
+    .expect_err("an always-retryable lookup must not open a producer");
+
+    assert!(
+        matches!(
+            err,
+            ClientError::Broker { code, ref message }
+                if code == pb::ServerError::ServiceNotReady as i32
+                    && message == "bundle is still loading"
+        ),
+        "deadline must surface the last broker error, got {err:?}"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "deadline expiry during backoff must prevent the configured reissue"
+    );
+
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+}
+
+/// A retryable partition-metadata rejection is re-issued and the eventual
+/// broker count is returned to the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_partition_metadata_service_not_ready_retries_then_succeeds() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let url = spawn_lookup_broker(LookupBehavior::MetadataRetryableThenSuccess {
+        attempts: attempts.clone(),
+    })
+    .await;
+    let config = ConnectionConfig::default();
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
+        .await
+        .expect("connect did not time out")
+        .expect("connect ok")
+        .with_operation_retry(OperationRetryConfig {
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+            max_retries: Some(1),
+        });
+
+    let partitions = tokio::time::timeout(HANG_GUARD, client.partitioned_topic_metadata(TOPIC))
+        .await
+        .expect("partition metadata did not time out")
+        .expect("retryable metadata failure must be re-issued");
+    assert_eq!(partitions, 3);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+}
+
+/// A retryable lookup rejection is re-issued under the configured operation
+/// policy, and the eventual success continues into producer attachment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokio_lookup_service_not_ready_retries_then_opens_producer() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let url = spawn_lookup_broker(LookupBehavior::RetryableThenConnect {
+        attempts: attempts.clone(),
+    })
+    .await;
+    let config = ConnectionConfig::default();
+
+    let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, config))
+        .await
+        .expect("connect did not time out")
+        .expect("connect ok")
+        .with_operation_retry(OperationRetryConfig {
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+            max_retries: Some(1),
+        });
+
+    let producer = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out")
+    .expect("retryable lookup failure must be re-issued");
+
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "one initial lookup plus one configured retry must reach the wire"
+    );
+
+    drop(producer);
+    if let Some(d) = client.take_driver() {
+        d.abort();
     }
 }
 

@@ -65,6 +65,10 @@ pub(crate) struct ConnectionFactory {
     /// `proxy_to_broker_url` on the clone; everything else (auth, supervisor,
     /// memory limit, etc.) carries over.
     pub(crate) bootstrap_config: ConnectionConfig,
+    /// Operation retry is runtime-owned rather than a public
+    /// `ConnectionConfig` field, preserving source compatibility for
+    /// downstream exhaustive config literals.
+    pub(crate) operation_retry: Arc<Mutex<magnetar_proto::OperationRetryConfig>>,
     /// Optional in-band auth provider for `CommandAuthChallenge`. Each pool
     /// entry shares the same provider, so a refreshed token propagates
     /// naturally across every pinned broker connection.
@@ -121,6 +125,31 @@ struct Entry {
     driver: Mutex<Option<DriverHandle>>,
 }
 
+/// Own a just-spawned driver until its pool entry becomes reachable.
+///
+/// Cancelling `build_entry` at any await point drops this guard and aborts the
+/// otherwise-detached Tokio task. Once the ready entry is assembled, `take`
+/// transfers lifecycle ownership to [`Entry`].
+struct PendingDriverGuard(Option<DriverHandle>);
+
+impl PendingDriverGuard {
+    fn new(driver: DriverHandle) -> Self {
+        Self(Some(driver))
+    }
+
+    fn take(&mut self) -> Option<DriverHandle> {
+        self.0.take()
+    }
+}
+
+impl Drop for PendingDriverGuard {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.as_ref() {
+            driver.abort();
+        }
+    }
+}
+
 /// Pool of `ConnectionShared` keyed by `(logical broker URL, physical dial
 /// URL)`. See module docs.
 pub(crate) struct ProxyConnectionPool {
@@ -146,6 +175,10 @@ impl ProxyConnectionPool {
             factory,
             entries: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn set_operation_retry_config(&self, config: magnetar_proto::OperationRetryConfig) {
+        *self.factory.operation_retry.lock() = config;
     }
 
     /// Snapshot of the currently-tracked `(logical, physical, index)` triples —
@@ -296,6 +329,10 @@ impl ProxyConnectionPool {
         .await?;
 
         let shared = ConnectionShared::with_auth(cfg, self.factory.auth_provider.clone());
+        shared
+            .inner
+            .lock()
+            .set_operation_retry_config(self.factory.operation_retry.lock().clone());
 
         // Kick off the CONNECT frame before the driver starts reading, so the
         // driver's first poll has something to flush.
@@ -308,7 +345,8 @@ impl ProxyConnectionPool {
             service_url_provider: self.factory.service_url_provider.clone(),
             dns_resolver: self.factory.dns_resolver.clone(),
         };
-        let driver = spawn_supervised_driver(shared.clone(), socket, ctx);
+        let mut driver =
+            PendingDriverGuard::new(spawn_supervised_driver(shared.clone(), socket, ctx));
 
         // Block until the new socket has finished its handshake — the caller
         // expects a ready-to-use connection — but bound the wait with
@@ -327,7 +365,6 @@ impl ProxyConnectionPool {
         let connected = match connected {
             Ok(inner) => inner,
             Err(_elapsed) => {
-                driver.abort();
                 let (host, port) = physical.socket_addr();
                 return Err(ClientError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -338,10 +375,7 @@ impl ProxyConnectionPool {
                 )));
             }
         };
-        if let Err(err) = connected {
-            driver.abort();
-            return Err(err);
-        }
+        connected?;
 
         // Lifecycle record (ADR-0054) — pool-entry flavour of the bootstrap
         // "connection established" in `client::start_supervised_handshake`.
@@ -361,7 +395,7 @@ impl ProxyConnectionPool {
 
         Ok(Arc::new(Entry {
             shared,
-            driver: Mutex::new(Some(driver)),
+            driver: Mutex::new(driver.take()),
         }))
     }
 
@@ -430,6 +464,7 @@ mod tests {
                 operation_timeout: Duration::from_secs(30),
                 ..ConnectionConfig::default()
             },
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
             auth_provider: None,
             service_url_provider: None,
             dns_resolver: None,
