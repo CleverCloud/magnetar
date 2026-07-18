@@ -14009,7 +14009,7 @@ mod otel_property_round_trip_tests {
             ..Default::default()
         });
         let _ = conn.poll_transmit();
-        let _ = conn.close_consumer(handle);
+        let _ = conn.close_consumer(handle, std::time::Instant::now());
         let _ = conn.poll_transmit();
 
         assert_eq!(conn.retry_consumer_subscribe(handle), None);
