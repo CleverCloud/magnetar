@@ -566,6 +566,10 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ProducerApi
         magnetar_runtime_moonpool::Producer::stats(self)
     }
 
+    fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        magnetar_runtime_moonpool::Producer::send_latency_histogram(self)
+    }
+
     fn close_owned(self) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(magnetar_runtime_moonpool::Producer::close(self))
     }
@@ -678,6 +682,22 @@ impl<P: moonpool_core::Providers + Send + Sync + 'static> ConsumerApi
 
     fn stats(&self) -> magnetar_proto::consumer::ConsumerStats {
         magnetar_runtime_moonpool::Consumer::stats(self)
+    }
+
+    fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        magnetar_runtime_moonpool::Consumer::receive_latency_histogram(self)
+    }
+
+    fn is_active(&self) -> Option<bool> {
+        magnetar_runtime_moonpool::Consumer::is_active(self)
+    }
+
+    fn next_active_change(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + Send + '_>> {
+        Box::pin(magnetar_runtime_moonpool::Consumer::next_active_change(
+            self,
+        ))
     }
 
     fn last_disconnected_timestamp(&self) -> Option<std::time::SystemTime> {

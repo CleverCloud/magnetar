@@ -19,9 +19,12 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                          | Status                                                                                           |
-| --- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e) | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| #   | Item                                                                                             | Status                                                                                           |
+| --- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                    | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)  | 🧠 needs design decision on the fan-out surface                                                  |
+| 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)   | ⚡ ready to dispatch                                                                             |
+| 4   | [`Auto` adjust-schedule arming is parasitic on other deadlines](#4-auto-adjust-arming-bootstrap) | ⚡ ready to dispatch                                                                             |
 
 ---
 
@@ -42,6 +45,48 @@ The wire surface is hand-encoded in `crates/magnetar-proto/src/pb/scalable_topic
 
 ---
 
+## 2. Wrapper rate-window fan-out
+
+**Gap.** `PartitionedProducer` / `MultiTopicsConsumer` (and the `PartitionedConsumer` alias) keep their children private and expose no way to drive `record_rate_window` on them, so the `msgs_per_sec` / `bytes_per_sec` fields of `aggregate_stats()` — structurally correct since the #347 fold fix — can never become nonzero for wrapper types.
+Discovered while writing `crates/magnetar/tests/e2e_aggregate_stats.rs`; the single-consumer path is proven end-to-end there, the wrapper path only sums zeros today.
+
+**Why it stays open.** Closing it needs new public API surface (a fan-out tick method on the wrappers, or an auto-update-ticker hookup like `auto_update_partitions_interval`) — a design decision outside #347's aggregation charter.
+
+---
+
+## 3. Latency-histogram clock leak
+
+**Gap.** `ConsumerState::pop_message` and `ProducerState::apply_receipt` record latency via `Instant::elapsed()` — a host-clock read inside `magnetar-proto`, violating the ADR-0011 injected-clock rule.
+`cargo run -p xtask -- check-no-internal-clock` greps only literal `Instant::now()` / `SystemTime::now()`, so the leak is invisible to the gate, and moonpool's receive/send-latency histograms are not actually deterministic under simulation.
+Surfaced during the #347 work; the differential test `aggregate_stats_equivalence.rs` works around it by overwriting the histograms with a synthetic distribution before folding.
+
+**Why it stays open.** The fix is a clock-injection refactor (thread `now: Instant` into the two record sites and derive latency as `now - arrived_at` / `now - enqueued_at`) plus extending the xtask gate to catch `.elapsed()`; both are out of #347's scope and deserve their own four-layer test set.
+
+**`/goal`.**
+
+```text
+/goal remove the Instant::elapsed() host-clock reads from magnetar-proto per docs/follow-ups.md §3: thread the injected `now: Instant` into ConsumerState::pop_message and ProducerState::apply_receipt, compute latencies against it, extend `cargo run -p xtask -- check-no-internal-clock` to also reject `.elapsed()` in magnetar-proto src, and ship the ADR-0024 four-layer test set proving moonpool latency histograms are deterministic per seed. Validation chain per CLAUDE.md.
+```
+
+---
+
+## 4. Auto adjust arming bootstrap
+
+**Gap.** The `Auto` receiver-queue adjust schedule's first arm (`arm_adjust_clock`) runs only inside `Connection::handle_timeout`, which the drivers invoke only when a `poll_timeout()` deadline actually elapses — the schedule has no dedicated bootstrap trigger and is parasitic on whichever other deadline fires first (typically keepalive).
+Every inbound frame refreshes `last_activity` (ADR-0058's single refresh site), so a connection with continuous inbound traffic — message deliveries, or the `CommandAckResponse` stream produced by a consumer that awaits each individual ack — defers the keepalive deadline indefinitely and the adjust schedule never arms, regardless of the configured `keepalive_interval`.
+Reproduced during the #349 e2e work (two failing runs, root-caused; the test now avoids per-message ack awaits and uses a 100 ms keepalive so natural gaps arm the schedule).
+Production impact is uncertain but not ruled out: individually-awaited acks in a receive loop are a common usage pattern.
+
+**Why it stays open.** The clean fix — arming the adjust clock explicitly at subscribe-ack / initial-flow time — threads `now: Instant` through `Connection::initial_flow`'s call graph and touches `client.rs` plus both engines' `consumer.rs`, a materially larger change than #349's locked permit-split scope.
+
+**`/goal`.**
+
+```text
+/goal arm the Auto receiver-queue adjust schedule deterministically per docs/follow-ups.md §4: give arm_adjust_clock a dedicated bootstrap at subscribe-ack/initial-flow time (threading the injected now: Instant through Connection::initial_flow's call graph in proto and both engines) so a continuously-busy connection cannot defer the first adjust tick, and ship the ADR-0024 four-layer test set including a regression test that drives continuous ack-response traffic and asserts the schedule still arms. Validation chain per CLAUDE.md.
+```
+
+---
+
 ## Notes on this file
 
 Items move from this file to `git log` when their commit ships.
@@ -51,4 +96,4 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-The remaining item is a fully external blocker: the PIP-460 e2e flesh-out ([§1](#1-pip-460-scalable-topics-e2e)) waits on a Pulsar 5.0 RC carrying PIP-460.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §3 and §4 are dispatch-ready.

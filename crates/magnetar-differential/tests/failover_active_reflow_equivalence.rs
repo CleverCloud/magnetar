@@ -41,6 +41,18 @@ struct Reaction {
     saw_active_event: bool,
     permits_after_redundant: u32,
     grants_on_redundant: Vec<u32>,
+    /// Issue #348: the per-slot active-state surface (`ConsumerState::is_active`
+    /// / `active_changes`) must agree across engines exactly like the permit
+    /// trajectory above — it is fed by the SAME per-slot-locked
+    /// `record_active_change` call inside the `ActiveConsumerChange` arm.
+    is_active_before: Option<bool>,
+    is_active_after_promote: Option<bool>,
+    /// Drained via `Connection::pop_consumer_active_change` after the
+    /// promotion — the transition(s) a parked `next_active_change()` future
+    /// would observe.
+    drained_after_promote: Vec<bool>,
+    is_active_after_redundant: Option<bool>,
+    drained_after_redundant: Vec<bool>,
 }
 
 /// Observable permit and delivery trace for one out-of-order chunked message.
@@ -173,6 +185,8 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
     let _ = conn.poll_transmit();
 
     let permits_before = conn.consumer_available_permits(handle);
+    // Issue #348: nothing has recorded an active-change yet.
+    let is_active_before = conn.consumer_is_active(handle);
 
     // Promote to active.
     let promote = active_consumer_change_frame(handle, true);
@@ -187,6 +201,11 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
     }
     let grants_on_promote = drain_flow_grants(conn, handle);
     let permits_after_promote = conn.consumer_available_permits(handle);
+    let is_active_after_promote = conn.consumer_is_active(handle);
+    let mut drained_after_promote = Vec::new();
+    while let Some(active) = conn.pop_consumer_active_change(handle) {
+        drained_after_promote.push(active);
+    }
 
     // Redundant promotion: permits already outstanding, must not double-flow.
     let promote_again = active_consumer_change_frame(handle, true);
@@ -195,6 +214,11 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
     while conn.poll_event().is_some() {}
     let grants_on_redundant = drain_flow_grants(conn, handle);
     let permits_after_redundant = conn.consumer_available_permits(handle);
+    let is_active_after_redundant = conn.consumer_is_active(handle);
+    let mut drained_after_redundant = Vec::new();
+    while let Some(active) = conn.pop_consumer_active_change(handle) {
+        drained_after_redundant.push(active);
+    }
 
     Reaction {
         permits_before,
@@ -203,6 +227,11 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
         saw_active_event,
         permits_after_redundant,
         grants_on_redundant,
+        is_active_before,
+        is_active_after_promote,
+        drained_after_promote,
+        is_active_after_redundant,
+        drained_after_redundant,
     }
 }
 
@@ -289,6 +318,14 @@ fn failover_active_reflow_event_streams_agree() {
         saw_active_event: true,
         permits_after_redundant: RQ as u32,
         grants_on_redundant: vec![],
+        // Issue #348: `record_active_change` fires unconditionally on every
+        // `ActiveConsumerChange` frame — including the redundant promotion,
+        // which does NOT re-flow but DOES still record the transition.
+        is_active_before: None,
+        is_active_after_promote: Some(true),
+        drained_after_promote: vec![true],
+        is_active_after_redundant: Some(true),
+        drained_after_redundant: vec![true],
     };
     assert_eq!(
         tokio_reaction, expected,

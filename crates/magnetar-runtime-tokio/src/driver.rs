@@ -134,6 +134,7 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
                     | ConnectionEvent::RedirectUrlRejected { .. }
                     | ConnectionEvent::ReplicatedSubscriptionMarkerObserved { .. }
                     | ConnectionEvent::ChecksumMismatch { .. }
+                    | ConnectionEvent::ActiveConsumerChanged { .. }
                     | ConnectionEvent::LookupResponse {
                         result: magnetar_proto::LookupOutcome::Redirected { .. },
                         ..
@@ -343,7 +344,16 @@ fn handle_pending_events(shared: &Arc<ConnectionShared>) -> Result<(), ClientErr
             // double-report. The `LookupResponse` arm only ever sees
             // `LookupOutcome::Redirected` — the `poll_event_if` predicate
             // above admits no other lookup result.
+            //
+            // `ActiveConsumerChanged` (issue #348) is drained the same way:
+            // the real per-slot active-state surface (`Consumer::is_active` /
+            // `next_active_change`) is fed directly by the proto layer's
+            // `record_active_change` under the per-slot lock (conn.rs's
+            // `ActiveConsumerChange` arm), NOT by this event queue — draining
+            // it here only stops it from piling up unbounded in the proto
+            // queue, which nothing else polls.
             ConnectionEvent::ChecksumMismatch { .. } => {}
+            ConnectionEvent::ActiveConsumerChanged { .. } => {}
             ConnectionEvent::LookupResponse { .. } => {}
             _ => {}
         }

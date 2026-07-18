@@ -357,6 +357,12 @@ pub struct ConsumerBuilder<'a, E: crate::Engine = crate::TokioEngine> {
     /// [`Self::subscribe_with_listener`]; the plain [`Self::subscribe`] ignores
     /// it and returns a pull-mode consumer.
     listener: Option<crate::MessageListener>,
+    /// Optional Failover active/standby callback (Java
+    /// `ConsumerBuilder#consumerEventListener`, issue #348). Set via
+    /// [`Self::consumer_event_listener`] and subscribe via
+    /// [`Self::subscribe_with_event_listener`]; the plain [`Self::subscribe`]
+    /// (and [`Self::subscribe_with_listener`]) ignore it.
+    event_listener: Option<crate::ConsumerEventListener>,
 }
 
 impl<E: crate::Engine> std::fmt::Debug for ConsumerBuilder<'_, E> {
@@ -379,6 +385,7 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
             req,
             decryptor: None,
             listener: None,
+            event_listener: None,
         }
     }
 
@@ -401,6 +408,17 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
     #[must_use]
     pub fn has_listener_for_test(&self) -> bool {
         self.listener.is_some()
+    }
+
+    /// Test-support seam (`#[doc(hidden)]`, not part of the stable API):
+    /// `true` once a [`crate::ConsumerEventListener`] has been set via
+    /// [`Self::consumer_event_listener`]. Lets the builder-surface guard test
+    /// pin the listener → field wiring without opening a real broker
+    /// connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_event_listener_for_test(&self) -> bool {
+        self.event_listener.is_some()
     }
 
     /// Required: set the subscription name.
@@ -769,6 +787,22 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         self
     }
 
+    /// Register a Failover active/standby callback (Java
+    /// `ConsumerBuilder#consumerEventListener`, issue #348). Subscribe via
+    /// [`Self::subscribe_with_event_listener`] to spawn the poller that
+    /// drives it; the plain [`Self::subscribe`] and
+    /// [`Self::subscribe_with_listener`] ignore it.
+    ///
+    /// The callback fires [`crate::ConsumerEvent::BecameActive`] /
+    /// [`crate::ConsumerEvent::BecameInactive`] once per broker-reported
+    /// `CommandActiveConsumerChange`, sequentially, from the detached poller
+    /// task — never under any lock.
+    #[must_use]
+    pub fn consumer_event_listener(mut self, listener: crate::ConsumerEventListener) -> Self {
+        self.event_listener = Some(listener);
+        self
+    }
+
     /// Subscribe and start a push-delivery poller over the resulting consumer,
     /// returning the owning [`crate::MessageListenerHandle`]. Mirrors Java's
     /// `ConsumerBuilder#messageListener(...)` + `subscribe()` flow.
@@ -797,6 +831,39 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
         };
         let consumer = self.subscribe().await?;
         Ok(crate::consumer_listener::spawn_message_listener(
+            consumer, listener,
+        ))
+    }
+
+    /// Subscribe and start a Failover active/standby poller over the
+    /// resulting consumer, returning the owning
+    /// [`crate::ConsumerEventListenerHandle`] (issue #348). Mirrors Java's
+    /// `ConsumerBuilder#consumerEventListener(...)` + `subscribe()` flow.
+    ///
+    /// The consumer is moved into the poller, so there is no handle left to
+    /// call on this terminal — hold a separate clone (subscribe pull-mode,
+    /// then use [`crate::spawn_consumer_event_listener`] directly on a
+    /// clone) if you also need to receive messages from the same consumer.
+    ///
+    /// # Errors
+    /// - [`PulsarError::Config`] if no listener was set via [`Self::consumer_event_listener`].
+    /// - [`PulsarError::Other`] (stringified) on broker rejection or wire failure.
+    pub async fn subscribe_with_event_listener(
+        self,
+    ) -> Result<crate::ConsumerEventListenerHandle, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+        <E::ClientState as crate::SubscribeApi>::Consumer: Clone,
+    {
+        let Some(listener) = self.event_listener.clone() else {
+            return Err(PulsarError::Config(
+                "subscribe_with_event_listener() requires a listener — \
+                 call consumer_event_listener(...) first (or use subscribe() for pull mode)"
+                    .to_owned(),
+            ));
+        };
+        let consumer = self.subscribe().await?;
+        Ok(crate::consumer_listener::spawn_consumer_event_listener(
             consumer, listener,
         ))
     }

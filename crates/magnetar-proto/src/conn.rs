@@ -275,6 +275,12 @@ enum PendingRequestKind {
     },
     Ack {
         handle: ConsumerHandle,
+        /// Injected-clock (ADR-0011) timestamp `Connection::ack` recorded this
+        /// request at. Feeds the `ack_response_timeout` backstop deadline
+        /// (`poll_timeout` / `handle_timeout`, issue #346) — a `CommandAck`
+        /// whose response never arrives is reaped once
+        /// `enqueued_at + ack_response_timeout` elapses.
+        enqueued_at: Instant,
     },
     ProducerClose {
         handle: ProducerHandle,
@@ -821,7 +827,8 @@ impl Connection {
             let mut consumer = slot.state.lock();
             consumer.queue.clear();
             consumer.pending_seek = None;
-            consumer.available_permits = 0;
+            consumer.granted_permits = 0;
+            consumer.permit_balance = 0;
             consumer.consumed_since_flow = 0;
             consumer.dead_letter_pending.clear();
             consumer.batch_ack_tracker.clear();
@@ -1019,13 +1026,25 @@ impl Connection {
         // (4) Wake every in-flight receive so it observes the terminal drop and
         // returns an error (the engine's receive future re-polls, sees
         // `!is_connected()` after the paired `mark_disconnected`, and errors).
-        // Drop the slot lock BEFORE waking.
+        // Drop the slot lock BEFORE waking. Issue #348: a parked
+        // `next_active_change()` future is a terminal-close observer too —
+        // wake its waker slab in the same pass so it resolves promptly
+        // instead of hanging forever.
         for slot in self.consumers.values() {
-            let wakers: Vec<std::task::Waker> = {
+            let (receive_wakers, active_change_wakers): (
+                Vec<std::task::Waker>,
+                Vec<std::task::Waker>,
+            ) = {
                 let mut consumer = slot.state.lock();
-                consumer.receive_wakers.drain().collect()
+                (
+                    consumer.receive_wakers.drain().collect(),
+                    consumer.active_change_wakers.drain().collect(),
+                )
             };
-            for w in wakers {
+            for w in receive_wakers {
+                w.wake();
+            }
+            for w in active_change_wakers {
                 w.wake();
             }
         }
@@ -1172,7 +1191,7 @@ impl Connection {
     /// so [`Self::consumer_handle_is_terminal`] returns `true` for this handle,
     /// drains + wakes every parked `receive()` waker so the future re-polls and
     /// resolves `Err` (instead of blocking forever on a subscription that will
-    /// never reattach — `available_permits` stays `0`), drops the per-session
+    /// never reattach — `granted_permits`/`permit_balance` stay `0`), drops the per-session
     /// subscribe request so a reconnect rebuild does not re-attach it, and
     /// pushes a [`ConnectionEvent::SubscribeFailed`] so an open future parked on
     /// the event stream also observes the terminal disposition.
@@ -1206,17 +1225,28 @@ impl Connection {
         reason: &str,
     ) {
         // Set the terminal marker + drain the parked receive wakers under the
-        // slot lock, then wake them outside it.
-        let wakers: Vec<std::task::Waker> = match self.consumers.get(&handle) {
-            Some(slot) => {
-                let mut c = slot.state.lock();
-                c.terminal_failure = Some(reason.to_owned());
-                c.available_permits = 0;
-                c.receive_wakers.drain().collect()
-            }
-            None => Vec::new(),
-        };
+        // slot lock, then wake them outside it. Issue #348: also drain the
+        // active-change wakers in the same pass — a parked
+        // `next_active_change()` future must observe this terminal failure
+        // exactly like `receive()` does.
+        let (wakers, active_change_wakers): (Vec<std::task::Waker>, Vec<std::task::Waker>) =
+            match self.consumers.get(&handle) {
+                Some(slot) => {
+                    let mut c = slot.state.lock();
+                    c.terminal_failure = Some(reason.to_owned());
+                    c.granted_permits = 0;
+                    c.permit_balance = 0;
+                    (
+                        c.receive_wakers.drain().collect(),
+                        c.active_change_wakers.drain().collect(),
+                    )
+                }
+                None => (Vec::new(), Vec::new()),
+            };
         for w in wakers {
+            w.wake();
+        }
+        for w in active_change_wakers {
             w.wake();
         }
         // Drop the per-session subscribe request so a reconnect rebuild does
@@ -2737,7 +2767,7 @@ impl Connection {
                 if let Some(rid) = request_id {
                     let kind = self.pending_requests.remove(&rid);
                     if result.is_err() {
-                        if let Some(PendingRequestKind::Ack { handle }) = kind {
+                        if let Some(PendingRequestKind::Ack { handle, .. }) = kind {
                             if let Some(slot) = self.consumers.get(&handle) {
                                 let mut consumer = slot.state.lock();
                                 consumer.total_acks_failed =
@@ -2946,9 +2976,12 @@ impl Connection {
                 // Issue #307: the broker tearing the dispatcher down resets its
                 // side of the flow-control window — the re-created consumer
                 // starts at `availablePermits = 0`. Re-sync the client's permit
-                // MIRROR to 0 here so it tracks broker reality. Without this the
-                // mirror stays stale (it is purely additive on the client side;
-                // `available_permits` is never decremented as messages arrive).
+                // MIRRORS to 0 here so they track broker reality. Without this
+                // `granted_permits` stays stale (it is purely additive on the
+                // client side; it is never decremented as messages arrive).
+                // Issue #349: `permit_balance` (the REAL, decrementing balance)
+                // is zeroed in lock-step for the same reason — this is a churn
+                // boundary, not a natural drain, so both mirrors reset together.
                 // `consumed_since_flow` is reset in lock-step so the
                 // `maybe_flow` threshold restarts cleanly once flow is re-armed
                 // (mirrors the `reset` re-attach path, which zeroes both). The
@@ -2957,7 +2990,8 @@ impl Connection {
                 // (the #65 / `duringSeek` invariant).
                 if let Some(slot) = self.consumers.get(&handle) {
                     let mut consumer = slot.state.lock();
-                    consumer.available_permits = 0;
+                    consumer.granted_permits = 0;
+                    consumer.permit_balance = 0;
                     consumer.consumed_since_flow = 0;
                 }
                 // Issue #307 ROOT CAUSE: a broker-initiated `CommandCloseConsumer`
@@ -2988,6 +3022,56 @@ impl Connection {
                 // is left untouched — that consumer is supposed to reconnect on
                 // the new URL, not re-subscribe on this socket.
                 if close.assigned_broker_service_url.is_none() {
+                    // Issue #346: an ack in flight when the broker tears this
+                    // consumer's dispatcher down is orphaned — the old consumer id
+                    // is gone, so no `CommandAckResponse` for it will EVER arrive on
+                    // this connection; `resubscribe_consumer_after_broker_close`
+                    // below attaches a FRESH consumer id via `CommandSubscribe`
+                    // (see the #307 ROOT CAUSE comment above). Fail every pending
+                    // ack for `handle` fast, right here, so the caller's
+                    // `ack().await` resolves immediately instead of parking until
+                    // the `ack_response_timeout` backstop (or, if that knob is
+                    // disabled, forever).
+                    //
+                    // MUST run before `resubscribe_consumer_after_broker_close` —
+                    // that helper early-returns on `closed` /
+                    // `terminal_failure.is_some()` / `pending_seek.is_some()` /
+                    // `flow_on_subscribe_ack`, any of which would otherwise skip
+                    // this sweep entirely on some re-attach paths.
+                    //
+                    // Two-phase collect-then-mutate (mirrors the send-timeout sweep
+                    // shape in `handle_timeout`) avoids mutating `pending_requests`
+                    // while iterating it.
+                    let orphaned_acks: Vec<RequestId> = self
+                        .pending_requests
+                        .iter()
+                        .filter_map(|(rid, kind)| match kind {
+                            PendingRequestKind::Ack { handle: h, .. } if *h == handle => Some(*rid),
+                            _ => None,
+                        })
+                        .collect();
+                    for rid in orphaned_acks {
+                        self.pending_requests.remove(&rid);
+                        let message = "ack orphaned by broker consumer close".to_owned();
+                        self.outcomes.insert(
+                            PendingOpKey::Request(rid),
+                            OpOutcome::Error {
+                                request_id: rid,
+                                code: -1,
+                                message: message.clone(),
+                            },
+                        );
+                        self.wake_for_request(rid);
+                        if let Some(slot) = self.consumers.get(&handle) {
+                            let mut consumer = slot.state.lock();
+                            consumer.total_acks_failed =
+                                consumer.total_acks_failed.saturating_add(1);
+                        }
+                        self.events.push_back(ConnectionEvent::AckResponse {
+                            request_id: Some(rid),
+                            result: Err(message),
+                        });
+                    }
                     // Same-broker bundle reassignment: re-subscribe in place and
                     // DO NOT surface a `ConsumerClosedByBroker` event — the
                     // re-attach is transparent to the runtime (which would
@@ -3038,34 +3122,45 @@ impl Connection {
                 let active = acc.is_active.unwrap_or(false);
                 self.events
                     .push_back(ConnectionEvent::ActiveConsumerChanged { handle, active });
+                // Issue #348: record the transition into the per-slot
+                // active-change ring (`is_active` + `active_changes` +
+                // waker fan-out) under the SAME per-slot lock acquisition
+                // the #307 reflow predicate below reads — one lock section
+                // for record + predicate, dropped before `initial_flow`
+                // re-acquires it (ADR-0038 lock ordering).
+                //
                 // Failover re-arm (issue #307): when a standby consumer is
                 // promoted to active and is sitting at zero broker-side
                 // permits, nothing else re-issues flow — `initial_flow` only
                 // runs at subscribe time / re-attach ack, and `maybe_flow`
                 // only fires once messages have been consumed (which can never
-                // happen at `available_permits == 0`, since the broker pushes
+                // happen at `granted_permits == 0`, since the broker pushes
                 // nothing). Such a promoted-but-starved consumer would block
                 // `receive()` forever with a non-empty broker backlog. Re-arm
                 // flow exactly once on promotion.
                 //
                 // Guarded so an already-fed consumer is left untouched (no
-                // double-flow): only when `available_permits == 0`, and only
-                // when the consumer is in a dispatch-eligible state — not
+                // double-flow): only when `granted_permits == 0` — issue #349
+                // kept this gate on the additive grant mirror (not
+                // `permit_balance`), the same "has the broker been told it may
+                // use anything yet" question the want-have delta answers — and
+                // only when the consumer is in a dispatch-eligible state — not
                 // user-closed, not paused, no in-flight seek freezing the
                 // queue, not terminal, and not mid-re-attach (the re-attach
                 // gate at the `Success` arm owns that flow). The predicate read
                 // takes only the per-slot lock and is dropped before
                 // `initial_flow` re-acquires it (ADR-0038 lock ordering).
-                let needs_reflow = active
-                    && self.consumers.get(&handle).is_some_and(|slot| {
-                        let consumer = slot.state.lock();
-                        consumer.available_permits == 0
-                            && !consumer.closed
-                            && !consumer.paused
-                            && consumer.pending_seek.is_none()
-                            && !consumer.reached_end_of_topic
-                            && !consumer.flow_on_subscribe_ack
-                    });
+                let needs_reflow = self.consumers.get(&handle).is_some_and(|slot| {
+                    let mut consumer = slot.state.lock();
+                    consumer.record_active_change(active);
+                    active
+                        && consumer.granted_permits == 0
+                        && !consumer.closed
+                        && !consumer.paused
+                        && consumer.pending_seek.is_none()
+                        && !consumer.reached_end_of_topic
+                        && !consumer.flow_on_subscribe_ack
+                });
                 if needs_reflow {
                     let _ = self.initial_flow(handle);
                     tracing::debug!(
@@ -3600,6 +3695,19 @@ impl Connection {
                 consider(d);
             }
         }
+        // Issue #346: surface the earliest pending-ack deadline
+        // (`enqueued_at + ack_response_timeout`) so the driver schedules a
+        // deterministic wake for `handle_timeout`'s reap sweep. Skipped
+        // entirely when the knob is `None` (disabled) — no spurious wakeups,
+        // load-bearing for moonpool determinism (an armed-but-never-firing
+        // deadline would still perturb the simulated wake schedule).
+        if let Some(timeout) = self.config.ack_response_timeout {
+            for kind in self.pending_requests.values() {
+                if let PendingRequestKind::Ack { enqueued_at, .. } = kind {
+                    consider(crate::time::deadline_with_clamp(*enqueued_at, timeout));
+                }
+            }
+        }
         next
     }
 
@@ -3742,6 +3850,7 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                now,
             );
         }
         // Flush the ack-grouping tracker. The actions go through the shared dispatcher
@@ -3749,7 +3858,7 @@ impl Connection {
         // routed back through the existing pending-requests slot, but no user future is
         // tied to it (ack_grouped_* is fire-and-forget).
         if !ack_actions.is_empty() {
-            self.dispatch_ack_actions(ack_actions);
+            self.dispatch_ack_actions(ack_actions, now);
         }
 
         // Per-producer batch flush sweep — Java `ProducerBuilder#batchingMaxPublishDelay`.
@@ -3808,6 +3917,53 @@ impl Connection {
                 code: -1,
                 message: "send timeout".to_owned(),
             });
+        }
+
+        // Issue #346: `ack_response_timeout` backstop — reap any pending ack
+        // whose `enqueued_at + ack_response_timeout` has elapsed. This is the
+        // generic backstop for a broker that goes silent without ever
+        // tearing the consumer down (dropped `CommandAckResponse` on an
+        // otherwise healthy connection); the same-broker `CloseConsumer`
+        // sweep above handles the fast-path for the broker-torn-the-consumer-
+        // down case. Two-phase collect-then-mutate, same shape as the
+        // send-timeout sweep above. Skipped entirely when the knob is
+        // disabled (`None`) — `poll_timeout` never arms a deadline in that
+        // case either, so this loop is then a guaranteed no-op.
+        if let Some(timeout) = self.config.ack_response_timeout {
+            let expired_acks: Vec<(RequestId, ConsumerHandle)> = self
+                .pending_requests
+                .iter()
+                .filter_map(|(rid, kind)| match kind {
+                    PendingRequestKind::Ack {
+                        handle,
+                        enqueued_at,
+                    } if now >= crate::time::deadline_with_clamp(*enqueued_at, timeout) => {
+                        Some((*rid, *handle))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (rid, handle) in expired_acks {
+                self.pending_requests.remove(&rid);
+                let message = "ack timeout".to_owned();
+                self.outcomes.insert(
+                    PendingOpKey::Request(rid),
+                    OpOutcome::Error {
+                        request_id: rid,
+                        code: -1,
+                        message: message.clone(),
+                    },
+                );
+                self.wake_for_request(rid);
+                if let Some(slot) = self.consumers.get(&handle) {
+                    let mut consumer = slot.state.lock();
+                    consumer.total_acks_failed = consumer.total_acks_failed.saturating_add(1);
+                }
+                self.events.push_back(ConnectionEvent::AckResponse {
+                    request_id: Some(rid),
+                    result: Err(message),
+                });
+            }
         }
     }
 
@@ -4371,11 +4527,33 @@ impl Connection {
     /// Number of dispatch permits the consumer still has with the broker — i.e. messages
     /// it has authorised the broker to push without an explicit `CommandFlow`. Returns `0`
     /// for unknown handles. Mirrors Java `ConsumerBase#getAvailablePermits`.
+    ///
+    /// Issue #349 scope note: this reads [`crate::consumer::ConsumerState::granted_permits`]
+    /// (the additive grant mirror), unchanged by the permit-balance split — out of scope per
+    /// the issue's four locked design items, which name only
+    /// [`crate::receiver_queue::FlowStats::available_permits`]. For the REAL, decrementing
+    /// balance see [`crate::consumer::ConsumerState::permit_balance`]; extending Java-parity
+    /// (a genuinely decrementing counter) to this public accessor is a separate, unscoped
+    /// change.
     #[must_use]
     pub fn consumer_available_permits(&self, handle: ConsumerHandle) -> u32 {
         self.consumers
             .get(&handle)
-            .map_or(0, |slot| slot.state.lock().available_permits)
+            .map_or(0, |slot| slot.state.lock().granted_permits)
+    }
+
+    /// Last broker-reported Failover active/standby state for `handle`
+    /// (issue #348). `None` for an unknown handle OR a consumer that has
+    /// never received a `CommandActiveConsumerChange` (e.g. a `Shared` /
+    /// `Exclusive` subscription, which the broker never sends the command
+    /// for). Mirrors Java `ConsumerEventListener`'s implicit state — the
+    /// runtime `Consumer::is_active()` accessor reads this via the per-slot
+    /// lock, no global lock required.
+    #[must_use]
+    pub fn consumer_is_active(&self, handle: ConsumerHandle) -> Option<bool> {
+        self.consumers
+            .get(&handle)
+            .and_then(|slot| slot.state.lock().is_active)
     }
 
     /// The consumer's CURRENT receiver-queue target (issue #301). For the
@@ -4520,7 +4698,7 @@ impl Connection {
     }
 
     /// Acknowledge messages.
-    pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest) -> RequestId {
+    pub fn ack(&mut self, handle: ConsumerHandle, ack: AckRequest, now: Instant) -> RequestId {
         let request_id = self.alloc_request_id();
         let n_ids = ack.message_ids.len() as u64;
         // Stop tracking the acked ids in both the unacked-message tracker and the nack tracker
@@ -4630,8 +4808,13 @@ impl Connection {
             ..Default::default()
         };
         let _ = self.encode_command(&base);
-        self.pending_requests
-            .insert(request_id, PendingRequestKind::Ack { handle });
+        self.pending_requests.insert(
+            request_id,
+            PendingRequestKind::Ack {
+                handle,
+                enqueued_at: now,
+            },
+        );
         if let Some(slot) = self.consumers.get(&handle) {
             let mut consumer = slot.state.lock();
             consumer.total_acks_sent = consumer.total_acks_sent.saturating_add(n_ids);
@@ -4660,7 +4843,7 @@ impl Connection {
                 .map(|t| t.add_individual(message_id, now))
         });
         if let Some(actions) = actions {
-            self.dispatch_ack_actions(actions);
+            self.dispatch_ack_actions(actions, now);
         } else {
             let _ = self.ack(
                 handle,
@@ -4670,6 +4853,7 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                now,
             );
         }
     }
@@ -4690,7 +4874,7 @@ impl Connection {
                 .map(|t| t.add_cumulative(message_id, now))
         });
         if let Some(actions) = actions {
-            self.dispatch_ack_actions(actions);
+            self.dispatch_ack_actions(actions, now);
         } else {
             let _ = self.ack(
                 handle,
@@ -4700,11 +4884,12 @@ impl Connection {
                     properties: Vec::new(),
                     txn_id: None,
                 },
+                now,
             );
         }
     }
 
-    fn dispatch_ack_actions(&mut self, actions: Vec<crate::trackers::AckAction>) {
+    fn dispatch_ack_actions(&mut self, actions: Vec<crate::trackers::AckAction>, now: Instant) {
         for action in actions {
             match action {
                 crate::trackers::AckAction::SendIndividualAck {
@@ -4719,6 +4904,7 @@ impl Connection {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        now,
                     );
                 }
                 crate::trackers::AckAction::SendCumulativeAck { handle, message_id } => {
@@ -4730,6 +4916,7 @@ impl Connection {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        now,
                     );
                 }
             }
@@ -5358,18 +5545,28 @@ impl Connection {
     /// Close a consumer. The caller is expected to await the broker ack via
     /// a `RequestFut`-style waiter that drains the recorded [`OpOutcome`]
     /// with [`Self::take_outcome`].
-    pub fn close_consumer(&mut self, handle: ConsumerHandle) -> RequestId {
-        self.close_consumer_inner(handle, false)
+    ///
+    /// `now` (ADR-0011 clock injection) is only consumed when this consumer
+    /// has a non-empty ack-grouping tracker to flush — the flush routes
+    /// through [`Self::ack`], which stamps the flushed `CommandAck`'s
+    /// `enqueued_at` for the `ack_response_timeout` backstop (issue #346).
+    pub fn close_consumer(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
+        self.close_consumer_inner(handle, false, now)
     }
 
     /// Fire-and-forget variant of [`Self::close_consumer`] for the engines'
     /// last-clone drop guard. The broker ack is consumed in-place because no
     /// waiter exists to drain it.
-    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle) -> RequestId {
-        self.close_consumer_inner(handle, true)
+    pub fn close_consumer_forget(&mut self, handle: ConsumerHandle, now: Instant) -> RequestId {
+        self.close_consumer_inner(handle, true, now)
     }
 
-    fn close_consumer_inner(&mut self, handle: ConsumerHandle, forget: bool) -> RequestId {
+    fn close_consumer_inner(
+        &mut self,
+        handle: ConsumerHandle,
+        forget: bool,
+        now: Instant,
+    ) -> RequestId {
         let ack_actions = self.consumers.get(&handle).and_then(|slot| {
             slot.state
                 .lock()
@@ -5378,7 +5575,7 @@ impl Connection {
                 .map(crate::trackers::AckGroupingTracker::flush)
         });
         if let Some(actions) = ack_actions {
-            self.dispatch_ack_actions(actions);
+            self.dispatch_ack_actions(actions, now);
         }
 
         let request_id = self.alloc_request_id();
@@ -5767,6 +5964,41 @@ impl Connection {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().cancel_receive_waker(slab_key);
         }
+    }
+
+    /// Register a per-consumer active-change waker (issue #348). Returns
+    /// `Some(slab_key)` if the consumer is alive (the caller MUST evict the
+    /// slot via [`Self::cancel_consumer_active_change_waker`] on drop), or
+    /// `None` if the consumer has been closed in the meantime. Mirrors
+    /// [`Self::register_consumer_receive_waker`].
+    pub fn register_consumer_active_change_waker(
+        &mut self,
+        handle: ConsumerHandle,
+        waker: Waker,
+    ) -> Option<usize> {
+        let slot = self.consumers.get(&handle)?;
+        Some(slot.state.lock().register_active_change_waker(waker))
+    }
+
+    /// Evict a previously-registered per-consumer active-change waker.
+    /// Idempotent — safe to call from a `Drop` impl even if the consumer has
+    /// been removed or the slot already drained. Mirrors
+    /// [`Self::cancel_consumer_receive_waker`].
+    pub fn cancel_consumer_active_change_waker(&mut self, handle: ConsumerHandle, slab_key: usize) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().cancel_active_change_waker(slab_key);
+        }
+    }
+
+    /// Pop the oldest not-yet-observed active-change transition for `handle`
+    /// (issue #348). Returns `None` for an unknown handle or an empty ring.
+    /// Mirrors [`Self::pop_message`].
+    pub fn pop_consumer_active_change(&mut self, handle: ConsumerHandle) -> Option<bool> {
+        self.consumers
+            .get(&handle)?
+            .state
+            .lock()
+            .pop_active_change()
     }
 
     /// Drain a single message from the given consumer's queue.
@@ -8026,6 +8258,7 @@ mod conn_state_tests {
                 properties: Vec::new(),
                 txn_id: None,
             },
+            Instant::now(),
         );
         let _ = drain_outbound_commands(&mut conn);
 
@@ -10661,6 +10894,13 @@ mod conn_state_tests {
         let flow = drain_command_flow(&mut conn, handle).expect("CommandFlow emitted on promotion");
         assert_eq!(flow.message_permits, 100);
 
+        // Issue #348: the per-slot active-state surface reflects the promotion.
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active must track the broker-reported promotion"
+        );
+
         // The ActiveConsumerChanged event is still surfaced.
         let mut saw_event = false;
         while let Some(ev) = conn.poll_event() {
@@ -10695,6 +10935,11 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no extra CommandFlow when permits are already outstanding"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active must track the broker-reported redundant promotion"
+        );
     }
 
     #[test]
@@ -10720,6 +10965,11 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow for a paused consumer"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active tracks the broker report independently of the reflow gate"
+        );
     }
 
     #[test]
@@ -10743,6 +10993,11 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow for a closed consumer"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(true),
+            "consumer_is_active tracks the broker report independently of the reflow gate"
+        );
     }
 
     #[test]
@@ -10765,6 +11020,85 @@ mod conn_state_tests {
             drain_command_flow(&mut conn, handle).is_none(),
             "no CommandFlow on demotion"
         );
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            Some(false),
+            "consumer_is_active must track the broker-reported demotion"
+        );
+    }
+
+    /// Issue #348: a recorded active-change transition is poppable exactly
+    /// once via [`Connection::pop_consumer_active_change`], mirroring
+    /// `pop_message`'s single-consumption semantics.
+    #[test]
+    fn active_change_recorded_and_poppable() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+
+        let frame = active_consumer_change_frame(handle, true);
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle active-change");
+
+        assert_eq!(
+            conn.pop_consumer_active_change(handle),
+            Some(true),
+            "the recorded transition must be poppable"
+        );
+        assert_eq!(
+            conn.pop_consumer_active_change(handle),
+            None,
+            "a popped transition is consumed — the ring drains once"
+        );
+    }
+
+    /// Issue #348: the `active_changes` ring is capped at `ACTIVE_CHANGES_CAP`
+    /// (32) — pushing a 33rd transition drops the oldest, not the newest.
+    #[test]
+    fn active_change_ring_caps_at_32_dropping_oldest() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+
+        let pushed: Vec<bool> = (0..33u32).map(|i| i % 2 == 0).collect();
+        for &active in &pushed {
+            let frame = active_consumer_change_frame(handle, active);
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle active-change");
+        }
+
+        let mut drained = Vec::new();
+        while let Some(active) = conn.pop_consumer_active_change(handle) {
+            drained.push(active);
+        }
+
+        assert_eq!(drained.len(), 32, "the ring caps at ACTIVE_CHANGES_CAP");
+        assert_eq!(
+            drained,
+            pushed[1..],
+            "the OLDEST transition (index 0) is dropped, the rest survive in order"
+        );
+    }
+
+    /// Issue #348: `consumer_is_active` mirrors the last broker report —
+    /// `None` before any `CommandActiveConsumerChange`, then flips with each
+    /// subsequent frame regardless of direction.
+    #[test]
+    fn is_active_tracks_last_broker_report() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        assert_eq!(
+            conn.consumer_is_active(handle),
+            None,
+            "no active-change frame observed yet"
+        );
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle active-change (promote)");
+        assert_eq!(conn.consumer_is_active(handle), Some(true));
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, false))
+            .expect("handle active-change (demote)");
+        assert_eq!(conn.consumer_is_active(handle), Some(false));
+
+        conn.handle_bytes(Instant::now(), &active_consumer_change_frame(handle, true))
+            .expect("handle active-change (re-promote)");
+        assert_eq!(conn.consumer_is_active(handle), Some(true));
     }
 
     /// Drain the next `CommandSubscribe` for `handle` out of the outbound
@@ -10937,6 +11271,353 @@ mod conn_state_tests {
     }
 
     // -------------------------------------------------------------------
+    // Issue #346 — ack orphaned by same-broker CloseConsumer + no deadline.
+    //
+    // Two complementary fixes: (1) the same-broker CloseConsumer arm above
+    // fails every pending ack for the torn-down handle immediately (fast
+    // path); (2) `ack_response_timeout` is a generic backstop that reaps a
+    // pending ack whose CommandAckResponse never arrives for ANY reason
+    // (broker silently drops it, etc.), independent of a CloseConsumer ever
+    // landing.
+    // -------------------------------------------------------------------
+
+    /// Primary sweep (fast path): an ack in flight when the broker tears this
+    /// consumer's dispatcher down via a same-broker `CommandCloseConsumer`
+    /// (`assigned_broker_service_url = None`) is orphaned — the old consumer
+    /// id is gone, so no `CommandAckResponse` for it will ever arrive on this
+    /// connection (`resubscribe_consumer_after_broker_close` attaches a FRESH
+    /// id). The close-handler sweep must fail the pending ack immediately
+    /// with `Error{code: -1, message: "ack orphaned by broker consumer
+    /// close"}` instead of leaving it parked until the `ack_response_timeout`
+    /// backstop (or forever, if that knob is disabled).
+    #[test]
+    fn ack_orphaned_by_same_broker_close_fails_fast() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker_inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&waker_inner).into();
+
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 1,
+            entry_id: 1,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        let key = PendingOpKey::Request(rid);
+        conn.register_waker(key, waker.clone());
+        assert!(
+            conn.has_pending_request_for_test(rid),
+            "the ack must be pending before the close frame lands"
+        );
+
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0 + Duration::from_millis(1), &close)
+            .expect("handle broker close");
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Error {
+                request_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(request_id, rid);
+                assert_eq!(code, -1, "orphaned-ack uses the -1 sentinel");
+                assert_eq!(message, "ack orphaned by broker consumer close");
+            }
+            other => panic!("expected an orphaned-ack Error outcome, got {other:?}"),
+        }
+        assert!(
+            !conn.has_pending_request_for_test(rid),
+            "the orphaned ack must drain out of pending_requests"
+        );
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "the parked waker must be woken exactly once"
+        );
+        assert_eq!(
+            conn.consumer_stats(handle)
+                .expect("consumer stats")
+                .total_acks_failed,
+            1,
+            "the orphaned ack must bump total_acks_failed"
+        );
+    }
+
+    /// Backstop deadline: an ack whose `CommandAckResponse` never arrives (the
+    /// broker goes silent without ever tearing the consumer down) must not
+    /// hang the caller's `ack().await` forever. Once the INJECTED clock
+    /// (ADR-0011) crosses `enqueued_at + ack_response_timeout`,
+    /// `handle_timeout`'s reap sweep resolves the pending ack with
+    /// `code=-1, "ack timeout"` and wakes the parked waker. Mirrors the
+    /// `default_send_timeout_fires_when_receipt_lost` shape (this file).
+    #[test]
+    fn pending_ack_deadline_reaps_when_broker_silent() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker_inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&waker_inner).into();
+
+        assert_eq!(
+            ConnectionConfig::default().ack_response_timeout,
+            Some(Duration::from_secs(30)),
+            "ack_response_timeout default must be 30s (Java-parity, mirrors the #304 \
+             send_timeout default, ADR-0072)"
+        );
+
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 2,
+            entry_id: 2,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+        let key = PendingOpKey::Request(rid);
+        conn.register_waker(key, waker.clone());
+
+        assert!(
+            conn.poll_timeout().is_some(),
+            "a wake-up deadline must be scheduled while an ack is pending"
+        );
+
+        // Just BEFORE the deadline: no timeout, no wake, no outcome.
+        conn.handle_timeout(t0 + Duration::from_secs(29));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no ack-timeout outcome before the 30s deadline"
+        );
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            0,
+            "waker must not fire before the deadline"
+        );
+
+        // Past the deadline: the sweep resolves the ack with a timeout error
+        // and wakes the parked waker.
+        conn.handle_timeout(t0 + Duration::from_secs(31));
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Error {
+                request_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(request_id, rid);
+                assert_eq!(code, -1, "ack-timeout uses the -1 sentinel");
+                assert_eq!(message, "ack timeout");
+            }
+            other => panic!("expected an ack-timeout Error outcome, got {other:?}"),
+        }
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "the parked waker must be woken exactly once on timeout"
+        );
+        assert!(
+            !conn.has_pending_request_for_test(rid),
+            "the timed-out ack must drain out of pending_requests"
+        );
+    }
+
+    /// `ack_response_timeout: None` disables the backstop entirely: an ack
+    /// left pending is never reaped no matter how far the injected clock
+    /// advances, and it contributes no deadline to `poll_timeout` (load-
+    /// bearing for moonpool determinism — an armed-but-never-firing deadline
+    /// would still perturb the simulated wake schedule).
+    #[test]
+    fn disabled_ack_timeout_never_reaps() {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                ack_response_timeout: None,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/ack-timeout-disabled".to_owned(),
+            subscription: "sub-ack-timeout-disabled".to_owned(),
+            receiver_queue_size: 16,
+            durable: true,
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+
+        let before = conn.poll_timeout();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 3,
+            entry_id: 3,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        assert_eq!(
+            conn.poll_timeout(),
+            before,
+            "a disabled ack_response_timeout must not perturb poll_timeout — the pending \
+             ack contributes no deadline"
+        );
+
+        conn.handle_timeout(t0 + Duration::from_hours(1));
+        assert!(
+            conn.has_pending_request_for_test(rid),
+            "a disabled ack_response_timeout must never reap the pending ack"
+        );
+        let key = PendingOpKey::Request(rid);
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no outcome must materialize for a disabled-timeout ack"
+        );
+    }
+
+    /// No-false-positive companion to `pending_ack_deadline_reaps_when_broker_silent`:
+    /// an ack whose `CommandAckResponse` lands BEFORE the deadline resolves
+    /// normally with a `Success` outcome, and ticking `handle_timeout` well
+    /// past the default 30s deadline afterwards must not spuriously re-fire —
+    /// the entry already drained out of `pending_requests` on the real
+    /// response.
+    #[test]
+    fn ack_response_before_deadline_resolves_normally() {
+        let (mut conn, handle) = handshake_subscribe_failover();
+        let _ = conn.initial_flow(handle);
+        let _ = conn.poll_transmit();
+
+        let t0 = Instant::now();
+        let acked = MessageId {
+            ledger_id: 4,
+            entry_id: 4,
+            partition: -1,
+            batch_index: -1,
+            batch_size: -1,
+            #[cfg(feature = "scalable-topics")]
+            segment_id: None,
+        };
+        let rid = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![acked],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            t0,
+        );
+        let _ = conn.poll_transmit();
+
+        // Broker acks well within the 30s window.
+        let ack_response = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(rid.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ack_response).expect("encode CommandAckResponse");
+        conn.handle_bytes(t0 + Duration::from_secs(1), &buf)
+            .expect("handle AckResponse");
+
+        let key = PendingOpKey::Request(rid);
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Success { request_id }) => assert_eq!(request_id, rid),
+            other => {
+                panic!("expected a Success outcome for the timely ack response, got {other:?}")
+            }
+        }
+
+        // Well past the default 30s deadline: the reap sweep must be a no-op
+        // — the entry already drained out of pending_requests when the real
+        // response landed.
+        conn.handle_timeout(t0 + Duration::from_hours(1));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no stale ack-timeout outcome must appear after the real response already resolved it"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // Issue #301 — pluggable receiver-queue policy, connection-driven adjust.
     //
     // The `Auto` policy ticks from `handle_timeout`'s injected `now`; a grown
@@ -10995,17 +11676,22 @@ mod conn_state_tests {
 
     #[test]
     fn auto_policy_grows_target_under_starvation_and_emits_incremental_flow() {
-        // With the broker holding zero permits (starvation) and the byte budget
-        // wide open, the adjust tick doubles the target and emits an incremental
+        // Issue #349: the broker's real permit BALANCE is drained by genuine
+        // dispatch (not a synthetic field write) and the byte budget is wide
+        // open — the adjust tick doubles the target and emits an incremental
         // flow for the delta.
         let interval = Duration::from_secs(1);
         let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
         let t0 = Instant::now();
 
-        // Drain the broker's grant to zero so `available_permits == 0` is the
-        // observed signal at tick time.
-        if let Some(slot) = conn.consumers.get(&handle) {
-            slot.state.lock().available_permits = 0;
+        // Drain the broker-side permit BALANCE via real dispatch — 100
+        // single-message deliveries against the 100-permit initial grant —
+        // so `available_permits == 0` is the genuine starvation signal at
+        // tick time, not a manually-zeroed mirror.
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
         }
 
         // First tick arms the adjust clock (no adjust yet).
@@ -11027,8 +11713,10 @@ mod conn_state_tests {
         let flow = drain_command_flow(&mut conn, handle)
             .expect("growing the target emits an incremental flow");
         assert_eq!(
-            flow.message_permits, 200,
-            "the broker had zero permits, so the delta tops it up to the new target"
+            flow.message_permits, 100,
+            "the broker had already been granted 100 permits (untouched by dispatch — \
+             `granted_permits` is a purely additive mirror); the delta tops it up from \
+             100 to the new 200 target"
         );
         assert_eq!(
             conn.consumer_available_permits(handle),
@@ -11062,13 +11750,17 @@ mod conn_state_tests {
     #[test]
     fn fixed_policy_default_never_adjusts() {
         // The default `Fixed` policy disables auto-adjust: no adjust deadline is
-        // surfaced and the target never moves even under starvation.
+        // surfaced and the target never moves even under genuine dispatch-driven
+        // starvation (real deliveries draining the permit balance to zero, not a
+        // synthetic field write).
         let (mut conn, handle) = handshake_subscribe_failover(); // receiver_queue_size: 100, Fixed
         let _ = conn.initial_flow(handle);
         let _ = conn.poll_transmit();
         let t0 = Instant::now();
-        if let Some(slot) = conn.consumers.get(&handle) {
-            slot.state.lock().available_permits = 0;
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
         }
         // Many ticks: a Fixed consumer never grows and never flows from adjust.
         for i in 0..10u32 {
@@ -11082,6 +11774,92 @@ mod conn_state_tests {
         assert!(
             drain_command_flow(&mut conn, handle).is_none(),
             "Fixed default never emits an adjust-driven flow"
+        );
+    }
+
+    #[test]
+    fn auto_policy_grows_under_real_dispatch_starvation() {
+        // Issue #349 regression: before the permit-balance split, the
+        // permit mirror was purely additive (grants only, never decremented
+        // as messages actually arrived), so a REAL dispatch-driven
+        // starvation never registered as zero and `Auto` could never
+        // observe the starvation signal it needs to grow. This test drives
+        // genuine message deliveries — not a synthetic field write — until
+        // the broker-side permit balance is truly exhausted, then asserts
+        // the adjust tick grows the target and emits an incremental flow.
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
+        let t0 = Instant::now();
+
+        // Real dispatch-unit starvation: deliver exactly the 100 permits'
+        // worth of single messages the initial flow granted, so the REAL
+        // balance drains to zero — no manual field write anywhere.
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
+        }
+
+        // First tick arms the schedule (no adjust yet).
+        conn.handle_timeout(t0);
+        let _ = conn.poll_transmit();
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "the arming tick does not itself adjust"
+        );
+
+        // Second tick, one interval later: real dispatch-driven starvation
+        // must be observed and must double the target.
+        conn.handle_timeout(t0 + interval);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "real dispatch-driven starvation must double the target (issue #349)"
+        );
+        let flow = drain_command_flow(&mut conn, handle)
+            .expect("growing the target under real starvation must emit an incremental flow");
+        assert_eq!(
+            flow.message_permits, 100,
+            "the broker had already been granted 100 permits (untouched by dispatch); \
+             the delta tops it up from 100 to the new 200 target"
+        );
+    }
+
+    #[test]
+    fn adjust_skips_growth_during_churn_window() {
+        // Issue #349 churn-window guard: a same-broker `CloseConsumer`
+        // zeroes the permit mirror as part of the #307 re-attach dance —
+        // that zero means "no outstanding grant to have starved against",
+        // NOT "the user is falling behind". Without the guard, an adjust
+        // tick landing in this window would misread the churn-zeroed
+        // balance as starvation and grow the target / emit a flow the
+        // broker would drop (it no longer knows this consumer id until the
+        // resubscribe's `Success` lands).
+        let interval = Duration::from_secs(1);
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
+        let t0 = Instant::now();
+
+        // Arm the adjust schedule before the churn event.
+        conn.handle_timeout(t0);
+        let _ = conn.poll_transmit();
+
+        // Same-broker bundle reassignment: the broker tears the consumer
+        // down and re-subscribes it in place, zeroing the permit mirror.
+        let close = close_consumer_frame(handle);
+        conn.handle_bytes(t0, &close).expect("handle broker close");
+        let _ = conn.poll_transmit();
+
+        // Tick past the adjust interval while sitting in the churn window.
+        conn.handle_timeout(t0 + interval);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "a churn-window tick must not grow the target"
+        );
+        assert!(
+            drain_command_flow(&mut conn, handle).is_none(),
+            "a churn-window tick must not emit an adjust-driven flow"
         );
     }
 
@@ -12011,6 +12789,7 @@ mod conn_state_tests {
                 properties: Vec::new(),
                 txn_id: None,
             },
+            t0,
         );
         assert_eq!(
             batch_tracker_keys(&conn, handle),
@@ -12047,6 +12826,7 @@ mod conn_state_tests {
                         properties: Vec::new(),
                         txn_id: None,
                     },
+                    t0,
                 );
                 assert_eq!(
                     batch_tracker_keys(&conn, handle),
@@ -12335,7 +13115,7 @@ mod consumer_close_contract_tests {
         let slot = conn.consumer(handle).expect("slot exists").clone();
         assert!(!slot.state.lock().closed, "fresh consumer must be open");
 
-        let _request_id = conn.close_consumer(handle);
+        let _request_id = conn.close_consumer(handle, now);
 
         assert!(
             slot.state.lock().closed,
@@ -12350,7 +13130,7 @@ mod consumer_close_contract_tests {
         let handle = subscribe(&mut conn, "close-frame");
         let _ = conn.poll_transmit();
 
-        let _request_id = conn.close_consumer(handle);
+        let _request_id = conn.close_consumer(handle, now);
 
         assert_eq!(
             drain_command_types(&mut conn),
@@ -12386,9 +13166,9 @@ mod consumer_close_contract_tests {
             conn.ack_grouped_individual(handle, message_id, now);
 
             if forget {
-                let _request_id = conn.close_consumer_forget(handle);
+                let _request_id = conn.close_consumer_forget(handle, now);
             } else {
-                let _request_id = conn.close_consumer(handle);
+                let _request_id = conn.close_consumer(handle, now);
             }
 
             assert_eq!(
@@ -12409,7 +13189,7 @@ mod consumer_close_contract_tests {
         let handle = subscribe(&mut conn, "forget-success");
         let slot = conn.consumer(handle).expect("slot exists").clone();
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         assert!(
             slot.state.lock().closed,
             "forget variant must still flip the closed flag synchronously"
@@ -12429,7 +13209,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-error");
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         ack_error(&mut conn, request_id.0, now);
 
         assert!(
@@ -12445,7 +13225,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-reset");
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         conn.reset();
 
         assert!(
@@ -12461,7 +13241,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "forget-fail-all");
 
-        let request_id = conn.close_consumer_forget(handle);
+        let request_id = conn.close_consumer_forget(handle, now);
         conn.fail_all_pending("synthetic terminal drop");
 
         assert!(
@@ -12477,7 +13257,7 @@ mod consumer_close_contract_tests {
         let mut conn = handshake_complete(now);
         let handle = subscribe(&mut conn, "awaited-close");
 
-        let request_id = conn.close_consumer(handle);
+        let request_id = conn.close_consumer(handle, now);
         ack_success(&mut conn, request_id.0, now);
 
         assert!(
@@ -13229,7 +14009,7 @@ mod otel_property_round_trip_tests {
             ..Default::default()
         });
         let _ = conn.poll_transmit();
-        let _ = conn.close_consumer(handle);
+        let _ = conn.close_consumer(handle, std::time::Instant::now());
         let _ = conn.poll_transmit();
 
         assert_eq!(conn.retry_consumer_subscribe(handle), None);

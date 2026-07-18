@@ -136,6 +136,12 @@ magnetar-messagecrypto     = { workspace = true, optional = true }
 opentelemetry              = { workspace = true, optional = true }
 bytes                      = { workspace = true }
 futures-util               = { workspace = true, optional = true, features = ["std", "async-await"] }
+# Already a workspace dep of `magnetar-proto`; wired in here so the
+# `ConsumerApi::receive_latency_histogram` / `ProducerApi::
+# send_latency_histogram` trait methods (issue #347) can name
+# `hdrhistogram::Histogram<u64>` directly. No new crate enters the
+# dependency graph.
+hdrhistogram                = { workspace = true }
 parking_lot                = { workspace = true }
 thiserror                  = { workspace = true }
 tokio                      = { workspace = true, optional = true, features = ["rt", "sync", "test-util"] }

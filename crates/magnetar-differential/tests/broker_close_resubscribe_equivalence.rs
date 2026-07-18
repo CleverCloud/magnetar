@@ -21,13 +21,21 @@
 //! For contrast the test also drives the `Some(url)` (PIP-188 topic migration)
 //! case, which MUST keep surfacing `ConsumerClosedByBroker` and must NOT
 //! re-subscribe in place — both engines, identically.
+//!
+//! Issue #346 extension: an ack issued just before the close is now part of
+//! the observable reaction. In the same-broker (`url = None`) case the close
+//! handler's orphan sweep must fail that ack immediately
+//! (`code=-1, "ack orphaned by broker consumer close"`) on both engines
+//! identically; in the PIP-188 migration case (`url = Some`) the ack is left
+//! pending (the generic `ack_response_timeout` backstop, not this sweep,
+//! eventually reaps it) — also identically on both engines.
 
 use std::time::Instant;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    Connection, ConnectionConfig, ConnectionEvent, ConsumerHandle, SubscribeRequest, decode_one,
-    encode_command, pb,
+    AckRequest, Connection, ConnectionConfig, ConnectionEvent, ConsumerHandle, MessageId,
+    OpOutcome, PendingOpKey, SubscribeRequest, decode_one, encode_command, pb,
 };
 
 const RQ: usize = 8;
@@ -52,6 +60,12 @@ struct Reaction {
     permits_after_ack: u32,
     /// Consumer still open (re-attach must not close it)?
     open_after: bool,
+    /// Issue #346: outcome of an ack issued immediately before the close,
+    /// read right after the close is handled (before the re-subscribe ack).
+    /// `Some((code, message))` when the close's orphan sweep resolved it
+    /// synchronously; `None` when it is still pending (the PIP-188 migration
+    /// branch, which the sweep does not touch).
+    ack_outcome_after_close: Option<(i32, String)>,
 }
 
 fn handshake_response_bytes() -> BytesMut {
@@ -172,6 +186,30 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
     let _ = drain_outbound(conn, handle); // discard subscribe + initial flow frames
     let permits_before_close = conn.consumer_available_permits(handle);
 
+    // Issue #346: an ack in flight when the close lands — issued (and its
+    // CommandAck frame drained off the wire) BEFORE peeking `resub_rid` below
+    // so the peek still predicts the re-subscribe's request id, not this
+    // ack's.
+    let ack_rid = conn.ack(
+        handle,
+        AckRequest {
+            message_ids: vec![MessageId {
+                ledger_id: 1,
+                entry_id: 1,
+                partition: -1,
+                batch_index: -1,
+                batch_size: -1,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            }],
+            ack_type: pb::command_ack::AckType::Individual,
+            properties: Vec::new(),
+            txn_id: None,
+        },
+        t0,
+    );
+    let _ = drain_outbound(conn, handle); // discard the CommandAck frame
+
     // The re-subscribe (if any) will allocate this request id.
     let resub_rid = conn.peek_next_request_id_for_test();
 
@@ -182,6 +220,12 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
     let (subs, grants_before_ack) = drain_outbound(conn, handle);
     let resubscribed = subs.contains(&resub_rid);
     let permits_after_close = conn.consumer_available_permits(handle);
+    let ack_outcome_after_close =
+        conn.take_outcome(PendingOpKey::Request(ack_rid))
+            .map(|outcome| match outcome {
+                OpOutcome::Error { code, message, .. } => (code, message),
+                other => panic!("unexpected ack outcome shape: {other:?}"),
+            });
 
     // Ack the re-subscribe (only meaningful when one was emitted; harmless
     // otherwise — an unmatched Success is ignored).
@@ -199,6 +243,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
         grants_after_ack,
         permits_after_ack,
         open_after: !conn.consumer_is_closed(handle),
+        ack_outcome_after_close,
     }
 }
 
@@ -228,7 +273,9 @@ fn same_broker_close_resubscribe_event_streams_agree() {
 
     // The correct #307 root-cause behaviour on both engines: NO close event,
     // a fresh re-subscribe, permits zeroed, flow deferred to the ack then
-    // re-armed to exactly RQ, consumer left open.
+    // re-armed to exactly RQ, consumer left open. Issue #346: the ack issued
+    // just before the close is orphaned — the orphan sweep fails it
+    // synchronously with the -1 sentinel, identically on both engines.
     let expected = Reaction {
         permits_before_close: RQ as u32,
         saw_close_event: false,
@@ -238,6 +285,7 @@ fn same_broker_close_resubscribe_event_streams_agree() {
         grants_after_ack: vec![RQ as u32],
         permits_after_ack: RQ as u32,
         open_after: true,
+        ack_outcome_after_close: Some((-1, "ack orphaned by broker consumer close".to_owned())),
     };
     assert_eq!(
         tokio_reaction, expected,
@@ -264,5 +312,16 @@ fn topic_migration_close_event_streams_agree() {
     assert!(
         !tokio_reaction.resubscribed,
         "migration close must NOT re-subscribe in place"
+    );
+    // Issue #346: the same-broker orphan sweep is scoped to the
+    // `url = None` branch only (a generic all-kinds request deadline belongs
+    // to #343's owner) — the PIP-188 migration branch must leave the
+    // pre-close ack pending here, identically on both engines. The
+    // `ack_response_timeout` backstop (not this sweep) is what eventually
+    // reaps it.
+    assert_eq!(
+        tokio_reaction.ack_outcome_after_close, None,
+        "migration close must NOT synchronously resolve the pre-close ack — only the \
+         same-broker sweep does that"
     );
 }

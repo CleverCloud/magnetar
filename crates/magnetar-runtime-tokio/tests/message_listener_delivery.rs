@@ -266,7 +266,7 @@ fn listener_drain_stops_cleanly_on_consumer_close() {
     // Close the consumer the way the façade `Consumer::close()` / drop does.
     {
         let mut conn = shared.inner.lock();
-        let _request_id = conn.close_consumer(handle);
+        let _request_id = conn.close_consumer(handle, t0);
         let _ = conn.poll_transmit();
     }
 

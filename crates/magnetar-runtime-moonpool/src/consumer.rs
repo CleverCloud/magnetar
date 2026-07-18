@@ -134,8 +134,9 @@ impl Drop for ConsumerCloseGuard {
             return;
         }
         {
+            let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
-            let _ = conn.close_consumer_forget(self.handle);
+            let _ = conn.close_consumer_forget(self.handle, now);
         }
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -290,6 +291,20 @@ impl<P: Providers> Consumer<P> {
         self.slot.state.lock().stats()
     }
 
+    /// Clone of this consumer's live receive-latency histogram (issue #347).
+    /// `None` if the histogram was never initialised (constructor failure,
+    /// statically impossible). Backs the façade's `ConsumerApi::
+    /// receive_latency_histogram` — used by `MultiTopicsConsumer::
+    /// aggregate_stats` / `PartitionedConsumer::aggregate_stats` (in the
+    /// `magnetar` façade crate) to merge several consumers' distributions
+    /// via [`magnetar_proto::consumer::ConsumerStats::fold`].
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.slot.state.lock().receive_latency_histogram()
+    }
+
     /// Number of messages currently buffered in this consumer's receiver
     /// queue, waiting for a `receive()` call to pull them out. Returns `0`
     /// for closed/unknown handles. Mirrors Java
@@ -306,10 +321,14 @@ impl<P: Providers> Consumer<P> {
     /// explicit `CommandFlow`. Returns `0` for closed/unknown handles.
     /// Mirrors Java `ConsumerBase#getAvailablePermits`.
     ///
+    /// Issue #349 scope note: reads `ConsumerState::granted_permits` (the additive grant
+    /// mirror), unchanged by the permit-balance split — out of scope per the issue's four
+    /// locked design items, which name only `FlowStats::available_permits`.
+    ///
     /// Per-slot read — does NOT take the global Connection mutex.
     #[must_use]
     pub fn available_permits(&self) -> u32 {
-        self.slot.state.lock().available_permits
+        self.slot.state.lock().granted_permits
     }
 
     /// This consumer's CURRENT receiver-queue target (issue #301). For the
@@ -331,6 +350,34 @@ impl<P: Providers> Consumer<P> {
     #[must_use]
     pub fn has_received_any_message(&self) -> bool {
         self.stats().total_msgs_received > 0
+    }
+
+    /// Last broker-reported Failover active/standby state (issue #348).
+    /// `None` until the first `CommandActiveConsumerChange` lands for this
+    /// consumer (e.g. a `Shared` / `Exclusive` subscription never receives
+    /// the command). 1:1 with the tokio engine.
+    ///
+    /// Per-slot read — does NOT take the global Connection mutex.
+    #[must_use]
+    pub fn is_active(&self) -> Option<bool> {
+        self.slot.state.lock().is_active
+    }
+
+    /// Resolve the next not-yet-observed Failover active/standby transition
+    /// (issue #348). Mirrors [`Self::receive`]'s waker-slab parking pattern.
+    /// 1:1 with the tokio engine.
+    ///
+    /// # Errors
+    /// Resolves the same error [`Self::receive`] does once the consumer
+    /// reaches a terminal state (closed, or a per-handle terminal subscribe
+    /// failure) with no unobserved transition buffered.
+    pub async fn next_active_change(&self) -> Result<bool, ClientError> {
+        ActiveChangeFut {
+            shared: self.shared.clone(),
+            handle: self.handle,
+            slab_key: None,
+        }
+        .await
     }
 
     /// Returns `true` if this consumer is currently paused (no automatic
@@ -748,6 +795,7 @@ impl<P: Providers> Consumer<P> {
                 }
                 PostProcessOutcome::Discard => {
                     // Ack and continue — the caller should never see this message.
+                    let now = self.shared.now_instant();
                     let mut conn = self.shared.inner.lock();
                     let _ = conn.ack(
                         self.handle,
@@ -757,6 +805,7 @@ impl<P: Providers> Consumer<P> {
                             properties: Vec::new(),
                             txn_id: None,
                         },
+                        now,
                     );
                     // Drop the connection lock before notifying the driver (lock-ordering:
                     // global → per-slot, and `notify_one` must never run under the conn lock).
@@ -922,6 +971,8 @@ impl<P: Providers> Consumer<P> {
             ack_type = ?ack_type,
             "ack enqueued"
         );
+        // ADR-0011: engine-supplied clock; see `ack_grouped`.
+        let now = self.shared.now_instant();
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.ack(
@@ -932,6 +983,7 @@ impl<P: Providers> Consumer<P> {
                     properties,
                     txn_id,
                 },
+                now,
             )
         };
         self.shared.driver_waker.notify_one();
@@ -1274,8 +1326,9 @@ impl<P: Providers> Consumer<P> {
     /// - [`ClientError::Other`] when an unexpected outcome arrives.
     pub async fn close(self) -> Result<(), ClientError> {
         let request_id = {
+            let now = self.shared.now_instant();
             let mut conn = self.shared.inner.lock();
-            conn.close_consumer(self.handle)
+            conn.close_consumer(self.handle, now)
         };
         self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
@@ -1670,6 +1723,7 @@ impl Future for ReceiveFut {
                         // to try the next queued message. Mirrors Java's
                         // `ConsumerImpl#decryptPayloadIfNeeded` which calls `discardMessage(...)`
                         // (an explicit ack) when the policy is `DISCARD`.
+                        let now = shared.now_instant();
                         let mut conn = shared.inner.lock();
                         let _ = conn.ack(
                             handle,
@@ -1679,6 +1733,7 @@ impl Future for ReceiveFut {
                                 properties: Vec::new(),
                                 txn_id: None,
                             },
+                            now,
                         );
                         drop(conn);
                         shared.driver_waker.notify_one();
@@ -1720,6 +1775,76 @@ impl Future for ReceiveFut {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
+    }
+}
+
+/// Future returned by [`Consumer::next_active_change`] (issue #348). Parks on
+/// the per-consumer active-change waker slab exposed by
+/// [`magnetar_proto::Connection::register_consumer_active_change_waker`]
+/// until a transition is recorded or the consumer reaches a terminal state.
+///
+/// On drop the future evicts its slab slot via
+/// [`magnetar_proto::Connection::cancel_consumer_active_change_waker`] so
+/// cancelled waits don't leak entries until the next transition. 1:1 mirror
+/// of `magnetar_runtime_tokio::consumer::ActiveChangeFut`.
+struct ActiveChangeFut {
+    shared: Arc<ConnectionShared>,
+    handle: ConsumerHandle,
+    /// Slab key of the currently-installed waker, if any.
+    slab_key: Option<usize>,
+}
+
+impl Drop for ActiveChangeFut {
+    fn drop(&mut self) {
+        if let Some(key) = self.slab_key.take() {
+            let mut conn = self.shared.inner.lock();
+            conn.cancel_consumer_active_change_waker(self.handle, key);
+        }
+    }
+}
+
+impl Future for ActiveChangeFut {
+    type Output = Result<bool, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let handle = this.handle;
+        let shared = this.shared.clone();
+        let mut conn = shared.inner.lock();
+        if let Some(active) = conn.pop_consumer_active_change(handle) {
+            if let Some(key) = this.slab_key.take() {
+                conn.cancel_consumer_active_change_waker(handle, key);
+            }
+            return Poll::Ready(Ok(active));
+        }
+        // Genuinely-terminal state with no buffered transition → resolve Err.
+        // Same terminal-vs-recoverable distinction as `ReceiveFut` (issue
+        // #299). 1:1 with the tokio engine.
+        if conn.consumer_handle_is_terminal(handle) || shared.is_no_driver() {
+            if let Some(old_key) = this.slab_key.take() {
+                conn.cancel_consumer_active_change_waker(handle, old_key);
+            }
+            return Poll::Ready(Err(ClientError::Closed));
+        }
+        // Refresh the slab registration so the current task is the one woken.
+        if let Some(old_key) = this.slab_key.take() {
+            conn.cancel_consumer_active_change_waker(handle, old_key);
+        }
+        let key = conn.register_consumer_active_change_waker(handle, cx.waker().clone());
+        drop(conn);
+        // The connection lock is held from the pop check through the
+        // registration above, so no transition, close, or removal can
+        // interleave within this poll: the terminal check proves the handle
+        // exists, and registration on a live handle cannot fail
+        // (`register_consumer_active_change_waker` returns `None` only for an
+        // absent handle, which `consumer_handle_is_terminal` reports as
+        // terminal).
+        debug_assert!(
+            key.is_some(),
+            "active-change waker registration failed for a live handle"
+        );
+        this.slab_key = key;
+        Poll::Pending
     }
 }
 
@@ -3708,9 +3833,13 @@ mod tests {
             let _ = conn.initial_flow(handle);
             // Seed at the floor.
             assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
-            // Drain the broker's grant so the tick observes starvation.
-            if let Some(slot) = conn.consumer(handle) {
-                slot.state.lock().available_permits = 0;
+            // Issue #349: drain the broker-side permit BALANCE via real
+            // dispatch — 100 single-message deliveries against the
+            // 100-permit initial grant — so the tick observes genuine
+            // starvation, not a synthetic field write.
+            for i in 0..100u64 {
+                let frame = command_message_bytes(handle.0, i, format!("m{i}").as_bytes());
+                conn.handle_bytes(t0, &frame).expect("deliver message");
             }
             // First tick arms the schedule; the second runs the adjust.
             conn.handle_timeout(t0);

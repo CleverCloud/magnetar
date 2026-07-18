@@ -411,6 +411,88 @@ pub struct ProducerStats {
     pub bytes_per_sec: f64,
 }
 
+impl ProducerStats {
+    /// Fold cumulative stats snapshots from multiple child producers (e.g.
+    /// `PartitionedProducer` fan-out) into one aggregate `ProducerStats`
+    /// (issue #347). Sibling of [`crate::consumer::ConsumerStats::fold`] —
+    /// same rationale, same exhaustive-destructure discipline.
+    ///
+    /// Each `(ProducerStats, Option<Histogram<u64>>)` pair is one child's
+    /// [`ProducerState::stats`] snapshot plus (ideally taken at the same
+    /// instant) its [`ProducerState::send_latency_histogram`] clone.
+    ///
+    /// Per-field aggregation rule — each is applied inside an **exhaustive**
+    /// destructure of the child `ProducerStats` below, so adding a field to
+    /// this struct is a compile error here until this fold picks a rule for
+    /// it:
+    /// - the four cumulative totals + `pending_queue_size` — **saturating sum**.
+    /// - `msgs_per_sec` / `bytes_per_sec` — **f64 sum** (fan-in throughput).
+    /// - `send_latency_max_ms` — **exact max** across children; a plain stats-field rule,
+    ///   independent of whether a histogram was supplied.
+    /// - `send_latency_p50_ms` / `send_latency_p99_ms` — **recomputed from the merged histogram**
+    ///   (`hdrhistogram::Histogram::add` over every supplied child histogram, then re-queried at
+    ///   the same quantiles). `0` when no child supplied a histogram.
+    #[must_use]
+    pub fn fold(
+        children: impl IntoIterator<Item = (ProducerStats, Option<hdrhistogram::Histogram<u64>>)>,
+    ) -> ProducerStats {
+        let mut agg = ProducerStats::default();
+        let mut merged_hist: Option<hdrhistogram::Histogram<u64>> = None;
+
+        for (stats, hist) in children {
+            // Exhaustive destructure: a future `ProducerStats` field
+            // addition is a compile error here until this fold picks an
+            // aggregation rule for it.
+            let ProducerStats {
+                total_msgs_sent,
+                total_bytes_sent,
+                total_send_failed,
+                total_acks_received,
+                pending_queue_size,
+                // Recomputed below from the merged histogram — a child's own
+                // percentile fields are not composable and must be ignored.
+                send_latency_p50_ms: _,
+                send_latency_p99_ms: _,
+                send_latency_max_ms,
+                msgs_per_sec,
+                bytes_per_sec,
+            } = stats;
+
+            agg.total_msgs_sent = agg.total_msgs_sent.saturating_add(total_msgs_sent);
+            agg.total_bytes_sent = agg.total_bytes_sent.saturating_add(total_bytes_sent);
+            agg.total_send_failed = agg.total_send_failed.saturating_add(total_send_failed);
+            agg.total_acks_received = agg.total_acks_received.saturating_add(total_acks_received);
+            agg.pending_queue_size = agg.pending_queue_size.saturating_add(pending_queue_size);
+            agg.msgs_per_sec += msgs_per_sec;
+            agg.bytes_per_sec += bytes_per_sec;
+            agg.send_latency_max_ms = agg.send_latency_max_ms.max(send_latency_max_ms);
+
+            if let Some(h) = hist {
+                match merged_hist.as_mut() {
+                    Some(merged) => {
+                        if let Err(err) = merged.add(&h) {
+                            tracing::warn!(
+                                error = %err,
+                                "ProducerStats::fold: hdrhistogram merge rejected a child \
+                                 histogram (auto-resize should make this unreachable); \
+                                 dropping its contribution to the merged percentiles"
+                            );
+                        }
+                    }
+                    None => merged_hist = Some(h),
+                }
+            }
+        }
+
+        if let Some(h) = merged_hist.as_ref().filter(|h| !h.is_empty()) {
+            agg.send_latency_p50_ms = h.value_at_quantile(0.50);
+            agg.send_latency_p99_ms = h.value_at_quantile(0.99);
+        }
+
+        agg
+    }
+}
+
 /// In-memory batch container.
 ///
 /// Mirrors `BatchMessageContainerImpl`. Holds `Vec<(SingleMessageMetadata, Bytes)>` pairs;
@@ -716,6 +798,20 @@ impl ProducerState {
             return 0;
         }
         h.max()
+    }
+
+    /// Clone of the live send-latency histogram (issue #347). For callers
+    /// that need the raw distribution rather than the three pre-computed
+    /// percentiles [`Self::stats`] exposes — primarily [`ProducerStats::
+    /// fold`], which merges several producers' histograms via
+    /// `hdrhistogram::Histogram::add` to compute a statistically sound
+    /// aggregate percentile (percentiles do not compose under per-child
+    /// summing or maxing, only a real histogram merge is). `None` when the
+    /// histogram was never initialised (constructor failure, statically
+    /// impossible — invariant #6).
+    #[must_use]
+    pub fn send_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.send_latency_hist.clone()
     }
 
     /// Returns whether this producer can add the given payload to its current batch.
@@ -2089,6 +2185,164 @@ mod tests {
         assert_eq!(stats.send_latency_p50_ms, p50);
         assert_eq!(stats.send_latency_p99_ms, p99);
         assert_eq!(stats.send_latency_max_ms, pmax);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #347: aggregate_stats zeroes fields. `ProducerState::
+    // send_latency_histogram` exposes the raw distribution so
+    // `ProducerStats::fold` can merge several producers' histograms into a
+    // statistically sound aggregate percentile — sibling of the consumer-side
+    // tests above (percentiles don't compose under per-child summing or
+    // maxing; only a real histogram merge is sound).
+    // ---------------------------------------------------------------------
+
+    /// [`ProducerState::send_latency_histogram`] hands back a clone of the
+    /// live `send_latency_hist` — independent of further mutation on the
+    /// source producer — for callers (the engine `ProducerApi::
+    /// send_latency_histogram` accessor, `ProducerStats::fold`) that need
+    /// the raw distribution rather than the three pre-computed percentiles
+    /// `stats()` exposes.
+    #[test]
+    fn send_latency_histogram_accessor_returns_clone_of_recorded_samples() {
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        assert!(
+            p.send_latency_histogram().is_none_or(|h| h.is_empty()),
+            "no samples recorded yet"
+        );
+
+        let hist = p
+            .send_latency_hist
+            .as_mut()
+            .expect("send_latency_hist initialised");
+        for v in [10u64, 20, 30] {
+            hist.saturating_record(v);
+        }
+
+        let snapshot = p
+            .send_latency_histogram()
+            .expect("histogram present after recording");
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot.value_at_quantile(1.0), 30);
+
+        // Mutate the live histogram after the snapshot was taken — the clone
+        // must not retroactively observe it (proves it's a real clone, not a
+        // shared reference / view).
+        p.send_latency_hist
+            .as_mut()
+            .expect("still initialised")
+            .saturating_record(999);
+        assert_eq!(
+            snapshot.len(),
+            3,
+            "snapshot must be independent of later recordings on the source producer"
+        );
+    }
+
+    /// `ProducerStats::fold` propagates every field per its documented rule:
+    /// the four cumulative totals + `pending_queue_size` sum (saturating);
+    /// `msgs_per_sec` / `bytes_per_sec` sum as f64; `send_latency_max_ms` is
+    /// the exact max; `send_latency_p50_ms` / `send_latency_p99_ms` are
+    /// recomputed from the REAL merged histogram, not from either child's
+    /// own (here deliberately stale) percentile fields.
+    ///
+    /// Sibling of `consumer_stats_fold_propagates_every_field`'s clean
+    /// 60/40 sample split at two widely-separated latencies (10ms / 500ms).
+    #[test]
+    fn producer_stats_fold_propagates_every_field() {
+        let mut hist1 = hdrhistogram::Histogram::<u64>::new(3).expect("histogram");
+        for _ in 0..60 {
+            hist1.saturating_record(10);
+        }
+        let mut hist2 = hdrhistogram::Histogram::<u64>::new(3).expect("histogram");
+        for _ in 0..40 {
+            hist2.saturating_record(500);
+        }
+
+        let s1 = ProducerStats {
+            total_msgs_sent: 100,
+            total_bytes_sent: 1_000,
+            total_send_failed: 1,
+            total_acks_received: 90,
+            pending_queue_size: 4,
+            // Deliberately stale/wrong — fold must ignore these and recompute
+            // from the merged histogram instead.
+            send_latency_p50_ms: 111,
+            send_latency_p99_ms: 222,
+            send_latency_max_ms: 10,
+            msgs_per_sec: 5.5,
+            bytes_per_sec: 55.5,
+        };
+        let s2 = ProducerStats {
+            total_msgs_sent: 20,
+            total_bytes_sent: 200,
+            total_send_failed: 0,
+            total_acks_received: 15,
+            pending_queue_size: 6,
+            send_latency_p50_ms: 333,
+            send_latency_p99_ms: 444,
+            send_latency_max_ms: 500,
+            msgs_per_sec: 1.5,
+            bytes_per_sec: 15.0,
+        };
+
+        let folded = ProducerStats::fold([(s1, Some(hist1)), (s2, Some(hist2))]);
+
+        assert_eq!(folded.total_msgs_sent, 120);
+        assert_eq!(folded.total_bytes_sent, 1_200);
+        assert_eq!(folded.total_send_failed, 1);
+        assert_eq!(folded.total_acks_received, 105);
+        assert_eq!(folded.pending_queue_size, 10);
+        assert_eq!(
+            folded.send_latency_max_ms, 500,
+            "max is the exact max across children, never summed"
+        );
+        assert!((folded.msgs_per_sec - 7.0).abs() < f64::EPSILON);
+        assert!((folded.bytes_per_sec - 70.5).abs() < f64::EPSILON);
+
+        assert_eq!(
+            folded.send_latency_p50_ms, 10,
+            "merged p50 must land in the 60-sample low cluster, not either \
+             child's stale field"
+        );
+        assert_eq!(
+            folded.send_latency_p99_ms, 500,
+            "merged p99 must land in the 40-sample high cluster (real \
+             histogram merge), not a sum/max of the children's own stale \
+             percentile fields"
+        );
+    }
+
+    /// When no child supplies a histogram, `fold` still sums the totals and
+    /// takes the exact max of `send_latency_max_ms` (a plain stats-field
+    /// rule, independent of the histogram), but the percentiles — which can
+    /// ONLY come from a real histogram merge — read zero.
+    #[test]
+    fn producer_stats_fold_with_no_histograms_yields_zero_percentiles() {
+        let s1 = ProducerStats {
+            total_msgs_sent: 5,
+            send_latency_max_ms: 15,
+            ..ProducerStats::default()
+        };
+        let s2 = ProducerStats {
+            total_msgs_sent: 7,
+            send_latency_max_ms: 25,
+            ..ProducerStats::default()
+        };
+
+        let folded = ProducerStats::fold([(s1, None), (s2, None)]);
+
+        assert_eq!(folded.total_msgs_sent, 12);
+        assert_eq!(
+            folded.send_latency_max_ms, 25,
+            "max is a stats-field rule, unaffected by histogram absence"
+        );
+        assert_eq!(folded.send_latency_p50_ms, 0);
+        assert_eq!(folded.send_latency_p99_ms, 0);
     }
 
     // ---------------------------------------------------------------------

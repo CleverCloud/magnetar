@@ -14,12 +14,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   One provider-backed `OperationDeadline` spans every setup stage and composite child, preserving the newest retryable broker error if a later deadline fires.
   Tokio and Moonpool share the policy with injected-time parity.
   ([#343](https://github.com/CleverCloud/magnetar/issues/343), ADR-0080)
+- **`ConsumerEventListener` (Failover becameActive/becameInactive parity):** `ConsumerBuilder::consumer_event_listener(...)` + `subscribe_with_event_listener()` mirror Java's `ConsumerBuilder#consumerEventListener`. `ConsumerEvent::{BecameActive,BecameInactive}` fires from a detached poller task, sequentially, once per broker `CommandActiveConsumerChange` — the same push-delivery poller shape ADR-0064's `MessageListener` uses, driving the new `Consumer::next_active_change()` future instead of `receive()`. `Consumer::is_active()` exposes the last-reported state synchronously (`None` until the first transition). Proto-side, `ConsumerState` gains a bounded per-slot active-change ring (`ACTIVE_CHANGES_CAP = 32`, oldest dropped) recorded under the SAME per-slot lock the #307 reflow predicate already holds — one lock acquisition, not two. Also closes a latent leak: `ConnectionEvent::ActiveConsumerChanged` previously accumulated unbounded in the proto event queue (neither driver drained it); it is now silently consumed like `ChecksumMismatch`.
+  (#348; ADR-0081)
 
 ### Fixed
 
+- **`Auto` receiver-queue policy never scaled up under real load:** the consumer's permit mirror (`ConsumerState::available_permits`) was purely additive — bumped on every grant but never decremented as messages actually arrived — so the `FlowStats::available_permits == 0` starvation signal `Auto::adjust` needs was reachable only via a churn-window reset, never via a broker genuinely exhausting its grant.
+  The field is now split: `ConsumerState::granted_permits` (renamed, semantics unchanged — the additive grant mirror the #307 failover-reflow gate and the want-have delta still use) and a new `ConsumerState::permit_balance` (the REAL balance: grants minus one unit per broker dispatch — plain message, batch member, chunk, or PIP-33 marker), which `flow_stats` now feeds into `FlowStats::available_permits`.
+  A new churn-window guard skips the adjust tick entirely when `granted_permits == 0` (reset / terminal-failure / same-broker `CloseConsumer`), so that window is never mistaken for load starvation.
+  `Auto::adjust` itself is unchanged — only the signal it was fed was wrong.
+  (#349; ADR-0082)
 - **Consumer final-clone resource release:** dropping the last clone of a consumer now stages a best-effort `CloseConsumer` and wakes the existing driver, allowing ownership-driven teardown to unregister the broker-side consumer when the frame reaches the broker and is accepted.
   Intermediate clone drops leave surviving consumers usable, explicit `close().await` remains the reliable acknowledgement-bearing path, and forgotten close responses never accumulate undrained outcomes.
   (#342; ADR-0077)
+- **`aggregate_stats()` no longer zeroes the rate, latency-percentile, and `pending_batch_acks` fields:** `MultiTopicsConsumer::aggregate_stats` / `PartitionedConsumer::aggregate_stats` and `PartitionedProducer::aggregate_stats` previously summed only a handful of cumulative totals, silently leaving `msgs_per_sec`, `bytes_per_sec`, `receive_latency_p50_ms`/`p99_ms`, `send_latency_p50_ms`/`p99_ms`, and `pending_batch_acks` at their zeroed default regardless of the children's real values.
+  New `ConsumerState::receive_latency_histogram` / `ProducerState::send_latency_histogram` accessors expose each child's raw latency distribution, and new `ConsumerStats::fold` / `ProducerStats::fold` associated functions (exhaustive per-field destructuring, so a future field addition is a compile error until this fold picks a rule for it) aggregate every child snapshot: the cumulative totals sum (saturating), the rolling rates sum as `f64`, `*_latency_max_ms` is the exact max, and `*_latency_p50_ms`/`p99_ms` are recomputed from a real `hdrhistogram::Histogram::add` merge of every child's histogram — summing or maxing percentiles directly is not statistically sound.
+  Both `ConsumerApi` and `ProducerApi` gain a `{receive,send}_latency_histogram` accessor (implemented on both the tokio and moonpool engines) so the façade rewrites are thin collect-then-fold wrappers.
+  (#347)
+- **Ack orphaned by same-broker `CloseConsumer` + no deadline:** a same-broker bundle reassignment (`CommandCloseConsumer` with `assigned_broker_service_url = None`, the #307 root cause) tears the old consumer id down without ever answering an ack in flight against it, parking the caller's `ack().await` forever.
+  The close-handler now fails every pending ack for the torn-down handle immediately (`code: -1, message: "ack orphaned by broker consumer close"`) before the in-place re-subscribe runs.
+  As a generic backstop for any other cause of a dropped `CommandAckResponse`, `Connection::ack` now takes an injected `now: Instant` (ADR-0011) and a new `ConnectionConfig::ack_response_timeout` knob (default `Some(30s)`, mirroring the #304 `send_timeout` default; `None` disables it) reaps a pending ack whose response never arrives, mirroring the existing `send_timeout` sweep.
+  **BREAKING CHANGE** (`magnetar-proto` only): `Connection::ack`, `Connection::close_consumer`, and `Connection::close_consumer_forget` are `pub fn` and now take an additional `now: Instant` parameter — any direct caller of these sans-io APIs (outside the `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` engines, which are updated in this changeset) must pass the current instant at the call site.
+  The `magnetar`/`magnetar-driver` façade and `magnetar_runtime_{tokio,moonpool}::Consumer::{ack,close}` are unaffected — their own signatures are unchanged.
+  (#346)
 
 ## [1.2.2] - 2026-07-13
 

@@ -66,9 +66,13 @@ pub struct FlowStats {
     /// nothing has arrived); a value near `current_queue_size` means the user
     /// is falling behind.
     pub queued_messages: usize,
-    /// Permits the broker still holds for us — messages it may push without a
-    /// further `CommandFlow`. `0` is the **starvation signal**: the broker has
-    /// exhausted its grant and will push nothing until we flow more.
+    /// Permits the broker still holds for us (grants minus dispatched); `0`
+    /// under load is the starvation signal: the broker has exhausted its
+    /// grant and will push nothing until we flow more. Issue #349: fed from
+    /// [`crate::consumer::ConsumerState::permit_balance`] — a REAL,
+    /// decrementing balance, not the purely-additive grant mirror
+    /// ([`crate::consumer::ConsumerState::granted_permits`]) that never
+    /// registered a genuine dispatch-driven starvation before this split.
     pub available_permits: u32,
     /// Rolling per-second message-receive rate (Java
     /// `ConsumerStats#getRateMsgsReceived`). `0.0` before the second rate

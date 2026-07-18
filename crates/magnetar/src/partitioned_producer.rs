@@ -375,22 +375,30 @@ impl<P: crate::ProducerApi> PartitionedProducer<P> {
         }
     }
 
-    /// Aggregate cumulative stats across all child producers. Adds the totals from each
-    /// child; the pending-queue size is the sum.
+    /// Aggregate cumulative stats across all child producers (issue #347).
+    /// Thin wrapper over [`magnetar_proto::ProducerStats::fold`] — collects
+    /// each child's `(stats(), send_latency_histogram())` snapshot and folds
+    /// them per that function's documented per-field rule: the four
+    /// cumulative totals + `pending_queue_size` sum; `msgs_per_sec` /
+    /// `bytes_per_sec` sum as f64 (fan-in throughput); `send_latency_max_ms`
+    /// is the exact max; `send_latency_p50_ms` / `send_latency_p99_ms` are
+    /// recomputed from a REAL merge of every child's send-latency histogram
+    /// — summing or maxing percentiles directly (the previous
+    /// implementation's bug: those five fields were silently left at their
+    /// `ProducerStats::default()` zero) is not statistically sound.
     #[must_use]
     pub fn aggregate_stats(&self) -> magnetar_proto::ProducerStats {
-        let mut agg = magnetar_proto::ProducerStats::default();
-        for p in &self.partitions {
-            let s = crate::ProducerApi::stats(p);
-            agg.total_msgs_sent = agg.total_msgs_sent.saturating_add(s.total_msgs_sent);
-            agg.total_bytes_sent = agg.total_bytes_sent.saturating_add(s.total_bytes_sent);
-            agg.total_send_failed = agg.total_send_failed.saturating_add(s.total_send_failed);
-            agg.total_acks_received = agg
-                .total_acks_received
-                .saturating_add(s.total_acks_received);
-            agg.pending_queue_size = agg.pending_queue_size.saturating_add(s.pending_queue_size);
-        }
-        agg
+        let children: Vec<_> = self
+            .partitions
+            .iter()
+            .map(|p| {
+                (
+                    crate::ProducerApi::stats(p),
+                    crate::ProducerApi::send_latency_histogram(p),
+                )
+            })
+            .collect();
+        magnetar_proto::ProducerStats::fold(children)
     }
 
     /// Close every child producer. Returns the first error encountered.

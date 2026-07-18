@@ -173,9 +173,39 @@ pub struct ConsumerState {
     /// first. Drives the [`Self::next_adjust_deadline`] schedule. Never
     /// `Instant::now()` (ADR-0011) — set from `handle_timeout`'s `now`.
     pub(crate) last_adjust_at: Option<std::time::Instant>,
-    /// Number of permits the broker currently has us at (i.e., messages the broker may still
-    /// push to us without our explicit consent).
-    pub available_permits: u32,
+    /// Cumulative permits GRANTED to the broker since the last zeroing (subscribe, reconnect
+    /// reset, terminal subscribe failure, same-broker `CloseConsumer`). Issue #349: this is a
+    /// purely ADDITIVE mirror — it is bumped at every grant site (`initial_flow`, `maybe_flow`,
+    /// the growth branch of `adjust_receiver_queue`) but is NEVER decremented as messages
+    /// actually arrive, so it does not track the broker's REAL outstanding grant. It is still
+    /// the right register for "how much have we told the broker it may use": the #307
+    /// failover-reflow gate and the `adjust_receiver_queue` want-have delta both need exactly
+    /// that question answered, and this additive counter answers it correctly. For the REAL,
+    /// decrementing balance — the starvation signal
+    /// [`crate::receiver_queue::FlowStats::available_permits`] needs — see
+    /// [`Self::permit_balance`].
+    pub granted_permits: u32,
+    /// REAL broker-side permit balance: `granted_permits` minus one unit per broker dispatch
+    /// unit that has actually arrived (issue #349). Incremented at the same three grant sites
+    /// as `granted_permits` (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth
+    /// branch) by the identical delta. Decremented by exactly one (saturating) per dispatch
+    /// unit as it arrives:
+    ///
+    /// - Once per delivered logical message in `classify_and_queue` — covers a plain message, each
+    ///   batch member, and the chunk-completing logical message. Unconditional across both the
+    ///   queued and dead-lettered branches: the broker already spent one permit dispatching the
+    ///   entry regardless of where the client routes it afterward.
+    /// - Once per incomplete chunk buffered in [`Self::deliver`] (the chunk has not yet reached
+    ///   `classify_and_queue` — reassembly is still pending — but the broker already dispatched
+    ///   it).
+    /// - Once per PIP-33 marker in [`Self::record_marker_consumed`].
+    ///
+    /// Force-zeroed everywhere `granted_permits` is zeroed so the two counters never drift apart
+    /// at a churn boundary. `flow_stats` feeds this — not `granted_permits` — into
+    /// [`crate::receiver_queue::FlowStats::available_permits`], so `0` is now a genuine
+    /// starvation signal instead of the never-decrementing mirror `granted_permits` was before
+    /// this split.
+    pub permit_balance: u32,
     /// Number of permits we've consumed since the last flow command. Visible to the
     /// [`Connection`](crate::Connection) so it can adjust the counter when surfacing messages
     /// to the user via `pop_message` paths that bypass `ConsumerState::pop_message`.
@@ -386,6 +416,34 @@ pub struct ConsumerState {
     /// when the inbound entry's [`pb::MessageMetadata::replicated_from`] is
     /// also populated.
     pub shadow_metadata: Option<ShadowTopicMetadata>,
+    /// Last broker-reported Failover active/standby state (issue #348). `None`
+    /// until the first `CommandActiveConsumerChange` lands for this consumer;
+    /// thereafter mirrors the most recent `is_active` the broker sent. Set by
+    /// [`Self::record_active_change`], which also pushes the value onto
+    /// [`Self::active_changes`] and wakes every parked
+    /// [`Self::active_change_wakers`] entry. Mirrors Java
+    /// `ConsumerEventListener#becameActive` / `becameInactive` — the runtime
+    /// engines surface transitions via `Consumer::is_active` /
+    /// `Consumer::next_active_change`.
+    pub is_active: Option<bool>,
+    /// Bounded FIFO of not-yet-observed active/standby transitions, capped at
+    /// [`ACTIVE_CHANGES_CAP`] (oldest dropped on overflow — issue #348). Each
+    /// runtime `next_active_change()` future pops one entry per resolution via
+    /// [`Self::pop_active_change`]; [`Self::record_active_change`] pushes.
+    /// Mirrors [`Self::queue`]'s bounded-buffer shape, but for the much
+    /// lower-cardinality active-change signal (a Failover flip happens at most
+    /// a handful of times per session, so 32 is a generous cap — this exists
+    /// only to bound memory against a pathological broker, not because
+    /// legitimate traffic ever approaches it).
+    pub active_changes: VecDeque<bool>,
+    /// Per-consumer waker slab for parked `next_active_change()` futures
+    /// (issue #348). Mirrors [`Self::receive_wakers`] exactly: each in-flight
+    /// future registers a `Waker` via [`Self::register_active_change_waker`]
+    /// and evicts it on `Drop` via [`Self::cancel_active_change_waker`]; a
+    /// new recorded transition (or a terminal close) drains and wakes every
+    /// parked slot. Not a channel — a `Slab<Waker>` is the canonical
+    /// no-channel wake pattern (ADR-0003).
+    pub active_change_wakers: Slab<Waker>,
 }
 
 /// One entry in the PIP-54 batch-ack tracker. Tracks which positions inside a single
@@ -484,9 +542,118 @@ pub struct ConsumerStats {
     pub pending_batch_acks: usize,
 }
 
+impl ConsumerStats {
+    /// Fold cumulative stats snapshots from multiple child consumers (e.g.
+    /// `MultiTopicsConsumer` / `PartitionedConsumer` fan-in) into one
+    /// aggregate `ConsumerStats` (issue #347). Java has no equivalent
+    /// aggregate type — `PartitionedConsumerImpl` doesn't expose a stats
+    /// getter at all — so this is a magnetar-specific convenience, but each
+    /// field's math mirrors the Java semantics for the underlying counter.
+    ///
+    /// Each `(ConsumerStats, Option<Histogram<u64>>)` pair is one child's
+    /// [`ConsumerState::stats`] snapshot plus (ideally taken at the same
+    /// instant) its [`ConsumerState::receive_latency_histogram`] clone —
+    /// the histogram is required separately because `ConsumerStats` only
+    /// carries the three pre-computed percentiles, not the distribution a
+    /// sound merge needs.
+    ///
+    /// Per-field aggregation rule — each is applied inside an **exhaustive**
+    /// destructure of the child `ConsumerStats` below, so adding a field to
+    /// this struct is a compile error here until this fold picks a rule for
+    /// it:
+    /// - the six cumulative totals + `pending_batch_acks` — **saturating sum** (never wrap into
+    ///   overflow noise).
+    /// - `msgs_per_sec` / `bytes_per_sec` — **f64 sum** (the aggregate throughput observed across
+    ///   every child is the sum of the per-child rates — fan-in, not an average).
+    /// - `receive_latency_max_ms` — **exact max** across children; this is a plain stats-field
+    ///   rule, independent of whether a histogram was supplied.
+    /// - `receive_latency_p50_ms` / `receive_latency_p99_ms` — **recomputed from the merged
+    ///   histogram** (`hdrhistogram::Histogram::add` over every supplied child histogram, then
+    ///   re-queried at the same quantiles). Percentiles do not compose under per-child summing or
+    ///   maxing — merging the underlying distributions is the only statistically sound way to
+    ///   compute the aggregate percentile. `0` when no child supplied a histogram.
+    #[must_use]
+    pub fn fold(
+        children: impl IntoIterator<Item = (ConsumerStats, Option<hdrhistogram::Histogram<u64>>)>,
+    ) -> ConsumerStats {
+        let mut agg = ConsumerStats::default();
+        let mut merged_hist: Option<hdrhistogram::Histogram<u64>> = None;
+
+        for (stats, hist) in children {
+            // Exhaustive destructure: a future `ConsumerStats` field
+            // addition is a compile error here until this fold picks an
+            // aggregation rule for it.
+            let ConsumerStats {
+                total_msgs_received,
+                total_bytes_received,
+                total_acks_sent,
+                total_acks_failed,
+                total_msgs_dead_lettered,
+                total_chunked_msgs_received,
+                // Recomputed below from the merged histogram — a child's own
+                // percentile fields are not composable and must be ignored.
+                receive_latency_p50_ms: _,
+                receive_latency_p99_ms: _,
+                receive_latency_max_ms,
+                msgs_per_sec,
+                bytes_per_sec,
+                pending_batch_acks,
+            } = stats;
+
+            agg.total_msgs_received = agg.total_msgs_received.saturating_add(total_msgs_received);
+            agg.total_bytes_received = agg
+                .total_bytes_received
+                .saturating_add(total_bytes_received);
+            agg.total_acks_sent = agg.total_acks_sent.saturating_add(total_acks_sent);
+            agg.total_acks_failed = agg.total_acks_failed.saturating_add(total_acks_failed);
+            agg.total_msgs_dead_lettered = agg
+                .total_msgs_dead_lettered
+                .saturating_add(total_msgs_dead_lettered);
+            agg.total_chunked_msgs_received = agg
+                .total_chunked_msgs_received
+                .saturating_add(total_chunked_msgs_received);
+            agg.pending_batch_acks = agg.pending_batch_acks.saturating_add(pending_batch_acks);
+            agg.msgs_per_sec += msgs_per_sec;
+            agg.bytes_per_sec += bytes_per_sec;
+            agg.receive_latency_max_ms = agg.receive_latency_max_ms.max(receive_latency_max_ms);
+
+            if let Some(h) = hist {
+                match merged_hist.as_mut() {
+                    Some(merged) => {
+                        if let Err(err) = merged.add(&h) {
+                            tracing::warn!(
+                                error = %err,
+                                "ConsumerStats::fold: hdrhistogram merge rejected a child \
+                                 histogram (auto-resize should make this unreachable); \
+                                 dropping its contribution to the merged percentiles"
+                            );
+                        }
+                    }
+                    None => merged_hist = Some(h),
+                }
+            }
+        }
+
+        if let Some(h) = merged_hist.as_ref().filter(|h| !h.is_empty()) {
+            agg.receive_latency_p50_ms = h.value_at_quantile(0.50);
+            agg.receive_latency_p99_ms = h.value_at_quantile(0.99);
+        }
+
+        agg
+    }
+}
+
 /// Default for [`ConsumerState::max_pending_chunked_message`]. Mirrors Java
 /// `ConsumerConfigurationData#maxPendingChunkedMessage = 10`.
 pub const DEFAULT_MAX_PENDING_CHUNKED_MESSAGE: usize = 10;
+
+/// Bound on [`ConsumerState::active_changes`] (issue #348). A Failover
+/// promotion/demotion is a rare, broker-scheduled event — this cap exists
+/// only to bound memory against a pathological/hostile broker flooding
+/// `CommandActiveConsumerChange`, not because legitimate traffic approaches
+/// it. Overflow drops the oldest entry (matches the ring semantics
+/// documented on [`ConsumerState::active_changes`]).
+pub const ACTIVE_CHANGES_CAP: usize = 32;
 
 /// Default for [`ConsumerState::expire_time_of_incomplete_chunked_message`].
 /// Mirrors Java `expireTimeOfIncompleteChunkedMessageMillis = 60_000` (1 minute).
@@ -614,7 +781,8 @@ impl ConsumerState {
             queued_bytes: 0,
             adjust_interval,
             last_adjust_at: None,
-            available_permits: 0,
+            granted_permits: 0,
+            permit_balance: 0,
             consumed_since_flow: 0,
             queue: VecDeque::new(),
             chunk_reassembly: HashMap::new(),
@@ -663,6 +831,9 @@ impl ConsumerState {
             current_msgs_per_sec: 0.0,
             current_bytes_per_sec: 0.0,
             shadow_metadata: None,
+            is_active: None,
+            active_changes: VecDeque::new(),
+            active_change_wakers: Slab::new(),
         }
     }
 
@@ -806,6 +977,20 @@ impl ConsumerState {
         h.max()
     }
 
+    /// Clone of the live receive-latency histogram (issue #347). For callers
+    /// that need the raw distribution rather than the three pre-computed
+    /// percentiles [`Self::stats`] exposes — primarily
+    /// [`ConsumerStats::fold`], which merges several consumers' histograms
+    /// via `hdrhistogram::Histogram::add` to compute a statistically sound
+    /// aggregate percentile (percentiles do not compose under per-child
+    /// summing or maxing, only a real histogram merge is). `None` when the
+    /// histogram was never initialised (constructor failure, statically
+    /// impossible — invariant #6).
+    #[must_use]
+    pub fn receive_latency_histogram(&self) -> Option<hdrhistogram::Histogram<u64>> {
+        self.receive_latency_hist.clone()
+    }
+
     /// Returns a `CommandFlow` if the consumer is below half of its receiver queue and not in
     /// a frozen state. Resets the consumed counter. While [`Self::paused`] is `true` no flow
     /// is emitted — the broker stops dispatching once permits drain.
@@ -819,7 +1004,8 @@ impl ConsumerState {
         }
         let permits = self.consumed_since_flow;
         self.consumed_since_flow = 0;
-        self.available_permits = self.available_permits.saturating_add(permits);
+        self.granted_permits = self.granted_permits.saturating_add(permits);
+        self.permit_balance = self.permit_balance.saturating_add(permits);
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: permits,
@@ -841,6 +1027,11 @@ impl ConsumerState {
     /// `total_bytes_received` counters: markers are not user messages.
     pub fn record_marker_consumed(&mut self) {
         self.record_broker_permit_consumed();
+        // Issue #349: a marker is one broker-dispatched unit too — decrement the
+        // REAL balance directly (not through `record_broker_permit_consumed`,
+        // which only tracks the pop-driven `consumed_since_flow` counter, the
+        // wrong site for the live balance).
+        self.permit_balance = self.permit_balance.saturating_sub(1);
     }
 
     /// Force an initial flow for the current receiver-queue target.
@@ -853,7 +1044,8 @@ impl ConsumerState {
     /// grants the policy's CURRENT target rather than a stale raw value.
     pub fn initial_flow(&mut self) -> pb::CommandFlow {
         let permits = self.receiver_queue_size as u32;
-        self.available_permits = permits;
+        self.granted_permits = permits;
+        self.permit_balance = permits;
         self.consumed_since_flow = 0;
         pb::CommandFlow {
             consumer_id: self.handle.0,
@@ -875,7 +1067,10 @@ impl ConsumerState {
         crate::receiver_queue::FlowStats {
             current_queue_size: self.receiver_queue_size,
             queued_messages: self.queue.len(),
-            available_permits: self.available_permits,
+            // Issue #349: feed the REAL decrementing balance, not the
+            // purely-additive `granted_permits` mirror, so `0` here is a
+            // genuine starvation signal (see `Self::permit_balance`'s doc).
+            available_permits: self.permit_balance,
             consume_rate_msgs_per_s: self.current_msgs_per_sec,
             avg_message_bytes,
             in_flight_bytes: self.queued_bytes,
@@ -887,8 +1082,8 @@ impl ConsumerState {
     /// target via `policy.adjust(&FlowStats)` and reconciles the broker grant:
     ///
     /// - **Grow** (`new > current`): the broker has fewer permits than the new target wants, so
-    ///   emit an incremental `CommandFlow` for the delta and bump `available_permits`. This is what
-    ///   keeps a starving consumer fed.
+    ///   emit an incremental `CommandFlow` for the delta and bump both `granted_permits` and
+    ///   `permit_balance`. This is what keeps a starving consumer fed.
     /// - **Shrink / hold** (`new <= current`): permits already granted to the broker cannot be
     ///   un-granted, so emit nothing — the surplus drains naturally as messages arrive and
     ///   `maybe_flow` simply asks for less next time (its threshold is `new / 2`).
@@ -914,6 +1109,16 @@ impl ConsumerState {
         {
             return None;
         }
+        // Issue #349 churn-window guard: `granted_permits == 0` only occurs
+        // right after a reset / terminal-failure / same-broker
+        // `CloseConsumer` zeroing — there is no outstanding grant for the
+        // broker to have dispatched against, so a zero `permit_balance` here
+        // reflects the churn window, not load starvation. Skip the tick
+        // entirely rather than let the policy misread it and grow (or emit a
+        // flow the broker would drop against a torn-down consumer id).
+        if self.granted_permits == 0 {
+            return None;
+        }
         let stats = self.flow_stats(partitions);
         let new_target = self.policy.adjust(&stats).max(1);
         let current = self.receiver_queue_size;
@@ -927,12 +1132,13 @@ impl ConsumerState {
         // Grow: top the broker's grant up to the new target with an incremental
         // flow for the delta the broker does not yet have.
         let want = new_target as u32;
-        let have = self.available_permits;
+        let have = self.granted_permits;
         let delta = want.saturating_sub(have);
         if delta == 0 {
             return None;
         }
-        self.available_permits = self.available_permits.saturating_add(delta);
+        self.granted_permits = self.granted_permits.saturating_add(delta);
+        self.permit_balance = self.permit_balance.saturating_add(delta);
         Some(pb::CommandFlow {
             consumer_id: self.handle.0,
             message_permits: delta,
@@ -1295,6 +1501,13 @@ impl ConsumerState {
                 );
                 if entry.received_chunks < entry.expected_chunks {
                     self.record_broker_permit_consumed();
+                    // Issue #349: this chunk is one dispatch unit even though
+                    // it never reaches `classify_and_queue` (reassembly is
+                    // still pending) — decrement the REAL balance directly
+                    // rather than through `record_broker_permit_consumed`
+                    // (which only tracks the pop-driven `consumed_since_flow`
+                    // counter, the wrong site for the live balance).
+                    self.permit_balance = self.permit_balance.saturating_sub(1);
                     return Ok(DeliverOutcome::Buffered);
                 }
                 // All chunks present — assemble. Take the buffer out by value
@@ -1438,6 +1651,14 @@ impl ConsumerState {
         now: std::time::Instant,
     ) -> DeliverOutcome {
         let payload_len = msg.payload.len();
+        // Issue #349: `classify_and_queue` is called exactly once per
+        // broker dispatch unit — once for a plain message, once per batch
+        // member (the `deliver` batch loop), and once for the chunk-
+        // completing logical message. Decrement the REAL balance
+        // unconditionally, before the queued-vs-dead-lettered branch below:
+        // the broker already spent one permit dispatching this entry
+        // regardless of which branch the client routes it into.
+        self.permit_balance = self.permit_balance.saturating_sub(1);
         if self.max_redeliver_count > 0 && redelivery > self.max_redeliver_count {
             self.total_msgs_dead_lettered = self.total_msgs_dead_lettered.saturating_add(1);
             self.dead_letter_pending.push(msg);
@@ -1516,6 +1737,60 @@ impl ConsumerState {
     pub fn close(&mut self) {
         self.closed = true;
         self.wake_receivers();
+        // Issue #348: a `next_active_change()` future already parked when the
+        // user closes the consumer must resolve promptly instead of hanging
+        // forever — mirror the receive-waker wake above exactly.
+        self.wake_active_change_waiters();
+    }
+
+    /// Record a broker-reported Failover active/standby transition (issue
+    /// #348). Sets [`Self::is_active`] to the new state, pushes it onto the
+    /// bounded [`Self::active_changes`] ring (dropping the oldest entry once
+    /// [`ACTIVE_CHANGES_CAP`] is reached), then drains and wakes every parked
+    /// [`Self::active_change_wakers`] entry — the same drain-all fan-out
+    /// semantic `wake_receivers` uses.
+    pub fn record_active_change(&mut self, active: bool) {
+        self.is_active = Some(active);
+        if self.active_changes.len() >= ACTIVE_CHANGES_CAP {
+            self.active_changes.pop_front();
+        }
+        self.active_changes.push_back(active);
+        self.wake_active_change_waiters();
+    }
+
+    /// Pop the oldest not-yet-observed active-change transition, if any.
+    /// Mirrors [`Self::pop_message`]'s FIFO-front semantics.
+    pub fn pop_active_change(&mut self) -> Option<bool> {
+        self.active_changes.pop_front()
+    }
+
+    /// Register a waker that fires when a new active-change transition is
+    /// recorded or the consumer reaches a terminal state. Returns a slab key
+    /// the caller MUST pass to [`Self::cancel_active_change_waker`] if the
+    /// future is dropped before observing the wake. Mirrors
+    /// [`Self::register_receive_waker`].
+    pub fn register_active_change_waker(&mut self, waker: Waker) -> usize {
+        self.active_change_wakers.insert(waker)
+    }
+
+    /// Evict a previously-registered active-change waker. Idempotent — a
+    /// missing slot is a no-op (a concurrent wake may already have drained
+    /// it). Mirrors [`Self::cancel_receive_waker`].
+    pub fn cancel_active_change_waker(&mut self, slab_key: usize) {
+        if self.active_change_wakers.contains(slab_key) {
+            self.active_change_wakers.remove(slab_key);
+        }
+    }
+
+    /// Drain every parked active-change waker and wake it. Mirrors
+    /// [`Self::wake_receivers`] exactly — drain-all rather than wake-one, so
+    /// every concurrent `next_active_change()` future re-polls and the first
+    /// to acquire the connection lock pops the transition.
+    fn wake_active_change_waiters(&mut self) {
+        let wakers: Vec<Waker> = self.active_change_wakers.drain().collect();
+        for w in wakers {
+            w.wake();
+        }
     }
 }
 
@@ -1555,7 +1830,8 @@ mod tests {
         let f = c.initial_flow();
         assert_eq!(f.consumer_id, 1);
         assert_eq!(f.message_permits, 100);
-        assert_eq!(c.available_permits, 100);
+        assert_eq!(c.granted_permits, 100);
+        assert_eq!(c.permit_balance, 100);
     }
 
     #[test]
@@ -1689,6 +1965,161 @@ mod tests {
             .unwrap();
         assert!(c.queue.is_empty());
         assert_eq!(c.dead_letter_pending.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #349 — `permit_balance` dispatch-unit accounting.
+    //
+    // The broker debits one permit per *message unit* dispatched: K for a
+    // K-message batch entry, one per PIP-37 chunk, one per PIP-33 marker.
+    // These four tests pin the exact decrement count per shape.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_normal() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.deliver(
+            &message_cmd(0),
+            metadata(1),
+            None,
+            Bytes::from_static(b"x"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.permit_balance, 99,
+            "one plain single message consumes exactly one dispatch unit"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_batch() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+
+        // Build a batch payload: two singles with their length-prefixed metadata
+        // (mirrors `batch_message_explodes`).
+        let mut buf = bytes::BytesMut::new();
+        for payload in [b"a".as_ref(), b"bb".as_ref()] {
+            let sm = pb::SingleMessageMetadata {
+                payload_size: payload.len() as i32,
+                ..Default::default()
+            };
+            let sm_len = sm.encoded_len();
+            buf.extend_from_slice(&(sm_len as u32).to_be_bytes());
+            sm.encode(&mut buf).unwrap();
+            buf.extend_from_slice(payload);
+        }
+
+        let outcome = c
+            .deliver(
+                &message_cmd(0),
+                metadata(2),
+                None,
+                buf.freeze(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        match outcome {
+            DeliverOutcome::Delivered { count } => assert_eq!(count, 2),
+            other => panic!("expected Delivered(2), got {other:?}"),
+        }
+        assert_eq!(
+            c.permit_balance, 98,
+            "a K=2 batch entry consumes exactly K=2 dispatch units"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_chunk() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+
+        let make_chunk = |idx: i32, payload: &'static [u8]| {
+            let mut meta = pb::MessageMetadata {
+                producer_name: "p".to_owned(),
+                sequence_id: 1,
+                publish_time: 1_700_000_000,
+                ..Default::default()
+            };
+            meta.num_chunks_from_msg = Some(3);
+            meta.chunk_id = Some(idx);
+            meta.uuid = Some("u-shape".to_owned());
+            meta.total_chunk_msg_size = Some(6);
+            (meta, Bytes::from_static(payload))
+        };
+
+        let (m0, p0) = make_chunk(0, b"aa");
+        c.deliver(&message_cmd(0), m0, None, p0, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(
+            c.permit_balance, 99,
+            "the first (incomplete) chunk consumes one dispatch unit"
+        );
+
+        let (m1, p1) = make_chunk(1, b"bb");
+        c.deliver(&message_cmd(0), m1, None, p1, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(
+            c.permit_balance, 98,
+            "the second (incomplete) chunk consumes one dispatch unit"
+        );
+
+        let (m2, p2) = make_chunk(2, b"cc");
+        let outcome = c
+            .deliver(&message_cmd(0), m2, None, p2, std::time::Instant::now())
+            .unwrap();
+        assert!(matches!(outcome, DeliverOutcome::Delivered { .. }));
+        assert_eq!(
+            c.permit_balance, 97,
+            "the completing (3rd) chunk consumes the final dispatch unit — an \
+             N=3-chunk message decrements exactly N=3 total"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_per_dispatch_unit_marker() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.record_marker_consumed();
+        assert_eq!(
+            c.permit_balance, 99,
+            "one PIP-33 marker consumes exactly one dispatch unit"
+        );
+    }
+
+    #[test]
+    fn permit_balance_decrements_for_dlq_routed_message_too() {
+        // The dead-letter branch of `classify_and_queue` is still one broker
+        // dispatch unit — the broker already spent the permit dispatching
+        // the entry, regardless of whether the client routes it to the user
+        // queue or diverts it to the DLQ pending list on this arrival.
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        c.max_redeliver_count = 2;
+        let _ = c.initial_flow();
+        assert_eq!(c.permit_balance, 100);
+        c.deliver(
+            &message_cmd(5),
+            metadata(1),
+            None,
+            Bytes::from_static(b"poison"),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.dead_letter_pending.len(),
+            1,
+            "routed to DLQ, not the queue"
+        );
+        assert_eq!(
+            c.permit_balance, 99,
+            "a DLQ-routed message still consumes exactly one dispatch unit"
+        );
     }
 
     #[test]
@@ -1858,6 +2289,169 @@ mod tests {
         assert!(c.receive_latency_max_ms() >= 1);
         let stats = c.stats();
         assert_eq!(stats.receive_latency_max_ms, c.receive_latency_max_ms());
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #347: aggregate_stats zeroes fields. `ConsumerState::
+    // receive_latency_histogram` exposes the raw distribution so
+    // `ConsumerStats::fold` can merge several consumers' histograms into a
+    // statistically sound aggregate percentile (percentiles don't compose
+    // under per-child summing or maxing — only a real histogram merge is
+    // sound).
+    // ---------------------------------------------------------------------
+
+    /// [`ConsumerState::receive_latency_histogram`] hands back a clone of the
+    /// live `receive_latency_hist` — independent of further mutation on the
+    /// source consumer — for callers (the engine `ConsumerApi::
+    /// receive_latency_histogram` accessor, `ConsumerStats::fold`) that need
+    /// the raw distribution rather than the three pre-computed percentiles
+    /// `stats()` exposes.
+    #[test]
+    fn receive_latency_histogram_accessor_returns_clone_of_recorded_samples() {
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        assert!(
+            c.receive_latency_histogram().is_none_or(|h| h.is_empty()),
+            "no samples recorded yet"
+        );
+
+        let hist = c
+            .receive_latency_hist
+            .as_mut()
+            .expect("receive_latency_hist initialised");
+        for v in [10u64, 20, 30] {
+            hist.saturating_record(v);
+        }
+
+        let snapshot = c
+            .receive_latency_histogram()
+            .expect("histogram present after recording");
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot.value_at_quantile(1.0), 30);
+
+        // Mutate the live histogram after the snapshot was taken — the clone
+        // must not retroactively observe it (proves it's a real clone, not a
+        // shared reference / view).
+        c.receive_latency_hist
+            .as_mut()
+            .expect("still initialised")
+            .saturating_record(999);
+        assert_eq!(
+            snapshot.len(),
+            3,
+            "snapshot must be independent of later recordings on the source consumer"
+        );
+    }
+
+    /// `ConsumerStats::fold` propagates every field per its documented rule:
+    /// the six cumulative totals + `pending_batch_acks` sum (saturating);
+    /// `msgs_per_sec` / `bytes_per_sec` sum as f64; `receive_latency_max_ms`
+    /// is the exact max; `receive_latency_p50_ms` / `receive_latency_p99_ms`
+    /// are recomputed from the REAL merged histogram, not from either
+    /// child's own (here deliberately stale) percentile fields.
+    ///
+    /// Two children with a clean 60/40 sample split at two widely-separated
+    /// latencies (10ms / 500ms) make the merged percentiles unambiguous:
+    /// the merged p50 falls within the 60-sample low cluster (10ms) and the
+    /// merged p99 falls within the 40-sample high cluster (500ms) — neither
+    /// matches either child's stale field, and neither is a sum/max of the
+    /// children's own percentile fields (which would be 555/666 or 444).
+    #[test]
+    fn consumer_stats_fold_propagates_every_field() {
+        let mut hist1 = hdrhistogram::Histogram::<u64>::new(3).expect("histogram");
+        for _ in 0..60 {
+            hist1.saturating_record(10);
+        }
+        let mut hist2 = hdrhistogram::Histogram::<u64>::new(3).expect("histogram");
+        for _ in 0..40 {
+            hist2.saturating_record(500);
+        }
+
+        let s1 = ConsumerStats {
+            total_msgs_received: 100,
+            total_bytes_received: 1_000,
+            total_acks_sent: 90,
+            total_acks_failed: 1,
+            total_msgs_dead_lettered: 2,
+            total_chunked_msgs_received: 3,
+            // Deliberately stale/wrong — fold must ignore these and recompute
+            // from the merged histogram instead.
+            receive_latency_p50_ms: 111,
+            receive_latency_p99_ms: 222,
+            receive_latency_max_ms: 10,
+            msgs_per_sec: 5.5,
+            bytes_per_sec: 55.5,
+            pending_batch_acks: 4,
+        };
+        let s2 = ConsumerStats {
+            total_msgs_received: 20,
+            total_bytes_received: 200,
+            total_acks_sent: 15,
+            total_acks_failed: 0,
+            total_msgs_dead_lettered: 0,
+            total_chunked_msgs_received: 1,
+            receive_latency_p50_ms: 333,
+            receive_latency_p99_ms: 444,
+            receive_latency_max_ms: 500,
+            msgs_per_sec: 1.5,
+            bytes_per_sec: 15.0,
+            pending_batch_acks: 6,
+        };
+
+        let folded = ConsumerStats::fold([(s1, Some(hist1)), (s2, Some(hist2))]);
+
+        assert_eq!(folded.total_msgs_received, 120);
+        assert_eq!(folded.total_bytes_received, 1_200);
+        assert_eq!(folded.total_acks_sent, 105);
+        assert_eq!(folded.total_acks_failed, 1);
+        assert_eq!(folded.total_msgs_dead_lettered, 2);
+        assert_eq!(folded.total_chunked_msgs_received, 4);
+        assert_eq!(
+            folded.receive_latency_max_ms, 500,
+            "max is the exact max across children, never summed"
+        );
+        assert!((folded.msgs_per_sec - 7.0).abs() < f64::EPSILON);
+        assert!((folded.bytes_per_sec - 70.5).abs() < f64::EPSILON);
+        assert_eq!(folded.pending_batch_acks, 10);
+
+        assert_eq!(
+            folded.receive_latency_p50_ms, 10,
+            "merged p50 must land in the 60-sample low cluster, not either \
+             child's stale field"
+        );
+        assert_eq!(
+            folded.receive_latency_p99_ms, 500,
+            "merged p99 must land in the 40-sample high cluster (real \
+             histogram merge), not a sum/max of the children's own stale \
+             percentile fields"
+        );
+    }
+
+    /// When no child supplies a histogram, `fold` still sums the totals and
+    /// takes the exact max of `receive_latency_max_ms` (a plain stats-field
+    /// rule, independent of the histogram), but the percentiles — which can
+    /// ONLY come from a real histogram merge — read zero.
+    #[test]
+    fn consumer_stats_fold_with_no_histograms_yields_zero_percentiles() {
+        let s1 = ConsumerStats {
+            total_msgs_received: 5,
+            receive_latency_max_ms: 15,
+            ..ConsumerStats::default()
+        };
+        let s2 = ConsumerStats {
+            total_msgs_received: 7,
+            receive_latency_max_ms: 25,
+            ..ConsumerStats::default()
+        };
+
+        let folded = ConsumerStats::fold([(s1, None), (s2, None)]);
+
+        assert_eq!(folded.total_msgs_received, 12);
+        assert_eq!(
+            folded.receive_latency_max_ms, 25,
+            "max is a stats-field rule, unaffected by histogram absence"
+        );
+        assert_eq!(folded.receive_latency_p50_ms, 0);
+        assert_eq!(folded.receive_latency_p99_ms, 0);
     }
 
     // ---------------------------------------------------------------------

@@ -21,6 +21,21 @@ use crate::client::{MemoryLimit, MemoryLimitPolicy, PulsarClient, PulsarError};
 /// `client.rs`.
 type Result<T, E = PulsarError> = std::result::Result<T, E>;
 
+/// Tri-state override for
+/// [`ConnectionConfig::ack_response_timeout`](magnetar_proto::conn::ConnectionConfig) (issue #346).
+/// A plain `Option<Duration>` can't represent "explicitly disabled" separately from "unset, inherit
+/// the default" because the underlying config field is itself `Option<Duration>` with a non-`None`
+/// default (`Some(30s)`) — unlike `operation_timeout`, whose config-level
+/// type is a bare `Duration`. `clippy::option_option` steers this shape into
+/// a named enum instead of `Option<Option<Duration>>`.
+#[derive(Debug, Clone, Copy)]
+enum AckResponseTimeoutOverride {
+    /// Explicit deadline via [`ClientBuilder::ack_response_timeout`].
+    Explicit(Duration),
+    /// Explicitly disabled via [`ClientBuilder::disable_ack_response_timeout`].
+    Disabled,
+}
+
 /// Builder for [`PulsarClient`].
 #[derive(Debug, Clone)]
 pub struct ClientBuilder {
@@ -30,6 +45,8 @@ pub struct ClientBuilder {
     keepalive: Option<Duration>,
     operation_timeout: Option<Duration>,
     operation_retry: Option<magnetar_proto::OperationRetryConfig>,
+    /// `None` = unset, inherit `ConnectionConfig::default()`'s `Some(30s)`.
+    ack_response_timeout: Option<AckResponseTimeoutOverride>,
     auth_method_name: Option<String>,
     auth_data: Option<bytes::Bytes>,
     auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
@@ -53,6 +70,7 @@ impl Default for ClientBuilder {
             keepalive: None,
             operation_timeout: None,
             operation_retry: None,
+            ack_response_timeout: None,
             auth_method_name: None,
             auth_data: None,
             auth_provider: None,
@@ -198,6 +216,38 @@ impl ClientBuilder {
     #[must_use]
     pub fn operation_retry(mut self, config: magnetar_proto::OperationRetryConfig) -> Self {
         self.operation_retry = Some(config);
+        self
+    }
+
+    /// Bound how long the client waits for a `CommandAckResponse` after
+    /// issuing a `CommandAck`. In-flight acks past `enqueued_at + timeout`
+    /// resolve with a synthetic broker error carrying `code=-1,
+    /// message="ack timeout"` on the next state-machine tick — mirrors
+    /// [`crate::ProducerBuilder::send_timeout`]'s shape and rationale.
+    ///
+    /// The default is **30 s** (mirrors the `send_timeout` Java-parity
+    /// default, ADR-0072), so an ack whose response is lost or dropped in
+    /// flight fails deterministically rather than hanging the caller's
+    /// `ack().await` forever. A same-broker `CloseConsumer` (bundle
+    /// reassignment, issue #307) additionally fails every ack pending
+    /// against the torn-down consumer id immediately, ahead of this
+    /// deadline — this knob is the generic backstop for every other cause
+    /// of a dropped response. Call [`Self::disable_ack_response_timeout`]
+    /// for the unbounded (never-times-out) behavior.
+    #[must_use]
+    pub fn ack_response_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_response_timeout = Some(AckResponseTimeoutOverride::Explicit(timeout));
+        self
+    }
+
+    /// Disable the ack-response timeout: in-flight acks never resolve with a
+    /// synthetic timeout error — they wait indefinitely for the broker's
+    /// `CommandAckResponse` (or a session-loss / terminal error, or the
+    /// same-broker `CloseConsumer` orphan sweep, which is unaffected by this
+    /// knob). Overrides the 30 s default.
+    #[must_use]
+    pub fn disable_ack_response_timeout(mut self) -> Self {
+        self.ack_response_timeout = Some(AckResponseTimeoutOverride::Disabled);
         self
     }
 
@@ -348,6 +398,13 @@ impl ClientBuilder {
         }
         if let Some(d) = self.operation_timeout {
             config.operation_timeout = d;
+        }
+        // Explicit or disabled always wins over `ConnectionConfig::default()`'s
+        // `Some(30s)`; unset (`None`) leaves the default untouched.
+        match self.ack_response_timeout {
+            Some(AckResponseTimeoutOverride::Explicit(d)) => config.ack_response_timeout = Some(d),
+            Some(AckResponseTimeoutOverride::Disabled) => config.ack_response_timeout = None,
+            None => {}
         }
         if let Some(s) = self.default_max_message_size {
             config.default_max_message_size = s;

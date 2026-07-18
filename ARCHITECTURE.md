@@ -439,8 +439,8 @@ The reconnect rebuild path (`Connection::rebuild_producers` / `rebuild_consumers
         │   state: parking_lot::Mutex<…>  ←── │    │   state: parking_lot::Mutex<…>  ←── │ per-slot mutex
         │     ─ pending: VecDeque<OpSend>     │    │     ─ queue: VecDeque<…>            │
         │     ─ batch: BatchContainer         │    │     ─ receive_wakers: Slab<Waker>   │
-        │     ─ outbound: VecDeque<Frame>     │    │     ─ available_permits, ack_tracker│
-        │     ─ name, epoch, stats, ...       │    │     ─ paused, reached_end_of_topic  │
+        │     ─ outbound: VecDeque<Frame>     │    │    ─ granted_permits, permit_balance│
+        │     ─ name, epoch, stats, ...       │    │     ─ ack_tracker, paused, ...      │
         └─────────────────────────────────────┘    └─────────────────────────────────────┘
 ```
 
@@ -524,6 +524,26 @@ The guard first probes `slot.state.lock().closed`, releases that guard, and only
 A completed explicit close marks the slot closed and suppresses a later drop close.
 The final-clone path is best-effort rather than confirmation-bearing: callers that must know the broker acknowledged resource release use explicit `close().await`.
 This is Rust RAII and pulsar-rs migration parity, beyond Java abandonment semantics; it does not claim that Java garbage collection closes consumers.
+
+### Consumer flow-permit accounting (issue #349, ADR-0082)
+
+Each `ConsumerState` (`crates/magnetar-proto/src/consumer.rs`) carries TWO permit counters, split because they answer different questions.
+
+- **`granted_permits: u32`** — a purely ADDITIVE record of every permit granted to the broker since the last zeroing (subscribe, reconnect reset, terminal subscribe failure, same-broker `CommandCloseConsumer`).
+  Bumped at the three grant sites (`initial_flow`, `maybe_flow`, `adjust_receiver_queue`'s growth branch); never decremented by dispatch.
+  Answers "how much have we told the broker it may use" — the #307 failover-reflow gate (the `ActiveConsumerChange` arm in `conn.rs`) and `adjust_receiver_queue`'s want-have delta both need exactly that, so both keep reading this field.
+- **`permit_balance: u32`** — the REAL broker-side balance: `granted_permits` minus one unit per broker dispatch unit that has actually arrived.
+  Incremented at the same three grant sites, by the identical delta.
+  Decremented by exactly one (`saturating_sub`) per dispatch unit: once per delivered logical message in `classify_and_queue` (a plain message, each batch member, or the chunk-completing logical message — unconditionally across the queued and dead-lettered branches, since the broker already spent the permit either way), once per incomplete chunk buffered in `deliver`, and once per PIP-33 marker in `record_marker_consumed`.
+  Force-zeroed everywhere `granted_permits` is zeroed, so the two never drift apart at a churn boundary.
+
+`flow_stats` feeds `permit_balance` — not `granted_permits` — into `FlowStats::available_permits`, the signal [`Auto::adjust`](../crates/magnetar-proto/src/receiver_queue.rs) uses to detect starvation.
+Before this split, the single additive field never registered a genuine dispatch-driven starvation (issue #349): `Auto` never scaled up under real load.
+
+`adjust_receiver_queue` also gates on `granted_permits == 0` before computing anything: a zero grant mirror only occurs right after a reset / terminal-failure / same-broker `CloseConsumer` zeroing — a churn window, not load starvation — so the tick is skipped entirely rather than let the policy misread it and grow (or emit a `CommandFlow` the broker would drop against a torn-down consumer id).
+
+`Connection::consumer_available_permits()` (and the façade's `Consumer::available_permits()` chain on both engines) intentionally keeps reading `granted_permits` — unchanged, additive semantics; extending Java-parity (a genuinely decrementing counter) to that public accessor is a separate, unscoped change.
+See [ADR-0082](specs/adr/0082-consumer-permit-balance-split.md).
 
 ---
 
@@ -751,6 +771,14 @@ pub enum OpOutcome {
 
 The slab maps `PendingOpKey -> Waker` + `PendingOpKey -> OpOutcome`.
 A future registers its waker via `Connection::register_waker(key, waker)` and consumes the outcome via `Connection::take_outcome(key)`.
+
+**Ack deadline (issue #346).** `PendingRequestKind::Ack` (the `Request(RequestId)` variant's payload when the pending op is a `CommandAck`) carries an `enqueued_at: Instant` alongside the `ConsumerHandle`, stamped by `Connection::ack`'s injected `now` parameter (ADR-0011).
+Two independent mechanisms resolve a pending ack that would otherwise park its `RequestFut` forever:
+
+1. **Same-broker `CloseConsumer` orphan sweep** — the close-handler's same-broker arm (`assigned_broker_service_url = None`, the #307 root cause) collects every `PendingRequestKind::Ack` entry for the torn-down handle and fails it immediately (`OpOutcome::Error{code: -1, message: "ack orphaned by broker consumer close"}`) before `resubscribe_consumer_after_broker_close` re-attaches a fresh consumer id — the broker will never answer a `CommandAck` addressed to a consumer id it has already forgotten.
+2. **`ack_response_timeout` backstop** — a connection-wide `ConnectionConfig::ack_response_timeout: Option<Duration>` (default `Some(30s)`, mirroring the `send_timeout` Java-parity default; `None` disables it) bounds every pending ack regardless of cause. `poll_timeout` folds `enqueued_at + ack_response_timeout` over every `PendingRequestKind::Ack` entry into the driver's next wake-up; `handle_timeout` reaps any that crossed the deadline with the same `Error{code: -1, ..}` shape (`message: "ack timeout"`). Skipped entirely when the knob is `None`, so a disabled backstop contributes no deadline and no spurious driver wakeups (load-bearing for moonpool determinism).
+
+Both mechanisms mirror the pre-existing per-producer `send_timeout` sweep in shape (two-phase collect-then-mutate over the pending map, then wake + record the outcome), and both also bump `ConsumerState::total_acks_failed` and push a `ConnectionEvent::AckResponse { request_id: Some(rid), result: Err(..) }` so the failure is observable through the same seams a real broker-rejected ack would use.
 
 ### Producer / consumer states
 
