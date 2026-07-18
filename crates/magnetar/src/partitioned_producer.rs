@@ -849,12 +849,15 @@ impl<'a, E: Engine> PartitionedProducerBuilder<'a, E> {
             send_timeout: self.send_timeout,
             batching_max_publish_delay: self.batching_max_publish_delay,
         };
+        let mut deadline =
+            crate::CreateProducerApi::new_producer_operation_deadline(&self.client.inner);
         open_partitioned_with_metadata(
             self.client,
             base_req,
             self.routing,
             self.router,
             self.auto_update_partitions_interval,
+            &mut deadline,
         )
         .await
     }
@@ -884,16 +887,20 @@ pub(crate) async fn open_partitioned_with_metadata<E>(
     routing: MessageRoutingMode,
     router: Option<Arc<dyn MessageRouter>>,
     auto_update_partitions_interval: Option<Duration>,
+    deadline: &mut crate::OperationDeadline,
 ) -> Result<PartitionedProducer<<E::ClientState as crate::CreateProducerApi>::Producer>, PulsarError>
 where
     E: Engine,
     E::ClientState: crate::BrokerMetadataApi + crate::CreateProducerApi,
 {
     let base_topic = base_req.topic.clone();
-    let partitions_count =
-        crate::BrokerMetadataApi::partitioned_topic_metadata(&client.inner, &base_topic)
-            .await
-            .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
+    let partitions_count = crate::BrokerMetadataApi::partitioned_topic_metadata_with_deadline(
+        &client.inner,
+        &base_topic,
+        deadline,
+    )
+    .await
+    .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
 
     let partition_topics: Vec<String> = if partitions_count == 0 {
         vec![base_topic.clone()]
@@ -908,7 +915,9 @@ where
     for child_topic in &partition_topics {
         let mut req = base_req.clone();
         req.topic = child_topic.clone();
-        let result = crate::CreateProducerApi::open_producer(&client.inner, req).await;
+        let result =
+            crate::CreateProducerApi::open_producer_with_deadline(&client.inner, req, deadline)
+                .await;
         match result {
             Ok(p) => child_producers.push(p),
             Err(e) => {
@@ -964,10 +973,16 @@ impl PartitionedProducerBuilder<'_, TokioEngine> {
     ///
     /// - [`PulsarError::Client`] on broker metadata lookup or per-partition open failure.
     pub async fn create_with_encryption(self) -> Result<PartitionedProducer, PulsarError> {
+        let mut deadline = self.client.runtime_client().operation_timer();
+        let mut last_broker_error = None;
         let partitions_count = self
             .client
             .runtime_client()
-            .partitioned_topic_metadata(&self.topic)
+            .partitioned_topic_metadata_with_operation_deadline(
+                &self.topic,
+                deadline.as_mut(),
+                &mut last_broker_error,
+            )
             .await?;
 
         let partition_topics: Vec<String> = if partitions_count == 0 {
@@ -998,7 +1013,12 @@ impl PartitionedProducerBuilder<'_, TokioEngine> {
             let result = self
                 .client
                 .runtime_client()
-                .open_producer_with(req, self.encryptor.clone())
+                .open_producer_with_operation_deadline(
+                    req,
+                    self.encryptor.clone(),
+                    deadline.as_mut(),
+                    &mut last_broker_error,
+                )
                 .await;
             match result {
                 Ok(p) => child_producers.push(p),

@@ -51,8 +51,8 @@ pub use magnetar_proto::conn::{ConnectionConfig, OpOutcome};
 // Re-export the most commonly used protocol types at the top level so users
 // don't have to remember which crate they live in.
 pub use magnetar_proto::{
-    AuthProvider, Backoff, ConnectionEvent, ConsumerHandle, MessageId, ProducerHandle,
-    ProtocolError, RequestId, SequenceId, SupervisorConfig,
+    AuthProvider, Backoff, ConnectionEvent, ConsumerHandle, MessageId, OperationRetryConfig,
+    ProducerHandle, ProtocolError, RequestId, SequenceId, SupervisorConfig,
 };
 #[cfg(feature = "moonpool")]
 pub use magnetar_runtime_moonpool as runtime_moonpool;
@@ -66,8 +66,9 @@ pub use engine::MoonpoolEngine;
 pub use engine::TokioEngine;
 #[cfg(feature = "tokio")]
 pub use engine::{
-    BrokerMetadataApi, ConsumerApi, CreateProducerApi, OpenProducerFut, ProducerApi,
-    ReceiveBatchFut, ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange, WatchTopicListFut,
+    BrokerMetadataApi, ConsumerApi, CreateProducerApi, OpenProducerFut, OperationDeadline,
+    ProducerApi, ReceiveBatchFut, ReceiveOptFut, SubscribeApi, SubscribeFut, TopicListChange,
+    WatchTopicListFut,
 };
 pub use engine::{Engine, MessageDecryptorApi, MessageEncryptorApi, NoEncryption, TransactionApi};
 

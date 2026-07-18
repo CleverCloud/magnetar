@@ -182,16 +182,22 @@ pub struct ConnectionConfig {
     pub feature_flags: pb::FeatureFlags,
     /// Keepalive (ping) interval. Default `30 s`.
     pub keepalive_interval: Duration,
-    /// Operation timeout (e.g. lookup + send). Default `30 s`.
+    /// Total timeout for one connect or broker-facing setup operation.
+    /// Default `30 s`.
     ///
-    /// Also bounds the post-dial `CONNECT` → `CONNECTED` handshake: once the
+    /// For producer/consumer setup, one provider-backed timer spans partition
+    /// metadata, lookup and redirect dialing, operation-retry backoff, and
+    /// producer-open or subscribe acknowledgement (ADR-0080).
+    ///
+    /// For connect, it also bounds the post-dial `CONNECT` → `CONNECTED` handshake: once the
     /// dial succeeds, the engines arm a single `operation_timeout` deadline
     /// over the handshake read loop so a broker that accepts the TCP SYN but
     /// never replies to `CommandConnect` surfaces a bounded `Io(TimedOut)`
     /// instead of parking forever. ADR-0052's dual cap scopes to the *dial*;
     /// this extends the same total budget to the handshake (Java
     /// `operationTimeoutMs` parity).
-    /// ([ADR-0052](../../specs/adr/0052-initial-connect-timeout-retry.md))
+    /// ([ADR-0052](../../specs/adr/0052-initial-connect-timeout-retry.md),
+    /// [ADR-0080](../../specs/adr/0080-configurable-operation-retry-policy.md))
     pub operation_timeout: Duration,
     /// Per-attempt timeout for the *initial* TCP/TLS dial. A dial that does not
     /// complete within this budget is abandoned and retried (see
@@ -469,17 +475,11 @@ mod connect_resilience_config_tests {
     }
 
     #[test]
-    fn operation_timeout_is_the_post_dial_handshake_budget() {
-        // ADR-0052 (extended): `operation_timeout` is the single total
-        // budget the engines arm over the post-dial CONNECT -> CONNECTED
-        // handshake read loop. A broker that accepts the SYN but never
-        // replies to `CommandConnect` must surface a bounded
-        // `Io(TimedOut)` within this budget, not park forever. The proto
-        // layer owns the field's semantics; the engines (moonpool
-        // `handshake_plain`, tokio `wait_connected`) consume it. Pin that
-        // an explicit, tight handshake budget round-trips independently of
-        // the dial caps so the engines can dial it down for the resilience
-        // sweep without disturbing `connect_timeout` / `connect_max_retries`.
+    fn operation_timeout_is_the_handshake_and_setup_operation_budget() {
+        // ADR-0052 + ADR-0080: the same configured duration bounds the
+        // post-dial handshake and each later caller-visible setup operation.
+        // Pin that an explicit tight budget round-trips independently of the
+        // dial caps.
         let cfg = ConnectionConfig {
             operation_timeout: Duration::from_secs(2),
             ..ConnectionConfig::default()
@@ -487,7 +487,7 @@ mod connect_resilience_config_tests {
         assert_eq!(
             cfg.operation_timeout,
             Duration::from_secs(2),
-            "operation_timeout must carry the caller's post-dial handshake budget verbatim",
+            "operation_timeout must carry the caller's handshake/setup budget verbatim",
         );
         // The handshake budget is independent of the dial caps — extending
         // the cap to the handshake must not couple it to either dial field.

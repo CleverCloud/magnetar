@@ -105,6 +105,7 @@ pub mod health_probe;
 pub(crate) mod log_fields;
 pub mod lookup;
 pub mod markers;
+pub mod operation_retry;
 pub mod producer;
 pub mod receiver_queue;
 pub mod schema;
@@ -178,7 +179,9 @@ pub use crate::dag_watch::{
     DagChangeReason, DagDelta, DagError, DagWatchSession, MergeEvent, SplitEvent,
 };
 pub use crate::error::{ConsumerError, ProducerError, ProtocolError};
-pub use crate::event::{ConnectionEvent, GetSchemaResult, IncomingMessage, LookupOutcome};
+pub use crate::event::{
+    ConnectionEvent, DriverRetry, GetSchemaResult, IncomingMessage, LookupOutcome,
+};
 pub use crate::frame::{
     Frame, FrameError, MAGIC_BROKER_ENTRY_METADATA, MAGIC_CRC32C, MAX_FRAME_SIZE, Payload,
     decode_one, encode_command, encode_payload,
@@ -189,6 +192,7 @@ pub use crate::markers::{
     ReplicatedSubscriptionMarkerDetails, ReplicatedSubscriptionMarkerKind,
     decode_replicated_subscription_marker,
 };
+pub use crate::operation_retry::{OperationKind, OperationRetryConfig, is_retryable_broker_error};
 pub use crate::producer::{ProducerIdentity, ProducerSlot, ProducerStats};
 pub use crate::receiver_queue::{
     Auto, DEFAULT_RECEIVER_QUEUE_SIZE, Fixed, FlowStats, ReceiverQueuePolicy, default_policy, fixed,

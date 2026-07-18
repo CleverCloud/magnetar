@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 
 use magnetar_proto::{
     ConnectionConfig, ConnectionEvent, CreateProducerRequest, HandshakeState, OpOutcome,
-    PendingOpKey, SubscribeRequest,
+    PendingOpKey, RequestId, SubscribeRequest,
 };
 use parking_lot::Mutex;
 
@@ -30,6 +30,35 @@ use crate::pool::{ConnectionFactory, ProxyConnectionPool};
 use crate::producer::Producer;
 use crate::transport::{Transport, default_tls_config};
 use crate::url_parse::{ParsedUrl, Scheme};
+
+type OperationDeadline<'a> = Pin<&'a mut (dyn Future<Output = ()> + Send)>;
+
+#[derive(Default)]
+struct LookupRetryState {
+    broker_failures: u32,
+}
+
+#[derive(Clone, Copy)]
+enum LookupIssue {
+    Initial { authoritative: bool },
+    Redirect { authoritative: bool, hops: u8 },
+}
+
+fn operation_deadline_error(
+    operation: &str,
+    last_broker_error: Option<(i32, String)>,
+) -> ClientError {
+    match last_broker_error {
+        Some((code, message)) => ClientError::Broker { code, message },
+        None => ClientError::Timeout(format!("{operation} exceeded operation_timeout")),
+    }
+}
+
+fn operation_deadline_expired(mut deadline: OperationDeadline<'_>) -> bool {
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    deadline.as_mut().poll(&mut cx).is_ready()
+}
 
 /// The top-level magnetar client.
 ///
@@ -395,6 +424,7 @@ impl Client {
             url: url.clone(),
             tls_config: tls_config.clone(),
             bootstrap_config: config.clone(),
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
             auth_provider: auth_provider.clone(),
             service_url_provider: service_url_provider.clone(),
             dns_resolver: dns_resolver.clone(),
@@ -454,15 +484,46 @@ impl Client {
         &self.shared
     }
 
+    /// Apply a broker-operation retry policy to the bootstrap and every future
+    /// pooled connection.
+    #[must_use]
+    pub fn with_operation_retry(self, config: magnetar_proto::OperationRetryConfig) -> Self {
+        self.shared
+            .inner
+            .lock()
+            .set_operation_retry_config(config.clone());
+        if let Some(pool) = &self.pool {
+            pool.set_operation_retry_config(config);
+        }
+        self
+    }
+
+    /// Create one timer for a caller-visible setup operation.
+    #[doc(hidden)]
+    pub fn operation_timer(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let timeout = self.shared.inner.lock().operation_timeout();
+        Box::pin(tokio::time::sleep(timeout))
+    }
+
     /// Open a producer.
     ///
     /// Returns once the broker has sent `CommandProducerSuccess`.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Broker`] if the broker refuses the producer.
+    /// Retryable broker refusals are reissued under `OperationRetryConfig`;
+    /// exhaustion returns [`ClientError::Broker`]. A deadline with no recorded
+    /// broker error returns [`ClientError::Timeout`].
     pub async fn open_producer(&self, req: CreateProducerRequest) -> Result<Producer, ClientError> {
-        self.open_producer_with(req, None).await
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.open_producer_with_operation_deadline(
+            req,
+            None,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
     }
 
     /// Same as [`Self::open_producer`] but with an optional encryption hook.
@@ -471,7 +532,29 @@ impl Client {
         req: CreateProducerRequest,
         encryptor: Option<Arc<dyn crate::crypto::MessageEncryptor>>,
     ) -> Result<Producer, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.open_producer_with_operation_deadline(
+            req,
+            encryptor,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware producer-open seam used by the engine-generic façade.
+    #[doc(hidden)]
+    pub async fn open_producer_with_operation_deadline(
+        &self,
+        req: CreateProducerRequest,
+        encryptor: Option<Arc<dyn crate::crypto::MessageEncryptor>>,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<Producer, ClientError> {
         let compression = req.compression;
+        let retry_config = self.shared.inner.lock().operation_retry_config().clone();
+        let mut attachment_failures = 0_u32;
         // Pulsar requires a `CommandLookupTopic` round-trip before opening a producer or
         // consumer: lookup is what triggers the broker to acquire ownership of the topic's
         // namespace bundle. Skipping it works only when the bundle has already been activated
@@ -483,42 +566,108 @@ impl Client {
         // connection (direct, no proxy) or on a per-broker pool entry (proxy-routed). The
         // `Producer` keeps an `Arc<ConnectionShared>` pointing at whichever connection it
         // was opened against, so subsequent sends / closes go to the right socket.
-        let (target, landed_on) = self.lookup_topic(&req.topic).await?;
-        let topic = req.topic.clone();
-        let target_shared = self.resolve_target(target, &landed_on, &topic).await?;
-        // ADR-0059: the resolved data-plane connection may be
-        // a pool entry distinct from the bootstrap; fast-fail if it has already
-        // gone terminal with no driver, before registering a doomed
-        // `CommandProducer`.
-        target_shared.fail_if_no_driver()?;
-        let (handle, slot) = {
-            let mut conn = target_shared.inner.lock();
-            let handle = conn.create_producer(req);
-            let slot = conn
-                .producer(handle)
-                .cloned()
-                .expect("just-created producer slot must exist");
-            (handle, slot)
-        };
-        target_shared.driver_waker.notify_one();
-        wait_producer_ready(&target_shared, handle).await?;
-        // Lifecycle record (ADR-0054): the broker-assigned producer name is
-        // available once `ProducerReady` has landed. Per-slot read only.
-        let producer_name = slot.state.lock().name.clone().unwrap_or_default();
-        tracing::info!(
-            topic = %slot.identity.topic,
-            producer_name = %producer_name,
-            handle = ?handle,
-            access_mode = ?slot.identity.access_mode,
-            "producer created"
-        );
-        Ok(Producer::assemble(
-            target_shared,
-            handle,
-            slot,
-            compression,
-            encryptor,
-        ))
+        loop {
+            let (target, landed_on) = self
+                .lookup_topic_with_operation_deadline(
+                    &req.topic,
+                    deadline.as_mut(),
+                    last_broker_error,
+                )
+                .await?;
+            let topic = req.topic.clone();
+            let target_shared = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "producer target resolution",
+                        last_broker_error.clone(),
+                    ));
+                }
+                result = self.resolve_target(target, &landed_on, &topic) => result?,
+            };
+            // ADR-0059: the resolved data-plane connection may be a pool entry distinct from the
+            // bootstrap; fast-fail before registering a doomed `CommandProducer`.
+            target_shared.fail_if_no_driver()?;
+            if operation_deadline_expired(deadline.as_mut()) {
+                return Err(operation_deadline_error(
+                    "producer open",
+                    last_broker_error.clone(),
+                ));
+            }
+            let (handle, slot) = {
+                let mut conn = target_shared.inner.lock();
+                let handle = conn.create_producer(req.clone());
+                let slot = conn
+                    .producer(handle)
+                    .cloned()
+                    .expect("just-created producer slot must exist");
+                (handle, slot)
+            };
+            target_shared.driver_waker.notify_one();
+            let mut guard = PendingProducerOpenGuard::new(target_shared.clone(), handle);
+            let wait_shared = target_shared.clone();
+            let ready = wait_producer_ready(&wait_shared, handle);
+            tokio::pin!(ready);
+            let ready_result = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    let last = target_shared
+                        .inner
+                        .lock()
+                        .producer_last_open_error(handle)
+                        .or_else(|| last_broker_error.clone());
+                    Err(operation_deadline_error("producer open", last))
+                }
+                result = ready.as_mut() => result,
+            };
+            match ready_result {
+                Ok(()) => {
+                    guard.disarm();
+                    let producer_name = slot.state.lock().name.clone().unwrap_or_default();
+                    tracing::info!(
+                        topic = %slot.identity.topic,
+                        producer_name = %producer_name,
+                        handle = ?handle,
+                        access_mode = ?slot.identity.access_mode,
+                        "producer created"
+                    );
+                    return Ok(Producer::assemble(
+                        target_shared,
+                        handle,
+                        slot,
+                        compression,
+                        encryptor,
+                    ));
+                }
+                Err(ClientError::Broker { code, message })
+                    if magnetar_proto::is_retryable_broker_error(
+                        magnetar_proto::OperationKind::ProducerOpen,
+                        code,
+                    ) =>
+                {
+                    *last_broker_error = Some((code, message.clone()));
+                    attachment_failures = attachment_failures.saturating_add(1);
+                    if !retry_config.should_retry_after_failure(attachment_failures) {
+                        return Err(ClientError::Broker { code, message });
+                    }
+                    drop(guard);
+                    let sleep =
+                        tokio::time::sleep(retry_config.delay_after_failure(attachment_failures));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "producer open retry",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        () = sleep.as_mut() => {}
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Issue a `CommandLookupTopic` for `topic` and decide where the topic's data ops should
@@ -560,6 +709,18 @@ impl Client {
         &self,
         topic: &str,
     ) -> Result<(LookupTarget, Arc<ConnectionShared>), ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.lookup_topic_with_operation_deadline(topic, deadline.as_mut(), &mut last_broker_error)
+            .await
+    }
+
+    async fn lookup_topic_with_operation_deadline(
+        &self,
+        topic: &str,
+        mut deadline: OperationDeadline<'_>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<(LookupTarget, Arc<ConnectionShared>), ClientError> {
         // ADR-0039 redirect dialing: the first lookup rides the bootstrap
         // connection. If the bootstrap broker is not the bundle owner it
         // answers `Redirect`; the proto layer no longer chases that on the
@@ -572,15 +733,38 @@ impl Client {
         // and decremented per dialed broker; the proto floor + this engine
         // guard keep the chain bounded by `MAX_LOOKUP_REDIRECTS`.
         let mut current = self.shared.clone();
+        let mut retry_state = LookupRetryState::default();
         // First hop is the user lookup; subsequent hops are redirect re-issues
         // and carry the budget the previous hop's `Redirected` advertised.
         let mut next_hop: Option<(bool, u8)> = None;
         loop {
             let outcome = match next_hop {
-                None => self.issue_lookup_on(&current, topic, false, None).await?,
+                None => {
+                    self.issue_lookup_on(
+                        &current,
+                        topic,
+                        LookupIssue::Initial {
+                            authoritative: false,
+                        },
+                        deadline.as_mut(),
+                        &mut retry_state,
+                        last_broker_error,
+                    )
+                    .await?
+                }
                 Some((authoritative, hops)) => {
-                    self.issue_lookup_on(&current, topic, authoritative, Some(hops))
-                        .await?
+                    self.issue_lookup_on(
+                        &current,
+                        topic,
+                        LookupIssue::Redirect {
+                            authoritative,
+                            hops,
+                        },
+                        deadline.as_mut(),
+                        &mut retry_state,
+                        last_broker_error,
+                    )
+                    .await?
                 }
             };
 
@@ -632,7 +816,16 @@ impl Client {
                 // data-plane producer/consumer placement, so it always pins the
                 // primary connection (index 0) — lookups never consume a
                 // `connections_per_broker` fan-out slot (ADR-0073).
-                current = self.resolve_direct_broker(&redirect_url, topic, 0).await?;
+                current = tokio::select! {
+                    biased;
+                    () = deadline.as_mut() => {
+                        return Err(operation_deadline_error(
+                            "lookup redirect dial",
+                            last_broker_error.clone(),
+                        ));
+                    }
+                    result = self.resolve_direct_broker(&redirect_url, topic, 0) => result?,
+                };
                 next_hop = Some((authoritative, hops_remaining));
                 continue;
             }
@@ -652,8 +845,10 @@ impl Client {
         &self,
         shared: &Arc<ConnectionShared>,
         topic: &str,
-        authoritative: bool,
-        redirect_budget: Option<u8>,
+        issue: LookupIssue,
+        mut deadline: OperationDeadline<'_>,
+        retry_state: &mut LookupRetryState,
+        last_broker_error: &mut Option<(i32, String)>,
     ) -> Result<OpOutcome, ClientError> {
         // ADR-0059: fast-fail BEFORE registering the lookup
         // when the connection is already terminal with no driver to recover it
@@ -666,23 +861,50 @@ impl Client {
         // until the connection is live again (or terminal), then re-issue. The
         // budget is only spent on a real broker round-trip.
         let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        let retry_config = shared.inner.lock().operation_retry_config().clone();
         loop {
             let request_id = {
+                if operation_deadline_expired(deadline.as_mut()) {
+                    return Err(operation_deadline_error(
+                        "topic lookup",
+                        last_broker_error.clone(),
+                    ));
+                }
                 let mut conn = shared.inner.lock();
-                match redirect_budget {
-                    None => conn.lookup(topic, authoritative),
-                    Some(hops) => conn.lookup_redirect(topic, authoritative, hops),
+                match issue {
+                    LookupIssue::Initial { authoritative } => conn.lookup(topic, authoritative),
+                    LookupIssue::Redirect {
+                        authoritative,
+                        hops,
+                    } => conn.lookup_redirect(topic, authoritative, hops),
                 }
             };
             shared.driver_waker.notify_one();
-            let outcome = RequestFut {
-                shared: shared.clone(),
-                request_id,
-            }
-            .await;
+            let request = RequestFut::cancellable(shared.clone(), request_id);
+            tokio::pin!(request);
+            let outcome = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "topic lookup",
+                        last_broker_error.clone(),
+                    ));
+                }
+                outcome = request.as_mut() => outcome,
+            };
 
             if matches!(outcome, OpOutcome::SessionLost { .. }) {
-                match shared.await_reconnect_or_terminal().await {
+                let readiness = tokio::select! {
+                    biased;
+                    () = deadline.as_mut() => {
+                        return Err(operation_deadline_error(
+                            "topic lookup",
+                            last_broker_error.clone(),
+                        ));
+                    }
+                    readiness = shared.await_reconnect_or_terminal() => readiness,
+                };
+                match readiness {
                     crate::LookupReissueReadiness::Reconnected => {
                         if reissues_remaining == 0 {
                             tracing::warn!(
@@ -703,6 +925,42 @@ impl Client {
                     crate::LookupReissueReadiness::Terminal => {
                         return Err(ClientError::PeerClosed);
                     }
+                }
+            }
+
+            if let OpOutcome::LookupResponse {
+                outcome: magnetar_proto::LookupOutcome::Failed { code, .. },
+                ..
+            } = &outcome
+                && magnetar_proto::is_retryable_broker_error(
+                    magnetar_proto::OperationKind::Lookup,
+                    *code,
+                )
+            {
+                if let OpOutcome::LookupResponse {
+                    outcome: magnetar_proto::LookupOutcome::Failed { code, message },
+                    ..
+                } = &outcome
+                {
+                    *last_broker_error = Some((*code, message.clone()));
+                }
+                retry_state.broker_failures = retry_state.broker_failures.saturating_add(1);
+                if retry_config.should_retry_after_failure(retry_state.broker_failures) {
+                    let sleep = tokio::time::sleep(
+                        retry_config.delay_after_failure(retry_state.broker_failures),
+                    );
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "topic lookup",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        () = sleep.as_mut() => {}
+                    }
+                    continue;
                 }
             }
 
@@ -970,11 +1228,7 @@ impl Client {
             conn.new_txn(timeout)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             magnetar_proto::OpOutcome::NewTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
@@ -1025,11 +1279,7 @@ impl Client {
             conn.tc_client_connect(0)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             OpOutcome::Success { .. } => {}
             OpOutcome::Error { code, message, .. } => {
@@ -1060,11 +1310,7 @@ impl Client {
             conn.add_partition_to_txn(txn, topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             magnetar_proto::OpOutcome::AddPartitionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
@@ -1089,11 +1335,7 @@ impl Client {
             conn.add_subscription_to_txn(txn, subscription.into(), topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             magnetar_proto::OpOutcome::AddSubscriptionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
@@ -1117,11 +1359,7 @@ impl Client {
             conn.end_txn(txn, action)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             magnetar_proto::OpOutcome::EndTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
@@ -1142,16 +1380,50 @@ impl Client {
         namespace: &str,
         pattern: &str,
     ) -> Result<Vec<String>, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.watch_topic_list_with_operation_deadline(
+            namespace,
+            pattern,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware topic-list snapshot seam used by the engine-generic
+    /// pattern-consumer builder.
+    #[doc(hidden)]
+    pub async fn watch_topic_list_with_operation_deadline(
+        &self,
+        namespace: &str,
+        pattern: &str,
+        mut deadline: OperationDeadline<'_>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<Vec<String>, ClientError> {
+        if operation_deadline_expired(deadline.as_mut()) {
+            return Err(operation_deadline_error(
+                "topic-list snapshot",
+                last_broker_error.clone(),
+            ));
+        }
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.watch_topic_list(namespace, pattern)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let request = RequestFut::cancellable(self.shared.clone(), request_id);
+        tokio::pin!(request);
+        let outcome = tokio::select! {
+            biased;
+            () = deadline.as_mut() => {
+                return Err(operation_deadline_error(
+                    "topic-list snapshot",
+                    last_broker_error.clone(),
+                ));
+            }
+            outcome = request.as_mut() => outcome,
+        };
         match outcome {
             magnetar_proto::OpOutcome::TopicListSnapshot { topics, .. } => Ok(topics),
             magnetar_proto::OpOutcome::Error { code, message, .. } => {
@@ -1247,30 +1519,96 @@ impl Client {
     /// Query the broker for the number of partitions a topic has. Returns `0` for
     /// non-partitioned topics. Mirrors Java `PulsarClient#getPartitionsForTopic`.
     pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.get_partitioned_topic_metadata(topic)
-        };
-        self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
-        match outcome {
-            magnetar_proto::OpOutcome::PartitionedMetadata {
-                partitions, error, ..
-            } => {
-                if let Some((code, message)) = error {
-                    Err(ClientError::Broker { code, message })
-                } else {
-                    Ok(partitions)
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.partitioned_topic_metadata_with_operation_deadline(
+            topic,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware partition-metadata seam used by the engine-generic façade.
+    #[doc(hidden)]
+    pub async fn partitioned_topic_metadata_with_operation_deadline(
+        &self,
+        topic: &str,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<u32, ClientError> {
+        let retry_config = self.shared.inner.lock().operation_retry_config().clone();
+        let mut broker_failures = 0_u32;
+        loop {
+            let request_id = {
+                if operation_deadline_expired(deadline.as_mut()) {
+                    return Err(operation_deadline_error(
+                        "partitioned topic metadata",
+                        last_broker_error.clone(),
+                    ));
+                }
+                let mut conn = self.shared.inner.lock();
+                conn.get_partitioned_topic_metadata(topic)
+            };
+            self.shared.driver_waker.notify_one();
+            let request = RequestFut::cancellable(self.shared.clone(), request_id);
+            tokio::pin!(request);
+            let outcome = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "partitioned topic metadata",
+                        last_broker_error.clone(),
+                    ));
+                }
+                outcome = request.as_mut() => outcome,
+            };
+            match outcome {
+                magnetar_proto::OpOutcome::PartitionedMetadata {
+                    partitions: _,
+                    error: Some((code, message)),
+                    ..
+                } if magnetar_proto::is_retryable_broker_error(
+                    magnetar_proto::OperationKind::PartitionedMetadata,
+                    code,
+                ) =>
+                {
+                    *last_broker_error = Some((code, message.clone()));
+                    broker_failures = broker_failures.saturating_add(1);
+                    if !retry_config.should_retry_after_failure(broker_failures) {
+                        return Err(ClientError::Broker { code, message });
+                    }
+                    let sleep =
+                        tokio::time::sleep(retry_config.delay_after_failure(broker_failures));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "partitioned topic metadata",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        () = sleep.as_mut() => {}
+                    }
+                }
+                magnetar_proto::OpOutcome::PartitionedMetadata {
+                    partitions: _,
+                    error: Some((code, message)),
+                    ..
+                } => return Err(ClientError::Broker { code, message }),
+                magnetar_proto::OpOutcome::PartitionedMetadata {
+                    partitions,
+                    error: None,
+                    ..
+                } => return Ok(partitions),
+                magnetar_proto::OpOutcome::Terminal { .. } => return Err(ClientError::PeerClosed),
+                other => {
+                    return Err(ClientError::Other(format!(
+                        "unexpected partitioned metadata outcome: {other:?}"
+                    )));
                 }
             }
-            magnetar_proto::OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected partitioned metadata outcome: {other:?}"
-            ))),
         }
     }
 
@@ -1383,9 +1721,14 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Broker`] if the broker refuses the subscribe.
+    /// Retryable broker refusals are reissued under `OperationRetryConfig`;
+    /// exhaustion returns [`ClientError::Broker`]. A deadline with no recorded
+    /// broker error returns [`ClientError::Timeout`].
     pub async fn subscribe(&self, req: SubscribeRequest) -> Result<Consumer, ClientError> {
-        self.subscribe_with(req, None).await
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.subscribe_with_operation_deadline(req, None, deadline.as_mut(), &mut last_broker_error)
+            .await
     }
 
     /// Same as [`Self::subscribe`] but with an optional decryption hook (PIP-4).
@@ -1394,54 +1737,131 @@ impl Client {
         req: SubscribeRequest,
         decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
     ) -> Result<Consumer, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.subscribe_with_operation_deadline(
+            req,
+            decryptor,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware subscribe seam used by the engine-generic façade.
+    #[doc(hidden)]
+    pub async fn subscribe_with_operation_deadline(
+        &self,
+        req: SubscribeRequest,
+        decryptor: Option<Arc<dyn crate::crypto::MessageDecryptor>>,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<Consumer, ClientError> {
         // See `open_producer_with`: subscribe also needs lookup-driven bundle activation,
         // and ADR-0039 routes proxy-resolved subscribes onto a pinned pool entry.
-        let (target, landed_on) = self.lookup_topic(&req.topic).await?;
-        let topic = req.topic.clone();
-        let target_shared = self.resolve_target(target, &landed_on, &topic).await?;
-        // ADR-0059: fast-fail if the resolved data-plane
-        // connection is already terminal with no driver, before registering a
-        // doomed `CommandSubscribe`.
-        target_shared.fail_if_no_driver()?;
-        let (handle, slot) = {
-            let mut conn = target_shared.inner.lock();
-            let handle = conn.subscribe(req);
-            let slot = conn
-                .consumer(handle)
-                .cloned()
-                .expect("just-created consumer slot must exist");
-            (handle, slot)
-        };
-        target_shared.driver_waker.notify_one();
-        wait_subscribe_acked(&target_shared, handle).await?;
-
-        // Feed an initial flow so the broker starts delivering.
-        {
-            let mut conn = target_shared.inner.lock();
-            // `initial_flow` returns None when there is no consumer state; ignore that.
-            let _ = conn.initial_flow(handle);
-            // Also send an explicit FLOW with the policy's CURRENT target as a safety net for
-            // any sans-io version that gates the initial flow on internal state we haven't
-            // reached. Issue #301: read the live target from the slot
-            // (`policy.initial()` after construction) rather than the raw
-            // `req.receiver_queue_size`, so an `Auto` policy is not double-granted a stale
-            // raw value.
-            let initial_target = slot.state.lock().receiver_queue_size;
-            if initial_target > 0 {
-                conn.flow(handle, initial_target as u32);
+        let retry_config = self.shared.inner.lock().operation_retry_config().clone();
+        let mut attachment_failures = 0_u32;
+        loop {
+            let (target, landed_on) = self
+                .lookup_topic_with_operation_deadline(
+                    &req.topic,
+                    deadline.as_mut(),
+                    last_broker_error,
+                )
+                .await?;
+            let topic = req.topic.clone();
+            let target_shared = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "consumer target resolution",
+                        last_broker_error.clone(),
+                    ));
+                }
+                result = self.resolve_target(target, &landed_on, &topic) => result?,
+            };
+            target_shared.fail_if_no_driver()?;
+            if operation_deadline_expired(deadline.as_mut()) {
+                return Err(operation_deadline_error(
+                    "consumer subscribe",
+                    last_broker_error.clone(),
+                ));
+            }
+            let (handle, slot) = {
+                let mut conn = target_shared.inner.lock();
+                let handle = conn.subscribe(req.clone());
+                let slot = conn
+                    .consumer(handle)
+                    .cloned()
+                    .expect("just-created consumer slot must exist");
+                (handle, slot)
+            };
+            target_shared.driver_waker.notify_one();
+            let mut guard = PendingConsumerSubscribeGuard::new(target_shared.clone(), handle);
+            let wait_shared = target_shared.clone();
+            let acked = wait_subscribe_acked(&wait_shared, handle, true, None);
+            tokio::pin!(acked);
+            let ack_result = tokio::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    let last = target_shared
+                        .inner
+                        .lock()
+                        .consumer_last_subscribe_error(handle)
+                        .or_else(|| last_broker_error.clone());
+                    Err(operation_deadline_error("consumer subscribe", last))
+                }
+                result = acked.as_mut() => result,
+            };
+            match ack_result {
+                Ok(()) => {
+                    guard.disarm();
+                    {
+                        let mut conn = target_shared.inner.lock();
+                        let _ = conn.initial_flow(handle);
+                        let initial_target = slot.state.lock().receiver_queue_size;
+                        if initial_target > 0 {
+                            conn.flow(handle, initial_target as u32);
+                        }
+                    }
+                    target_shared.driver_waker.notify_one();
+                    tracing::info!(
+                        topic = %slot.identity.topic,
+                        subscription = %slot.identity.subscription,
+                        handle = ?handle,
+                        "consumer subscribed"
+                    );
+                    return Ok(Consumer::assemble(target_shared, handle, slot, decryptor));
+                }
+                Err(ClientError::Broker { code, message })
+                    if magnetar_proto::is_retryable_broker_error(
+                        magnetar_proto::OperationKind::Subscribe,
+                        code,
+                    ) =>
+                {
+                    *last_broker_error = Some((code, message.clone()));
+                    attachment_failures = attachment_failures.saturating_add(1);
+                    if !retry_config.should_retry_after_failure(attachment_failures) {
+                        return Err(ClientError::Broker { code, message });
+                    }
+                    drop(guard);
+                    let sleep =
+                        tokio::time::sleep(retry_config.delay_after_failure(attachment_failures));
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "consumer subscribe retry",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        () = sleep.as_mut() => {}
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
-        target_shared.driver_waker.notify_one();
-
-        // Lifecycle record (ADR-0054).
-        tracing::info!(
-            topic = %slot.identity.topic,
-            subscription = %slot.identity.subscription,
-            handle = ?handle,
-            "consumer subscribed"
-        );
-
-        Ok(Consumer::assemble(target_shared, handle, slot, decryptor))
     }
 
     /// Close the connection. Sends `CommandCloseConnection`-style state-machine close on the
@@ -1730,6 +2150,31 @@ impl Future for ConnectedFut {
 pub(crate) struct RequestFut {
     pub(crate) shared: Arc<ConnectionShared>,
     pub(crate) request_id: magnetar_proto::RequestId,
+    cancel_on_drop: bool,
+}
+
+impl RequestFut {
+    pub(crate) fn new(
+        shared: Arc<ConnectionShared>,
+        request_id: magnetar_proto::RequestId,
+    ) -> Self {
+        Self {
+            shared,
+            request_id,
+            cancel_on_drop: false,
+        }
+    }
+
+    pub(crate) fn cancellable(
+        shared: Arc<ConnectionShared>,
+        request_id: magnetar_proto::RequestId,
+    ) -> Self {
+        Self {
+            shared,
+            request_id,
+            cancel_on_drop: true,
+        }
+    }
 }
 
 impl Future for RequestFut {
@@ -1759,8 +2204,75 @@ impl Drop for RequestFut {
     /// MEDIUM-4 finding. ADR-0024 four-layer coverage lives in
     /// `tests/lookup_drop_unregister.rs`.
     fn drop(&mut self) {
-        let key = magnetar_proto::PendingOpKey::Request(self.request_id);
-        self.shared.inner.lock().unregister_waker(key);
+        if self.cancel_on_drop {
+            self.shared.inner.lock().cancel_request(self.request_id);
+        } else {
+            let key = magnetar_proto::PendingOpKey::Request(self.request_id);
+            self.shared.inner.lock().unregister_waker(key);
+        }
+    }
+}
+
+struct PendingProducerOpenGuard {
+    shared: Arc<ConnectionShared>,
+    handle: magnetar_proto::ProducerHandle,
+    armed: bool,
+}
+
+impl PendingProducerOpenGuard {
+    fn new(shared: Arc<ConnectionShared>, handle: magnetar_proto::ProducerHandle) -> Self {
+        Self {
+            shared,
+            handle,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingProducerOpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.inner.lock().cancel_producer_open(self.handle);
+            self.shared.operation_cancel_notify.notify_waiters();
+            self.shared.driver_waker.notify_one();
+        }
+    }
+}
+
+struct PendingConsumerSubscribeGuard {
+    shared: Arc<ConnectionShared>,
+    handle: magnetar_proto::ConsumerHandle,
+    armed: bool,
+}
+
+impl PendingConsumerSubscribeGuard {
+    fn new(shared: Arc<ConnectionShared>, handle: magnetar_proto::ConsumerHandle) -> Self {
+        Self {
+            shared,
+            handle,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingConsumerSubscribeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared
+                .inner
+                .lock()
+                .cancel_consumer_subscribe(self.handle);
+            self.shared.operation_cancel_notify.notify_waiters();
+            self.shared.driver_waker.notify_one();
+        }
     }
 }
 
@@ -1768,12 +2280,12 @@ async fn wait_producer_ready(
     shared: &Arc<ConnectionShared>,
     handle: magnetar_proto::ProducerHandle,
 ) -> Result<(), ClientError> {
-    // Drain the event queue until we see ProducerReady/ProducerClosedByBroker for our handle,
-    // or until the producer-open request resolves with an Error outcome.
+    // Select only ProducerReady/ProducerClosedByBroker events for this handle;
+    // concurrent setup waiters retain ownership of their own events.
     EventWaitFut {
         shared: shared.clone(),
         matcher: EventMatcher::ProducerReady(handle),
-        helper: None,
+        notification: None,
     }
     .await
 }
@@ -1781,11 +2293,13 @@ async fn wait_producer_ready(
 pub(crate) async fn wait_subscribe_acked(
     shared: &Arc<ConnectionShared>,
     handle: magnetar_proto::ConsumerHandle,
+    accept_prior_attachment: bool,
+    expected_waiter_id: Option<RequestId>,
 ) -> Result<(), ClientError> {
     EventWaitFut {
         shared: shared.clone(),
-        matcher: EventMatcher::SubscribeAcked(handle),
-        helper: None,
+        matcher: EventMatcher::SubscribeAcked(handle, accept_prior_attachment, expected_waiter_id),
+        notification: None,
     }
     .await
 }
@@ -1793,29 +2307,20 @@ pub(crate) async fn wait_subscribe_acked(
 #[derive(Debug, Clone, Copy)]
 enum EventMatcher {
     ProducerReady(magnetar_proto::ProducerHandle),
-    SubscribeAcked(magnetar_proto::ConsumerHandle),
+    SubscribeAcked(magnetar_proto::ConsumerHandle, bool, Option<RequestId>),
 }
 
-/// Each `Pending` return spawns a helper that awaits `driver_waker.notified()`
-/// and wakes the caller; on the next poll (or on drop) the previous helper is
-/// aborted. Without that abort, the stale helper from an earlier poll keeps
-/// waiting on `driver_waker.notified()` and competes with the driver loop for
-/// the `notify_one` permits that user-facing futures emit after enqueueing
-/// outbound work — when the helper wins the race, the freshly-queued frame
-/// (e.g. the post-subscribe FLOW) sits in `outbound` and the driver stays
-/// parked, deterministically hanging the next `receive()`.
+/// The dedicated event notification is owned and polled before connection
+/// state is inspected. It therefore remains registered across `Pending` and
+/// cannot miss a driver `notify_waiters()` that races with the state check.
+/// Keeping it separate from `driver_waker` also prevents event waiters from
+/// consuming outbound-work permits intended for the driver loop.
+/// Each waiter removes only events for its own handle; unrelated concurrent
+/// setup events remain in the connection queue for their owning waiter.
 struct EventWaitFut {
     shared: Arc<ConnectionShared>,
     matcher: EventMatcher,
-    helper: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for EventWaitFut {
-    fn drop(&mut self) {
-        if let Some(h) = self.helper.take() {
-            h.abort();
-        }
-    }
+    notification: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
 }
 
 impl Future for EventWaitFut {
@@ -1823,146 +2328,225 @@ impl Future for EventWaitFut {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut conn = this.shared.inner.lock();
-        // Inspect both events and the outcome slab.
         loop {
-            match conn.poll_event() {
-                Some(ConnectionEvent::ProducerReady { handle, .. }) => {
-                    if let EventMatcher::ProducerReady(h) = this.matcher {
-                        if h == handle {
-                            return Poll::Ready(Ok(()));
+            let notification = this
+                .notification
+                .get_or_insert_with(|| Box::pin(this.shared.event_waker.clone().notified_owned()));
+            let notified = notification.as_mut().poll(cx);
+
+            let mut conn = this.shared.inner.lock();
+            // Inspect both events and the outcome slab.
+            loop {
+                let matcher = this.matcher;
+                match conn.poll_event_if(|event| match (matcher, event) {
+                    (
+                        EventMatcher::ProducerReady(expected),
+                        ConnectionEvent::ProducerReady { handle, .. }
+                        | ConnectionEvent::ProducerClosedByBroker { handle, .. }
+                        | ConnectionEvent::ProducerOpenFailed { handle, .. },
+                    ) => expected == *handle,
+                    (
+                        EventMatcher::SubscribeAcked(expected, _, _),
+                        ConnectionEvent::SubscribeAcked { handle }
+                        | ConnectionEvent::ConsumerClosedByBroker { handle, .. }
+                        | ConnectionEvent::SubscribeFailed { handle, .. },
+                    ) => expected == *handle,
+                    _ => false,
+                }) {
+                    Some(ConnectionEvent::ProducerReady { handle, .. }) => {
+                        if let EventMatcher::ProducerReady(h) = this.matcher {
+                            if h == handle {
+                                return Poll::Ready(Ok(()));
+                            }
                         }
                     }
-                }
-                Some(ConnectionEvent::SubscribeAcked { handle }) => {
-                    if let EventMatcher::SubscribeAcked(h) = this.matcher {
-                        if h == handle {
-                            return Poll::Ready(Ok(()));
+                    Some(ConnectionEvent::SubscribeAcked { handle }) => {
+                        if let EventMatcher::SubscribeAcked(h, _, waiter_id) = this.matcher {
+                            let completed = match waiter_id {
+                                Some(waiter_id) => conn
+                                    .consume_consumer_subscribe_waiter_completion(
+                                        handle, waiter_id,
+                                    ),
+                                None => conn.consume_initial_consumer_subscribe_completion(handle),
+                            };
+                            if h == handle && completed {
+                                return Poll::Ready(Ok(()));
+                            }
                         }
                     }
-                }
-                Some(ConnectionEvent::ProducerClosedByBroker {
-                    handle,
-                    assigned_broker_service_url,
-                }) => {
-                    if let EventMatcher::ProducerReady(h) = this.matcher {
-                        if h == handle {
-                            // Broker-forced close — degraded-but-recovering
-                            // (warn! per ADR-0054 §2.1); the open future
-                            // surfaces `Closed` and the caller decides.
-                            let topic = conn
-                                .producer(handle)
-                                .map(|s| s.identity.topic.clone())
-                                .unwrap_or_default();
-                            tracing::warn!(
-                                handle = ?handle,
-                                topic = %topic,
-                                assigned_broker_service_url = assigned_broker_service_url
-                                    .as_deref()
-                                    .map(crate::log_fields::truncate_broker_str),
-                                "broker closed producer while waiting for ProducerReady"
-                            );
-                            return Poll::Ready(Err(ClientError::Closed));
+                    Some(ConnectionEvent::ProducerClosedByBroker {
+                        handle,
+                        assigned_broker_service_url,
+                    }) => {
+                        if let EventMatcher::ProducerReady(h) = this.matcher {
+                            if h == handle {
+                                // Broker-forced close — degraded-but-recovering
+                                // (warn! per ADR-0054 §2.1); the open future
+                                // surfaces `Closed` and the caller decides.
+                                let topic = conn
+                                    .producer(handle)
+                                    .map(|s| s.identity.topic.clone())
+                                    .unwrap_or_default();
+                                tracing::warn!(
+                                    handle = ?handle,
+                                    topic = %topic,
+                                    assigned_broker_service_url = assigned_broker_service_url
+                                        .as_deref()
+                                        .map(crate::log_fields::truncate_broker_str),
+                                    "broker closed producer while waiting for ProducerReady"
+                                );
+                                return Poll::Ready(Err(ClientError::Closed));
+                            }
                         }
                     }
-                }
-                Some(ConnectionEvent::ProducerOpenFailed {
-                    handle,
-                    code,
-                    message,
-                }) => {
-                    if let EventMatcher::ProducerReady(h) = this.matcher {
-                        if h == handle {
-                            return Poll::Ready(Err(ClientError::Broker { code, message }));
+                    Some(ConnectionEvent::ProducerOpenFailed {
+                        handle,
+                        code,
+                        message,
+                    }) => {
+                        if let EventMatcher::ProducerReady(h) = this.matcher {
+                            if h == handle {
+                                return Poll::Ready(Err(ClientError::Broker { code, message }));
+                            }
                         }
                     }
-                }
-                Some(ConnectionEvent::ConsumerClosedByBroker {
-                    handle,
-                    assigned_broker_service_url,
-                }) => {
-                    if let EventMatcher::SubscribeAcked(h) = this.matcher {
-                        if h == handle {
-                            // Broker-forced close — warn! per ADR-0054 §2.1.
-                            let (topic, subscription) = conn
-                                .consumer(handle)
-                                .map(|s| {
-                                    (s.identity.topic.clone(), s.identity.subscription.clone())
-                                })
-                                .unwrap_or_default();
-                            tracing::warn!(
-                                handle = ?handle,
-                                topic = %topic,
-                                subscription = %subscription,
-                                assigned_broker_service_url = assigned_broker_service_url
-                                    .as_deref()
-                                    .map(crate::log_fields::truncate_broker_str),
-                                "broker closed consumer while waiting for SubscribeAcked"
-                            );
-                            return Poll::Ready(Err(ClientError::Closed));
+                    Some(ConnectionEvent::ConsumerClosedByBroker {
+                        handle,
+                        assigned_broker_service_url,
+                    }) => {
+                        if let EventMatcher::SubscribeAcked(h, _, _) = this.matcher {
+                            if h == handle {
+                                // Broker-forced close — warn! per ADR-0054 §2.1.
+                                let (topic, subscription) = conn
+                                    .consumer(handle)
+                                    .map(|s| {
+                                        (s.identity.topic.clone(), s.identity.subscription.clone())
+                                    })
+                                    .unwrap_or_default();
+                                tracing::warn!(
+                                    handle = ?handle,
+                                    topic = %topic,
+                                    subscription = %subscription,
+                                    assigned_broker_service_url = assigned_broker_service_url
+                                        .as_deref()
+                                        .map(crate::log_fields::truncate_broker_str),
+                                    "broker closed consumer while waiting for SubscribeAcked"
+                                );
+                                return Poll::Ready(Err(ClientError::Closed));
+                            }
                         }
                     }
-                }
-                Some(ConnectionEvent::SubscribeFailed {
-                    handle,
-                    code,
-                    message,
-                }) => {
-                    if let EventMatcher::SubscribeAcked(h) = this.matcher {
-                        if h == handle {
-                            return Poll::Ready(Err(ClientError::Broker { code, message }));
+                    Some(ConnectionEvent::SubscribeFailed {
+                        handle,
+                        code,
+                        message,
+                    }) => {
+                        if let EventMatcher::SubscribeAcked(h, _, _) = this.matcher {
+                            if h == handle {
+                                return Poll::Ready(Err(ClientError::Broker { code, message }));
+                            }
                         }
                     }
+                    Some(ConnectionEvent::Closed { reason }) => {
+                        // Connection-level close while a producer-open / subscribe
+                        // future was parked. ADR-0055 §1: a TERMINAL drop
+                        // (`fail_all_pending`, which carries a `reason`) must
+                        // unblock the waiter with the terminal `PeerClosed`, the
+                        // same outcome the request / send / receive surfaces — not
+                        // a generic `Other`. A user-requested graceful `close()`
+                        // (reason `None`) keeps the existing `Closed` mapping so
+                        // "user wants out" stays distinguishable from "peer went
+                        // away". warn! per ADR-0054 §2.1; `reason` is
+                        // broker-controlled text.
+                        tracing::warn!(
+                            reason = reason
+                                .as_deref()
+                                .map(crate::log_fields::truncate_broker_str),
+                            "connection closed while waiting for producer/consumer readiness"
+                        );
+                        return Poll::Ready(Err(match reason {
+                            Some(_) => ClientError::PeerClosed,
+                            None => ClientError::Closed,
+                        }));
+                    }
+                    Some(_) => {} // ignore unrelated events
+                    None => break,
                 }
-                Some(ConnectionEvent::Closed { reason }) => {
-                    // Connection-level close while a producer-open / subscribe
-                    // future was parked. ADR-0055 §1: a TERMINAL drop
-                    // (`fail_all_pending`, which carries a `reason`) must
-                    // unblock the waiter with the terminal `PeerClosed`, the
-                    // same outcome the request / send / receive surfaces — not
-                    // a generic `Other`. A user-requested graceful `close()`
-                    // (reason `None`) keeps the existing `Closed` mapping so
-                    // "user wants out" stays distinguishable from "peer went
-                    // away". warn! per ADR-0054 §2.1; `reason` is
-                    // broker-controlled text.
-                    tracing::warn!(
-                        reason = reason
-                            .as_deref()
-                            .map(crate::log_fields::truncate_broker_str),
-                        "connection closed while waiting for producer/consumer readiness"
-                    );
-                    return Poll::Ready(Err(match reason {
-                        Some(_) => ClientError::PeerClosed,
-                        None => ClientError::Closed,
-                    }));
-                }
-                Some(_) => {} // ignore unrelated events
-                None => break,
             }
+
+            // Consume a queued success event before consulting the durable
+            // attachment bit. The bit is only a reset-race fallback: using it
+            // first would leave the initial SubscribeAcked in the queue, where
+            // a later seek/re-subscribe waiter could mistake it for its fresh
+            // acknowledgement and send Flow before the broker registered the
+            // replacement consumer.
+            if let EventMatcher::ProducerReady(handle) = this.matcher {
+                if conn.producer_has_ever_attached(handle) {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            if let EventMatcher::SubscribeAcked(handle, accept_prior_attachment, waiter_id) =
+                this.matcher
+            {
+                let completed = match waiter_id {
+                    Some(waiter_id) => {
+                        conn.consume_consumer_subscribe_waiter_completion(handle, waiter_id)
+                    }
+                    None => {
+                        accept_prior_attachment
+                            && conn.consume_initial_consumer_subscribe_completion(handle)
+                    }
+                };
+                if completed {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+
+            let terminal = match this.matcher {
+                EventMatcher::SubscribeAcked(handle, _, _) => {
+                    conn.consumer_handle_is_terminal(handle)
+                }
+                EventMatcher::ProducerReady(_) => conn.is_terminally_closed(),
+            };
+            if terminal || this.shared.is_no_driver() {
+                return Poll::Ready(Err(if this.shared.is_no_driver() {
+                    ClientError::PeerClosed
+                } else {
+                    ClientError::Closed
+                }));
+            }
+
+            // Success-side: `ProducerSuccess` / `Success` in the sans-io layer push
+            // `ProducerReady` / `SubscribeAcked` events. Failure-side: a `CommandError` correlated
+            // with the pending producer-open / subscribe pushes the matching
+            // `ProducerOpenFailed` / `SubscribeFailed` event. Both paths are observed by the match
+            // arms above, so we never need to peek at the request-id-keyed outcome slab here.
+
+            drop(conn);
+
+            if notified.is_pending() {
+                return Poll::Pending;
+            }
+            // An unrelated event pulse completed this notification. Replace
+            // it, arm the replacement, and re-check state before parking.
+            this.notification = None;
         }
+    }
+}
 
-        // Success-side: `ProducerSuccess` / `Success` in the sans-io layer push
-        // `ProducerReady` / `SubscribeAcked` events. Failure-side: a `CommandError` correlated
-        // with the pending producer-open / subscribe pushes the matching
-        // `ProducerOpenFailed` / `SubscribeFailed` event. Both paths are observed by the match
-        // arms above, so we never need to peek at the request-id-keyed outcome slab here.
-
-        drop(conn);
-
-        // Abort the prior helper (if any) before spawning a new one. Otherwise the
-        // stale helper from an earlier poll lingers on `driver_waker.notified()`
-        // and competes with the driver itself for `notify_one` permits emitted by
-        // user-facing futures (post-subscribe FLOW being the classic case).
-        if let Some(prev) = this.helper.take() {
-            prev.abort();
+impl Drop for EventWaitFut {
+    fn drop(&mut self) {
+        let EventMatcher::SubscribeAcked(handle, _, Some(waiter_id)) = self.matcher else {
+            return;
+        };
+        let changed = self
+            .shared
+            .inner
+            .lock()
+            .abandon_consumer_subscribe_waiter(handle, waiter_id);
+        if changed {
+            self.shared.driver_waker.notify_one();
         }
-        let waker = cx.waker().clone();
-        let shared = this.shared.clone();
-        this.helper = Some(tokio::spawn(async move {
-            shared.driver_waker.notified().await;
-            waker.wake();
-        }));
-        Poll::Pending
     }
 }
 
@@ -1972,7 +2556,626 @@ fn _opoutcome_usage_marker(_o: OpOutcome, _k: PendingOpKey) {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use bytes::BytesMut;
+    use magnetar_proto::{CreateProducerRequest, SubscribeRequest, decode_one, encode_command, pb};
+
     use super::*;
+
+    struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn handshake_complete_shared() -> Arc<ConnectionShared> {
+        handshake_complete_shared_with_config(ConnectionConfig::default())
+    }
+
+    fn handshake_complete_supervised_shared() -> Arc<ConnectionShared> {
+        handshake_complete_shared_with_config(ConnectionConfig {
+            supervisor: Some(magnetar_proto::SupervisorConfig::default()),
+            ..ConnectionConfig::default()
+        })
+    }
+
+    fn handshake_complete_shared_with_config(config: ConnectionConfig) -> Arc<ConnectionShared> {
+        let shared = ConnectionShared::new(config);
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode CommandConnected");
+        {
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+        }
+        shared
+    }
+
+    fn inject_broker_error(
+        shared: &Arc<ConnectionShared>,
+        request_id: u64,
+        code: pb::ServerError,
+        message: &str,
+    ) {
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id,
+                error: code as i32,
+                message: message.to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &error).expect("encode CommandError");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandError");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_waiter_registers_before_returning_pending() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let mut future = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::ProducerReady(magnetar_proto::ProducerHandle(42)),
+            notification: None,
+        });
+        let counter = Arc::new(WakeCounter(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        shared.event_waker.notify_waiters();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+
+        let shared = handshake_complete_shared();
+        let (first, second, second_request_id) = {
+            let mut conn = shared.inner.lock();
+            let first = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/first-concurrent-producer".to_owned(),
+                ..Default::default()
+            });
+            let second_request_id = conn.peek_next_request_id_for_test();
+            let second = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/second-concurrent-producer".to_owned(),
+                ..Default::default()
+            });
+            (first, second, second_request_id)
+        };
+        inject_broker_error(
+            &shared,
+            second_request_id,
+            pb::ServerError::AuthorizationError,
+            "second producer denied",
+        );
+        let mut first_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::ProducerReady(first),
+            notification: None,
+        });
+        let mut second_waiter = Box::pin(EventWaitFut {
+            shared,
+            matcher: EventMatcher::ProducerReady(second),
+            notification: None,
+        });
+        assert!(first_waiter.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            second_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ClientError::Broker { code, ref message }))
+                if code == pb::ServerError::AuthorizationError as i32
+                    && message == "second producer denied"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_waiter_registers_before_returning_pending() {
+        let shared = handshake_complete_shared();
+        let handle = shared.inner.lock().subscribe(SubscribeRequest {
+            topic: "persistent://public/default/pending-waiter-registration".to_owned(),
+            subscription: "pending-waiter-registration".to_owned(),
+            ..Default::default()
+        });
+        let mut future = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, true, None),
+            notification: None,
+        });
+        let counter = Arc::new(WakeCounter(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        shared.event_waker.notify_waiters();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+
+        let shared = handshake_complete_shared();
+        let (first, second, second_request_id) = {
+            let mut conn = shared.inner.lock();
+            let first = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/first-concurrent-consumer".to_owned(),
+                subscription: "first-concurrent-consumer".to_owned(),
+                ..Default::default()
+            });
+            let second_request_id = conn.peek_next_request_id_for_test();
+            let second = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/second-concurrent-consumer".to_owned(),
+                subscription: "second-concurrent-consumer".to_owned(),
+                ..Default::default()
+            });
+            (first, second, second_request_id)
+        };
+        inject_broker_error(
+            &shared,
+            second_request_id,
+            pb::ServerError::AuthorizationError,
+            "second consumer denied",
+        );
+        let mut first_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(first, true, None),
+            notification: None,
+        });
+        let mut second_waiter = Box::pin(EventWaitFut {
+            shared,
+            matcher: EventMatcher::SubscribeAcked(second, true, None),
+            notification: None,
+        });
+        assert!(first_waiter.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            second_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ClientError::Broker { code, ref message }))
+                if code == pb::ServerError::AuthorizationError as i32
+                    && message == "second consumer denied"
+        ));
+
+        let shared = handshake_complete_supervised_shared();
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/subscribe-acked-before-seek".to_owned(),
+                subscription: "subscribe-acked-before-seek".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode CommandSuccess");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandSuccess");
+        let mut initial_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, true, None),
+            notification: None,
+        });
+        assert!(matches!(
+            initial_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let mut reattach_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, false, None),
+            notification: None,
+        });
+        assert!(
+            reattach_waiter.as_mut().poll(&mut cx).is_pending(),
+            "the initial waiter must consume its ack so a seek cannot reuse the stale event"
+        );
+        drop(reattach_waiter);
+
+        let (background_request_id, seek_request_id) = {
+            let mut conn = shared.inner.lock();
+            let background_request_id = conn
+                .rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("background reattach request");
+            let seek_request_id = conn
+                .resubscribe_consumer_after_seek(handle)
+                .expect("seek reattach request");
+            (background_request_id, seek_request_id)
+        };
+        let background_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: background_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &background_success).expect("encode background success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle background success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Flow as i32,
+                "an older background ack must not release seek flow"
+            );
+        }
+        let mut seek_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, false, Some(seek_request_id)),
+            notification: None,
+        });
+        assert!(
+            seek_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a seek waiter must not consume an unattended background reattach ack"
+        );
+        let seek_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: seek_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &seek_success).expect("encode seek success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle seek success");
+        shared.inner.lock().mark_disconnected();
+        assert!(
+            seek_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a supervised transport failure must not terminate the seek waiter"
+        );
+        shared.inner.lock().reset();
+        assert!(
+            seek_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a reset must not expose an old-session seek completion"
+        );
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("restart handshake");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode reconnect CommandConnected");
+        let rebuilt_request_id = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect handshake");
+            conn.rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("rebuilt subscribe request")
+        };
+        let rebuilt_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: rebuilt_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &rebuilt_success).expect("encode rebuilt success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle rebuilt success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Flow as i32,
+                "reset/rebuild must preserve user-owned seek flow"
+            );
+        }
+        assert!(matches!(
+            seek_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let retry_waiter_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("retry-owned seek subscribe");
+        let mut retry_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, false, Some(retry_waiter_id)),
+            notification: None,
+        });
+        inject_broker_error(
+            &shared,
+            retry_waiter_id.0,
+            pb::ServerError::ServiceNotReady,
+            "retry seek subscribe",
+        );
+        assert!(retry_waiter.as_mut().poll(&mut cx).is_pending());
+        let retry_request_id = shared
+            .inner
+            .lock()
+            .retry_consumer_subscribe_if_current(handle, retry_waiter_id)
+            .expect("replacement subscribe request");
+        let retry_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: retry_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &retry_success).expect("encode retry success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle retry success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            assert_ne!(
+                frame.command.r#type,
+                pb::base_command::Type::Flow as i32,
+                "retry replacement must preserve user-owned seek flow"
+            );
+        }
+        assert!(matches!(
+            retry_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let cancelled_waiter_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("cancelled seek subscribe");
+        let cancelled_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, false, Some(cancelled_waiter_id)),
+            notification: None,
+        });
+        drop(cancelled_waiter);
+        let cancelled_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: cancelled_waiter_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &cancelled_success).expect("encode cancelled success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle cancelled success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        let mut saw_flow = false;
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            saw_flow |= frame.command.r#type == pb::base_command::Type::Flow as i32;
+        }
+        assert!(
+            saw_flow,
+            "cancelling a seek waiter must transfer its active subscribe to flow ownership"
+        );
+
+        let disconnected_waiter_id = shared
+            .inner
+            .lock()
+            .resubscribe_consumer_after_seek(handle)
+            .expect("disconnect-cancelled seek subscribe");
+        let disconnected_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, false, Some(disconnected_waiter_id)),
+            notification: None,
+        });
+        let disconnected_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: disconnected_waiter_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &disconnected_success)
+            .expect("encode disconnect-cancelled success");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle disconnect-cancelled success");
+            conn.mark_disconnected();
+            conn.reset();
+        }
+        drop(disconnected_waiter);
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("restart handshake after waiter cancellation");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode reconnect CommandConnected");
+        let rebuilt_request_id = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect after waiter cancellation");
+            conn.rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("rebuilt flow-owned subscribe request")
+        };
+        let rebuilt_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: rebuilt_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &rebuilt_success).expect("encode flow-owned rebuilt success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle flow-owned rebuilt success");
+        let mut staged = shared.inner.lock().poll_transmit();
+        let mut saw_flow = false;
+        while !staged.is_empty() {
+            let frame = decode_one(&mut staged).expect("staged frame must decode");
+            saw_flow |= frame.command.r#type == pb::base_command::Type::Flow as i32;
+        }
+        assert!(
+            saw_flow,
+            "cancelling during reconnect must transfer the rebuilt subscribe to flow ownership"
+        );
+
+        let shared = handshake_complete_shared();
+        let (handle, request_id) = {
+            let mut conn = shared.inner.lock();
+            let request_id = conn.peek_next_request_id_for_test();
+            let handle = conn.subscribe(SubscribeRequest {
+                topic: "persistent://public/default/subscribe-acked-before-reset".to_owned(),
+                subscription: "subscribe-acked-before-reset".to_owned(),
+                ..Default::default()
+            });
+            (handle, request_id)
+        };
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode CommandSuccess");
+        {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle CommandSuccess");
+            conn.reset();
+        }
+        let mut initial_waiter = Box::pin(EventWaitFut {
+            shared: shared.clone(),
+            matcher: EventMatcher::SubscribeAcked(handle, true, None),
+            notification: None,
+        });
+        assert!(
+            initial_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a reset must not expose an old-session initial subscribe completion"
+        );
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("restart handshake");
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode reconnect CommandConnected");
+        let rebuilt_request_id = {
+            let mut conn = shared.inner.lock();
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete reconnect handshake");
+            conn.rebuild_consumers()
+                .into_iter()
+                .next()
+                .expect("rebuilt subscribe request")
+        };
+        let rebuilt_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: rebuilt_request_id.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &rebuilt_success).expect("encode rebuilt success");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle rebuilt success");
+        assert!(matches!(
+            initial_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let mut reattach_waiter = Box::pin(EventWaitFut {
+            shared,
+            matcher: EventMatcher::SubscribeAcked(handle, false, None),
+            notification: None,
+        });
+        assert!(
+            reattach_waiter.as_mut().poll(&mut cx).is_pending(),
+            "a seek/re-subscribe waiter must still require its fresh acknowledgement"
+        );
+    }
 
     #[test]
     fn preferred_broker_url_strips_scheme_on_tls_bootstrap() {

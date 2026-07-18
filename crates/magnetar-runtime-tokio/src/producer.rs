@@ -117,6 +117,7 @@ impl Drop for ProducerCloseGuard {
             let mut conn = self.shared.inner.lock();
             let _ = conn.close_producer_forget(self.handle);
         }
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         tracing::debug!(
             topic = %self.slot.identity.topic,
@@ -580,6 +581,7 @@ impl Producer {
             let mut conn = self.shared.inner.lock();
             conn.close_producer(self.handle)
         };
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         let result = wait_request(&self.shared, request_id).await;
         if result.is_ok() {

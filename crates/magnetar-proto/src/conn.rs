@@ -50,6 +50,10 @@ use crate::types::{ConsumerHandle, MessageId, ProducerHandle, RequestId, Sequenc
 /// The central sans-io state machine.
 pub struct Connection {
     config: ConnectionConfig,
+    /// Broker-operation retry policy, deliberately kept outside the public
+    /// `ConnectionConfig` struct so adding the feature does not break
+    /// downstream exhaustive config literals.
+    operation_retry: crate::OperationRetryConfig,
     state: HandshakeState,
     broker_max_message_size: Option<usize>,
     broker_protocol_version: i32,
@@ -90,6 +94,8 @@ pub struct Connection {
     inbound: BytesMut,
     /// Event queue.
     events: VecDeque<ConnectionEvent>,
+    /// Exact failed generations for built-in runtime retry legs.
+    driver_retries: VecDeque<crate::DriverRetry>,
     /// Outcomes ready to be consumed by user futures.
     outcomes: HashMap<PendingOpKey, OpOutcome>,
     /// Waker slab keyed by op id.
@@ -230,50 +236,17 @@ impl core::fmt::Debug for Connection {
     }
 }
 
-/// Classify a `ServerError` code as a transient producer-open / consumer-subscribe error
-/// — one where the broker is asking the client to retry rather than treating the
-/// attachment as permanently failed. Mirrors the retry-classification Java's
-/// `ProducerImpl.handleProducerCreationError` and `ConsumerImpl.connectionFailed` apply.
+/// Compatibility constant for the default operation retry count.
 ///
-/// Codes covered:
-/// - `MetadataError` (1): metadata store is still loading; usually transient post-restart.
-/// - `ServiceNotReady` (6): broker isn't done initialising the topic / bundle.
-/// - `TopicNotFound` (11): topic load timed out or autocreate hasn't happened yet.
-///
-/// Everything else (auth failures, fenced producer, "topic already deleted", quota
-/// exceeded, …) stays on the permanent-failure path so the user-facing future surfaces
-/// the error instead of silently looping.
-/// Maximum number of consecutive transient `CommandProducer` /
-/// `CommandSubscribe` rejections the state machine answers with a lookup +
-/// retry before declaring the open TERMINAL (issue #302). Each transient
-/// rejection bumps the per-handle attempt counter
-/// ([`crate::producer::ProducerState::transient_open_attempts`] /
-/// [`crate::consumer::ConsumerState::transient_subscribe_attempts`]); once the
-/// counter crosses this cap the state machine stops emitting the recoverable
-/// `*FailedTransient` event and instead installs a terminal failure
-/// ([`Connection::fail_producer_open`] / [`Connection::fail_consumer_subscribe`])
-/// so the parked `send()` / `receive()` future surfaces an `Err` instead of
-/// hanging forever. The runtime drivers size their exponential backoff between
-/// attempts off the same counter, so this cap together with
-/// [`crate::Backoff`]'s `max` bounds the worst-case give-up latency. Mirrors
-/// the bounded-retry shape of Java `ProducerImpl#connectionFailed` /
-/// `ConsumerImpl#connectionFailed`, which give up after
-/// `maxReconnectAttempts` (default unbounded only when the user opts in;
-/// magnetar bounds it so a permanently-fenced bundle cannot strand a handle).
-///
-/// Sized together with the engines' `transient_retry_delay` backoff
-/// (2 s initial, capped at 8 s) so the worst-case give-up window —
-/// `~2+4+8×6 ≈ 54 s` — lands in the same ballpark as Java's default 30 s
-/// `operationTimeout` give-up, rather than minutes.
+/// Runtime decisions read the connection's installed
+/// [`crate::OperationRetryConfig`]; callers can override the count through
+/// [`crate::OperationRetryConfig::max_retries`].
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
 
-fn is_transient_open_error(code: i32) -> bool {
-    matches!(
-        pb::ServerError::try_from(code),
-        Ok(pb::ServerError::MetadataError
-            | pb::ServerError::ServiceNotReady
-            | pb::ServerError::TopicNotFound)
-    )
+#[derive(Debug, Clone, Copy)]
+enum SubscribeAckAction {
+    NotifyWaiter,
+    ReleaseFlow,
 }
 
 // reason: variant payloads (handle, watcher_id, watch_session_id) are carried for the derived
@@ -361,6 +334,7 @@ impl Connection {
         };
         Self {
             config,
+            operation_retry: crate::OperationRetryConfig::default(),
             state: HandshakeState::Uninitialized,
             broker_max_message_size: None,
             broker_protocol_version: 0,
@@ -372,6 +346,7 @@ impl Connection {
             pending_vectored_segments: Vec::new(),
             inbound: BytesMut::with_capacity(4 * 1024),
             events: VecDeque::new(),
+            driver_retries: VecDeque::new(),
             outcomes: HashMap::new(),
             wakers: HashMap::new(),
             pending_requests: HashMap::new(),
@@ -528,6 +503,23 @@ impl Connection {
     #[must_use]
     pub fn supervisor_config(&self) -> Option<&crate::supervisor::SupervisorConfig> {
         self.config.supervisor.as_ref()
+    }
+
+    /// Borrow the broker-operation retry policy.
+    #[must_use]
+    pub fn operation_retry_config(&self) -> &crate::OperationRetryConfig {
+        &self.operation_retry
+    }
+
+    /// Replace the broker-operation retry policy.
+    pub fn set_operation_retry_config(&mut self, config: crate::OperationRetryConfig) {
+        self.operation_retry = config;
+    }
+
+    /// Total deadline applied by runtime engines to one logical setup operation.
+    #[must_use]
+    pub fn operation_timeout(&self) -> Duration {
+        self.config.operation_timeout
     }
 
     /// The per-attempt initial-dial timeout ([`ConnectionConfig::connect_timeout`]).
@@ -732,6 +724,12 @@ impl Connection {
         // them without materializing an undrainable outcome.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
+            if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
+                self.clear_consumer_unsubscribe(handle, request_id);
+                if !self.wakers.contains_key(&key) {
+                    continue;
+                }
+            }
             if matches!(
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
@@ -839,6 +837,7 @@ impl Connection {
         // (4) Drop queued events + raw bytes. Anything not yet observed by the runtime
         // belongs to the dead session.
         self.events.clear();
+        self.driver_retries.clear();
         self.outbound.clear();
         self.inbound.clear();
 
@@ -932,6 +931,12 @@ impl Connection {
         // them without materializing an undrainable outcome.
         for (request_id, kind) in std::mem::take(&mut self.pending_requests) {
             let key = PendingOpKey::Request(request_id);
+            if let PendingRequestKind::ConsumerUnsubscribe { handle } = kind {
+                self.clear_consumer_unsubscribe(handle, request_id);
+                if !self.wakers.contains_key(&key) {
+                    continue;
+                }
+            }
             if matches!(
                 kind,
                 PendingRequestKind::ProducerCloseForgotten { .. }
@@ -1044,17 +1049,19 @@ impl Connection {
         // on the event queue plus a runtime notification, NOT the waker slab,
         // so the `Closed` event is the only thing that unblocks them on a
         // terminal drop.
+        self.driver_retries.clear();
         self.events.push_back(ConnectionEvent::Closed {
             reason: Some(reason.to_owned()),
         });
     }
 
     /// Install a TERMINAL failure for a SINGLE producer handle whose open could
-    /// not be recovered — the transient-retry budget
-    /// ([`MAX_TRANSIENT_OPEN_RETRIES`]) was exhausted (issue #302). Scoped
+    /// not be recovered — the configured operation-retry budget was exhausted
+    /// (issue #302, ADR-0080). Scoped
     /// per-handle counterpart of [`Self::fail_all_pending`] step (2): it drains
-    /// every staged / in-flight `OpSend` for this producer WITHOUT a replay
-    /// snapshot (there is no recoverable session to replay onto), installs an
+    /// every staged / in-flight `OpSend` for this producer, including replay
+    /// snapshots captured by [`Self::reset`] (there is no recoverable session
+    /// to replay onto), installs an
     /// [`OpOutcome::Terminal`] on each `Send` key, flips the slot's `closed`
     /// flag so any later `queue_send` fast-fails with `ProducerError::Closed`
     /// instead of registering a doomed pending op, wakes each parked send
@@ -1074,6 +1081,24 @@ impl Connection {
     /// `&mut self` receiver; each per-slot mutex is taken BELOW it in a single
     /// acquisition, and the guard is dropped before user wakers fire.
     pub fn fail_producer_open(&mut self, handle: ProducerHandle, reason: &str) {
+        self.fail_producer_open_with_broker_error(
+            handle,
+            pb::ServerError::MetadataError as i32,
+            reason,
+        );
+    }
+
+    /// Terminalize one opening producer while preserving the broker's exact
+    /// error code and message.
+    ///
+    /// Runtime retry legs use this when a prerequisite lookup returns a
+    /// terminal broker error before another producer-open can be issued.
+    pub fn fail_producer_open_with_broker_error(
+        &mut self,
+        handle: ProducerHandle,
+        code: i32,
+        reason: &str,
+    ) {
         // Drain + terminalize every pending send under the per-slot lock,
         // flip `closed` in the same scope, then wake outside the lock.
         let drained = self.producers.get(&handle).map(|slot| {
@@ -1100,24 +1125,49 @@ impl Connection {
                 }
             }
         }
+        // Sends extracted by `reset()` no longer live in the producer slot.
+        // Terminalize those replay snapshots too; their futures re-registered
+        // in the connection-wide waker slab after reset and otherwise have no
+        // remaining correlation surface.
+        if let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle) {
+            for mut snapshot in snapshots {
+                let key = PendingOpKey::Send(handle, snapshot.sequence_id);
+                self.outcomes.insert(
+                    key,
+                    OpOutcome::Terminal {
+                        key,
+                        reason: reason.to_owned(),
+                    },
+                );
+                if let Some(w) = snapshot.waker.take() {
+                    let _ = self.wakers.remove(&key);
+                    w.wake();
+                } else if let Some(w) = self.wakers.remove(&key) {
+                    w.wake();
+                }
+            }
+        }
         // Drop the now-dead producer state so a subsequent reconnect rebuild
         // does not re-emit a `CommandProducer` for a handle the user has been
         // told is terminally failed.
         self.producers.remove(&handle);
         self.producer_create_requests.remove(&handle);
-        self.in_flight_publish_snapshots.remove(&handle);
+        self.events.retain(|event| {
+            !matches!(event, ConnectionEvent::ProducerReady { handle: event_handle, .. } if *event_handle == handle)
+        });
         self.events.push_back(ConnectionEvent::ProducerOpenFailed {
             handle,
-            // `MetadataError` is the canonical "the broker never managed to
-            // serve this bundle" transient code; we reached the cap on it.
-            code: pb::ServerError::MetadataError as i32,
+            code,
             message: reason.to_owned(),
+        });
+        self.driver_retries.retain(|retry| {
+            !matches!(retry, crate::DriverRetry::Producer { handle: event_handle, .. } if *event_handle == handle)
         });
     }
 
     /// Install a TERMINAL failure for a SINGLE consumer handle whose subscribe
-    /// could not be recovered — the transient-retry budget
-    /// ([`MAX_TRANSIENT_OPEN_RETRIES`]) was exhausted (issue #302). Sets the
+    /// could not be recovered — the configured operation-retry budget was
+    /// exhausted (issue #302, ADR-0080). Sets the
     /// per-consumer [`crate::consumer::ConsumerState::terminal_failure`] marker
     /// so [`Self::consumer_handle_is_terminal`] returns `true` for this handle,
     /// drains + wakes every parked `receive()` waker so the future re-polls and
@@ -1137,6 +1187,24 @@ impl Connection {
     /// mutex is taken below it, and the receive wakers fire after the slot lock
     /// is dropped.
     pub fn fail_consumer_subscribe(&mut self, handle: ConsumerHandle, reason: &str) {
+        self.fail_consumer_subscribe_with_broker_error(
+            handle,
+            pb::ServerError::MetadataError as i32,
+            reason,
+        );
+    }
+
+    /// Terminalize one opening consumer while preserving the broker's exact
+    /// error code and message.
+    ///
+    /// Runtime retry legs use this when a prerequisite lookup returns a
+    /// terminal broker error before another subscribe can be issued.
+    pub fn fail_consumer_subscribe_with_broker_error(
+        &mut self,
+        handle: ConsumerHandle,
+        code: i32,
+        reason: &str,
+    ) {
         // Set the terminal marker + drain the parked receive wakers under the
         // slot lock, then wake them outside it.
         let wakers: Vec<std::task::Waker> = match self.consumers.get(&handle) {
@@ -1158,8 +1226,11 @@ impl Connection {
         self.consumer_subscribe_requests.remove(&handle);
         self.events.push_back(ConnectionEvent::SubscribeFailed {
             handle,
-            code: pb::ServerError::MetadataError as i32,
+            code,
             message: reason.to_owned(),
+        });
+        self.driver_retries.retain(|retry| {
+            !matches!(retry, crate::DriverRetry::Consumer { handle: event_handle, .. } if *event_handle == handle)
         });
     }
 
@@ -1233,6 +1304,210 @@ impl Connection {
         self.consumers
             .get(&handle)
             .map_or(0, |slot| slot.state.lock().transient_subscribe_attempts)
+    }
+
+    /// Whether this producer completed at least one broker attachment.
+    ///
+    /// Unlike the current-session `broker_ready` gate, this remains true across
+    /// a supervised reset so an opening future can observe a success that was
+    /// immediately followed by a broker-requested migration.
+    #[must_use]
+    pub fn producer_has_ever_attached(&self, handle: ProducerHandle) -> bool {
+        self.producers
+            .get(&handle)
+            .is_some_and(|slot| slot.state.lock().has_ever_attached)
+    }
+
+    /// Whether this consumer completed at least one broker attachment.
+    ///
+    /// This is a durable lifecycle fact for retry ownership and diagnostics.
+    /// Subscribe waiters use their stable logical token instead: a reset
+    /// transfers that token to the rebuilt wire request, so an old-session
+    /// acknowledgement cannot complete a new attachment.
+    #[must_use]
+    pub fn consumer_has_ever_attached(&self, handle: ConsumerHandle) -> bool {
+        self.consumers
+            .get(&handle)
+            .is_some_and(|slot| slot.state.lock().has_ever_attached)
+    }
+
+    /// Consume a durable user-owned subscribe/seek acknowledgement.
+    ///
+    /// Completion remains in per-consumer state until the runtime observes
+    /// the stable waiter token. A reset before observation transfers the same
+    /// token to the rebuilt wire request instead of losing the wakeup with the
+    /// semantic event queue.
+    pub fn consume_consumer_subscribe_waiter_completion(
+        &mut self,
+        handle: ConsumerHandle,
+        waiter_id: RequestId,
+    ) -> bool {
+        if self.state != HandshakeState::Connected {
+            return false;
+        }
+        let Some(slot) = self.consumers.get(&handle) else {
+            return false;
+        };
+        let mut consumer = slot.state.lock();
+        if consumer.subscribe_waiter_id == Some(waiter_id) && consumer.subscribe_waiter_completed {
+            consumer.subscribe_waiter_id = None;
+            consumer.subscribe_waiter_completed = false;
+            return true;
+        }
+        false
+    }
+
+    /// Consume the current completed subscribe waiter without a caller-known
+    /// token. Used only by initial subscribe setup, whose handle cannot have a
+    /// prior user-owned waiter.
+    pub fn consume_initial_consumer_subscribe_completion(
+        &mut self,
+        handle: ConsumerHandle,
+    ) -> bool {
+        if self.state != HandshakeState::Connected {
+            return false;
+        }
+        let Some(slot) = self.consumers.get(&handle) else {
+            return false;
+        };
+        let mut consumer = slot.state.lock();
+        if consumer.subscribe_waiter_id.is_some() && consumer.subscribe_waiter_completed {
+            consumer.subscribe_waiter_id = None;
+            consumer.subscribe_waiter_completed = false;
+            return true;
+        }
+        false
+    }
+
+    /// Abandon a user-owned seek subscribe waiter without abandoning the
+    /// established consumer. The active wire request becomes flow-owned so a
+    /// later success still resumes dispatch; if success already landed, flow
+    /// is staged immediately and the now-unowned semantic event is removed.
+    pub fn abandon_consumer_subscribe_waiter(
+        &mut self,
+        handle: ConsumerHandle,
+        waiter_id: RequestId,
+    ) -> bool {
+        let (active_request, release_flow_now) = {
+            let Some(slot) = self.consumers.get(&handle) else {
+                return false;
+            };
+            let mut consumer = slot.state.lock();
+            if consumer.subscribe_waiter_id != Some(waiter_id) {
+                return false;
+            }
+            let active_request = consumer.subscribe_waiter_request.take();
+            let release_flow_now =
+                consumer.subscribe_waiter_completed && self.state == HandshakeState::Connected;
+            consumer.subscribe_waiter_id = None;
+            consumer.subscribe_waiter_completed = false;
+            if let Some(request_id) = active_request {
+                consumer.flow_on_subscribe_ack = true;
+                consumer.flow_on_subscribe_ack_request = Some(request_id);
+            }
+            (active_request, release_flow_now)
+        };
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::SubscribeAcked { handle: event_handle }
+                    if *event_handle == handle
+            )
+        });
+        if release_flow_now {
+            let _ = self.initial_flow(handle);
+        }
+        active_request.is_some() || release_flow_now
+    }
+
+    /// Last retryable broker rejection observed for an opening producer.
+    #[must_use]
+    pub fn producer_last_open_error(&self, handle: ProducerHandle) -> Option<(i32, String)> {
+        self.producers
+            .get(&handle)
+            .and_then(|slot| slot.state.lock().last_open_error.clone())
+    }
+
+    /// Last retryable broker rejection observed for a subscribing consumer.
+    #[must_use]
+    pub fn consumer_last_subscribe_error(&self, handle: ConsumerHandle) -> Option<(i32, String)> {
+        self.consumers
+            .get(&handle)
+            .and_then(|slot| slot.state.lock().last_subscribe_error.clone())
+    }
+
+    /// Cancel a producer that has not completed its opening operation.
+    ///
+    /// Idempotent and local-only: the broker has not acknowledged the handle,
+    /// so no `CommandCloseProducer` is required. Any detached retry leg sees
+    /// the missing request/slot and exits without re-issuing.
+    pub fn cancel_producer_open(&mut self, handle: ProducerHandle) {
+        let request_ids: Vec<RequestId> = self
+            .pending_requests
+            .iter()
+            .filter_map(|(request_id, kind)| {
+                matches!(kind, PendingRequestKind::ProducerOpen { handle: h } if *h == handle)
+                    .then_some(*request_id)
+            })
+            .collect();
+        for request_id in request_ids {
+            self.cancel_request(request_id);
+        }
+        self.producers.remove(&handle);
+        self.producer_create_requests.remove(&handle);
+        self.in_flight_publish_snapshots.remove(&handle);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::ProducerReady { handle: event_handle, .. }
+                    | ConnectionEvent::ProducerClosedByBroker { handle: event_handle, .. }
+                    | ConnectionEvent::ProducerOpenFailed { handle: event_handle, .. }
+                    | ConnectionEvent::ProducerOpenFailedTransient {
+                        handle: event_handle,
+                        ..
+                    }
+                    if *event_handle == handle
+            )
+        });
+        self.driver_retries.retain(|retry| {
+            !matches!(retry, crate::DriverRetry::Producer { handle: event_handle, .. } if *event_handle == handle)
+        });
+    }
+
+    /// Cancel a consumer that has not completed its subscribe operation.
+    ///
+    /// Idempotent and local-only; detached retry legs stop once the slot and
+    /// replay request disappear.
+    pub fn cancel_consumer_subscribe(&mut self, handle: ConsumerHandle) {
+        let request_ids: Vec<RequestId> = self
+            .pending_requests
+            .iter()
+            .filter_map(|(request_id, kind)| {
+                matches!(kind, PendingRequestKind::ConsumerSubscribe { handle: h, .. } if *h == handle)
+                    .then_some(*request_id)
+            })
+            .collect();
+        for request_id in request_ids {
+            self.cancel_request(request_id);
+        }
+        self.consumers.remove(&handle);
+        self.consumer_subscribe_requests.remove(&handle);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::SubscribeAcked { handle: event_handle, .. }
+                    | ConnectionEvent::ConsumerClosedByBroker { handle: event_handle, .. }
+                    | ConnectionEvent::SubscribeFailed { handle: event_handle, .. }
+                    | ConnectionEvent::SubscribeFailedTransient {
+                        handle: event_handle,
+                        ..
+                    }
+                    if *event_handle == handle
+            )
+        });
+        self.driver_retries.retain(|retry| {
+            !matches!(retry, crate::DriverRetry::Consumer { handle: event_handle, .. } if *event_handle == handle)
+        });
     }
 
     /// Reason the last handshake attempt failed, if the broker sent a
@@ -1372,7 +1647,7 @@ impl Connection {
             .filter_map(|(handle, req)| {
                 let slot = self.consumers.get(handle)?;
                 let state = slot.state.lock();
-                if state.closed {
+                if state.closed || state.unsubscribe_request_id.is_some() {
                     return None;
                 }
                 Some((*handle, req.clone(), state.last_acked_message_id))
@@ -1384,18 +1659,8 @@ impl Connection {
             // original `start_message_id` from the subscribe request (broker uses its
             // persisted cursor if both are absent).
             let resume = resume_from.or(req.start_message_id);
-            let subscribe_request_id = self.emit_command_subscribe(handle, &req, resume);
-            // The initial flow is DEFERRED to the broker's subscribe ack (the
-            // `Success` arm reads this flag): Pulsar silently drops
-            // `CommandFlow` for a consumer id whose subscribe is still being
-            // processed — post-restart cursor recovery makes that window
-            // seconds long, and flow-alongside-subscribe starved the
-            // re-attached consumer with zero broker-side permits. Java
-            // `ConsumerImpl#reconnectLater` ordering (ARCHITECTURE.md
-            // §Supervised reconnect step 6).
-            if let Some(slot) = self.consumers.get(&handle) {
-                slot.state.lock().flow_on_subscribe_ack = true;
-            }
+            let subscribe_request_id =
+                self.emit_command_subscribe(handle, &req, resume, SubscribeAckAction::ReleaseFlow);
             request_ids.push(subscribe_request_id);
         }
         request_ids
@@ -1445,13 +1710,26 @@ impl Connection {
         let req = self.consumer_subscribe_requests.get(&handle)?.clone();
         // `consumer.closed` is no longer flipped by `handle_close_consumer`
         // (see the comment block in `CloseConsumer` branch above), so we
-        // don't need to reset it here. We only need to drain the stale
-        // close-by-broker events so the runtime's wait future doesn't trip
-        // on them.
-        let _ = self.consumers.get(&handle)?;
-        self.events.retain(
-            |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
-        );
+        // don't need to reset it here. Drain stale close and acknowledgement
+        // events before replacing the logical waiter token.
+        if self
+            .consumers
+            .get(&handle)?
+            .state
+            .lock()
+            .unsubscribe_request_id
+            .is_some()
+        {
+            return None;
+        }
+        self.events.retain(|ev| {
+            !matches!(
+                ev,
+                ConnectionEvent::ConsumerClosedByBroker { handle: h, .. }
+                    | ConnectionEvent::SubscribeAcked { handle: h, .. }
+                    if *h == handle
+            )
+        });
         // `None` here = use the broker's persisted cursor (just reset by the seek).
         //
         // NOTE: we ONLY emit `CommandSubscribe` here. The runtime layer is
@@ -1465,7 +1743,8 @@ impl Connection {
         // post-seek backlog. This was #67's root cause — the broker
         // confirmed `backlog 10` after the cursor reset, but no message ever
         // arrived because the permits were dropped on the floor.
-        let request_id = self.emit_command_subscribe(handle, &req, None);
+        let request_id =
+            self.emit_command_subscribe(handle, &req, None, SubscribeAckAction::NotifyWaiter);
         Some(request_id)
     }
 
@@ -1952,9 +2231,23 @@ impl Connection {
                 if let Some(PendingRequestKind::ProducerOpen { handle }) =
                     self.pending_requests.remove(&request_id)
                 {
+                    let current = self
+                        .producers
+                        .get(&handle)
+                        .is_some_and(|slot| slot.state.lock().open_request_id == Some(request_id));
+                    if !current {
+                        tracing::debug!(
+                            target: "magnetar_proto::conn",
+                            handle = ?handle,
+                            request_id = ?request_id,
+                            "ignored producer success for superseded same-handle request"
+                        );
+                        return Ok(());
+                    }
                     let snapshots = self.in_flight_publish_snapshots.remove(&handle);
                     if let Some(slot) = self.producers.get(&handle) {
                         let mut producer = slot.state.lock();
+                        producer.open_request_id = None;
                         producer.name = Some(ok.producer_name.clone());
                         producer.last_sequence_id_published = ok.last_sequence_id.unwrap_or(-1);
                         // Java `ProducerImpl#handleProducerSuccess` →
@@ -1972,10 +2265,12 @@ impl Connection {
                             producer.replay_snapshots(snapshots);
                         }
                         producer.broker_ready = true;
+                        producer.has_ever_attached = true;
                         // The re-attach succeeded — clear the transient-retry
                         // budget so a future bundle reshuffle starts its backoff
                         // schedule fresh (issue #302).
                         producer.transient_open_attempts = 0;
+                        producer.last_open_error = None;
                         tracing::debug!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
@@ -1984,11 +2279,6 @@ impl Connection {
                             "producer re-attach acked; replay staged and drain gate opened"
                         );
                     }
-                    self.outcomes.insert(
-                        PendingOpKey::Request(request_id),
-                        OpOutcome::Success { request_id },
-                    );
-                    self.wake_for_request(request_id);
                     self.events.push_back(ConnectionEvent::ProducerReady {
                         handle,
                         producer_name: ok.producer_name,
@@ -2010,6 +2300,12 @@ impl Connection {
                     .ok_or(ProtocolError::InvariantViolation("missing CommandSuccess"))?;
                 let request_id = RequestId(ok.request_id);
                 let kind = self.pending_requests.remove(&request_id);
+                let unsubscribe_has_waiter =
+                    matches!(kind, Some(PendingRequestKind::ConsumerUnsubscribe { .. }))
+                        && self.wakers.contains_key(&PendingOpKey::Request(request_id));
+                if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
+                    self.complete_consumer_unsubscribe(handle, request_id);
+                }
                 match kind {
                     Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
                         // Fire-and-forget drop-close: no waiter will ever drain
@@ -2031,42 +2327,76 @@ impl Connection {
                             "fire-and-forget consumer close acked by broker"
                         );
                     }
-                    _ => {
+                    Some(PendingRequestKind::ConsumerSubscribe { .. }) => {}
+                    Some(PendingRequestKind::ConsumerUnsubscribe { .. })
+                        if !unsubscribe_has_waiter =>
+                    {
+                        // The user cancelled the unsubscribe future, but the
+                        // broker-side operation still completed. Lifecycle is
+                        // finalized above; without a waiter, retaining an
+                        // outcome would leak it permanently.
+                    }
+                    Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
                             OpOutcome::Success { request_id },
                         );
                         self.wake_for_request(request_id);
                     }
+                    None => {}
                 }
                 if let Some(PendingRequestKind::ConsumerSubscribe { handle }) = kind {
-                    self.events
-                        .push_back(ConnectionEvent::SubscribeAcked { handle });
-                    // The (re-)subscribe succeeded — clear the transient-retry
-                    // budget so a future bundle reshuffle starts its backoff
-                    // schedule fresh (issue #302).
-                    if let Some(slot) = self.consumers.get(&handle) {
-                        slot.state.lock().transient_subscribe_attempts = 0;
+                    let (waiter_id, flow_now) = self
+                        .consumers
+                        .get(&handle)
+                        .map(|slot| {
+                            let mut consumer = slot.state.lock();
+                            let waiter_id = if consumer.subscribe_waiter_request == Some(request_id)
+                            {
+                                consumer.subscribe_waiter_completed = true;
+                                consumer.subscribe_waiter_id
+                            } else {
+                                None
+                            };
+                            let flow_now = consumer.flow_on_subscribe_ack
+                                && consumer
+                                    .flow_on_subscribe_ack_request
+                                    .is_none_or(|active| active == request_id);
+                            if waiter_id.is_some() {
+                                consumer.subscribe_waiter_request = None;
+                            }
+                            if flow_now {
+                                consumer.flow_on_subscribe_ack = false;
+                                consumer.flow_on_subscribe_ack_request = None;
+                            }
+                            if waiter_id.is_some() || flow_now {
+                                consumer.has_ever_attached = true;
+                                consumer.transient_subscribe_attempts = 0;
+                                consumer.last_subscribe_error = None;
+                            }
+                            (waiter_id, flow_now)
+                        })
+                        .unwrap_or_default();
+                    if waiter_id.is_some() {
+                        self.events
+                            .push_back(ConnectionEvent::SubscribeAcked { handle });
                     }
-                    // ADR-0028 anti-thrash: feed the successful subscribe ack into
-                    // the detector. No-op when the detector is disabled (default).
-                    self.record_reattach_outcome(
-                        now,
-                        crate::anti_thrash::ReAttachHandle::Consumer(handle),
-                        crate::anti_thrash::ReAttachOutcomeKind::ReAttachOk,
-                    );
-                    // Re-attach flow gate (rebuild / transient-retry paths):
-                    // the broker has acked the re-subscribe — NOW the initial
-                    // flow lands on a registered consumer id instead of being
-                    // silently dropped mid-subscribe.
-                    let flow_now = self.consumers.get(&handle).is_some_and(|slot| {
-                        std::mem::take(&mut slot.state.lock().flow_on_subscribe_ack)
-                    });
+                    if waiter_id.is_some() || flow_now {
+                        // ADR-0028 anti-thrash: feed only the current successful
+                        // attachment into the detector. Late replies from a
+                        // superseded same-handle request own neither gate.
+                        self.record_reattach_outcome(
+                            now,
+                            crate::anti_thrash::ReAttachHandle::Consumer(handle),
+                            crate::anti_thrash::ReAttachOutcomeKind::ReAttachOk,
+                        );
+                    }
                     if flow_now {
                         let _ = self.initial_flow(handle);
                         tracing::debug!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
+                            request_id = ?request_id,
                             "consumer re-attach acked; initial flow re-issued"
                         );
                     }
@@ -2121,6 +2451,12 @@ impl Connection {
                 }
                 let request_id = RequestId(err.request_id);
                 let kind = self.pending_requests.remove(&request_id);
+                let unsubscribe_has_waiter =
+                    matches!(kind, Some(PendingRequestKind::ConsumerUnsubscribe { .. }))
+                        && self.wakers.contains_key(&PendingOpKey::Request(request_id));
+                if let Some(PendingRequestKind::ConsumerUnsubscribe { handle }) = kind {
+                    let _ = self.resume_consumer_after_unsubscribe_failure(handle, request_id);
+                }
                 match kind {
                     Some(PendingRequestKind::ProducerCloseForgotten { handle }) => {
                         let bounded_message = crate::log_fields::truncate_broker_str(&err.message);
@@ -2149,7 +2485,18 @@ impl Connection {
                             "broker rejected fire-and-forget consumer close (consumer dropped without explicit close)"
                         );
                     }
-                    _ => {
+                    Some(
+                        PendingRequestKind::ProducerOpen { .. }
+                        | PendingRequestKind::ConsumerSubscribe { .. },
+                    ) => {}
+                    Some(PendingRequestKind::ConsumerUnsubscribe { .. })
+                        if !unsubscribe_has_waiter =>
+                    {
+                        // The retry generation was restored above. A cancelled
+                        // waiter cannot drain an error outcome, so consume it
+                        // in-place after applying the protocol-owned lifecycle.
+                    }
+                    Some(_) => {
                         self.outcomes.insert(
                             PendingOpKey::Request(request_id),
                             OpOutcome::Error {
@@ -2160,49 +2507,74 @@ impl Connection {
                         );
                         self.wake_for_request(request_id);
                     }
+                    None => {}
                 }
-                // When the failing request id correlates with a pending producer-open /
-                // consumer-subscribe, surface a typed failure event so event-stream waiters
-                // (`EventWaitFut::ProducerReady` / `EventWaitFut::SubscribeAcked` in the
-                // tokio engine, and the moonpool engine's equivalent) observe the rejection
-                // instead of hanging forever. The success-side paths (`ProducerSuccess`,
-                // `Success`) already push `ProducerReady` / `SubscribeAcked`; we mirror that
-                // shape for failures, and drop the matching state so the dead handle is not
-                // re-emitted on reconnect.
+                // When a request id correlates with producer-open or subscribe, surface a
+                // typed event so the runtime waiter cannot hang.
+                //
+                // Provisional handles have never attached: every rejection removes their
+                // state and emits `ProducerOpenFailed` / `SubscribeFailed`, allowing the
+                // client-owned retry loop to re-run lookup and routing with a fresh handle.
+                //
+                // Established handles retain state only for an ADR-0080 retryable rejection
+                // and emit the corresponding `*Transient` event for driver-owned
+                // reattachment. Terminal errors still remove the state and emit the ordinary
+                // failure event. Producer-open additionally retries both quota variants and
+                // `ProducerBusy`; subscribe additionally retries `ConsumerBusy`.
                 match kind {
                     Some(PendingRequestKind::ProducerOpen { handle }) => {
-                        // Pulsar wire convention: `ServiceNotReady` (6),
-                        // `MetadataError` (1), `TopicNotFound` (11) are the broker's
-                        // transient post-restart codes — the namespace bundle hasn't
-                        // been re-acquired by this broker yet, the metadata store is
-                        // still loading, or the topic load timed out. Java's
-                        // `ProducerImpl.handleProducerCreationError` re-runs lookup
-                        // with backoff in those cases and only fails permanently on
-                        // authentication / fenced / "topic already deleted" errors.
+                        let current = self.producers.get(&handle).is_some_and(|slot| {
+                            slot.state.lock().open_request_id == Some(request_id)
+                        });
+                        if !current {
+                            tracing::debug!(
+                                target: "magnetar_proto::conn",
+                                handle = ?handle,
+                                request_id = ?request_id,
+                                code = err.error,
+                                "ignored producer-open error for superseded same-handle request"
+                            );
+                            return Ok(());
+                        }
+                        // ADR-0080 classifies broker failures per operation.
+                        // The common retryable set covers metadata/persistence
+                        // loading, service readiness, and rate limiting;
+                        // producer-open additionally accepts both quota variants and
+                        // ProducerBusy. TopicNotFound, auth/schema, fencing,
+                        // termination, and unknown codes remain terminal.
                         // Without this classification, magnetar removed the producer
                         // state on every transient post-`docker restart` rebuild and
                         // left every subsequent `producer.send()` hanging on a
                         // "unknown producer handle".
-                        if is_transient_open_error(err.error) {
+                        let retryable = crate::is_retryable_broker_error(
+                            crate::OperationKind::ProducerOpen,
+                            err.error,
+                        );
+                        let established = self
+                            .producers
+                            .get(&handle)
+                            .is_some_and(|slot| slot.state.lock().has_ever_attached);
+                        if retryable && established {
                             // The attachment failed — close the drain gate so no
                             // staged send reaches the wire before the retry's
                             // `ProducerSuccess` (the broker closes the whole
                             // connection on a send to a not-ready producer).
                             //
-                            // Bump the per-handle attempt counter under the same
-                            // slot lock. Once it crosses
-                            // [`MAX_TRANSIENT_OPEN_RETRIES`] the one-shot retry has
-                            // re-failed too many times (issue #302): stop emitting
-                            // the recoverable `*Transient` event — which would
-                            // re-arm the driver's lookup+retry leg forever — and
-                            // install a TERMINAL failure so the parked `send()`
-                            // future surfaces `Err(PeerClosed)` instead of hanging.
+                            // Bump the per-handle failure counter under the same
+                            // slot lock. Once the configured policy rejects
+                            // another re-issue (issue #302, ADR-0080), stop
+                            // emitting the recoverable `*Transient` event —
+                            // which would re-arm the driver's lookup+retry leg
+                            // forever — and install a TERMINAL failure so the
+                            // parked `send()` future surfaces `Err(PeerClosed)`
+                            // instead of hanging.
                             let attempts = {
                                 let mut slot_state =
                                     self.producers.get(&handle).map(|slot| slot.state.lock());
                                 match slot_state.as_mut() {
                                     Some(s) => {
                                         s.broker_ready = false;
+                                        s.last_open_error = Some((err.error, err.message.clone()));
                                         s.transient_open_attempts =
                                             s.transient_open_attempts.saturating_add(1);
                                         s.transient_open_attempts
@@ -2212,7 +2584,21 @@ impl Connection {
                                     None => u32::MAX,
                                 }
                             };
-                            if attempts > MAX_TRANSIENT_OPEN_RETRIES {
+                            if self.operation_retry.should_retry_after_failure(attempts) {
+                                self.driver_retries.push_back(crate::DriverRetry::Producer {
+                                    handle,
+                                    failed_request_id: request_id,
+                                    code: err.error,
+                                    message: err.message.clone(),
+                                });
+                                self.events.push_back(
+                                    ConnectionEvent::ProducerOpenFailedTransient {
+                                        handle,
+                                        code: err.error,
+                                        message: err.message.clone(),
+                                    },
+                                );
+                            } else {
                                 tracing::warn!(
                                     target: "magnetar_proto::conn",
                                     handle = ?handle,
@@ -2221,19 +2607,18 @@ impl Connection {
                                     "producer-open transient retry budget exhausted; \
                                      surfacing terminal failure"
                                 );
-                                self.fail_producer_open(
+                                self.fail_producer_open_with_broker_error(
                                     handle,
-                                    "producer-open transient retry budget exhausted",
-                                );
-                            } else {
-                                self.events.push_back(
-                                    ConnectionEvent::ProducerOpenFailedTransient {
-                                        handle,
-                                        code: err.error,
-                                        message: err.message.clone(),
-                                    },
+                                    err.error,
+                                    &err.message,
                                 );
                             }
+                        } else if established {
+                            self.fail_producer_open_with_broker_error(
+                                handle,
+                                err.error,
+                                &err.message,
+                            );
                         } else {
                             self.producers.remove(&handle);
                             self.producer_create_requests.remove(&handle);
@@ -2244,8 +2629,34 @@ impl Connection {
                             });
                         }
                     }
-                    Some(PendingRequestKind::ConsumerSubscribe { handle }) => {
-                        if is_transient_open_error(err.error) {
+                    Some(PendingRequestKind::ConsumerSubscribe { handle, .. }) => {
+                        let current = self.consumers.get(&handle).is_some_and(|slot| {
+                            let consumer = slot.state.lock();
+                            consumer.subscribe_waiter_request == Some(request_id)
+                                || (consumer.flow_on_subscribe_ack
+                                    && consumer
+                                        .flow_on_subscribe_ack_request
+                                        .is_none_or(|active| active == request_id))
+                        });
+                        if !current {
+                            tracing::debug!(
+                                target: "magnetar_proto::conn",
+                                handle = ?handle,
+                                request_id = ?request_id,
+                                code = err.error,
+                                "ignored subscribe error for superseded same-handle request"
+                            );
+                            return Ok(());
+                        }
+                        let retryable = crate::is_retryable_broker_error(
+                            crate::OperationKind::Subscribe,
+                            err.error,
+                        );
+                        let established = self
+                            .consumers
+                            .get(&handle)
+                            .is_some_and(|slot| slot.state.lock().has_ever_attached);
+                        if retryable && established {
                             // Bump the per-handle attempt counter; give up
                             // terminally once it crosses the cap (issue #302 —
                             // companion to the producer arm above). A terminal
@@ -2256,6 +2667,7 @@ impl Connection {
                             let attempts = match self.consumers.get(&handle) {
                                 Some(slot) => {
                                     let mut c = slot.state.lock();
+                                    c.last_subscribe_error = Some((err.error, err.message.clone()));
                                     c.transient_subscribe_attempts =
                                         c.transient_subscribe_attempts.saturating_add(1);
                                     c.transient_subscribe_attempts
@@ -2263,7 +2675,20 @@ impl Connection {
                                 // Consumer already gone — nothing to retry.
                                 None => u32::MAX,
                             };
-                            if attempts > MAX_TRANSIENT_OPEN_RETRIES {
+                            if self.operation_retry.should_retry_after_failure(attempts) {
+                                self.events
+                                    .push_back(ConnectionEvent::SubscribeFailedTransient {
+                                        handle,
+                                        code: err.error,
+                                        message: err.message.clone(),
+                                    });
+                                self.driver_retries.push_back(crate::DriverRetry::Consumer {
+                                    handle,
+                                    failed_request_id: request_id,
+                                    code: err.error,
+                                    message: err.message.clone(),
+                                });
+                            } else {
                                 tracing::warn!(
                                     target: "magnetar_proto::conn",
                                     handle = ?handle,
@@ -2272,18 +2697,18 @@ impl Connection {
                                     "consumer-subscribe transient retry budget exhausted; \
                                      surfacing terminal failure"
                                 );
-                                self.fail_consumer_subscribe(
+                                self.fail_consumer_subscribe_with_broker_error(
                                     handle,
-                                    "consumer-subscribe transient retry budget exhausted",
+                                    err.error,
+                                    &err.message,
                                 );
-                            } else {
-                                self.events
-                                    .push_back(ConnectionEvent::SubscribeFailedTransient {
-                                        handle,
-                                        code: err.error,
-                                        message: err.message.clone(),
-                                    });
                             }
+                        } else if established {
+                            self.fail_consumer_subscribe_with_broker_error(
+                                handle,
+                                err.error,
+                                &err.message,
+                            );
                         } else {
                             self.consumers.remove(&handle);
                             self.consumer_subscribe_requests.remove(&handle);
@@ -3030,7 +3455,69 @@ impl Connection {
 
     /// Pull the next [`ConnectionEvent`], if any.
     pub fn poll_event(&mut self) -> Option<ConnectionEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.remove_driver_retry_for_event(&event);
+        Some(event)
+    }
+
+    fn driver_retry_matches_event(retry: &crate::DriverRetry, event: &ConnectionEvent) -> bool {
+        match (retry, event) {
+            (
+                crate::DriverRetry::Producer {
+                    handle,
+                    code,
+                    message,
+                    ..
+                },
+                ConnectionEvent::ProducerOpenFailedTransient {
+                    handle: event_handle,
+                    code: event_code,
+                    message: event_message,
+                },
+            ) => event_handle == handle && event_code == code && event_message == message,
+            (
+                crate::DriverRetry::Consumer {
+                    handle,
+                    code,
+                    message,
+                    ..
+                },
+                ConnectionEvent::SubscribeFailedTransient {
+                    handle: event_handle,
+                    code: event_code,
+                    message: event_message,
+                },
+            ) => event_handle == handle && event_code == code && event_message == message,
+            _ => false,
+        }
+    }
+
+    fn remove_driver_retry_for_event(&mut self, event: &ConnectionEvent) {
+        if let Some(index) = self
+            .driver_retries
+            .iter()
+            .position(|retry| Self::driver_retry_matches_event(retry, event))
+        {
+            let _ = self.driver_retries.remove(index);
+        }
+    }
+
+    /// Pull the next generation-correlated retry owned by a runtime driver.
+    ///
+    /// The matching public transient event is removed at the same time. This
+    /// preserves the stable [`ConnectionEvent`] shape while the built-in
+    /// runtimes retain the exact failed request id needed for ABA-safe retries.
+    #[doc(hidden)]
+    pub fn poll_driver_retry(&mut self) -> Option<crate::DriverRetry> {
+        let retry = self.driver_retries.pop_front()?;
+        let matching_event = self
+            .events
+            .iter()
+            .position(|event| Self::driver_retry_matches_event(&retry, event));
+        if let Some(index) = matching_event {
+            let _ = self.events.remove(index);
+        }
+        Some(retry)
     }
 
     /// Pop the first [`ConnectionEvent`] that satisfies `predicate`,
@@ -3050,7 +3537,9 @@ impl Connection {
         F: Fn(&ConnectionEvent) -> bool,
     {
         let idx = self.events.iter().position(predicate)?;
-        self.events.remove(idx)
+        let event = self.events.remove(idx)?;
+        self.remove_driver_retry_for_event(&event);
+        Some(event)
     }
 
     /// Time of the next scheduled wake-up — the earliest of the keepalive deadline and any
@@ -3384,6 +3873,26 @@ impl Connection {
         }
     }
 
+    /// Cancel a request-id-correlated operation.
+    ///
+    /// Removes every local correlation surface: parked waker, landed outcome,
+    /// pending-request discriminator, and lookup/partition registry capacity.
+    /// The already-encoded wire frame cannot be recalled; a late broker reply
+    /// is ignored because its registry and request-kind entries are gone.
+    /// Idempotent so response-vs-drop races are harmless.
+    pub fn cancel_request(&mut self, request_id: RequestId) {
+        let key = PendingOpKey::Request(request_id);
+        self.unregister_waker(key);
+        let _ = self.outcomes.remove(&key);
+        if let Some(PendingRequestKind::TopicWatcher { watcher_id }) =
+            self.pending_requests.remove(&request_id)
+        {
+            self.topic_watchers.close(watcher_id);
+        }
+        let _ = self.lookup.take_lookup(request_id);
+        let _ = self.lookup.take_partition(request_id);
+    }
+
     /// Consume the outcome of a pending op, if one is ready.
     pub fn take_outcome(&mut self, key: PendingOpKey) -> Option<OpOutcome> {
         self.outcomes.remove(&key)
@@ -3487,6 +3996,9 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::ProducerOpen { handle });
+        if let Some(slot) = self.producers.get(&handle) {
+            slot.state.lock().open_request_id = Some(request_id);
+        }
         request_id
     }
 
@@ -3542,19 +4054,27 @@ impl Connection {
         // session.
         self.consumer_subscribe_requests.insert(handle, req.clone());
 
-        let _ = self.emit_command_subscribe(handle, &req, req.start_message_id);
+        let _ = self.emit_command_subscribe(
+            handle,
+            &req,
+            req.start_message_id,
+            SubscribeAckAction::NotifyWaiter,
+        );
         handle
     }
 
     /// Emit a `CommandSubscribe` carrying `req`'s parameters for the consumer identified by
     /// `handle`. `resume_from` overrides `req.start_message_id` — used by
     /// [`Self::rebuild_consumers`] to point the broker at the post-ack position after a
-    /// reconnect.
+    /// reconnect. `ack_action` transfers acknowledgement ownership to the new
+    /// request while preserving an existing user waiter across driver-owned
+    /// retries and reconnect rebuilds.
     fn emit_command_subscribe(
         &mut self,
         handle: ConsumerHandle,
         req: &SubscribeRequest,
         resume_from: Option<MessageId>,
+        ack_action: SubscribeAckAction,
     ) -> RequestId {
         let request_id = self.alloc_request_id();
         let subscription_properties: Vec<pb::KeyValue> = req
@@ -3615,6 +4135,29 @@ impl Connection {
         let _ = self.encode_command(&base);
         self.pending_requests
             .insert(request_id, PendingRequestKind::ConsumerSubscribe { handle });
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            match ack_action {
+                SubscribeAckAction::NotifyWaiter => {
+                    consumer.subscribe_waiter_id = Some(request_id);
+                    consumer.subscribe_waiter_request = Some(request_id);
+                    consumer.subscribe_waiter_completed = false;
+                    consumer.flow_on_subscribe_ack = false;
+                    consumer.flow_on_subscribe_ack_request = None;
+                }
+                SubscribeAckAction::ReleaseFlow => {
+                    if consumer.subscribe_waiter_id.is_some() {
+                        consumer.subscribe_waiter_request = Some(request_id);
+                        consumer.subscribe_waiter_completed = false;
+                        consumer.flow_on_subscribe_ack = false;
+                        consumer.flow_on_subscribe_ack_request = None;
+                    } else {
+                        consumer.flow_on_subscribe_ack = true;
+                        consumer.flow_on_subscribe_ack_request = Some(request_id);
+                    }
+                }
+            }
+        }
         request_id
     }
 
@@ -4868,13 +5411,52 @@ impl Connection {
     /// Mirrors `org.apache.pulsar.client.api.Consumer#unsubscribe`. Unlike
     /// [`close_consumer`](Self::close_consumer) which keeps the subscription
     /// cursor alive on the broker, `unsubscribe` deletes the subscription
-    /// entirely — useful for tear-down + cleanup. The runtime should call
-    /// `close_consumer` afterwards.
-    ///
+    /// entirely — useful for tear-down + cleanup. A successful broker reply
+    /// closes and removes the local handle even when the runtime waiter was
+    /// cancelled; a rejection restores the suspended attachment generation.
     /// `force=true` (PIP-313) drops the subscription even if other consumers
     /// are still attached.
     pub fn unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
+        if let Some(request_id) = self
+            .consumers
+            .get(&handle)
+            .and_then(|slot| slot.state.lock().unsubscribe_request_id)
+        {
+            return request_id;
+        }
+        self.stage_unsubscribe(handle, force)
+    }
+
+    /// Stage an unsubscribe unless one is already in flight for this handle.
+    ///
+    /// Built-in runtimes use this idempotent admission gate so overlapping
+    /// user futures cannot both claim ownership of the same broker operation.
+    pub fn try_unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> Option<RequestId> {
+        if self
+            .consumers
+            .get(&handle)
+            .is_some_and(|slot| slot.state.lock().unsubscribe_request_id.is_some())
+        {
+            return None;
+        }
+        Some(self.stage_unsubscribe(handle, force))
+    }
+
+    fn stage_unsubscribe(&mut self, handle: ConsumerHandle, force: bool) -> RequestId {
         let request_id = self.alloc_request_id();
+        if let Some(slot) = self.consumers.get(&handle) {
+            slot.state.lock().unsubscribe_request_id = Some(request_id);
+        }
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                ConnectionEvent::SubscribeFailedTransient { handle: event_handle, .. }
+                    if *event_handle == handle
+            )
+        });
+        self.driver_retries.retain(|retry| {
+            !matches!(retry, crate::DriverRetry::Consumer { handle: event_handle, .. } if *event_handle == handle)
+        });
         let cmd = pb::CommandUnsubscribe {
             consumer_id: handle.0,
             request_id: request_id.0,
@@ -4891,6 +5473,68 @@ impl Connection {
             PendingRequestKind::ConsumerUnsubscribe { handle },
         );
         request_id
+    }
+
+    /// Restore a consumer after the broker rejects an unsubscribe request.
+    ///
+    /// Staging `CommandUnsubscribe` suspends the active subscribe generation so
+    /// no detached retry can enqueue `CommandSubscribe` behind it. Java returns
+    /// a failed unsubscribe future to `Ready`; equivalently, this clears that
+    /// suspension and re-emits a previously failed established attachment when
+    /// the connection is still live.
+    fn resume_consumer_after_unsubscribe_failure(
+        &mut self,
+        handle: ConsumerHandle,
+        unsubscribe_request_id: RequestId,
+    ) -> Option<RequestId> {
+        let failed_request_id = {
+            let slot = self.consumers.get(&handle)?;
+            let mut consumer = slot.state.lock();
+            if consumer.unsubscribe_request_id != Some(unsubscribe_request_id) || consumer.closed {
+                return None;
+            }
+            consumer.unsubscribe_request_id = None;
+            consumer.last_subscribe_error.as_ref()?;
+            consumer
+                .subscribe_waiter_request
+                .or(consumer.flow_on_subscribe_ack_request)
+        }?;
+        if !self.is_connected() {
+            return None;
+        }
+        self.retry_consumer_subscribe_if_current(handle, failed_request_id)
+    }
+
+    fn complete_consumer_unsubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        unsubscribe_request_id: RequestId,
+    ) {
+        let current = self.consumers.get(&handle).is_some_and(|slot| {
+            let mut consumer = slot.state.lock();
+            if consumer.unsubscribe_request_id != Some(unsubscribe_request_id) {
+                return false;
+            }
+            consumer.unsubscribe_request_id = None;
+            consumer.close();
+            true
+        });
+        if current {
+            self.cancel_consumer_subscribe(handle);
+        }
+    }
+
+    fn clear_consumer_unsubscribe(
+        &mut self,
+        handle: ConsumerHandle,
+        unsubscribe_request_id: RequestId,
+    ) {
+        if let Some(slot) = self.consumers.get(&handle) {
+            let mut consumer = slot.state.lock();
+            if consumer.unsubscribe_request_id == Some(unsubscribe_request_id) {
+                consumer.unsubscribe_request_id = None;
+            }
+        }
     }
 
     /// Mutable accessor for the embedded [`TxnClient`].
@@ -5394,16 +6038,57 @@ impl Connection {
         Ok(())
     }
 
-    /// Re-emit `CommandProducer` for a SINGLE producer handle. Used by the supervised
-    /// driver loop to retry a producer-open that the broker rejected with a transient
-    /// error (`ServiceNotReady`, `MetadataError`, `TopicNotFound` — see #71). The full
-    /// [`Self::rebuild_producers`] sweep would re-emit `CommandProducer` for every still-
-    /// open producer; this targeted variant is cheaper and avoids stepping on producers
-    /// that are already successfully reattached on this session. Bumps `epoch` so the
-    /// broker associates the new attachment with a strictly newer generation. Returns
-    /// the request id that the user can correlate with the next response, or `None` when
-    /// the producer was closed / removed between the broker error and this retry.
+    /// Whether this failed wire request still owns the producer's active open
+    /// generation.
+    ///
+    /// Delayed driver retry legs use this as their liveness check before and
+    /// after lookup. A reconnect rebuild or newer retry replaces the active
+    /// request id, making older legs harmless no-ops.
+    #[must_use]
+    pub fn producer_open_retry_is_current(
+        &self,
+        handle: ProducerHandle,
+        failed_request_id: RequestId,
+    ) -> bool {
+        self.producer_create_requests.contains_key(&handle)
+            && self.producers.get(&handle).is_some_and(|slot| {
+                let producer = slot.state.lock();
+                !producer.closed && producer.open_request_id == Some(failed_request_id)
+            })
+    }
+
+    /// Re-emit `CommandProducer` for a single producer handle.
+    ///
+    /// This preserves the original low-level API, whose caller owns generation
+    /// coordination. Built-in asynchronous runtimes use
+    /// [`Self::retry_producer_open_if_current`] instead.
     pub fn retry_producer_open(&mut self, handle: ProducerHandle) -> Option<RequestId> {
+        self.retry_producer_open_inner(handle)
+    }
+
+    /// Re-emit `CommandProducer` only if `failed_request_id` still owns the
+    /// producer's active open generation (ADR-0080).
+    ///
+    /// The failed request id prevents a delayed retry leg from superseding a
+    /// newer reconnect rebuild or retry. The full [`Self::rebuild_producers`]
+    /// sweep would re-emit `CommandProducer` for every still-open producer;
+    /// this targeted variant is cheaper and avoids stepping on producers that
+    /// are already successfully reattached on this session. It bumps `epoch`
+    /// so the broker associates the new attachment with a strictly newer
+    /// generation and returns the new request id, or `None` when the failed
+    /// generation is no longer current.
+    pub fn retry_producer_open_if_current(
+        &mut self,
+        handle: ProducerHandle,
+        failed_request_id: RequestId,
+    ) -> Option<RequestId> {
+        if !self.producer_open_retry_is_current(handle, failed_request_id) {
+            return None;
+        }
+        self.retry_producer_open_inner(handle)
+    }
+
+    fn retry_producer_open_inner(&mut self, handle: ProducerHandle) -> Option<RequestId> {
         let req = self.producer_create_requests.get(&handle)?.clone();
         {
             let slot = self.producers.get(&handle)?;
@@ -5425,6 +6110,30 @@ impl Connection {
         Some(request_id)
     }
 
+    /// Whether this failed wire request still owns the consumer's active
+    /// subscribe generation.
+    ///
+    /// Delayed driver retry legs use this as their liveness check before and
+    /// after lookup. A seek, reconnect rebuild, or newer retry replaces the
+    /// active request id and makes the older leg inert.
+    #[must_use]
+    pub fn consumer_subscribe_retry_is_current(
+        &self,
+        handle: ConsumerHandle,
+        failed_request_id: RequestId,
+    ) -> bool {
+        self.consumer_subscribe_requests.contains_key(&handle)
+            && self.consumers.get(&handle).is_some_and(|slot| {
+                let consumer = slot.state.lock();
+                !consumer.closed
+                    && consumer.unsubscribe_request_id.is_none()
+                    && consumer.terminal_failure.is_none()
+                    && (consumer.subscribe_waiter_request == Some(failed_request_id)
+                        || (consumer.flow_on_subscribe_ack
+                            && consumer.flow_on_subscribe_ack_request == Some(failed_request_id)))
+            })
+    }
+
     /// Companion to [`Self::retry_producer_open`] for consumers. Re-emits the
     /// `CommandSubscribe` + initial `CommandFlow` for a single consumer handle, used
     /// when the broker rejected a previous `CommandSubscribe` with a transient code
@@ -5433,6 +6142,27 @@ impl Connection {
     /// still-open consumer's `CommandSubscribe`, which would double-attach the ones
     /// that already succeeded on this session.
     pub fn retry_consumer_subscribe(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
+        self.retry_consumer_subscribe_inner(handle)
+    }
+
+    /// Re-emit `CommandSubscribe` only if `failed_request_id` still owns the
+    /// active subscribe generation.
+    ///
+    /// The failed request id is both a correlation key and cancellation token:
+    /// a delayed retry returns `None` after seek, rebuild, unsubscribe, or
+    /// another retry replaces the active wire request for the same handle.
+    pub fn retry_consumer_subscribe_if_current(
+        &mut self,
+        handle: ConsumerHandle,
+        failed_request_id: RequestId,
+    ) -> Option<RequestId> {
+        if !self.consumer_subscribe_retry_is_current(handle, failed_request_id) {
+            return None;
+        }
+        self.retry_consumer_subscribe_inner(handle)
+    }
+
+    fn retry_consumer_subscribe_inner(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
         let req = self.consumer_subscribe_requests.get(&handle)?.clone();
         let resume_from = {
             let slot = self.consumers.get(&handle)?;
@@ -5445,12 +6175,8 @@ impl Connection {
             // `start_message_id` as "from the configured initial position".
             c.last_acked_message_id
         };
-        let request_id = self.emit_command_subscribe(handle, &req, resume_from);
-        // Flow deferred to the subscribe ack — same gate as
-        // `rebuild_consumers` (the broker drops pre-ack flow silently).
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().flow_on_subscribe_ack = true;
-        }
+        let request_id =
+            self.emit_command_subscribe(handle, &req, resume_from, SubscribeAckAction::ReleaseFlow);
         Some(request_id)
     }
 
@@ -5493,6 +6219,7 @@ impl Connection {
             };
             let c = slot.state.lock();
             if c.closed
+                || c.unsubscribe_request_id.is_some()
                 || c.terminal_failure.is_some()
                 || c.pending_seek.is_some()
                 || c.flow_on_subscribe_ack
@@ -5513,10 +6240,8 @@ impl Connection {
         self.events.retain(
             |ev| !matches!(ev, ConnectionEvent::ConsumerClosedByBroker { handle: h, .. } if *h == handle),
         );
-        let _ = self.emit_command_subscribe(handle, &req, resume_from);
-        if let Some(slot) = self.consumers.get(&handle) {
-            slot.state.lock().flow_on_subscribe_ack = true;
-        }
+        let _ =
+            self.emit_command_subscribe(handle, &req, resume_from, SubscribeAckAction::ReleaseFlow);
         tracing::debug!(
             target: "magnetar_proto::conn",
             handle = ?handle,
@@ -7266,6 +7991,7 @@ mod conn_state_tests {
         conn.handle_bytes(Instant::now(), &handshake_response_bytes())
             .expect("handle");
 
+        let initial_subscribe_request_id = conn.peek_next_request_id_for_test();
         let c_handle = conn.subscribe(SubscribeRequest {
             topic: "persistent://public/default/topic".to_owned(),
             subscription: "sub-x".to_owned(),
@@ -7277,6 +8003,9 @@ mod conn_state_tests {
         });
         // Drop the initial subscribe traffic.
         let _initial = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, initial_subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(c_handle));
+        while conn.poll_event().is_some() {}
 
         // Simulate the consumer having acked a message before the disconnect, so the rebuild
         // should resume from the post-ack id (not from `start_message_id == None`).
@@ -7444,13 +8173,14 @@ mod conn_state_tests {
     /// `ProducerOpenFailed` event (and clear the producer state) so engines waiting on the
     /// event stream observe the rejection instead of hanging. Regression for the CLI
     /// "produce hangs against fresh broker" bug: the broker rejects with
-    /// `ServiceNotReady`/"Please redo the lookup". `ServiceNotReady` is the broker's
-    /// transient post-restart code, so the connection MUST keep the producer state and
-    /// emit `ProducerOpenFailedTransient` (the runtime then retries via
-    /// [`Connection::retry_producer_open`]). The permanent-failure path is covered by
+    /// `ServiceNotReady`/"Please redo the lookup". A provisional producer has no
+    /// connection-stable façade yet, so the connection MUST surface the exact retryable
+    /// broker error and clear the provisional state; the routing-aware client then re-runs
+    /// lookup and can move the next attempt to a redirected owner. Established-handle
+    /// reattachment remains driver-owned. The permanent-failure path is covered by
     /// [`command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`].
     #[test]
-    fn command_error_on_producer_open_emits_producer_open_failed_transient() {
+    fn retryable_error_on_provisional_producer_open_is_client_routable() {
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
@@ -7484,7 +8214,7 @@ mod conn_state_tests {
             .expect("handle CommandError");
 
         match conn.poll_event() {
-            Some(ConnectionEvent::ProducerOpenFailedTransient {
+            Some(ConnectionEvent::ProducerOpenFailed {
                 handle: ev_handle,
                 code,
                 message,
@@ -7493,11 +8223,11 @@ mod conn_state_tests {
                 assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
                 assert_eq!(message, "namespace bundle not served");
             }
-            other => panic!("expected ProducerOpenFailedTransient event, got {other:?}"),
+            other => panic!("expected ProducerOpenFailed event, got {other:?}"),
         }
         assert!(
-            conn.producer(handle).is_some(),
-            "producer state must be RETAINED so the runtime can retry attach"
+            conn.producer(handle).is_none(),
+            "provisional state must be cleared so the client can retry on a redirected owner"
         );
         assert!(
             !conn.has_pending_request_for_test(request_id),
@@ -7508,8 +8238,7 @@ mod conn_state_tests {
     /// Sibling of the transient test above: a hard error code
     /// (`AuthorizationError`, `ProducerFenced`, …) MUST drop the producer state and
     /// emit `ProducerOpenFailed` so the user's open future fails fast. The transient
-    /// retry path only applies to the codes Java's `ProducerImpl` treats as retriable
-    /// (`MetadataError`, `ServiceNotReady`, `TopicNotFound`).
+    /// retry path only applies to ADR-0080's operation-specific allowlist.
     #[test]
     fn command_error_on_producer_open_with_permanent_code_emits_producer_open_failed() {
         let mut conn = Connection::new(
@@ -7559,11 +8288,9 @@ mod conn_state_tests {
         );
     }
 
-    /// Same shape as the producer-open transient case but on the subscribe path. The
-    /// transient code keeps the consumer state alive so the runtime can retry via
-    /// [`Connection::retry_consumer_subscribe`].
+    /// Same routing-aware provisional-failure contract as the producer-open path.
     #[test]
-    fn command_error_on_subscribe_emits_subscribe_failed_transient() {
+    fn retryable_error_on_provisional_subscribe_is_client_routable() {
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
@@ -7598,7 +8325,7 @@ mod conn_state_tests {
             .expect("handle CommandError");
 
         match conn.poll_event() {
-            Some(ConnectionEvent::SubscribeFailedTransient {
+            Some(ConnectionEvent::SubscribeFailed {
                 handle: ev_handle,
                 code,
                 message,
@@ -7607,8 +8334,12 @@ mod conn_state_tests {
                 assert_eq!(code, pb::ServerError::ServiceNotReady as i32);
                 assert_eq!(message, "namespace bundle not served");
             }
-            other => panic!("expected SubscribeFailedTransient event, got {other:?}"),
+            other => panic!("expected SubscribeFailed event, got {other:?}"),
         }
+        assert!(
+            conn.consumer(handle).is_none(),
+            "provisional state must be cleared so the client can retry on a redirected owner"
+        );
         assert!(
             !conn.has_pending_request_for_test(request_id),
             "pending request slot freed"
@@ -7620,7 +8351,7 @@ mod conn_state_tests {
     // failures must back off and eventually SURFACE a terminal error to the
     // parked send / receive future instead of giving up forever (one-shot
     // retry) or re-arming forever. The per-handle attempt counter bumps on each
-    // transient rejection and a give-up past `MAX_TRANSIENT_OPEN_RETRIES`
+    // transient rejection and a give-up past the configured retry count
     // terminalizes the handle, waking the parked waker.
     // ============================================================================
 
@@ -7646,10 +8377,10 @@ mod conn_state_tests {
     /// `ProducerOpenFailedTransient`; a SECOND transient failure on the retry
     /// bumps it to 2 and re-emits again (proving the retry re-arms across
     /// MULTIPLE failures — no existing test exercised a repeated transient
-    /// failure). Driving the counter past `MAX_TRANSIENT_OPEN_RETRIES` then
-    /// terminalizes the open: the parked `send()` future's waker fires and the
-    /// `Send` outcome flips to `Terminal` (so `send()` returns `Err` instead of
-    /// hanging on the closed `broker_ready` drain gate forever).
+    /// failure). Driving the counter past the default configured retry count
+    /// then terminalizes the open: the parked `send()` future's waker fires and
+    /// the `Send` outcome flips to `Terminal` (so `send()` returns `Err` instead
+    /// of hanging on the closed `broker_ready` drain gate forever).
     #[test]
     fn transient_producer_open_retries_then_terminalizes_and_wakes_send() {
         use std::sync::Arc;
@@ -7676,12 +8407,18 @@ mod conn_state_tests {
         while conn.poll_event().is_some() {}
         let _ = drain_outbound_commands(&mut conn);
 
-        // Open a producer; the broker bounces the open with a transient code.
+        // Model an established producer being reattached: provisional failures
+        // return to the routing-aware client and do not use this per-handle path.
         let mut request_id = RequestId(conn.peek_next_request_id_for_test());
         let handle = conn.create_producer(CreateProducerRequest {
             topic: "persistent://public/default/no-bundle".to_owned(),
             ..Default::default()
         });
+        conn.producer(handle)
+            .expect("producer exists")
+            .state
+            .lock()
+            .has_ever_attached = true;
 
         // A staged send parks a user waker on the Send key. It can never flow
         // while `broker_ready` is false (the drain gate), so its future stays
@@ -7708,6 +8445,11 @@ mod conn_state_tests {
 
         // First transient rejection → attempt 1, recoverable event re-emitted.
         feed_transient_error(&mut conn, request_id);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "producer-open uses typed events; its request outcome must not leak"
+        );
         assert_eq!(conn.producer_transient_open_attempts(handle), 1);
         assert!(matches!(
             conn.poll_event(),
@@ -7719,7 +8461,7 @@ mod conn_state_tests {
         // recoverable.
         let _ = drain_outbound_commands(&mut conn);
         request_id = conn
-            .retry_producer_open(handle)
+            .retry_producer_open_if_current(handle, request_id)
             .expect("retry re-issues open");
         feed_transient_error(&mut conn, request_id);
         assert_eq!(conn.producer_transient_open_attempts(handle), 2);
@@ -7729,15 +8471,16 @@ mod conn_state_tests {
         ));
 
         // Now exhaust the budget: keep re-issuing + bouncing until the counter
-        // crosses `MAX_TRANSIENT_OPEN_RETRIES`. The crossing event must be a
-        // TERMINAL `ProducerOpenFailed`, NOT another transient.
+        // crosses the default configured retry count. The crossing event must
+        // be a TERMINAL `ProducerOpenFailed`, NOT another transient.
         let mut saw_terminal = false;
         for _ in 0..(MAX_TRANSIENT_OPEN_RETRIES + 4) {
             let _ = drain_outbound_commands(&mut conn);
-            let Some(rid) = conn.retry_producer_open(handle) else {
+            let Some(rid) = conn.retry_producer_open_if_current(handle, request_id) else {
                 // Producer was removed by the terminal give-up.
                 break;
             };
+            request_id = rid;
             feed_transient_error(&mut conn, rid);
             match conn.poll_event() {
                 Some(ConnectionEvent::ProducerOpenFailed { handle: h, .. }) => {
@@ -7771,6 +8514,188 @@ mod conn_state_tests {
             conn.producer(handle).is_none(),
             "terminal give-up drops the producer state"
         );
+    }
+
+    #[test]
+    fn operation_retry_config_can_disable_producer_open_reissues() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.set_operation_retry_config(crate::OperationRetryConfig {
+            max_retries: Some(0),
+            ..crate::OperationRetryConfig::default()
+        });
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/no-retry".to_owned(),
+            ..Default::default()
+        });
+        feed_transient_error(&mut conn, request_id);
+
+        assert!(
+            matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::ProducerOpenFailed {
+                    handle: failed,
+                    code,
+                    ..
+                }) if failed == handle && code == pb::ServerError::ServiceNotReady as i32
+            ),
+            "max_retries=Some(0) must surface the first broker error"
+        );
+        assert!(
+            conn.producer(handle).is_none(),
+            "disabled retries must terminalize the producer immediately"
+        );
+    }
+
+    #[test]
+    fn permanent_reattachment_errors_terminalize_established_operations() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let producer_request_id = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/permanent-reattach-producer".to_owned(),
+            ..Default::default()
+        });
+        ack_producer_success(&mut conn, producer_request_id);
+
+        let consumer_request_id = conn.peek_next_request_id_for_test();
+        let consumer = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/permanent-reattach-consumer".to_owned(),
+            subscription: "permanent-reattach".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        feed_subscribe_success(&mut conn, consumer_request_id);
+        while conn.poll_event().is_some() {}
+
+        let snapshot_sequence_id = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"before-reset"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 12,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send before reset");
+        let reset_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let reset_waker: Waker = Arc::clone(&reset_counter).into();
+        conn.register_waker(
+            PendingOpKey::Send(producer, snapshot_sequence_id),
+            reset_waker,
+        );
+        conn.reset();
+        assert_eq!(
+            reset_counter.0.load(Ordering::SeqCst),
+            1,
+            "reset must wake the send so its future re-registers"
+        );
+        let snapshot_terminal_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let snapshot_terminal_waker: Waker = Arc::clone(&snapshot_terminal_counter).into();
+        conn.register_waker(
+            PendingOpKey::Send(producer, snapshot_sequence_id),
+            snapshot_terminal_waker,
+        );
+        conn.begin_handshake().expect("re-handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle reconnect handshake");
+        while conn.poll_event().is_some() {}
+        let producer_retry = conn.rebuild_producers()[0];
+        let consumer_retry = conn.rebuild_consumers()[0];
+
+        let sequence_id = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"pending"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 7,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send during producer reattachment");
+        let send_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let send_waker: Waker = Arc::clone(&send_counter).into();
+        conn.register_waker(PendingOpKey::Send(producer, sequence_id), send_waker);
+
+        let receive_counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let receive_waker: Waker = Arc::clone(&receive_counter).into();
+        conn.register_consumer_receive_waker(consumer, receive_waker)
+            .expect("register receive waker during consumer reattachment");
+
+        for request_id in [producer_retry, consumer_retry] {
+            let error = pb::BaseCommand {
+                r#type: pb::base_command::Type::Error as i32,
+                error: Some(pb::CommandError {
+                    request_id: request_id.0,
+                    error: pb::ServerError::TopicNotFound as i32,
+                    message: "topic was deleted".to_owned(),
+                }),
+                ..Default::default()
+            };
+            let mut frame = bytes::BytesMut::new();
+            encode_command(&mut frame, &error).expect("encode CommandError");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("handle terminal reattachment error");
+        }
+
+        assert_eq!(send_counter.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, sequence_id)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+        assert_eq!(snapshot_terminal_counter.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            conn.take_outcome(PendingOpKey::Send(producer, snapshot_sequence_id)),
+            Some(OpOutcome::Terminal { .. })
+        ));
+        assert_eq!(receive_counter.0.load(Ordering::SeqCst), 1);
+        assert!(
+            conn.consumer(consumer).is_some(),
+            "the terminal marker must remain readable by the parked receive future"
+        );
+        assert!(conn.consumer_handle_is_terminal(consumer));
     }
 
     /// #302 (proto unit, consumer): the twin of the producer test. Repeated
@@ -7812,6 +8737,11 @@ mod conn_state_tests {
             sub_type: pb::command_subscribe::SubType::Exclusive,
             ..Default::default()
         });
+        conn.consumer(handle)
+            .expect("consumer exists")
+            .state
+            .lock()
+            .has_ever_attached = true;
 
         // Park a receive waker on the consumer (the future that would hang).
         let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
@@ -7821,6 +8751,11 @@ mod conn_state_tests {
 
         // First transient → attempt 1, recoverable.
         feed_transient_error(&mut conn, request_id);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(request_id))
+                .is_none(),
+            "subscribe uses typed events; its request outcome must not leak"
+        );
         assert_eq!(conn.consumer_transient_subscribe_attempts(handle), 1);
         assert!(matches!(
             conn.poll_event(),
@@ -7835,7 +8770,7 @@ mod conn_state_tests {
         let mut saw_terminal = false;
         for _ in 0..(MAX_TRANSIENT_OPEN_RETRIES + 4) {
             let _ = drain_outbound_commands(&mut conn);
-            let Some(rid) = conn.retry_consumer_subscribe(handle) else {
+            let Some(rid) = conn.retry_consumer_subscribe_if_current(handle, request_id) else {
                 break;
             };
             request_id = rid;
@@ -7869,6 +8804,135 @@ mod conn_state_tests {
             conn.consumer_available_permits(handle),
             0,
             "terminal give-up leaves no broker permits"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_suspends_and_rejection_restores_established_retry_generation() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+        let failed_request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/unsubscribe-retry-generation".to_owned(),
+            subscription: "s".to_owned(),
+            ..Default::default()
+        });
+        conn.consumer(handle)
+            .expect("consumer exists")
+            .state
+            .lock()
+            .has_ever_attached = true;
+        feed_transient_error(&mut conn, failed_request_id);
+        assert!(conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
+
+        let unsubscribe_request_id = conn
+            .try_unsubscribe(handle, false)
+            .expect("first unsubscribe must be staged");
+        assert_eq!(
+            conn.try_unsubscribe(handle, true),
+            None,
+            "overlapping unsubscribe must be rejected"
+        );
+        assert!(!conn.consumer_subscribe_retry_is_current(handle, failed_request_id));
+        assert_eq!(
+            conn.retry_consumer_subscribe_if_current(handle, failed_request_id),
+            None
+        );
+        assert!(
+            !matches!(
+                conn.poll_event(),
+                Some(ConnectionEvent::SubscribeFailedTransient { .. })
+            ),
+            "staging unsubscribe must remove an unclaimed retry event"
+        );
+
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: unsubscribe_request_id.0,
+                error: pb::ServerError::MetadataError as i32,
+                message: "unsubscribe rejected".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &error).expect("encode unsubscribe error");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle unsubscribe error");
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(unsubscribe_request_id))
+                .is_none(),
+            "a cancelled waiter must not leave an undrainable outcome"
+        );
+        let resumed_request_id = RequestId(conn.peek_next_request_id_for_test() - 1);
+        assert!(conn.consumer_subscribe_retry_is_current(handle, resumed_request_id));
+    }
+
+    #[test]
+    fn unsubscribe_success_finalizes_after_waiter_cancellation() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let subscribe_request_id = RequestId(conn.peek_next_request_id_for_test());
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/unsubscribe-cancelled-waiter".to_owned(),
+            subscription: "s".to_owned(),
+            ..Default::default()
+        });
+        let subscribe_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: subscribe_request_id.0,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &subscribe_success).expect("encode subscribe success");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle subscribe success");
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
+        let _ = drain_outbound_commands(&mut conn);
+
+        let unsubscribe_request_id = conn
+            .try_unsubscribe(handle, false)
+            .expect("unsubscribe must be staged");
+        let unsubscribe_success = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: unsubscribe_request_id.0,
+                schema: None,
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &unsubscribe_success).expect("encode unsubscribe success");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle unsubscribe success");
+
+        assert!(
+            conn.consumer(handle).is_none(),
+            "broker success must finalize the local handle without a runtime waiter"
+        );
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(unsubscribe_request_id))
+                .is_none(),
+            "a cancelled waiter must not leave an undrainable success outcome"
         );
     }
 
@@ -8314,6 +9378,218 @@ mod conn_state_tests {
             counter_b.0.load(Ordering::SeqCst),
             1,
             "the un-touched sibling waker fires exactly once on reset"
+        );
+    }
+
+    #[test]
+    fn cancel_request_releases_lookup_capacity_and_is_idempotent() {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                max_pending_lookups: 1,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let first = conn.lookup("persistent://public/default/cancel-first", false);
+        conn.register_waker(
+            PendingOpKey::Request(first),
+            std::task::Waker::noop().clone(),
+        );
+        assert!(conn.has_pending_request_for_test(first));
+        assert_eq!(conn.pending_waker_count(), 1);
+
+        let rejected = conn.lookup("persistent://public/default/rejected", false);
+        assert!(
+            !conn.has_pending_request_for_test(rejected),
+            "the one-slot lookup registry must reject while the first request is pending"
+        );
+
+        conn.cancel_request(first);
+        conn.cancel_request(first);
+        assert!(!conn.has_pending_request_for_test(first));
+        assert_eq!(conn.pending_waker_count(), 0);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(first)).is_none(),
+            "cancellation must discard an already-landed outcome too"
+        );
+
+        let after_cancel = conn.lookup("persistent://public/default/after-cancel", false);
+        assert!(
+            conn.has_pending_request_for_test(after_cancel),
+            "cancellation must return lookup registry capacity to the caller"
+        );
+    }
+
+    #[test]
+    fn cancelled_attachment_late_replies_do_not_recreate_outcomes() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+
+        let producer_request_id = RequestId(conn.peek_next_request_id_for_test());
+        let _producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/cancelled-producer-open".to_owned(),
+            ..Default::default()
+        });
+        conn.cancel_request(producer_request_id);
+        feed_transient_error(&mut conn, producer_request_id);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(producer_request_id))
+                .is_none(),
+            "a late producer-open error must stay ignored after cancellation"
+        );
+
+        let consumer_request_id = RequestId(conn.peek_next_request_id_for_test());
+        let _consumer = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/cancelled-subscribe".to_owned(),
+            subscription: "cancelled".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        conn.cancel_request(consumer_request_id);
+        feed_subscribe_success(&mut conn, consumer_request_id.0);
+        assert!(
+            conn.take_outcome(PendingOpKey::Request(consumer_request_id))
+                .is_none(),
+            "a late subscribe success must stay ignored after cancellation"
+        );
+    }
+
+    #[test]
+    fn cancelling_completed_attachment_purges_unowned_ready_event() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+        while conn.poll_event().is_some() {}
+
+        let producer_request_id = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/completed-cancel-producer".to_owned(),
+            ..Default::default()
+        });
+        let success = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id: producer_request_id,
+                producer_name: "cancelled".to_owned(),
+                last_sequence_id: Some(-1),
+                producer_ready: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut frame = bytes::BytesMut::new();
+        encode_command(&mut frame, &success).expect("encode ProducerSuccess");
+        conn.handle_bytes(Instant::now(), &frame)
+            .expect("handle ProducerSuccess");
+        conn.events
+            .push_back(ConnectionEvent::ProducerClosedByBroker {
+                handle: producer,
+                assigned_broker_service_url: None,
+            });
+        conn.events.push_back(ConnectionEvent::ProducerOpenFailed {
+            handle: producer,
+            code: pb::ServerError::TopicNotFound as i32,
+            message: "late failure".to_owned(),
+        });
+        conn.events
+            .push_back(ConnectionEvent::ProducerOpenFailedTransient {
+                handle: producer,
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "late retry".to_owned(),
+            });
+        conn.driver_retries.push_back(crate::DriverRetry::Producer {
+            handle: producer,
+            failed_request_id: RequestId(producer_request_id),
+            code: pb::ServerError::ServiceNotReady as i32,
+            message: "late retry".to_owned(),
+        });
+        conn.cancel_producer_open(producer);
+        assert!(
+            !conn.events.iter().any(|event| matches!(
+                event,
+                ConnectionEvent::ProducerReady { handle, .. }
+                    | ConnectionEvent::ProducerClosedByBroker { handle, .. }
+                    | ConnectionEvent::ProducerOpenFailed { handle, .. }
+                    | ConnectionEvent::ProducerOpenFailedTransient { handle, .. }
+                    if *handle == producer
+            )),
+            "cancelling must remove every now-unowned producer attachment event"
+        );
+        assert!(!conn.driver_retries.iter().any(
+            |retry| matches!(retry, crate::DriverRetry::Producer { handle, .. } if *handle == producer)
+        ));
+
+        let consumer_request_id = conn.peek_next_request_id_for_test();
+        let consumer = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/completed-cancel-consumer".to_owned(),
+            subscription: "cancelled".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        });
+        feed_subscribe_success(&mut conn, consumer_request_id);
+        conn.events
+            .push_back(ConnectionEvent::ConsumerClosedByBroker {
+                handle: consumer,
+                assigned_broker_service_url: None,
+            });
+        conn.events.push_back(ConnectionEvent::SubscribeFailed {
+            handle: consumer,
+            code: pb::ServerError::TopicNotFound as i32,
+            message: "late failure".to_owned(),
+        });
+        conn.events
+            .push_back(ConnectionEvent::SubscribeFailedTransient {
+                handle: consumer,
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "late retry".to_owned(),
+            });
+        conn.driver_retries.push_back(crate::DriverRetry::Consumer {
+            handle: consumer,
+            failed_request_id: RequestId(consumer_request_id),
+            code: pb::ServerError::ServiceNotReady as i32,
+            message: "late retry".to_owned(),
+        });
+        conn.cancel_consumer_subscribe(consumer);
+        assert!(
+            !conn.events.iter().any(|event| matches!(
+                event,
+                ConnectionEvent::SubscribeAcked { handle, .. }
+                    | ConnectionEvent::ConsumerClosedByBroker { handle, .. }
+                    | ConnectionEvent::SubscribeFailed { handle, .. }
+                    | ConnectionEvent::SubscribeFailedTransient { handle, .. }
+                    if *handle == consumer
+            )),
+            "cancelling must remove every now-unowned consumer attachment event"
+        );
+        assert!(!conn.driver_retries.iter().any(
+            |retry| matches!(retry, crate::DriverRetry::Consumer { handle, .. } if *handle == consumer)
+        ));
+    }
+
+    #[test]
+    fn cancel_request_removes_an_uninitialised_topic_watcher() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let request_id = conn.watch_topic_list("public/default", "events-.*");
+
+        assert!(conn.topic_watchers.lookup_by_request(request_id).is_some());
+        conn.cancel_request(request_id);
+
+        assert!(
+            conn.topic_watchers.lookup_by_request(request_id).is_none(),
+            "cancelling the initial snapshot must remove the watcher registry entry"
         );
     }
 
@@ -9003,7 +10279,7 @@ mod conn_state_tests {
 
         // Driver retry path: re-emit CommandProducer for the single handle.
         let retry_rid = conn
-            .retry_producer_open(producer)
+            .retry_producer_open_if_current(producer, rebuild_rids[0])
             .expect("retry must re-emit");
         let pre_ack = drain_outbound_commands(&mut conn);
         assert!(
@@ -9215,6 +10491,7 @@ mod conn_state_tests {
             Some(ConnectionEvent::Connected { .. }) => {}
             other => panic!("expected Connected, got {other:?}"),
         }
+        let initial_subscribe_request_id = conn.peek_next_request_id_for_test();
         let handle = conn.subscribe(SubscribeRequest {
             topic: "persistent://public/default/failover".to_owned(),
             subscription: "sub-failover".to_owned(),
@@ -9224,6 +10501,9 @@ mod conn_state_tests {
         });
         let _ = drain_command_subscribe(&mut conn);
         let _ = conn.poll_transmit();
+        feed_subscribe_success(&mut conn, initial_subscribe_request_id);
+        assert!(conn.consume_initial_consumer_subscribe_completion(handle));
+        while conn.poll_event().is_some() {}
         (conn, handle)
     }
 
@@ -11829,5 +13109,130 @@ mod otel_property_round_trip_tests {
             1,
             "exactly one traceparent on the republished frame"
         );
+    }
+
+    #[test]
+    fn driver_retry_dequeue_preserves_unrelated_semantic_event() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = ProducerHandle(7);
+        conn.events.push_back(ConnectionEvent::Connected {
+            protocol_version: 21,
+            max_message_size: 0,
+            feature_flags: pb::FeatureFlags::default(),
+        });
+        conn.events
+            .push_back(ConnectionEvent::ProducerOpenFailedTransient {
+                handle,
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "retry".to_owned(),
+            });
+        conn.driver_retries.push_back(crate::DriverRetry::Producer {
+            handle,
+            failed_request_id: RequestId(9),
+            code: pb::ServerError::ServiceNotReady as i32,
+            message: "retry".to_owned(),
+        });
+
+        assert!(matches!(
+            conn.poll_driver_retry(),
+            Some(crate::DriverRetry::Producer {
+                handle: event_handle,
+                failed_request_id: RequestId(9),
+                ..
+            }) if event_handle == handle
+        ));
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::Connected { .. })
+        ));
+        assert!(conn.poll_event().is_none());
+    }
+
+    #[test]
+    fn public_transient_event_dequeue_removes_private_retry_context() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = ProducerHandle(7);
+        conn.events
+            .push_back(ConnectionEvent::ProducerOpenFailedTransient {
+                handle,
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "retry".to_owned(),
+            });
+        conn.driver_retries.push_back(crate::DriverRetry::Producer {
+            handle,
+            failed_request_id: RequestId(9),
+            code: pb::ServerError::ServiceNotReady as i32,
+            message: "retry".to_owned(),
+        });
+
+        assert!(matches!(
+            conn.poll_event(),
+            Some(ConnectionEvent::ProducerOpenFailedTransient { .. })
+        ));
+        assert!(conn.poll_driver_retry().is_none());
+    }
+
+    #[test]
+    fn mixed_retry_dequeue_keeps_identical_failure_pairs_in_order() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = ConsumerHandle(7);
+        for request_id in [RequestId(9), RequestId(10)] {
+            conn.events
+                .push_back(ConnectionEvent::SubscribeFailedTransient {
+                    handle,
+                    code: pb::ServerError::ServiceNotReady as i32,
+                    message: "retry".to_owned(),
+                });
+            conn.driver_retries.push_back(crate::DriverRetry::Consumer {
+                handle,
+                failed_request_id: request_id,
+                code: pb::ServerError::ServiceNotReady as i32,
+                message: "retry".to_owned(),
+            });
+        }
+
+        assert!(
+            conn.poll_event_if(|event| matches!(
+                event,
+                ConnectionEvent::SubscribeFailedTransient { .. }
+            ))
+            .is_some()
+        );
+        assert!(matches!(
+            conn.poll_driver_retry(),
+            Some(crate::DriverRetry::Consumer {
+                failed_request_id: RequestId(10),
+                ..
+            })
+        ));
+        assert!(conn.poll_event().is_none());
+    }
+
+    #[test]
+    fn legacy_consumer_retry_does_not_resubscribe_closed_handle() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/closed-retry".to_owned(),
+            subscription: "closed".to_owned(),
+            ..Default::default()
+        });
+        let _ = conn.poll_transmit();
+        let _ = conn.close_consumer(handle);
+        let _ = conn.poll_transmit();
+
+        assert_eq!(conn.retry_consumer_subscribe(handle), None);
+        assert!(conn.poll_transmit().is_empty());
     }
 }

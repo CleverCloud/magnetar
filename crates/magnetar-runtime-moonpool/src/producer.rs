@@ -50,7 +50,7 @@ use magnetar_proto::{
 use moonpool_core::Providers;
 
 use crate::ConnectionShared;
-use crate::client::{Client, ClientError};
+use crate::client::{Client, ClientError, operation_deadline_error, operation_deadline_expired};
 use crate::crypto::MessageEncryptor;
 
 /// User-facing producer handle, moonpool engine flavour.
@@ -134,6 +134,7 @@ impl Drop for ProducerCloseGuard {
             let mut conn = self.shared.inner.lock();
             let _ = conn.close_producer_forget(self.handle);
         }
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         tracing::debug!(
             topic = %self.slot.identity.topic,
@@ -656,6 +657,7 @@ impl<P: Providers> Producer<P> {
             let mut conn = self.shared.inner.lock();
             conn.close_producer(self.handle)
         };
+        self.shared.operation_cancel_notify.notify_waiters();
         self.shared.driver_waker.notify_one();
         let outcome = RequestFut {
             shared: self.shared.clone(),
@@ -747,11 +749,21 @@ impl<P: Providers + Send + Sync> Client<P> {
     /// - [`ClientError::Closed`] if the broker closes the producer before it becomes ready (or
     ///   while we wait for the success ack).
     /// - [`ClientError::Other`] if the connection drops mid-open.
+    /// - [`ClientError::Broker`] after retryable broker refusals exhaust `OperationRetryConfig`.
+    /// - [`ClientError::Other`] when the deadline expires before any broker error is recorded.
     pub async fn open_producer(
         &self,
         req: CreateProducerRequest,
     ) -> Result<Producer<P>, ClientError> {
-        self.open_producer_with(req, None).await
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.open_producer_with_operation_deadline(
+            req,
+            None,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
     }
 
     /// Same as [`Self::open_producer`] but with an optional PIP-4 encryption hook.
@@ -761,12 +773,35 @@ impl<P: Providers + Send + Sync> Client<P> {
     ///
     /// - [`ClientError::Closed`] if the broker closes the producer before it becomes ready.
     /// - [`ClientError::Other`] if the connection drops mid-open.
+    /// - [`ClientError::Broker`] after retryable broker refusals exhaust `OperationRetryConfig`.
     pub async fn open_producer_with(
         &self,
         req: CreateProducerRequest,
         encryptor: Option<Arc<dyn MessageEncryptor>>,
     ) -> Result<Producer<P>, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.open_producer_with_operation_deadline(
+            req,
+            encryptor,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware producer-open seam used by the engine-generic façade.
+    #[doc(hidden)]
+    pub async fn open_producer_with_operation_deadline(
+        &self,
+        req: CreateProducerRequest,
+        encryptor: Option<Arc<dyn MessageEncryptor>>,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<Producer<P>, ClientError> {
         let compression = req.compression;
+        let retry_config = self.shared().inner.lock().operation_retry_config().clone();
+        let mut attachment_failures = 0_u32;
         // Pulsar requires a `CommandLookupTopic` round-trip before opening a producer or
         // consumer: lookup is what triggers the broker to acquire ownership of the topic's
         // namespace bundle. Skipping it works only when the bundle has already been activated
@@ -776,46 +811,141 @@ impl<P: Providers + Send + Sync> Client<P> {
         // `PulsarClientImpl#createProducerAsync`.
         //
         // ADR-0039 routing: detect `proxy_through_service_url = true` via
-        // [`Client::lookup_topic_target`], then dispatch via [`Client::resolve_target`].
+        // [`Client::lookup_topic_target_with_operation_deadline`], then dispatch via
+        // [`Client::resolve_target`].
         // On a client built via `connect_plain_supervised`, the `Proxy` branch routes
         // through the per-broker connection pool (`crate::pool`); on `connect_plain` /
         // `from_parts` clients the pool is `None` and the branch surfaces
         // `ProxyUnsupportedOnUnsupervisedClient`.
-        let (target, landed_on) = self.lookup_topic_target(&req.topic).await?;
-        let target_shared = self.resolve_target(&target, &landed_on, &req.topic).await?;
-        // ADR-0059: the resolved data-plane connection may be
-        // a pool entry distinct from the bootstrap; fast-fail if it has already
-        // gone terminal with no driver, before registering a doomed
-        // `CommandProducer`. 1:1 with the tokio engine.
-        target_shared.fail_if_no_driver()?;
-        let (handle, slot) = {
-            let mut conn = target_shared.inner.lock();
-            let handle = conn.create_producer(req);
-            let slot = conn
-                .producer(handle)
-                .cloned()
-                .expect("just-created producer slot must exist");
-            (handle, slot)
-        };
-        target_shared.driver_waker.notify_one();
-        wait_producer_ready(&target_shared, handle).await?;
-        // Lifecycle record (ADR-0054): the broker-assigned producer name is
-        // available once `ProducerReady` has landed. Per-slot read only.
-        let producer_name = slot.state.lock().name.clone().unwrap_or_default();
-        tracing::info!(
-            topic = %slot.identity.topic,
-            producer_name = %producer_name,
-            handle = ?handle,
-            access_mode = ?slot.identity.access_mode,
-            "producer created"
-        );
-        Ok(Producer::assemble(
-            target_shared,
+        loop {
+            let (target, landed_on) = self
+                .lookup_topic_target_with_operation_deadline(
+                    &req.topic,
+                    deadline.as_mut(),
+                    last_broker_error,
+                )
+                .await?;
+            let target_shared = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "producer target resolution",
+                        last_broker_error.clone(),
+                    ));
+                }
+                result = self.resolve_target(&target, &landed_on, &req.topic) => result?,
+            };
+            target_shared.fail_if_no_driver()?;
+            if operation_deadline_expired(deadline.as_mut()) {
+                return Err(operation_deadline_error(
+                    "producer open",
+                    last_broker_error.clone(),
+                ));
+            }
+            let (handle, slot) = {
+                let mut conn = target_shared.inner.lock();
+                let handle = conn.create_producer(req.clone());
+                let slot = conn
+                    .producer(handle)
+                    .cloned()
+                    .expect("just-created producer slot must exist");
+                (handle, slot)
+            };
+            target_shared.driver_waker.notify_one();
+            let mut guard = PendingProducerOpenGuard::new(target_shared.clone(), handle);
+            let wait_shared = target_shared.clone();
+            let ready = wait_producer_ready(&wait_shared, handle);
+            tokio::pin!(ready);
+            let ready_result = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    let last = target_shared
+                        .inner
+                        .lock()
+                        .producer_last_open_error(handle)
+                        .or_else(|| last_broker_error.clone());
+                    Err(operation_deadline_error("producer open", last))
+                }
+                result = ready.as_mut() => result,
+            };
+            match ready_result {
+                Ok(()) => {
+                    guard.disarm();
+                    let producer_name = slot.state.lock().name.clone().unwrap_or_default();
+                    tracing::info!(
+                        topic = %slot.identity.topic,
+                        producer_name = %producer_name,
+                        handle = ?handle,
+                        access_mode = ?slot.identity.access_mode,
+                        "producer created"
+                    );
+                    return Ok(Producer::assemble(
+                        target_shared,
+                        handle,
+                        slot,
+                        compression,
+                        encryptor,
+                    ));
+                }
+                Err(ClientError::Broker { code, message })
+                    if magnetar_proto::is_retryable_broker_error(
+                        magnetar_proto::OperationKind::ProducerOpen,
+                        code,
+                    ) =>
+                {
+                    *last_broker_error = Some((code, message.clone()));
+                    attachment_failures = attachment_failures.saturating_add(1);
+                    if !retry_config.should_retry_after_failure(attachment_failures) {
+                        return Err(ClientError::Broker { code, message });
+                    }
+                    drop(guard);
+                    let sleep_provider = self.sleep_provider();
+                    let mut sleep =
+                        sleep_provider(retry_config.delay_after_failure(attachment_failures));
+                    moonpool_core::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "producer open retry",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        _ = sleep.as_mut() => {}
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+struct PendingProducerOpenGuard {
+    shared: Arc<ConnectionShared>,
+    handle: ProducerHandle,
+    armed: bool,
+}
+
+impl PendingProducerOpenGuard {
+    fn new(shared: Arc<ConnectionShared>, handle: ProducerHandle) -> Self {
+        Self {
+            shared,
             handle,
-            slot,
-            compression,
-            encryptor,
-        ))
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingProducerOpenGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.inner.lock().cancel_producer_open(self.handle);
+            self.shared.operation_cancel_notify.notify_waiters();
+            self.shared.driver_waker.notify_one();
+        }
     }
 }
 
@@ -1043,7 +1173,8 @@ impl Drop for RequestFut {
     }
 }
 
-/// Drive the connection's semantic event queue until the expected
+/// Future that selectively removes this producer's events from the
+/// connection's semantic event queue until the expected
 /// [`ConnectionEvent::ProducerReady`] (or a terminal
 /// `ProducerClosedByBroker` / `Closed`) lands for the given handle.
 ///
@@ -1053,97 +1184,124 @@ impl Drop for RequestFut {
 /// from any request-correlated outcome — the sans-io layer surfaces it
 /// as `ProducerReady`.
 ///
-/// The notification is armed before the queue is inspected, preventing a
-/// driver event between the empty check and the await from being lost.
+/// The dedicated event notification is owned and polled before connection
+/// state is inspected. It therefore remains registered across `Pending` and
+/// cannot miss a driver `notify_waiters()` that races with the state check.
+/// Keeping it separate from `driver_waker` also prevents this waiter from
+/// consuming outbound-work permits intended for the driver loop.
+/// Events for other producer handles remain queued for their owning waiters.
+struct ProducerReadyFut {
+    shared: Arc<ConnectionShared>,
+    handle: ProducerHandle,
+    notification: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+}
+
+impl Future for ProducerReadyFut {
+    type Output = Result<(), ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            let notification = this
+                .notification
+                .get_or_insert_with(|| Box::pin(this.shared.event_waker.clone().notified_owned()));
+            let notified = notification.as_mut().poll(cx);
+
+            let mut conn = this.shared.inner.lock();
+            loop {
+                match conn.poll_event_if(|event| {
+                    matches!(
+                        event,
+                        ConnectionEvent::ProducerReady { handle, .. }
+                            | ConnectionEvent::ProducerClosedByBroker { handle, .. }
+                            | ConnectionEvent::ProducerOpenFailed { handle, .. }
+                            if *handle == this.handle
+                    )
+                }) {
+                    Some(ConnectionEvent::ProducerReady { handle, .. }) => {
+                        if handle == this.handle {
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    Some(ConnectionEvent::ProducerClosedByBroker {
+                        handle,
+                        assigned_broker_service_url,
+                    }) => {
+                        if handle == this.handle {
+                            // Broker-forced close — degraded-but-recovering
+                            // (warn! per ADR-0054 §2.1); the open future
+                            // surfaces `Closed` and the caller decides. Mirror
+                            // of the tokio engine's `EventWaitFut` arm.
+                            let topic = conn
+                                .producer(handle)
+                                .map(|s| s.identity.topic.clone())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                handle = ?handle,
+                                topic = %topic,
+                                assigned_broker_service_url = assigned_broker_service_url
+                                    .as_deref()
+                                    .map(crate::log_fields::truncate_broker_str),
+                                "broker closed producer while waiting for ProducerReady"
+                            );
+                            return Poll::Ready(Err(ClientError::Closed));
+                        }
+                    }
+                    Some(ConnectionEvent::ProducerOpenFailed {
+                        handle,
+                        code,
+                        message,
+                    }) => {
+                        if handle == this.handle {
+                            return Poll::Ready(Err(ClientError::Broker { code, message }));
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+
+            // The durable bit is a reset-race fallback. Drain a queued
+            // ProducerReady first so readiness events do not accumulate.
+            if conn.producer_has_ever_attached(this.handle) {
+                return Poll::Ready(Ok(()));
+            }
+
+            if conn.is_closed() {
+                return Poll::Ready(Err(if this.shared.is_no_driver() {
+                    ClientError::PeerClosed
+                } else {
+                    ClientError::Closed
+                }));
+            }
+            drop(conn);
+
+            if notified.is_pending() {
+                return Poll::Pending;
+            }
+            this.notification = None;
+        }
+    }
+}
+
 async fn wait_producer_ready(
     shared: &Arc<ConnectionShared>,
     handle: ProducerHandle,
 ) -> Result<(), ClientError> {
-    loop {
-        let notified = shared.event_notify().notified();
-        let mut notified = std::pin::pin!(notified);
-        notified.as_mut().enable();
-
-        {
-            let mut conn = shared.inner.lock();
-            let event = conn.poll_event_if(|event| match event {
-                ConnectionEvent::ProducerReady {
-                    handle: event_handle,
-                    ..
-                }
-                | ConnectionEvent::ProducerClosedByBroker {
-                    handle: event_handle,
-                    ..
-                }
-                | ConnectionEvent::ProducerOpenFailed {
-                    handle: event_handle,
-                    ..
-                } => *event_handle == handle,
-                ConnectionEvent::Closed { .. } => true,
-                _ => false,
-            });
-            match event {
-                Some(ConnectionEvent::ProducerReady { .. }) => return Ok(()),
-                Some(ConnectionEvent::ProducerClosedByBroker {
-                    handle: event_handle,
-                    assigned_broker_service_url,
-                }) => {
-                    // Broker-forced close — degraded-but-recovering
-                    // (warn! per ADR-0054 §2.1); the open future
-                    // surfaces `Closed` and the caller decides. Mirror
-                    // of the tokio engine's `EventWaitFut` arm.
-                    let topic = conn
-                        .producer(event_handle)
-                        .map(|s| s.identity.topic.clone())
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        handle = ?event_handle,
-                        topic = %topic,
-                        assigned_broker_service_url = assigned_broker_service_url
-                            .as_deref()
-                            .map(crate::log_fields::truncate_broker_str),
-                        "broker closed producer while waiting for ProducerReady"
-                    );
-                    return Err(ClientError::Closed);
-                }
-                Some(ConnectionEvent::ProducerOpenFailed { code, message, .. }) => {
-                    return Err(ClientError::Broker { code, message });
-                }
-                Some(ConnectionEvent::Closed { reason }) => {
-                    // Connection-level close while a producer-open future was
-                    // parked. ADR-0055 §1: a TERMINAL drop (`fail_all_pending`,
-                    // which carries a `reason`) must unblock the waiter with
-                    // the terminal `PeerClosed`, mirroring the tokio engine and
-                    // the request / send / receive surfaces — not a generic
-                    // `Other`. A user-requested graceful `close()` (reason
-                    // `None`) keeps the `Closed` mapping. warn! per ADR-0054
-                    // §2.1; `reason` is broker-controlled text.
-                    tracing::warn!(
-                        reason = reason
-                            .as_deref()
-                            .map(crate::log_fields::truncate_broker_str),
-                        "connection closed while waiting for producer readiness"
-                    );
-                    return Err(match reason {
-                        Some(_) => ClientError::PeerClosed,
-                        None => ClientError::Closed,
-                    });
-                }
-                Some(_) => unreachable!("poll_event_if returned an unselected event"),
-                None => {}
-            }
-
-            if conn.is_closed() {
-                return Err(ClientError::Closed);
-            }
-        }
-        notified.await;
+    ProducerReadyFut {
+        shared: shared.clone(),
+        handle,
+        notification: None,
     }
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future as _;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake};
     use std::time::{Duration, Instant};
 
     use bytes::{Bytes, BytesMut};
@@ -1155,6 +1313,79 @@ mod tests {
     use super::Producer;
     use crate::client::{Client, ClientError};
     use crate::{ConnectionShared, MoonpoolEngine};
+
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn producer_ready_waiter_registers_before_returning_pending() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        let mut future = Box::pin(super::ProducerReadyFut {
+            shared: shared.clone(),
+            handle: ProducerHandle(42),
+            notification: None,
+        });
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        shared.event_waker.notify_waiters();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+
+        let shared = handshake_complete_shared();
+        let (first, second, second_request_id) = {
+            let mut conn = shared.inner.lock();
+            let first = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/first-concurrent-producer".to_owned(),
+                ..Default::default()
+            });
+            let second_request_id = conn.peek_next_request_id_for_test();
+            let second = conn.create_producer(CreateProducerRequest {
+                topic: "persistent://public/default/second-concurrent-producer".to_owned(),
+                ..Default::default()
+            });
+            (first, second, second_request_id)
+        };
+        let error = pb::BaseCommand {
+            r#type: pb::base_command::Type::Error as i32,
+            error: Some(pb::CommandError {
+                request_id: second_request_id,
+                error: pb::ServerError::AuthorizationError as i32,
+                message: "second producer denied".to_owned(),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &error).expect("encode CommandError");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("handle CommandError");
+        let mut first_waiter = Box::pin(super::ProducerReadyFut {
+            shared: shared.clone(),
+            handle: first,
+            notification: None,
+        });
+        let mut second_waiter = Box::pin(super::ProducerReadyFut {
+            shared,
+            handle: second,
+            notification: None,
+        });
+        assert!(first_waiter.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(
+            second_waiter.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ClientError::Broker { code, ref message }))
+                if code == pb::ServerError::AuthorizationError as i32
+                    && message == "second producer denied"
+        ));
+    }
 
     fn handshake_response_bytes() -> BytesMut {
         let cmd = pb::BaseCommand {
@@ -1696,9 +1927,10 @@ mod tests {
     /// waker forever. Mirrors the proto-level
     /// `command_error_on_producer_open_with_permanent_code_emits_producer_open_failed`
     /// test, but covers the engine-side bridge from event to future-result.
-    /// `ServiceNotReady` / `MetadataError` / `TopicNotFound` are deliberately NOT used
-    /// here — those are transient (the runtime retries via
-    /// `retry_producer_open`).
+    /// `ServiceNotReady` / `MetadataError` / `PersistenceError` are deliberately
+    /// NOT used here — those are retryable for producer-open. `TopicNotFound`
+    /// is terminal under ADR-0080, but authorization is the sharper regression
+    /// case for this bridge.
     #[tokio::test(flavor = "current_thread")]
     async fn wait_producer_ready_surfaces_broker_error() {
         let shared = handshake_complete_shared();

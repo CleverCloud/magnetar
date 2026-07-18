@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{ConnectionConfig, FrameError, decode_one, encode_command, pb};
-use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
+use magnetar_runtime_moonpool::{Client, ClientError, MoonpoolEngine};
 use moonpool_core::TokioProviders;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -104,6 +104,105 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
     }
 }
 
+async fn assert_lookup_deadline(client: &Client<TokioProviders>) {
+    let mut deadline = Box::pin(tokio::time::sleep(Duration::from_millis(20)));
+    let mut last_broker_error = None;
+    let error = client
+        .lookup_topic_with_operation_deadline(
+            "persistent://public/default/lookup-deadline",
+            false,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+        .expect_err("silent lookup must resolve on its explicit deadline");
+    assert!(
+        matches!(error, ClientError::Other(ref message)
+            if message == "topic lookup exceeded operation_timeout"),
+        "unexpected lookup deadline error: {error:?}"
+    );
+}
+
+async fn assert_metadata_deadlines(client: &Client<TokioProviders>) {
+    let mut expired = Box::pin(async {});
+    let mut last_broker_error = None;
+    let preflight_error = client
+        .partitioned_topic_metadata_with_operation_deadline(
+            "persistent://public/default/metadata-preflight",
+            expired.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+        .expect_err("ready metadata deadline must fail before enqueue");
+    assert!(
+        matches!(preflight_error, ClientError::Other(ref message)
+            if message == "partitioned topic metadata exceeded operation_timeout"),
+        "unexpected metadata preflight error: {preflight_error:?}"
+    );
+
+    let mut deadline = Box::pin(tokio::time::sleep(Duration::from_millis(20)));
+    let mut last_broker_error = None;
+    let error = client
+        .partitioned_topic_metadata_with_operation_deadline(
+            "persistent://public/default/metadata-deadline",
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+        .expect_err("silent metadata request must resolve on its explicit deadline");
+    assert!(
+        matches!(error, ClientError::Other(ref message)
+            if message == "partitioned topic metadata exceeded operation_timeout"),
+        "unexpected metadata deadline error: {error:?}"
+    );
+}
+
+async fn assert_watcher_deadlines_and_cancellation(client: &Client<TokioProviders>) {
+    let mut expired = Box::pin(async {});
+    let mut last_broker_error = None;
+    let preflight_error = client
+        .watch_topic_list_with_operation_deadline(
+            "public/default",
+            "preflight-.*",
+            expired.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+        .expect_err("ready watcher deadline must fail before enqueue");
+    assert!(
+        matches!(preflight_error, ClientError::Other(ref message)
+            if message == "topic-list snapshot exceeded operation_timeout"),
+        "unexpected watcher preflight error: {preflight_error:?}"
+    );
+
+    let mut deadline = Box::pin(tokio::time::sleep(Duration::from_millis(20)));
+    let mut last_broker_error = None;
+    let error = client
+        .watch_topic_list_with_operation_deadline(
+            "public/default",
+            "deadline-.*",
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+        .expect_err("silent watcher request must resolve on its explicit deadline");
+    assert!(
+        matches!(error, ClientError::Other(ref message)
+            if message == "topic-list snapshot exceeded operation_timeout"),
+        "unexpected watcher deadline error: {error:?}"
+    );
+
+    let watcher = tokio::time::timeout(
+        Duration::from_millis(20),
+        client.watch_topic_list("public/default", "cancelled-.*"),
+    )
+    .await;
+    assert!(
+        watcher.is_err(),
+        "public watcher wrapper must remain pending against the silent broker"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_partitioned_metadata_unregisters_waker() {
     let local = tokio::task::LocalSet::new();
@@ -120,6 +219,9 @@ async fn cancelled_partitioned_metadata_unregisters_waker() {
             .expect("connect ok");
 
             let baseline_wakers = client.shared().inner.lock().pending_waker_count();
+            assert_lookup_deadline(&client).await;
+            assert_metadata_deadlines(&client).await;
+            assert_watcher_deadlines_and_cancellation(&client).await;
 
             let res = tokio::time::timeout(
                 Duration::from_millis(200),

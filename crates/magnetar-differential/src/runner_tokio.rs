@@ -608,6 +608,7 @@ fn classify(err: &ClientError) -> String {
         ClientError::Tls(_) => "tls".to_owned(),
         ClientError::Broker { code, .. } => format!("broker:{code}"),
         ClientError::Closed => "closed".to_owned(),
+        ClientError::Timeout(_) => "timeout".to_owned(),
         // Terminal drop on a plain connection (peer close / fatal decode):
         // the proto layer resolved every pending op with `OpOutcome::Terminal`
         // and the engine mapped it to `PeerClosed`. The terminal-error
@@ -615,5 +616,16 @@ fn classify(err: &ClientError) -> String {
         // (ADR-0055 §1).
         ClientError::PeerClosed => "peer-closed".to_owned(),
         _ => "other".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_operation_timeout() {
+        let error = ClientError::Timeout("producer open exceeded operation_timeout".to_owned());
+        assert_eq!(classify(&error), "timeout");
     }
 }

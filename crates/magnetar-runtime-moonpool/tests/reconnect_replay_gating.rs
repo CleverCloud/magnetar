@@ -53,8 +53,8 @@ use futures::io::{
 };
 use magnetar_proto::producer::OutgoingMessage;
 use magnetar_proto::{
-    ConnectionConfig, ConsumerHandle, CreateProducerRequest, Frame, FrameError, SubscribeRequest,
-    decode_one, encode_command, encode_payload, pb,
+    ConnectionConfig, ConsumerHandle, CreateProducerRequest, Frame, FrameError,
+    OperationRetryConfig, SubscribeRequest, decode_one, encode_command, encode_payload, pb,
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TokioProviders};
@@ -119,6 +119,24 @@ fn emit_lookup_response(out: &mut BytesMut, request_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
+fn emit_lookup_redirect(out: &mut BytesMut, request_id: u64, broker_url: &str) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::LookupResponse as i32,
+        lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+            broker_service_url: Some(broker_url.to_owned()),
+            broker_service_url_tls: None,
+            response: Some(pb::command_lookup_topic_response::LookupType::Redirect as i32),
+            request_id,
+            authoritative: Some(true),
+            error: None,
+            message: None,
+            proxy_through_service_url: Some(false),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
 fn emit_producer_success(out: &mut BytesMut, request_id: u64) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::ProducerSuccess as i32,
@@ -157,14 +175,35 @@ fn emit_send_receipt(out: &mut BytesMut, producer_id: u64, sequence_id: u64) {
     let _ = encode_command(out, &cmd);
 }
 
-fn emit_transient_error(out: &mut BytesMut, request_id: u64) {
+fn emit_broker_error(out: &mut BytesMut, request_id: u64, error: pb::ServerError, message: &str) {
     let cmd = pb::BaseCommand {
         r#type: pb::base_command::Type::Error as i32,
         error: Some(pb::CommandError {
             request_id,
-            error: pb::ServerError::ServiceNotReady as i32,
-            message: "Namespace bundle not served by this instance. Please redo the lookup."
-                .to_owned(),
+            error: error as i32,
+            message: message.to_owned(),
+        }),
+        ..Default::default()
+    };
+    let _ = encode_command(out, &cmd);
+}
+
+fn emit_transient_error(out: &mut BytesMut, request_id: u64) {
+    emit_broker_error(
+        out,
+        request_id,
+        pb::ServerError::ServiceNotReady,
+        "Namespace bundle not served by this instance. Please redo the lookup.",
+    );
+}
+
+fn emit_terminal_lookup_error(out: &mut BytesMut, request_id: u64) {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::Error as i32,
+        error: Some(pb::CommandError {
+            request_id,
+            error: pb::ServerError::AuthorizationError as i32,
+            message: "lookup denied after transient attachment failure".to_owned(),
         }),
         ..Default::default()
     };
@@ -445,6 +484,36 @@ struct GiveUpGating {
     subscribes: AtomicU32,
 }
 
+fn fast_give_up_config() -> ConnectionConfig {
+    ConnectionConfig {
+        operation_timeout: Duration::from_secs(1),
+        ..ConnectionConfig::default()
+    }
+}
+
+fn fast_give_up_policy() -> OperationRetryConfig {
+    OperationRetryConfig {
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(1),
+        max_retries: Some(2),
+    }
+}
+
+fn attachment_deadline_config() -> ConnectionConfig {
+    ConnectionConfig {
+        operation_timeout: Duration::from_millis(100),
+        ..ConnectionConfig::default()
+    }
+}
+
+fn retry_after_attachment_deadline_policy() -> OperationRetryConfig {
+    OperationRetryConfig {
+        initial_backoff: Duration::from_secs(5),
+        max_backoff: Duration::from_secs(5),
+        max_retries: Some(2),
+    }
+}
+
 /// Broker that NEVER acks the producer-open — every `CommandProducer` is bounced
 /// transiently. Mirror of the tokio engine's `run_always_transient_producer_broker`.
 async fn run_always_transient_producer_broker(listener: TcpListener, state: Arc<GiveUpGating>) {
@@ -476,9 +545,10 @@ async fn run_always_transient_producer_broker(listener: TcpListener, state: Arc<
 
 /// #302 (moonpool integration, producer give-up): 1:1 twin of the tokio
 /// `producer_open_gives_up_with_error_after_budget_exhausted`. The bounded
-/// retry loop re-arms across MANY transient rejects then surfaces `Err` once
-/// the proto budget is exhausted — never hangs `open_producer` forever.
-#[tokio::test(start_paused = true)]
+/// retry loop re-arms across the configured transient rejects, then surfaces
+/// `Err` once the client-owned operation budget is exhausted — never hangs `open_producer`
+/// forever.
+#[tokio::test]
 async fn producer_open_gives_up_with_error_after_budget_exhausted() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -492,12 +562,13 @@ async fn producer_open_gives_up_with_error_after_budget_exhausted() {
     let client = Client::connect_plain_supervised(
         &engine,
         &addr.to_string(),
-        ConnectionConfig::default(),
+        fast_give_up_config(),
         None,
         None,
     )
     .await
-    .expect("connect must succeed");
+    .expect("connect must succeed")
+    .with_operation_retry(fast_give_up_policy());
 
     let result = client
         .open_producer(CreateProducerRequest {
@@ -510,14 +581,54 @@ async fn producer_open_gives_up_with_error_after_budget_exhausted() {
         "open_producer must surface Err after the transient retry budget is exhausted, \
          not hang forever (issue #302); got {result:?}"
     );
-    assert!(
-        state.producer_opens.load(Ordering::SeqCst) >= 2,
-        "the retry leg must re-arm across MULTIPLE transient rejects before giving up \
-         (saw {} opens)",
+    assert_eq!(
         state.producer_opens.load(Ordering::SeqCst),
+        3,
+        "one initial producer-open plus two configured retries must reach the wire"
     );
 
     client.close().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let deadline_state = Arc::new(GiveUpGating::default());
+    tokio::spawn(run_always_transient_producer_broker(
+        listener,
+        Arc::clone(&deadline_state),
+    ));
+    let deadline_client = Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        attachment_deadline_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect must succeed")
+    .with_operation_retry(retry_after_attachment_deadline_policy());
+
+    let deadline_error = deadline_client
+        .open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/producer-deadline".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("producer-open must stop at operation_timeout during retry backoff");
+    assert!(matches!(
+        deadline_error,
+        magnetar_runtime_moonpool::ClientError::Broker {
+            code,
+            ref message
+        } if code == pb::ServerError::ServiceNotReady as i32
+            && message == "Namespace bundle not served by this instance. Please redo the lookup."
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(
+        deadline_state.producer_opens.load(Ordering::SeqCst),
+        1,
+        "the operation deadline must stop provisional retries before a second producer-open"
+    );
+    deadline_client.close().await;
 }
 
 /// Broker that NEVER acks the subscribe — every `CommandSubscribe` is bounced
@@ -550,9 +661,9 @@ async fn run_always_transient_subscribe_broker(listener: TcpListener, state: Arc
 }
 
 /// #302 (moonpool integration, consumer give-up): 1:1 twin of the tokio
-/// `subscribe_gives_up_and_receive_errors_after_budget_exhausted`.
-#[tokio::test(start_paused = true)]
-async fn subscribe_gives_up_and_receive_errors_after_budget_exhausted() {
+/// `subscribe_gives_up_with_error_after_budget_exhausted`.
+#[tokio::test]
+async fn subscribe_gives_up_with_error_after_budget_exhausted() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
     let addr = listener.local_addr().expect("local_addr");
     let state = Arc::new(GiveUpGating::default());
@@ -565,46 +676,406 @@ async fn subscribe_gives_up_and_receive_errors_after_budget_exhausted() {
     let client = Client::connect_plain_supervised(
         &engine,
         &addr.to_string(),
-        ConnectionConfig::default(),
+        fast_give_up_config(),
         None,
         None,
     )
     .await
-    .expect("connect must succeed");
+    .expect("connect must succeed")
+    .with_operation_retry(fast_give_up_policy());
 
-    let consumer = client
+    let error = client
         .subscribe(SubscribeRequest {
             topic: "persistent://public/default/never-served-sub".to_owned(),
             subscription: "giveup-302".to_owned(),
             sub_type: pb::command_subscribe::SubType::Exclusive,
             ..Default::default()
         })
-        .await;
-
-    match consumer {
-        Err(_) => {}
-        Ok(consumer) => {
-            let got = consumer.receive().await;
-            assert!(
-                got.is_err(),
-                "receive() must surface Err after the subscribe give-up, not block forever \
-                 (issue #302); got {got:?}"
-            );
-        }
-    }
-    assert!(
-        state.subscribes.load(Ordering::SeqCst) >= 2,
-        "the subscribe retry leg must re-arm across MULTIPLE transient rejects before \
-         giving up (saw {} subscribes)",
+        .await
+        .expect_err("provisional subscribe must return the final broker error");
+    assert!(matches!(
+        error,
+        magnetar_runtime_moonpool::ClientError::Broker { .. }
+    ));
+    assert_eq!(
         state.subscribes.load(Ordering::SeqCst),
+        3,
+        "one initial subscribe plus two configured retries must reach the wire"
     );
 
+    client.close().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let deadline_state = Arc::new(GiveUpGating::default());
+    tokio::spawn(run_always_transient_subscribe_broker(
+        listener,
+        Arc::clone(&deadline_state),
+    ));
+    let deadline_client = Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        attachment_deadline_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect must succeed")
+    .with_operation_retry(retry_after_attachment_deadline_policy());
+
+    let deadline_error = deadline_client
+        .subscribe(SubscribeRequest {
+            topic: "persistent://public/default/subscribe-deadline".to_owned(),
+            subscription: "deadline".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        })
+        .await
+        .expect_err("subscribe must stop at operation_timeout during retry backoff");
+    assert!(matches!(
+        deadline_error,
+        magnetar_runtime_moonpool::ClientError::Broker {
+            code,
+            ref message
+        } if code == pb::ServerError::ServiceNotReady as i32
+            && message == "Namespace bundle not served by this instance. Please redo the lookup."
+    ));
+    tokio::task::yield_now().await;
+    assert_eq!(
+        deadline_state.subscribes.load(Ordering::SeqCst),
+        1,
+        "the operation deadline must stop provisional retries before a second subscribe"
+    );
+    deadline_client.close().await;
+}
+
+const TERMINAL_LOOKUP_PRODUCER_TOPIC: &str = "persistent://public/default/terminal-lookup-producer";
+const TERMINAL_LOOKUP_CONSUMER_TOPIC: &str = "persistent://public/default/terminal-lookup-consumer";
+
+#[derive(Default)]
+struct TerminalLookupGating {
+    producer_lookups: AtomicU32,
+    consumer_lookups: AtomicU32,
+    producer_opens: AtomicU32,
+    subscribes: AtomicU32,
+}
+
+async fn run_terminal_lookup_after_provisional_setup_broker(
+    listener: TcpListener,
+    state: Arc<TerminalLookupGating>,
+) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    serve_conn(&mut stream, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(lookup) = &frame.command.lookup_topic {
+                    let attempts = if lookup.topic == TERMINAL_LOOKUP_PRODUCER_TOPIC {
+                        &state.producer_lookups
+                    } else {
+                        &state.consumer_lookups
+                    };
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        emit_lookup_response(out, lookup.request_id);
+                    } else {
+                        emit_terminal_lookup_error(out, lookup.request_id);
+                    }
+                }
+            }
+            Ok(pb::base_command::Type::Producer) => {
+                if let Some(producer) = &frame.command.producer {
+                    state.producer_opens.fetch_add(1, Ordering::SeqCst);
+                    emit_transient_error(out, producer.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Subscribe) => {
+                if let Some(subscribe) = &frame.command.subscribe {
+                    state.subscribes.fetch_add(1, Ordering::SeqCst);
+                    emit_transient_error(out, subscribe.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+/// A terminal lookup result in an attachment retry leg must surface that exact
+/// broker error and must not send another producer-open or subscribe command.
+#[tokio::test]
+async fn terminal_lookup_failure_stops_provisional_setup_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(TerminalLookupGating::default());
+    tokio::spawn(run_terminal_lookup_after_provisional_setup_broker(
+        listener,
+        Arc::clone(&state),
+    ));
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let client = Client::connect_plain_supervised(
+        &engine,
+        &addr.to_string(),
+        fast_give_up_config(),
+        None,
+        None,
+    )
+    .await
+    .expect("connect must succeed")
+    .with_operation_retry(fast_give_up_policy());
+
+    let producer_error = client
+        .open_producer(CreateProducerRequest {
+            topic: TERMINAL_LOOKUP_PRODUCER_TOPIC.to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("terminal retry-path lookup must fail producer-open");
+    assert!(matches!(
+        producer_error,
+        magnetar_runtime_moonpool::ClientError::Broker {
+            code,
+            ref message
+        } if code == pb::ServerError::AuthorizationError as i32
+            && message == "lookup denied after transient attachment failure"
+    ));
+
+    let subscribe_error = client
+        .subscribe(SubscribeRequest {
+            topic: TERMINAL_LOOKUP_CONSUMER_TOPIC.to_owned(),
+            subscription: "terminal-lookup".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        })
+        .await
+        .expect_err("terminal retry-path lookup must fail subscribe");
+    assert!(matches!(
+        subscribe_error,
+        magnetar_runtime_moonpool::ClientError::Broker {
+            code,
+            ref message
+        } if code == pb::ServerError::AuthorizationError as i32
+            && message == "lookup denied after transient attachment failure"
+    ));
+
+    assert_eq!(state.producer_opens.load(Ordering::SeqCst), 1);
+    assert_eq!(state.subscribes.load(Ordering::SeqCst), 1);
+    client.close().await;
+}
+
+#[derive(Clone, Copy)]
+enum OwnershipOperation {
+    Producer,
+    Subscribe,
+}
+
+#[derive(Default)]
+struct OwnershipMoveGating {
+    a_lookups: AtomicU32,
+    a_producers: AtomicU32,
+    a_subscribes: AtomicU32,
+    b_lookups: AtomicU32,
+    b_producers: AtomicU32,
+    b_subscribes: AtomicU32,
+}
+
+async fn run_previous_owner_broker(
+    listener: TcpListener,
+    redirect_url: String,
+    operation: OwnershipOperation,
+    state: Arc<OwnershipMoveGating>,
+) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    serve_conn(&mut stream, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(lookup) = &frame.command.lookup_topic {
+                    let attempt = state.a_lookups.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        emit_lookup_response(out, lookup.request_id);
+                    } else {
+                        emit_lookup_redirect(out, lookup.request_id, &redirect_url);
+                    }
+                }
+            }
+            Ok(pb::base_command::Type::Producer)
+                if matches!(operation, OwnershipOperation::Producer) =>
+            {
+                if let Some(producer) = &frame.command.producer {
+                    state.a_producers.fetch_add(1, Ordering::SeqCst);
+                    emit_broker_error(
+                        out,
+                        producer.request_id,
+                        pb::ServerError::ProducerBusy,
+                        "producer owner is moving",
+                    );
+                }
+            }
+            Ok(pb::base_command::Type::Subscribe)
+                if matches!(operation, OwnershipOperation::Subscribe) =>
+            {
+                if let Some(subscribe) = &frame.command.subscribe {
+                    state.a_subscribes.fetch_add(1, Ordering::SeqCst);
+                    emit_broker_error(
+                        out,
+                        subscribe.request_id,
+                        pb::ServerError::ConsumerBusy,
+                        "consumer owner is moving",
+                    );
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+async fn run_new_owner_broker(
+    listener: TcpListener,
+    operation: OwnershipOperation,
+    state: Arc<OwnershipMoveGating>,
+) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    serve_conn(&mut stream, move |frame, out| {
+        match pb::base_command::Type::try_from(frame.command.r#type) {
+            Ok(pb::base_command::Type::Connect) => emit_connected(out),
+            Ok(pb::base_command::Type::Lookup) => {
+                if let Some(lookup) = &frame.command.lookup_topic {
+                    state.b_lookups.fetch_add(1, Ordering::SeqCst);
+                    emit_lookup_response(out, lookup.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Producer)
+                if matches!(operation, OwnershipOperation::Producer) =>
+            {
+                if let Some(producer) = &frame.command.producer {
+                    state.b_producers.fetch_add(1, Ordering::SeqCst);
+                    emit_producer_success(out, producer.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Subscribe)
+                if matches!(operation, OwnershipOperation::Subscribe) =>
+            {
+                if let Some(subscribe) = &frame.command.subscribe {
+                    state.b_subscribes.fetch_add(1, Ordering::SeqCst);
+                    emit_subscribe_success(out, subscribe.request_id);
+                }
+            }
+            Ok(pb::base_command::Type::Ping) => emit_pong(out),
+            _ => {}
+        }
+        true
+    })
+    .await;
+}
+
+async fn ownership_move_client(
+    operation: OwnershipOperation,
+) -> (Client<TokioProviders>, Arc<OwnershipMoveGating>) {
+    let listener_b = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("broker B bind");
+    let addr_b = listener_b.local_addr().expect("broker B address");
+    let listener_a = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("broker A bind");
+    let addr_a = listener_a.local_addr().expect("broker A address");
+    let state = Arc::new(OwnershipMoveGating::default());
+    tokio::spawn(run_new_owner_broker(
+        listener_b,
+        operation,
+        Arc::clone(&state),
+    ));
+    tokio::spawn(run_previous_owner_broker(
+        listener_a,
+        format!("pulsar://{addr_b}"),
+        operation,
+        Arc::clone(&state),
+    ));
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let mut config = fast_give_up_config();
+    config.supervisor = Some(magnetar_proto::SupervisorConfig::default());
+    let client = Client::connect_plain_supervised(&engine, &addr_a.to_string(), config, None, None)
+        .await
+        .expect("connect to broker A")
+        .with_operation_retry(fast_give_up_policy());
+    (client, state)
+}
+
+fn assert_ownership_move(
+    state: &OwnershipMoveGating,
+    expected_producers: u32,
+    expected_subscribes: u32,
+) {
+    assert_eq!(state.a_lookups.load(Ordering::SeqCst), 2);
+    assert_eq!(state.a_producers.load(Ordering::SeqCst), expected_producers);
+    assert_eq!(
+        state.a_subscribes.load(Ordering::SeqCst),
+        expected_subscribes
+    );
+    assert_eq!(state.b_lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(state.b_producers.load(Ordering::SeqCst), expected_producers);
+    assert_eq!(
+        state.b_subscribes.load(Ordering::SeqCst),
+        expected_subscribes
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A provisional producer rejected by broker A is removed before the retry;
+/// the client re-runs lookup and attaches a fresh handle on redirected broker B.
+async fn producer_open_retry_follows_redirect_to_new_owner() {
+    let (client, state) = ownership_move_client(OwnershipOperation::Producer).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/producer-owner-move".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("producer ownership retry must not hang")
+    .expect("producer ownership retry must attach on broker B");
+    assert_ownership_move(&state, 1, 0);
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A provisional consumer rejected by broker A is removed before the retry;
+/// the client re-runs lookup and attaches a fresh handle on redirected broker B.
+async fn subscribe_retry_follows_redirect_to_new_owner() {
+    let (client, state) = ownership_move_client(OwnershipOperation::Subscribe).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/consumer-owner-move".to_owned(),
+            subscription: "owner-move".to_owned(),
+            sub_type: pb::command_subscribe::SubType::Exclusive,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("subscribe ownership retry must not hang")
+    .expect("subscribe ownership retry must attach on broker B");
+    assert_ownership_move(&state, 0, 1);
     client.close().await;
 }
 
 #[derive(Default)]
 struct ReceiveAcrossDropGating {
     subscribes: AtomicU32,
+    retry_lookups: AtomicU32,
+    reattached: AtomicBool,
 }
 
 /// Two-session supervised broker for the #299 receive-across-drop test. Mirror
@@ -648,7 +1119,8 @@ async fn run_receive_across_drop_broker(
         drop(s_dead);
     }
 
-    // Session 2: re-ack subscribe, deliver one message on the rebuild flow.
+    // Session 2: reject the rebuilt subscribe once, then answer the driver's
+    // retry lookup, re-ack subscribe, and deliver on the rebuild flow.
     if let Ok((mut s2, _)) = listener.accept().await {
         let st = Arc::clone(&state);
         serve_conn(&mut s2, move |frame, out| {
@@ -656,17 +1128,25 @@ async fn run_receive_across_drop_broker(
                 Ok(pb::base_command::Type::Connect) => emit_connected(out),
                 Ok(pb::base_command::Type::Lookup) => {
                     if let Some(l) = &frame.command.lookup_topic {
+                        st.retry_lookups.fetch_add(1, Ordering::SeqCst);
                         emit_lookup_response(out, l.request_id);
                     }
                 }
                 Ok(pb::base_command::Type::Subscribe) => {
                     if let Some(sub) = &frame.command.subscribe {
-                        st.subscribes.fetch_add(1, Ordering::SeqCst);
-                        emit_subscribe_success(out, sub.request_id);
+                        let previous = st.subscribes.fetch_add(1, Ordering::SeqCst);
+                        if previous == 1 {
+                            emit_transient_error(out, sub.request_id);
+                        } else {
+                            emit_subscribe_success(out, sub.request_id);
+                            st.reattached.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
                 Ok(pb::base_command::Type::Flow) => {
-                    emit_message_frame(out, ConsumerHandle(consumer_id), 1, b"after-reconnect");
+                    if st.reattached.load(Ordering::SeqCst) {
+                        emit_message_frame(out, ConsumerHandle(consumer_id), 1, b"after-reconnect");
+                    }
                 }
                 Ok(pb::base_command::Type::Ping) => emit_pong(out),
                 _ => {}
@@ -710,7 +1190,8 @@ async fn receive_across_supervised_drop_resolves_with_message_not_closed() {
     )
     .await
     .expect("connect did not time out")
-    .expect("connect must succeed");
+    .expect("connect must succeed")
+    .with_operation_retry(fast_give_up_policy());
 
     let consumer = tokio::time::timeout(
         Duration::from_secs(5),
@@ -738,10 +1219,15 @@ async fn receive_across_supervised_drop_resolves_with_message_not_closed() {
         b"after-reconnect",
         "the receive() must resolve with the message delivered on the rebuilt session"
     );
-    assert!(
-        state.subscribes.load(Ordering::SeqCst) >= 2,
-        "the subscribe must be replayed on the rebuilt session (saw {} subscribes)",
+    assert_eq!(
         state.subscribes.load(Ordering::SeqCst),
+        3,
+        "initial attach, rejected rebuild, and successful retry must each reach the wire",
+    );
+    assert_eq!(
+        state.retry_lookups.load(Ordering::SeqCst),
+        1,
+        "the established-consumer retry must re-run lookup exactly once",
     );
 
     client.close().await;

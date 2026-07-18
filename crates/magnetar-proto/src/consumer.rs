@@ -117,10 +117,9 @@ pub struct ShadowTopicMetadata {
 
 /// Per-consumer state.
 // reason: `closed` / `paused` / `reached_end_of_topic` /
-// `flow_on_subscribe_ack` are orthogonal protocol axes (user latch, user
-// toggle, broker signal, re-attach flow gate), not an encodable state
-// machine — collapsing them into enums would invent product states that
-// cannot occur.
+// `closed` / `paused` / `reached_end_of_topic` are orthogonal protocol axes
+// (user latch, user toggle, broker signal), not an encodable state machine —
+// collapsing them into enums would invent product states that cannot occur.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct ConsumerState {
@@ -235,8 +234,18 @@ pub struct ConsumerState {
     pub receive_wakers: Slab<Waker>,
     /// Closed flag.
     pub closed: bool,
-    /// Number of consecutive transient `CommandSubscribe` rejections
-    /// (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) the broker has
+    /// The unsubscribe request currently in flight, if any.
+    ///
+    /// This mirrors Java's `Closing` state closely enough for retry ownership:
+    /// detached re-attachment legs must stop before they can enqueue a
+    /// `CommandSubscribe` behind `CommandUnsubscribe`. A broker rejection
+    /// clears the flag and restores the prior attachment generation.
+    pub(crate) unsubscribe_request_id: Option<RequestId>,
+    /// Whether this consumer has completed at least one broker attachment.
+    /// Provisional retries belong to the routing-aware client operation;
+    /// established-handle retries remain connection-local reattachment.
+    pub(crate) has_ever_attached: bool,
+    /// Number of consecutive retryable `CommandSubscribe` rejections
     /// returned for this consumer since the last success. Bumped by the
     /// [`crate::Connection`] error handler on each transient subscribe
     /// failure; reset to `0` when the re-subscribe is acked. The runtime
@@ -244,8 +253,12 @@ pub struct ConsumerState {
     /// [`crate::Connection::consumer_transient_subscribe_attempts`] to size
     /// their exponential-backoff sleep before the next lookup + retry, and the
     /// proto layer installs a terminal failure once it crosses
-    /// [`crate::conn::MAX_TRANSIENT_OPEN_RETRIES`] (issue #302).
+    /// [`crate::OperationRetryConfig::max_retries`] (issue #302 / ADR-0080).
     pub transient_subscribe_attempts: u32,
+    /// Last retryable broker rejection observed while this consumer is
+    /// subscribing. Runtime deadlines surface it instead of replacing useful
+    /// broker diagnostics with a synthetic timeout.
+    pub(crate) last_subscribe_error: Option<(i32, String)>,
     /// `Some(reason)` once this consumer has been given a TERMINAL subscribe
     /// failure — the transient-retry budget was exhausted (issue #302) or a
     /// non-recoverable subscribe error landed. Installed by
@@ -257,16 +270,24 @@ pub struct ConsumerState {
     /// supervisor is still reconnecting (issue #299 — a recoverable `Failed`
     /// window must NOT surface `Closed`).
     pub terminal_failure: Option<String>,
-    /// Re-attach flow gate: set by `rebuild_consumers` /
-    /// `retry_consumer_subscribe` so the connection emits the initial
-    /// `CommandFlow` only when the broker ACKS the re-subscribe (`Success`
-    /// arm). Pulsar silently drops `CommandFlow` for a consumer id whose
-    /// subscribe is still being processed (post-restart cursor recovery
-    /// makes that window seconds long) — flow-alongside-subscribe left the
-    /// re-attached consumer with zero broker-side permits and starved
-    /// `receive()` forever. Java parity: `ConsumerImpl#reconnectLater`
-    /// ordering (documented in `ARCHITECTURE.md` §Supervised reconnect).
+    /// Stable user-waiter token, initialized from the first subscribe request
+    /// id and preserved while rebuild/retry replaces the active wire request.
+    pub(crate) subscribe_waiter_id: Option<RequestId>,
+    /// Active wire request owned by [`Self::subscribe_waiter_id`]. Older
+    /// same-handle replies cannot satisfy the stable waiter.
+    pub(crate) subscribe_waiter_request: Option<RequestId>,
+    /// The active wire request succeeded, but the runtime has not yet consumed
+    /// the stable waiter completion. Preserved across reset so rebuild can
+    /// transfer the same waiter onto the replacement session.
+    pub(crate) subscribe_waiter_completed: bool,
+    /// Re-attach flow gate: set while a driver-owned subscribe waits for its
+    /// acknowledgement. Kept public as a boolean for source compatibility;
+    /// the correlated wire request is retained separately by the connection.
     pub flow_on_subscribe_ack: bool,
+    /// Current driver-owned re-attach request whose acknowledgement releases
+    /// initial flow. Request-id correlation prevents an older overlapping
+    /// subscribe success from sending flow before the latest subscribe lands.
+    pub(crate) flow_on_subscribe_ack_request: Option<RequestId>,
     /// Configured max redelivery before DLQ routing kicks in (`0` disables DLQ routing).
     pub max_redeliver_count: u32,
     /// Messages flagged for DLQ routing. The runtime crate drains this and republishes.
@@ -608,9 +629,16 @@ impl ConsumerState {
             pending_seek: None,
             receive_wakers: Slab::new(),
             closed: false,
+            unsubscribe_request_id: None,
+            has_ever_attached: false,
             transient_subscribe_attempts: 0,
+            last_subscribe_error: None,
             terminal_failure: None,
+            subscribe_waiter_id: None,
+            subscribe_waiter_request: None,
+            subscribe_waiter_completed: false,
             flow_on_subscribe_ack: false,
+            flow_on_subscribe_ack_request: None,
             max_redeliver_count: 0,
             dead_letter_pending: Vec::new(),
             paused: false,

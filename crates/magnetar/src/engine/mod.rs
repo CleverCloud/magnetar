@@ -682,6 +682,57 @@ pub struct TopicListChange {
     pub removed: Vec<String>,
 }
 
+/// One setup-operation context shared across every caller-visible stage.
+///
+/// The pinned timer enforces the total deadline, while `last_broker_error`
+/// preserves the newest broker diagnostic across metadata, lookup, routing,
+/// and attachment so a later timeout does not replace it with a generic error.
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub struct OperationDeadline {
+    timer: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    last_broker_error: Option<(i32, String)>,
+}
+
+type OperationDeadlineParts<'a> = (
+    Pin<&'a mut (dyn Future<Output = ()> + Send)>,
+    &'a mut Option<(i32, String)>,
+);
+
+#[cfg(feature = "tokio")]
+impl core::fmt::Debug for OperationDeadline {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OperationDeadline").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl OperationDeadline {
+    /// Build a façade deadline from an engine-provided timer.
+    #[doc(hidden)]
+    pub fn new(timer: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> Self {
+        Self {
+            timer,
+            last_broker_error: None,
+        }
+    }
+
+    fn never() -> Self {
+        Self::new(Box::pin(std::future::pending()))
+    }
+
+    /// Reborrow the pinned engine timer.
+    #[doc(hidden)]
+    pub fn timer(&mut self) -> Pin<&mut (dyn Future<Output = ()> + Send)> {
+        self.timer.as_mut()
+    }
+
+    /// Reborrow both parts for a built-in runtime operation.
+    pub(crate) fn parts(&mut self) -> OperationDeadlineParts<'_> {
+        (self.timer.as_mut(), &mut self.last_broker_error)
+    }
+}
+
 /// Engine-side broker metadata lookups used by
 /// [`crate::PartitionedConsumerBuilder`] and
 /// [`crate::PatternConsumerBuilder`] (alongside other partition-aware
@@ -704,6 +755,26 @@ pub trait BrokerMetadataApi: 'static + Send + Sync {
         topic: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>>;
 
+    /// Create a provider-correct setup timer.
+    ///
+    /// The default preserves compatibility for downstream custom engines:
+    /// their established operation method remains authoritative until they
+    /// opt into the deadline-aware companion below.
+    #[doc(hidden)]
+    fn new_metadata_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::never()
+    }
+
+    /// Deadline-aware metadata lookup used by built-in composite builders.
+    #[doc(hidden)]
+    fn partitioned_topic_metadata_with_deadline<'a>(
+        &'a self,
+        topic: &'a str,
+        _deadline: &'a mut OperationDeadline,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Self::Error>> + Send + 'a>> {
+        self.partitioned_topic_metadata(topic)
+    }
+
     /// Subscribe to a topic-list watcher and return the initial topic
     /// snapshot for the given namespace + regex pattern (PIP-145).
     fn watch_topic_list<'a>(
@@ -711,6 +782,17 @@ pub trait BrokerMetadataApi: 'static + Send + Sync {
         namespace: &'a str,
         pattern: &'a str,
     ) -> WatchTopicListFut<'a, Self>;
+
+    /// Deadline-aware topic-list snapshot used by built-in composite builders.
+    #[doc(hidden)]
+    fn watch_topic_list_with_deadline<'a>(
+        &'a self,
+        namespace: &'a str,
+        pattern: &'a str,
+        _deadline: &'a mut OperationDeadline,
+    ) -> WatchTopicListFut<'a, Self> {
+        self.watch_topic_list(namespace, pattern)
+    }
 
     /// Drain the next pending `TopicListChanged` delta from the
     /// connection's PIP-145 buffer, if any. Returns `None` when no
@@ -745,6 +827,22 @@ pub trait SubscribeApi: 'static + Send + Sync {
     /// per-consumer queue and the initial FLOW frame has been queued
     /// for the driver.
     fn subscribe(&self, req: magnetar_proto::SubscribeRequest) -> SubscribeFut<'_, Self>;
+
+    /// Create a provider-correct setup timer.
+    #[doc(hidden)]
+    fn new_subscribe_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::never()
+    }
+
+    /// Deadline-aware subscribe used by built-in composite builders.
+    #[doc(hidden)]
+    fn subscribe_with_deadline<'a>(
+        &'a self,
+        req: magnetar_proto::SubscribeRequest,
+        _deadline: &'a mut OperationDeadline,
+    ) -> SubscribeFut<'a, Self> {
+        self.subscribe(req)
+    }
 }
 
 /// Helper alias: `SubscribeApi::subscribe` future return type.
@@ -800,6 +898,22 @@ pub trait CreateProducerApi: 'static + Send + Sync {
         &self,
         req: magnetar_proto::CreateProducerRequest,
     ) -> OpenProducerFut<'_, Self>;
+
+    /// Create a provider-correct setup timer.
+    #[doc(hidden)]
+    fn new_producer_operation_deadline(&self) -> OperationDeadline {
+        OperationDeadline::never()
+    }
+
+    /// Deadline-aware producer-open used by built-in composite builders.
+    #[doc(hidden)]
+    fn open_producer_with_deadline<'a>(
+        &'a self,
+        req: magnetar_proto::CreateProducerRequest,
+        _deadline: &'a mut OperationDeadline,
+    ) -> OpenProducerFut<'a, Self> {
+        self.open_producer(req)
+    }
 }
 
 /// Helper alias: `CreateProducerApi::open_producer` future return type.

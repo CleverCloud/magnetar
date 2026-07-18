@@ -135,6 +135,19 @@ pub struct ConnectionShared {
     pub inner: Mutex<magnetar_proto::Connection>,
     /// Single-cell wakeup for the driver loop. Not a channel.
     pub driver_waker: Notify,
+    /// Dedicated wakeup for futures that drain handle-correlated events.
+    ///
+    /// This is separate from [`Self::driver_waker`] so event waiters cannot
+    /// consume outbound-work permits intended for the driver. The `Arc`
+    /// permits those futures to retain an owned, pre-armed notification across
+    /// polls, closing the registration gap around `notify_waiters()`.
+    pub(crate) event_waker: Arc<Notify>,
+    /// Pulsed when an opening producer/consumer is cancelled.
+    ///
+    /// Detached retry legs enroll before checking handle liveness, then stop
+    /// their sleep or intermediate lookup when the caller's deadline/drop
+    /// removes the handle.
+    pub(crate) operation_cancel_notify: Notify,
     /// Optional auth provider that the driver consults when the broker emits
     /// [`CommandAuthChallenge`](magnetar_proto::pb::CommandAuthChallenge).
     /// `None` means no in-band token refresh — the connection will drop if the
@@ -571,6 +584,8 @@ impl ConnectionShared {
         Arc::new(Self {
             inner: Mutex::new(conn),
             driver_waker: Notify::new(),
+            event_waker: Arc::new(Notify::new()),
+            operation_cancel_notify: Notify::new(),
             auth_provider,
             topic_list_changes: Mutex::new(std::collections::VecDeque::new()),
             topic_list_notify: Notify::new(),

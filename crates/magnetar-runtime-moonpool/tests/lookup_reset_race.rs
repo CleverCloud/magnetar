@@ -359,6 +359,47 @@ async fn lookup_severed_by_reconnect_reissues_and_succeeds() {
     if let Some(d) = client.take_driver() {
         d.abort();
     }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stalled-reconnect broker bind");
+    let stalled_addr = listener.local_addr().expect("stalled listener addr");
+    let stalled_lookups = Arc::new(AtomicU32::new(0));
+    tokio::spawn(async move {
+        let Ok((first, _peer)) = listener.accept().await else {
+            return;
+        };
+        let _ = handle_lookup_flap_session(first, stalled_lookups, 1).await;
+        let Ok((_second, _peer)) = listener.accept().await else {
+            return;
+        };
+        tokio::time::sleep(HANG_GUARD).await;
+    });
+
+    let config = ConnectionConfig {
+        operation_timeout: Duration::from_millis(50),
+        supervisor: Some(supervisor(Some(32))),
+        ..ConnectionConfig::default()
+    };
+    let client =
+        Client::connect_plain_supervised(&engine, &stalled_addr.to_string(), config, None, None)
+            .await
+            .expect("initial stalled-reconnect session must connect");
+    let error = client
+        .lookup_topic(
+            "persistent://public/default/lookup-reconnect-deadline",
+            false,
+        )
+        .await
+        .expect_err("stalled reconnect must be bounded by operation_timeout");
+    assert!(
+        matches!(error, ClientError::Other(ref message)
+            if message == "topic lookup exceeded operation_timeout"),
+        "unexpected reconnect deadline error: {error:?}"
+    );
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
 }
 
 /// (ii) Moonpool twin: a TERMINAL `SessionLost` — supervisor gives up
@@ -384,10 +425,7 @@ async fn terminal_session_lost_surfaces_peer_closed_without_spin() {
 
     let res = tokio::time::timeout(
         HANG_GUARD,
-        client.open_producer(CreateProducerRequest {
-            topic: "persistent://public/default/lookup-retry-terminal".to_owned(),
-            ..Default::default()
-        }),
+        client.lookup_topic("persistent://public/default/lookup-retry-terminal", false),
     )
     .await
     .expect("a terminal SessionLost must surface PeerClosed PROMPTLY, not hang or spin");

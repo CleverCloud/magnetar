@@ -260,6 +260,55 @@ fn handle_full_frame(
                 let _ = encode_command(out, &cmd);
             }
         }
+        pb::base_command::Type::WatchTopicList => {
+            if let Some(watch) = &frame.command.watch_topic_list {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::WatchTopicListSuccess as i32,
+                    watch_topic_list_success: Some(pb::CommandWatchTopicListSuccess {
+                        request_id: watch.request_id,
+                        watcher_id: watch.watcher_id,
+                        topic: vec!["persistent://public/default/watched".to_owned()],
+                        topics_hash: "coverage-close-hash".to_owned(),
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
+        pb::base_command::Type::AddPartitionToTxn => {
+            if let Some(add) = &frame.command.add_partition_to_txn {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::AddPartitionToTxnResponse as i32,
+                    add_partition_to_txn_response: Some(pb::CommandAddPartitionToTxnResponse {
+                        request_id: add.request_id,
+                        txnid_least_bits: add.txnid_least_bits,
+                        txnid_most_bits: add.txnid_most_bits,
+                        error: None,
+                        message: None,
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
+        pb::base_command::Type::AddSubscriptionToTxn => {
+            if let Some(add) = &frame.command.add_subscription_to_txn {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::AddSubscriptionToTxnResponse as i32,
+                    add_subscription_to_txn_response: Some(
+                        pb::CommandAddSubscriptionToTxnResponse {
+                            request_id: add.request_id,
+                            txnid_least_bits: add.txnid_least_bits,
+                            txnid_most_bits: add.txnid_most_bits,
+                            error: None,
+                            message: None,
+                        },
+                    ),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
         _ => {}
     }
 }
@@ -663,6 +712,35 @@ async fn producer_and_consumer_close_complete() {
                 .await
                 .expect("consumer close did not time out")
                 .expect("consumer close ok");
+
+            let topics = tokio::time::timeout(
+                HANG_GUARD,
+                client.watch_topic_list("public/default", "watched-.*"),
+            )
+            .await
+            .expect("watch_topic_list did not time out")
+            .expect("watch_topic_list ok");
+            assert_eq!(topics, vec!["persistent://public/default/watched"]);
+
+            let txn = magnetar_proto::TxnId::new(0x33, 0x44);
+            tokio::time::timeout(
+                HANG_GUARD,
+                client.add_partition_to_txn(txn, "persistent://public/default/coverage-close-txn"),
+            )
+            .await
+            .expect("add_partition_to_txn did not time out")
+            .expect("add_partition_to_txn ok");
+            tokio::time::timeout(
+                HANG_GUARD,
+                client.add_subscription_to_txn(
+                    txn,
+                    "persistent://public/default/coverage-close-txn",
+                    "coverage-close-subscription",
+                ),
+            )
+            .await
+            .expect("add_subscription_to_txn did not time out")
+            .expect("add_subscription_to_txn ok");
             client.close().await;
         })
         .await;

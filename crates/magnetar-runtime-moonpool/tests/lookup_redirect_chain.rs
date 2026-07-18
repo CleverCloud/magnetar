@@ -24,11 +24,12 @@
 #![allow(clippy::similar_names)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    ConnectionConfig, CreateProducerRequest, FrameError, SupervisorConfig, decode_one,
-    encode_command, pb,
+    ConnectionConfig, CreateProducerRequest, FrameError, OperationRetryConfig, SupervisorConfig,
+    decode_one, encode_command, pb,
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::TokioProviders;
@@ -59,6 +60,9 @@ enum LookupBehaviour {
     /// Answer `Redirect` (advertising `redirect_url`) for the first `count`
     /// lookups, then resolve to self.
     RedirectTo { redirect_url: String, count: u8 },
+    /// Reject the first lookup with a retryable broker error, then redirect
+    /// the retry to another physical broker.
+    RetryableThenRedirect { redirect_url: String },
     /// Always answer `Connect` resolving to self (no advertised URL → the
     /// engine routes onto this connection via `landed_on`).
     ConnectToSelf,
@@ -108,8 +112,10 @@ async fn handle_session(
     let mut out_buf = BytesMut::with_capacity(8 * 1024);
     let mut redirects_left = match &behaviour {
         LookupBehaviour::RedirectTo { count, .. } => *count,
-        LookupBehaviour::ConnectToSelf => 0,
+        LookupBehaviour::RetryableThenRedirect { .. } | LookupBehaviour::ConnectToSelf => 0,
     };
+    let mut retryable_lookup_pending =
+        matches!(behaviour, LookupBehaviour::RetryableThenRedirect { .. });
     loop {
         loop {
             let mut framed = read_buf.clone().freeze();
@@ -132,6 +138,7 @@ async fn handle_session(
                 session_idx,
                 &behaviour,
                 &mut redirects_left,
+                &mut retryable_lookup_pending,
             );
         }
 
@@ -156,6 +163,7 @@ fn handle_frame(
     session_idx: usize,
     behaviour: &LookupBehaviour,
     redirects_left: &mut u8,
+    retryable_lookup_pending: &mut bool,
 ) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
@@ -187,6 +195,27 @@ fn handle_frame(
                 sessions.lock()[session_idx]
                     .lookup_request_ids
                     .push(l.request_id);
+                if *retryable_lookup_pending {
+                    *retryable_lookup_pending = false;
+                    let cmd = pb::BaseCommand {
+                        r#type: pb::base_command::Type::LookupResponse as i32,
+                        lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                            broker_service_url: None,
+                            broker_service_url_tls: None,
+                            response: Some(
+                                pb::command_lookup_topic_response::LookupType::Failed as i32,
+                            ),
+                            request_id: l.request_id,
+                            authoritative: Some(true),
+                            error: Some(pb::ServerError::ServiceNotReady as i32),
+                            message: Some("owner is moving; retry lookup".to_owned()),
+                            proxy_through_service_url: Some(false),
+                        }),
+                        ..Default::default()
+                    };
+                    let _ = encode_command(out, &cmd);
+                    return;
+                }
                 let (response_kind, broker_url) = match behaviour {
                     LookupBehaviour::RedirectTo { redirect_url, .. } if *redirects_left > 0 => {
                         *redirects_left -= 1;
@@ -195,6 +224,10 @@ fn handle_frame(
                             Some(redirect_url.to_owned()),
                         )
                     }
+                    LookupBehaviour::RetryableThenRedirect { redirect_url } => (
+                        pb::command_lookup_topic_response::LookupType::Redirect,
+                        Some(redirect_url.to_owned()),
+                    ),
                     LookupBehaviour::RedirectTo { .. } | LookupBehaviour::ConnectToSelf => {
                         (pb::command_lookup_topic_response::LookupType::Connect, None)
                     }
@@ -339,6 +372,73 @@ async fn lookup_redirect_dials_target_broker_and_re_lookups_there() {
                  target); frames {:?}",
                 session_b.frames
             );
+
+            // A retryable lookup error recovered before a redirect must remain
+            // the operation-wide diagnostic if the target handshake later
+            // reaches the deadline. `close()` cancels and joins the Pending
+            // pool dial, so the silent target observes EOF before teardown
+            // returns.
+            let (silent_hostport, silent_listener) = bind_broker().await;
+            let silent_accepted = Arc::new(tokio::sync::Notify::new());
+            let silent_accepted_task = Arc::clone(&silent_accepted);
+            let silent_eof = Arc::new(tokio::sync::Notify::new());
+            let silent_eof_task = Arc::clone(&silent_eof);
+            tokio::spawn(async move {
+                let Ok((mut stream, _peer)) = silent_listener.accept().await else {
+                    return;
+                };
+                silent_accepted_task.notify_one();
+                let mut buf = [0_u8; 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            silent_eof_task.notify_one();
+                            return;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            });
+            let (redirect_hostport, redirect_listener) = bind_broker().await;
+            let _redirect_sessions = serve_broker(
+                redirect_listener,
+                LookupBehaviour::RetryableThenRedirect {
+                    redirect_url: format!("pulsar://{silent_hostport}"),
+                },
+            );
+            let config = ConnectionConfig {
+                operation_timeout: Duration::from_millis(500),
+                ..supervised_config()
+            };
+            let client =
+                Client::connect_plain_supervised(&engine, &redirect_hostport, config, None, None)
+                    .await
+                    .expect("retry bootstrap connect")
+                    .with_operation_retry(OperationRetryConfig {
+                        initial_backoff: Duration::from_millis(1),
+                        max_backoff: Duration::from_millis(1),
+                        max_retries: Some(2),
+                    });
+            let error = client
+                .open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/retry-redirect-deadline".to_owned(),
+                    ..Default::default()
+                })
+                .await
+                .expect_err("silent redirect target must reach the operation deadline");
+            assert!(
+                matches!(error, magnetar_runtime_moonpool::ClientError::Broker { code, ref message }
+                    if code == pb::ServerError::ServiceNotReady as i32
+                        && message == "owner is moving; retry lookup"),
+                "later target timeout must preserve the earlier broker error, got {error:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(1), silent_accepted.notified())
+                .await
+                .expect("Moonpool regression must reach the silent redirect target");
+            client.close().await;
+            tokio::time::timeout(Duration::from_secs(1), silent_eof.notified())
+                .await
+                .expect("closed Moonpool Pending dial must close the silent target socket");
         })
         .await;
 }

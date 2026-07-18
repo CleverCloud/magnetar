@@ -35,7 +35,7 @@ use bytes::Bytes;
 
 use crate::error::ProducerError;
 use crate::pb;
-use crate::types::{CompressionKind, MessageId, ProducerHandle, SequenceId};
+use crate::types::{CompressionKind, MessageId, ProducerHandle, RequestId, SequenceId};
 
 /// Latency-histogram constructor shared by [`ProducerState`] and `ConsumerState`.
 ///
@@ -202,8 +202,15 @@ pub struct ProducerState {
     /// `resendMessages`, which only re-issues pending messages after the
     /// broker confirms the attachment.
     pub broker_ready: bool,
-    /// Number of consecutive transient `CommandProducer` rejections
-    /// (`ServiceNotReady`, `MetadataError`, `TopicNotFound`) the broker has
+    /// Whether this producer has completed at least one broker attachment.
+    /// Retryable failures before the first success return to the routing-aware
+    /// client operation; failures after it are connection-local reattachment.
+    pub(crate) has_ever_attached: bool,
+    /// Active `CommandProducer` wire request for this handle. Retry and
+    /// reconnect replace it; replies and delayed retry legs from an older
+    /// request id are ignored.
+    pub(crate) open_request_id: Option<RequestId>,
+    /// Number of consecutive retryable `CommandProducer` rejections
     /// returned for this producer since the last success. Bumped by the
     /// [`crate::Connection`] error handler on each transient open failure;
     /// reset to `0` when the re-attach is acked (`CommandProducerSuccess`).
@@ -211,9 +218,12 @@ pub struct ProducerState {
     /// [`crate::Connection::producer_transient_open_attempts`] to size their
     /// exponential-backoff sleep before the next lookup + retry, and the proto
     /// layer surfaces a terminal `ProducerOpenFailed` once it crosses
-    /// [`crate::conn::MAX_TRANSIENT_OPEN_RETRIES`] (issue #302 — a one-shot
-    /// retry that gave up forever stranded `send()` PENDING with no error).
+    /// [`crate::OperationRetryConfig::max_retries`] (issue #302 / ADR-0080).
     pub transient_open_attempts: u32,
+    /// Last retryable broker rejection observed while this producer is
+    /// opening. Runtime deadlines surface it instead of replacing useful
+    /// broker diagnostics with a synthetic timeout.
+    pub(crate) last_open_error: Option<(i32, String)>,
     /// Cumulative count of logical messages handed to the wire (sum of `num_messages` per
     /// emitted SEND, including each chunk of a chunked publish). Mirrors Java
     /// `ProducerStats#getTotalMsgsSent`.
@@ -529,7 +539,10 @@ impl ProducerState {
             outbound: VecDeque::new(),
             closed: false,
             broker_ready: false,
+            has_ever_attached: false,
+            open_request_id: None,
             transient_open_attempts: 0,
+            last_open_error: None,
             total_msgs_sent: 0,
             total_bytes_sent: 0,
             total_send_failed: 0,

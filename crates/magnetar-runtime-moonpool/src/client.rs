@@ -39,6 +39,35 @@ use crate::{
     sleep_provider_from_time, tokio_sleep_provider,
 };
 
+pub(crate) type OperationDeadline<'a> = Pin<&'a mut (dyn Future<Output = ()> + Send)>;
+
+#[derive(Default)]
+struct LookupRetryState {
+    broker_failures: u32,
+}
+
+#[derive(Clone, Copy)]
+enum LookupIssue {
+    Initial { authoritative: bool },
+    Redirect { authoritative: bool, hops: u8 },
+}
+
+pub(crate) fn operation_deadline_error(
+    operation: &str,
+    last_broker_error: Option<(i32, String)>,
+) -> ClientError {
+    match last_broker_error {
+        Some((code, message)) => ClientError::Broker { code, message },
+        None => ClientError::Other(format!("{operation} exceeded operation_timeout")),
+    }
+}
+
+pub(crate) fn operation_deadline_expired(mut deadline: OperationDeadline<'_>) -> bool {
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    deadline.as_mut().poll(&mut cx).is_ready()
+}
+
 /// Engine-layer error surfaced by [`Client`]. Wraps [`EngineError`] with a
 /// dedicated `Broker` variant for request-correlated server errors so the
 /// surface matches the tokio engine's `ClientError`.
@@ -90,7 +119,7 @@ pub enum ClientError {
 /// Re-export of [`magnetar_proto::event::LookupOutcome`]. This raw accessor
 /// surfaces the terminal outcome on the bootstrap connection — `Connect`,
 /// `Redirected`, or `Failed`. A `Redirected` is a driveable outcome: the
-/// engine path `Client::lookup_topic_target` dials the redirect target
+/// engine path `Client::lookup_topic_target_with_operation_deadline` dials the redirect target
 /// broker and re-issues the lookup there (ADR-0039). Callers that drive the
 /// dial themselves consume the `Redirected` directly.
 pub type LookupTopicResult = LookupOutcome;
@@ -134,11 +163,11 @@ pub struct Client<P: Providers> {
     _providers: std::marker::PhantomData<fn() -> P>,
 }
 
-/// Decision returned by [`Client::lookup_topic_target`] driving where the data ops for the
-/// resolved topic should ride (ADR-0039). Mirror of the tokio engine's `LookupTarget` — the
-/// moonpool [`Client::lookup_topic`] accessor still returns the raw `LookupOutcome` so existing
-/// callers keep their full proto view; runtime code (producer / consumer open paths) uses
-/// this routing-decision enum instead.
+/// Decision returned by [`Client::lookup_topic_target_with_operation_deadline`] driving where the
+/// data ops for the resolved topic should ride (ADR-0039). Mirror of the tokio engine's
+/// `LookupTarget` — the moonpool [`Client::lookup_topic`] accessor still returns the raw
+/// `LookupOutcome` so existing callers keep their full proto view; runtime code (producer /
+/// consumer open paths) uses this routing-decision enum instead.
 ///
 /// Both routing shapes ride through the moonpool [`ProxyConnectionPool`] (see
 /// [`Client::resolve_target`]). ADR-0039 §"Multi-broker DIRECT routing (2026-06-01)" documents
@@ -259,6 +288,7 @@ impl<P: Providers> Client<P> {
         let factory = crate::pool::ConnectionFactory {
             addr: addr.to_owned(),
             bootstrap_config: config,
+            operation_retry: Arc::new(Mutex::new(magnetar_proto::OperationRetryConfig::default())),
             providers: engine.providers().clone(),
             service_url_provider,
             dns_resolver,
@@ -327,6 +357,30 @@ impl<P: Providers> Client<P> {
         self.sleep_provider.clone()
     }
 
+    /// Apply a broker-operation retry policy to the bootstrap and every future
+    /// pooled connection.
+    #[must_use]
+    pub fn with_operation_retry(self, config: magnetar_proto::OperationRetryConfig) -> Self {
+        self.shared
+            .inner
+            .lock()
+            .set_operation_retry_config(config.clone());
+        if let Some(pool) = &self.pool {
+            pool.set_operation_retry_config(config);
+        }
+        self
+    }
+
+    /// Create one provider-backed timer for a caller-visible setup operation.
+    #[doc(hidden)]
+    pub fn operation_timer(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let timeout = self.shared.inner.lock().operation_timeout();
+        let sleep = (self.sleep_provider)(timeout);
+        Box::pin(async move {
+            let _ = sleep.await;
+        })
+    }
+
     /// `true` while the underlying broker connection is in
     /// [`magnetar_proto::HandshakeState::Connected`]. Mirrors Java
     /// `Producer/Consumer#isConnected` at the connection scope — the moonpool
@@ -390,21 +444,46 @@ impl<P: Providers> Client<P> {
     /// When the terminal `Connect` advertises `proxy_through_service_url =
     /// true`, the data ops ride a pinned per-broker pool entry; otherwise the
     /// resolved broker is the data plane.
-    pub(crate) async fn lookup_topic_target(
+    pub(crate) async fn lookup_topic_target_with_operation_deadline(
         &self,
         topic: &str,
+        mut deadline: OperationDeadline<'_>,
+        last_broker_error: &mut Option<(i32, String)>,
     ) -> Result<(LookupTarget, Arc<ConnectionShared>), ClientError>
     where
         P: Send + Sync,
     {
         let mut current = self.shared.clone();
         let mut next_hop: Option<(bool, u8)> = None;
+        let mut retry_state = LookupRetryState::default();
         loop {
             let outcome = match next_hop {
-                None => self.issue_lookup_on(&current, topic, false, None).await?,
+                None => {
+                    self.issue_lookup_on(
+                        &current,
+                        topic,
+                        LookupIssue::Initial {
+                            authoritative: false,
+                        },
+                        deadline.as_mut(),
+                        &mut retry_state,
+                        last_broker_error,
+                    )
+                    .await?
+                }
                 Some((authoritative, hops)) => {
-                    self.issue_lookup_on(&current, topic, authoritative, Some(hops))
-                        .await?
+                    self.issue_lookup_on(
+                        &current,
+                        topic,
+                        LookupIssue::Redirect {
+                            authoritative,
+                            hops,
+                        },
+                        deadline.as_mut(),
+                        &mut retry_state,
+                        last_broker_error,
+                    )
+                    .await?
                 }
             };
 
@@ -431,9 +510,10 @@ impl<P: Providers> Client<P> {
                         // Lookup-driven reconnects on the moonpool engine ride the plaintext
                         // bootstrap pipe even when both URLs are advertised — TLS routing on the
                         // pinned per-broker pool is wired through the engine's `connect_tls`
-                        // entry, not through `lookup_topic_target`. Prefer the plain
-                        // `broker_service_url` here for that reason. The advertised value is
-                        // normalised to `host:port` via [`proxy_broker_authority`] so the wire
+                        // entry, not through `lookup_topic_target_with_operation_deadline`. Prefer
+                        // the plain `broker_service_url` here for that
+                        // reason. The advertised value is normalised to
+                        // `host:port` via [`proxy_broker_authority`] so the wire
                         // bytes match the tokio engine (ADR-0039).
                         let raw = broker_service_url.or(broker_service_url_tls).ok_or_else(|| {
                             ClientError::Other(format!(
@@ -487,7 +567,16 @@ impl<P: Providers> Client<P> {
                     // bootstrap on a host:port match, else pins a pool entry. This is a
                     // control-plane lookup dial, so it pins the primary connection (index 0) —
                     // lookups never consume a `connections_per_broker` fan-out slot (ADR-0073).
-                    current = self.resolve_direct_broker(&raw, topic, 0).await?;
+                    current = moonpool_core::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "lookup redirect dial",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        result = self.resolve_direct_broker(&raw, topic, 0) => result?,
+                    };
                     next_hop = Some((authoritative, hops_remaining));
                 }
                 LookupOutcome::Failed { code, message } => {
@@ -680,7 +769,7 @@ impl<P: Providers> Client<P> {
     /// `authoritative` should be `false` for a fresh lookup. The returned
     /// [`LookupTopicResult`] is the terminal outcome on this connection — one
     /// of `Connect` / `Redirected` / `Failed`. On `Redirected` the engine
-    /// (via `Self::lookup_topic_target`) dials the redirect target and
+    /// (via `Self::lookup_topic_target_with_operation_deadline`) dials the redirect target and
     /// re-issues there; this raw accessor surfaces the `Redirected` as-is for
     /// callers that route the dial themselves.
     ///
@@ -695,8 +784,36 @@ impl<P: Providers> Client<P> {
         topic: &str,
         authoritative: bool,
     ) -> Result<LookupTopicResult, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.lookup_topic_with_operation_deadline(
+            topic,
+            authoritative,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware raw lookup seam.
+    #[doc(hidden)]
+    pub async fn lookup_topic_with_operation_deadline(
+        &self,
+        topic: &str,
+        authoritative: bool,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<LookupTopicResult, ClientError> {
+        let mut retry_state = LookupRetryState::default();
         let outcome = self
-            .issue_lookup_on(&self.shared, topic, authoritative, None)
+            .issue_lookup_on(
+                &self.shared,
+                topic,
+                LookupIssue::Initial { authoritative },
+                deadline.as_mut(),
+                &mut retry_state,
+                last_broker_error,
+            )
             .await?;
 
         match outcome {
@@ -725,8 +842,10 @@ impl<P: Providers> Client<P> {
         &self,
         shared: &Arc<ConnectionShared>,
         topic: &str,
-        authoritative: bool,
-        redirect_budget: Option<u8>,
+        issue: LookupIssue,
+        mut deadline: OperationDeadline<'_>,
+        retry_state: &mut LookupRetryState,
+        last_broker_error: &mut Option<(i32, String)>,
     ) -> Result<OpOutcome, ClientError> {
         // ADR-0059: fast-fail BEFORE registering the lookup
         // when the connection is already terminal with no driver to recover it
@@ -739,23 +858,50 @@ impl<P: Providers> Client<P> {
         // until the connection is live again (or terminal), then re-issue. The
         // budget is only spent on a real broker round-trip.
         let mut reissues_remaining = magnetar_proto::lookup::MAX_LOOKUP_SESSION_REISSUES;
+        let retry_config = shared.inner.lock().operation_retry_config().clone();
         loop {
             let request_id = {
+                if operation_deadline_expired(deadline.as_mut()) {
+                    return Err(operation_deadline_error(
+                        "topic lookup",
+                        last_broker_error.clone(),
+                    ));
+                }
                 let mut conn = shared.inner.lock();
-                match redirect_budget {
-                    None => conn.lookup(topic, authoritative),
-                    Some(hops) => conn.lookup_redirect(topic, authoritative, hops),
+                match issue {
+                    LookupIssue::Initial { authoritative } => conn.lookup(topic, authoritative),
+                    LookupIssue::Redirect {
+                        authoritative,
+                        hops,
+                    } => conn.lookup_redirect(topic, authoritative, hops),
                 }
             };
             shared.driver_waker.notify_one();
-            let outcome = RequestFut {
-                shared: shared.clone(),
-                request_id,
-            }
-            .await;
+            let request = RequestFut::cancellable(shared.clone(), request_id);
+            tokio::pin!(request);
+            let outcome = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "topic lookup",
+                        last_broker_error.clone(),
+                    ));
+                }
+                outcome = request.as_mut() => outcome,
+            };
 
             if matches!(outcome, OpOutcome::SessionLost { .. }) {
-                match shared.await_reconnect_or_terminal().await {
+                let readiness = moonpool_core::select! {
+                    biased;
+                    () = deadline.as_mut() => {
+                        return Err(operation_deadline_error(
+                            "topic lookup",
+                            last_broker_error.clone(),
+                        ));
+                    }
+                    readiness = shared.await_reconnect_or_terminal() => readiness,
+                };
+                match readiness {
                     crate::LookupReissueReadiness::Reconnected => {
                         if reissues_remaining == 0 {
                             tracing::warn!(
@@ -779,6 +925,41 @@ impl<P: Providers> Client<P> {
                 }
             }
 
+            if let OpOutcome::LookupResponse {
+                outcome: LookupOutcome::Failed { code, .. },
+                ..
+            } = &outcome
+                && magnetar_proto::is_retryable_broker_error(
+                    magnetar_proto::OperationKind::Lookup,
+                    *code,
+                )
+            {
+                if let OpOutcome::LookupResponse {
+                    outcome: LookupOutcome::Failed { code, message },
+                    ..
+                } = &outcome
+                {
+                    *last_broker_error = Some((*code, message.clone()));
+                }
+                retry_state.broker_failures = retry_state.broker_failures.saturating_add(1);
+                if retry_config.should_retry_after_failure(retry_state.broker_failures) {
+                    let mut sleep = (self.sleep_provider)(
+                        retry_config.delay_after_failure(retry_state.broker_failures),
+                    );
+                    moonpool_core::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "topic lookup",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        _ = sleep.as_mut() => {}
+                    }
+                    continue;
+                }
+            }
+
             return Ok(outcome);
         }
     }
@@ -791,31 +972,95 @@ impl<P: Providers> Client<P> {
     /// - [`ClientError::Broker`] when the broker rejects the request.
     /// - [`ClientError::Other`] when an unexpected outcome arrives on this request id.
     pub async fn partitioned_topic_metadata(&self, topic: &str) -> Result<u32, ClientError> {
-        let request_id = {
-            let mut conn = self.shared.inner.lock();
-            conn.get_partitioned_topic_metadata(topic)
-        };
-        self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
-        match outcome {
-            OpOutcome::PartitionedMetadata {
-                partitions, error, ..
-            } => {
-                if let Some((code, message)) = error {
-                    Err(ClientError::Broker { code, message })
-                } else {
-                    Ok(partitions)
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.partitioned_topic_metadata_with_operation_deadline(
+            topic,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware partition-metadata seam used by the engine-generic façade.
+    #[doc(hidden)]
+    pub async fn partitioned_topic_metadata_with_operation_deadline(
+        &self,
+        topic: &str,
+        mut deadline: Pin<&mut (dyn Future<Output = ()> + Send)>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<u32, ClientError> {
+        let retry_config = self.shared.inner.lock().operation_retry_config().clone();
+        let mut broker_failures = 0_u32;
+        loop {
+            let request_id = {
+                if operation_deadline_expired(deadline.as_mut()) {
+                    return Err(operation_deadline_error(
+                        "partitioned topic metadata",
+                        last_broker_error.clone(),
+                    ));
+                }
+                let mut conn = self.shared.inner.lock();
+                conn.get_partitioned_topic_metadata(topic)
+            };
+            self.shared.driver_waker.notify_one();
+            let request = RequestFut::cancellable(self.shared.clone(), request_id);
+            tokio::pin!(request);
+            let outcome = moonpool_core::select! {
+                biased;
+                () = deadline.as_mut() => {
+                    return Err(operation_deadline_error(
+                        "partitioned topic metadata",
+                        last_broker_error.clone(),
+                    ));
+                }
+                outcome = request.as_mut() => outcome,
+            };
+            if let OpOutcome::PartitionedMetadata {
+                error: Some((code, message)),
+                ..
+            } = &outcome
+                && magnetar_proto::is_retryable_broker_error(
+                    magnetar_proto::OperationKind::PartitionedMetadata,
+                    *code,
+                )
+            {
+                *last_broker_error = Some((*code, message.clone()));
+                broker_failures = broker_failures.saturating_add(1);
+                if retry_config.should_retry_after_failure(broker_failures) {
+                    let mut sleep =
+                        (self.sleep_provider)(retry_config.delay_after_failure(broker_failures));
+                    moonpool_core::select! {
+                        biased;
+                        () = deadline.as_mut() => {
+                            return Err(operation_deadline_error(
+                                "partitioned topic metadata",
+                                last_broker_error.clone(),
+                            ));
+                        }
+                        _ = sleep.as_mut() => {}
+                    }
+                    continue;
                 }
             }
-            OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
-            OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
-            other => Err(ClientError::Other(format!(
-                "unexpected partitioned metadata outcome: {other:?}"
-            ))),
+            return match outcome {
+                OpOutcome::PartitionedMetadata {
+                    partitions, error, ..
+                } => {
+                    if let Some((code, message)) = error {
+                        Err(ClientError::Broker { code, message })
+                    } else {
+                        Ok(partitions)
+                    }
+                }
+                OpOutcome::Error { code, message, .. } => {
+                    Err(ClientError::Broker { code, message })
+                }
+                OpOutcome::Terminal { .. } => Err(ClientError::PeerClosed),
+                other => Err(ClientError::Other(format!(
+                    "unexpected partitioned metadata outcome: {other:?}"
+                ))),
+            };
         }
     }
 
@@ -831,16 +1076,50 @@ impl<P: Providers> Client<P> {
         namespace: &str,
         pattern: &str,
     ) -> Result<Vec<String>, ClientError> {
+        let mut deadline = self.operation_timer();
+        let mut last_broker_error = None;
+        self.watch_topic_list_with_operation_deadline(
+            namespace,
+            pattern,
+            deadline.as_mut(),
+            &mut last_broker_error,
+        )
+        .await
+    }
+
+    /// Deadline-aware topic-list snapshot seam used by the engine-generic
+    /// pattern-consumer builder.
+    #[doc(hidden)]
+    pub async fn watch_topic_list_with_operation_deadline(
+        &self,
+        namespace: &str,
+        pattern: &str,
+        mut deadline: OperationDeadline<'_>,
+        last_broker_error: &mut Option<(i32, String)>,
+    ) -> Result<Vec<String>, ClientError> {
+        if operation_deadline_expired(deadline.as_mut()) {
+            return Err(operation_deadline_error(
+                "topic-list snapshot",
+                last_broker_error.clone(),
+            ));
+        }
         let request_id = {
             let mut conn = self.shared.inner.lock();
             conn.watch_topic_list(namespace, pattern)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let request = RequestFut::cancellable(self.shared.clone(), request_id);
+        tokio::pin!(request);
+        let outcome = moonpool_core::select! {
+            biased;
+            () = deadline.as_mut() => {
+                return Err(operation_deadline_error(
+                    "topic-list snapshot",
+                    last_broker_error.clone(),
+                ));
+            }
+            outcome = request.as_mut() => outcome,
+        };
         match outcome {
             OpOutcome::TopicListSnapshot { topics, .. } => Ok(topics),
             OpOutcome::Error { code, message, .. } => Err(ClientError::Broker { code, message }),
@@ -1053,11 +1332,7 @@ impl<P: Providers> Client<P> {
             conn.new_txn(timeout)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             OpOutcome::NewTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("new_txn: {err}")))
@@ -1086,11 +1361,7 @@ impl<P: Providers> Client<P> {
             conn.add_partition_to_txn(txn, topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             OpOutcome::AddPartitionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_partition_to_txn: {err}")))
@@ -1125,11 +1396,7 @@ impl<P: Providers> Client<P> {
             conn.add_subscription_to_txn(txn, subscription.into(), topic.into())
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             OpOutcome::AddSubscriptionToTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("add_subscription_to_txn: {err}")))
@@ -1159,11 +1426,7 @@ impl<P: Providers> Client<P> {
             conn.end_txn(txn, action)
         };
         self.shared.driver_waker.notify_one();
-        let outcome = RequestFut {
-            shared: self.shared.clone(),
-            request_id,
-        }
-        .await;
+        let outcome = RequestFut::new(self.shared.clone(), request_id).await;
         match outcome {
             OpOutcome::EndTxn { result, .. } => {
                 result.map_err(|err| ClientError::Other(format!("end_txn: {err}")))
@@ -1185,6 +1448,25 @@ impl<P: Providers> Client<P> {
 struct RequestFut {
     shared: Arc<ConnectionShared>,
     request_id: RequestId,
+    cancel_on_drop: bool,
+}
+
+impl RequestFut {
+    fn new(shared: Arc<ConnectionShared>, request_id: RequestId) -> Self {
+        Self {
+            shared,
+            request_id,
+            cancel_on_drop: false,
+        }
+    }
+
+    fn cancellable(shared: Arc<ConnectionShared>, request_id: RequestId) -> Self {
+        Self {
+            shared,
+            request_id,
+            cancel_on_drop: true,
+        }
+    }
 }
 
 impl Future for RequestFut {
@@ -1209,8 +1491,12 @@ impl Drop for RequestFut {
     /// [`magnetar_runtime_tokio::client::RequestFut::drop`].
     /// Lookup multi-agent review MEDIUM-4; ADR-0024 four-layer parity.
     fn drop(&mut self) {
-        let key = PendingOpKey::Request(self.request_id);
-        self.shared.inner.lock().unregister_waker(key);
+        if self.cancel_on_drop {
+            self.shared.inner.lock().cancel_request(self.request_id);
+        } else {
+            let key = PendingOpKey::Request(self.request_id);
+            self.shared.inner.lock().unregister_waker(key);
+        }
     }
 }
 
@@ -1223,8 +1509,9 @@ impl Drop for RequestFut {
 ///
 /// Mirrors `magnetar_runtime_tokio::client::preferred_broker_url`. The two engines
 /// pick their preferred URL differently — moonpool prefers `broker_service_url` so
-/// it can keep riding the plaintext bootstrap pipe (see [`Client::lookup_topic_target`])
-/// — but the scheme-strip step is identical.
+/// it can keep riding the plaintext bootstrap pipe (see
+/// [`Client::lookup_topic_target_with_operation_deadline`]) — but the scheme-strip step is
+/// identical.
 fn proxy_broker_authority(input: &str) -> String {
     let (rest, default_port) = if let Some(rest) = input.strip_prefix("pulsar+ssl://") {
         (rest, Some(6651u16))
@@ -1265,12 +1552,20 @@ fn direct_broker_authority(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::future::Future as _;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::Context;
+    use std::time::{Duration, Instant};
 
-    use magnetar_proto::ConnectionConfig;
+    use bytes::BytesMut;
+    use magnetar_proto::{ConnectionConfig, encode_command, pb};
     use moonpool_core::TokioProviders;
+    use parking_lot::Mutex;
 
-    use super::{Client, ClientError, LookupTopicResult, proxy_broker_authority};
+    use super::{
+        Client, ClientError, LookupIssue, LookupRetryState, LookupTopicResult,
+        proxy_broker_authority,
+    };
     use crate::{ConnectionShared, MoonpoolEngine, TopicListChange};
 
     /// `Client::connect_plain` is generic over `P: Providers` — name it to
@@ -1286,13 +1581,71 @@ mod tests {
 
     /// `LookupTopicResult` is the re-exported `LookupOutcome`. Smoke test the
     /// alias by constructing a `Connect` variant.
-    #[test]
-    fn lookup_topic_result_alias_constructs() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lookup_topic_result_alias_constructs() {
         let _: LookupTopicResult = LookupTopicResult::Connect {
             broker_service_url: Some("pulsar://broker:6650".to_owned()),
             broker_service_url_tls: None,
             proxy_through_service_url: false,
         };
+
+        // Deterministically drive the terminal half of the SessionLost
+        // re-issue decision. The first poll registers a real lookup; reset
+        // publishes SessionLost, then the supervisor give-up state makes the
+        // readiness waiter choose Terminal instead of re-issuing.
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        {
+            let connected = pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "magnetar-test".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            };
+            let mut frame = BytesMut::new();
+            encode_command(&mut frame, &connected).expect("encode CommandConnected");
+            let mut conn = shared.inner.lock();
+            conn.begin_handshake().expect("begin handshake");
+            conn.handle_bytes(Instant::now(), &frame)
+                .expect("complete handshake");
+        }
+        let client: Client<TokioProviders> = Client {
+            shared: shared.clone(),
+            driver: Mutex::new(None),
+            pool: None,
+            connections_per_broker: 1,
+            connection_rr: AtomicUsize::new(0),
+            sleep_provider: crate::tokio_sleep_provider(),
+            _providers: std::marker::PhantomData,
+        };
+        let mut deadline = Box::pin(std::future::pending::<()>());
+        let mut retry_state = LookupRetryState::default();
+        let mut last_broker_error = None;
+        let mut lookup = Box::pin(client.issue_lookup_on(
+            &shared,
+            "persistent://public/default/terminal-session-lost",
+            LookupIssue::Initial {
+                authoritative: false,
+            },
+            deadline.as_mut(),
+            &mut retry_state,
+            &mut last_broker_error,
+        ));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(lookup.as_mut().poll(&mut cx).is_pending());
+        {
+            let mut conn = shared.inner.lock();
+            conn.reset();
+            conn.mark_disconnected();
+            conn.fail_all_pending("supervisor retry budget exhausted");
+        }
+        shared.mark_no_driver();
+        shared.driver_waker.notify_waiters();
+        assert!(matches!(lookup.await, Err(ClientError::PeerClosed)));
     }
 
     /// `ClientError::Engine` wraps `EngineError` via `From`.

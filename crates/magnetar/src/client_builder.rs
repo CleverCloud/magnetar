@@ -29,6 +29,7 @@ pub struct ClientBuilder {
     client_version: Option<String>,
     keepalive: Option<Duration>,
     operation_timeout: Option<Duration>,
+    operation_retry: Option<magnetar_proto::OperationRetryConfig>,
     auth_method_name: Option<String>,
     auth_data: Option<bytes::Bytes>,
     auth_provider: Option<std::sync::Arc<dyn magnetar_proto::AuthProvider>>,
@@ -51,6 +52,7 @@ impl Default for ClientBuilder {
             client_version: None,
             keepalive: None,
             operation_timeout: None,
+            operation_retry: None,
             auth_method_name: None,
             auth_data: None,
             auth_provider: None,
@@ -168,10 +170,34 @@ impl ClientBuilder {
         self
     }
 
-    /// Set the operation timeout (lookup + send).
+    /// Set the total deadline for one broker-facing setup operation.
+    ///
+    /// The budget includes partition metadata, topic-list snapshots, lookup
+    /// and redirect routing, retry backoff, producer-open or subscribe
+    /// attachment, and every child of a composite builder. The operation
+    /// preserves the newest retryable broker diagnostic so a later deadline
+    /// returns it instead of a generic timeout.
     #[must_use]
     pub fn operation_timeout(mut self, dur: Duration) -> Self {
         self.operation_timeout = Some(dur);
+        self
+    }
+
+    /// Configure broker-operation retries independently from transport
+    /// reconnection.
+    ///
+    /// Applies to lookup, partition metadata, producer-open, and subscribe.
+    /// Producer-open additionally retries both producer-quota variants and
+    /// `ProducerBusy`; subscribe additionally retries `ConsumerBusy`.
+    /// Before first attachment, producer-open and subscribe retries re-run
+    /// lookup and routing with a fresh provisional handle. Established
+    /// reattachment remains driver-owned.
+    /// `max_retries` counts re-issues after the initial attempt; `None`
+    /// removes the count cap but the enclosing [`Self::operation_timeout`]
+    /// deadline still bounds the operation.
+    #[must_use]
+    pub fn operation_retry(mut self, config: magnetar_proto::OperationRetryConfig) -> Self {
+        self.operation_retry = Some(config);
         self
     }
 
@@ -312,6 +338,7 @@ impl ClientBuilder {
         // `ConnectionConfig`. Captured here (it is `Copy`) before `self` is moved
         // into the connect-flavour branches below.
         let connections_per_broker = self.connections_per_broker;
+        let operation_retry = self.operation_retry.clone();
         let mut config = magnetar_proto::conn::ConnectionConfig::default();
         if let Some(v) = self.client_version {
             config.client_version = v;
@@ -431,6 +458,10 @@ impl ClientBuilder {
         };
         // Java `ClientBuilder#connectionsPerBroker` — apply the fan-out to the
         // runtime client now that the bootstrap connection is up (ADR-0073, #314).
+        let inner = match operation_retry {
+            Some(config) => inner.with_operation_retry(config),
+            None => inner,
+        };
         let inner = match connections_per_broker {
             Some(n) => inner.with_connections_per_broker(n),
             None => inner,
@@ -445,7 +476,7 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use magnetar_proto::{AuthError, AuthProvider};
+    use magnetar_proto::{AuthError, AuthProvider, OperationRetryConfig};
 
     use super::ClientBuilder;
     use crate::PulsarError;
@@ -463,6 +494,21 @@ mod tests {
         fn initial(&self) -> Result<Bytes, AuthError> {
             Err(AuthError::Invalid("forced failure (test)".to_owned()))
         }
+    }
+
+    #[test]
+    fn operation_retry_builder_knob_stores_the_independent_policy() {
+        let policy = OperationRetryConfig {
+            initial_backoff: std::time::Duration::from_millis(25),
+            max_backoff: std::time::Duration::from_millis(200),
+            max_retries: Some(4),
+        };
+        let builder = ClientBuilder::default().operation_retry(policy.clone());
+        assert_eq!(builder.operation_retry, Some(policy));
+        assert!(
+            builder.supervisor.is_none(),
+            "operation retry must not implicitly enable transport reconnection"
+        );
     }
 
     /// BREAKING CHANGE regression (F6, CWE-287): `ClientBuilder::auth(...)`

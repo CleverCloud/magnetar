@@ -231,10 +231,15 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
         // `CommandPartitionedTopicMetadata` round-trip, the same cost the
         // Java client pays.
         let topic = self.req.topic.clone();
-        let partitions =
-            crate::BrokerMetadataApi::partitioned_topic_metadata(&self.client.inner, &topic)
-                .await
-                .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
+        let mut deadline =
+            crate::CreateProducerApi::new_producer_operation_deadline(&self.client.inner);
+        let partitions = crate::BrokerMetadataApi::partitioned_topic_metadata_with_deadline(
+            &self.client.inner,
+            &topic,
+            &mut deadline,
+        )
+        .await
+        .map_err(|err| PulsarError::Other(format!("partitioned_topic_metadata: {err}")))?;
         if partitions > 0 {
             return Err(PulsarError::Other(format!(
                 "topic `{topic}` is partitioned (broker reports {partitions} partitions); \
@@ -243,9 +248,13 @@ impl<'a, E: crate::Engine> ProducerBuilder<'a, E> {
                  NotAllowedError(22) \"Found partitioned metadata for non-partitioned topic\"."
             )));
         }
-        crate::CreateProducerApi::open_producer(&self.client.inner, self.req)
-            .await
-            .map_err(|err| PulsarError::Other(format!("open_producer: {err}")))
+        crate::CreateProducerApi::open_producer_with_deadline(
+            &self.client.inner,
+            self.req,
+            &mut deadline,
+        )
+        .await
+        .map_err(|err| PulsarError::Other(format!("open_producer: {err}")))
     }
 }
 
@@ -714,6 +723,18 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
     where
         E::ClientState: crate::SubscribeApi,
     {
+        let mut deadline =
+            crate::SubscribeApi::new_subscribe_operation_deadline(&self.client.inner);
+        self.subscribe_with_deadline(&mut deadline).await
+    }
+
+    pub(crate) async fn subscribe_with_deadline(
+        self,
+        deadline: &mut crate::OperationDeadline,
+    ) -> Result<<E::ClientState as crate::SubscribeApi>::Consumer, PulsarError>
+    where
+        E::ClientState: crate::SubscribeApi,
+    {
         if self.decryptor.is_some() {
             return Err(PulsarError::Other(
                 "ConsumerBuilder::subscribe() refuses a configured decryptor — \
@@ -723,7 +744,7 @@ impl<'a, E: crate::Engine> ConsumerBuilder<'a, E> {
                     .to_owned(),
             ));
         }
-        crate::SubscribeApi::subscribe(&self.client.inner, self.req)
+        crate::SubscribeApi::subscribe_with_deadline(&self.client.inner, self.req, deadline)
             .await
             .map_err(|err| PulsarError::Other(format!("subscribe: {err}")))
     }

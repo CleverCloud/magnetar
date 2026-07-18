@@ -647,27 +647,35 @@ The counter resets to 0 only when `should_reset_backoff(socket_alive)` is true (
 The default `max_attempts = None` keeps retrying forever (Java parity).
 On a successful dial the supervisor logs `"supervisor: TCP connected; handshaking"` at `info!`; the TRUE reconnect-success `info!` (`"supervisor: reconnected to broker; handshake complete, …"`) fires only after the handshake completes, so a TCP accept behind a down backend is never mislabelled as a reconnect.
 
-#### Transient-error retry (per-handle)
+#### Broker-operation retry: provisional setup and established reattachment
 
-Not every failed re-attach needs a full reset cycle.
-Pulsar's broker classifies a subset of `CommandError` codes as transient retry signals: `MetadataError` (1), `ServiceNotReady` (6), `TopicNotFound` (11) — the same set Java's `ProducerImpl.handleProducerCreationError` retries on.
-A common case is `NamespaceBundleNotServed`, emitted as `ServiceNotReady` with the text `"Please redo the lookup"`.
+ADR-0080 defines one configurable `OperationRetryConfig` for lookup, partition metadata, producer-open, and subscribe, independent from transport `SupervisorConfig`.
+All four operations retry `MetadataError`, `PersistenceError`, `ServiceNotReady`, and `TooManyRequests`.
+Producer-open additionally retries both producer-quota variants and `ProducerBusy`; subscribe additionally retries `ConsumerBusy`.
+`ProducerBusy` outside producer-open, `ConsumerBusy` outside subscribe, `TopicNotFound`, authentication and authorization failures, schema failures, fencing, termination, and unknown codes remain terminal. A common retryable case is `NamespaceBundleNotServed`, emitted as `ServiceNotReady` with the text `"Please redo the lookup"`.
 
-For these codes the supervisor:
+Retry ownership depends on whether the handle has ever attached:
 
-1. **Retains state.** `Connection::handle_command_error` emits `ProducerOpenFailedTransient` / `SubscribeFailedTransient` events; the producer / consumer state is NOT removed.
-   Permanent codes (e.g. `AuthorizationError`) still drop state and surface `ProducerOpenFailed` / `SubscribeFailed` to the user.
-2. **Looks up first, then retries.** The driver's `handle_pending_events` schedules a delayed `lookup_then(topic)` before `Connection::retry_producer_open(handle)` / `retry_consumer_subscribe(handle)`.
-   `lookup_then` issues a `CommandLookupTopic`, waits for the `CommandLookupTopicResponse` via a future bound to the existing `PendingOpKey::Request` slot, and only then signals the per-handle retry.
-   This is what re-acquires bundle ownership on the broker side.
-3. **Re-emits a single command.** `retry_producer_open` bumps the handle's `epoch`, emits a fresh `CommandProducer`, and calls `ProducerState::replay_pending_outbound` so any `OpSend`s enqueued during the transient window get their cached wire frames re-pushed onto outbound after the targeted re-attach.
-   `retry_consumer_subscribe` resumes from `last_acked_message_id` when one exists.
+1. **Provisional setup is client-owned and routing-aware.** Before the first `ProducerSuccess` or subscribe acknowledgement, `Connection::handle_command_error` removes the provisional handle and emits `ProducerOpenFailed` or `SubscribeFailed`.
+   The runtime client backs off, re-runs lookup and target resolution, and creates a fresh provisional handle on the resolved connection, so a redirect or ownership move can route the retry to a different broker.
+2. **Established reattachment is driver-owned and connection-local.** After a handle has attached at least once, a retryable reattachment failure retains its state and emits `ProducerOpenFailedTransient` or `SubscribeFailedTransient`.
+   The driver sleeps, runs `lookup_then(topic)`, and invokes `retry_producer_open_if_current(handle, failed_request_id)` or `retry_consumer_subscribe_if_current(handle, failed_request_id)` for that established handle; the failed request id makes a delayed retry a no-op when a newer reconnect rebuild or retry generation has already superseded it.
+   Producer and consumer retry lookup legs run only on a connected session and are awakened when their active request generation is replaced, so a blackholed lookup cannot outlive the generation that authorized it.
+   Producer sends remain staged until `ProducerSuccess`; consumer flow remains gated until the subscribe acknowledgement.
+   A driver-owned consumer reattachment acknowledgement updates durable attachment state and releases gated flow without emitting an unowned `SubscribeAcked` event.
+   Producer and consumer attachment state record the active wire `RequestId`; only that generation may accept a success or transient failure, terminalize the handle after lookup failure, or emit another retry.
+   A terminal broker error on the current established generation drains producer sends or marks the consumer terminal and wakes every parked operation before removing replay state.
+   Cancellation removes the request correlation, any landed outcome, and any queued success, failure, or broker-close attachment event; a later broker reply for that canceled request is ignored.
+   A user-owned subscribe or seek additionally keeps one stable logical waiter token while retry and reconnect replace its active wire `RequestId`; only the current active request can complete that token, so an older same-handle acknowledgement cannot satisfy the waiter or release flow.
+   Completion remains durable across reset but is consumed only on a connected rebuilt session, and dropping the waiter transfers the active or next rebuilt subscribe to flow ownership.
+3. **Retry budgets stay distinct.** Provisional attachment retries consume the caller operation's attachment counter and shared deadline.
+   Established lifecycle reattachment uses an independent per-handle counter under the same configured policy and does not consume the completed setup operation's count or deadline.
 
-Both engines run this leg.
-The tokio driver detaches it on `tokio::spawn` + `tokio::time::sleep`; the moonpool driver's non-generic `handle_pending_events` drains each transient event into a `RetryRequest` that the generic `driver_loop_inner` dispatches as a detached task through the engine's `TaskProvider`, with the pre-lookup delay sleeping on the injected `TimeProvider`.
-Routing the delay through the provider (never a host `tokio::time::sleep`) is load-bearing: under `SimProviders` the retry fires at a deterministic point in virtual time ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md)), and the detached-spawn shape matches the tokio engine so the two engines' `EventStream`s stay identical in order ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md)).
-
-The transient path is independent of the full Stage 2 reset cycle: it keeps the existing connection alive and only rebuilds the specific handle that errored.
+Tokio performs provisional and established retry sleeps on `tokio::time`.
+Moonpool routes both through the injected `TimeProvider`, preserving deterministic virtual-time behavior.
+One `OperationDeadline` context is allocated at the public setup entry and reborrowed across partition metadata, PIP-145 topic-list snapshots, lookup, redirect routing, retry sleeps, attachment, and every child of a composite builder.
+Every retryable broker response updates the same latest-error slot, including responses from an intermediate stage or an earlier composite child.
+If a later deadline fires, the runtime returns that newest broker code and message instead of replacing it with a generic timeout.
 
 #### Anti-thrash policy (opt-in, ADR-0028)
 

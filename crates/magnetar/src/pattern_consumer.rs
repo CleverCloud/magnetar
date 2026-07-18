@@ -816,6 +816,15 @@ where
     pub async fn subscribe(
         self,
     ) -> Result<PatternConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
+        let mut deadline =
+            crate::SubscribeApi::new_subscribe_operation_deadline(&self.client.inner);
+        self.subscribe_with_deadline(&mut deadline).await
+    }
+
+    async fn subscribe_with_deadline(
+        self,
+        deadline: &mut crate::OperationDeadline,
+    ) -> Result<PatternConsumer<<E::ClientState as SubscribeApi>::Consumer>, PulsarError> {
         let namespace = self
             .namespace
             .ok_or_else(|| PulsarError::Config("namespace is required".to_owned()))?;
@@ -856,14 +865,14 @@ where
 
         let topics = self
             .client
-            .topic_list_snapshot(&namespace, &pattern)
+            .topic_list_snapshot_with_deadline(&namespace, &pattern, deadline)
             .await?;
 
         let mut opened: Vec<NamedConsumer<<E::ClientState as SubscribeApi>::Consumer>> =
             Vec::with_capacity(topics.len());
         for topic in &topics {
             let builder = template.apply(self.client.consumer(topic.clone()));
-            match builder.subscribe().await {
+            match builder.subscribe_with_deadline(deadline).await {
                 Ok(c) => opened.push(NamedConsumer {
                     topic: topic.clone(),
                     consumer: c,
