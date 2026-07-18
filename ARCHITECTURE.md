@@ -439,8 +439,8 @@ The reconnect rebuild path (`Connection::rebuild_producers` / `rebuild_consumers
         │   state: parking_lot::Mutex<…>  ←── │    │   state: parking_lot::Mutex<…>  ←── │ per-slot mutex
         │     ─ pending: VecDeque<OpSend>     │    │     ─ queue: VecDeque<…>            │
         │     ─ batch: BatchContainer         │    │     ─ receive_wakers: Slab<Waker>   │
-        │     ─ outbound: VecDeque<Frame>     │    │     ─ available_permits, ack_tracker│
-        │     ─ name, epoch, stats, ...       │    │     ─ paused, reached_end_of_topic  │
+        │     ─ outbound: VecDeque<Frame>     │    │    ─ granted_permits, permit_balance│
+        │     ─ name, epoch, stats, ...       │    │     ─ ack_tracker, paused, ...      │
         └─────────────────────────────────────┘    └─────────────────────────────────────┘
 ```
 

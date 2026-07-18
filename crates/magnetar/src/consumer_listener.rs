@@ -298,27 +298,6 @@ pub trait WrapperReceiver: Clone + Send + Sync + 'static {
     fn membership_changed(&self) -> impl Future<Output = ()> + Send;
 }
 
-/// Spawn a push-delivery poller over a wrapper consumer, returning the owning
-/// [`MessageListenerHandle`]. The poller drives `receiver.wrapper_receive()` and
-/// invokes `listener(topic, &msg)` once per message, sequentially and in order,
-/// with **no auto-ack** — the callback acks explicitly via the wrapper's
-/// topic-routed ack (`ack(topic, id)`).
-///
-/// This is the wrapper-surface sibling of [`spawn_message_listener`]. The loop is
-/// the same bare `loop { receive(); callback }` shape — no channel (ADR-0003), no
-/// extra lock (ADR-0038), no host-clock read (ADR-0011) — and breaks the first
-/// time `wrapper_receive()` errors (closed / empty consumer set) for clean,
-/// panic-free shutdown.
-///
-/// Children discovered after subscribe (pattern `TopicListChanged` deltas,
-/// partition growth) inherit the listener: each iteration the poller races its
-/// in-flight `wrapper_receive()` (over the *current* child snapshot) against
-/// [`WrapperReceiver::membership_changed`]. When a child is added while the poller
-/// is parked, the membership signal wins, the stale receive is dropped
-/// (cancel-safe — unpopped messages stay queued), and the next iteration
-/// re-snapshots and starts draining the new child. An empty wrapper (e.g. a
-/// pattern with no current match) parks on the membership signal instead of
-/// spinning on the empty-set error.
 /// Event surfaced by a push-delivery [`ConsumerEventListener`] (issue #348).
 /// Mirrors Java `ConsumerEventListener#becameActive(Consumer, int)` /
 /// `becameInactive(Consumer, int)` — the Failover subscription
@@ -435,6 +414,27 @@ pub fn spawn_consumer_event_listener<C: crate::ConsumerApi + Clone>(
     }
 }
 
+/// Spawn a push-delivery poller over a wrapper consumer, returning the owning
+/// [`MessageListenerHandle`]. The poller drives `receiver.wrapper_receive()` and
+/// invokes `listener(topic, &msg)` once per message, sequentially and in order,
+/// with **no auto-ack** — the callback acks explicitly via the wrapper's
+/// topic-routed ack (`ack(topic, id)`).
+///
+/// This is the wrapper-surface sibling of [`spawn_message_listener`]. The loop is
+/// the same bare `loop { receive(); callback }` shape — no channel (ADR-0003), no
+/// extra lock (ADR-0038), no host-clock read (ADR-0011) — and breaks the first
+/// time `wrapper_receive()` errors (closed / empty consumer set) for clean,
+/// panic-free shutdown.
+///
+/// Children discovered after subscribe (pattern `TopicListChanged` deltas,
+/// partition growth) inherit the listener: each iteration the poller races its
+/// in-flight `wrapper_receive()` (over the *current* child snapshot) against
+/// [`WrapperReceiver::membership_changed`]. When a child is added while the poller
+/// is parked, the membership signal wins, the stale receive is dropped
+/// (cancel-safe — unpopped messages stay queued), and the next iteration
+/// re-snapshots and starts draining the new child. An empty wrapper (e.g. a
+/// pattern with no current match) parks on the membership signal instead of
+/// spinning on the empty-set error.
 pub fn spawn_wrapper_message_listener<R: WrapperReceiver>(
     receiver: R,
     listener: WrapperMessageListener,
