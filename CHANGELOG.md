@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-07-20
+
 ### Added
 
 - **Configurable operation retry policy:** `ClientBuilder::operation_retry(OperationRetryConfig)` now applies operation-specific broker retries across lookup, partition metadata, producer-open, and subscribe, independently from transport supervision.
@@ -279,6 +281,7 @@ See the [parity matrix](README.md#java-client-parity-matrix) for the per-feature
 - Exposed `tls_allow_insecure_connection` and `tls_hostname_verification_enable` for Java parity, and cleared cargo-audit advisories (`time` 0.3.45 CVE, `rustls-pemfile` unmaintained).
   (2a9fafb, abc7aad)
 
+[1.2.3]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.3
 [1.2.2]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.2
 [1.2.1]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.1
 [1.2.0]: https://github.com/CleverCloud/magnetar/releases/tag/v1.2.0
