@@ -61,6 +61,13 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 /// two keepalive intervals, so the watchdog must escalate during the window.
 const BLACKHOLE_WINDOW: Duration = Duration::from_secs(4);
 
+/// JVM budget for the `pulsar standalone` container.
+/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
+/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
+/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
+/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
+const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
 }
@@ -89,6 +96,7 @@ async fn start_pulsar()
             "Created namespace public/default",
         ))
         .with_startup_timeout(Duration::from_mins(2))
+        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
         .with_cmd(vec!["bin/pulsar".to_owned(), "standalone".to_owned()])
         .start()
         .await?;

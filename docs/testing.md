@@ -137,6 +137,17 @@ Set `MAGNETAR_PULSAR_IMAGE_TAG` to an explicit tag for compatibility runs; the i
 Its flow-control regression creates twelve direct Failover child-topic consumers with receiver queues of 2,000, sends five-chunk messages to one partition and small messages to the other eleven, and requires every partition to drain without reaching zero broker permits below the logical-message refill threshold.
 This topology is the end-to-end verification contract for [ADR-0076](../specs/adr/0076-conserve-flow-permits-across-chunk-reassembly.md).
 
+### e2e container memory budget
+
+Every `pulsar standalone` container the suite starts is capped with `PULSAR_MEM = -Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g`, declared as the `PULSAR_MEM_LIMIT` const next to `image_repo()` / `image_tag()` in each `e2e_*.rs` file.
+
+The image default is `-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g` ([`conf/pulsar_env.sh`](https://github.com/apache/pulsar/blob/master/conf/pulsar_env.sh)), which measures **~2.3 GiB RSS per idle standalone container** against **~0.95 GiB** at the capped budget.
+That difference is load-bearing on CI, not cosmetic: libtest runs up to `nproc` tests of a binary in parallel — 4 on a GitHub `ubuntu-latest` runner — and the PIP-33 two-cluster compose fixture (zookeeper + 2 bookkeepers + 2 brokers, itself capped at 256m–1g) stays up for the whole job.
+At stock sizes four concurrent standalones alone reserve ~9 GiB of the runner's 16 GiB, and the resulting memory pressure stalls brokers long enough that client operations blow their 30s `operation_timeout` — surfacing as `open_producer: timed out: producer target resolution exceeded operation_timeout` (or an outright OOM-kill, as [`e2e_cluster_failover.rs`](../crates/magnetar/tests/e2e_cluster_failover.rs) documents) in whichever e2e test happens to be running.
+
+The cap is a broker-side resource budget, never a client-side timeout adjustment: no test loosens an assertion or widens a deadline to accommodate a slow broker.
+Raise `PULSAR_MEM_LIMIT` in a specific file if that suite genuinely needs more heap (compaction and deep-partition topologies are the likely candidates), and say why in the const's doc comment.
+
 Suites cover:
 
 | File                                                                                            | Coverage                                                                                                                                                                                                                                                                                                                                         |
