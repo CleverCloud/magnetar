@@ -362,10 +362,15 @@ The driver-to-driver communication path is _also_ not a channel — it is a sing
 `Notify` is permitted because it has no queue and no payload — it is an async condvar, not a channel.
 If even `Notify` feels too channel-flavoured, a `parking_lot::Condvar + Mutex<bool>` is the documented fallback.
 
-**Enroll-before-drain wakeup discipline.** Every `Notify` the driver pulses with `notify_waiters()` — `driver_waker`, `topic_list_notify`, `replicated_subscription_marker_notify`, `scalable_notify` — stores **no permit**: it only wakes waiters enrolled at the instant it fires.
+**Enroll-before-drain wakeup discipline.** Every `Notify` the driver pulses with `notify_waiters()` — `driver_waker`, `event_waker`, `topic_list_notify`, `replicated_subscription_marker_notify`, `scalable_notify` — stores **no permit**: it only wakes waiters enrolled at the instant it fires.
 So every accessor that parks on one of these (`Client::await_reconnect_or_terminal`, `next_topic_list_change`, `next_replicated_subscription_marker`, `next_scalable_event`) MUST arm its `Notified` future — create it and call `enable()` — **before** it drains the buffer and re-checks `is_closed()`, then `await` the pre-armed future.
 The reverse (drain → check → `notified().await`) leaves a window in which the driver can push an item and `notify_waiters()` between the empty-check and the (too-late) enrollment, losing the wakeup and hanging the accessor forever.
 This is enforced 1:1 across both engines; the marker accessor's missing enrollment was the latent §5.1 lost-wakeup race (the same shape already fixed for the subscribe-readiness waiter).
+
+The same rule binds hand-written `Future` impls, which enroll by **owning** a `Notified` across polls rather than by `enable()`-ing a local one: `EventWaitFut` (`ProducerReady` / `SubscribeAcked`) and `ConnectedFut` (the `wait_connected` handshake wait) both store an `OwnedNotified` on `event_waker` and poll it **before** inspecting connection state.
+Enrolling from a spawned helper task instead — `tokio::spawn(async move { waker.notified().await; … })` — does NOT satisfy this: the helper enrolls whenever the runtime happens to schedule it, so any pulse that lands first is lost.
+That was the tokio engine's handshake hang: `ConnectedFut` parked via a spawned helper, and because a freshly dialled connection is silent once `CONNECTED` lands, one missed pulse stranded the wait for the whole `operation_timeout` and surfaced at the caller as `producer target resolution exceeded operation_timeout`.
+The moonpool engine has no such window — `handshake_plain` completes the handshake inline, before the driver task is spawned.
 
 ### Reference
 
