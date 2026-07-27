@@ -2024,7 +2024,7 @@ fn parse_direct_broker_url(
 pub(crate) async fn wait_connected(shared: Arc<ConnectionShared>) -> Result<(), ClientError> {
     ConnectedFut {
         shared,
-        helper: None,
+        notification: None,
     }
     .await
 }
@@ -2063,17 +2063,20 @@ fn handshake_failure_message(conn: &magnetar_proto::Connection) -> Option<String
 
 /// Future that resolves once the state machine reports `HandshakeState::Connected` (or fails if
 /// it transitions to `Failed`/`Closed` before that).
+///
+/// The notification is **owned and polled before connection state is
+/// inspected**, exactly like [`EventWaitFut`]. It therefore stays registered
+/// across `Poll::Pending` and cannot miss the driver's `notify_waiters()`.
+/// That discipline is load-bearing here: the driver announces handshake
+/// completion with `notify_waiters()`, which stores no permit, and a freshly
+/// dialled connection is idle once `CONNECTED` lands — so a single missed
+/// pulse parks the handshake for the whole `operation_timeout` instead of
+/// milliseconds. Registering from a spawned helper task (as this future used
+/// to) loses the pulse whenever the runtime has not scheduled the helper yet,
+/// which is why the failure only ever showed up on loaded CI runners.
 struct ConnectedFut {
     shared: Arc<ConnectionShared>,
-    helper: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for ConnectedFut {
-    fn drop(&mut self) {
-        if let Some(h) = self.helper.take() {
-            h.abort();
-        }
-    }
+    notification: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
 }
 
 impl Future for ConnectedFut {
@@ -2081,9 +2084,45 @@ impl Future for ConnectedFut {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut conn = this.shared.inner.lock();
-        // Drain events, looking for Connected. We don't care about the others at this stage.
-        while let Some(ev) = conn.poll_event() {
+        loop {
+            // Register (or stay registered) BEFORE reading connection state, so a
+            // pulse that lands between the state check and the park cannot be lost.
+            let notification = this
+                .notification
+                .get_or_insert_with(|| Box::pin(this.shared.event_waker.clone().notified_owned()));
+            let notified = notification.as_mut().poll(cx);
+
+            let mut conn = this.shared.inner.lock();
+            match Self::inspect(&mut conn) {
+                Poll::Ready(outcome) => return Poll::Ready(outcome),
+                Poll::Pending => {
+                    drop(conn);
+                    if notified.is_ready() {
+                        // Consumed a pulse without reaching a terminal state: re-arm
+                        // and re-check rather than parking on a spent notification.
+                        this.notification = None;
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl ConnectedFut {
+    /// Drain the handshake-relevant events and classify the connection state.
+    /// `Poll::Pending` means "still handshaking" — the caller parks.
+    fn inspect(conn: &mut magnetar_proto::Connection) -> Poll<Result<(), ClientError>> {
+        // Take only the events this future terminalizes on; anything else stays
+        // queued for its own waiter (same discipline as `EventWaitFut`). Both
+        // admitted variants are terminal here, so one event is all we ever need.
+        if let Some(ev) = conn.poll_event_if(|event| {
+            matches!(
+                event,
+                ConnectionEvent::Connected { .. } | ConnectionEvent::Closed { .. }
+            )
+        }) {
             match ev {
                 ConnectionEvent::Connected { .. } => return Poll::Ready(Ok(())),
                 ConnectionEvent::Closed { reason } => {
@@ -2097,14 +2136,12 @@ impl Future for ConnectedFut {
                     // surfaces regardless of which terminalization path won the
                     // capture-vs-drop race. The reason is already length-bounded
                     // at the proto capture site (ADR-0062).
-                    let msg = handshake_failure_message(&conn).unwrap_or_else(|| {
+                    let msg = handshake_failure_message(conn).unwrap_or_else(|| {
                         reason.unwrap_or_else(|| "connection closed during handshake".into())
                     });
                     return Poll::Ready(Err(ClientError::Other(msg)));
                 }
-                _ => {
-                    // Tolerate other events that may sneak in (none expected pre-handshake).
-                }
+                _ => unreachable!("poll_event_if admitted only Connected / Closed"),
             }
         }
         match conn.state() {
@@ -2115,28 +2152,12 @@ impl Future for ConnectedFut {
                 // namespace not found via proxy_to_broker_url, etc.). Falls
                 // back to the opaque message for raw transport drops where no
                 // protocol frame ever arrived (TLS error, ECONNREFUSED).
-                let msg = handshake_failure_message(&conn)
+                let msg = handshake_failure_message(conn)
                     .unwrap_or_else(|| "handshake failed".to_owned());
                 Poll::Ready(Err(ClientError::Other(msg)))
             }
             HandshakeState::Closed => Poll::Ready(Err(ClientError::Closed)),
-            _ => {
-                // Park on the driver waker — it fires after every inbound packet.
-                // Abort any prior helper so a stale `notified()` waiter from an
-                // earlier poll can't swallow a `notify_one` permit intended for
-                // the driver loop.
-                drop(conn);
-                if let Some(prev) = this.helper.take() {
-                    prev.abort();
-                }
-                let waker = cx.waker().clone();
-                let shared = this.shared.clone();
-                this.helper = Some(tokio::spawn(async move {
-                    shared.driver_waker.notified().await;
-                    waker.wake();
-                }));
-                Poll::Pending
-            }
+            _ => Poll::Pending,
         }
     }
 }
@@ -3229,5 +3250,75 @@ mod tests {
         // lookup result on the floor.
         let got = preferred_broker_url(Some("not a url".to_owned()), None, Scheme::Plain);
         assert_eq!(got.as_deref(), Some("not a url"));
+    }
+
+    /// Regression: [`wait_connected`] must already be registered for the
+    /// driver's handshake pulse by the time it returns `Poll::Pending`.
+    ///
+    /// The driver announces handshake completion with `notify_waiters()`,
+    /// which — unlike `notify_one()` — stores **no permit**. A waiter that
+    /// registers asynchronously (the pre-fix `ConnectedFut` spawned a helper
+    /// task to `await` the notification) misses the pulse outright whenever
+    /// the helper has not been scheduled yet. A freshly dialled connection is
+    /// idle after `CONNECTED`, so nothing ever pulses again: the handshake
+    /// wait then parks for the full `operation_timeout`, surfacing at the
+    /// caller as `open_producer: timed out: producer target resolution
+    /// exceeded operation_timeout`.
+    ///
+    /// The test reproduces that ordering deterministically — it polls the
+    /// future once (parking it), then completes the handshake and pulses
+    /// **without yielding to the executor**, so a waiter that had not
+    /// registered synchronously cannot have registered at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_connected_registers_before_the_driver_pulse_can_race_it() {
+        let shared = ConnectionShared::new(ConnectionConfig::default());
+        shared
+            .inner
+            .lock()
+            .begin_handshake()
+            .expect("begin handshake");
+
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(wait_connected(shared.clone()));
+
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "a pre-handshake connection must park the wait"
+        );
+
+        // The driver's inbound arm: feed CONNECTED, then pulse. No `.await`
+        // separates the two, so a not-yet-scheduled waiter never registers.
+        let connected = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let mut frame = BytesMut::new();
+        encode_command(&mut frame, &connected).expect("encode CommandConnected");
+        shared
+            .inner
+            .lock()
+            .handle_bytes(Instant::now(), &frame)
+            .expect("complete handshake");
+        shared.event_waker.notify_waiters();
+        shared.driver_waker.notify_waiters();
+
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the handshake pulse was lost: wait_connected was not registered when the driver \
+             fired notify_waiters(), so it would park until operation_timeout"
+        );
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(()))),
+            "the wait must resolve once the handshake completed"
+        );
     }
 }
