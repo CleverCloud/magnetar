@@ -967,12 +967,23 @@ mod tests {
         let waker_ctr = Arc::new(NoopWaker(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(waker_ctr.clone());
 
+        // Adaptive loop: iterate until the wall-clock deadline elapses, with
+        // a minimum-iteration floor so the recheck-path coverage stays hit
+        // even on a fast host. The original fixed 10_000-iteration loop
+        // panicked under heavy parallel test load (e.g. full workspace
+        // `cargo test --all-features`, or `--lib --bins` where 133 lib tests
+        // run concurrently): the loop performs 10_000 thread spawn/join
+        // round-trips, so the in-loop `assert!(Instant::now() <= deadline)`
+        // measured how fast the host creates threads, not anything about
+        // `try_reserve_memory_or_register`. The helper's correctness contract
+        // holds regardless of iteration count, so the deadline now ENDS the
+        // loop instead of failing it. Mirrors the moonpool twin, which
+        // already carried this shape — the fix had only ever been applied to
+        // one of the two engines.
         let deadline = Instant::now() + Duration::from_secs(5);
-        for _ in 0..10_000usize {
-            assert!(
-                Instant::now() <= deadline,
-                "recheck race did not fire within 5s budget",
-            );
+        let mut iters = 0usize;
+        while Instant::now() <= deadline && iters < 10_000 {
+            iters += 1;
             shared.try_reserve_memory(16).expect("seed budget at limit");
 
             let releaser = {
@@ -995,9 +1006,18 @@ mod tests {
                 }
             }
         }
-        // Best-effort coverage probe — always passes correctness-wise.
-        // On contention-rich hardware the recheck-won path fires within
-        // tens of iterations, lighting up the equivalent lines in the
-        // tokio runtime for sim-coverage parity.
+        // Coverage floor: enough iterations for the recheck-path hit count to
+        // be meaningful. Two orders of magnitude below what a loaded host
+        // manages in 5s (the failing runs were still clearing thousands), so
+        // this catches a degenerate zero/one-iteration loop without
+        // reintroducing a machine-speed assertion.
+        assert!(
+            iters >= 100,
+            "expected ≥100 race iterations within 5s, got {iters}",
+        );
+        // Best-effort coverage probe — always passes correctness-wise. On
+        // contention-rich hardware the recheck-won path fires within tens of
+        // iterations; the outcome distribution is deliberately not asserted,
+        // since the helper's contract holds on either branch.
     }
 }
