@@ -68,8 +68,8 @@ magnetar-admin       = { workspace = true }
 # `issuer_endpoint`. Wired into the admin client via `AdminAuth::OAuth2` and
 # into the data-plane client via its `AuthProvider` impl. ADR-0068.
 magnetar-auth-oauth2 = { workspace = true }
-anstream           = "1"
-anstyle            = "1"
+anstream           = "^1.0.0"
+anstyle            = "^1.0.14"
 clap               = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tracing            = { workspace = true }
