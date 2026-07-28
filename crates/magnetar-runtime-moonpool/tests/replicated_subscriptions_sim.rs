@@ -511,6 +511,20 @@ fn sim_connect_config() -> ConnectionConfig {
     }
 }
 
+/// How many `BitFlip` faults the run's captured trace holds so far.
+///
+/// `observability().snapshot()` is run-wide and monotonically grows, so callers
+/// compare two readings to scope the evidence to a specific window rather than
+/// accepting any flip that ever fired. Used by `drive` to tell a chaos-orphaned
+/// marker apart from a genuine lost wakeup.
+fn bit_flip_count(ctx: &SimContext) -> usize {
+    ctx.observability()
+        .snapshot(moonpool_sim::SIM_FAULT_EVENT_NAME)
+        .iter()
+        .filter(|e| e.str("kind") == Some("bit_flip"))
+        .count()
+}
+
 /// Anti-hang backstop for the connect and subscribe steps in `drive` —
 /// deliberately **longer** than `sim_connect_config()`'s `operation_timeout`
 /// (20s). `Client::connect_plain` / `Client::subscribe` already route
@@ -607,6 +621,15 @@ impl MarkerClientWorkload {
         // chaos-free single-seed anchor) is completely unaffected: it never
         // has fault evidence to find, and a real regression on that seed
         // still fails loudly.
+        // The evidence must come from THIS wait, not from anywhere in the run.
+        // `observability().snapshot()` returns the run-wide fault timeline, so a
+        // `BitFlip` that fired during connect or subscribe — already recovered
+        // from, since we only reach here after a clean subscribe — would
+        // otherwise satisfy the check and reclassify a genuine lost wakeup as the
+        // tolerated `ChaosOrphaned`. That would blunt exactly the seed diversity
+        // `sim_delayed_marker_is_observed_sweep_16_seeds` exists to provide.
+        // Baseline the count before the wait and require it to have GROWN.
+        let bit_flips_before = bit_flip_count(ctx);
         let wait_result = time
             .timeout(
                 Duration::from_secs(15),
@@ -614,16 +637,12 @@ impl MarkerClientWorkload {
             )
             .await;
         let Ok(resolved) = wait_result else {
-            let saw_bit_flip = ctx
-                .observability()
-                .snapshot(moonpool_sim::SIM_FAULT_EVENT_NAME)
-                .iter()
-                .any(|e| e.str("kind") == Some("bit_flip"));
+            let saw_bit_flip = bit_flip_count(ctx) > bit_flips_before;
             if saw_bit_flip {
                 return Ok(MarkerOutcome::ChaosOrphaned(
                     "next_replicated_subscription_marker timed out with a BitFlip fault \
-                     recorded on this run — the single-shot marker frame was chaos-corrupted \
-                     in flight (#365)"
+                     recorded DURING the wait — the single-shot marker frame was \
+                     chaos-corrupted in flight (#365)"
                         .to_owned(),
                 ));
             }
