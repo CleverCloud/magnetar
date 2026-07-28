@@ -521,7 +521,7 @@ impl<P: Providers> Client<P> {
                                  not advertise a broker_service_url"
                             ))
                         })?;
-                        let broker_url = proxy_broker_authority(&raw);
+                        let broker_url = proxy_broker_authority(&raw)?;
                         return Ok((LookupTarget::Proxy { broker_url }, current));
                     }
                     // ADR-0039 §"Multi-broker DIRECT routing": capture the resolved broker URL
@@ -740,7 +740,7 @@ impl<P: Providers> Client<P> {
             return Ok(self.shared.clone());
         };
 
-        let physical = direct_broker_authority(broker_url);
+        let physical = direct_broker_authority(broker_url)?;
         // Bootstrap-equality fast path: same `host:port` as the connect-time URL → reuse the
         // bootstrap connection. Saves one TCP handshake on every single-broker / bootstrap-broker
         // lookup, and keeps existing single-broker tests on exactly one socket (no spurious pool
@@ -1507,24 +1507,42 @@ impl Drop for RequestFut {
 /// `ServerError.ServiceNotReady "Target broker cannot be validated"` (ADR-0039,
 /// parity with Java client + pulsar-rs + the tokio engine).
 ///
-/// Mirrors `magnetar_runtime_tokio::client::preferred_broker_url`. The two engines
-/// pick their preferred URL differently — moonpool prefers `broker_service_url` so
-/// it can keep riding the plaintext bootstrap pipe (see
-/// [`Client::lookup_topic_target_with_operation_deadline`]) — but the scheme-strip step is
-/// identical.
-fn proxy_broker_authority(input: &str) -> String {
+/// Mirrors `magnetar_runtime_tokio::client::preferred_broker_url` in scheme-strip
+/// shape (moonpool prefers `broker_service_url` where tokio's TLS-posture pick
+/// differs — see [`Client::lookup_topic_target_with_operation_deadline`]) but
+/// **not** in error behaviour on an unrecognised scheme: `preferred_broker_url`
+/// warns and forwards the raw string unchanged (relying on the downstream proxy's
+/// `validateBrokerTarget()` to reject it), which this helper deliberately does
+/// NOT copy. A single-bit corruption of the `pulsar` scheme word (e.g.
+/// `"ptlsar://broker:6650"`, issue #364) previously matched NEITHER
+/// `strip_prefix` arm and fell through to the bare-`host:port` branch below,
+/// where naive `split('/')` truncated it into the nonsense authority
+/// `"ptlsar:"` — silently corrupting the value sent to the proxy on
+/// `CommandConnect.proxy_to_broker_url` instead of failing the lookup. Reject
+/// explicitly instead: any input containing `"://"` that isn't a recognised
+/// Pulsar scheme is a scheme error, not a bare-authority input, and must not
+/// reach the naive host:port split. A **bare** `host:port` with no `"://"` at
+/// all (no scheme prefix whatsoever) is still accepted unchanged — that shape
+/// is a legitimate, tested input (see
+/// `proxy_broker_authority_passes_through_bare_host_port`), not a corruption.
+fn proxy_broker_authority(input: &str) -> Result<String, ClientError> {
     let (rest, default_port) = if let Some(rest) = input.strip_prefix("pulsar+ssl://") {
         (rest, Some(6651u16))
     } else if let Some(rest) = input.strip_prefix("pulsar://") {
         (rest, Some(6650u16))
+    } else if input.contains("://") {
+        return Err(ClientError::Other(format!(
+            "broker-advertised URL '{input}' carries an unrecognised scheme (expected \
+             'pulsar://' or 'pulsar+ssl://'); refusing to derive a proxy authority from it"
+        )));
     } else {
         (input, None)
     };
     let host_port = rest.split('/').next().unwrap_or(rest);
-    match default_port {
+    Ok(match default_port {
         Some(port) if !host_port.contains(':') => format!("{host_port}:{port}"),
         _ => host_port.to_owned(),
-    }
+    })
 }
 
 /// Normalise an advertised broker URL into the `host:port` form moonpool's
@@ -1546,7 +1564,16 @@ fn proxy_broker_authority(input: &str) -> String {
 /// §"TLS posture"). The two helpers are deliberately distinct so each carries
 /// its own contract docstring; both engines pin this contract at the type
 /// level (see the tokio counterparts).
-fn direct_broker_authority(input: &str) -> String {
+///
+/// Like [`proxy_broker_authority`], rejecting on an unrecognised scheme HERE
+/// is moonpool-specific hardening, NOT cross-engine parity: the tokio
+/// engine's `parse_direct_broker_url` does not cleanly reject the
+/// equivalent DIRECT-path input either — its own bare-`host:port` fallback
+/// mis-derives a garbage host with the WRONG default port on a corrupted
+/// scheme (a distinct latent bug from the truncation this function used to
+/// have; see `docs/follow-ups.md` §6, filed rather than fixed here since
+/// `magnetar-runtime-tokio` is out of scope for this changeset).
+fn direct_broker_authority(input: &str) -> Result<String, ClientError> {
     proxy_broker_authority(input)
 }
 
@@ -1741,7 +1768,7 @@ mod tests {
     #[test]
     fn proxy_broker_authority_strips_pulsar_ssl_scheme() {
         assert_eq!(
-            proxy_broker_authority("pulsar+ssl://b-c3-n12:6651"),
+            proxy_broker_authority("pulsar+ssl://b-c3-n12:6651").unwrap(),
             "b-c3-n12:6651"
         );
     }
@@ -1749,20 +1776,23 @@ mod tests {
     #[test]
     fn proxy_broker_authority_strips_pulsar_scheme() {
         assert_eq!(
-            proxy_broker_authority("pulsar://b-c3-n12:6650"),
+            proxy_broker_authority("pulsar://b-c3-n12:6650").unwrap(),
             "b-c3-n12:6650"
         );
     }
 
     #[test]
     fn proxy_broker_authority_appends_default_port_for_pulsar_scheme() {
-        assert_eq!(proxy_broker_authority("pulsar://b-c3-n12"), "b-c3-n12:6650");
+        assert_eq!(
+            proxy_broker_authority("pulsar://b-c3-n12").unwrap(),
+            "b-c3-n12:6650"
+        );
     }
 
     #[test]
     fn proxy_broker_authority_appends_default_port_for_pulsar_ssl_scheme() {
         assert_eq!(
-            proxy_broker_authority("pulsar+ssl://b-c3-n12"),
+            proxy_broker_authority("pulsar+ssl://b-c3-n12").unwrap(),
             "b-c3-n12:6651"
         );
     }
@@ -1771,7 +1801,10 @@ mod tests {
     fn proxy_broker_authority_passes_through_bare_host_port() {
         // Defensive: a broker that advertised `host:port` directly (no scheme) is forwarded
         // unchanged.
-        assert_eq!(proxy_broker_authority("b-c3-n12:6650"), "b-c3-n12:6650");
+        assert_eq!(
+            proxy_broker_authority("b-c3-n12:6650").unwrap(),
+            "b-c3-n12:6650"
+        );
     }
 
     #[test]
@@ -1779,8 +1812,18 @@ mod tests {
         // Real lookup responses don't carry paths, but the helper is the only thing standing
         // between the broker's string and `CommandConnect`, so be defensive.
         assert_eq!(
-            proxy_broker_authority("pulsar://b-c3-n12:6650/extra/path"),
+            proxy_broker_authority("pulsar://b-c3-n12:6650/extra/path").unwrap(),
             "b-c3-n12:6650"
         );
     }
+
+    // The issue #364 corrupted-scheme-rejection regression (both
+    // `proxy_broker_authority` and `direct_broker_authority`) is covered by
+    // `crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs`'s
+    // `open_producer_through_proxy_rejects_corrupted_broker_scheme` (that
+    // file is one of xtask's PARITY_EXEMPT_FILES) rather than by a private-fn
+    // unit test here — this keeps `cargo run -p xtask -- check-runtime-test-parity`
+    // balanced without inventing a matching tokio-side test for a fix that,
+    // per this function's doc comment, is moonpool-specific hardening with
+    // no tokio behavioural counterpart to mirror.
 }

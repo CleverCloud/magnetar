@@ -1619,14 +1619,12 @@ impl Workload for ProducerConsumerWorkload {
         // Supervised connect (ADR-0055 §3): a bit-flip-induced terminal drop is
         // recovered by reconnect + replay against the persistent broker, rather
         // than killing the plain driver and stranding the un-acked tail.
-        let client = time_provider_setup
-            .timeout(
-                Duration::from_secs(30),
-                Client::connect_plain_supervised(&engine, &addr, supervised_config(), None, None),
-            )
-            .await
-            .map_err(|_| SimulationError::InvalidState("connect timed out".into()))?
-            .map_err(|e| SimulationError::InvalidState(format!("connect: {e:?}")))?;
+        // `retry_supervised_connect` additionally rides out a chaos-induced
+        // drop DURING the initial dial itself (before the supervised driver
+        // exists to reconnect on its own) — see its doc comment (#366).
+        let client =
+            retry_supervised_connect(&time_provider_setup, &engine, &addr, supervised_config())
+                .await?;
 
         // Open consumer first so it's ready to receive before we publish.
         // `retry_setup` re-issues the op across a transient chaos drop (a
@@ -2493,50 +2491,71 @@ impl Workload for ProxyClientWorkload {
             ..ConnectionConfig::default()
         };
 
-        let connect_res = time
-            .timeout(
+        // (2a) Bound retry, not a bare timeout: a bit-flip during the proxy
+        // bootstrap dial (before any supervised driver exists to reconnect on
+        // its own) otherwise fails the whole iteration on the first
+        // transient drop. `retry_setup` re-issues the connect against a
+        // fresh attempt, virtual-clock delayed (ADR-0011), and still
+        // surfaces the final error — with the original diagnostic wording —
+        // when setup is genuinely broken.
+        let connect_res = retry_setup(&time, || async {
+            time.timeout(
                 Duration::from_secs(11),
-                Client::connect_plain_supervised(&engine, &addr, cfg, None, None),
+                Client::connect_plain_supervised(&engine, &addr, cfg.clone(), None, None),
             )
-            .await;
+            .await
+            .map_err(|err| format!("proxy bootstrap connect guard elapsed: {err:?}"))?
+            .map_err(|err| format!("proxy bootstrap connect failed: {err:?}"))
+        })
+        .await;
         let client = match connect_res {
-            Ok(Ok(client)) => client,
-            Ok(Err(err)) => {
-                let diagnostic = format!("proxy bootstrap connect failed: {err:?}");
-                self.diagnostics.lock().push(diagnostic.clone());
-                return Err(SimulationError::InvalidState(diagnostic));
-            }
-            Err(err) => {
-                let diagnostic = format!("proxy bootstrap connect guard elapsed: {err:?}");
+            Ok(client) => client,
+            Err(diagnostic) => {
                 self.diagnostics.lock().push(diagnostic.clone());
                 return Err(SimulationError::InvalidState(diagnostic));
             }
         };
 
-        let open_res = time
-            .timeout(
+        // (2b) Same treatment for the producer open, matching how
+        // `ProducerConsumerWorkload` already guards its own `open_producer`.
+        let open_res = retry_setup(&time, || async {
+            time.timeout(
                 Duration::from_secs(11),
                 client.open_producer(magnetar_proto::CreateProducerRequest {
                     topic: "persistent://public/default/sim-proxy-multi-conn".to_owned(),
                     ..Default::default()
                 }),
             )
-            .await;
+            .await
+            .map_err(|err| format!("timeout-provider error: {err:?}"))?
+            .map_err(|err| format!("error: {err:?}"))
+        })
+        .await;
 
-        let producer_opened = matches!(open_res, Ok(Ok(_)));
+        let producer_opened = open_res.is_ok();
         let producer_outcome = match &open_res {
-            Ok(Ok(_)) => "opened".to_owned(),
-            Ok(Err(err)) => format!("error: {err:?}"),
-            Err(err) => format!("timeout-provider error: {err:?}"),
+            Ok(_) => "opened".to_owned(),
+            Err(diagnostic) => diagnostic.clone(),
         };
         let snapshot = self.sessions.lock().clone();
-        let bootstrap_clean = snapshot.first().is_some_and(|session| {
+        // (2c) Retry-aware evidence: a chaos-induced redial (2a/2b) means the
+        // FIRST/only-non-first session recorded is no longer guaranteed to be
+        // the clean one — a dead session from an aborted attempt can precede
+        // it (observed in #362: `frames: []`), or a corrupted-scheme session
+        // can be interleaved with a correctly-pinned one (observed in #364:
+        // `connect_proxy_to_broker_url: Some("ptlsar:")`). Search ALL
+        // recorded sessions for at least one clean bootstrap and at least one
+        // correctly-pinned session, rather than requiring the first/only
+        // session to already be clean. This tolerates EXTRA chaos-damaged
+        // sessions coexisting; it does not stop requiring that a clean
+        // bootstrap session and a correctly-pinned session both occurred.
+        let bootstrap_clean = snapshot.iter().any(|session| {
             session.connect_proxy_to_broker_url.is_none()
                 && session
                     .frames
                     .contains(&(pb::base_command::Type::Lookup as i32))
         });
-        let pinned_clean = snapshot.iter().skip(1).any(|session| {
+        let pinned_clean = snapshot.iter().any(|session| {
             session.connect_proxy_to_broker_url.as_deref()
                 == Some(PROXY_ADVERTISED_BROKER_AUTHORITY)
                 && session
@@ -2603,6 +2622,80 @@ fn sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds() {
         "report: {report:?}; diagnostics: {:?}",
         diagnostics.lock()
     );
+}
+
+/// Regression pin for the four proxy-bootstrap sub-seeds surfaced by chaos
+/// (issues #362, #363, #364, #367). Before the fix, a bit-flip during the
+/// proxy bootstrap dial / `open_producer` setup — or a corrupted
+/// `broker_service_url` scheme landing a `Some("ptlsar:")` pinned session —
+/// failed the whole iteration: `producer target resolution exceeded
+/// operation_timeout` (#362), `Frame(BadLength(38))` on the bootstrap
+/// connect (#363), a corrupted-scheme pinned session tripping the old
+/// `.first()` / `.skip(1)` evidence checks (#364), and `frame length out of
+/// bounds: 38` on the producer open (#367). `retry_setup`-wrapped connect +
+/// `open_producer` (Edit 2a/2b) plus the retry-aware evidence search across
+/// ALL recorded sessions (Edit 2c) fixed all four. Pin the exact failing
+/// sub-seeds so this regression stays tied to the original reproducers,
+/// independent of `MOONPOOL_SEED` derivation.
+#[test]
+fn sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367() {
+    let sessions = Arc::new(Mutex::new(Vec::<ProxySessionRecord>::new()));
+    let diagnostics = Arc::new(Mutex::new(Vec::<String>::new()));
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(ProxyThroughBroker {
+            sessions: sessions.clone(),
+        })
+        .workload(ProxyClientWorkload::new(sessions, diagnostics.clone()))
+        .set_debug_seeds(vec![
+            17_655_772_840_140_759_888,
+            2_734_405_100_989_005_031,
+            16_831_727_181_602_372_843,
+            14_671_817_017_058_487_908,
+        ])
+        .set_iterations(4)
+        .run();
+    assert_eq!(
+        report.successful_runs,
+        4,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+    assert_eq!(
+        report.failed_runs,
+        0,
+        "report: {report:?}; diagnostics: {:?}",
+        diagnostics.lock()
+    );
+}
+
+/// Regression pin for the produce-consume dial sub-seed (#366). Before the
+/// fix, a bit-flip landing on the very first connect attempt — before the
+/// supervised driver exists to reconnect on its own — surfaced as
+/// `connect: Engine(Io(Custom { kind: ConnectionRefused, .. }))` and failed
+/// the iteration outright. `retry_supervised_connect` (Edit 1) fixed it by
+/// bounding the initial dial in the same retry loop already used by
+/// `SwizzleClogClientWorkload`. Pin the exact failing sub-seed so this stays
+/// tied to the original reproducer.
+#[test]
+fn sim_chaos_produce_consume_sub_seed_366() {
+    let report = SimulationBuilder::new()
+        .run_time_budget(CHAOS_RUN_TIME_BUDGET)
+        .workload(StatefulBrokerWorkload::new())
+        .workload(ProducerConsumerWorkload::new())
+        .invariant(MonotonicMsgIdInvariant::default())
+        .invariant(AckAfterReceiveInvariant::default())
+        .invariant(NoDupOnAckedInvariant::default())
+        .invariant(HandleResolutionInvariant::default())
+        .set_debug_seeds(vec![16_011_264_899_749_977_182])
+        .set_iterations(1)
+        .run();
+    assert!(
+        report.assertion_violations.is_empty(),
+        "invariant violation(s): {report:?}"
+    );
+    assert_eq!(report.successful_runs, 1, "report: {report:?}");
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
 }
 
 // =============================================================================
