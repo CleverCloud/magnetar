@@ -1262,6 +1262,10 @@ where
     // rationale, discovered empirically while proving this fix out under
     // deterministic simulation.)
     let mut write_deadline: Option<Instant> = None;
+    // Set while a TLS flush may be outstanding; see `write_one_budget`. Lives
+    // outside the loop for the same reason `write_deadline` does — a
+    // cancelled flush must survive into the next iteration to re-arm the arm.
+    let mut flush_pending = false;
 
     loop {
         // Drain outbound bytes + check if the state machine wants us to terminate, and snapshot
@@ -1319,7 +1323,11 @@ where
             return Ok(());
         }
 
-        let write_has_work = !pending_write.is_empty();
+        // `flush_pending` mirrors moonpool's `write_half.has_pending_ciphertext()`
+        // term: a flush cancelled by another arm winning the round leaves
+        // encrypted-but-unflushed records in the rustls session buffer with
+        // `pending_write` already empty, and only this keeps the arm armed.
+        let write_has_work = !pending_write.is_empty() || flush_pending;
         // Arm the deadline on the transition into "has work"; leave it
         // untouched while work continues across iterations; clear it once
         // drained so the NEXT logical write gets a fresh full budget.
@@ -1521,6 +1529,7 @@ where
                 &mut pending_write,
                 &mut write_half,
                 flush_after_write,
+                &mut flush_pending,
                 // `write_deadline` is `Some` whenever `write_has_work` is —
                 // see where it's armed above.
                 write_deadline.unwrap_or_else(|| Instant::now() + operation_timeout),
@@ -1565,10 +1574,27 @@ where
 /// deadline source: `keepalive_interval` only detects read-side silence (a
 /// peer that keeps ACKing pings while refusing to drain our writes would
 /// never trip it).
+///
+/// `flush_pending` is the tokio analogue of moonpool's
+/// [`TransportWriteHalf::has_pending_ciphertext`]: the caller folds it into
+/// `write_has_work` so a CANCELLED flush re-arms this arm. It is required
+/// because `tokio_rustls` returns `Poll::Ready(Ok(n))` when its
+/// `would_block` flag is set (`tokio-rustls/src/common/mod.rs`, the
+/// `(n, true) => Poll::Ready(Ok(n))` arm) — bytes are accepted into the
+/// rustls session buffer while the socket write blocks, so `write_budgeted`
+/// can drain `pending_write` to empty with encrypted records still unflushed.
+/// Without the flag, `write_has_work` would be `false`, the arm would be
+/// gated off, and nothing would re-poll the flush (nor would the stall be
+/// charged against `write_deadline`, which is cleared on the same branch).
+/// The flag is set BEFORE `write_budgeted`, not just before the flush:
+/// cancelling mid-`write_budgeted` can already have handed bytes to rustls
+/// and advanced `front_offset` past them. The cost of being conservative is
+/// one extra no-op flush per round on a TLS connection.
 async fn write_one_budget<S>(
     pending_write: &mut PendingDriverWrite,
     write_half: &mut tokio::io::WriteHalf<S>,
     flush_after_write: bool,
+    flush_pending: &mut bool,
     deadline: Instant,
 ) -> std::io::Result<()>
 where
@@ -1576,12 +1602,18 @@ where
 {
     let remaining = deadline.saturating_duration_since(Instant::now());
     let outcome = tokio::time::timeout(remaining, async {
+        // Set before the first `.await`, so every cancellation point below
+        // leaves the flag set for the caller to re-arm on.
+        if flush_after_write {
+            *flush_pending = true;
+        }
         let bytes = pending_write
             .write_budgeted(write_half, DRIVER_WRITE_BUDGET_BYTES)
             .await?;
         tracing::trace!(bytes, "writing outbound bytes");
         if flush_after_write {
             write_half.flush().await?;
+            *flush_pending = false;
         }
         Ok::<(), std::io::Error>(())
     })
@@ -1633,7 +1665,7 @@ mod tests {
     use super::{
         DRIVER_WRITE_BUDGET_BYTES, PendingDriverWrite, RetryRequest, lookup_then,
         notify_retry_generation_replaced, spawn_retry_leg, terminalize_retry_request,
-        write_all_vectored,
+        write_all_vectored, write_one_budget,
     };
     use crate::ConnectionShared;
     use crate::producer::Producer;
@@ -2640,6 +2672,103 @@ mod tests {
             "the peer's total received bytes must equal the source exactly \
              once — no duplication from re-sending the pre-cancellation \
              bytes, no gap from skipping them"
+        );
+    }
+
+    /// A flush cancelled by another `select!` arm must leave `flush_pending`
+    /// set, because that flag is the ONLY thing keeping the write arm armed
+    /// once `pending_write` has drained.
+    ///
+    /// `tokio_rustls` answers `poll_write` with `Poll::Ready(Ok(n))` even when
+    /// its `would_block` flag is set, so bytes land in the rustls session
+    /// buffer while the socket write blocks — `write_budgeted` reports them
+    /// all written and `pending_write` goes empty with encrypted records still
+    /// unflushed. Before ADR-0083 the flush ran to completion at the top of
+    /// the loop and could not be cancelled; now it sits in a cancellable arm,
+    /// so without the flag `write_has_work` would be `false`, the arm would be
+    /// gated off, nothing would re-poll the flush, and the stall would not be
+    /// charged against `write_deadline` either. The moonpool engine covers the
+    /// same hole with `TransportWriteHalf::has_pending_ciphertext()`.
+    #[tokio::test]
+    async fn cancelled_flush_leaves_the_write_arm_rearm_flag_set() {
+        use std::pin::Pin;
+        use std::task::Context;
+
+        /// Accepts every write synchronously, then stalls in `poll_flush`
+        /// forever — models rustls holding encrypted-but-unflushed records.
+        /// Never registers a waker; nothing needs to wake it here.
+        struct FlushStallsForever;
+
+        impl tokio::io::AsyncRead for FlushStallsForever {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for FlushStallsForever {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut pending = PendingDriverWrite::from_transmit(
+            magnetar_proto::TransmitOwned::Contiguous(Bytes::from_static(b"ciphertext-payload")),
+        );
+        let (_read_half, mut write_half) = tokio::io::split(FlushStallsForever);
+        let mut flush_pending = false;
+        // Far enough out that the deadline cannot be what makes the future
+        // suspend — the stalled flush must be.
+        let deadline = Instant::now() + Duration::from_mins(5);
+
+        {
+            let mut fut = std::pin::pin!(write_one_budget(
+                &mut pending,
+                &mut write_half,
+                true, // flush_after_write — the TLS case
+                &mut flush_pending,
+                deadline,
+            ));
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "the double must suspend the future inside the flush so the \
+                 drop below models a real select! cancellation"
+            );
+            // Dropped here — another arm won the round.
+        }
+
+        assert!(
+            pending.is_empty(),
+            "the double accepted every byte, so the queue is drained — this \
+             is exactly the state where `!pending_write.is_empty()` alone \
+             would gate the write arm off"
+        );
+        assert!(
+            flush_pending,
+            "a cancelled flush must leave the re-arm flag set; otherwise \
+             `write_has_work` is false, the write arm never fires again, and \
+             the rustls residue strands until the next send or keepalive"
         );
     }
 

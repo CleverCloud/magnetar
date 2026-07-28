@@ -1200,6 +1200,37 @@ mod tests {
         ClientConnection::new(config, name).expect("rustls client session")
     }
 
+    /// Moonpool twin of the tokio engine's
+    /// `driver::tests::cancelled_flush_leaves_the_write_arm_rearm_flag_set`.
+    ///
+    /// Both pin the same invariant: once a write round has left
+    /// encrypted-but-unwritten bytes behind, the driver's `write_has_work`
+    /// must still report work even though `pending_write` has drained —
+    /// otherwise the write `select!` arm is gated off and nothing re-polls
+    /// it. tokio cannot see rustls' residue through `tokio_rustls`, so it
+    /// tracks it with an explicit `flush_pending` flag; moonpool owns the
+    /// adapter and answers from real state via `has_pending_ciphertext()`,
+    /// which is the extra term in its `write_has_work` (see `driver.rs`).
+    #[test]
+    fn absorbed_ciphertext_keeps_the_write_arm_armed() {
+        let mut shared = TlsShared::new(RustlsByteAdapter::new(make_session()));
+        assert!(
+            !shared.has_pending_ciphertext(),
+            "nothing has been absorbed yet"
+        );
+
+        // A fresh client session queues its ClientHello for the wire — the
+        // stand-in for any encrypted-but-unwritten residue.
+        shared.adapter.step().expect("adapter step");
+        shared.absorb_adapter_output();
+
+        assert!(
+            shared.has_pending_ciphertext(),
+            "absorbed ciphertext must keep the write arm armed; this is the \
+             term the tokio engine has to emulate with `flush_pending`"
+        );
+    }
+
     /// A double whose `poll_write` always returns `Pending` and never
     /// registers a waker — models a kernel send buffer that isn't ready
     /// yet. `write_some_tls` issues AT MOST ONE `poll_write` per call, so
