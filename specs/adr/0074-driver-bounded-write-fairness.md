@@ -1,6 +1,6 @@
 # ADR-0074 — Bound driver write turns before returning to reads
 
-- **Status**: Accepted
+- **Status**: Accepted; amended by [ADR-0083](0083-bounded-cancellable-driver-write.md)
 - **Date**: 2026-07-01
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, driver-loop, performance, determinism

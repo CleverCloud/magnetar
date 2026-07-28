@@ -4,12 +4,14 @@
 //! engine's `connect_tls` entry point.
 //!
 //! `crates/magnetar-runtime-moonpool/src/transport.rs` carries the
-//! `Transport::Tls { stream, adapter, plaintext_overflow }` arm and its
-//! associated pump (`connect_tls`, `tls_handshake`, the TLS variants of
-//! `read_buf` / `write_all` / `flush` / `shutdown`). Until this file
-//! landed, only the `Plain` arm was exercised through the engine —
-//! per-file coverage on `transport.rs` sat at 30.3% with the 124-line
-//! TLS hunk uncovered (ADR-0024 patch coverage).
+//! `Transport::Tls { stream, shared, plaintext_overflow, read_scratch }`
+//! arm (`shared: Arc<parking_lot::Mutex<TlsShared>>`, ADR-0083 —
+//! `TlsShared` bundles the adapter with the resumable `pending_ciphertext`
+//! queue) and its associated pump (`connect_tls`, `tls_handshake`, the TLS
+//! variants of `read_buf` / `write_some` / `write_all` / `flush` /
+//! `shutdown`). Until this file landed, only the `Plain` arm was exercised
+//! through the engine — per-file coverage on `transport.rs` sat at 30.3%
+//! with the 124-line TLS hunk uncovered (ADR-0024 patch coverage).
 //!
 //! Strategy. Stand up an in-process rustls server (one self-signed cert
 //! per test, minted with `rcgen` at fixture build time so no PEM file

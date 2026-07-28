@@ -1,6 +1,6 @@
 # ADR-0070 — Driver-loop read-arm fairness: poll inbound before the waker arm, keep `biased`
 
-- **Status**: Accepted
+- **Status**: Accepted; amended by [ADR-0083](0083-bounded-cancellable-driver-write.md)
 - **Date**: 2026-06-22
 - **Decider**: Florentin Dubois
 - **Tags**: runtime, driver-loop, performance, determinism

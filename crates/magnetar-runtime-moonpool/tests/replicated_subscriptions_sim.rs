@@ -45,7 +45,9 @@ use magnetar_proto::{
 };
 use magnetar_runtime_moonpool::{Client, MoonpoolEngine};
 use moonpool_core::{NetworkProvider, Providers, TaskProvider, TcpListenerTrait, TimeProvider};
-use moonpool_sim::{SimContext, SimulationBuilder, SimulationError, SimulationResult, Workload};
+use moonpool_sim::{
+    SimContext, SimulationBuilder, SimulationError, SimulationResult, TraceQuery, Workload,
+};
 use parking_lot::Mutex;
 
 mod common;
@@ -371,6 +373,19 @@ enum MarkerOutcome {
     /// not the lost-wakeup hang. Carries the stringified reason for
     /// diagnostics.
     Severed(String),
+    /// The marker-accessor guard expired (the same symptom the lost-wakeup
+    /// bug produces) **and** the run's captured fault trace shows a `BitFlip`
+    /// fired on the connection — independent evidence that the
+    /// default-network chaos corrupted the single-shot, CRC-covered marker
+    /// `MESSAGE` frame in flight (magnetar-proto's verify-or-drop policy,
+    /// invariant #4, silently drops it and keeps the connection alive, so
+    /// `is_closed()` never flips and nothing re-notifies the marker waiter —
+    /// there is no retry infrastructure for this single-shot push, by
+    /// design; see the module docs). A bounded, chaos-attributable outcome,
+    /// NOT the lost-wakeup hang: without the `BitFlip` evidence the same
+    /// guard expiry still fails hard (see `drive`). Carries the stringified
+    /// reason for diagnostics. #365.
+    ChaosOrphaned(String),
 }
 
 /// Client workload: connect, subscribe, signal "parked", then await the
@@ -423,7 +438,7 @@ impl Workload for MarkerClientWorkload {
         let engine = MoonpoolEngine::new(ctx.providers().clone());
         let time = ctx.providers().time().clone();
 
-        let result = self.drive(&engine, &addr, &time).await;
+        let result = self.drive(ctx, &engine, &addr, &time).await;
         // Both `Observed` and `Severed` are bounded outcomes — the run
         // terminated. Only a genuine lost-wakeup hang (or a wrong-kind marker)
         // returns `Err` and fails the run. Record which seeds actually proved
@@ -460,6 +475,18 @@ impl Workload for MarkerClientWorkload {
                 );
                 Ok(())
             }
+            Some(Ok(MarkerOutcome::ChaosOrphaned(reason))) => {
+                // Same tolerated-outcome treatment as `Severed` above — the
+                // fault-evidence gate in `drive` already confirmed a `BitFlip`
+                // fired on this connection, so this is chaos attribution, not
+                // the lost-wakeup regression (#365).
+                tracing::info!(
+                    capture = true,
+                    trail = "marker_chaos_orphaned",
+                    reason = %reason,
+                );
+                Ok(())
+            }
             Some(Err(reason)) => Err(SimulationError::InvalidState(format!(
                 "marker accessor did not resolve: {reason}"
             ))),
@@ -484,9 +511,42 @@ fn sim_connect_config() -> ConnectionConfig {
     }
 }
 
+/// How many `BitFlip` faults the run's captured trace holds so far.
+///
+/// `observability().snapshot()` is run-wide and monotonically grows, so callers
+/// compare two readings to scope the evidence to a specific window rather than
+/// accepting any flip that ever fired. Used by `drive` to tell a chaos-orphaned
+/// marker apart from a genuine lost wakeup.
+fn bit_flip_count(ctx: &SimContext) -> usize {
+    ctx.observability()
+        .snapshot(moonpool_sim::SIM_FAULT_EVENT_NAME)
+        .iter()
+        .filter(|e| e.str("kind") == Some("bit_flip"))
+        .count()
+}
+
+/// Anti-hang backstop for the connect and subscribe steps in `drive` —
+/// deliberately **longer** than `sim_connect_config()`'s `operation_timeout`
+/// (20s). `Client::connect_plain` / `Client::subscribe` already route
+/// through the connection's own bounded operation deadline, whose `Err` this
+/// function already classifies as the tolerated `MarkerOutcome::Severed`; a
+/// guard shorter than or equal to that deadline (the pre-fix 20s connect
+/// guard, the 5s subscribe guard) can fire *first* and convert an
+/// already-handled bounded outcome into a hard "timed out" failure before the
+/// connection's own recovery gets a chance to resolve it (#368). This guard
+/// exists ONLY as a last-resort anti-hang backstop for a genuine driver
+/// stall — it must never pre-empt the operation deadline it wraps.
+///
+/// Deliberately NOT applied to the marker-accessor guard below:
+/// `next_replicated_subscription_marker()` has no operation deadline of its
+/// own, so its own guard is the only bound and doubles as the lost-wakeup
+/// detector — raising it would weaken that detector.
+const OUTER_GUARD: Duration = Duration::from_secs(25);
+
 impl MarkerClientWorkload {
     async fn drive<P, T>(
         &self,
+        ctx: &SimContext,
         engine: &MoonpoolEngine<P>,
         addr: &str,
         time: &T,
@@ -501,7 +561,7 @@ impl MarkerClientWorkload {
         // the lost-wakeup window is only entered *after* a clean subscribe.
         let connect = time
             .timeout(
-                Duration::from_secs(20),
+                OUTER_GUARD,
                 Client::connect_plain(engine, addr, sim_connect_config()),
             )
             .await
@@ -513,7 +573,7 @@ impl MarkerClientWorkload {
 
         let subscribe = time
             .timeout(
-                Duration::from_secs(5),
+                OUTER_GUARD,
                 client.subscribe(SubscribeRequest {
                     topic: TOPIC.to_owned(),
                     subscription: SUBSCRIPTION.to_owned(),
@@ -537,18 +597,58 @@ impl MarkerClientWorkload {
         // failure; the enroll-before-drain fix captures it.
         self.coord.parked.store(true, Ordering::SeqCst);
 
-        // A *hang* here is the lost-wakeup bug — it MUST fail the run (hard
-        // `Err`). A connection severed by chaos *after* parking resolves the
-        // accessor to `None` (closed before the marker arrived) — still a
-        // bounded `Severed` outcome, not a hang.
-        let Some(observed) = time
+        // A *hang* here is normally the lost-wakeup bug and MUST fail the run
+        // (hard `Err`) — this guard is the ONLY bound on
+        // `next_replicated_subscription_marker()` and must not be raised
+        // (see `OUTER_GUARD`'s docs). A connection severed by chaos *after*
+        // parking resolves the accessor to `None` (closed before the marker
+        // arrived) — still a bounded `Severed` outcome, not a hang.
+        //
+        // #365: the marker push is single-shot (no retry infrastructure —
+        // see the module docs) and rides an ordinary CRC32C-covered `MESSAGE`
+        // frame (invariant #4). When the SAME default-network chaos that can
+        // sever `Lookup` / `Subscribe` above instead flips a bit inside THIS
+        // frame in flight, magnetar-proto's verify-or-drop policy silently
+        // drops it and the connection stays alive (`is_closed()` never
+        // flips) — so this guard expires with the identical symptom the
+        // lost-wakeup bug produces. Distinguish the two with independent
+        // evidence from the run's own captured fault trace (the same
+        // mechanism `sim_chaos.rs`-style chaos tests use): only classify as
+        // the bounded, chaos-attributable `ChaosOrphaned` when the trace
+        // shows a `BitFlip` fault actually fired during this run. With NO
+        // such evidence — the genuine lost-wakeup case — the hard `Err`
+        // still fires, so `sim_delayed_marker_is_observed` (the strict,
+        // chaos-free single-seed anchor) is completely unaffected: it never
+        // has fault evidence to find, and a real regression on that seed
+        // still fails loudly.
+        // The evidence must come from THIS wait, not from anywhere in the run.
+        // `observability().snapshot()` returns the run-wide fault timeline, so a
+        // `BitFlip` that fired during connect or subscribe — already recovered
+        // from, since we only reach here after a clean subscribe — would
+        // otherwise satisfy the check and reclassify a genuine lost wakeup as the
+        // tolerated `ChaosOrphaned`. That would blunt exactly the seed diversity
+        // `sim_delayed_marker_is_observed_sweep_16_seeds` exists to provide.
+        // Baseline the count before the wait and require it to have GROWN.
+        let bit_flips_before = bit_flip_count(ctx);
+        let wait_result = time
             .timeout(
                 Duration::from_secs(15),
                 client.next_replicated_subscription_marker(),
             )
-            .await
-            .map_err(|_| "next_replicated_subscription_marker hung (lost wakeup)".to_owned())?
-        else {
+            .await;
+        let Ok(resolved) = wait_result else {
+            let saw_bit_flip = bit_flip_count(ctx) > bit_flips_before;
+            if saw_bit_flip {
+                return Ok(MarkerOutcome::ChaosOrphaned(
+                    "next_replicated_subscription_marker timed out with a BitFlip fault \
+                     recorded DURING the wait — the single-shot marker frame was \
+                     chaos-corrupted in flight (#365)"
+                        .to_owned(),
+                ));
+            }
+            return Err("next_replicated_subscription_marker hung (lost wakeup)".to_owned());
+        };
+        let Some(observed) = resolved else {
             return Ok(MarkerOutcome::Severed(
                 "connection closed before marker arrived".to_owned(),
             ));
@@ -642,4 +742,57 @@ fn sim_delayed_marker_is_observed_sweep_16_seeds() {
         observed_any.load(Ordering::SeqCst),
         "no seed reached the parked-waiter window to observe the marker: {report:?}"
     );
+}
+
+/// Pinned regression: issue #365, `MOONPOOL_SEED=0x7aefae55458dd414`, derived
+/// sub-seed `6405417372729688799` — a `BitFlip` chaos fault corrupts the
+/// single-shot, CRC32C-covered snapshot-marker `MESSAGE` frame in flight;
+/// magnetar-proto's verify-or-drop policy (invariant #4) silently drops it
+/// and the connection stays alive with nothing left to re-notify the parked
+/// marker waiter. Fixed by classifying the marker-guard expiry as
+/// `MarkerOutcome::ChaosOrphaned` when the run's captured fault trace shows a
+/// `BitFlip`, exactly the bounded treatment `Severed` already gets. Pins the
+/// derived sub-seed directly (not the outer `MOONPOOL_SEED`) so the guard
+/// targets the exact faulty draw. This file is `PARITY_EXEMPT`
+/// (`check-runtime-test-parity`), so this regression test costs nothing
+/// against the tokio↔moonpool 1:1 counter.
+#[test]
+fn sim_delayed_marker_regression_365_sub_seed_6405417372729688799() {
+    let coord = Arc::new(Coordination::default());
+    let client = MarkerClientWorkload::new(coord.clone());
+    let report = SimulationBuilder::new()
+        .run_time_budget(SIM_RUN_TIME_BUDGET)
+        .workload(DelayedMarkerBroker::new(coord))
+        .workload(client)
+        .set_debug_seeds(vec![6_405_417_372_729_688_799])
+        .set_iterations(1)
+        .run();
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
+}
+
+/// Pinned regression: issue #368, `MOONPOOL_SEED=0x10af708e269312b0`, derived
+/// sub-seed `7383837303657982387` — a bit flip corrupts an un-CRC'd CONTROL
+/// (`Subscribe`) frame; the broker's `Success` reply then correlates against
+/// the wrong (corrupted) `request_id` and the client's subscribe future never
+/// resolves. `Client::subscribe` already routes through the connection's own
+/// bounded `operation_timeout` (`sim_connect_config()`'s 20s), whose `Err`
+/// this file already classifies as `MarkerOutcome::Severed` — but the test's
+/// OWN outer guards (previously 20s connect / 5s subscribe) were shorter
+/// than or equal to that deadline and fired first, converting an
+/// already-handled bounded outcome into a hard "timed out" failure. Fixed by
+/// raising both outer guards to `OUTER_GUARD` (25s), strictly longer than
+/// the 20s `operation_timeout` they wrap. Pins the derived sub-seed directly.
+/// `PARITY_EXEMPT` — see the #365 regression test above.
+#[test]
+fn sim_delayed_marker_regression_368_sub_seed_7383837303657982387() {
+    let coord = Arc::new(Coordination::default());
+    let client = MarkerClientWorkload::new(coord.clone());
+    let report = SimulationBuilder::new()
+        .run_time_budget(SIM_RUN_TIME_BUDGET)
+        .workload(DelayedMarkerBroker::new(coord))
+        .workload(client)
+        .set_debug_seeds(vec![7_383_837_303_657_982_387])
+        .set_iterations(1)
+        .run();
+    assert_eq!(report.failed_runs, 0, "report: {report:?}");
 }

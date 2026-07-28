@@ -236,3 +236,230 @@ async fn e2e_send_timeout_fires_when_receipt_lost() -> Result<(), Box<dyn std::e
     client.close().await;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Issue #369 — send_timeout must surface for a publish RELOCATED across a
+// supervised reconnect, instead of hanging for the whole reconnect budget.
+//
+// The scenario above disables reconnect on purpose ("a redial would
+// transparently replay the in-flight send and mask the timeout") — that
+// comment marks exactly the gap this second test closes: with the
+// auto-reconnect supervisor ENABLED, the in-flight send survives the drop by
+// being relocated into `Connection::in_flight_publish_snapshots`
+// (`Connection::reset()`), and MUST still resolve via `send_timeout` well
+// before the supervisor's much longer reconnect budget gives up.
+// ---------------------------------------------------------------------------
+
+/// Proxy client<->broker bytes for ONE connection, watching the
+/// client-to-broker direction for a `CommandSend` frame. Every frame BEFORE
+/// the send is forwarded untouched; the `CommandSend` frame itself (and
+/// everything behind it) is dropped WITHOUT forwarding and the connection is
+/// torn down immediately — the broker never sees the publish, so a
+/// `CommandSendReceipt` is categorically impossible and cannot race the
+/// timeout under test. Flips `send_seen` right before dropping so the
+/// accept loop knows every connection from here on is a supervisor redial.
+///
+/// Applied to EVERY connection the gate proxies (not just "the first") — a
+/// Pulsar client may legitimately open more than one physical connection to
+/// the same broker address before the producer's operational connection
+/// carries any `CommandSend` (e.g. a separate bootstrap/lookup leg), and
+/// hard-coding "only the first connection is real" black-holed those
+/// legitimate legs and made `open_producer` hang on `operation_timeout`
+/// instead of exercising the scenario under test.
+async fn proxy_until_send_then_drop(
+    inbound: TcpStream,
+    outbound: TcpStream,
+    send_seen: Arc<AtomicBool>,
+) {
+    let (mut ri, mut wi) = inbound.into_split();
+    let (mut ro, mut wo) = outbound.into_split();
+
+    let c2b = async move {
+        let mut pending = bytes::BytesMut::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match ri.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            pending.extend_from_slice(&buf[..n]);
+            loop {
+                let before_len = pending.len();
+                let mut probe = pending.clone().freeze();
+                let frame = match magnetar_proto::decode_one(&mut probe) {
+                    Ok(f) => f,
+                    Err(magnetar_proto::FrameError::Incomplete { .. }) => break,
+                    Err(_) => return,
+                };
+                let consumed = before_len - probe.len();
+                let is_send =
+                    frame.command.r#type == magnetar_proto::pb::base_command::Type::Send as i32;
+                let frame_bytes = pending.split_to(consumed);
+                if is_send {
+                    // Mid-publish drop: never forward the Send frame, close now.
+                    send_seen.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if wo.write_all(&frame_bytes).await.is_err() {
+                    return;
+                }
+                if wo.flush().await.is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let b2c = async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match ro.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            if wi.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+            if wi.flush().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = c2b => {}
+        () = b2c => {}
+    }
+    // Whichever direction finished first, dropping the other future here
+    // closes its half of both sockets — the connection is fully torn down.
+}
+
+/// Gate for issue #369: every inbound connection proxies transparently to
+/// the real broker (via [`proxy_until_send_then_drop`]) UNTIL the first
+/// `CommandSend` frame is observed on ANY connection — at that point the
+/// carrying connection drops (the broker never sees the publish) and the
+/// shared `send_seen` flag flips. Every connection accepted AFTER that
+/// point is a supervisor redial: accepted but never proxied to the broker
+/// at all (a loopback black hole), so the handshake never completes and the
+/// supervisor stays "trying" for as long as its (deliberately generous)
+/// attempt budget allows, while the relocated send's `send_timeout` is what
+/// this test expects to fire first.
+async fn spawn_drop_on_send_then_blackhole_gate(
+    broker_host: String,
+    broker_port: u16,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gate_addr = listener.local_addr()?;
+    let send_seen = Arc::new(AtomicBool::new(false));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _peer)) = listener.accept().await else {
+                return;
+            };
+            if send_seen.load(Ordering::SeqCst) {
+                tokio::spawn(async move {
+                    let _inbound = inbound;
+                    std::future::pending::<()>().await;
+                });
+                continue;
+            }
+            let host = broker_host.clone();
+            let flag = send_seen.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = TcpStream::connect((host.as_str(), broker_port)).await else {
+                    return;
+                };
+                proxy_until_send_then_drop(inbound, outbound, flag).await;
+            });
+        }
+    });
+
+    Ok(format!("{}:{}", gate_addr.ip(), gate_addr.port()))
+}
+
+fn generous_supervisor() -> magnetar_proto::SupervisorConfig {
+    magnetar_proto::SupervisorConfig {
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(100),
+        // Comfortably longer than SEND_TIMEOUT — the supervisor must still
+        // be trying (not have given up) when the send-timeout sweep fires,
+        // proving the fix (not a give-up / fail_all_pending path) resolved
+        // the send.
+        mandatory_stop: Duration::from_mins(2),
+        max_attempts: Some(10_000),
+        anti_thrash_threshold: None,
+        drop_grace: Duration::from_millis(500),
+        max_backoff_after_thrash: Duration::from_millis(200),
+    }
+}
+
+/// Issue #369 e2e acceptance test: with the auto-reconnect supervisor
+/// ENABLED, a publish relocated by `Connection::reset()` across a supervised
+/// reconnect surfaces its configured `send_timeout` error, instead of
+/// parking for the supervisor's entire (much longer) reconnect budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_send_timeout_fires_for_publish_relocated_across_supervised_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (broker_host, broker_port, _container) = start_pulsar().await?;
+
+    let gate_host_port = spawn_drop_on_send_then_blackhole_gate(broker_host, broker_port).await?;
+    let service_url = format!("pulsar://{gate_host_port}");
+
+    // Reconnect intentionally ENABLED — this is the gap the scenario above
+    // does NOT cover.
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .operation_timeout(Duration::from_mins(1))
+        .enable_reconnect(generous_supervisor())
+        .build()
+        .await?;
+
+    let topic = "persistent://public/default/magnetar-e2e-send-timeout-reconnect";
+    let producer = client
+        .producer(topic)
+        .send_timeout(SEND_TIMEOUT)
+        .create()
+        .await?;
+
+    // No sanity send before this one: the gate drops the connection on the
+    // FIRST `CommandSend` frame it ever observes (see
+    // `spawn_drop_on_send_then_blackhole_gate`), so an earlier sanity
+    // publish would itself trigger the drop instead of this one.
+    // `open_producer`'s already-successful `CommandProducerSuccess`
+    // round-trip is sufficient proof the connection is live and healthy.
+    let send_started = std::time::Instant::now();
+    // The gate drops the connection the instant it sees this CommandSend,
+    // then black-holes every subsequent redial. The send must still resolve
+    // via `send_timeout` well before the supervisor's 120s / 10_000-attempt
+    // budget could plausibly be exhausted. The outer tokio timeout is a
+    // generous no-hang guard, not the assertion itself.
+    let send_result = tokio::time::timeout(
+        Duration::from_secs(30),
+        producer.send(OutgoingMessage::with_payload(b"relocated-across-reconnect".to_vec()).into()),
+    )
+    .await
+    .expect("the relocated send must resolve well before the supervisor's reconnect budget");
+    let elapsed = send_started.elapsed();
+
+    match send_result {
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(
+                msg.contains("timeout"),
+                "the relocated send must fail with a TIMEOUT error, got: {e}"
+            );
+        }
+        Ok(message_id) => {
+            panic!(
+                "send returned Ok({message_id:?}) despite the connection being dropped mid-publish"
+            )
+        }
+    }
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "send-timeout must fire on roughly the {SEND_TIMEOUT:?} deadline, not the \
+         supervisor's reconnect budget (elapsed={elapsed:?})"
+    );
+
+    client.close().await;
+    Ok(())
+}

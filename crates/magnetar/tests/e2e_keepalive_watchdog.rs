@@ -34,11 +34,26 @@
 //! Pairs with the proto unit tests, the runtime `keepalive_watchdog`
 //! integration tests, and the differential equivalence test (ADR-0024).
 //!
+//! ## Issue #370 / ADR-0083 — the write-deadline sibling scenario
+//!
+//! [`e2e_write_deadline_recovers_from_stalled_peer`] below is the e2e layer
+//! for ADR-0083, a DIFFERENT failure shape than the black-hole scenario
+//! above: `keepalive_watchdog` covers a peer that goes silent on READS
+//! (never answers `PING`); the write-deadline scenario covers a peer that
+//! accepts the connection and then stops draining our WRITES — exactly the
+//! one-directional stall `keepalive_interval` cannot detect (it only
+//! measures read-side liveness). It uses its own `spawn_stall_once_gate` /
+//! `splice_with_stall` pair rather than the black-hole gate above: a
+//! black-hole gate keeps READING the client's bytes and only drops them
+//! (so the client's own socket write never backs up — it wouldn't
+//! reproduce this bug at all); the stall gate genuinely stops reading from
+//! the client-facing socket, so the client's own kernel send buffer fills.
+//!
 //! Runs as a regular test under `cargo test` (ADR-0046, no `#[ignore]`, no
 //! feature gate). Requires Docker + a reachable `apachepulsar/pulsar` image.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use magnetar::{OutgoingMessage, PulsarClient, SupervisorConfig};
@@ -251,6 +266,160 @@ async fn e2e_keepalive_watchdog_recovers_from_silent_peer() -> Result<(), Box<dy
         }
     };
     send_outcome?;
+
+    producer.close().await?;
+    client.close().await;
+    Ok(())
+}
+
+/// Payload comfortably larger than the loopback TCP window the gate has
+/// already been granted by the time it stops draining the client→broker
+/// direction — window growth requires the receiver to actually read, which
+/// never happens once the stall arms. Kept under any realistic
+/// `max_message_size` so it is one frame, no chunking involved.
+const STALLED_WRITE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024 - 4096;
+
+/// Bytes forwarded client→broker before the stall arms — generous headroom
+/// over the CONNECT + PRODUCER open frames so both are safely through
+/// before the gate stops reading.
+const ARM_STALL_AFTER_BYTES: u64 = 4096;
+
+/// Copies `src` → `dst` until EOF/error, OR — once `stall` is armed for
+/// this connection AND `forwarded` crosses [`ARM_STALL_AFTER_BYTES`] —
+/// parks forever without ever reading `src` again. The socket is neither
+/// closed nor drained further: this is the genuine one-directional stall
+/// issue #370 is about, DIFFERENT from `splice_with_blackhole` above
+/// (which keeps reading and only drops bytes, so the peer's own socket
+/// write never backs up and would not reproduce this bug at all).
+async fn splice_with_stall<R, W>(mut src: R, mut dst: W, stall_this_connection: bool)
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut forwarded: u64 = 0;
+    loop {
+        if stall_this_connection && forwarded >= ARM_STALL_AFTER_BYTES {
+            std::future::pending::<()>().await;
+        }
+        let n = match src.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        forwarded += u64::try_from(n).unwrap_or(u64::MAX);
+        if dst.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+        if dst.flush().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Spawn a gate that proxies client↔broker. The FIRST accepted connection
+/// stalls its client→broker direction once [`ARM_STALL_AFTER_BYTES`] have
+/// been forwarded (letting CONNECT + PRODUCER-open through first); every
+/// LATER accepted connection (the supervisor's post-deadline redial)
+/// proxies normally in both directions, so the replayed send can complete.
+async fn spawn_stall_once_gate(
+    broker_host: String,
+    broker_port: u16,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gate_addr = listener.local_addr()?;
+    let accept_count = Arc::new(AtomicU32::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((inbound, _peer)) = listener.accept().await else {
+                return;
+            };
+            let is_first = accept_count.fetch_add(1, Ordering::SeqCst) == 0;
+            let host = broker_host.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = TcpStream::connect((host.as_str(), broker_port)).await else {
+                    return;
+                };
+                let (ri, wi) = inbound.into_split();
+                let (ro, wo) = outbound.into_split();
+                let c2b = splice_with_stall(ri, wo, is_first);
+                let b2c = splice_with_stall(ro, wi, false);
+                tokio::join!(c2b, b2c);
+            });
+        }
+    });
+
+    Ok(format!("{}:{}", gate_addr.ip(), gate_addr.port()))
+}
+
+/// Issue #370 / ADR-0083: a broker-side peer that accepts the connection
+/// then stops draining the client's socket must not be able to wedge the
+/// connection forever. A short `operation_timeout` bounds the write; once
+/// it fires the connection is marked disconnected and the supervisor
+/// redials through the gate's second (healthy) accepted connection, so a
+/// send that started before the stall still eventually completes, and a
+/// send issued after recovery succeeds normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_write_deadline_recovers_from_stalled_peer() -> Result<(), Box<dyn std::error::Error>> {
+    let (broker_host, broker_port, _container) = start_pulsar().await?;
+
+    let gate_host_port = spawn_stall_once_gate(broker_host, broker_port).await?;
+    let service_url = format!("pulsar://{gate_host_port}");
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .enable_reconnect(supervisor_for_e2e())
+        // Short so the write-deadline expiry is reached quickly inside the
+        // test budget; still comfortably longer than a normal round trip
+        // against the local gate.
+        .operation_timeout(Duration::from_secs(3))
+        .build()
+        .await?;
+
+    let topic = "persistent://public/default/magnetar-e2e-write-deadline";
+    let producer = client.producer(topic).create().await?;
+
+    // Sanity round-trip before the stall so we know the session is live.
+    producer
+        .send(OutgoingMessage::with_payload(b"before-stall".to_vec()).into())
+        .await?;
+
+    // Oversized publish: parks mid-write once the gate's first connection
+    // stops draining. Bounded by an outer harness timeout well past the
+    // 3s operation_timeout + redial + replay budget, so a regression back
+    // to "never resolves" fails loudly instead of hanging the suite.
+    tracing::info!("issuing the stalled write");
+    let big_payload = vec![0xABu8; STALLED_WRITE_PAYLOAD_BYTES];
+    let stalled_outcome = tokio::time::timeout(
+        Duration::from_secs(25),
+        producer.send(OutgoingMessage::with_payload(big_payload).into()),
+    )
+    .await;
+    match stalled_outcome {
+        Ok(Ok(_message_id)) => {
+            tracing::info!("stalled send recovered via write-deadline + redial + replay");
+        }
+        Ok(Err(e)) => {
+            return Err(format!(
+                "stalled send resolved with a terminal error instead of \
+                 redial + replay (issue #370 regression): {e:?}"
+            )
+            .into());
+        }
+        Err(_elapsed) => {
+            return Err(
+                "stalled send never completed within the 25s harness budget — \
+                         the driver write deadline did not fire (issue #370 regression)"
+                    .into(),
+            );
+        }
+    }
+
+    // A send issued AFTER recovery, on the now-healthy redialled
+    // connection, must also succeed normally.
+    producer
+        .send(OutgoingMessage::with_payload(b"after-stall".to_vec()).into())
+        .await?;
 
     producer.close().await?;
     client.close().await;

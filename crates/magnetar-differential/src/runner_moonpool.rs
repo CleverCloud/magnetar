@@ -73,6 +73,28 @@ pub async fn run_supervised(
     replay(client, trace).await
 }
 
+/// Sibling of [`run_supervised`] with a caller-supplied `operation_timeout`
+/// — see [`crate::runner_tokio::run_supervised_with_operation_timeout`] for
+/// the rationale.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_supervised_with_operation_timeout(
+    host_port: &str,
+    trace: &Trace,
+    supervisor: magnetar_proto::SupervisorConfig,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    let engine = MoonpoolEngine::new(TokioProviders::new());
+    let config = ConnectionConfig {
+        supervisor: Some(supervisor),
+        operation_timeout,
+        ..Default::default()
+    };
+    let client = Client::connect_plain_supervised(&engine, host_port, config, None, None).await?;
+    replay(client, trace).await
+}
+
 async fn replay(client: Client<TokioProviders>, trace: &Trace) -> Result<EventStream, ClientError> {
     let mut stream = EventStream::empty();
 

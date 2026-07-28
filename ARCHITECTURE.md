@@ -570,63 +570,71 @@ Owns the I/O resources (TCP or TLS stream), the per-connection read buffer, and 
                                                │
         ┌──────────────────────────────────────▼──────────────────────────────────┐
         │  (1) Lock state if no write tail is pending. Drain outbound bytes into  │
-        │      a driver-owned pending-write queue. Read deadline / closing flag.  │
-        │      Read next deadline (poll_timeout). Read closing-flag. Drop lock.   │
+        │      a driver-owned pending-write queue. Read deadline / closing flag / │
+        │      operation_timeout (ADR-0083's write-deadline source). Drop lock.   │
         └──────────────────────────────────────┬──────────────────────────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
-                                │  (2) write at most 256 KiB  │
-                                │      from pending queue     │
+                                │  (2) if closing, queue empty │
+                                │      AND no TLS ciphertext   │
+                                │      residue: shutdown now   │
                                 └──────────────┬──────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
-                                │  (3) if closing and queue   │
-                                │      is empty: shutdown     │
+                                │  (3) runtime select! biased  │
                                 └──────────────┬──────────────┘
                                                │
-                                ┌──────────────▼──────────────┐
-                                │  (4) runtime select! biased  │
-                                └──────────────┬──────────────┘
-                                               │
-              ┌────────────────────────────────┼────────────────────────────────┐
-              │                                │                                │
-              ▼                                ▼                                ▼
-   ┌─────────────────────────┐     ┌──────────────────────┐     ┌─────────────────────────┐
-   │ socket.read_buf(&buf)   │     │ shared.driver_waker  │     │ runtime timer deadline  │
-   │   (polled FIRST —        │     │   .notified()        │     │   on tick -> handle_   │
-   │   receipt fairness)      │     │   (user enqueued     │     │   timeout(now)           │
-   │   on Ok(0) -> PeerClosed │     │   a send/ack/etc.)   │     │                         │
-   │   on Ok(n) -> lock +     │     │   loop continues     │     │                         │
-   │   handle_bytes(now, &b)  │     │                      │     │                         │
-   │   then drain events      │     │                      │     │                         │
-   └─────────────────────────┘     └──────────────────────┘     └─────────────────────────┘
-                                               │
-                                ┌──────────────▼──────────────┐
-                                │ pending-write continuation  │
-                                │ if tail bytes remain        │
-                                └──────────────┬──────────────┘
+      ┌─────────────────┬───────────────────────┼───────────────────────┬─────────────────┐
+      │                 │                       │                       │
+      ▼                 ▼                       ▼                       ▼
+┌───────────────┐┌──────────────────┐┌───────────────────────────┐┌─────────────────────┐
+│ read_half     ││ shared.driver_   ││ write_one_budget(…),       ││ runtime timer        │
+│  .read_buf(…) ││  waker           ││   IF write_has_work         ││  deadline on tick    │
+│  (polled       ││  .notified()     ││   (ADR-0083): write up to  ││  -> handle_timeout   │
+│  FIRST —       ││  (user enqueued  ││   256 KiB, bounded by      ││  (now)                │
+│  receipt       ││  a send/ack/     ││   operation_timeout; Err   ││                       │
+│  fairness)     ││  etc.); loop     ││   -> mark_disconnected +   ││                       │
+│  on Ok(0) ->   ││  continues       ││   propagate (redial);      ││                       │
+│  PeerClosed    ││                  ││   Ok + queue drained +     ││                       │
+│  on Ok(n) ->   ││                  ││   closing -> shutdown      ││                       │
+│  lock +        ││                  ││                             ││                       │
+│  handle_bytes  ││                  ││                             ││                       │
+│  (now, &buf)   ││                  ││                             ││                       │
+│  then drain    ││                  ││                             ││                       │
+│  events        ││                  ││                             ││                       │
+└───────────────┘└──────────────────┘└───────────────────────────┘└─────────────────────┘
                                                │
                                 ┌──────────────▼──────────────┐
                                 │     back to (1)             │
                                 └─────────────────────────────┘
 ```
 
-### Read fairness
+`read_half` / `write_half` are produced ONCE, at loop entry, by splitting the connected socket (`tokio::io::split` on tokio; `Transport::into_split` on moonpool — see "TLS byte-pipe" below for why moonpool's split needs a shared adapter) and held as separate local bindings for the life of the loop — not re-split per iteration.
+
+### Read fairness and the write deadline (ADR-0070, ADR-0074, ADR-0083)
 
 The tokio driver uses `tokio::select!`; the Moonpool driver uses `moonpool_core::select!`, whose fair branch offset is derived from the simulation seed.
 Both keep `biased;` because ADR-0070 requires a fixed **inbound-read-first** priority before the `driver_waker` arm.
 An unbiased Moonpool selection would remain reproducible, but it would rotate that protocol priority instead of guaranteeing receipt fairness.
 Every `Producer::send` pulses `driver_waker.notify_one()`, so under sustained publish load a waker permit is almost always pending on loop entry; polling the waker arm first would let the outbound path starve inbound `CommandSendReceipt` reads, inflating `send→ack` latency under load while the broker acks in milliseconds (issue #303).
-The outbound path is not starved by giving reads priority: `poll_transmit` + `write_all` run at the TOP of every loop iteration (step (1)/(2) above) regardless of which `select!` arm wins, so each tick still flushes pending sends.
 The read arm is cancel-safe — bytes land in the persistent `read_buf` and are consumed via `split()` only after the arm wins — so the reorder drops no bytes.
-Issue #319 exposed the remaining single-task coupling: a large staged producer transmit could still monopolise the driver inside `write_all` before the read-first `select!` was reached.
-The driver now stores an owned pending-write queue and writes at most 256 KiB per loop turn before returning to the read-first `select!`; if tail bytes remain, a fixed continuation arm keeps flushing them when no read is ready.
-A full read/write task split (a dedicated reader, mirroring `pulsar-client-go`) remains a larger architectural option, but the bounded write turn closes the observed per-connection receipt starvation without splitting TLS or changing supervisor ownership.
+
+Through 2026-07, the write ran unconditionally at the top of every loop iteration (ADR-0074 bounded it to 256 KiB per turn after issue #319, with a fixed continuation arm keeping it flushing whenever bytes remained), and ADR-0070's fairness argument leaned on that: "the outbound path is not starved by giving reads priority, because `poll_transmit` + `write_all` run at the TOP of every loop iteration regardless of which arm wins."
+Issue #370 showed that premise fails against a peer that accepts the connection and then simply stops draining its receive window: the write parks inside that unconditional top-of-loop step, which blocks the ENTIRE loop — not just the write path — starving the read arm, the `driver_waker` arm, and (critically) the timer arm that drives `Connection::handle_timeout` (the keepalive watchdog, the `send_timeout` sweep, and the `ack_response_timeout` backstop).
+`mark_disconnected()` was never reached, so `is_connected()` kept reporting `true` on a functionally dead connection.
+
+**ADR-0083** (amends ADR-0070 and ADR-0074) makes the write its own `select!` arm — third in order, after read and the waker, before the timer — gated by `write_has_work` so an idle connection never polls it.
+Two independent bounds keep it from starving anything: `DRIVER_WRITE_BUDGET_BYTES` (256 KiB, unchanged from ADR-0074) caps how much one arm win writes before yielding back to read, and `Connection::operation_timeout()` (30 s default — **not** `keepalive_interval`, which only detects read-side silence and would never trip against a peer that keeps ACKing pings while refusing to drain writes) caps how long a single win may block on a peer that never drains.
+The deadline is anchored to a fixed `Instant` computed once, outside the `select!`, when a logical write first has work, and held fixed while it continues across iterations — re-arming it fresh inside the per-iteration arm expression would silently reset to a full budget every time an unrelated arm won a round, so a stalled write racing ordinary background traffic on the same connection would never accumulate real elapsed time toward its own deadline.
+Expiry maps to `io::ErrorKind::TimedOut` and routes through the exact same `mark_disconnected()` + `Err` branch every other write failure already takes, so the supervisor redials unchanged.
+
+Making the write cancellable (droppable mid-poll, routine once it races other arms) required a prerequisite rewrite: both engines' `write_budgeted` now issue single-poll writes and commit `front_offset` synchronously right after each `Ready(n)`, before any further `.await`, so a cancelled write never re-sends bytes the kernel already accepted nor silently drops bytes that were popped out of the queue ahead of the actual I/O (moonpool's old eager `pop_budgeted` detach did exactly that).
+Moonpool's TLS arm additionally gained a resumable `pending_ciphertext` queue between the adapter and the wire — encryption capture (`push_plaintext` → `step` → drain into the queue) is fully synchronous, so it can never itself be cancelled mid-way, and the read half appends any protocol-mandated ciphertext its own decrypt step produces (e.g. a TLS 1.3 `KeyUpdate` ack) into the SAME queue rather than stranding it on an otherwise write-idle connection.
 
 ### Lock discipline
 
 Every interaction with `Connection` happens inside a `parking_lot::Mutex` critical section.
-Critical sections are short — they **never `.await`**. The `write_all` / `flush` calls happen _outside_ the lock so user futures can keep enqueuing while the driver holds the network handle.
+Critical sections are short — they **never `.await`**. The write / flush calls happen _outside_ the lock so user futures can keep enqueuing while the driver holds the network handle.
 
 ### Event dispatch
 
@@ -1484,8 +1492,9 @@ The workspace has **three** TLS sites.
 1. **`magnetar-runtime-tokio`** — `tokio_rustls::TlsConnector::connect(server_name, tcp)` is the standard path.
    Roots come from `rustls-native-certs` by default; users can override with `ClientBuilder::tls_trust_certs_pem` / `tls_trust_certs_file_path`, in which case `Client::tls_config_from_pem` builds a custom `rustls::ClientConfig` from the supplied PEM chain.
 2. **`magnetar-runtime-moonpool`** — `tls::RustlsByteAdapter` drives a `rustls::ClientConnection` (itself sans-io) over the moonpool byte pipe.
-   Each iteration of the driver loop pumps `socket.read` → `session.read_tls` → `session.process_new_packets()` → drain `session.reader()` into `plaintext_in`.
-   Symmetric on the write path.
+   A read-arm win pumps `socket.read` → `session.read_tls` → `session.process_new_packets()` → drain `session.reader()` into `plaintext_in`; symmetric on the write path.
+   Since [ADR-0083](specs/adr/0083-bounded-cancellable-driver-write.md), the read and write `select!` arms hold independent halves of the split transport (`Transport::into_split`), so the adapter — inherently bidirectional (one `step()` call drains both directions) — lives behind `Arc<parking_lot::Mutex<TlsShared>>`, shared by both halves; the mutex is never held across an `.await` (`step()` is fully synchronous).
+   `TlsShared` also carries a resumable `pending_ciphertext` queue: the read half only ever appends to it (e.g. a protocol-mandated TLS 1.3 `KeyUpdate` ack produced while decrypting inbound bytes), never writing to the socket itself, and the write half drains it.
 3. **`magnetar-admin`** — `reqwest` configured with `rustls-tls` for the REST admin client.
 
 Source: GUIDELINES.md §"TLS" — rule is hard.

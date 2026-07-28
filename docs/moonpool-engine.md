@@ -219,6 +219,11 @@ The TLS arm stays contiguous, so its chaos fidelity is unchanged (rustls owns re
 
 `cargo run -p xtask -- check-runtime-test-parity` (ADR-0024) skips the four `PARITY_EXEMPT_FILES` (`sim_chaos.rs`, `src/pool.rs`, `proxy_multi_conn.rs`, `replicated_subscriptions_sim.rs`) — moonpool-only harnesses with no tokio twin — so the strict 1:1 tokio ↔ moonpool count holds on the non-exempt set.
 
+Every `SimulationBuilder::new()` test — which is every test in this chaos pack, `sim_chaos.rs` included — inherits `moonpool-sim`'s default-on network chaos: bit-flip corruption, probabilistic connect failure, and buggified delay, all active from `NetworkConfiguration::default()`.
+This is a deliberate, binding decision, not an oversight: see [ADR-0055](../specs/adr/0055-bit-flip-survivability-model.md), which considered and rejected both disabling bit-flip for magnetar's sim and making moonpool's bit-flip opt-in, and instead mandates hardening the client and the workloads.
+Every sim workload's setup path (initial connect, `subscribe`, `open_producer`) must therefore be wrapped in `retry_setup` / `retry_supervised_connect` (both defined near the top of `sim_chaos.rs`) so a transient chaos-induced drop during setup is retried instead of failing the whole iteration.
+As a verified-but-out-of-scope observation, `ChaosConfiguration::disabled()` exists in `moonpool-sim` but is unreachable from `SimulationBuilder`'s public API — `ChaosMode` offers only `Random` and `Swarm` — so opting out of chaos is not available today.
+
 Reproduce a flaky run under a specific seed:
 
 ```bash

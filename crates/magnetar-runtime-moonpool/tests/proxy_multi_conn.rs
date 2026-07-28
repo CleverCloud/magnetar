@@ -66,8 +66,12 @@ const ADVERTISED_BROKER_HOST_PORT: &str = "broker-a.proxy.internal:6650";
 
 /// Spawn a fake Apache Pulsar Proxy on `127.0.0.1:0`. Returns the bound
 /// `host:port` (moonpool's address form — no `pulsar://` scheme) and the
-/// per-session record log.
-async fn spawn_proxy() -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
+/// per-session record log. `broker_url` is the value the fake advertises in
+/// every lookup response's `broker_service_url` — normally
+/// [`ADVERTISED_BROKER_URL`], but a corrupted-scheme override lets a test
+/// exercise `direct_broker_authority` / `proxy_broker_authority`'s
+/// issue #364 rejection path.
+async fn spawn_proxy(broker_url: &'static str) -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
     let addr = listener.local_addr().expect("local_addr");
     let sessions: Arc<Mutex<Vec<SessionRecord>>> = Arc::new(Mutex::new(Vec::new()));
@@ -84,7 +88,7 @@ async fn spawn_proxy() -> (String, Arc<Mutex<Vec<SessionRecord>>>) {
             };
             let sessions = sessions_for_task.clone();
             tokio::spawn(async move {
-                let _ = handle_session(stream, &sessions, session_idx).await;
+                let _ = handle_session(stream, &sessions, session_idx, broker_url).await;
             });
         }
     });
@@ -95,6 +99,7 @@ async fn handle_session(
     mut stream: tokio::net::TcpStream,
     sessions: &Arc<Mutex<Vec<SessionRecord>>>,
     session_idx: usize,
+    broker_url: &str,
 ) -> std::io::Result<()> {
     let mut read_buf = BytesMut::with_capacity(8 * 1024);
     let mut out_buf = BytesMut::with_capacity(8 * 1024);
@@ -122,7 +127,7 @@ async fn handle_session(
                 sessions.lock()[session_idx].frames.push(kind);
             }
 
-            handle_frame(&frame, &mut out_buf, session_idx);
+            handle_frame(&frame, &mut out_buf, session_idx, broker_url);
         }
 
         if !out_buf.is_empty() {
@@ -139,7 +144,12 @@ async fn handle_session(
     }
 }
 
-fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, session_idx: usize) {
+fn handle_frame(
+    frame: &magnetar_proto::Frame,
+    out: &mut BytesMut,
+    session_idx: usize,
+    broker_url: &str,
+) {
     let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
         return;
     };
@@ -176,7 +186,7 @@ fn handle_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut, session_idx: 
                 let cmd = pb::BaseCommand {
                     r#type: pb::base_command::Type::LookupResponse as i32,
                     lookup_topic_response: Some(pb::CommandLookupTopicResponse {
-                        broker_service_url: Some(ADVERTISED_BROKER_URL.to_owned()),
+                        broker_service_url: Some(broker_url.to_owned()),
                         broker_service_url_tls: None,
                         response: Some(
                             pb::command_lookup_topic_response::LookupType::Connect as i32,
@@ -241,7 +251,7 @@ async fn open_producer_through_proxy_opens_second_connection() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (host_port, sessions) = spawn_proxy().await;
+            let (host_port, sessions) = spawn_proxy(ADVERTISED_BROKER_URL).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let client = tokio::time::timeout(
@@ -328,7 +338,7 @@ async fn subscribe_through_proxy_opens_second_connection() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (host_port, sessions) = spawn_proxy().await;
+            let (host_port, sessions) = spawn_proxy(ADVERTISED_BROKER_URL).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let client = tokio::time::timeout(
@@ -390,7 +400,7 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (host_port, sessions) = spawn_proxy().await;
+            let (host_port, sessions) = spawn_proxy(ADVERTISED_BROKER_URL).await;
             let engine = MoonpoolEngine::new(TokioProviders::new());
 
             let client = tokio::time::timeout(
@@ -451,6 +461,88 @@ async fn second_producer_to_same_broker_reuses_pool_entry() {
             assert_eq!(
                 producer_count, 2,
                 "pinned session must have served both producers; saw {producer_count}"
+            );
+        })
+        .await;
+}
+
+/// Broker URL carrying a single-bit corruption of the `pulsar` scheme word
+/// (`pulsar` -> `ptlsar`) — the same shape issue #364 observed from
+/// moonpool-sim's bit-flip chaos. Neither `strip_prefix("pulsar+ssl://")`
+/// nor `strip_prefix("pulsar://")` matches this.
+const CORRUPTED_SCHEME_BROKER_URL: &str = "ptlsar://broker-a.proxy.internal:6650";
+
+/// Regression coverage for issue #364's production hardening (this is the
+/// integration-level (c) layer of ADR-0024's obligation; see
+/// `crates/magnetar-runtime-moonpool/src/client.rs`'s
+/// `proxy_broker_authority` unit tests for the (a)-adjacent private-fn
+/// coverage, and `magnetar-differential`'s
+/// `corrupted_broker_scheme_equivalence.rs` for the (d) layer).
+///
+/// Before the fix, a corrupted-scheme `broker_service_url` silently
+/// truncated into the nonsense authority `"ptlsar:"` and the client still
+/// tried (and — depending on the fake broker's leniency — could even
+/// succeed) opening a producer through it. After the fix,
+/// `proxy_broker_authority` returns `Err` as soon as the lookup response
+/// is processed, and `open_producer` must fail with that error instead of
+/// silently mis-routing through a garbage authority. Exactly ONE TCP
+/// session (the bootstrap) is opened — the client never attempts the
+/// second (pinned) dial at all, because the authority derivation fails
+/// before any dial is attempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_producer_through_proxy_rejects_corrupted_broker_scheme() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (host_port, sessions) = spawn_proxy(CORRUPTED_SCHEME_BROKER_URL).await;
+            let engine = MoonpoolEngine::new(TokioProviders::new());
+
+            let client = tokio::time::timeout(
+                HANG_GUARD,
+                Client::connect_plain_supervised(
+                    &engine,
+                    &host_port,
+                    supervised_config(),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("connect did not time out")
+            .expect("connect ok");
+
+            let open_result = tokio::time::timeout(
+                HANG_GUARD,
+                client.open_producer(CreateProducerRequest {
+                    topic: "persistent://public/default/proxy-moonpool-corrupted-scheme".to_owned(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("open_producer did not time out");
+
+            let snapshot = sessions.lock().clone();
+            if let Some(d) = client.take_driver() {
+                d.abort();
+            }
+            drop(client);
+
+            assert!(
+                open_result.is_err(),
+                "open_producer must fail on a corrupted-scheme broker_service_url, not silently \
+                 succeed through a mis-derived authority"
+            );
+
+            assert_eq!(
+                snapshot.len(),
+                1,
+                "only the bootstrap session may be opened — the corrupted scheme must be \
+                 rejected before any pinned dial is attempted, got {snapshot:?}"
+            );
+            assert!(
+                snapshot[0].connect_proxy_to_broker_url.is_none(),
+                "the single session must be the bootstrap (no proxy_to_broker_url), got {:?}",
+                snapshot[0].connect_proxy_to_broker_url
             );
         })
         .await;

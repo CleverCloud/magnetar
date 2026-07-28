@@ -474,3 +474,101 @@ fn session_epoch_bumps_exactly_once_per_reset_in_replay_cycle() {
         "the snapshot bucket is empty after both acked rebuild cycles"
     );
 }
+
+/// Issue #369: a publish relocated into `in_flight_publish_snapshots` by
+/// `reset()` still surfaces its configured `send_timeout` at exactly the
+/// original virtual deadline — it must not hang for the whole reconnect
+/// budget, and it must not fire early either. Mirrors
+/// `virtual_clock_send_timeout.rs::send_timeout_fires_at_virtual_deadline`'s
+/// deterministic-virtual-clock shape, with a `reset()` inserted between
+/// enqueue and the deadline ticks so the timeout must be enforced from the
+/// snapshot bucket rather than the live pending queue.
+#[test]
+fn send_timeout_fires_at_virtual_deadline_for_publish_relocated_across_reset() {
+    // `open_producer_ready` opens with `CreateProducerRequest::default()`,
+    // which carries the Java-parity default `send_timeout = Some(30s)`
+    // (ADR-0072) — match it here so the deadline math below is exact.
+    const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let t0 = Instant::now();
+    let shared = handshake_complete_shared(t0);
+    let handle = open_producer_ready(
+        &shared,
+        "persistent://public/default/issue-369-virtual-clock",
+        t0,
+    );
+
+    {
+        let mut conn = shared.inner.lock();
+        let seq = conn
+            .send(
+                handle,
+                OutgoingMessage {
+                    payload: Bytes::from_static(b"relocated-virtual-clock"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 24,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue send");
+        drop(conn);
+
+        // Relocate: reset() moves the op out of `pending` into the snapshot
+        // bucket. No new session is built — the point is to exercise the
+        // relocated-send timeout sweep in isolation, exactly like the sibling
+        // proto-level unit tests in `magnetar_proto::conn::conn_state_tests`.
+        shared.inner.lock().reset();
+        assert_eq!(
+            shared.inner.lock().in_flight_publish_snapshot_len(handle),
+            1,
+            "the relocated send must land in the snapshot bucket"
+        );
+        assert_eq!(shared.inner.lock().producer_pending_count(handle), 0);
+
+        let key = PendingOpKey::Send(handle, seq);
+        assert!(
+            shared.inner.lock().take_outcome(key).is_none(),
+            "reset installs no outcome on the Send key — transparent replay contract"
+        );
+
+        // Just BEFORE the deadline (measured from the ORIGINAL t0, not from
+        // the reset): still pending, snapshot survives.
+        let t_before = t0 + SEND_TIMEOUT.saturating_sub(std::time::Duration::from_millis(100));
+        shared.inner.lock().handle_timeout(t_before);
+        assert!(
+            shared.inner.lock().take_outcome(key).is_none(),
+            "no send-timeout outcome before the deadline for a relocated send"
+        );
+        assert_eq!(
+            shared.inner.lock().in_flight_publish_snapshot_len(handle),
+            1,
+            "the snapshot must survive an early handle_timeout tick"
+        );
+
+        // Just AFTER the deadline: the sweep resolves the send with the
+        // configured timeout error and drains the snapshot.
+        let t_after = t0 + SEND_TIMEOUT + std::time::Duration::from_millis(100);
+        shared.inner.lock().handle_timeout(t_after);
+        match shared.inner.lock().take_outcome(key) {
+            Some(OpOutcome::SendError {
+                sequence_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(sequence_id, seq);
+                assert_eq!(code, -1, "send-timeout SendError uses the -1 sentinel");
+                assert_eq!(message, "send timeout");
+            }
+            other => panic!("expected a send-timeout SendError, got {other:?}"),
+        }
+        assert_eq!(
+            shared.inner.lock().in_flight_publish_snapshot_len(handle),
+            0,
+            "the timed-out relocated send must drain out of the snapshot bucket"
+        );
+    }
+}
