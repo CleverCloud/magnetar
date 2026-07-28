@@ -445,3 +445,254 @@ fn replay_preserves_fifo_ordering_across_rebuild() {
         "rebuild must replay the OpSends in their original payload order"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #369 — send_timeout must surface for a publish RELOCATED across a
+// supervised reconnect, instead of hanging for the whole reconnect budget.
+//
+// Everything above this point in the file exercises `ConnectionShared`
+// directly (no real socket, no supervisor). That harness cannot reach this
+// bug: it never drives `magnetar_runtime_tokio::Client`'s supervised
+// `driver_loop`, so it never observes the real reconnect timing this issue is
+// about. This section adds a small real-socket, single-purpose fault
+// injector (a fake broker over loopback TCP) — the file had no such harness
+// to "reuse" for this scenario.
+// ---------------------------------------------------------------------------
+
+mod issue_369_send_timeout_across_reconnect {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use bytes::BytesMut;
+    use magnetar_proto::{
+        AntiThrashThreshold, ConnectionConfig, CreateProducerRequest, FrameError, SupervisorConfig,
+        decode_one, encode_command, pb,
+    };
+    use magnetar_runtime_tokio::{Client, ClientError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::common::HANG_GUARD;
+
+    fn emit_connected(out: &mut BytesMut) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::Connected as i32,
+            connected: Some(pb::CommandConnected {
+                server_version: "magnetar-issue-369-test".to_owned(),
+                protocol_version: Some(21),
+                max_message_size: Some(5 * 1024 * 1024),
+                feature_flags: Some(pb::FeatureFlags::default()),
+            }),
+            ..Default::default()
+        };
+        let _ = encode_command(out, &cmd);
+    }
+
+    fn emit_lookup_response(out: &mut BytesMut, request_id: u64) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::LookupResponse as i32,
+            lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                broker_service_url: None,
+                broker_service_url_tls: None,
+                response: Some(pb::command_lookup_topic_response::LookupType::Connect as i32),
+                request_id,
+                authoritative: Some(true),
+                error: None,
+                message: None,
+                proxy_through_service_url: Some(false),
+            }),
+            ..Default::default()
+        };
+        let _ = encode_command(out, &cmd);
+    }
+
+    fn emit_producer_success(out: &mut BytesMut, request_id: u64) {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id,
+                producer_name: "issue-369-test".to_owned(),
+                last_sequence_id: Some(-1),
+                schema_version: None,
+                topic_epoch: Some(0),
+                producer_ready: Some(true),
+            }),
+            ..Default::default()
+        };
+        let _ = encode_command(out, &cmd);
+    }
+
+    /// First session: answer CONNECT / LOOKUP / PRODUCER normally, then on the
+    /// FIRST `CommandSend` frame close the socket immediately without ever
+    /// sending a `CommandSendReceipt` or `CommandSendError` — a mid-publish
+    /// drop. This is what drives the supervisor's `Connection::reset()`,
+    /// which relocates the in-flight publish into `in_flight_publish_snapshots`
+    /// (issue #369's root cause).
+    async fn handle_first_session_drop_on_send(mut stream: TcpStream) -> std::io::Result<()> {
+        let mut read_buf = BytesMut::with_capacity(64 * 1024);
+        let mut out_buf = BytesMut::new();
+        loop {
+            loop {
+                let mut framed = read_buf.clone().freeze();
+                let before = framed.len();
+                let frame = match decode_one(&mut framed) {
+                    Ok(f) => f,
+                    Err(FrameError::Incomplete { .. }) => break,
+                    Err(_) => return Ok(()),
+                };
+                let consumed = before - framed.len();
+                let _ = read_buf.split_to(consumed);
+                let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+                    continue;
+                };
+                match kind {
+                    pb::base_command::Type::Connect => emit_connected(&mut out_buf),
+                    pb::base_command::Type::Lookup => {
+                        if let Some(l) = &frame.command.lookup_topic {
+                            emit_lookup_response(&mut out_buf, l.request_id);
+                        }
+                    }
+                    pb::base_command::Type::Producer => {
+                        if let Some(p) = &frame.command.producer {
+                            emit_producer_success(&mut out_buf, p.request_id);
+                        }
+                    }
+                    pb::base_command::Type::Send => {
+                        // Mid-publish drop: no receipt, no error — just gone.
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            if !out_buf.is_empty() {
+                stream.write_all(&out_buf).await?;
+                stream.flush().await?;
+                out_buf.clear();
+            }
+            match stream.read_buf(&mut read_buf).await {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Every subsequent redial: accept the TCP connection (so the supervisor's
+    /// dial genuinely succeeds and `Connection::reset()` fires) but never write
+    /// a single byte back — a loopback black hole. The handshake never
+    /// completes, so the supervisor's reconnect stays outstanding for as long
+    /// as its (deliberately generous) attempt budget allows, while the
+    /// relocated send's `send_timeout` deadline is what this test expects to
+    /// fire first.
+    async fn hold_blackhole(stream: TcpStream) {
+        let _stream = stream;
+        std::future::pending::<()>().await;
+    }
+
+    async fn spawn_broker() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                if first {
+                    first = false;
+                    tokio::spawn(async move {
+                        let _ = handle_first_session_drop_on_send(stream).await;
+                    });
+                } else {
+                    tokio::spawn(hold_blackhole(stream));
+                }
+            }
+        });
+        addr
+    }
+
+    fn generous_supervisor() -> SupervisorConfig {
+        SupervisorConfig {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            // Comfortably longer than the send_timeout under test — the
+            // supervisor must still be trying (not have given up) when the
+            // send-timeout sweep fires, proving the fix (not a give-up path)
+            // resolved the send.
+            mandatory_stop: Duration::from_mins(1),
+            max_attempts: Some(10_000),
+            anti_thrash_threshold: Some(AntiThrashThreshold {
+                successful_attaches: 3,
+                window: Duration::from_secs(5),
+                drop_within: Duration::from_millis(200),
+            }),
+            drop_grace: Duration::from_millis(500),
+            max_backoff_after_thrash: Duration::from_millis(60),
+        }
+    }
+
+    /// Issue #369 acceptance test: a publish relocated by `Connection::reset()`
+    /// across a supervised reconnect surfaces its configured `send_timeout`
+    /// error, instead of parking for the supervisor's entire (much longer)
+    /// reconnect budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_times_out_for_publish_relocated_across_supervised_reconnect() {
+        const SEND_TIMEOUT: Duration = Duration::from_millis(600);
+
+        let addr = spawn_broker().await;
+        let url = format!("pulsar://{addr}");
+
+        let cfg = ConnectionConfig {
+            supervisor: Some(generous_supervisor()),
+            ..ConnectionConfig::default()
+        };
+
+        let client = tokio::time::timeout(HANG_GUARD, Client::connect(&url, cfg))
+            .await
+            .expect("connect did not time out")
+            .expect("connect ok");
+
+        let producer = tokio::time::timeout(
+            HANG_GUARD,
+            client.open_producer(CreateProducerRequest {
+                topic: "persistent://public/default/issue-369-send-timeout".to_owned(),
+                send_timeout: Some(SEND_TIMEOUT),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("open_producer did not time out")
+        .expect("open_producer ok");
+
+        let send_started = std::time::Instant::now();
+        // Well before the supervisor's `mandatory_stop` / `max_attempts`
+        // budget could plausibly be exhausted (60s / 10_000 attempts), but
+        // generous enough that CI scheduling jitter cannot trip it as a false
+        // hang — the assertion is on the ERROR arriving, not on tight timing.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            producer.send_bytes("relocated-across-reconnect"),
+        )
+        .await
+        .expect("send must resolve well before the supervisor's reconnect budget");
+        let elapsed = send_started.elapsed();
+
+        match result {
+            Err(ClientError::SendRejected { code, message }) => {
+                assert_eq!(code, -1, "send-timeout SendError uses the -1 sentinel");
+                assert_eq!(message, "send timeout");
+            }
+            other => panic!("expected a send-timeout SendRejected error, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "send-timeout must fire on roughly the {SEND_TIMEOUT:?} deadline, not the \
+             supervisor's reconnect budget (elapsed={elapsed:?})"
+        );
+
+        if let Some(d) = client.take_driver() {
+            d.abort();
+        }
+        drop(client);
+    }
+}

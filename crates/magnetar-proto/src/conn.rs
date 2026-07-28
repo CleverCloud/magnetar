@@ -1007,6 +1007,39 @@ impl Connection {
             }
         }
 
+        // (2b) Issue #369, Change 2 (separable from Change 1 — a reviewer can drop this
+        // block without unpicking the send-timeout sweep above): terminalize every
+        // publish RELOCATED by a prior `reset()` into `in_flight_publish_snapshots` too.
+        // Symmetric with `fail_producer_open_with_broker_error`'s snapshot drain — without
+        // it, a send parked in the snapshot bucket at give-up time depends on its future
+        // having already re-polled and re-registered into the connection-wide waker slab
+        // (the step-(3) sweep below only wakes `self.wakers`, which the snapshot's own
+        // wakerless `OpSend` is not a member of). Draining the bucket directly removes
+        // that dependency instead of relying on the woken task being rescheduled in time.
+        let snapshot_handles: Vec<ProducerHandle> =
+            self.in_flight_publish_snapshots.keys().copied().collect();
+        for handle in snapshot_handles {
+            let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle) else {
+                continue;
+            };
+            for mut snapshot in snapshots {
+                let key = PendingOpKey::Send(handle, snapshot.sequence_id);
+                self.outcomes.insert(
+                    key,
+                    OpOutcome::Terminal {
+                        key,
+                        reason: reason.to_owned(),
+                    },
+                );
+                if let Some(w) = snapshot.waker.take() {
+                    let _ = self.wakers.remove(&key);
+                    w.wake();
+                } else if let Some(w) = self.wakers.remove(&key) {
+                    w.wake();
+                }
+            }
+        }
+
         // (3) Sweep any leftover slab wakers — BOTH `Request` and `Send` keys
         // get a `Terminal` outcome (no replay carve-out here, unlike `reset`).
         let leftover_keys: Vec<PendingOpKey> = self.wakers.keys().copied().collect();
@@ -3695,6 +3728,26 @@ impl Connection {
                 consider(d);
             }
         }
+        // Issue #369: a publish relocated by `reset()` into
+        // `in_flight_publish_snapshots` is no longer visible to
+        // `ProducerState::next_send_deadline` (that only walks the live
+        // `pending` queue), so without this loop `poll_timeout` would never
+        // arm a wake-up for a send parked across a reconnect and the
+        // `handle_timeout` sweep below would only fire opportunistically.
+        // Each bucket is documented FIFO (oldest first), so the front entry
+        // alone carries the earliest deadline for that producer.
+        for (handle, snapshots) in &self.in_flight_publish_snapshots {
+            let Some(front) = snapshots.first() else {
+                continue;
+            };
+            let Some(slot) = self.producers.get(handle) else {
+                continue;
+            };
+            let Some(timeout) = slot.state.lock().send_timeout else {
+                continue;
+            };
+            consider(crate::time::deadline_with_clamp(front.enqueued_at, timeout));
+        }
         // Issue #346: surface the earliest pending-ack deadline
         // (`enqueued_at + ack_response_timeout`) so the driver schedules a
         // deterministic wake for `handle_timeout`'s reap sweep. Skipped
@@ -3918,6 +3971,87 @@ impl Connection {
                 message: "send timeout".to_owned(),
             });
         }
+
+        // Issue #369: send-timeout sweep for publishes RELOCATED by `reset()` into
+        // `in_flight_publish_snapshots`. The live-queue sweep above (`drain_timed_out_sends`)
+        // only ever sees `ProducerState::pending`; a send parked across a supervisor
+        // reconnect moves out of `pending` at `reset()` time and would otherwise be
+        // invisible to `send_timeout` enforcement until either a successful rebuild
+        // replays it or the supervisor gives up and calls `fail_all_pending`. Two-phase
+        // collect-then-mutate, same shape as the ack-deadline backstop below: phase 1
+        // only immutably borrows `self.producers` / `self.in_flight_publish_snapshots`
+        // to find which FRONT snapshots have elapsed; phase 2 removes them and installs
+        // outcomes. The deadline base is the op's ORIGINAL `enqueued_at` (preserved
+        // verbatim by `snapshot_pending_sends`), NOT a fresh reset()-relative budget —
+        // otherwise a send could silently outlive its configured send_timeout by an
+        // unbounded number of reconnect cycles.
+        let mut expired_snapshot_sends: Vec<(ProducerHandle, SequenceId)> = Vec::new();
+        for (handle, snapshots) in &self.in_flight_publish_snapshots {
+            let Some(slot) = self.producers.get(handle) else {
+                continue;
+            };
+            let Some(timeout) = slot.state.lock().send_timeout else {
+                continue;
+            };
+            for op in snapshots {
+                if now < crate::time::deadline_with_clamp(op.enqueued_at, timeout) {
+                    // FIFO order (oldest first) — once an entry has not yet
+                    // elapsed, none behind it have either.
+                    break;
+                }
+                expired_snapshot_sends.push((*handle, op.sequence_id));
+            }
+        }
+        for (handle, seq) in expired_snapshot_sends {
+            let Some(bucket) = self.in_flight_publish_snapshots.get_mut(&handle) else {
+                continue;
+            };
+            if bucket.first().map(|op| op.sequence_id) != Some(seq) {
+                // Already popped by an earlier iteration (defensive; the FIFO
+                // scan above only ever queues each front entry once).
+                continue;
+            }
+            let mut op = bucket.remove(0);
+            if let Some(slot) = self.producers.get(&handle) {
+                let mut producer = slot.state.lock();
+                producer.total_send_failed = producer.total_send_failed.saturating_add(1);
+            }
+            let key = PendingOpKey::Send(handle, seq);
+            self.outcomes.insert(
+                key,
+                OpOutcome::SendError {
+                    sequence_id: seq,
+                    code: -1,
+                    message: "send timeout".to_owned(),
+                },
+            );
+            // The snapshot's own waker was cleared at `reset()` time — the
+            // re-polled future's waker lives in the connection-wide slab
+            // instead (mirrors the waker fallback in
+            // `fail_producer_open_with_broker_error`'s snapshot drain).
+            if let Some(w) = op.waker.take() {
+                w.wake();
+            } else if let Some(w) = self.wakers.remove(&key) {
+                w.wake();
+            }
+            self.events.push_back(ConnectionEvent::SendError {
+                handle,
+                sequence_id: seq,
+                code: -1,
+                message: "send timeout".to_owned(),
+            });
+            tracing::warn!(
+                target: "magnetar_proto::conn",
+                producer = handle.0,
+                sequence_id = seq.0,
+                "send timed out while relocated across reconnect",
+            );
+        }
+        // `rebuild_producers`'s debug_asserts require every remaining snapshot
+        // key to reference a live producer with at least one entry — drop any
+        // bucket the sweep above emptied.
+        self.in_flight_publish_snapshots
+            .retain(|_, v| !v.is_empty());
 
         // Issue #346: `ack_response_timeout` backstop — reap any pending ack
         // whose `enqueued_at + ack_response_timeout` has elapsed. This is the
@@ -9532,6 +9666,482 @@ mod conn_state_tests {
             counter2.0.load(Ordering::SeqCst),
             1,
             "the freshly-registered waker fires exactly once on the replayed receipt"
+        );
+    }
+
+    /// Issue #369, positive case: a send relocated into
+    /// `in_flight_publish_snapshots` by `reset()` still surfaces the configured
+    /// `send_timeout` at the ORIGINAL `enqueued_at` deadline — it must not hang
+    /// for the whole reconnect budget. Models the future's re-poll-and-reregister
+    /// behaviour documented on `reset()`: the waker fires once at reset (no
+    /// outcome installed), the future re-registers, and only the later
+    /// `handle_timeout` sweep past the deadline resolves it.
+    #[test]
+    fn send_timeout_fires_for_publish_relocated_across_reset() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn counting_waker() -> (Arc<CountingWake>, Waker) {
+            let inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+            let waker: Waker = Arc::clone(&inner).into();
+            (inner, waker)
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/send-timeout-relocated".to_owned(),
+            send_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let t0 = Instant::now();
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"relocated"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 9,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let key = PendingOpKey::Send(producer, seq);
+        let (counter, waker) = counting_waker();
+        conn.register_waker(key, waker);
+
+        // Relocate: reset() moves the op out of `pending` into the snapshot
+        // bucket and wakes the future exactly once with no outcome installed.
+        conn.reset();
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "reset must wake the parked send future once"
+        );
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "reset installs no outcome on the Send key — transparent replay contract"
+        );
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            1,
+            "the relocated send must land in the snapshot bucket"
+        );
+
+        // The future re-polls after the wake-up and re-registers, exactly as
+        // `reset()`'s doc comment describes.
+        let (counter2, waker2) = counting_waker();
+        conn.register_waker(key, waker2);
+
+        // `poll_timeout` must surface a wake-up deadline for the relocated
+        // send too — this is what lets the moonpool engine arm a deterministic
+        // virtual timer for it (issue #369, Change 1a).
+        assert!(
+            conn.poll_timeout().is_some(),
+            "poll_timeout must surface a deadline for a relocated in-flight send"
+        );
+
+        // Past the ORIGINAL enqueued_at + send_timeout deadline (measured from
+        // t0, NOT from the reset): the sweep resolves the send with the same
+        // timeout error the live-queue path installs and drains the snapshot.
+        conn.handle_timeout(t0 + Duration::from_secs(31));
+        match conn.take_outcome(key) {
+            Some(OpOutcome::SendError {
+                sequence_id,
+                code,
+                message,
+            }) => {
+                assert_eq!(sequence_id, seq);
+                assert_eq!(code, -1, "send-timeout SendError uses the -1 sentinel");
+                assert_eq!(message, "send timeout");
+            }
+            other => panic!("expected a send-timeout SendError, got {other:?}"),
+        }
+        assert_eq!(
+            counter2.0.load(Ordering::SeqCst),
+            1,
+            "the re-registered waker must fire exactly once on the send-timeout sweep"
+        );
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            0,
+            "the timed-out relocated send must drain out of the snapshot bucket"
+        );
+    }
+
+    /// Issue #369, negative case (no false positive): a send relocated by
+    /// `reset()` must NOT resolve — and its snapshot must survive — while the
+    /// configured `send_timeout` has not yet elapsed. Guards against an
+    /// overly-eager sweep that fires on every `reset()` regardless of deadline.
+    #[test]
+    fn send_timeout_does_not_fire_early_for_publish_relocated_across_reset() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/send-timeout-relocated-early".to_owned(),
+            send_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let t0 = Instant::now();
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"relocated-early"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 15,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let key = PendingOpKey::Send(producer, seq);
+        conn.reset();
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 1);
+
+        // Well before the 30s deadline.
+        conn.handle_timeout(t0 + Duration::from_secs(10));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "no send-timeout outcome before the deadline for a relocated send"
+        );
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            1,
+            "the snapshot must survive an early handle_timeout tick"
+        );
+    }
+
+    /// Issue #369, no-timeout guard: a publish relocated by `reset()` on a
+    /// producer opened with `send_timeout: None` must never resolve via the
+    /// synthetic timeout sweep, no matter how far the virtual clock advances.
+    /// Exercises the `None`-timeout branch in both the `poll_timeout` and
+    /// `handle_timeout` sweeps added for the relocated-snapshot case, mirroring
+    /// `drain_timed_out_sends_without_timeout_returns_empty`'s coverage of the
+    /// same guard on the live-queue path.
+    #[test]
+    fn send_timeout_disabled_never_fires_for_publish_relocated_across_reset() {
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/send-timeout-disabled-relocated".to_owned(),
+            send_timeout: None,
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let t0 = Instant::now();
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"relocated-no-timeout"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 20,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                t0,
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let key = PendingOpKey::Send(producer, seq);
+        conn.reset();
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 1);
+
+        // poll_timeout must not contribute a deadline sourced from this
+        // relocated send (it may still return Some from keepalive — that is
+        // fine and orthogonal; the assertion below is on handle_timeout's
+        // effect, which is the authoritative check that this producer's
+        // relocated send is never touched by the sweep).
+        let _ = conn.poll_timeout();
+
+        // Advance the virtual clock a full hour — an eternity relative to
+        // any realistic send_timeout — and tick handle_timeout. With no
+        // timeout configured, the relocated send must survive untouched.
+        conn.handle_timeout(t0 + Duration::from_hours(1));
+        assert!(
+            conn.take_outcome(key).is_none(),
+            "send_timeout: None must never synthesize a timeout outcome for a relocated send"
+        );
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            1,
+            "the snapshot must survive indefinitely when send_timeout is disabled"
+        );
+    }
+
+    /// Issue #369, Change 2: `fail_all_pending` must be self-sufficient for
+    /// publishes relocated by a prior `reset()` — it must terminalize them from
+    /// `in_flight_publish_snapshots` directly rather than depending on the
+    /// woken send future having already re-registered a waker into the
+    /// connection-wide slab. Calls `fail_all_pending` immediately after
+    /// `reset()`, WITHOUT any prior waker re-registration (the race the
+    /// superseded scheduler-timing justification described — the woken task
+    /// has not yet been rescheduled and re-polled), mirroring
+    /// `fail_producer_open_with_broker_error`'s snapshot drain.
+    #[test]
+    fn fail_all_pending_terminalizes_publishes_relocated_across_reset() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker_inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker: Waker = Arc::clone(&waker_inner).into();
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/fail-all-pending-relocated".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"give-up"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 7,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let key = PendingOpKey::Send(producer, seq);
+        conn.register_waker(key, waker);
+
+        // Relocate via reset() — this is the ONLY waker registration in this
+        // test. `reset()` fires it once (transparent-replay contract, no
+        // outcome installed) and clears it from every correlation surface; we
+        // deliberately do NOT re-register a fresh waker afterwards, so when
+        // `fail_all_pending` runs below there is nothing left in
+        // `self.wakers` for this key — proving the Terminal outcome lands
+        // even when the woken task has not yet re-polled and re-registered.
+        conn.reset();
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "reset must wake the parked send future exactly once"
+        );
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 1);
+        assert!(conn.take_outcome(key).is_none());
+
+        // Give up: the supervisor exhausted its reconnect budget.
+        conn.fail_all_pending("reconnect attempts exhausted");
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Terminal { key: k, reason }) => {
+                assert_eq!(k, key);
+                assert_eq!(reason, "reconnect attempts exhausted");
+            }
+            other => panic!("expected a Terminal outcome, got {other:?}"),
+        }
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            0,
+            "fail_all_pending must drain the relocated snapshot bucket"
+        );
+        // No waker was registered for this key at `fail_all_pending` time (it
+        // was consumed by `reset()` and never re-registered), so the counter
+        // stays at 1 — the outcome install does not depend on a waker being
+        // present, and nothing double-fires.
+        assert_eq!(
+            waker_inner.0.load(Ordering::SeqCst),
+            1,
+            "fail_all_pending must not double-fire a waker it cannot find"
+        );
+    }
+
+    /// Issue #369, Change 2 — companion to
+    /// `fail_all_pending_terminalizes_publishes_relocated_across_reset`: this
+    /// time the send future DOES re-poll and re-register a fresh waker into
+    /// the connection-wide slab after `reset()` relocates it (mirroring
+    /// `send_timeout_fires_for_publish_relocated_across_reset`'s shape for the
+    /// Change-1 path), so `snapshot.waker` is `None` and `fail_all_pending`
+    /// must fall through to the `self.wakers.remove(&key)` arm instead —
+    /// exercising the more common real-world case where the parked send has
+    /// already been rescheduled by the time the reconnect budget is
+    /// exhausted.
+    #[test]
+    fn fail_all_pending_wakes_reregistered_waker_for_publish_relocated_across_reset() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn counting_waker() -> (Arc<CountingWake>, Waker) {
+            let inner = Arc::new(CountingWake(AtomicUsize::new(0)));
+            let waker: Waker = Arc::clone(&inner).into();
+            (inner, waker)
+        }
+
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/fail-all-pending-relocated-reregistered".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"give-up-reregistered"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 21,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                Instant::now(),
+            )
+            .expect("queue send");
+        let _ = drain_outbound_commands(&mut conn);
+
+        let key = PendingOpKey::Send(producer, seq);
+        let (counter, waker) = counting_waker();
+        conn.register_waker(key, waker);
+
+        // Relocate: reset() moves the op into the snapshot bucket and wakes
+        // the parked future exactly once with no outcome installed.
+        conn.reset();
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "reset must wake the parked send future once"
+        );
+        assert_eq!(conn.in_flight_publish_snapshot_len(producer), 1);
+        assert!(conn.take_outcome(key).is_none());
+
+        // The future re-polls after the wake-up and re-registers, exactly as
+        // `send_timeout_fires_for_publish_relocated_across_reset` models —
+        // this leaves `snapshot.waker` empty (it was taken by `reset()`) but
+        // populates `self.wakers` for the same key.
+        let (counter2, waker2) = counting_waker();
+        conn.register_waker(key, waker2);
+
+        // Give up: the supervisor exhausted its reconnect budget. The
+        // snapshot's own `waker` field is `None`, so the Change-2 drain must
+        // take the `else if let Some(w) = self.wakers.remove(&key)` arm to
+        // fire the re-registered waker rather than silently dropping it.
+        conn.fail_all_pending("reconnect attempts exhausted");
+
+        match conn.take_outcome(key) {
+            Some(OpOutcome::Terminal { key: k, reason }) => {
+                assert_eq!(k, key);
+                assert_eq!(reason, "reconnect attempts exhausted");
+            }
+            other => panic!("expected a Terminal outcome, got {other:?}"),
+        }
+        assert_eq!(
+            conn.in_flight_publish_snapshot_len(producer),
+            0,
+            "fail_all_pending must drain the relocated snapshot bucket"
+        );
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "the original reset-time waker must not fire again"
+        );
+        assert_eq!(
+            counter2.0.load(Ordering::SeqCst),
+            1,
+            "the re-registered connection-slab waker must fire exactly once via the \
+             self.wakers fallback arm"
         );
     }
 
