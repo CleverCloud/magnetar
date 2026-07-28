@@ -1030,25 +1030,7 @@ impl Connection {
         let snapshot_handles: Vec<ProducerHandle> =
             self.in_flight_publish_snapshots.keys().copied().collect();
         for handle in snapshot_handles {
-            let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle) else {
-                continue;
-            };
-            for mut snapshot in snapshots {
-                let key = PendingOpKey::Send(handle, snapshot.sequence_id);
-                self.outcomes.insert(
-                    key,
-                    OpOutcome::Terminal {
-                        key,
-                        reason: reason.to_owned(),
-                    },
-                );
-                if let Some(w) = snapshot.waker.take() {
-                    let _ = self.wakers.remove(&key);
-                    w.wake();
-                } else if let Some(w) = self.wakers.remove(&key) {
-                    w.wake();
-                }
-            }
+            self.terminalize_snapshot_bucket(handle, reason);
         }
 
         // (3) Sweep any leftover slab wakers — BOTH `Request` and `Send` keys
@@ -1192,24 +1174,7 @@ impl Connection {
         // Terminalize those replay snapshots too; their futures re-registered
         // in the connection-wide waker slab after reset and otherwise have no
         // remaining correlation surface.
-        if let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle) {
-            for mut snapshot in snapshots {
-                let key = PendingOpKey::Send(handle, snapshot.sequence_id);
-                self.outcomes.insert(
-                    key,
-                    OpOutcome::Terminal {
-                        key,
-                        reason: reason.to_owned(),
-                    },
-                );
-                if let Some(w) = snapshot.waker.take() {
-                    let _ = self.wakers.remove(&key);
-                    w.wake();
-                } else if let Some(w) = self.wakers.remove(&key) {
-                    w.wake();
-                }
-            }
-        }
+        self.terminalize_snapshot_bucket(handle, reason);
         // Drop the now-dead producer state so a subsequent reconnect rebuild
         // does not re-emit a `CommandProducer` for a handle the user has been
         // told is terminally failed.
@@ -4076,6 +4041,38 @@ impl Connection {
                     request_id: Some(rid),
                     result: Err(message),
                 });
+            }
+        }
+    }
+
+    /// Terminalize every publish relocated into `in_flight_publish_snapshots` for `handle`.
+    ///
+    /// Removes the whole bucket and installs an `OpOutcome::Terminal` per snapshot. The wake
+    /// goes through the snapshot's own waker when it still carries one and falls back to the
+    /// connection-wide slab otherwise: `reset()` clears a relocated `OpSend`'s waker, so which
+    /// of the two holds the wake depends on whether the future has re-polled since.
+    ///
+    /// Shared by [`Self::fail_all_pending`] (every handle, at supervisor give-up) and
+    /// [`Self::fail_producer_open_with_broker_error`] (a single handle). No-op when the handle
+    /// has no bucket.
+    fn terminalize_snapshot_bucket(&mut self, handle: ProducerHandle, reason: &str) {
+        let Some(snapshots) = self.in_flight_publish_snapshots.remove(&handle) else {
+            return;
+        };
+        for mut snapshot in snapshots {
+            let key = PendingOpKey::Send(handle, snapshot.sequence_id);
+            self.outcomes.insert(
+                key,
+                OpOutcome::Terminal {
+                    key,
+                    reason: reason.to_owned(),
+                },
+            );
+            if let Some(w) = snapshot.waker.take() {
+                let _ = self.wakers.remove(&key);
+                w.wake();
+            } else if let Some(w) = self.wakers.remove(&key) {
+                w.wake();
             }
         }
     }
