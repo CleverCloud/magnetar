@@ -173,3 +173,216 @@ FIXED by a2c56b3. See ADR-0078. RETAINED as a regression anchor — do NOT
 remove on a green replay. Verified passing at a2c56b3 alone (bisected
 against 1dc22a4..HEAD) and at current HEAD (8208901).
 """
+
+# --- 2026-07-27 issue sweep: chaos tolerance in the sim workloads (#362-#368) ---
+# Seven seeds the daily sweep flagged between 2026-07-22 and 2026-07-26, all
+# reproduced locally against 1b0e44d and all fixed in the changeset that adds
+# these entries. None was a production defect in the driver or the connection
+# pool: each is a sim workload whose setup path or outer anti-hang guard could
+# not survive moonpool-sim's default-on network chaos (ADR-0055), plus one
+# genuine moonpool-side broker-URL parsing defect surfaced by a bit flip.
+# All seven are RETAINED as regression anchors per the convention above.
+
+[[seed]]
+value        = "0x4991627312a29bf3"
+discovered   = "2026-07-22"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29895602266"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/362"
+note         = """
+Derived sub-seed 17655772840140759888 drove ProxyClientWorkload's bare
+11s-timeout connect/open_producer calls into moonpool-sim's default-on
+network chaos (ADR-0055): the first bootstrap session died mid-lookup
+(frames: []) and the workload had no retry, surfacing "producer target
+resolution exceeded operation_timeout" and failing the iteration outright.
+
+FIXED by wrapping ProxyClientWorkload's connect and open_producer calls in
+the in-file `retry_setup` helper (bounded, virtual-clock-delayed retries)
+and making the bootstrap/pinned evidence assertions search ALL recorded
+sessions instead of only `.first()` / `.skip(1)`, so a dead session from an
+aborted attempt no longer fails a test whose actual proxy multi-connection
+contract still held. Pinned by the
+`sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367` regression test
+in sim_chaos.rs. RETAINED as a regression anchor — do NOT remove on a green
+replay: the per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0xfd90a96e70b1a2c0"
+discovered   = "2026-07-22"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29895602266"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/363"
+note         = """
+Derived sub-seed 2734405100989005031 drove the same unretried bare-timeout
+connect in ProxyClientWorkload into a bit-flip-corrupted command frame on
+the proxy bootstrap dial: "proxy bootstrap connect failed:
+Engine(Protocol(Frame(BadLength(38))))", failing the iteration with no
+retry attempted.
+
+FIXED by the same ProxyClientWorkload `retry_setup` wrapping as #362 (this
+is the same root defect — no chaos tolerance on the workload's setup path —
+manifesting as a different sub-seed's specific corruption). Pinned by the
+`sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367` regression test
+in sim_chaos.rs. RETAINED as a regression anchor — do NOT remove on a green
+replay: the per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x26c3cedb3e5069b9"
+discovered   = "2026-07-23"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29984186739"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/364"
+note         = """
+Derived sub-seed 16831727181602372843 flipped a single bit in the proxy
+lookup response's advertised `broker_service_url`, turning
+"pulsar://broker-sim.proxy.internal:6650" into
+"ptlsar://broker-sim.proxy.internal:6650". TWO independent defects
+compounded: (1) the test-harness assertion (`pinned_clean`) only inspected
+sessions via `.skip(1)`/`.first()`, so a corrupted-but-still-connected
+pinned session tripped the test even though the proxy multi-connection
+contract otherwise held; (2) production code
+(`Client::proxy_broker_authority` in
+crates/magnetar-runtime-moonpool/src/client.rs) matched neither
+`strip_prefix("pulsar+ssl://")` nor `strip_prefix("pulsar://")` on the
+corrupted scheme and fell through to a naive `host_port.split('/')`,
+silently truncating it into the nonsense authority "ptlsar:" instead of
+failing the lookup.
+
+FIXED with TWO changesets per the same commit series: (a) the test-harness
+evidence assertions now search ALL recorded sessions for a clean bootstrap
+AND a correctly-pinned session, tolerating an EXTRA chaos-damaged session
+coexisting rather than requiring none ever occurred; (b) production
+`proxy_broker_authority` / `direct_broker_authority` now return
+`Result<String, ClientError>` and reject an input containing "://" with an
+unrecognised scheme explicitly (ADR-0024 four-layer + e2e obligation met:
+proto-level differential equivalence test
+`corrupted_broker_scheme_equivalence.rs`, moonpool integration test
+`proxy_multi_conn.rs::open_producer_through_proxy_rejects_corrupted_broker_scheme`,
+e2e `e2e_moonpool_direct_broker_authority.rs` proving the happy path is
+unregressed; no magnetar-proto state-machine change and no tokio-side
+behavioural change, both absences argued in the commit message). Pinned by
+the `sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367` regression
+test in sim_chaos.rs. RETAINED as a regression anchor — do NOT remove on a
+green replay: the per-PR seed-replay re-validates BOTH fixes.
+"""
+
+[[seed]]
+value        = "0x7aefae55458dd414"
+discovered   = "2026-07-23"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/29984186739"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_delayed_marker_is_observed_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/365"
+note         = """
+Derived sub-seed 6405417372729688799 drove a `BitFlip` chaos fault into the
+single-shot, CRC32C-covered snapshot-marker `MESSAGE` frame while it was in
+flight. magnetar-proto's verify-or-drop policy (invariant #4) silently
+dropped the corrupted frame and left the connection alive (`is_closed()`
+never flips), so nothing was left to re-notify the parked marker waiter —
+the guard on `next_replicated_subscription_marker()` then expired with the
+exact same symptom the genuine lost-wakeup bug produces, because this
+single-shot push has no retry infrastructure by design.
+
+FIXED by adding `MarkerOutcome::ChaosOrphaned` and classifying the
+marker-guard expiry into it, but ONLY when the run's own captured fault
+trace (`ctx.observability().snapshot(SIM_FAULT_EVENT_NAME)`) shows a
+`BitFlip` actually fired during this run — with no such evidence the hard
+`Err` (lost-wakeup failure) still fires, so the strict chaos-free
+`sim_delayed_marker_is_observed` anchor is unaffected and a real regression
+still fails loudly. Pinned by the
+`sim_delayed_marker_regression_365_sub_seed_6405417372729688799` regression
+test in replicated_subscriptions_sim.rs, which pins the derived sub-seed
+directly via `set_debug_seeds`. RETAINED as a regression anchor — do NOT
+remove on a green replay: the per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x0d470b8e750b364b"
+discovered   = "2026-07-26"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/30190718691"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_chaos_produce_consume_with_invariants"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/366"
+note         = """
+Derived sub-seed 16011264899749977182 drove ProducerConsumerWorkload's bare
+`Client::connect_plain_supervised` call (no retry wrapper around the INITIAL
+dial itself, unlike its already-retried `subscribe` / `open_producer` calls)
+into moonpool-sim's probabilistic connect-failure chaos exhausting all five
+internal dial attempts (`supervised_config()`'s `connect_max_retries: 4`):
+"connect: Engine(Io(Custom { kind: ConnectionRefused, error:
+\"Connection establishment failed (Probabilistic mode)\" }))", failing the
+iteration before any supervised driver existed to reconnect on its own.
+
+FIXED by replacing the bare connect with the existing in-file
+`retry_supervised_connect` helper (already used by
+`SwizzleClogClientWorkload` for the identical purpose) — a one-line swap
+adopting blessed in-repo prior art, bounding the initial dial in the same
+retry loop that already guards the workload's other setup calls. Pinned by
+the `sim_chaos_produce_consume_sub_seed_366` regression test in
+sim_chaos.rs. RETAINED as a regression anchor — do NOT remove on a green
+replay: the per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x1009eafb7ff4dbfe"
+discovered   = "2026-07-26"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/30190718691"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_chaos_pulsar_proxy_multi_conn_sweep_8_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/367"
+note         = """
+Derived sub-seed 14671817017058487908 drove the same unretried bare-timeout
+open_producer call in ProxyClientWorkload into a bit-flip-corrupted frame
+length on the producer-open round trip: "frame length out of bounds: 38",
+failing the iteration with no retry attempted.
+
+FIXED by the same ProxyClientWorkload `retry_setup` wrapping as #362/#363
+(this is the same root defect — no chaos tolerance on the workload's setup
+path — manifesting as yet another sub-seed's specific corruption). Pinned
+by the `sim_chaos_pulsar_proxy_bootstrap_sub_seeds_362_363_364_367`
+regression test in sim_chaos.rs. RETAINED as a regression anchor — do NOT
+remove on a green replay: the per-PR seed-replay re-validates this fix.
+"""
+
+[[seed]]
+value        = "0x10af708e269312b0"
+discovered   = "2026-07-26"
+workflow_run = "https://github.com/CleverCloud/magnetar/actions/runs/30190718691"
+commit_sha   = "5d6c39fe86c0a5c2bc0ef17318157948d166af48"
+test_name    = "sim_delayed_marker_is_observed_sweep_16_seeds"
+status       = "open"
+issue        = "https://github.com/CleverCloud/magnetar/issues/368"
+note         = """
+Derived sub-seed 7383837303657982387 flipped a bit in an un-CRC'd CONTROL
+(`Subscribe`) frame, so the broker's `Success` reply correlated against the
+wrong (corrupted) `request_id` and the client's subscribe future never
+resolved. `Client::subscribe` already routes through the connection's own
+bounded `operation_timeout` (`sim_connect_config()`'s 20s), whose `Err` this
+file already classifies as the bounded `MarkerOutcome::Severed` outcome —
+but the test's OWN outer anti-hang guards (previously a 20s guard around
+connect, a 5s guard around subscribe) were shorter than or equal to that
+20s deadline and fired first, converting an already-handled bounded outcome
+into a hard "timed out" test failure before the connection's own recovery
+path got a chance to resolve it.
+
+FIXED by introducing `OUTER_GUARD` (25s, strictly longer than the 20s
+`operation_timeout` it wraps) and applying it to both the connect and
+subscribe steps in `drive`, so the outer backstop can no longer pre-empt
+the operation deadline it is meant to merely guard against a genuine driver
+stall. Pinned by the
+`sim_delayed_marker_regression_368_sub_seed_7383837303657982387` regression
+test in replicated_subscriptions_sim.rs, which pins the derived sub-seed
+directly via `set_debug_seeds`. RETAINED as a regression anchor — do NOT
+remove on a green replay: the per-PR seed-replay re-validates this fix.
+"""
