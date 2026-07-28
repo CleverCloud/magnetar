@@ -40,6 +40,13 @@ const TXN_TIMEOUT: Duration = Duration::from_secs(30);
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const ABORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// JVM budget for the `pulsar standalone` container.
+/// The image default (`-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g`) costs ~2.3 GiB RSS per
+/// container; libtest runs up to `nproc` e2e tests in parallel and the PIP-33 compose fixture
+/// stays up for the whole run, which overcommits the 16 GiB GitHub runner and stalls brokers
+/// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
+const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
 }
@@ -76,6 +83,7 @@ async fn start_pulsar_with_txn() -> Result<
         .with_exposed_port(ContainerPort::Tcp(BROKER_HTTP_PORT))
         .with_wait_for(WaitFor::message_on_stdout("Created namespace public/default"))
         .with_startup_timeout(Duration::from_mins(3))
+        .with_env_var("PULSAR_MEM", PULSAR_MEM_LIMIT)
         // Transactions require three things the default standalone image
         // does not wire up:
         //   1. `transactionCoordinatorEnabled=true` in `standalone.conf`,
