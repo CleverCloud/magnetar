@@ -243,6 +243,17 @@ impl core::fmt::Debug for Connection {
 /// [`crate::OperationRetryConfig::max_retries`].
 pub const MAX_TRANSIENT_OPEN_RETRIES: u32 = 8;
 
+/// Error code surfaced when a publish exceeds its configured `send_timeout`.
+///
+/// Pulsar's wire-protocol `ServerError` enum has no `TimeoutError` variant, so both
+/// send-timeout sweeps use the same `-1` sentinel the Java client surfaces as
+/// `TimeoutException`, paired with [`SEND_TIMEOUT_MESSAGE`] so callers can pattern-match on
+/// the error string.
+const SEND_TIMEOUT_CODE: i32 = -1;
+
+/// Error message paired with [`SEND_TIMEOUT_CODE`]. Callers match on this exact string.
+const SEND_TIMEOUT_MESSAGE: &str = "send timeout";
+
 #[derive(Debug, Clone, Copy)]
 enum SubscribeAckAction {
     NotifyWaiter,
@@ -3947,29 +3958,10 @@ impl Connection {
             }
         }
         for (handle, seq, waker) in send_timeouts {
-            let key = PendingOpKey::Send(handle, seq);
             // Pulsar's ServerError enum has no TimeoutError; use the same `-1` sentinel
             // Java surfaces as TimeoutException with a descriptive message so callers can
             // pattern-match on the error string.
-            self.outcomes.insert(
-                key,
-                OpOutcome::SendError {
-                    sequence_id: seq,
-                    code: -1,
-                    message: "send timeout".to_owned(),
-                },
-            );
-            if let Some(w) = waker {
-                w.wake();
-            } else if let Some(w) = self.wakers.remove(&key) {
-                w.wake();
-            }
-            self.events.push_back(ConnectionEvent::SendError {
-                handle,
-                sequence_id: seq,
-                code: -1,
-                message: "send timeout".to_owned(),
-            });
+            self.resolve_send_error(handle, seq, SEND_TIMEOUT_CODE, SEND_TIMEOUT_MESSAGE, waker);
         }
 
         // Issue #369: send-timeout sweep for publishes RELOCATED by `reset()` into
@@ -4016,30 +4008,17 @@ impl Connection {
                 let mut producer = slot.state.lock();
                 producer.total_send_failed = producer.total_send_failed.saturating_add(1);
             }
-            let key = PendingOpKey::Send(handle, seq);
-            self.outcomes.insert(
-                key,
-                OpOutcome::SendError {
-                    sequence_id: seq,
-                    code: -1,
-                    message: "send timeout".to_owned(),
-                },
-            );
             // The snapshot's own waker was cleared at `reset()` time — the
             // re-polled future's waker lives in the connection-wide slab
-            // instead (mirrors the waker fallback in
+            // instead, which `resolve_send_error`'s fallback covers (mirrors
             // `fail_producer_open_with_broker_error`'s snapshot drain).
-            if let Some(w) = op.waker.take() {
-                w.wake();
-            } else if let Some(w) = self.wakers.remove(&key) {
-                w.wake();
-            }
-            self.events.push_back(ConnectionEvent::SendError {
+            self.resolve_send_error(
                 handle,
-                sequence_id: seq,
-                code: -1,
-                message: "send timeout".to_owned(),
-            });
+                seq,
+                SEND_TIMEOUT_CODE,
+                SEND_TIMEOUT_MESSAGE,
+                op.waker.take(),
+            );
             tracing::warn!(
                 target: "magnetar_proto::conn",
                 producer = handle.0,
@@ -4099,6 +4078,48 @@ impl Connection {
                 });
             }
         }
+    }
+
+    /// Resolve a publish as failed: install the outcome, wake whoever is parked on it, and
+    /// queue the matching event.
+    ///
+    /// Shared by both send-timeout sweeps in [`Self::handle_timeout`] — the live-queue sweep
+    /// over `ProducerState::pending` and the issue #369 sweep over
+    /// `in_flight_publish_snapshots`. The waker fallback matters because the two sweeps source
+    /// it differently: a live-queue entry carries its own waker, while a relocated snapshot had
+    /// its waker cleared at `reset()` time and the re-polled future's waker lives in the
+    /// connection-wide slab instead.
+    ///
+    /// Callers keep their own `total_send_failed` accounting and logging — the two sweeps bump
+    /// that counter at different points (phase 1 vs. inline).
+    fn resolve_send_error(
+        &mut self,
+        handle: ProducerHandle,
+        seq: SequenceId,
+        code: i32,
+        message: &str,
+        waker: Option<Waker>,
+    ) {
+        let key = PendingOpKey::Send(handle, seq);
+        self.outcomes.insert(
+            key,
+            OpOutcome::SendError {
+                sequence_id: seq,
+                code,
+                message: message.to_owned(),
+            },
+        );
+        if let Some(w) = waker {
+            w.wake();
+        } else if let Some(w) = self.wakers.remove(&key) {
+            w.wake();
+        }
+        self.events.push_back(ConnectionEvent::SendError {
+            handle,
+            sequence_id: seq,
+            code,
+            message: message.to_owned(),
+        });
     }
 
     /// Register a waker for a pending op. The waker will be woken when an outcome lands.
