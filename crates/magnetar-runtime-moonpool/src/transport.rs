@@ -696,9 +696,17 @@ async fn read_tls_buf<S: futures::io::AsyncRead + Unpin>(
             // ADR-0083: surface any protocol-mandated outbound response this
             // decrypt step produced (e.g. a TLS 1.3 KeyUpdate ack) into the
             // shared, resumable ciphertext queue — WITHOUT writing to the
-            // socket from the read side. The write half's `select!`-arm
-            // gate (`has_pending_ciphertext`) picks this up on the very
-            // next loop iteration; see the module docs.
+            // socket from the read side. The write half's `select!`-arm gate
+            // (`has_pending_ciphertext`) picks this up on the next driver-loop
+            // iteration — which is NOT necessarily the next instant: we are
+            // inside this function's own retry loop, and `write_has_work` was
+            // snapshotted before the driver entered `select!`. If the decrypt
+            // yielded no plaintext we loop and `.await` another read here, so
+            // the queued ciphertext waits for whichever comes first: more wire
+            // bytes, a `driver_waker` pulse, or the timer arm. It is therefore
+            // bounded by the driver's timer interval, not by one iteration —
+            // acceptable because the frames this queues (KeyUpdate acks) are
+            // rare and not latency-critical. See the module docs.
             g.absorb_adapter_output();
             g.adapter.take_plaintext()
         };

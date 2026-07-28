@@ -90,7 +90,14 @@ Pre-this-ADR that was safe by accident (the top-of-loop write ran every iteratio
 Post-split, if the read half could only leave those bytes sitting in the adapter's own buffer, they would strand on an otherwise write-idle connection — a narrower recurrence of the exact bug this ADR fixes.
 Closed structurally: `TlsShared::absorb_adapter_output()` — called by BOTH halves after their own `step()` — moves anything the adapter just queued into the shared `pending_ciphertext`.
 The read half only ever **appends**; it never touches the socket.
-`TransportWriteHalf::has_pending_ciphertext()` is part of `write_has_work`, so a read-triggered append makes the write arm fire on the very next loop iteration with no extra wake plumbing — the loop already recomputes `write_has_work` fresh at the top of every iteration.
+`TransportWriteHalf::has_pending_ciphertext()` is part of `write_has_work`, so a read-triggered append makes the write arm fire with no extra wake plumbing — the loop recomputes `write_has_work` fresh at the top of every iteration.
+
+The flush is **not** guaranteed on the immediately following instant, and the distinction matters enough to record.
+`write_has_work` is snapshotted before the driver enters `select!`, and `absorb_adapter_output()` is called from inside `read_tls_buf`'s own retry loop — which keeps awaiting another read whenever the decrypt step yielded no plaintext, precisely the case that produces a `KeyUpdate` ack.
+While that inner loop spins the read arm is still `Pending`, so the queued ciphertext waits for whichever arrives first: more wire bytes, a `driver_waker` pulse, or the timer arm.
+The real bound is therefore the driver's timer interval, not one loop iteration.
+That is accepted rather than fixed: the frames involved are rare, server-initiated and not latency-critical, and the alternative — pulsing `driver_waker` from the read half whenever an append happened — adds a wake path into the very code the ADR-0070/#303 fairness work exists to keep predictable.
+Should a latency-sensitive read-triggered frame ever appear, that pulse is the fix.
 
 ### 4. The deadline
 
