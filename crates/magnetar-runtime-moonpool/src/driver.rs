@@ -513,8 +513,46 @@ impl PendingDriverWrite {
         self.segments.is_empty()
     }
 
-    fn pop_budgeted(&mut self, budget: usize) -> Vec<Bytes> {
-        let mut chunks = Vec::new();
+    /// Total unwritten bytes still queued — `warn!(pending_bytes = ...)`
+    /// diagnostic field for a write-deadline expiry (ADR-0054, ADR-0083).
+    fn remaining_len(&self) -> usize {
+        self.segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                if i == 0 {
+                    seg.len().saturating_sub(self.front_offset)
+                } else {
+                    seg.len()
+                }
+            })
+            .sum()
+    }
+
+    /// Cancellation-safety invariant (ADR-0083): once the write becomes a
+    /// `select!` arm it can be dropped mid-poll on any iteration of this
+    /// loop. Each inner step therefore issues exactly ONE single-poll
+    /// [`TransportWriteHalf::write_some`] call and commits
+    /// `self.front_offset` synchronously in the SAME poll that reported
+    /// progress, before the next `.await` point is even reached —
+    /// `write_some`'s own single-poll contract makes this sound (see its
+    /// doc comment). This replaced the earlier `pop_budgeted`, which
+    /// eagerly detached an entire budget's worth of segments into an owned
+    /// `Vec<Bytes>` BEFORE any I/O was attempted: a `write_budgeted` future
+    /// cancelled mid-loop could lose chunks that were popped-and-detached
+    /// but never actually sent — not duplicated, silently DROPPED. That
+    /// was safe only because the write ran unconditionally ahead of the
+    /// `select!` and was never itself cancelled; ADR-0083 changes that
+    /// precondition.
+    async fn write_budgeted<P>(
+        &mut self,
+        write_half: &mut crate::transport::TransportWriteHalf<P>,
+        budget: usize,
+    ) -> std::io::Result<usize>
+    where
+        P: Providers,
+    {
+        let mut written = 0usize;
         let mut remaining = budget;
         while remaining > 0 {
             let Some(front) = self.segments.front() else {
@@ -526,31 +564,30 @@ impl PendingDriverWrite {
                 self.front_offset = 0;
                 continue;
             }
-            let n = available.min(remaining);
-            chunks.push(front.slice(self.front_offset..self.front_offset + n));
+            let n_to_try = available.min(remaining);
+            let n = write_half
+                .write_some(&front[self.front_offset..self.front_offset + n_to_try])
+                .await?;
+            if n == 0 {
+                // `TransportWriteHalf::write_some` legitimately returns
+                // `Ok(0)` while draining a TLS transport's already-encrypted
+                // residue (no NEW plaintext consumed that call, but real
+                // wire progress happened) — that is NOT a stall, so unlike
+                // the tokio engine's plain-socket `write_zero` guard we must
+                // NOT treat it as `WriteZero` here. Simply loop again; the
+                // budget/timeout bounds this exactly like every other
+                // iteration.
+                continue;
+            }
+            // Commit BEFORE the next `.await` — see the cancellation-safety
+            // note above.
             self.front_offset += n;
+            written += n;
             remaining -= n;
             if self.front_offset == front.len() {
                 let _ = self.segments.pop_front();
                 self.front_offset = 0;
             }
-        }
-        chunks
-    }
-
-    async fn write_budgeted<P>(
-        &mut self,
-        transport: &mut Transport<P>,
-        budget: usize,
-    ) -> std::io::Result<usize>
-    where
-        P: Providers,
-    {
-        let chunks = self.pop_budgeted(budget);
-        let mut written = 0usize;
-        for chunk in chunks {
-            written += chunk.len();
-            transport.write_all(&chunk).await?;
         }
         Ok(written)
     }
@@ -1318,16 +1355,36 @@ fn strip_url_to_host_port(raw: &str) -> Option<String> {
 ///   exactly once per reconnect.
 pub(crate) async fn driver_loop_inner<P>(
     shared: Arc<ConnectionShared>,
-    mut transport: Transport<P>,
+    transport: Transport<P>,
     time: P::Time,
     task: P::Task,
 ) -> Result<(), EngineError>
 where
     P: Providers,
 {
+    // ADR-0083: split once, right after connect (handshake already
+    // complete), into independently-pollable halves — see the `transport`
+    // module's "Read/write split" docs. `read_half` and `write_half` are
+    // separate local bindings held across the whole loop below, NOT
+    // re-split per iteration.
+    let (mut read_half, mut write_half) = transport.into_split();
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
     let mut pending_write = PendingDriverWrite::new();
     let mut close_after_write = false;
+    // ADR-0083: the write's `operation_timeout` deadline, anchored to a
+    // fixed `Instant` set the moment a logical write FIRST has work and
+    // cleared once it fully drains — NOT recomputed fresh every loop
+    // iteration. `select!`'s write arm is a per-iteration expression
+    // (`write_one_budget(...)`), so a naive `time.timeout(operation_timeout,
+    // ...)` inside it would silently re-arm a brand-new full budget every
+    // time ANY other arm (read, waker, or an unrelated timer tick such as
+    // the keepalive interval) wins a round and the outer `loop` restarts —
+    // an in-flight stalled write would never actually accumulate 30s of
+    // real elapsed time toward its own deadline. Anchoring the deadline
+    // instant here, outside the `select!`, closes that hole: the remaining
+    // budget only ever shrinks across iterations, regardless of which arm
+    // wins any given round.
+    let mut write_deadline: Option<std::time::Instant> = None;
 
     loop {
         // 0. Advance the engine's wall-clock atomic from `providers.time().now()`. The proto-layer
@@ -1344,9 +1401,10 @@ where
                 .store(now_ms, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // 1. Drain outbound bytes + check if the state machine wants us to terminate. ADR-0040 wave
-        //    2: take the owned `TransmitOwned` — the contiguous arm uses the same O(1)
-        //    `BytesMut::split()` ownership transfer the legacy `poll_transmit` returned; the
+        // 1. Drain outbound bytes + check if the state machine wants us to terminate, and snapshot
+        //    `operation_timeout` (ADR-0083's write-deadline source — see `write_one_budget` below).
+        //    ADR-0040 wave 2: take the owned `TransmitOwned` — the contiguous arm uses the same
+        //    O(1) `BytesMut::split()` ownership transfer the legacy `poll_transmit` returned; the
         //    vectored arm carries the producer batch's `[head, payload]` segment list.
         //
         //    moonpool main now exposes vectored writes, so the engine
@@ -1366,7 +1424,7 @@ where
         //    segment is `Arc`-backed `Bytes`) and drop the lock BEFORE
         //    awaiting the network write. The `parking_lot::Mutex` is never
         //    held across an `.await`.
-        let (out, deadline, should_close) = if pending_write.is_empty() {
+        let (out, deadline, should_close, operation_timeout) = if pending_write.is_empty() {
             let mut conn = shared.inner.lock();
             let out = conn.poll_transmit_owned();
             let dl = conn.poll_timeout();
@@ -1376,7 +1434,7 @@ where
                     | magnetar_proto::HandshakeState::Closed
                     | magnetar_proto::HandshakeState::Failed
             );
-            (out, dl, closing)
+            (out, dl, closing, conn.operation_timeout())
         } else {
             let conn = shared.inner.lock();
             let dl = conn.poll_timeout();
@@ -1390,6 +1448,7 @@ where
                 magnetar_proto::TransmitOwned::Contiguous(Bytes::new()),
                 dl,
                 closing,
+                conn.operation_timeout(),
             )
         };
         close_after_write |= should_close;
@@ -1397,29 +1456,24 @@ where
             pending_write.push_transmit(out);
         }
 
-        // 2. Flush whatever the state machine produced. This happens outside the lock so user
-        //    futures can keep enqueuing.
-        if !pending_write.is_empty() {
-            match pending_write
-                .write_budgeted(&mut transport, DRIVER_WRITE_BUDGET_BYTES)
-                .await
-            {
-                Ok(bytes) => tracing::trace!(bytes, "writing outbound bytes"),
-                Err(err) => {
-                    shared.inner.lock().mark_disconnected();
-                    return Err(err.into());
-                }
-            }
-            if let Err(err) = transport.flush().await {
-                shared.inner.lock().mark_disconnected();
-                return Err(err.into());
-            }
-        }
-
-        if pending_write.is_empty() && close_after_write {
-            let _ = transport.shutdown().await;
+        // 2. Close-with-nothing-pending: the write `select!` arm below only fires when there is
+        //    work (`write_has_work`), so a close requested with an already-empty queue (and no TLS
+        //    residue) must be handled here at the top rather than waiting for an arm that would
+        //    never become ready.
+        if pending_write.is_empty() && !write_half.has_pending_ciphertext() && close_after_write {
+            let _ = write_half.shutdown().await;
             return Ok(());
         }
+
+        let write_has_work = !pending_write.is_empty() || write_half.has_pending_ciphertext();
+        // Arm the deadline on the transition into "has work"; leave it
+        // untouched while work continues across iterations; clear it once
+        // drained so the NEXT logical write gets a fresh full budget.
+        write_deadline = if write_has_work {
+            Some(write_deadline.unwrap_or_else(|| shared.now_instant() + operation_timeout))
+        } else {
+            None
+        };
 
         // 3. Park until something interesting happens. The duration is relative because moonpool's
         //    `TimeProvider::sleep` takes a `Duration`, not an `Instant`. The "now" baseline is
@@ -1430,32 +1484,43 @@ where
         let sleep_dur = deadline.map(|t| t.saturating_duration_since(shared.now_instant()));
 
         moonpool_core::select! {
-            // ADR-0070 read-fairness (issue #303): under a sustained `send`
-            // burst every `Producer::send` pulses `driver_waker.notify_one()`,
-            // so a waker permit is almost always pending on loop entry. With
-            // `biased;` the FIRST arm wins whenever it is ready, so polling the
-            // `driver_waker` arm first would let writes starve the inbound path
-            // — already-arrived `CommandSendReceipt` bytes would not be read
-            // that iteration and the matching `SendFut`s would resolve late.
+            // ADR-0083 (amends ADR-0070). Issue #303's read-fairness fix
+            // reordered the read arm ahead of the `driver_waker` arm but
+            // relied on the write happening UNCONDITIONALLY at the top of
+            // every iteration to keep the outbound path live — issue #370
+            // showed that premise is exactly what lets a stalled write
+            // (a peer that stops draining) starve read, waker AND timer
+            // alike, since the write never reached the `select!` at all. The
+            // fix: the write is now its own arm, THIRD in order (after read
+            // and the waker, before the timer) and gated by `write_has_work`
+            // so it is not even polled when there's nothing to send. Two
+            // bounds keep it from re-introducing starvation in the other
+            // direction: `DRIVER_WRITE_BUDGET_BYTES` caps how much one arm
+            // win writes before yielding back to read, and
+            // `operation_timeout` caps how long a single win may block on a
+            // peer that never drains — `write_one_budget` maps that timeout
+            // to an I/O error routed through the same `mark_disconnected()`
+            // path every other write failure already takes, so the
+            // supervisor redials instead of the connection wedging as
+            // still-connected forever.
             //
-            // The outbound path is NOT starved by giving reads priority here:
-            // `poll_transmit` + `write_all` already run at the TOP of every loop
-            // iteration (above), so each tick flushes pending sends regardless
-            // of which `select!` arm wins. Draining the socket first therefore
-            // keeps BOTH directions live. `biased;` is retained so the arm
-            // order is deterministic — this engine's bit-for-bit-reproducible
-            // simulation depends on it, and a non-biased `select!` would pick
-            // arms via an uncontrolled thread-local RNG, breaking moonpool
-            // determinism (ADR-0024 determinism constraint). The read arm is
-            // cancel-safe: bytes land in the persistent `read_buf` and are only
-            // consumed via `split()` AFTER this arm wins, so reordering drops
-            // nothing. Identical to the tokio engine so the differential
-            // EventStream parity holds. The full read/write task split is the
-            // deferred follow-up — this localized reorder is the minimal fix.
+            // `biased;` is retained — required for moonpool's bit-for-bit
+            // reproducibility (a non-biased `select!` would pick arms via an
+            // uncontrolled thread-local RNG) — and the read arm STAYS FIRST:
+            // `Producer::send` pulses `driver_waker.notify_one()` on every
+            // call, so under sustained publish load a waker permit is
+            // almost always pending on loop entry; polling read before the
+            // waker arm is still what keeps already-arrived
+            // `CommandSendReceipt` bytes from being deferred behind that
+            // permit (issue #303). The read arm is cancel-safe: bytes land
+            // in the persistent `read_buf` and are only consumed via
+            // `split()` AFTER this arm wins, so losing a race here drops
+            // nothing. Identical structure to the tokio engine so the
+            // differential `EventStream` parity holds.
             biased;
 
             // Inbound bytes (polled first for receipt fairness — see above).
-            r = transport.read_buf(&mut read_buf) => {
+            r = read_half.read_buf(&mut read_buf) => {
                 let n = match r {
                     Ok(n) => n,
                     Err(err) => {
@@ -1591,19 +1656,43 @@ where
             // send). Polled AFTER the inbound arm (see the read-fairness note at
             // the top of this `select!`): when both are ready the socket is
             // drained first so receipts are not deferred; the enqueued frames
-            // are still flushed by the top-of-loop `poll_transmit` on the next
-            // iteration. Identical to the tokio engine.
+            // are picked up by the write arm below (or, if this iteration's
+            // `write_has_work` snapshot predates the send, the very next
+            // iteration's). Identical to the tokio engine.
             () = shared.driver_waker.notified() => {
-                // Loop: poll_transmit will drain whatever the future enqueued.
+                // Loop: the next iteration's `poll_transmit_owned` will drain
+                // whatever the future enqueued.
             }
 
-            () = async {
-                if pending_write.is_empty() {
-                    std::future::pending::<()>().await;
+            // Bounded, cancellation-safe write (ADR-0083) — third in order,
+            // gated by `write_has_work` so it is skipped entirely when there
+            // is nothing to send. See the `biased;` comment above for why
+            // this is safe against both read-starvation (issue #303) and
+            // write-starvation (issue #370).
+            write_result = write_one_budget::<P>(
+                &mut pending_write,
+                &mut write_half,
+                &time,
+                // `write_deadline` is `Some` whenever `write_has_work` is —
+                // see where it's armed above.
+                write_deadline.unwrap_or_else(|| shared.now_instant() + operation_timeout),
+                shared.now_instant(),
+            ), if write_has_work => {
+                match write_result {
+                    Ok(()) => {
+                        if pending_write.is_empty()
+                            && !write_half.has_pending_ciphertext()
+                            && close_after_write
+                        {
+                            let _ = write_half.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => {
+                        shared.inner.lock().mark_disconnected();
+                        return Err(err.into());
+                    }
                 }
-            } => {
-                // Pending outbound bytes remain. Yield the read arm once, then
-                // continue with the next bounded write slice.
             }
 
             // Timer fired. `sleep_or_pending` only returns once the duration
@@ -1614,6 +1703,57 @@ where
                 // virtual-time sim runs see deterministic timeout firings.
                 shared.inner.lock().handle_timeout(shared.now_instant());
             }
+        }
+    }
+}
+
+/// Run ONE bounded batch of [`PendingDriverWrite::write_budgeted`] (capped at
+/// [`DRIVER_WRITE_BUDGET_BYTES`]) plus a trailing flush, itself bounded by
+/// `deadline` — a FIXED `Instant` computed once by the caller when a logical
+/// write first has work (ADR-0083), not a fresh `operation_timeout` duration
+/// re-armed on every call: the caller (`driver_loop_inner`) reconstructs
+/// this future's expression fresh on every `select!` round, so timing out
+/// off a relative duration here would silently reset to a full budget any
+/// time an unrelated arm (read, waker, or another timer tick) won a round
+/// while the write was mid-stall. `Connection::operation_timeout()` — NOT
+/// `keepalive_interval` — is the deadline source: `keepalive_interval` only
+/// detects read-side silence (a peer that keeps ACKing pings while refusing
+/// to drain our writes would never trip it). Routed through the injected
+/// `TimeProvider::timeout` (ADR-0011) — NEVER a host-clock read — so
+/// `moonpool-sim` runs stay bit-for-bit reproducible.
+async fn write_one_budget<P>(
+    pending_write: &mut PendingDriverWrite,
+    write_half: &mut crate::transport::TransportWriteHalf<P>,
+    time: &P::Time,
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> std::io::Result<()>
+where
+    P: Providers,
+{
+    let remaining = deadline.saturating_duration_since(now);
+    let outcome = time
+        .timeout(remaining, async {
+            let bytes = pending_write
+                .write_budgeted(write_half, DRIVER_WRITE_BUDGET_BYTES)
+                .await?;
+            tracing::trace!(bytes, "writing outbound bytes");
+            write_half.flush().await
+        })
+        .await;
+    match outcome {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            let pending_bytes = pending_write.remaining_len();
+            tracing::warn!(
+                deadline_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                pending_bytes,
+                "driver write deadline exceeded"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "driver write deadline exceeded",
+            ))
         }
     }
 }
@@ -2323,27 +2463,85 @@ mod tests {
         assert_eq!(ProducerHandle(42), ProducerHandle(42));
     }
 
+    /// `write_budgeted` (ADR-0083: lazily driven off `write_some`, no eager
+    /// `pop_budgeted` detach) over a REAL `moonpool-sim` `SimTcpStream`, via
+    /// `Transport::into_split`'s `TransportWriteHalf::Plain` arm — the same
+    /// split the driver loop now holds across the whole connection.
     #[test]
     fn driver_write_budget_leaves_tail_for_next_tick() {
-        let mut pending =
-            PendingDriverWrite::from_transmit(magnetar_proto::TransmitOwned::Contiguous(
-                Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"),
-            ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build current-thread runtime");
 
-        let first = pending.pop_budgeted(8);
-        assert_eq!(first, vec![Bytes::from_static(b"abcdefgh")]);
-        assert!(
-            !pending.is_empty(),
-            "the driver must keep unwritten bytes so it can read before continuing writes"
-        );
+        rt.block_on(async move {
+            use futures::io::AsyncRead as _;
+            use moonpool_core::{NetworkProvider as _, TcpListenerTrait as _};
+            use moonpool_sim::providers::SimProviders;
+            use moonpool_sim::{NetworkConfiguration, SimWorld};
 
-        let rest = pending.pop_budgeted(DRIVER_WRITE_BUDGET_BYTES);
-        let mut observed = Vec::new();
-        for chunk in rest {
-            observed.extend_from_slice(&chunk);
-        }
-        assert_eq!(&observed, b"ijklmnopqrstuvwxyz");
-        assert!(pending.is_empty());
+            let mut sim = SimWorld::new_with_network_config(NetworkConfiguration::fast_local());
+            let provider = sim.network_provider();
+            let addr = "driver-write-budget";
+
+            let listener = provider.bind(addr).await.expect("bind");
+            let client_stream = provider.connect(addr).await.expect("connect");
+            let (mut server, _peer) = listener.accept().await.expect("accept");
+
+            let transport: crate::transport::Transport<SimProviders> =
+                crate::transport::Transport::Plain {
+                    stream: client_stream,
+                    read_scratch: vec![0u8; 16 * 1024].into_boxed_slice(),
+                };
+            let (_read_half, mut write_half) = transport.into_split();
+
+            let mut pending =
+                PendingDriverWrite::from_transmit(magnetar_proto::TransmitOwned::Contiguous(
+                    Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz"),
+                ));
+
+            let written = pending
+                .write_budgeted(&mut write_half, 8)
+                .await
+                .expect("budgeted write");
+            assert_eq!(written, 8);
+            assert!(
+                !pending.is_empty(),
+                "the driver must keep unwritten bytes so it can read before continuing writes"
+            );
+
+            let rest = pending
+                .write_budgeted(&mut write_half, DRIVER_WRITE_BUDGET_BYTES)
+                .await
+                .expect("drain tail");
+            assert_eq!(rest, 18);
+            assert!(pending.is_empty());
+
+            // Drain the sim and confirm the peer's reassembled stream is the
+            // exact concatenation, in order — no gap from the two separate
+            // budgeted calls, no duplication from `write_budgeted`'s
+            // internal per-write_some commit loop.
+            let mut received: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; 64];
+            for _ in 0..1000 {
+                if received.len() >= 26 {
+                    break;
+                }
+                sim.step();
+                tokio::task::yield_now().await;
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                if let std::task::Poll::Ready(Ok(n)) =
+                    std::pin::Pin::new(&mut server).poll_read(&mut cx, &mut buf)
+                {
+                    if n > 0 {
+                        received.extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+            assert_eq!(&received, b"abcdefghijklmnopqrstuvwxyz");
+        });
     }
 
     #[test]

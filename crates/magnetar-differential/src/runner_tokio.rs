@@ -71,6 +71,34 @@ pub async fn run_supervised(
     .await
 }
 
+/// Run `trace` against the tokio engine with BOTH the auto-reconnect
+/// supervisor AND a caller-supplied `operation_timeout` — the ADR-0083
+/// write-deadline source. Layered on top of [`run_supervised`] rather than
+/// widening its signature: `run_supervised` stays the common case (default
+/// 30s `operation_timeout`), and the write-deadline equivalence scenario is
+/// the only caller that needs a short deadline to keep the differential
+/// test's wall-clock budget small.
+///
+/// # Errors
+/// Same envelope as [`run`].
+pub async fn run_supervised_with_operation_timeout(
+    pulsar_url: &str,
+    trace: &Trace,
+    supervisor: magnetar_proto::SupervisorConfig,
+    operation_timeout: Duration,
+) -> Result<EventStream, ClientError> {
+    run_with_config(
+        pulsar_url,
+        trace,
+        magnetar_proto::ConnectionConfig {
+            supervisor: Some(supervisor),
+            operation_timeout,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 async fn run_with_config(
     pulsar_url: &str,
     trace: &Trace,

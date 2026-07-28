@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Moonpool proxy/DIRECT broker-URL parsing no longer truncates a corrupted scheme into a nonsense authority:** `Client::proxy_broker_authority` / `direct_broker_authority` (moonpool engine only) previously fell through to a naive `host_port.split('/')` on any input that didn't match `strip_prefix("pulsar://")` / `strip_prefix("pulsar+ssl://")`, silently deriving authorities like `"ptlsar:"` from a single-bit-corrupted `broker_service_url` (e.g. moonpool-sim's bit-flip chaos) instead of failing the lookup. Both helpers now return `Result<String, ClientError>` and reject an input containing `"://"` with an unrecognised scheme explicitly, while still accepting a genuine scheme-less bare `host:port` unchanged.
+  (#362, #363, #364, #367; ADR-0055)
+- **`send_timeout` was blind to publishes relocated by a supervised reconnect:** `Connection::reset()` moves every in-flight `OpSend` out of `ProducerState::pending` and into `Connection::in_flight_publish_snapshots` so the supervisor can transparently replay it on the new session — but `ProducerState::drain_timed_out_sends` (the `send_timeout` sweep) only ever walked `pending`, so a publish parked across a reconnect was invisible to timeout enforcement until either a successful rebuild replayed it or the supervisor exhausted its entire reconnect attempt budget.
+  With a realistic `max_attempts`, a user's `send().await` could stay `Pending` for hours with `send_timeout` configured and armed.
+  `Connection::poll_timeout` and `Connection::handle_timeout` now also sweep `in_flight_publish_snapshots`, using each op's ORIGINAL `enqueued_at` (not a fresh reset()-relative budget) as the deadline base, so a relocated send now surfaces the same `SendError { code: -1, message: "send timeout" }` outcome the live-queue path installs, at the correctly-measured deadline — a previously-silent hang becomes a deterministic error.
+  Separately, `Connection::fail_all_pending` now also drains `in_flight_publish_snapshots` (installing `OpOutcome::Terminal`), mirroring `fail_producer_open_with_broker_error`'s existing snapshot drain, so a relocated send resolves promptly when the supervisor gives up even if the woken send future has not yet re-registered its waker.
+  (#369)
+- **A stalled outbound socket no longer starves the driver's read and timer paths:** the driver's write ran unconditionally at the top of every loop iteration in both engines, ahead of `select!` — safe only as long as the write always completed quickly.
+  A peer that accepted the connection and then simply stopped draining its receive window parked that write forever, blocking the ENTIRE loop: the read arm, the `driver_waker` arm, and the timer arm (the sole caller of `Connection::handle_timeout`, which drives the keepalive watchdog, the `send_timeout` sweep, and the `ack_response_timeout` backstop) never ran again, so `mark_disconnected()` was never reached and `is_connected()` kept reporting `true` on a functionally dead connection.
+  The write is now its own bounded, cancellation-safe `select!` arm (after read and the waker, before the timer), capped by both `DRIVER_WRITE_BUDGET_BYTES` and `Connection::operation_timeout()` (30s default; NOT `keepalive_interval`, which only detects read-side silence).
+  Expiry is treated as an I/O failure routed through the same `mark_disconnected()` path every other write error already takes, so the auto-reconnect supervisor redials exactly as it does for any other write failure, instead of the connection wedging as still-connected forever.
+  (#370; ADR-0083, amends ADR-0070 and ADR-0074)
+
 ## [1.2.3] - 2026-07-20
 
 ### Added
