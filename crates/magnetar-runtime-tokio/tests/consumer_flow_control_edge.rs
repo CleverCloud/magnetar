@@ -102,7 +102,7 @@ fn open_consumer(
     // isolation.
     {
         let mut conn = shared.inner.lock();
-        conn.initial_flow(handle);
+        conn.initial_flow(handle, at);
         let _ = conn.poll_transmit();
     }
     handle

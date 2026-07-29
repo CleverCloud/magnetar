@@ -129,7 +129,7 @@ fn consumer_receive_latency_histogram_reflects_popped_messages() {
     conn.handle_bytes(t0, &buf).expect("Success");
     let _ = conn.poll_event();
 
-    conn.initial_flow(handle);
+    conn.initial_flow(handle, t0);
     let _ = conn.poll_transmit();
 
     // No samples before any pop.

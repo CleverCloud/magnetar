@@ -34,14 +34,28 @@
 //! longer distinguishes "real starvation" from "churn window" the way the
 //! production code does, so this test drains the balance the same way the
 //! broker would: by actually dispatching messages.
+//!
+//! ## Second scenario: the arming bootstrap under a busy connection
+//!
+//! `receiver_queue_adjust_arming_agrees_under_continuous_ack_traffic` pins the
+//! `docs/follow-ups.md` §4 fix across both engines. `Connection::initial_flow`
+//! arms the adjust schedule from its injected `now`, so the first tick's
+//! deadline is a function of the subscribe-ack instant alone. The scenario
+//! drives continuous `CommandAckResponse` traffic — every decoded frame
+//! refreshes `last_activity` and pushes the keepalive deadline out (ADR-0058's
+//! single refresh site) — and captures the `poll_timeout()` sequence as offsets
+//! from `t0`. Both engines must report the same immovable adjust deadline: a
+//! deadline that slid with the traffic would mean the schedule never armed,
+//! which is precisely the defect, and under moonpool it would also make the
+//! first adjust land at a seed-dependent simulated instant.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    Auto, Connection, ConnectionConfig, ConsumerHandle, SubscribeRequest, decode_one,
-    encode_command, encode_payload, pb,
+    AckRequest, Auto, Connection, ConnectionConfig, ConsumerHandle, MessageId, PendingOpKey,
+    RequestId, SubscribeRequest, decode_one, encode_command, encode_payload, pb,
 };
 
 /// Auto floor; the queue seeds here and doubles under repeated starvation.
@@ -60,6 +74,10 @@ const TICKS: usize = 4;
 /// over-generous batch just bottoms the balance out at zero rather than
 /// under/over-shooting.
 const DRAIN_BATCH: u64 = 1000;
+/// Ack round-trips driven inside one adjust interval by the arming scenario.
+/// Nine 100 ms steps stay strictly inside the 1 s `TICK`, so every captured
+/// `poll_timeout()` is taken while the armed deadline is still in the future.
+const ACK_ROUND_TRIPS: usize = 9;
 
 /// The observable reaction both engines must agree on: the seeded target, the
 /// receiver-queue target after each adjust tick, and the ordered `CommandFlow`
@@ -157,8 +175,9 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
         ..Default::default()
     };
     let handle: ConsumerHandle = conn.subscribe(req);
-    // Force the initial flow (seeds the broker grant at the floor).
-    let _ = conn.initial_flow(handle);
+    // Force the initial flow (seeds the broker grant at the floor, and arms the
+    // adjust schedule at `t0` — follow-ups §4).
+    let _ = conn.initial_flow(handle, t0);
     // Drain the subscribe + initial-flow frames; we only track adjust-driven flows.
     let _ = conn.poll_transmit();
 
@@ -168,7 +187,8 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Reaction {
     let mut flow_grants = Vec::new();
     let mut next_entry_id: u64 = 0;
 
-    // First tick arms the adjust schedule (no adjust happens on it).
+    // Already armed at `t0`; this tick lands short of the `t0 + TICK` deadline
+    // and adjusts nothing.
     conn.handle_timeout(t0);
     let _ = conn.poll_transmit();
 
@@ -239,5 +259,157 @@ fn receiver_queue_policy_auto_event_streams_agree() {
     assert_eq!(
         tokio_reaction, expected,
         "Auto must ramp by bounded doubling under real dispatch-driven starvation, got {tokio_reaction:?}"
+    );
+}
+
+/// The observable reaction under continuous ack-response traffic, captured as
+/// offsets from `t0` so it is comparable across engines without leaking the
+/// absolute `Instant` into the equality check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BusyReaction {
+    /// `poll_timeout()` right after `initial_flow`, relative to `t0`.
+    armed_deadline_offset: Option<Duration>,
+    /// `poll_timeout()` after each ack round-trip, relative to `t0`.
+    deadline_offsets_per_ack: Vec<Option<Duration>>,
+    /// Receiver-queue target after the tick on the armed deadline.
+    target_after_armed_tick: usize,
+    /// Ordered `CommandFlow` grants emitted by that tick.
+    flow_grants: Vec<u32>,
+}
+
+/// Encode a broker `CommandAckResponse` resolving `request_id` for `handle`.
+fn ack_response_frame(handle: ConsumerHandle, request_id: RequestId) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AckResponse as i32,
+        ack_response: Some(pb::CommandAckResponse {
+            consumer_id: handle.0,
+            request_id: Some(request_id.0),
+            error: None,
+            message: None,
+            txnid_least_bits: None,
+            txnid_most_bits: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandAckResponse");
+    buf
+}
+
+/// Drive handshake + subscribe-Auto + initial-flow, then a run of sub-interval
+/// ack round-trips, over one engine's locked `Connection`.
+///
+/// Each round-trip decodes an inbound frame, which refreshes `last_activity`
+/// (ADR-0058's single refresh site) and so pushes the keepalive deadline out.
+/// The captured `poll_timeout()` sequence is the differential claim: on BOTH
+/// engines the armed adjust deadline must sit at `t0 + TICK` and stay there,
+/// unmoved by the traffic — which is what makes the first adjust tick fire at
+/// the same simulated instant under moonpool as under tokio (follow-ups §4).
+fn lock_and_run_busy(conn: &mut Connection, t0: Instant) -> BusyReaction {
+    conn.begin_handshake().expect("handshake");
+    conn.handle_bytes(t0, &handshake_response_bytes())
+        .expect("Connected");
+    let _ = conn.poll_event();
+
+    let req = SubscribeRequest {
+        topic: "persistent://public/default/auto-rq-busy".to_owned(),
+        subscription: "sub-auto-rq-busy".to_owned(),
+        receiver_queue_policy: Some(Arc::new(Auto::new(MIN, MAX_BYTES))),
+        receiver_queue_adjust_interval: Some(TICK),
+        ..Default::default()
+    };
+    let handle: ConsumerHandle = conn.subscribe(req);
+    let _ = conn.initial_flow(handle, t0);
+    let _ = conn.poll_transmit();
+
+    let armed_deadline_offset = conn.poll_timeout().map(|d| d.duration_since(t0));
+
+    // Real dispatch-driven starvation before the tick observes the balance.
+    for entry_id in 0..DRAIN_BATCH {
+        let frame = drain_message_frame(handle, entry_id, b"x");
+        conn.handle_bytes(t0, &frame)
+            .expect("deliver drain message");
+    }
+    while conn.poll_event().is_some() {}
+    let _ = conn.poll_transmit();
+
+    // Continuous ack round-trips across the whole sub-interval window.
+    let step = Duration::from_millis(100);
+    let mut deadline_offsets_per_ack = Vec::with_capacity(ACK_ROUND_TRIPS);
+    for k in 1..=ACK_ROUND_TRIPS {
+        let at = t0 + step * u32::try_from(k).expect("small loop counter");
+        let request_id = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 4,
+                    entry_id: k as u64,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: -1,
+                    #[cfg(feature = "scalable-topics")]
+                    segment_id: None,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            at,
+        );
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(at, &ack_response_frame(handle, request_id))
+            .expect("handle AckResponse");
+        let _ = conn.take_outcome(PendingOpKey::Request(request_id));
+        deadline_offsets_per_ack.push(conn.poll_timeout().map(|d| d.duration_since(t0)));
+    }
+
+    conn.handle_timeout(t0 + TICK);
+    let target_after_armed_tick = conn.consumer_receiver_queue_size(handle);
+    let flow_grants = drain_flow_grants(conn, handle);
+
+    BusyReaction {
+        armed_deadline_offset,
+        deadline_offsets_per_ack,
+        target_after_armed_tick,
+        flow_grants,
+    }
+}
+
+#[test]
+fn receiver_queue_adjust_arming_agrees_under_continuous_ack_traffic() {
+    let t0 = Instant::now();
+
+    let tokio_reaction = {
+        let shared = magnetar_runtime_tokio::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        lock_and_run_busy(&mut conn, t0)
+    };
+
+    let moonpool_reaction = {
+        let shared = magnetar_runtime_moonpool::ConnectionShared::new(ConnectionConfig::default());
+        let mut conn = shared.inner.lock();
+        lock_and_run_busy(&mut conn, t0)
+    };
+
+    assert_eq!(
+        tokio_reaction, moonpool_reaction,
+        "tokio and moonpool engines diverged on the Auto adjust-schedule arming under \
+         continuous ack-response traffic"
+    );
+
+    // And the shared behaviour is the right one: armed at `t0 + TICK` by
+    // `initial_flow` alone, held there across every ack round-trip (a sliding
+    // keepalive-derived deadline here would mean the schedule never armed —
+    // the follow-ups §4 defect), and the tick on that deadline doubles the
+    // target with a matching incremental grant.
+    let expected = BusyReaction {
+        armed_deadline_offset: Some(TICK),
+        deadline_offsets_per_ack: vec![Some(TICK); ACK_ROUND_TRIPS],
+        target_after_armed_tick: MIN * 2,
+        flow_grants: vec![MIN as u32],
+    };
+    assert_eq!(
+        tokio_reaction, expected,
+        "the armed adjust deadline must be immovable by inbound traffic, got {tokio_reaction:?}"
     );
 }

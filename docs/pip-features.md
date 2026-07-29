@@ -617,12 +617,15 @@ For partitioned consumers the byte budget is divided across the live partition c
 
 `adjust` and `initial` are **pure functions** of their inputs — no clock, no randomness, no I/O.
 The adjust tick is driven from the connection's sans-io timeout (`handle_timeout`) on the injected clock, never from a wall clock inside the policy ([ADR-0004](../specs/adr/0004-sans-io-protocol-core.md), [ADR-0011](../specs/adr/0011-clock-injection-sans-io.md)).
+The schedule itself is armed once, at subscribe-ack time, by `Connection::initial_flow(handle, now)` — so the first tick's deadline is `now + adjust_interval` and nothing on the connection can defer it ([ADR-0084](../specs/adr/0084-arm-auto-adjust-schedule-at-initial-flow.md)).
+That matters for a busy consumer: every decoded inbound frame refreshes the keepalive baseline, so a receive loop that awaits each individual ack would otherwise keep the connection's only other deadline permanently out of reach.
 This keeps the production tokio engine and the deterministic moonpool simulation engine bit-for-bit identical ([ADR-0024](../specs/adr/0024-cross-runtime-test-and-coverage-policy.md)).
 **Custom user policies MUST honour the same purity contract** — a policy that reads a clock or an RNG inside `adjust` would diverge the two engines.
 
 ### PIP-74 references
 
 - [ADR-0071](../specs/adr/0071-pluggable-receiver-queue-policy.md) — scope, design, and the five-layer test coverage.
+- [ADR-0084](../specs/adr/0084-arm-auto-adjust-schedule-at-initial-flow.md) — why the adjust schedule is armed at initial-flow time rather than on the first elapsed deadline.
 - [`crates/magnetar-proto/src/receiver_queue.rs`](../crates/magnetar-proto/src/receiver_queue.rs) — the trait, `FlowStats`, `Fixed`, `Auto`.
 - Apache Pulsar Java — `org.apache.pulsar.client.api.ConsumerBuilder#autoScaledReceiverQueueSizeEnabled`.
 
