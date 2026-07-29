@@ -219,6 +219,70 @@ async fn delete_subscription_without_force_omits_query() {
         .expect("delete returns 204");
 }
 
+/// Pulsar subscription names routinely embed `|` (Clever Cloud's
+/// `<app-name>|<app-id>` convention, and any Java consumer that defaults its
+/// subscription to a pipe-joined identifier). `|` is not an RFC 3986 `pchar`,
+/// so a raw pipe on the wire makes the broker's Jetty front end reject the
+/// request at URI-parse time with `400 Illegal Path Character` — before
+/// routing, which is why the body carries no broker `reason`.
+///
+/// Java encodes the segment with `Codec.encode` (`URLEncoder.encode`) in
+/// `TopicsImpl#deleteSubscriptionAsync`, putting `%7C` on the wire; the broker
+/// percent-decodes it back to `|`. Assert the same byte sequence here.
+#[tokio::test]
+async fn delete_subscription_percent_encodes_pipe_in_name() {
+    let mock = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .subscription_delete(
+            "persistent://orga_8b852f0a/pulsar_871e00e8/events",
+            "ovd.loadbalancer.api|app_6153c255",
+            false,
+        )
+        .await
+        .expect("delete returns 204");
+
+    let requests = mock.received_requests().await.expect("recording enabled");
+    assert_eq!(
+        requests[0].url.path(),
+        "/admin/v2/persistent/orga_8b852f0a/pulsar_871e00e8/events/subscription/\
+         ovd.loadbalancer.api%7Capp_6153c255",
+    );
+}
+
+/// The same encoding gap applies to every segment the client interpolates, not
+/// just subscription names: `[`, `]`, `^` and `|` are the four printable ASCII
+/// bytes the `url` crate's WHATWG path-segment set leaves raw while RFC 3986
+/// forbids them in a path. A topic name carrying one must not reach the broker
+/// unencoded either.
+#[tokio::test]
+async fn subscriptions_list_percent_encodes_non_pchar_topic_bytes() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let admin = client(&mock);
+    admin
+        .subscriptions_list("public/default/or[der]s^v|1")
+        .await
+        .expect("list returns 200");
+
+    let requests = mock.received_requests().await.expect("recording enabled");
+    assert_eq!(
+        requests[0].url.path(),
+        "/admin/v2/persistent/public/default/or%5Bder%5Ds%5Ev%7C1/subscriptions",
+    );
+}
+
 #[tokio::test]
 async fn delete_subscription_with_force_sets_query() {
     let mock = MockServer::start().await;

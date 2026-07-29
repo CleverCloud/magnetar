@@ -3410,27 +3410,32 @@ impl AdminClient {
     }
 
     /// Shared URL-builder body for the v2 / v3 helpers.
+    ///
+    /// Segments are percent-encoded by [`push_encoded_segment`] rather than by
+    /// `Url::path_segments_mut().push()`, whose WHATWG encode set is laxer than
+    /// RFC 3986 and leaves broker-hostile bytes raw — see that function.
     fn url_for(base: &Url, segments: &[&str]) -> Result<Url, AdminError> {
-        let mut url = base.clone();
-        {
-            // `Url::path_segments_mut` only fails for cannot-be-a-base URLs;
-            // builder already rejected those.
-            let mut path = url
-                .path_segments_mut()
-                .map_err(|()| AdminError::Builder("base url is cannot-be-a-base".into()))?;
-            // Both `base_url` (anchored at `/admin/v2/`) and `base_url_v3`
-            // (`/admin/v3/`) carry a trailing slash, which produces a
-            // sentinel empty trailing segment in `path_segments_mut`. Drop
-            // it before appending API segments — otherwise pushes land
-            // after the empty, producing `/admin/v2//persistent/...`. Real
-            // brokers tolerate the double slash; strict mocks (wiremock)
-            // do not, and Java's `PulsarAdmin` emits the single-slash
-            // form.
-            path.pop_if_empty();
-            for segment in segments {
-                path.push(segment);
-            }
+        // `Url::set_path` cannot signal failure, so keep the cannot-be-a-base
+        // rejection the old `path_segments_mut()` arm provided. The builder
+        // already rejects those URLs; this is the belt-and-braces arm.
+        if base.cannot_be_a_base() {
+            return Err(AdminError::Builder("base url is cannot-be-a-base".into()));
         }
+        // Both `base_url` (anchored at `/admin/v2/`) and `base_url_v3`
+        // (`/admin/v3/`) carry a trailing slash. Drop it before appending API
+        // segments — otherwise the join produces `/admin/v2//persistent/...`.
+        // Real brokers tolerate the double slash; strict mocks (wiremock) do
+        // not, and Java's `PulsarAdmin` emits the single-slash form.
+        let mut path = base.path().trim_end_matches('/').to_owned();
+        for segment in segments {
+            path.push('/');
+            push_encoded_segment(&mut path, segment);
+        }
+        let mut url = base.clone();
+        // Every byte outside `pchar` is already a `%XX` triplet here, and
+        // `set_path` preserves existing triplets verbatim, so this re-parse is
+        // a no-op on the path we just built.
+        url.set_path(&path);
         Ok(url)
     }
 
@@ -4528,6 +4533,57 @@ async fn ensure_status(api: ApiResponse) -> Result<ApiResponse, AdminError> {
     })
 }
 
+/// Is `b` an RFC 3986 `pchar` byte — legal, unescaped, inside a path segment?
+///
+/// `pchar = unreserved / pct-encoded / sub-delims / ":" / "@"`, with
+/// `unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"` and
+/// `sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="`.
+/// The `pct-encoded` alternative is what [`push_encoded_segment`] emits for
+/// everything this returns `false` for, so it is deliberately absent here.
+const fn is_pchar(b: u8) -> bool {
+    matches!(b,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+        | b'-' | b'.' | b'_' | b'~'
+        | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+        | b':' | b'@'
+    )
+}
+
+/// Append `segment` to `out`, percent-encoding every byte outside [`is_pchar`].
+///
+/// `Url::path_segments_mut().push()` encodes to the WHATWG URL path set, which
+/// is strictly laxer than RFC 3986: it leaves `[`, `]`, `^` and `|` raw. Those
+/// four bytes are illegal in a URI path, and Pulsar's Jetty front end rejects
+/// them at URI-parse time with `400 Illegal Path Character` — before routing,
+/// which is why such a failure carries no broker `reason` in the body.
+///
+/// Subscription names hit this constantly: `<consumer>|<app-id>` is a common
+/// convention, and `magnetarctl admin subscriptions delete … 'name|app_id'`
+/// 400'd on every such subscription.
+///
+/// Java reaches the same wire bytes from the other direction —
+/// `TopicsImpl#deleteSubscriptionAsync` calls `Codec.encode` (i.e.
+/// `URLEncoder.encode`) on the subscription before handing it to JAX-RS, so it
+/// too puts `%7C` on the wire. `URLEncoder` additionally escapes the
+/// `sub-delims` this function keeps raw (`!$&'()+,;=` and `:@~`); both forms
+/// percent-decode to the same name broker-side, and keeping the RFC 3986 set
+/// leaves the paths of every already-passing test byte-identical.
+///
+/// The encode set is a strict superset of what the `url` crate applied before,
+/// so the only observable change is those four bytes.
+fn push_encoded_segment(out: &mut String, segment: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in segment.as_bytes() {
+        if is_pchar(b) {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(b >> 4)]));
+            out.push(char::from(HEX[usize::from(b & 0x0f)]));
+        }
+    }
+}
+
 /// Split a `tenant/namespace` string into its two segments.
 /// Reject path segments the `url` crate would silently rewrite. `.` and `..`
 /// disappear under RFC 3986 dot-segment normalisation; percent-encoded slash
@@ -4892,6 +4948,73 @@ mod tests {
             split_topic("tenant/./topic"),
             Err(AdminError::InvalidName(_))
         ));
+    }
+
+    /// The four bytes the `url` crate left raw while RFC 3986 forbids them —
+    /// the exact regression that made every `|`-bearing subscription name 400.
+    #[test]
+    fn encoded_segment_escapes_the_non_pchar_ascii_bytes() {
+        let mut out = String::new();
+        push_encoded_segment(&mut out, "ovd.loadbalancer.api|app_6153c255");
+        assert_eq!(out, "ovd.loadbalancer.api%7Capp_6153c255");
+
+        let mut out = String::new();
+        push_encoded_segment(&mut out, "a[b]c^d|e");
+        assert_eq!(out, "a%5Bb%5Dc%5Ed%7Ce");
+    }
+
+    /// `pchar` passes through byte-identically, so every path the client
+    /// already built stays on the wire unchanged.
+    #[test]
+    fn encoded_segment_leaves_pchar_untouched() {
+        let pchar = "AZaz09-._~!$&'()*+,;=:@";
+        let mut out = String::new();
+        push_encoded_segment(&mut out, pchar);
+        assert_eq!(out, pchar);
+
+        // The literal segments the client interpolates must not move either.
+        for literal in ["persistent", "subscription", "skip_all", "expireMessages"] {
+            let mut out = String::new();
+            push_encoded_segment(&mut out, literal);
+            assert_eq!(out, literal);
+        }
+    }
+
+    /// Bytes the `url` crate already escaped stay escaped, and multi-byte
+    /// UTF-8 is encoded per byte (uppercase hex, as RFC 3986 recommends).
+    #[test]
+    fn encoded_segment_escapes_delimiters_space_and_non_ascii() {
+        let mut out = String::new();
+        push_encoded_segment(&mut out, "a b/c?d#e%f\\g\"h<i>j{k}l`m");
+        assert_eq!(out, "a%20b%2Fc%3Fd%23e%25f%5Cg%22h%3Ci%3Ej%7Bk%7Dl%60m");
+
+        let mut out = String::new();
+        push_encoded_segment(&mut out, "évé");
+        assert_eq!(out, "%C3%A9v%C3%A9");
+    }
+
+    /// End-to-end through the real builder: the pipe survives as `%7C` and the
+    /// `/admin/v2/` base keeps its single slash.
+    #[test]
+    fn url_for_percent_encodes_pipe_without_doubling_the_base_slash() {
+        let base = Url::parse("https://broker.example/admin/v2/").expect("valid base");
+        let url = AdminClient::url_for(
+            &base,
+            &["persistent", "t", "ns", "events", "subscription", "a|b"],
+        )
+        .expect("base is not cannot-be-a-base");
+        assert_eq!(
+            url.as_str(),
+            "https://broker.example/admin/v2/persistent/t/ns/events/subscription/a%7Cb"
+        );
+    }
+
+    /// A path-prefixed admin URL (K8s ingress shape) keeps its prefix.
+    #[test]
+    fn url_for_preserves_a_base_path_prefix() {
+        let base = Url::parse("https://gw.example/pulsar/admin/v2/").expect("valid base");
+        let url = AdminClient::url_for(&base, &["clusters"]).expect("valid base");
+        assert_eq!(url.as_str(), "https://gw.example/pulsar/admin/v2/clusters");
     }
 
     #[test]

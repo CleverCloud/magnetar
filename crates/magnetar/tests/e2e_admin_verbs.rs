@@ -278,10 +278,20 @@ async fn e2e_admin_topic_ops() -> Result<(), Box<dyn std::error::Error>> {
 /// Subscription operational verbs — list, skip-all, delete. The
 /// subscription is created by attaching a magnetar consumer (the only
 /// way to materialise one in Pulsar — admin REST has no
-/// `create-subscription`). Asserts:
+/// `create-subscription`). Asserts, for each subscription name:
 /// 1. `subscriptions_list` includes the subscription after attach.
 /// 2. `subscription_skip_all_messages` succeeds against a real subscription.
 /// 3. `subscription_delete` with `force=true` removes the subscription.
+///
+/// Runs the full cycle twice: once with a plain name, once with a name
+/// carrying a `|`. The pipe case is the regression guard for the admin
+/// client's path encoding — `|` is not an RFC 3986 `pchar`, so a raw one on
+/// the wire is rejected by the broker's Jetty front end at URI-parse time
+/// with `400 Illegal Path Character`, before any Pulsar handler runs.
+///
+/// This has to be an e2e test: `wiremock` accepts a raw `|` in a request
+/// target quite happily, so the crate's wire-level tests can pin the encoded
+/// bytes but cannot prove the broker accepts them. Only a real Jetty can.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_admin_subscription_ops() -> Result<(), Box<dyn std::error::Error>> {
     let (service_url, admin_url, _container) = start_pulsar().await?;
@@ -292,9 +302,8 @@ async fn e2e_admin_subscription_ops() -> Result<(), Box<dyn std::error::Error>> 
         .await?;
 
     let topic = "persistent://public/default/magnetar-e2e-subs";
-    let sub_name = "magnetar-e2e-sub";
 
-    // Bootstrap topic and attach a consumer to create the subscription.
+    // Bootstrap the topic once; both subscriptions attach to it.
     {
         let producer = client.producer(topic).create().await?;
         producer
@@ -302,38 +311,44 @@ async fn e2e_admin_subscription_ops() -> Result<(), Box<dyn std::error::Error>> 
             .await?;
         producer.close().await?;
     }
-    {
-        let _consumer = client
-            .consumer(topic)
-            .subscription(sub_name)
-            .subscription_type(SubType::Exclusive)
-            .subscribe()
+
+    // The pipe-bearing name mirrors the `<consumer>|<app-id>` convention that
+    // surfaced the bug in the field.
+    for sub_name in ["magnetar-e2e-sub", "ovd.loadbalancer.api|app_6153c255"] {
+        {
+            let _consumer = client
+                .consumer(topic)
+                .subscription(sub_name)
+                .subscription_type(SubType::Exclusive)
+                .subscribe()
+                .await?;
+            // Drop the consumer to release the exclusive lock so the
+            // delete call below isn't 412-blocked.
+        }
+
+        // 1. List includes the subscription. The broker echoes the decoded name, so a mis-encoded
+        //    path would also show up as a mismatch here.
+        let listed = admin.subscriptions_list(topic).await?;
+        assert!(
+            listed.iter().any(|s| s == sub_name),
+            "subscriptions_list missing `{sub_name}`; got {listed:?}"
+        );
+
+        // 2. Skip-all on a real subscription succeeds. The broker treats "drain-backlog" as
+        //    idempotent — succeeds with 204 whether or not there's a pending entry to skip.
+        admin
+            .subscription_skip_all_messages(topic, sub_name)
             .await?;
-        // Drop the consumer to release the exclusive lock so the
-        // delete call below isn't 412-blocked.
+
+        // 3. Delete with force=true (in case Pulsar still considers a cursor active in the metadata
+        //    cache).
+        admin.subscription_delete(topic, sub_name, true).await?;
+        let after_delete = admin.subscriptions_list(topic).await?;
+        assert!(
+            !after_delete.iter().any(|s| s == sub_name),
+            "subscription_delete left `{sub_name}` in place: {after_delete:?}"
+        );
     }
-
-    // 1. List includes the subscription.
-    let listed = admin.subscriptions_list(topic).await?;
-    assert!(
-        listed.iter().any(|s| s == sub_name),
-        "subscriptions_list missing `{sub_name}`; got {listed:?}"
-    );
-
-    // 2. Skip-all on a real subscription succeeds. The broker treats "drain-backlog" as idempotent
-    //    — succeeds with 204 whether or not there's a pending entry to skip.
-    admin
-        .subscription_skip_all_messages(topic, sub_name)
-        .await?;
-
-    // 3. Delete with force=true (in case Pulsar still considers a cursor active in the metadata
-    //    cache).
-    admin.subscription_delete(topic, sub_name, true).await?;
-    let after_delete = admin.subscriptions_list(topic).await?;
-    assert!(
-        !after_delete.iter().any(|s| s == sub_name),
-        "subscription_delete left the subscription in place: {after_delete:?}"
-    );
 
     Ok(())
 }
