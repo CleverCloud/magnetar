@@ -538,3 +538,92 @@ async fn lookup_resolving_to_bootstrap_broker_reuses_bootstrap_connection() {
         "bootstrap session must have seen PRODUCER (reused, not pooled), got {kinds:?}",
     );
 }
+
+/// A single-bit corruption of the `pulsar` scheme word, the shape
+/// moonpool-sim's bit-flip chaos actually produced for issue #364.
+const CORRUPTED_SCHEME_BROKER_URL: &str = "ptlsar://broker-sim.proxy.internal:6650";
+
+/// Regression (ADR-0024 layer b): a DIRECT lookup advertising a
+/// corrupted-scheme `broker_service_url` must fail the producer open with a
+/// scheme rejection, not dial a fabricated broker.
+///
+/// `Client::resolve_direct_broker` feeds the advertised URL through
+/// `parse_direct_broker_url`. Before the fix that helper prefixed a SECOND
+/// scheme onto a string that already carried one
+/// (`"pulsar://ptlsar://broker-sim.proxy.internal:6650"`), which
+/// `url::Url::parse` accepts — yielding host `"ptlsar"` and the wrong default
+/// port 6650 — so the runtime went on to *dial* that fabricated target.
+///
+/// The open fails either way, which is why the assertion is on the error
+/// **variant**, not merely on `is_err()`: pre-fix the failure came from the
+/// doomed dial to `ptlsar:6650` (a DNS `ClientError::Io`), post-fix it is the
+/// `ClientError::Other` scheme rejection raised before any dial is attempted.
+/// The session count pins the same distinction structurally — the bootstrap
+/// broker must see the LOOKUP and nothing else.
+///
+/// Moonpool twin:
+/// `crates/magnetar-runtime-moonpool/tests/lookup_direct_multi_broker.rs`'s
+/// test of the same name. Cross-engine equivalence:
+/// `crates/magnetar-differential/tests/corrupted_broker_scheme_equivalence.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_producer_rejects_corrupted_scheme_broker_url() {
+    let (url_a, sessions_a) = spawn_broker(BrokerRole {
+        redirect_to: Some(CORRUPTED_SCHEME_BROKER_URL.to_owned()),
+    })
+    .await;
+
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        Client::connect(&url_a, ConnectionConfig::default()),
+    )
+    .await
+    .expect("connect ok")
+    .expect("connect ok");
+
+    let open_result = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: "persistent://public/default/direct-corrupted-scheme".to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("open_producer did not time out");
+
+    let snap = sessions_a.lock().clone();
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+    drop(client);
+
+    let err = open_result.expect_err(
+        "open_producer must fail on a corrupted-scheme broker_service_url, not silently succeed \
+         through a fabricated dial target",
+    );
+    assert!(
+        matches!(err, magnetar_runtime_tokio::ClientError::Other(_)),
+        "the corrupted scheme must be rejected before any dial is attempted (a dial failure \
+         would surface as ClientError::Io); got {err:?}",
+    );
+
+    // Exactly one session — the bootstrap. The corrupted target is never
+    // dialled, so no second connection is even attempted.
+    assert_eq!(
+        snap.len(),
+        1,
+        "only the bootstrap session may be opened, got {snap:?}",
+    );
+    let kinds: Vec<_> = snap[0]
+        .frames
+        .iter()
+        .filter_map(|k| pb::base_command::Type::try_from(*k).ok())
+        .collect();
+    assert!(
+        kinds.contains(&pb::base_command::Type::Lookup),
+        "bootstrap session must have seen the LOOKUP, got {kinds:?}",
+    );
+    assert!(
+        !kinds.contains(&pb::base_command::Type::Producer),
+        "the PRODUCER must never be sent — the lookup target could not be resolved, got {kinds:?}",
+    );
+}

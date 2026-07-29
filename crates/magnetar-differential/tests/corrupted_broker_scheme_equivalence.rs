@@ -1,61 +1,99 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Layer (d) of the ADR-0024 obligation for issue #364's production
-//! hardening — `magnetar_runtime_moonpool::client::proxy_broker_authority`
-//! / `direct_broker_authority` changed from `fn(&str) -> String` to
-//! `fn(&str) -> Result<String, ClientError>`, rejecting a corrupted /
-//! unrecognised URL scheme (e.g. a single-bit corruption of `pulsar`,
-//! `"ptlsar://..."`) instead of silently truncating it into a nonsense
-//! authority.
+//! Layer (d) of the ADR-0024 obligation for the corrupted-broker-scheme
+//! hardening, in two parts: the PROXY-path half (issue #364,
+//! `magnetar_runtime_moonpool::client::proxy_broker_authority` /
+//! `direct_broker_authority` changed from `fn(&str) -> String` to
+//! `fn(&str) -> Result<String, ClientError>`) and the DIRECT-path half
+//! (`magnetar_runtime_tokio::client::parse_direct_broker_url`, tracked in
+//! `docs/follow-ups.md` until this changeset closed it — see `git log` for
+//! the implementation reference; the tracker renumbers on every close, so
+//! no section number is cited here).
+//! Both concern a corrupted / unrecognised URL scheme — a single-bit
+//! corruption of the `pulsar` scheme word, `"ptlsar://..."`, the shape
+//! moonpool-sim's bit-flip chaos actually produced.
 //!
-//! **Honest scope note: this test is NOT the fix's regression proof.** It
-//! asserts a proto-level invariant that is unaffected by, and true both
-//! before AND after, the client-layer fix — reverting the `client.rs`
-//! change would NOT turn this test red, because it never calls
-//! `proxy_broker_authority` / `direct_broker_authority` at all; it only
-//! drives `magnetar_proto::Connection` directly. The actual red/green
-//! regression proof for this fix lives in
-//! `crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs`'s
-//! `open_producer_through_proxy_rejects_corrupted_broker_scheme` (verified
-//! red pre-fix, green post-fix — see the commit message). What THIS test
-//! proves is narrower but still load-bearing for ADR-0024 layer (d): that
-//! both engines' proto layers decode the identical corrupted wire bytes
-//! identically, so whatever each engine's `Client` layer subsequently does
-//! with that value is reacting to the same decoded input, not a
-//! decode-level divergence between engines.
+//! The file holds two tests at two different altitudes; read the scope
+//! notes below before treating either as proof of something it is not.
 //!
-//! **What this test does and, deliberately, does NOT assert.** Per the
-//! `lookup_direct_multi_broker_equivalence.rs` precedent this file mirrors:
-//! a full client-level cross-engine assertion would require standing up a
-//! broker/proxy pair for each engine, so the load-bearing equivalence is at
-//! the **proto** layer — both engines' [`magnetar_proto::Connection`] must
-//! decode the SAME corrupted `CommandLookupTopicResponse` bytes to the SAME
-//! `OpOutcome::LookupResponse` / `broker_service_url: Some("ptlsar://...")`
-//! shape (the raw bytes on the wire are unaffected by this fix; only the
-//! CLIENT-layer post-processing of that value changed, and only on
-//! moonpool). This test does NOT assert that both engines' `Client`
-//! layers behave the same way past that point — they don't, on purpose:
-//! moonpool's `proxy_broker_authority` now rejects the corrupted scheme
-//! explicitly, while the tokio engine's `preferred_broker_url` still
-//! forwards the raw string unchanged (relying on the downstream Pulsar
-//! Proxy's `validateBrokerTarget()` to reject it — see
+//! # 1. Proto-layer decode equivalence — [`tokio_and_moonpool_decode_the_same_corrupted_scheme_lookup_response`]
+//!
+//! **Honest scope note: this one is NOT a regression proof.** It asserts a
+//! proto-level invariant that is unaffected by, and true both before AND
+//! after, either client-layer fix — reverting either `client.rs` change
+//! would NOT turn it red, because it never calls the client helpers at
+//! all; it only drives `magnetar_proto::Connection` directly. What it
+//! proves is narrower but still load-bearing: both engines' proto layers
+//! decode the identical corrupted wire bytes identically, so whatever each
+//! engine's `Client` layer subsequently does with that value is reacting
+//! to the same decoded input, not a decode-level divergence. The
+//! `magnetar-proto` side of the same invariant is pinned by
+//! `crates/magnetar-proto/src/lookup.rs`'s
+//! `connect_outcome_surfaces_a_corrupted_scheme_verbatim`.
+//!
+//! # 2. Client-layer rejection equivalence — [`tokio_and_moonpool_reject_the_same_corrupted_direct_broker_url`]
+//!
+//! This one IS a regression proof, and it is the reason the file grew a
+//! client-level test after the `lookup_direct_multi_broker_equivalence.rs`
+//! precedent had settled on proto-only assertions: on the DIRECT path the
+//! two engines used to genuinely **disagree**, so there was a real
+//! cross-engine divergence to pin. Moonpool's `direct_broker_authority`
+//! rejected `"ptlsar://…"`; tokio's `parse_direct_broker_url` fell through
+//! to a bare-`host:port` fallback that prefixed a SECOND scheme onto a
+//! string already carrying one (`"pulsar://ptlsar://…"`), which
+//! `url::Url::parse` accepts — silently yielding host `"ptlsar"` with the
+//! WRONG default port, which the runtime then dialled. Verified red
+//! pre-fix: the tokio half failed with
+//! `Io(… "failed to lookup address information: Name or service not
+//! known")`, i.e. the fabricated target really was dialled.
+//!
+//! Both engines are driven over real host sockets against one shared
+//! in-process fake broker (moonpool via `TokioProviders`), so this asserts
+//! equivalence of the actual `Client` surface, not of a proto snapshot.
+//!
+//! It is also the only test in the moonpool/differential runner set that
+//! actually *executes* the fixed tokio helper. Note what that does and does
+//! not buy: `cargo run -p xtask -- check-sim-coverage` runs
+//! `cargo llvm-cov -p magnetar-runtime-moonpool -p magnetar-differential`,
+//! and the `-p` form instruments only those two crates — verified on this
+//! changeset's own `target/sim-coverage.lcov`, whose `SF:` records cover 12
+//! `magnetar-runtime-moonpool` files and 4 `magnetar-differential` files and
+//! **zero** `magnetar-runtime-tokio` files. `intersect_diff_with_coverage`
+//! treats a file absent from the LCOV as non-executable, so added lines in
+//! `magnetar-runtime-tokio/src/client.rs` are silently skipped, not enforced:
+//! the gate's "all added lines across 2 file(s) are covered" counts *tracked*
+//! files, not verified ones. The execution here is therefore real coverage in
+//! the ordinary sense and no coverage at all in the gate's sense — do not
+//! rely on `check-sim-coverage` to police a tokio-only change.
+//!
+//! # Still deliberately NOT asserted
+//!
+//! The **PROXY** path remains an intentional cross-engine split, and no
+//! test here claims otherwise: moonpool's `proxy_broker_authority` rejects
+//! a corrupted scheme, while tokio's `preferred_broker_url` forwards the
+//! raw string unchanged with a warning, relying on the downstream Pulsar
+//! Proxy's `validateBrokerTarget()` to reject it. See
 //! `crates/magnetar-runtime-moonpool/src/client.rs`'s
-//! `proxy_broker_authority` doc comment for the full split verdict). Neither
-//! hardening is cross-engine parity restoration: tokio's `parse_direct_broker_url`
-//! (the DIRECT-path sibling `direct_broker_authority` was compared against)
-//! does not cleanly reject the equivalent corrupted-scheme input either — it
-//! has its own distinct latent bug, silently mis-deriving a garbage host
-//! with the WRONG default port (see `docs/follow-ups.md` §6, filed rather
-//! than fixed here since `magnetar-runtime-tokio` is out of scope for this
-//! changeset). Both moonpool hardenings go beyond what tokio currently does.
+//! `proxy_broker_authority` doc comment for that verdict. The moonpool
+//! PROXY-path red/green proof lives in
+//! `crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs`'s
+//! `open_producer_through_proxy_rejects_corrupted_broker_scheme`.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use magnetar_proto::{Connection, ConnectionConfig, LookupOutcome, OpOutcome, encode_command, pb};
+use magnetar_differential::HANG_GUARD;
+use magnetar_proto::{
+    Connection, ConnectionConfig, CreateProducerRequest, FrameError, LookupOutcome, OpOutcome,
+    SupervisorConfig, decode_one, encode_command, pb,
+};
+use moonpool_core::TokioProviders;
+use parking_lot::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// A single-bit corruption of the `pulsar` scheme word, matching the
 /// shape moonpool-sim's bit-flip chaos actually produced for issue #364.
@@ -218,4 +256,354 @@ fn tokio_and_moonpool_decode_the_same_corrupted_scheme_lookup_response() {
         tokio_snap.proxy_through_service_url,
         "PROXY routing must decode identically on both engines regardless of scheme corruption"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Client-layer rejection equivalence (DIRECT path).
+// ---------------------------------------------------------------------------
+
+/// How an engine's `Client` reacted to the corrupted DIRECT-path broker URL.
+///
+/// The distinction that matters is *where* the failure came from, not merely
+/// that one occurred: both engines fail either way, so a bare `is_err()`
+/// comparison would have called the pre-fix divergence "equivalent".
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RejectionShape {
+    /// The engine refused to derive a dial target from the corrupted scheme —
+    /// `ClientError::Other` on both engines, raised before any socket to the
+    /// fabricated host is opened.
+    SchemeRejected,
+    /// The engine derived *something* from the corrupted scheme and tried to
+    /// dial it, failing at the transport. This is what tokio did before the
+    /// `parse_direct_broker_url` fix. The two engines spell this arm
+    /// differently — tokio has `ClientError::Io`, moonpool routes socket
+    /// failures through `ClientError::Engine(EngineError)` — so the mapping is
+    /// per-engine and the comparison happens on this normalised shape.
+    TransportFailure,
+    /// Neither — recorded verbatim so a mismatch reports what actually
+    /// happened instead of collapsing to "not equal".
+    Unexpected(&'static str),
+}
+
+/// Per-session log for the shared fake broker.
+#[derive(Debug, Default, Clone)]
+struct DirectSessionRecord {
+    connect_proxy_to_broker_url: Option<String>,
+    frames: Vec<i32>,
+}
+
+/// Spawn an in-process broker on `127.0.0.1:0` that answers every lookup with
+/// `LookupOutcome::Connect { broker_service_url = CORRUPTED_SCHEME_BROKER_URL,
+/// proxy_through_service_url = false }` — the DIRECT-routing shape both
+/// engines feed through their broker-URL helper.
+///
+/// Returns `(host:port, pulsar:// url, session log)`. The two address forms
+/// exist because the engines take different bootstrap shapes: tokio's
+/// `Client::connect` wants the full URL, moonpool's
+/// `Client::connect_plain_supervised` wants the bare authority.
+async fn spawn_corrupted_direct_broker() -> (String, String, Arc<Mutex<Vec<DirectSessionRecord>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("broker bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let sessions: Arc<Mutex<Vec<DirectSessionRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sessions_for_task = sessions.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            let session_idx = {
+                let mut s = sessions_for_task.lock();
+                s.push(DirectSessionRecord::default());
+                s.len() - 1
+            };
+            let sessions = sessions_for_task.clone();
+            tokio::spawn(async move {
+                let _ = handle_direct_session(stream, &sessions, session_idx).await;
+            });
+        }
+    });
+    (addr.to_string(), format!("pulsar://{addr}"), sessions)
+}
+
+async fn handle_direct_session(
+    mut stream: tokio::net::TcpStream,
+    sessions: &Arc<Mutex<Vec<DirectSessionRecord>>>,
+    session_idx: usize,
+) -> std::io::Result<()> {
+    let mut read_buf = BytesMut::with_capacity(8 * 1024);
+    let mut out_buf = BytesMut::with_capacity(8 * 1024);
+    loop {
+        loop {
+            let mut framed = read_buf.clone().freeze();
+            let before = framed.len();
+            let frame = match decode_one(&mut framed) {
+                Ok(f) => f,
+                Err(FrameError::Incomplete { .. }) => break,
+                Err(_) => return Ok(()),
+            };
+            let consumed = before - framed.len();
+            let _ = read_buf.split_to(consumed);
+
+            let kind = frame.command.r#type;
+            if matches!(
+                pb::base_command::Type::try_from(kind).ok(),
+                Some(pb::base_command::Type::Connect)
+            ) {
+                if let Some(c) = &frame.command.connect {
+                    sessions.lock()[session_idx]
+                        .connect_proxy_to_broker_url
+                        .clone_from(&c.proxy_to_broker_url);
+                }
+            } else {
+                sessions.lock()[session_idx].frames.push(kind);
+            }
+
+            handle_direct_frame(&frame, &mut out_buf);
+        }
+
+        if !out_buf.is_empty() {
+            stream.write_all(&out_buf).await?;
+            stream.flush().await?;
+            out_buf.clear();
+        }
+
+        match stream.read_buf(&mut read_buf).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn handle_direct_frame(frame: &magnetar_proto::Frame, out: &mut BytesMut) {
+    let Ok(kind) = pb::base_command::Type::try_from(frame.command.r#type) else {
+        return;
+    };
+    match kind {
+        pb::base_command::Type::Connect => {
+            let cmd = pb::BaseCommand {
+                r#type: pb::base_command::Type::Connected as i32,
+                connected: Some(pb::CommandConnected {
+                    server_version: "magnetar-diff-corrupted-direct".to_owned(),
+                    protocol_version: Some(21),
+                    max_message_size: Some(5 * 1024 * 1024),
+                    feature_flags: Some(pb::FeatureFlags::default()),
+                }),
+                ..Default::default()
+            };
+            let _ = encode_command(out, &cmd);
+        }
+        pb::base_command::Type::Ping => {
+            let cmd = pb::BaseCommand {
+                r#type: pb::base_command::Type::Pong as i32,
+                pong: Some(pb::CommandPong {}),
+                ..Default::default()
+            };
+            let _ = encode_command(out, &cmd);
+        }
+        pb::base_command::Type::Lookup => {
+            if let Some(l) = &frame.command.lookup_topic {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::LookupResponse as i32,
+                    lookup_topic_response: Some(pb::CommandLookupTopicResponse {
+                        broker_service_url: Some(CORRUPTED_SCHEME_BROKER_URL.to_owned()),
+                        broker_service_url_tls: None,
+                        response: Some(
+                            pb::command_lookup_topic_response::LookupType::Connect as i32,
+                        ),
+                        request_id: l.request_id,
+                        authoritative: Some(true),
+                        error: None,
+                        message: None,
+                        // DIRECT routing — the path `parse_direct_broker_url` /
+                        // `direct_broker_authority` serve.
+                        proxy_through_service_url: Some(false),
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
+        // A producer must never reach us — if the corrupted target were
+        // dialled it would go to the fabricated host, not here. Answering
+        // anyway keeps the fake honest if the contract ever regresses, so the
+        // frame-kind assertion is what catches it rather than a hang.
+        pb::base_command::Type::Producer => {
+            if let Some(p) = &frame.command.producer {
+                let cmd = pb::BaseCommand {
+                    r#type: pb::base_command::Type::ProducerSuccess as i32,
+                    producer_success: Some(pb::CommandProducerSuccess {
+                        request_id: p.request_id,
+                        producer_name: "diff-corrupted-direct".to_owned(),
+                        last_sequence_id: Some(-1),
+                        schema_version: None,
+                        topic_epoch: Some(0),
+                        producer_ready: Some(true),
+                    }),
+                    ..Default::default()
+                };
+                let _ = encode_command(out, &cmd);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The supervisor must be wired so each engine builds its `ProxyConnectionPool`
+/// — without a pool there is no per-broker dial path and the DIRECT branch
+/// degrades to "reuse the bootstrap", never reaching the helper under test.
+fn supervised_config() -> ConnectionConfig {
+    ConnectionConfig {
+        supervisor: Some(SupervisorConfig::default()),
+        operation_timeout: Duration::from_secs(10),
+        ..ConnectionConfig::default()
+    }
+}
+
+const DIFF_TOPIC: &str = "persistent://public/default/diff-corrupted-direct-scheme";
+
+/// Drive `magnetar_runtime_tokio::Client` against the corrupted-scheme broker.
+async fn tokio_direct_rejection() -> (RejectionShape, Vec<DirectSessionRecord>) {
+    let (_host_port, url, sessions) = spawn_corrupted_direct_broker().await;
+
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        magnetar_runtime_tokio::Client::connect(&url, supervised_config()),
+    )
+    .await
+    .expect("tokio connect did not time out")
+    .expect("tokio connect ok");
+
+    let open_result = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: DIFF_TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("tokio open_producer did not time out");
+
+    let snapshot = sessions.lock().clone();
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+    drop(client);
+
+    let shape = match open_result {
+        Ok(_) => RejectionShape::Unexpected("open_producer succeeded"),
+        Err(magnetar_runtime_tokio::ClientError::Other(_)) => RejectionShape::SchemeRejected,
+        Err(magnetar_runtime_tokio::ClientError::Io(_)) => RejectionShape::TransportFailure,
+        Err(_) => RejectionShape::Unexpected("other ClientError variant"),
+    };
+    (shape, snapshot)
+}
+
+/// Drive `magnetar_runtime_moonpool::Client` against its own instance of the
+/// same corrupted-scheme broker. `TokioProviders` runs the moonpool engine
+/// over real host sockets, so both engines face identical wire conditions.
+async fn moonpool_direct_rejection() -> (RejectionShape, Vec<DirectSessionRecord>) {
+    let (host_port, _url, sessions) = spawn_corrupted_direct_broker().await;
+
+    let engine = magnetar_runtime_moonpool::MoonpoolEngine::new(TokioProviders::new());
+    let client = tokio::time::timeout(
+        HANG_GUARD,
+        magnetar_runtime_moonpool::Client::connect_plain_supervised(
+            &engine,
+            &host_port,
+            supervised_config(),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("moonpool connect did not time out")
+    .expect("moonpool connect ok");
+
+    let open_result = tokio::time::timeout(
+        HANG_GUARD,
+        client.open_producer(CreateProducerRequest {
+            topic: DIFF_TOPIC.to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("moonpool open_producer did not time out");
+
+    let snapshot = sessions.lock().clone();
+    if let Some(d) = client.take_driver() {
+        d.abort();
+    }
+    drop(client);
+
+    let shape = match open_result {
+        Ok(_) => RejectionShape::Unexpected("open_producer succeeded"),
+        Err(magnetar_runtime_moonpool::ClientError::Other(_)) => RejectionShape::SchemeRejected,
+        Err(magnetar_runtime_moonpool::ClientError::Engine(_)) => RejectionShape::TransportFailure,
+        Err(_) => RejectionShape::Unexpected("other ClientError variant"),
+    };
+    (shape, snapshot)
+}
+
+/// Both engines' `Client` layers must reject a corrupted-scheme DIRECT broker
+/// URL the same way: refuse to derive a dial target, before any socket to the
+/// fabricated host is opened.
+///
+/// This is the cross-engine parity assertion the DIRECT path could not carry
+/// until `magnetar_runtime_tokio::client::parse_direct_broker_url` was fixed:
+/// moonpool answered `SchemeRejected`, tokio answered `TransportFailure` (it
+/// had derived host `"ptlsar"` with the wrong default port 6650 and dialled
+/// it).
+/// The session log pins the same conclusion structurally — one session, the
+/// bootstrap, carrying the LOOKUP and no `CommandProducer`.
+///
+/// Runs in a `LocalSet`: `TokioProviders` is not `Send`, so the moonpool half
+/// must stay on one thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tokio_and_moonpool_reject_the_same_corrupted_direct_broker_url() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (tokio_shape, tokio_sessions) = tokio_direct_rejection().await;
+            let (moonpool_shape, moonpool_sessions) = moonpool_direct_rejection().await;
+
+            assert_eq!(
+                tokio_shape, moonpool_shape,
+                "the engines disagree on how to handle a corrupted-scheme DIRECT broker URL:\n\
+                 tokio    = {tokio_shape:?}\n\
+                 moonpool = {moonpool_shape:?}",
+            );
+            assert_eq!(
+                tokio_shape,
+                RejectionShape::SchemeRejected,
+                "both engines must refuse to derive a dial target from '{CORRUPTED_SCHEME_BROKER_URL}' \
+                 rather than dialling whatever they can salvage from it",
+            );
+
+            for (engine, snapshot) in [
+                ("tokio", &tokio_sessions),
+                ("moonpool", &moonpool_sessions),
+            ] {
+                assert_eq!(
+                    snapshot.len(),
+                    1,
+                    "{engine}: only the bootstrap session may be opened, got {snapshot:?}",
+                );
+                let kinds: Vec<_> = snapshot[0]
+                    .frames
+                    .iter()
+                    .filter_map(|k| pb::base_command::Type::try_from(*k).ok())
+                    .collect();
+                assert!(
+                    kinds.contains(&pb::base_command::Type::Lookup),
+                    "{engine}: bootstrap session must have seen the LOOKUP, got {kinds:?}",
+                );
+                assert!(
+                    !kinds.contains(&pb::base_command::Type::Producer),
+                    "{engine}: the PRODUCER must never be sent — the lookup target could not be \
+                     resolved, got {kinds:?}",
+                );
+            }
+        })
+        .await;
 }

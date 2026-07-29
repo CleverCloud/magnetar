@@ -19,14 +19,13 @@ Breaking API changes are acceptable when they improve correctness, ergonomics, o
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                                                           | Status                                                                                           |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                                  | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)                                                | 🧠 needs design decision on the fan-out surface                                                  |
-| 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)                                                 | ⚡ ready to dispatch                                                                             |
-| 5   | [`HealthProbe::authority` shares the scheme-truncation pattern](#5-health-probe-authority-scheme-truncation)                                   | ⚡ ready to dispatch                                                                             |
-| 6   | [`parse_direct_broker_url` mis-derives a garbage host on a corrupted scheme](#6-tokio-parse_direct_broker_url-corrupted-scheme-mis-derivation) | ⚡ ready to dispatch                                                                             |
-| 7   | [No gate keeps new e2e files on the container memory budget](#7-e2e-container-memory-gate)                                                     | ⚡ ready to dispatch                                                                             |
+| #   | Item                                                                                                         | Status                                                                                           |
+| --- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)              | 🧠 needs design decision on the fan-out surface                                                  |
+| 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)               | ⚡ ready to dispatch                                                                             |
+| 5   | [`HealthProbe::authority` shares the scheme-truncation pattern](#5-health-probe-authority-scheme-truncation) | ⚡ ready to dispatch                                                                             |
+| 7   | [No gate keeps new e2e files on the container memory budget](#7-e2e-container-memory-gate)                   | ⚡ ready to dispatch                                                                             |
 
 ---
 
@@ -89,27 +88,6 @@ Unlike `proxy_broker_authority`'s corrupted value (which used to flow into `Comm
 
 ---
 
-## 6. Tokio `parse_direct_broker_url` corrupted-scheme mis-derivation
-
-**Gap.** While investigating issue #364 (root-caused to moonpool's `Client::proxy_broker_authority`), the owner's D3 lead asked whether the tokio engine "already rejects bad broker URLs" on the equivalent DIRECT-routing path, expecting a straightforward parity fix.
-It does not.
-`parse_direct_broker_url` (`crates/magnetar-runtime-tokio/src/client.rs`) first tries `ParsedUrl::parse(broker_url)` directly; on a corrupted scheme (e.g. `"ptlsar://broker:6650"`) that correctly fails with `ClientError::UnsupportedScheme`, so the function falls through to its bare-`host:port` fallback, which unconditionally synthesises `format!("{bootstrap_scheme_prefix}{broker_url}")` — for an input that ALREADY carries a scheme this produces a double-scheme string (`"pulsar://ptlsar://broker:6650"`).
-`url::Url::parse` on that string does NOT error: it treats the authority as ending at the first `/` after `pulsar://`, so it parses host `"ptlsar"` with NO port digits present in that truncated authority, and `.port().unwrap_or_else(|| scheme.default_port())` silently substitutes the WRONG default port (6650) in place of the corrupted URL's real port.
-The function returns `Ok(ParsedUrl { host: "ptlsar", port: 6650 })` — a plausible-looking but entirely fabricated dial target — instead of the `Err` its doc comment and the DIRECT-path caller's error-handling assume.
-Confirmed empirically (not by inspection) in a throwaway test during the #364 investigation, then reverted rather than landed — the file is out of scope for that unit (see below) and no fix PR should carry an unlanded exploratory test.
-Reproduce with (`parse_direct_broker_url` is a private fn — paste into a `#[cfg(test)] mod tests` block inside `crates/magnetar-runtime-tokio/src/client.rs` itself, e.g. alongside the existing `preferred_broker_url_*` tests, which already have `use super::*;` in scope): `parse_direct_broker_url("ptlsar://broker-sim.proxy.internal:6650", Scheme::Plain)` — returns `Ok(ParsedUrl { host: "ptlsar", port: 6650, .. })`, not `Err`.
-
-**Why it stays open.** `magnetar-runtime-tokio/src/client.rs` is out of scope for the unit that discovered this (it is only authorised to fix `magnetar-runtime-moonpool/src/client.rs`'s `proxy_broker_authority` / `direct_broker_authority` for issue #364); fixing it needs its own ADR-0024 four-layer changeset since it is tokio production code with no moonpool counterpart bug (moonpool's `direct_broker_authority` was hardened to reject the equivalent input outright — see `crates/magnetar-runtime-moonpool/src/client.rs`).
-Distinct from §5 (a different function, a different silent-fallback shape: mis-derived host+port vs. truncated authority) — keep as separate items so a fix PR for one doesn't have to re-litigate the other's scope.
-
-**`/goal`.**
-
-```text
-/goal fix parse_direct_broker_url's double-scheme-prefix bug in crates/magnetar-runtime-tokio/src/client.rs per docs/follow-ups.md §6: reproduce with parse_direct_broker_url("ptlsar://broker-sim.proxy.internal:6650", Scheme::Plain) returning Ok(ParsedUrl { host: "ptlsar", port: 6650 }) instead of Err. When ParsedUrl::parse(broker_url) fails AND broker_url already contains "://", return Err(ClientError::Other(...)) instead of falling through to the bare-host:port synthesis (that fallback should only fire for input with NO "://" at all — mirror the distinction magnetar-runtime-moonpool/src/client.rs's proxy_broker_authority now makes). Add a regression test pinning the corrected Err behavior and ship the ADR-0024 four-layer test set. Validation chain per CLAUDE.md.
-```
-
----
-
 ## 7. e2e container memory gate
 
 **Gap.** Every `pulsar standalone` container in `crates/magnetar/tests/e2e_*.rs` now passes `PULSAR_MEM = PULSAR_MEM_LIMIT` (see [`docs/testing.md` § "e2e container memory budget"](testing.md#e2e-container-memory-budget)), but nothing enforces it.
@@ -135,4 +113,4 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §3, §5, §6 and §7 are dispatch-ready.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §3, §5 and §7 are dispatch-ready.

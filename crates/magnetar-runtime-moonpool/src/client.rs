@@ -1565,14 +1565,18 @@ fn proxy_broker_authority(input: &str) -> Result<String, ClientError> {
 /// its own contract docstring; both engines pin this contract at the type
 /// level (see the tokio counterparts).
 ///
-/// Like [`proxy_broker_authority`], rejecting on an unrecognised scheme HERE
-/// is moonpool-specific hardening, NOT cross-engine parity: the tokio
-/// engine's `parse_direct_broker_url` does not cleanly reject the
-/// equivalent DIRECT-path input either — its own bare-`host:port` fallback
-/// mis-derives a garbage host with the WRONG default port on a corrupted
-/// scheme (a distinct latent bug from the truncation this function used to
-/// have; see `docs/follow-ups.md` §6, filed rather than fixed here since
-/// `magnetar-runtime-tokio` is out of scope for this changeset).
+/// On the DIRECT path the two engines now agree: tokio's
+/// `parse_direct_broker_url` rejects the same corrupted-scheme input rather
+/// than falling through to its bare-`host:port` fallback, which used to
+/// prefix a second scheme onto a string that already carried one and
+/// mis-derive a garbage host with the WRONG default port (a distinct latent
+/// bug from the truncation this function used to have; both are fixed).
+/// Cross-engine equivalence for that rejection is pinned by
+/// `crates/magnetar-differential/tests/corrupted_broker_scheme_equivalence.rs`.
+/// [`proxy_broker_authority`]'s rejection remains moonpool-specific
+/// hardening: tokio's PROXY-path `preferred_broker_url` still forwards an
+/// unrecognised scheme unchanged with a warning, relying on the downstream
+/// Pulsar Proxy's `validateBrokerTarget()` to reject it.
 fn direct_broker_authority(input: &str) -> Result<String, ClientError> {
     proxy_broker_authority(input)
 }
@@ -1591,7 +1595,7 @@ mod tests {
 
     use super::{
         Client, ClientError, LookupIssue, LookupRetryState, LookupTopicResult,
-        proxy_broker_authority,
+        direct_broker_authority, proxy_broker_authority,
     };
     use crate::{ConnectionShared, MoonpoolEngine, TopicListChange};
 
@@ -1817,13 +1821,59 @@ mod tests {
         );
     }
 
-    // The issue #364 corrupted-scheme-rejection regression (both
-    // `proxy_broker_authority` and `direct_broker_authority`) is covered by
-    // `crates/magnetar-runtime-moonpool/tests/proxy_multi_conn.rs`'s
-    // `open_producer_through_proxy_rejects_corrupted_broker_scheme` (that
-    // file is one of xtask's PARITY_EXEMPT_FILES) rather than by a private-fn
-    // unit test here — this keeps `cargo run -p xtask -- check-runtime-test-parity`
-    // balanced without inventing a matching tokio-side test for a fix that,
-    // per this function's doc comment, is moonpool-specific hardening with
-    // no tokio behavioural counterpart to mirror.
+    /// A single-bit corruption of the `pulsar` scheme word, the shape
+    /// moonpool-sim's bit-flip chaos actually produced for issue #364.
+    const CORRUPTED_SCHEME_BROKER_URL: &str = "ptlsar://broker-sim.proxy.internal:6650";
+
+    /// 1:1 twin of `magnetar_runtime_tokio::client::tests::
+    /// parse_direct_broker_url_rejects_corrupted_scheme`.
+    ///
+    /// Both engines' DIRECT-path helpers now reject an unrecognised scheme
+    /// outright. Until the tokio side was fixed, this pair could not exist:
+    /// tokio's `parse_direct_broker_url` returned a fabricated
+    /// `Ok(ParsedUrl { host: "ptlsar", port: 6650 })` for the identical input,
+    /// so there was no behaviour to mirror and the private-fn coverage on this
+    /// side lived only in the parity-exempt
+    /// `tests/proxy_multi_conn.rs::open_producer_through_proxy_rejects_corrupted_broker_scheme`.
+    #[test]
+    fn direct_broker_authority_rejects_corrupted_scheme() {
+        let err = direct_broker_authority(CORRUPTED_SCHEME_BROKER_URL)
+            .expect_err("a corrupted scheme must not resolve to a dial target");
+        assert!(
+            matches!(err, ClientError::Other(_)),
+            "expected the scheme rejection, got {err:?}",
+        );
+    }
+
+    /// Twin of tokio's `parse_direct_broker_url_accepts_bare_host_port`:
+    /// scheme-less input is a legitimate, unchanged DIRECT-path shape on both
+    /// engines — the rejection above narrows the fallback, it does not remove
+    /// it.
+    #[test]
+    fn direct_broker_authority_accepts_bare_host_port() {
+        assert_eq!(
+            direct_broker_authority("b-c3-n12:6650").unwrap(),
+            "b-c3-n12:6650"
+        );
+        // No port either: moonpool dials by `host:port` and has no URL scheme
+        // to derive a default from, so a bare host is forwarded verbatim (the
+        // transport layer supplies the port). Tokio's twin synthesises the
+        // bootstrap scheme's default port instead — the engines differ in
+        // *representation* here, not in what they accept.
+        assert_eq!(direct_broker_authority("b-c3-n12").unwrap(), "b-c3-n12");
+    }
+
+    /// Twin of tokio's `parse_direct_broker_url_accepts_full_pulsar_url`: the
+    /// ordinary shape a real broker advertises still resolves on both engines.
+    #[test]
+    fn direct_broker_authority_accepts_full_pulsar_url() {
+        assert_eq!(
+            direct_broker_authority("pulsar://b-c3-n12:6650").unwrap(),
+            "b-c3-n12:6650"
+        );
+        assert_eq!(
+            direct_broker_authority("pulsar+ssl://b-c3-n12").unwrap(),
+            "b-c3-n12:6651"
+        );
+    }
 }

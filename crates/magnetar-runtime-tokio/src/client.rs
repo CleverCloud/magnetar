@@ -2001,12 +2001,39 @@ fn direct_broker_url(
 /// dial it). The scheme falls back to the bootstrap scheme when missing —
 /// brokers in a single cluster typically run the same TLS posture, and the
 /// bootstrap's `tls_config` is the only one the pool has on hand.
+///
+/// The bare-`host:port` fallback fires **only** for input carrying no `"://"`
+/// at all. Input that already carries a scheme [`ParsedUrl::parse`] rejected —
+/// e.g. a single-bit corruption of the `pulsar` scheme word,
+/// `"ptlsar://broker:6650"` — is a scheme error, not a bare-authority input,
+/// and is rejected outright. Letting it reach the fallback used to prefix a
+/// SECOND scheme onto it (`"pulsar://ptlsar://broker:6650"`), which
+/// `url::Url::parse` does NOT reject: for the non-special `pulsar` scheme the
+/// authority ends at the first `/`, so it read the authority as `"ptlsar:"` —
+/// host `"ptlsar"`, no port digits — and the
+/// `.port().unwrap_or_else(default_port)` fallback substituted the WRONG
+/// default port. The function then returned a plausible-looking but entirely
+/// fabricated dial target instead of the `Err` this doc comment and
+/// [`Client::resolve_direct_broker`] both assume.
+///
+/// Mirrors the same distinction
+/// `magnetar_runtime_moonpool::client::proxy_broker_authority` /
+/// `direct_broker_authority` make (issue #364, ADR-0055): a genuine
+/// scheme-less `host:port` stays accepted, an unrecognised scheme fails.
 fn parse_direct_broker_url(
     broker_url: &str,
     bootstrap_scheme: Scheme,
 ) -> Result<ParsedUrl, ClientError> {
-    if let Ok(parsed) = ParsedUrl::parse(broker_url) {
-        return Ok(parsed);
+    match ParsedUrl::parse(broker_url) {
+        Ok(parsed) => return Ok(parsed),
+        Err(err) if broker_url.contains("://") => {
+            return Err(ClientError::Other(format!(
+                "lookup advertised broker URL '{broker_url}' carries an unrecognised scheme \
+                 (expected 'pulsar://' or 'pulsar+ssl://'); refusing to derive a dial target \
+                 from it: {err}"
+            )));
+        }
+        Err(_) => {}
     }
     // Try as bare `host:port`. We synthesise a `pulsar://`-prefixed URL using
     // the bootstrap scheme so [`ParsedUrl::parse`] does the host/port split
@@ -3255,6 +3282,74 @@ mod tests {
         // lookup result on the floor.
         let got = preferred_broker_url(Some("not a url".to_owned()), None, Scheme::Plain);
         assert_eq!(got.as_deref(), Some("not a url"));
+    }
+
+    /// A single-bit corruption of the `pulsar` scheme word, the shape
+    /// moonpool-sim's bit-flip chaos actually produced for issue #364.
+    const CORRUPTED_SCHEME_BROKER_URL: &str = "ptlsar://broker-sim.proxy.internal:6650";
+
+    /// Regression: a DIRECT-path broker URL whose scheme is corrupted must
+    /// FAIL the lookup, not resolve to a fabricated dial target.
+    ///
+    /// `ParsedUrl::parse` rejects `"ptlsar://…"` with
+    /// [`ClientError::UnsupportedScheme`]. Before the fix, that rejection fell
+    /// through to the bare-`host:port` fallback, which prefixed a SECOND scheme
+    /// onto a string that already carried one
+    /// (`"pulsar://ptlsar://broker-sim.proxy.internal:6650"`). `url::Url::parse`
+    /// does not reject that: for the non-special `pulsar` scheme the authority
+    /// ends at the first `/`, so it read the authority as `"ptlsar:"` — host
+    /// `"ptlsar"`, no port digits — and `.port().unwrap_or_else(default_port)`
+    /// substituted 6650. The function returned
+    /// `Ok(ParsedUrl { host: "ptlsar", port: 6650 })`, a plausible-looking but
+    /// entirely fabricated broker the pool would then dial.
+    ///
+    /// Mirrors `magnetar_runtime_moonpool::client::direct_broker_authority`'s
+    /// rejection of the same input.
+    #[test]
+    fn parse_direct_broker_url_rejects_corrupted_scheme() {
+        let err = parse_direct_broker_url(CORRUPTED_SCHEME_BROKER_URL, Scheme::Plain)
+            .expect_err("a corrupted scheme must not resolve to a dial target");
+        assert!(
+            matches!(err, ClientError::Other(_)),
+            "expected the scheme rejection, got {err:?}",
+        );
+    }
+
+    /// The bare-`host:port` fallback is only for input carrying NO scheme at
+    /// all — the shape [`preferred_broker_url`] emits. It must keep working:
+    /// the fix narrows the fallback, it does not remove it.
+    #[test]
+    fn parse_direct_broker_url_accepts_bare_host_port() {
+        let parsed = parse_direct_broker_url("b-c3-n12:6650", Scheme::Plain)
+            .expect("a scheme-less host:port is a legitimate DIRECT-path input");
+        assert_eq!(parsed.host, "b-c3-n12");
+        assert_eq!(parsed.port, 6650);
+        assert_eq!(parsed.scheme, Scheme::Plain);
+
+        // Port omitted entirely -> the synthesised bootstrap scheme supplies it.
+        let parsed = parse_direct_broker_url("b-c3-n12", Scheme::Tls)
+            .expect("a scheme-less bare host is a legitimate DIRECT-path input");
+        assert_eq!(parsed.host, "b-c3-n12");
+        assert_eq!(parsed.port, 6651);
+        assert_eq!(parsed.scheme, Scheme::Tls);
+    }
+
+    /// And the ordinary case a real broker advertises: a well-formed Pulsar
+    /// URL parses on the first attempt, never reaching the fallback.
+    #[test]
+    fn parse_direct_broker_url_accepts_full_pulsar_url() {
+        let parsed = parse_direct_broker_url("pulsar://b-c3-n12:6650", Scheme::Tls)
+            .expect("a well-formed Pulsar URL must parse");
+        assert_eq!(parsed.host, "b-c3-n12");
+        assert_eq!(parsed.port, 6650);
+        // The URL's own scheme wins over the bootstrap scheme.
+        assert_eq!(parsed.scheme, Scheme::Plain);
+
+        let parsed = parse_direct_broker_url("pulsar+ssl://b-c3-n12", Scheme::Plain)
+            .expect("a well-formed TLS Pulsar URL must parse");
+        assert_eq!(parsed.host, "b-c3-n12");
+        assert_eq!(parsed.port, 6651);
+        assert_eq!(parsed.scheme, Scheme::Tls);
     }
 
     /// Regression: [`wait_connected`] must already be registered for the
