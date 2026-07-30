@@ -19,6 +19,12 @@
 //! The auto-adjust tick rides the tokio driver's existing
 //! `poll_timeout`/`handle_timeout` loop, so no manual ticking is needed here.
 //!
+//! A second test, `e2e_auto_adjust_arms_under_continuous_ack_response_traffic`,
+//! pins the `docs/follow-ups.md` §4 arming bootstrap: an `Auto` consumer on the
+//! DEFAULT keepalive that awaits every individual ack — continuous inbound
+//! `CommandAckResponse` traffic that used to defer the schedule's only arming
+//! site indefinitely — must still be observed ramping past the floor.
+//!
 //! Runs as a regular test under `cargo test` (ADR-0046). Run with:
 //!
 //! ```sh
@@ -124,17 +130,16 @@ async fn e2e_auto_receiver_queue_drains_backlog_without_unbounded_memory()
 
     let client = PulsarClient::builder()
         .service_url(service_url)
-        // A short keepalive so the connection's `poll_timeout`/`handle_timeout`
-        // loop wakes frequently enough to arm the `Auto` adjust schedule during
-        // the natural gaps between the broker's permit-limited dispatch bursts.
-        // The adjust clock's FIRST arm happens inside `handle_timeout`, which is
-        // itself only invoked when some deadline elapses; with the 30s default
-        // keepalive and a busy consumer whose reads keep refreshing the
-        // keepalive baseline, that first arm can be deferred well past this
-        // test's window. A short keepalive is a realistic production tuning
-        // choice (fast failure detection) that also happens to close this gap —
-        // no internal state is touched, the driver loop and the `Auto` policy
-        // logic being exercised are both the real ones.
+        // A short keepalive — a realistic production tuning choice (fast failure
+        // detection) that also keeps the driver's timer arm ticking briskly.
+        // This used to be load-bearing: while the adjust schedule's first arm
+        // lived only in `handle_timeout`'s fallback, a busy consumer refreshing
+        // the keepalive baseline could defer that arm past this test's window.
+        // `Connection::initial_flow` now arms the schedule at subscribe-ack time
+        // (follow-ups §4), so the tuning is no longer required for correctness —
+        // the sibling `e2e_auto_adjust_arms_under_continuous_ack_response_traffic`
+        // proves the ramp on the DEFAULT keepalive. It is kept here so this test
+        // keeps measuring the bounded-memory drain it was written for.
         .keepalive(Duration::from_millis(100))
         .build()
         .await?;
@@ -169,17 +174,16 @@ async fn e2e_auto_receiver_queue_drains_backlog_without_unbounded_memory()
             .await
             .expect("consumer.receive timeout")
             .expect("consumer.receive error");
-        // Issue #349: acking is deliberately NOT awaited per-message here.
-        // `consumer.ack(...).await` round-trips a `CommandAckResponse` from
-        // the broker (ADR-0082's sibling ack-deadline work, #346) — inbound
-        // traffic on the SAME connection the adjust-tick timer watches. Acks
-        // are orthogonal to flow control (which is driven by `receive()`
-        // pops, not acks), so acking per-message here would keep refreshing
-        // the connection's keepalive baseline on every iteration and starve
-        // the timer arm that bootstraps the `Auto` adjust schedule, masking
-        // the very starvation this test exists to observe. A single
-        // cumulative ack after the drain (below) is enough to advance the
-        // subscription cursor for this test's purposes.
+        // Acking is not awaited per-message here: acks are orthogonal to flow
+        // control (driven by `receive()` pops, not acks), and a single
+        // cumulative ack after the drain (below) advances the subscription
+        // cursor well enough for this test's purposes. Historically this was
+        // also a workaround — per-message ack awaits round-trip a
+        // `CommandAckResponse` on the SAME connection the adjust-tick timer
+        // watches, which used to starve the schedule's only arming site. That
+        // is fixed (follow-ups §4) and pinned by the sibling
+        // `e2e_auto_adjust_arms_under_continuous_ack_response_traffic`, which
+        // deliberately DOES await every ack.
         last_message_id = Some(msg.message_id);
         received += 1;
         // Sample the buffered-queue depth — the prefetch the broker has pushed
@@ -234,6 +238,109 @@ async fn e2e_auto_receiver_queue_drains_backlog_without_unbounded_memory()
     assert!(
         current_target >= FLOOR,
         "the auto-tuned target {current_target} must not drop below the floor {FLOOR}"
+    );
+    Ok(())
+}
+
+/// End-to-end regression for `docs/follow-ups.md` §4: the `Auto` adjust
+/// schedule must arm on a connection that is never quiet.
+///
+/// The failure this pins was reproduced twice while writing the issue #349 e2e
+/// above. Every decoded inbound frame refreshes the connection's `last_activity`
+/// keepalive baseline (ADR-0058's single refresh site). While the adjust
+/// schedule's first arm lived only in `Connection::handle_timeout`'s fallback
+/// arm — and `handle_timeout` runs only when a `poll_timeout()` deadline
+/// actually elapses — a consumer that awaits each individual ack produces a
+/// continuous `CommandAckResponse` stream that pushes the keepalive deadline
+/// (the ONLY deadline an unarmed `Auto` consumer has) permanently out of reach.
+/// `handle_timeout` never ran, the schedule never armed, and `Auto` never
+/// scaled, regardless of the configured `keepalive_interval`.
+///
+/// So this test deliberately does the two things the sibling test avoids:
+///
+/// 1. it leaves `keepalive` at the 30 s default — no short-keepalive tuning,
+/// 2. it `await`s EVERY individual ack inside the receive loop.
+///
+/// Under those conditions the auto-tuned target must still be observed growing
+/// past the floor. `Connection::initial_flow` arming the schedule at
+/// subscribe-ack time is what makes that true.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_auto_adjust_arms_under_continuous_ack_response_traffic()
+-> Result<(), Box<dyn std::error::Error>> {
+    const BACKLOG: usize = 300;
+    /// A small floor so the prefetch window stays well below the backlog and
+    /// the deliberately-slow consumer keeps hitting genuine starvation.
+    const FLOOR: usize = 20;
+    const MESSAGE_PAYLOAD_BYTES: usize = 52;
+    /// Byte budget wide enough that the doubling rule, not the OOM guard,
+    /// governs the first few growth steps this test needs to observe.
+    const MAX_BYTES: usize = 115 * MESSAGE_PAYLOAD_BYTES;
+
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    let id = uuid::Uuid::new_v4().simple();
+    let topic = format!("persistent://public/default/magnetar-e2e-rq-arming-{id}");
+
+    // NOTE: no `.keepalive(...)` call. The 30 s default is the whole point —
+    // combined with the per-message ack awaits below, the pre-fix client could
+    // never arm the adjust schedule within this test's window.
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    let producer = client.producer(&topic).create().await?;
+    for i in 0..BACKLOG {
+        let payload = format!("rq-arming-msg-{i:05}-padding-XXXXXXXXXXXXXXXXXXXXXXXX").into_bytes();
+        producer
+            .send(OutgoingMessage::with_payload(payload).into())
+            .await?;
+    }
+    producer.flush().await?;
+
+    let consumer = client
+        .consumer(&topic)
+        .subscription("magnetar-e2e-rq-arming")
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .receiver_queue_policy(Arc::new(Auto::new(FLOOR, MAX_BYTES)))
+        // Fast adjust cadence so the ramp is observable within the test window.
+        .receiver_queue_adjust_interval(Duration::from_millis(200))
+        .subscribe()
+        .await?;
+
+    let mut received = 0usize;
+    let mut max_observed_target = consumer.current_receiver_queue_size();
+    while received < BACKLOG {
+        let msg = tokio::time::timeout(Duration::from_secs(30), consumer.receive())
+            .await
+            .expect("consumer.receive timeout")
+            .expect("consumer.receive error");
+        // The traffic shape that used to defeat the arming: await the broker's
+        // `CommandAckResponse` for every single message, so the connection is
+        // never idle long enough for the keepalive deadline to elapse.
+        consumer.ack(msg.message_id).await?;
+        received += 1;
+        max_observed_target = max_observed_target.max(consumer.current_receiver_queue_size());
+        // Deliberately slow consumer, matching the sibling test: guarantees the
+        // broker's grant is fully dispatched and drained to zero for long enough
+        // that an adjust tick catches real starvation.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    consumer.close().await?;
+    client.close().await;
+
+    assert_eq!(
+        received, BACKLOG,
+        "Auto-policy consumer must drain the entire backlog while awaiting every ack"
+    );
+    assert!(
+        max_observed_target > FLOOR,
+        "the adjust schedule must arm on a connection kept busy by continuous ack-response \
+         traffic on the DEFAULT keepalive: the auto-tuned target must be OBSERVED growing past \
+         the floor ({FLOOR}), but the max observed was {max_observed_target} \
+         (docs/follow-ups.md §4)"
     );
     Ok(())
 }

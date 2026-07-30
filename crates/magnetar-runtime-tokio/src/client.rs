@@ -1817,8 +1817,12 @@ impl Client {
                 Ok(()) => {
                     guard.disarm();
                     {
+                        // ADR-0011: snapshot the host clock at the call site and
+                        // hand it to the state machine — this is also what arms
+                        // the receiver-queue auto-adjust schedule (follow-ups §4).
+                        let now = std::time::Instant::now();
                         let mut conn = target_shared.inner.lock();
-                        let _ = conn.initial_flow(handle);
+                        let _ = conn.initial_flow(handle, now);
                         let initial_target = slot.state.lock().receiver_queue_size;
                         if initial_target > 0 {
                             conn.flow(handle, initial_target as u32);
@@ -2560,11 +2564,12 @@ impl Drop for EventWaitFut {
         let EventMatcher::SubscribeAcked(handle, _, Some(waiter_id)) = self.matcher else {
             return;
         };
+        let now = std::time::Instant::now();
         let changed = self
             .shared
             .inner
             .lock()
-            .abandon_consumer_subscribe_waiter(handle, waiter_id);
+            .abandon_consumer_subscribe_waiter(handle, waiter_id, now);
         if changed {
             self.shared.driver_waker.notify_one();
         }

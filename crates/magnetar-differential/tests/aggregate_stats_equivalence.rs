@@ -128,7 +128,7 @@ fn subscribe_and_ack(conn: &mut Connection, t0: Instant, topic: &str, sub: &str)
     encode_command(&mut buf, &success).expect("encode CommandSuccess");
     conn.handle_bytes(t0, &buf).expect("Success");
     let _ = conn.poll_event();
-    conn.initial_flow(handle);
+    conn.initial_flow(handle, t0);
     let _ = conn.poll_transmit();
     handle
 }

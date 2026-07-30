@@ -264,7 +264,7 @@ fn lock_and_run_chunk_flow(conn: &mut Connection, t0: Instant) -> ChunkFlowReact
     let _ = conn.poll_event();
     let _ = conn.poll_transmit();
 
-    conn.initial_flow(handle);
+    conn.initial_flow(handle, t0);
     let _ = conn.poll_transmit();
 
     let mut grants_after_chunks = Vec::new();

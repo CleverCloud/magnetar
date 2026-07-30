@@ -749,8 +749,9 @@ impl Consumer {
                     // confirms backlog but no message dispatches".
                     wait_subscribe_acked(&self.shared, self.handle, false, Some(waiter_id)).await?;
                     {
+                        let now = std::time::Instant::now();
                         let mut conn = self.shared.inner.lock();
-                        let _ = conn.initial_flow(self.handle);
+                        let _ = conn.initial_flow(self.handle, now);
                         conn.redeliver_unacked_all(self.handle);
                     }
                     self.shared.driver_waker.notify_one();
@@ -2758,7 +2759,7 @@ mod tests {
         // Granting the initial flow bumps the counter to receiver_queue_size.
         {
             let mut conn = shared.inner.lock();
-            let _ = conn.initial_flow(handle);
+            let _ = conn.initial_flow(handle, Instant::now());
         }
         assert_eq!(consumer.available_permits(), 64);
 
@@ -2792,7 +2793,7 @@ mod tests {
         let t0 = Instant::now();
         {
             let mut conn = shared.inner.lock();
-            let _ = conn.initial_flow(handle);
+            let _ = conn.initial_flow(handle, t0);
             // Seed at the floor.
             assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
             // Issue #349: drain the broker-side permit BALANCE via real

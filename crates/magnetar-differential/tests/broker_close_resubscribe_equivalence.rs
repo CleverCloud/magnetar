@@ -182,7 +182,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant, url: Option<String>) -> Reac
 
     // Arm the initial flow so the consumer holds permits — the running, active
     // state the broker close hits in production.
-    let _ = conn.initial_flow(handle);
+    let _ = conn.initial_flow(handle, t0);
     let _ = drain_outbound(conn, handle); // discard subscribe + initial flow frames
     let permits_before_close = conn.consumer_available_permits(handle);
 

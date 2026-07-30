@@ -1164,10 +1164,19 @@ impl ConsumerState {
             .map(|last| crate::time::deadline_with_clamp(last, interval))
     }
 
-    /// Seed the first adjust deadline at `now + adjust_interval`. Called once by
-    /// the connection when the consumer is first armed (subscribe ack) so the
-    /// `next_adjust_deadline` schedule has a starting point. No-op when
-    /// auto-adjust is disabled.
+    /// Seed the first adjust deadline at `now + adjust_interval` so the
+    /// [`Self::next_adjust_deadline`] schedule has a starting point.
+    ///
+    /// Called from [`crate::Connection::initial_flow`] at subscribe-ack time —
+    /// the schedule's dedicated bootstrap, which is what keeps the first tick
+    /// independent of whichever unrelated deadline happens to fire first
+    /// (`Connection::handle_timeout` keeps a backstop call for a consumer that
+    /// somehow ticks without ever having been flowed).
+    ///
+    /// Idempotent and no-op when auto-adjust is disabled: it only fires while
+    /// `last_adjust_at` is `None` and `adjust_interval` is `Some`, so the
+    /// re-attach / Failover-promotion re-flows that also route through
+    /// `initial_flow` neither restart nor skew a running schedule.
     pub fn arm_adjust_clock(&mut self, now: std::time::Instant) {
         if self.adjust_interval.is_some() && self.last_adjust_at.is_none() {
             self.last_adjust_at = Some(now);

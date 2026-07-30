@@ -24,7 +24,6 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                                  | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
 | 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)                                                | 🧠 needs design decision on the fan-out surface                                                  |
 | 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)                                                 | ⚡ ready to dispatch                                                                             |
-| 4   | [`Auto` adjust-schedule arming is parasitic on other deadlines](#4-auto-adjust-arming-bootstrap)                                               | ⚡ ready to dispatch                                                                             |
 | 5   | [`HealthProbe::authority` shares the scheme-truncation pattern](#5-health-probe-authority-scheme-truncation)                                   | ⚡ ready to dispatch                                                                             |
 | 6   | [`parse_direct_broker_url` mis-derives a garbage host on a corrupted scheme](#6-tokio-parse_direct_broker_url-corrupted-scheme-mis-derivation) | ⚡ ready to dispatch                                                                             |
 | 7   | [No gate keeps new e2e files on the container memory budget](#7-e2e-container-memory-gate)                                                     | ⚡ ready to dispatch                                                                             |
@@ -72,21 +71,6 @@ Surfaced during the #347 work; the differential test `aggregate_stats_equivalenc
 ```
 
 ---
-
-## 4. Auto adjust arming bootstrap
-
-**Gap.** The `Auto` receiver-queue adjust schedule's first arm (`arm_adjust_clock`) runs only inside `Connection::handle_timeout`, which the drivers invoke only when a `poll_timeout()` deadline actually elapses — the schedule has no dedicated bootstrap trigger and is parasitic on whichever other deadline fires first (typically keepalive).
-Every inbound frame refreshes `last_activity` (ADR-0058's single refresh site), so a connection with continuous inbound traffic — message deliveries, or the `CommandAckResponse` stream produced by a consumer that awaits each individual ack — defers the keepalive deadline indefinitely and the adjust schedule never arms, regardless of the configured `keepalive_interval`.
-Reproduced during the #349 e2e work (two failing runs, root-caused; the test now avoids per-message ack awaits and uses a 100 ms keepalive so natural gaps arm the schedule).
-Production impact is uncertain but not ruled out: individually-awaited acks in a receive loop are a common usage pattern.
-
-**Why it stays open.** The clean fix — arming the adjust clock explicitly at subscribe-ack / initial-flow time — threads `now: Instant` through `Connection::initial_flow`'s call graph and touches `client.rs` plus both engines' `consumer.rs`, a materially larger change than #349's locked permit-split scope.
-
-**`/goal`.**
-
-```text
-/goal arm the Auto receiver-queue adjust schedule deterministically per docs/follow-ups.md §4: give arm_adjust_clock a dedicated bootstrap at subscribe-ack/initial-flow time (threading the injected now: Instant through Connection::initial_flow's call graph in proto and both engines) so a continuously-busy connection cannot defer the first adjust tick, and ship the ADR-0024 four-layer test set including a regression test that drives continuous ack-response traffic and asserts the schedule still arms. Validation chain per CLAUDE.md.
-```
 
 ---
 
@@ -151,4 +135,4 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §3, §4, §5, §6 and §7 are dispatch-ready.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §3, §5, §6 and §7 are dispatch-ready.

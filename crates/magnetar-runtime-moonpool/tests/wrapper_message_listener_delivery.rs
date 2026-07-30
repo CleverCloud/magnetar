@@ -99,7 +99,7 @@ fn open_consumer(
 
     {
         let mut conn = shared.inner.lock();
-        conn.initial_flow(handle);
+        conn.initial_flow(handle, at);
         // Drain the initial flow so later ack-absence assertions see the wire in isolation.
         let _ = conn.poll_transmit();
     }

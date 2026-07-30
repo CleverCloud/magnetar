@@ -1422,10 +1422,15 @@ impl Connection {
     /// established consumer. The active wire request becomes flow-owned so a
     /// later success still resumes dispatch; if success already landed, flow
     /// is staged immediately and the now-unowned semantic event is removed.
+    ///
+    /// `now` is forwarded to [`Self::initial_flow`] on the immediate-release
+    /// path so the receiver-queue auto-adjust schedule is armed there too
+    /// (ADR-0011 injected clock).
     pub fn abandon_consumer_subscribe_waiter(
         &mut self,
         handle: ConsumerHandle,
         waiter_id: RequestId,
+        now: Instant,
     ) -> bool {
         let (active_request, release_flow_now) = {
             let Some(slot) = self.consumers.get(&handle) else {
@@ -1454,7 +1459,7 @@ impl Connection {
             )
         });
         if release_flow_now {
-            let _ = self.initial_flow(handle);
+            let _ = self.initial_flow(handle, now);
         }
         active_request.is_some() || release_flow_now
     }
@@ -2431,7 +2436,7 @@ impl Connection {
                         );
                     }
                     if flow_now {
-                        let _ = self.initial_flow(handle);
+                        let _ = self.initial_flow(handle, now);
                         tracing::debug!(
                             target: "magnetar_proto::conn",
                             handle = ?handle,
@@ -3171,7 +3176,7 @@ impl Connection {
                         && !consumer.flow_on_subscribe_ack
                 });
                 if needs_reflow {
-                    let _ = self.initial_flow(handle);
+                    let _ = self.initial_flow(handle, now);
                     tracing::debug!(
                         target: "magnetar_proto::conn",
                         handle = ?handle,
@@ -3847,9 +3852,15 @@ impl Connection {
                 }
                 Some(_) => {}
                 None => {
-                    // First tick for an auto-adjust consumer: seed the schedule so
-                    // `poll_timeout` can surface the deadline next round. No-op for
-                    // the default `Fixed` policy (auto-adjust disabled).
+                    // Backstop only. `Connection::initial_flow` owns the arming
+                    // bootstrap now (follow-ups §4): it seeds `last_adjust_at`
+                    // at subscribe-ack time, so a consumer reaching this arm
+                    // unarmed is one that got a tick without ever having had an
+                    // initial flow issued. Seeding here still lets
+                    // `poll_timeout` surface the deadline next round. No-op for
+                    // the default `Fixed` policy (auto-adjust disabled) and for
+                    // an already-armed consumer (`arm_adjust_clock` only fires
+                    // while `last_adjust_at` is `None`).
                     consumer.arm_adjust_clock(now);
                 }
             }
@@ -4469,9 +4480,36 @@ impl Connection {
         request_id
     }
 
-    /// Emit the initial flow command for a consumer once it's been acked.
-    pub fn initial_flow(&mut self, handle: ConsumerHandle) -> Option<RequestId> {
-        let flow_cmd = self.consumers.get(&handle)?.state.lock().initial_flow();
+    /// Emit the initial flow command for a consumer once it's been acked, and
+    /// bootstrap its receiver-queue auto-adjust schedule from the injected
+    /// `now` (ADR-0011).
+    ///
+    /// The arming is the point of the `now` parameter. `ConsumerState::next_adjust_deadline`
+    /// yields `None` until `last_adjust_at` is set, and `Self::poll_timeout` folds that `None`
+    /// away — so before this bootstrap existed the only live deadline for a fresh `Auto`
+    /// consumer was the keepalive one, and every decoded inbound frame pushes that out
+    /// (the single `last_activity` refresh site, ADR-0058). A connection with continuous
+    /// inbound traffic — message deliveries, or the `CommandAckResponse` stream produced by
+    /// a consumer that awaits each individual ack — therefore deferred the keepalive
+    /// deadline indefinitely, `Self::handle_timeout` never ran, and the adjust schedule
+    /// never armed at all. Arming here makes the first tick's timing a function of the
+    /// subscribe-ack moment alone.
+    ///
+    /// `ConsumerState::arm_adjust_clock` is idempotent (it only fires while
+    /// `last_adjust_at` is `None`) and a no-op for the default `Fixed` policy
+    /// (`adjust_interval == None`), so the re-attach and Failover-promotion
+    /// re-flows that also route through here neither restart nor skew an
+    /// already-running schedule.
+    ///
+    /// Both the flow command and the arming happen under a single per-slot lock
+    /// acquisition, dropped before the connection-wide encode (ADR-0038).
+    pub fn initial_flow(&mut self, handle: ConsumerHandle, now: Instant) -> Option<RequestId> {
+        let flow_cmd = {
+            let mut consumer = self.consumers.get(&handle)?.state.lock();
+            let flow_cmd = consumer.initial_flow();
+            consumer.arm_adjust_clock(now);
+            flow_cmd
+        };
         let base = pb::BaseCommand {
             r#type: pb::base_command::Type::Flow as i32,
             flow: Some(flow_cmd),
@@ -11467,7 +11505,7 @@ mod conn_state_tests {
     #[test]
     fn accepted_incomplete_chunks_replenish_flow_before_reassembly() {
         let (mut conn, handle) = handshake_subscribe_chunk_flow();
-        conn.initial_flow(handle);
+        conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         for (chunk_id, body) in [(0, b"aa".as_slice()), (2, b"cc"), (1, b"bb")] {
@@ -11546,7 +11584,7 @@ mod conn_state_tests {
         // A consumer that already holds permits must NOT be given extra flow on
         // a redundant promotion (no double-flow).
         let (mut conn, handle) = handshake_subscribe_failover();
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
         assert_eq!(conn.consumer_available_permits(handle), 100);
 
@@ -11789,7 +11827,7 @@ mod conn_state_tests {
         let (mut conn, handle) = handshake_subscribe_failover();
 
         // (1) Initial flow on the active consumer.
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
         assert_eq!(conn.consumer_available_permits(handle), 100);
 
@@ -11861,7 +11899,7 @@ mod conn_state_tests {
         // this socket, and MUST still surface the `ConsumerClosedByBroker`
         // event the runtime drives the migration from.
         let (mut conn, handle) = handshake_subscribe_failover();
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         let cmd = pb::BaseCommand {
@@ -11937,7 +11975,7 @@ mod conn_state_tests {
         let waker: Waker = Arc::clone(&waker_inner).into();
 
         let (mut conn, handle) = handshake_subscribe_failover();
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         let t0 = Instant::now();
@@ -12036,7 +12074,7 @@ mod conn_state_tests {
         );
 
         let (mut conn, handle) = handshake_subscribe_failover();
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         let t0 = Instant::now();
@@ -12184,7 +12222,7 @@ mod conn_state_tests {
     #[test]
     fn ack_response_before_deadline_resolves_normally() {
         let (mut conn, handle) = handshake_subscribe_failover();
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         let t0 = Instant::now();
@@ -12258,17 +12296,23 @@ mod conn_state_tests {
     /// Subscribe an `Auto`-policy consumer over a handshaked connection, drain
     /// the outbound `CommandSubscribe`, and feed the initial flow. Returns the
     /// connection, handle, and the adjust interval used.
+    ///
+    /// `at` pins the whole setup — handshake, initial flow, and therefore the
+    /// adjust schedule's arming instant, which `initial_flow` now seeds
+    /// (follow-ups §4). Callers advance from `at` so every deadline in the test
+    /// is expressible relative to a single known origin.
     fn handshake_subscribe_auto(
         min: usize,
         max_bytes: usize,
         adjust_interval: Duration,
+        at: Instant,
     ) -> (Connection, ConsumerHandle, Duration) {
         let mut conn = Connection::new(
             ConnectionConfig::default(),
             std::sync::Arc::new(std::time::SystemTime::now),
         );
         conn.begin_handshake().expect("handshake");
-        conn.handle_bytes(Instant::now(), &handshake_response_bytes())
+        conn.handle_bytes(at, &handshake_response_bytes())
             .expect("handle handshake");
         match conn.poll_event() {
             Some(ConnectionEvent::Connected { .. }) => {}
@@ -12284,7 +12328,7 @@ mod conn_state_tests {
             ..Default::default()
         });
         let _ = drain_command_subscribe(&mut conn);
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, at);
         let _ = conn.poll_transmit();
         (conn, handle, adjust_interval)
     }
@@ -12293,8 +12337,12 @@ mod conn_state_tests {
     fn auto_policy_seeds_initial_flow_at_the_floor() {
         // `Auto::initial()` returns the floor; the consumer's first flow grants
         // exactly that, not the (ignored) raw `receiver_queue_size`.
-        let (conn, handle, _) =
-            handshake_subscribe_auto(100, 128 * 1024 * 1024, Duration::from_secs(1));
+        let (conn, handle, _) = handshake_subscribe_auto(
+            100,
+            128 * 1024 * 1024,
+            Duration::from_secs(1),
+            Instant::now(),
+        );
         assert_eq!(
             conn.consumer_available_permits(handle),
             100,
@@ -12309,8 +12357,8 @@ mod conn_state_tests {
         // open — the adjust tick doubles the target and emits an incremental
         // flow for the delta.
         let interval = Duration::from_secs(1);
-        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
         let t0 = Instant::now();
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
 
         // Drain the broker-side permit BALANCE via real dispatch — 100
         // single-message deliveries against the 100-permit initial grant —
@@ -12322,13 +12370,14 @@ mod conn_state_tests {
             conn.handle_bytes(t0, &frame).expect("deliver message");
         }
 
-        // First tick arms the adjust clock (no adjust yet).
+        // The schedule was armed at `t0` by `initial_flow` (follow-ups §4), so a
+        // tick at `t0` itself is still short of the `t0 + interval` deadline.
         conn.handle_timeout(t0);
         let _ = conn.poll_transmit();
         assert_eq!(
             conn.consumer_receiver_queue_size(handle),
             100,
-            "the first tick only arms the schedule"
+            "a tick before the first deadline does not adjust"
         );
 
         // Second tick, one interval later, runs the adjust: 100 -> 200.
@@ -12358,10 +12407,10 @@ mod conn_state_tests {
         // Permits remain and bytes are within budget: the target holds and no
         // flow is emitted (invariant: no thrash).
         let interval = Duration::from_secs(1);
-        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
         let t0 = Instant::now();
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
         // Healthy: the initial flow left 100 permits in place.
-        conn.handle_timeout(t0); // arm
+        conn.handle_timeout(t0); // before the first deadline — no adjust
         let _ = conn.poll_transmit();
         conn.handle_timeout(t0 + interval); // adjust — holds
         assert_eq!(
@@ -12382,7 +12431,7 @@ mod conn_state_tests {
         // starvation (real deliveries draining the permit balance to zero, not a
         // synthetic field write).
         let (mut conn, handle) = handshake_subscribe_failover(); // receiver_queue_size: 100, Fixed
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
         let t0 = Instant::now();
         for i in 0..100u64 {
@@ -12416,8 +12465,8 @@ mod conn_state_tests {
         // the broker-side permit balance is truly exhausted, then asserts
         // the adjust tick grows the target and emits an incremental flow.
         let interval = Duration::from_secs(1);
-        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
         let t0 = Instant::now();
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
 
         // Real dispatch-unit starvation: deliver exactly the 100 permits'
         // worth of single messages the initial flow granted, so the REAL
@@ -12428,13 +12477,14 @@ mod conn_state_tests {
             conn.handle_bytes(t0, &frame).expect("deliver message");
         }
 
-        // First tick arms the schedule (no adjust yet).
+        // Armed at `t0` by `initial_flow`; a tick at `t0` is still short of the
+        // `t0 + interval` deadline.
         conn.handle_timeout(t0);
         let _ = conn.poll_transmit();
         assert_eq!(
             conn.consumer_receiver_queue_size(handle),
             100,
-            "the arming tick does not itself adjust"
+            "a tick before the first deadline does not adjust"
         );
 
         // Second tick, one interval later: real dispatch-driven starvation
@@ -12465,10 +12515,11 @@ mod conn_state_tests {
         // broker would drop (it no longer knows this consumer id until the
         // resubscribe's `Success` lands).
         let interval = Duration::from_secs(1);
-        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval);
         let t0 = Instant::now();
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
 
-        // Arm the adjust schedule before the churn event.
+        // The schedule is already armed at `t0` (`initial_flow`); this tick just
+        // settles the connection before the churn event.
         conn.handle_timeout(t0);
         let _ = conn.poll_transmit();
 
@@ -12488,6 +12539,130 @@ mod conn_state_tests {
         assert!(
             drain_command_flow(&mut conn, handle).is_none(),
             "a churn-window tick must not emit an adjust-driven flow"
+        );
+    }
+
+    /// Encode a broker `CommandAckResponse` resolving `request_id` for `handle`.
+    fn ack_response_frame(handle: ConsumerHandle, request_id: RequestId) -> bytes::BytesMut {
+        let cmd = pb::BaseCommand {
+            r#type: pb::base_command::Type::AckResponse as i32,
+            ack_response: Some(pb::CommandAckResponse {
+                consumer_id: handle.0,
+                request_id: Some(request_id.0),
+                error: None,
+                message: None,
+                txnid_least_bits: None,
+                txnid_most_bits: None,
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &cmd).expect("encode CommandAckResponse");
+        buf
+    }
+
+    /// Ack one message id and feed the broker's `CommandAckResponse` back at
+    /// `at`, draining the resulting outcome. One full ack round-trip — the
+    /// traffic shape a consumer that awaits every individual ack produces.
+    fn ack_round_trip(conn: &mut Connection, handle: ConsumerHandle, entry_id: u64, at: Instant) {
+        let request_id = conn.ack(
+            handle,
+            AckRequest {
+                message_ids: vec![MessageId {
+                    ledger_id: 4,
+                    entry_id,
+                    partition: -1,
+                    batch_index: -1,
+                    batch_size: -1,
+                    #[cfg(feature = "scalable-topics")]
+                    segment_id: None,
+                }],
+                ack_type: pb::command_ack::AckType::Individual,
+                properties: Vec::new(),
+                txn_id: None,
+            },
+            at,
+        );
+        let _ = conn.poll_transmit();
+        conn.handle_bytes(at, &ack_response_frame(handle, request_id))
+            .expect("handle AckResponse");
+        let _ = conn.take_outcome(PendingOpKey::Request(request_id));
+    }
+
+    #[test]
+    fn auto_policy_arms_adjust_schedule_at_initial_flow() {
+        // follow-ups §4: `initial_flow` is the adjust schedule's dedicated
+        // bootstrap. Without ever calling `handle_timeout`, `poll_timeout` must
+        // already surface the adjust deadline — that is what makes the first
+        // tick's timing a function of the subscribe-ack moment rather than of
+        // whichever unrelated deadline happens to fire first.
+        let interval = Duration::from_secs(1);
+        let t0 = Instant::now();
+        let (conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            100,
+            "Auto seeds at its floor"
+        );
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(t0 + interval),
+            "the adjust deadline must be armed by `initial_flow` alone, and must win the \
+             `poll_timeout` minimum against the far-away default keepalive deadline"
+        );
+    }
+
+    #[test]
+    fn auto_adjust_schedule_arms_under_continuous_ack_response_traffic() {
+        // follow-ups §4 regression. Every decoded inbound frame refreshes
+        // `last_activity` (the single refresh site, ADR-0058), so the keepalive
+        // deadline slides forward forever on a busy connection. While arming
+        // lived only in `handle_timeout`'s fallback arm, a consumer awaiting each
+        // individual ack — a continuous `CommandAckResponse` stream — kept the
+        // keepalive deadline (the ONLY deadline an unarmed `Auto` consumer has)
+        // permanently out of reach, so `handle_timeout` never ran, the schedule
+        // never armed, and `Auto` never scaled regardless of `keepalive_interval`.
+        //
+        // With the bootstrap at `initial_flow`, the armed adjust deadline is
+        // fixed at `t0 + interval` and no amount of inbound traffic can defer it.
+        let interval = Duration::from_secs(1);
+        let t0 = Instant::now();
+        let (mut conn, handle, _) = handshake_subscribe_auto(100, 128 * 1024 * 1024, interval, t0);
+
+        // Real dispatch-driven starvation: drain the 100-permit initial grant.
+        for i in 0..100u64 {
+            let meta = regular_metadata();
+            let frame = message_frame(handle.0, &meta, format!("m{i}").as_bytes());
+            conn.handle_bytes(t0, &frame).expect("deliver message");
+        }
+        let _ = conn.poll_transmit();
+
+        // Nine ack round-trips at 100 ms cadence — continuous inbound traffic
+        // for the whole sub-interval window, each frame pushing the keepalive
+        // deadline further out.
+        let step = Duration::from_millis(100);
+        for k in 1..=9u64 {
+            let at = t0 + step * u32::try_from(k).expect("small loop counter");
+            ack_round_trip(&mut conn, handle, k, at);
+            assert_eq!(
+                conn.poll_timeout(),
+                Some(t0 + interval),
+                "ack-response traffic must not defer the armed adjust deadline (round {k})"
+            );
+        }
+
+        // The driver wakes on the armed deadline and the adjust runs there.
+        conn.handle_timeout(t0 + interval);
+        assert_eq!(
+            conn.consumer_receiver_queue_size(handle),
+            200,
+            "the armed tick must observe the drained permit balance and double the target"
+        );
+        let flow = drain_command_flow(&mut conn, handle)
+            .expect("growing the target emits an incremental flow");
+        assert_eq!(
+            flow.message_permits, 100,
+            "the delta tops the additive grant mirror up from 100 to the new 200 target"
         );
     }
 
@@ -12605,7 +12780,7 @@ mod conn_state_tests {
         // ConnectionEvent::Message.
         let (mut conn, handle) = handshake_subscribe(None);
         let _ = drain_command_subscribe(&mut conn);
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         // Drain any flow command on the wire.
         let _ = conn.poll_transmit();
 
@@ -12637,7 +12812,7 @@ mod conn_state_tests {
         // only (decoder returns Ok(None) for txn kinds).
         let (mut conn, handle) = handshake_subscribe(None);
         let _ = drain_command_subscribe(&mut conn);
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         let mut meta = marker_metadata(21); // TXN_COMMIT
@@ -12671,7 +12846,7 @@ mod conn_state_tests {
         // path in `deliver` already counts its own loop iterations.
         let (mut conn, handle) = handshake_subscribe(None);
         let _ = drain_command_subscribe(&mut conn);
-        let _ = conn.initial_flow(handle);
+        let _ = conn.initial_flow(handle, Instant::now());
         let _ = conn.poll_transmit();
 
         // Feed three single-message frames back-to-back with no `pop_message`

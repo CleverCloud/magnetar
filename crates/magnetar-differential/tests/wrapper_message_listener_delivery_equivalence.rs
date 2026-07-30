@@ -85,7 +85,7 @@ fn open(conn: &mut Connection, topic: &str, t0: Instant) -> ConsumerHandle {
     conn.handle_bytes(t0, &buf).expect("Success");
     let _ = conn.poll_event();
 
-    conn.initial_flow(handle);
+    conn.initial_flow(handle, t0);
     let _ = conn.poll_transmit();
     handle
 }

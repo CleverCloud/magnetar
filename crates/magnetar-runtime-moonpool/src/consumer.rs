@@ -1478,8 +1478,14 @@ impl<P: Providers + Send + Sync> Client<P> {
                 Ok(()) => {
                     guard.disarm();
                     {
+                        // ADR-0011: pull the instant through the engine clock
+                        // (virtual time under `SimProviders`) rather than the
+                        // host, then hand it to the state machine — this is also
+                        // what arms the receiver-queue auto-adjust schedule
+                        // (follow-ups §4), so a seed replay arms it identically.
+                        let now = shared.now_instant();
                         let mut conn = shared.inner.lock();
-                        let _ = conn.initial_flow(handle);
+                        let _ = conn.initial_flow(handle, now);
                         let initial_target = slot.state.lock().receiver_queue_size;
                         if initial_target > 0 {
                             conn.flow(handle, initial_target as u32);
@@ -1970,11 +1976,12 @@ impl Drop for SubscribeAckedFut {
         let Some(waiter_id) = self.expected_waiter_id else {
             return;
         };
-        let changed = self
-            .shared
-            .inner
-            .lock()
-            .abandon_consumer_subscribe_waiter(self.handle, waiter_id);
+        let now = self.shared.now_instant();
+        let changed =
+            self.shared
+                .inner
+                .lock()
+                .abandon_consumer_subscribe_waiter(self.handle, waiter_id, now);
         if changed {
             self.shared.driver_waker.notify_one();
         }
@@ -3796,7 +3803,7 @@ mod tests {
         // Granting the initial flow bumps the counter to receiver_queue_size.
         {
             let mut conn = shared.inner.lock();
-            let _ = conn.initial_flow(handle);
+            let _ = conn.initial_flow(handle, Instant::now());
         }
         assert_eq!(consumer.available_permits(), 64);
 
@@ -3830,7 +3837,7 @@ mod tests {
         let t0 = Instant::now();
         {
             let mut conn = shared.inner.lock();
-            let _ = conn.initial_flow(handle);
+            let _ = conn.initial_flow(handle, t0);
             // Seed at the floor.
             assert_eq!(conn.consumer_receiver_queue_size(handle), 100);
             // Issue #349: drain the broker-side permit BALANCE via real

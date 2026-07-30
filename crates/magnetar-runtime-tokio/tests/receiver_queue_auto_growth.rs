@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `Auto` receiver-queue growth under real dispatch-driven starvation, and the
-//! churn-window guard that must NOT be mistaken for it (issue #349). The tokio
+//! `Auto` receiver-queue growth under real dispatch-driven starvation, the
+//! churn-window guard that must NOT be mistaken for it (issue #349), and the
+//! adjust schedule's arming bootstrap (`docs/follow-ups.md` §4). The tokio
 //! mirror of `magnetar-runtime-moonpool/tests/receiver_queue_auto_growth.rs`.
 //!
 //! Maintains the tokio ↔ moonpool 1:1 test count required by ADR-0024
-//! (`check-runtime-test-parity`): two `#[test]` functions here mirror the
-//! moonpool file's two.
+//! (`check-runtime-test-parity`): four `#[test]` functions here mirror the
+//! moonpool file's four.
 //!
 //! ## What this pins
 //!
@@ -24,6 +25,12 @@
 //! 2. `auto_receiver_queue_skips_growth_during_churn_window` — a same-broker `CommandCloseConsumer`
 //!    zeroes the permit mirror as part of the #307 re-attach dance; an adjust tick landing in that
 //!    churn window must NOT misread the zero as starvation and grow.
+//! 3. `auto_adjust_schedule_armed_by_initial_flow` — `Connection::initial_flow` alone puts the
+//!    adjust deadline on `poll_timeout`, with no `handle_timeout` ever having run.
+//! 4. `auto_adjust_schedule_survives_continuous_ack_response_traffic` — the follow-ups §4
+//!    regression: a continuous `CommandAckResponse` stream refreshes `last_activity` on every frame
+//!    and so defers the keepalive deadline indefinitely; the armed adjust deadline must be unmoved
+//!    by it, and the tick on that deadline must still grow the target.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used)]
@@ -32,8 +39,8 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use magnetar_proto::{
-    Auto, ConnectionConfig, ConsumerHandle, SubscribeRequest, decode_one, encode_command,
-    encode_payload, pb,
+    AckRequest, Auto, ConnectionConfig, ConsumerHandle, MessageId, RequestId, SubscribeRequest,
+    decode_one, encode_command, encode_payload, pb,
 };
 use magnetar_runtime_tokio::ConnectionShared;
 
@@ -90,7 +97,7 @@ fn open_auto_consumer(
         receiver_queue_adjust_interval: Some(adjust_interval),
         ..Default::default()
     });
-    let _ = conn.initial_flow(handle);
+    let _ = conn.initial_flow(handle, at);
     let _ = conn.poll_transmit();
     handle
 }
@@ -181,7 +188,8 @@ fn auto_receiver_queue_grows_under_real_dispatch_starvation() {
     let mut targets = Vec::new();
     let mut grants = Vec::new();
 
-    // Arm the schedule.
+    // The schedule was already armed at `t0` by `initial_flow` (follow-ups §4);
+    // this tick lands before the `t0 + TICK` deadline and adjusts nothing.
     {
         let mut conn = shared.inner.lock();
         conn.handle_timeout(t0);
@@ -232,7 +240,8 @@ fn auto_receiver_queue_skips_growth_during_churn_window() {
         t0,
     );
 
-    // Arm the adjust schedule before the churn event.
+    // The schedule is already armed at `t0` (`initial_flow`); this tick just
+    // settles the connection before the churn event.
     {
         let mut conn = shared.inner.lock();
         conn.handle_timeout(t0);
@@ -258,5 +267,148 @@ fn auto_receiver_queue_skips_growth_during_churn_window() {
     assert!(
         drain_flow_grants(&shared, handle).is_empty(),
         "a churn-window tick must not emit an adjust-driven flow"
+    );
+}
+
+/// Encode a broker `CommandAckResponse` resolving `request_id` for `handle`.
+fn ack_response_frame(handle: ConsumerHandle, request_id: RequestId) -> BytesMut {
+    let cmd = pb::BaseCommand {
+        r#type: pb::base_command::Type::AckResponse as i32,
+        ack_response: Some(pb::CommandAckResponse {
+            consumer_id: handle.0,
+            request_id: Some(request_id.0),
+            error: None,
+            message: None,
+            txnid_least_bits: None,
+            txnid_most_bits: None,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_command(&mut buf, &cmd).expect("encode CommandAckResponse");
+    buf
+}
+
+/// One full ack round-trip at `at`: ack a message id, then feed the broker's
+/// `CommandAckResponse` back in. This is the traffic shape a consumer that
+/// awaits every individual ack produces, and every decoded frame refreshes the
+/// connection's `last_activity` keepalive baseline (ADR-0058).
+fn ack_round_trip(shared: &ConnectionShared, handle: ConsumerHandle, entry_id: u64, at: Instant) {
+    let mut conn = shared.inner.lock();
+    let request_id = conn.ack(
+        handle,
+        AckRequest {
+            message_ids: vec![MessageId {
+                ledger_id: 4,
+                entry_id,
+                partition: -1,
+                batch_index: -1,
+                batch_size: -1,
+                #[cfg(feature = "scalable-topics")]
+                segment_id: None,
+            }],
+            ack_type: pb::command_ack::AckType::Individual,
+            properties: Vec::new(),
+            txn_id: None,
+        },
+        at,
+    );
+    let _ = conn.poll_transmit();
+    conn.handle_bytes(at, &ack_response_frame(handle, request_id))
+        .expect("handle AckResponse");
+    let _ = conn.take_outcome(magnetar_proto::PendingOpKey::Request(request_id));
+}
+
+#[test]
+fn auto_adjust_schedule_armed_by_initial_flow() {
+    // follow-ups §4: `Connection::initial_flow` is the schedule's dedicated
+    // bootstrap. With no `handle_timeout` ever having run, `poll_timeout` must
+    // already report the adjust deadline — that is what the driver needs in
+    // order to schedule the very first tick.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let handle = open_auto_consumer(
+        &shared,
+        "persistent://public/default/auto-growth-arming",
+        MIN,
+        MAX_BYTES,
+        TICK,
+        t0,
+    );
+
+    let conn = shared.inner.lock();
+    assert_eq!(
+        conn.consumer_receiver_queue_size(handle),
+        MIN,
+        "Auto seeds at its floor"
+    );
+    assert_eq!(
+        conn.poll_timeout(),
+        Some(t0 + TICK),
+        "the adjust deadline must be armed by `initial_flow` alone, and must win the \
+         `poll_timeout` minimum against the far-away default keepalive deadline"
+    );
+}
+
+#[test]
+fn auto_adjust_schedule_survives_continuous_ack_response_traffic() {
+    // follow-ups §4 regression. Every decoded inbound frame refreshes
+    // `last_activity` (ADR-0058's single refresh site), so a consumer awaiting
+    // each individual ack slides the keepalive deadline forward forever. While
+    // arming lived only in `handle_timeout`'s fallback arm, keepalive was the
+    // ONLY deadline an unarmed `Auto` consumer had — so `handle_timeout` never
+    // ran, the schedule never armed, and `Auto` never scaled under exactly the
+    // load it exists to handle.
+    let t0 = Instant::now();
+    let shared = ConnectionShared::new(ConnectionConfig::default());
+    let handle = open_auto_consumer(
+        &shared,
+        "persistent://public/default/auto-growth-busy",
+        MIN,
+        MAX_BYTES,
+        TICK,
+        t0,
+    );
+
+    // Real dispatch-driven starvation: drain the initial grant's balance.
+    {
+        let mut conn = shared.inner.lock();
+        for entry_id in 0..DRAIN_BATCH {
+            let frame = drain_message_frame(handle, entry_id, b"x");
+            conn.handle_bytes(t0, &frame)
+                .expect("deliver drain message");
+        }
+        while conn.poll_event().is_some() {}
+        let _ = conn.poll_transmit();
+    }
+
+    // Nine ack round-trips at 100 ms cadence: continuous inbound traffic across
+    // the whole sub-interval window, each frame pushing keepalive further out.
+    let step = Duration::from_millis(100);
+    for k in 1..=9u32 {
+        let at = t0 + step * k;
+        ack_round_trip(&shared, handle, u64::from(k), at);
+        assert_eq!(
+            shared.inner.lock().poll_timeout(),
+            Some(t0 + TICK),
+            "ack-response traffic must not defer the armed adjust deadline (round {k})"
+        );
+    }
+
+    // The driver wakes on the armed deadline and the adjust runs there.
+    let target = {
+        let mut conn = shared.inner.lock();
+        conn.handle_timeout(t0 + TICK);
+        conn.consumer_receiver_queue_size(handle)
+    };
+    assert_eq!(
+        target,
+        MIN * 2,
+        "the armed tick must observe the drained permit balance and double the target"
+    );
+    assert_eq!(
+        drain_flow_grants(&shared, handle),
+        vec![MIN as u32],
+        "the delta tops the additive grant mirror up to the new target"
     );
 }
