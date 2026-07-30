@@ -455,6 +455,21 @@ impl<C: ConsumerApi + Clone> MultiTopicsConsumer<C> {
     /// Applies equally to [`crate::PartitionedConsumer`] (a
     /// `MultiTopicsConsumer` type alias) since it shares this
     /// implementation.
+    ///
+    /// The two rate fields are populated by the client-wide sweep armed with
+    /// [`crate::ClientBuilder::stats_interval`], which reaches every child
+    /// because it ticks each slot on the connection rather than fanning out
+    /// from here (ADR-0089 — Java's `MultiTopicsConsumerImpl.getStats()` has no
+    /// fan-out either, and one clock ticking every child is what makes the f64
+    /// sum well-defined). With that knob unset they stay caller-driven and
+    /// therefore `0.0`; see
+    /// [`magnetar_proto::consumer::ConsumerState::record_rate_window`].
+    ///
+    /// A child added mid-window by [`Self::add_topic`] or by partition growth
+    /// is seeded at its own creation, so it contributes a full snapshot of its
+    /// counters immediately but `0.0` to the rate fields for its first full
+    /// interval — the window needs a baseline first. Java's recorders behave
+    /// identically.
     #[must_use]
     pub fn aggregate_stats(&self) -> magnetar_proto::ConsumerStats {
         let children: Vec<_> = self

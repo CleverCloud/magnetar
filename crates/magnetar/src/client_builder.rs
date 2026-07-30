@@ -43,6 +43,9 @@ pub struct ClientBuilder {
     service_url_provider: Option<std::sync::Arc<dyn magnetar_proto::ServiceUrlProvider>>,
     client_version: Option<String>,
     keepalive: Option<Duration>,
+    /// `None` = unset, inherit `ConnectionConfig::default()`'s `stats_interval`.
+    /// `Some(Duration::ZERO)` is the Java `statsIntervalSeconds = 0` disable.
+    stats_interval: Option<Duration>,
     operation_timeout: Option<Duration>,
     operation_retry: Option<magnetar_proto::OperationRetryConfig>,
     /// `None` = unset, inherit `ConnectionConfig::default()`'s `Some(30s)`.
@@ -68,6 +71,7 @@ impl Default for ClientBuilder {
             service_url_provider: None,
             client_version: None,
             keepalive: None,
+            stats_interval: None,
             operation_timeout: None,
             operation_retry: None,
             ack_response_timeout: None,
@@ -185,6 +189,36 @@ impl ClientBuilder {
     #[must_use]
     pub fn keepalive(mut self, dur: Duration) -> Self {
         self.keepalive = Some(dur);
+        self
+    }
+
+    /// Set the cadence at which the client re-samples every producer's and
+    /// consumer's rolling rate window — the sampling that makes
+    /// [`magnetar_proto::ProducerStats::msgs_per_sec`] / `bytes_per_sec` and
+    /// their [`magnetar_proto::ConsumerStats`] counterparts nonzero. Mirrors
+    /// Java `ClientBuilder#statsInterval(long, TimeUnit)`.
+    ///
+    /// The tick runs inside the sans-io state machine's existing
+    /// `poll_timeout` / `handle_timeout` deadline loop (ADR-0089), so it
+    /// applies to **every** producer and consumer on the client — including
+    /// the per-partition and per-topic children behind
+    /// [`crate::PartitionedProducer`], [`crate::MultiTopicsConsumer`] and
+    /// [`crate::PatternConsumer`], whose `aggregate_stats()` folds therefore
+    /// sum real rates rather than zeros. There is deliberately no per-wrapper
+    /// fan-out method: Java's wrappers have none either, and one clock ticking
+    /// every child is what makes the folded sum well-defined.
+    ///
+    /// `Duration::ZERO` disables the sweep, spelling Java's
+    /// `statsIntervalSeconds = 0`. Leaving the knob unset inherits
+    /// [`ConnectionConfig::stats_interval`](magnetar_proto::conn::ConnectionConfig)'s
+    /// default.
+    ///
+    /// A producer or consumer created mid-window has no baseline yet, so its
+    /// first sweep only seeds one and it reports `0.0` for one further
+    /// interval. Java behaves identically.
+    #[must_use]
+    pub fn stats_interval(mut self, dur: Duration) -> Self {
+        self.stats_interval = Some(dur);
         self
     }
 
@@ -395,6 +429,13 @@ impl ClientBuilder {
         }
         if let Some(d) = self.keepalive {
             config.keepalive_interval = d;
+        }
+        // ADR-0089 / Java `statsIntervalSeconds`: zero disables the sweep, any
+        // other value arms it. Unset leaves `ConnectionConfig::default()`'s
+        // value untouched, so the eventual default flip to Java's 60 s reaches
+        // callers who never touched this knob.
+        if let Some(d) = self.stats_interval {
+            config.stats_interval = (d != Duration::ZERO).then_some(d);
         }
         if let Some(d) = self.operation_timeout {
             config.operation_timeout = d;

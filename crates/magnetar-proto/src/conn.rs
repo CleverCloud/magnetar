@@ -254,6 +254,72 @@ const SEND_TIMEOUT_CODE: i32 = -1;
 /// Error message paired with [`SEND_TIMEOUT_CODE`]. Callers match on this exact string.
 const SEND_TIMEOUT_MESSAGE: &str = "send timeout";
 
+/// Whether a producer or consumer slot's rolling rate window is due for a
+/// re-sample at `now`, given the slot's existing `last_rate_snapshot` baseline
+/// and the connection's [`ConnectionConfig::stats_interval`] (ADR-0089).
+///
+/// Shared by [`Connection::handle_timeout`]'s consumer and producer sweeps so
+/// the two sides cannot drift; both `ProducerState::last_rate_snapshot` and
+/// `ConsumerState::last_rate_snapshot` are the same
+/// `Option<(u64, u64, Instant)>` shape, which is why one free function serves
+/// both without a trait.
+///
+/// `None` — no baseline yet, i.e. a slot created since the last sweep — is
+/// **due**: `record_rate_window` computes no rate without a previous snapshot,
+/// so that first visit only installs the baseline and the slot reports `0.0`
+/// for one further interval. Java's recorders behave identically for a
+/// producer or consumer constructed mid-window, so this is parity-correct
+/// rather than a rounding artefact; it is also the property
+/// `PartitionedProducer::aggregate_stats` and its consumer counterparts
+/// document for a child added by `add_topic` or partition growth.
+///
+/// `deadline_with_clamp` keeps a near-`Duration::MAX` interval panic-free
+/// (invariant #6).
+fn rate_window_due(
+    baseline: Option<(u64, u64, std::time::Instant)>,
+    interval: std::time::Duration,
+    now: std::time::Instant,
+) -> bool {
+    match baseline {
+        None => true,
+        Some((_, _, at)) => now >= crate::time::deadline_with_clamp(at, interval),
+    }
+}
+
+/// Install a producer's or consumer's initial rolling-rate baseline at slot
+/// creation, so its first sample lands one [`ConnectionConfig::stats_interval`]
+/// later (ADR-0089). Java's stats recorder is likewise constructed with the
+/// producer/consumer and arms its first `pulsarClient.timer()` tick then.
+///
+/// Seeding here rather than on the first sweep is load-bearing, not cosmetic.
+/// The only deadline a bare producer/consumer connection arms is keepalive, and
+/// its base (`last_activity`) is refreshed by every decoded frame (ADR-0058),
+/// so on a continuously busy connection it keeps sliding and `handle_timeout`
+/// may not run for a long time. A slot left unseeded would then go unswept for
+/// exactly as long. A baseline, by contrast, is a fixed instant, so the
+/// deadline `poll_timeout` arms from it cannot slide.
+///
+/// Both counters are zero at slot creation, so `(0, 0, at)` is precisely what
+/// `record_rate_window` would have written.
+///
+/// No-ops in two cases, both of which leave `handle_timeout`'s
+/// [`rate_window_due`] backstop to seed on the first sweep instead:
+/// - the sweep is disabled (`None`), so the disabled default stays bit-for-bit what it was before
+///   this feature existed — `last_rate_snapshot` is never written and no deadline is ever armed;
+/// - the connection has no `last_activity` yet, i.e. the slot was opened before the handshake
+///   response landed and there is no instant to anchor to.
+fn seed_rate_window_baseline(
+    baseline: &mut Option<(u64, u64, std::time::Instant)>,
+    interval: Option<std::time::Duration>,
+    last_activity: Option<std::time::Instant>,
+) {
+    if interval.is_some()
+        && let Some(at) = last_activity
+    {
+        *baseline = Some((0, 0, at));
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SubscribeAckAction {
     NotifyWaiter,
@@ -3742,6 +3808,35 @@ impl Connection {
                 }
             }
         }
+        // ADR-0089: rolling-rate sampling. Java's stats recorders self-tick on
+        // the client-wide `HashedWheelTimer`; magnetar expresses the same
+        // periodic obligation as a deadline here, so it costs no task, no
+        // `select!` arm and no new state — each slot's existing
+        // `last_rate_snapshot` timestamp is its own baseline, and the next
+        // sample is due `stats_interval` after it.
+        //
+        // Skipped entirely when the knob is `None` (the default) — no spurious
+        // wakeups, same load-bearing determinism rationale as the
+        // `ack_response_timeout` arm above.
+        //
+        // A slot with no baseline yet arms nothing here: there is no instant to
+        // arm from. `handle_timeout` seeds it on the next tick the connection
+        // takes for any reason — the keepalive deadline is unconditionally
+        // armed above while `last_activity` is set — and this arm drives every
+        // sample after that. The one-interval delay that costs a fresh slot is
+        // the same one Java's mid-window recorders carry.
+        if let Some(interval) = self.config.stats_interval {
+            for slot in self.consumers.values() {
+                if let Some((_, _, at)) = slot.state.lock().last_rate_snapshot {
+                    consider(crate::time::deadline_with_clamp(at, interval));
+                }
+            }
+            for slot in self.producers.values() {
+                if let Some((_, _, at)) = slot.state.lock().last_rate_snapshot {
+                    consider(crate::time::deadline_with_clamp(at, interval));
+                }
+            }
+        }
         next
     }
 
@@ -3796,6 +3891,11 @@ impl Connection {
         // Issue #301: receiver-queue auto-adjust flow commands staged inside the
         // per-slot loop, emitted after it under `&mut self`.
         let mut adjust_flows: Vec<pb::CommandFlow> = Vec::new();
+        // ADR-0089: hoisted so both the CONSUMER loop below and the PRODUCER
+        // send-timeout loop further down read one `Copy` value instead of
+        // re-borrowing `self.config` while `self.consumers` / `self.producers`
+        // are borrowed.
+        let stats_interval = self.config.stats_interval;
         for (handle, slot) in &self.consumers {
             let mut consumer = slot.state.lock();
             if let Some(tracker) = consumer.nack_tracker.as_mut() {
@@ -3865,6 +3965,16 @@ impl Connection {
                 }
             }
             // ---- END issue #301 ----
+            // ADR-0089: rolling-rate sample for this consumer, taken under the
+            // per-slot lock this loop already holds (ADR-0038 lock ordering —
+            // `record_rate_window` touches only `ConsumerState`). No-op when
+            // the knob is disabled, in which case `poll_timeout` never arms the
+            // matching deadline either.
+            if let Some(interval) = stats_interval
+                && rate_window_due(consumer.last_rate_snapshot, interval, now)
+            {
+                consumer.record_rate_window(now);
+            }
         }
         for (handle, ids) in redeliveries {
             self.emit_redeliver_unacked(handle, ids);
@@ -3931,6 +4041,14 @@ impl Connection {
             for (seq, waker) in producer.drain_timed_out_sends(now) {
                 producer.total_send_failed = producer.total_send_failed.saturating_add(1);
                 send_timeouts.push((*handle, seq, waker));
+            }
+            // ADR-0089: rolling-rate sample for this producer — the PRODUCER-side
+            // twin of the tick in the CONSUMER loop above, taken under the
+            // per-slot lock this loop already holds.
+            if let Some(interval) = stats_interval
+                && rate_window_due(producer.last_rate_snapshot, interval, now)
+            {
+                producer.record_rate_window(now);
             }
         }
         for (handle, seq, waker) in send_timeouts {
@@ -4249,6 +4367,11 @@ impl Connection {
         state.send_timeout = req.send_timeout;
         state.batching_max_publish_delay = req.batching_max_publish_delay;
         state.access_mode = req.access_mode;
+        seed_rate_window_baseline(
+            &mut state.last_rate_snapshot,
+            self.config.stats_interval,
+            self.last_activity,
+        );
         let identity = crate::producer::ProducerIdentity {
             handle,
             topic: req.topic.clone(),
@@ -4362,6 +4485,11 @@ impl Connection {
             req.auto_ack_oldest_chunked_message_on_queue_full;
         state.expire_time_of_incomplete_chunked_message =
             req.expire_time_of_incomplete_chunked_message;
+        seed_rate_window_baseline(
+            &mut state.last_rate_snapshot,
+            self.config.stats_interval,
+            self.last_activity,
+        );
         let identity = crate::consumer::ConsumerIdentity {
             handle,
             topic: req.topic.clone(),
@@ -4667,10 +4795,18 @@ impl Connection {
     /// `ConsumerStatsRecorder`'s rolling-window rate calculation. No-op if the handle is
     /// unknown.
     ///
-    /// Sampling is **caller-driven**: no engine calls this, so a caller that never invokes it
-    /// leaves `ConsumerStats::msgs_per_sec` / `bytes_per_sec` at `0.0` forever. Java instead
-    /// self-ticks each recorder on the client-wide timer; wiring an equivalent to the
-    /// `poll_timeout` / `handle_timeout` sweep is tracked as `docs/follow-ups.md` §2.
+    /// This is the manual sample point. The connection samples every registered
+    /// consumer on its own once [`ConnectionConfig::stats_interval`] is set,
+    /// off a `poll_timeout` deadline swept in `handle_timeout` (ADR-0089) —
+    /// magnetar's equivalent of Java's per-recorder tick on the client-wide
+    /// timer. That knob defaults to `None`, and with it disabled sampling is
+    /// **caller-driven**: no engine calls this, so a caller that never invokes
+    /// it leaves `ConsumerStats::msgs_per_sec` / `bytes_per_sec` at `0.0`
+    /// forever.
+    ///
+    /// Pick one cadence. Calling this while the sweep is armed re-seeds the
+    /// window, so the two interleave and neither reports the interval it
+    /// intended.
     pub fn consumer_record_rate_window(&mut self, handle: ConsumerHandle, now: std::time::Instant) {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().record_rate_window(now);
@@ -9664,6 +9800,400 @@ mod conn_state_tests {
             hist.max(),
             DWELL_MS,
             "Connection::pop_message must forward `now` verbatim to ConsumerState::pop_message"
+        );
+    }
+
+    /// ADR-0089 layer (a) fixture: a handshaked connection carrying exactly one
+    /// consumer and one producer, both attached and flow-controlled, built with
+    /// the supplied `stats_interval`.
+    ///
+    /// Returns the connection plus both handles so each test below can drive
+    /// real traffic through the production delivery / publish paths — the rate
+    /// window is a function of `total_msgs_received` / `total_msgs_sent`, and
+    /// hand-poking those counters would test the arithmetic rather than the
+    /// sweep that is supposed to call it.
+    ///
+    /// Every inbound frame is fed at `base`, deliberately: the creation-time
+    /// baseline is anchored to `last_activity`, so the shared
+    /// `feed_subscribe_success` / `ack_producer_success` helpers — which stamp
+    /// `Instant::now()` — would seed the two slots microseconds apart and make
+    /// the exact-deadline assertions below meaningless.
+    fn stats_interval_conn(
+        interval: Option<Duration>,
+        base: Instant,
+    ) -> (Connection, ConsumerHandle, ProducerHandle) {
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                stats_interval: interval,
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(base, &handshake_response_bytes())
+            .expect("handle handshake");
+
+        let sub_rid = conn.peek_next_request_id_for_test();
+        let consumer = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/stats-interval".to_owned(),
+            subscription: "sub-stats-interval".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        let ok = pb::BaseCommand {
+            r#type: pb::base_command::Type::Success as i32,
+            success: Some(pb::CommandSuccess {
+                request_id: sub_rid,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ok).expect("encode CommandSuccess");
+        conn.handle_bytes(base, &buf)
+            .expect("handle CommandSuccess");
+        while conn.poll_event().is_some() {}
+        conn.initial_flow(consumer, base);
+        let _ = drain_outbound_commands(&mut conn);
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/stats-interval".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        let ok = pb::BaseCommand {
+            r#type: pb::base_command::Type::ProducerSuccess as i32,
+            producer_success: Some(pb::CommandProducerSuccess {
+                request_id: create_rid,
+                producer_name: "p-test".to_owned(),
+                last_sequence_id: Some(-1),
+                schema_version: None,
+                topic_epoch: None,
+                producer_ready: Some(true),
+            }),
+            ..Default::default()
+        };
+        let mut buf = bytes::BytesMut::new();
+        encode_command(&mut buf, &ok).expect("encode ProducerSuccess");
+        conn.handle_bytes(base, &buf)
+            .expect("handle ProducerSuccess");
+        while conn.poll_event().is_some() {}
+
+        (conn, consumer, producer)
+    }
+
+    /// The instant each slot's rolling-rate baseline is anchored at, or `None`
+    /// when it has no baseline yet.
+    fn stats_baselines(
+        conn: &Connection,
+        consumer: ConsumerHandle,
+        producer: ProducerHandle,
+    ) -> (Option<Instant>, Option<Instant>) {
+        (
+            conn.consumer(consumer)
+                .expect("consumer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .map(|(_, _, at)| at),
+            conn.producer(producer)
+                .expect("producer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .map(|(_, _, at)| at),
+        )
+    }
+
+    /// Push `count` messages of `payload` at the consumer and publish `count`
+    /// of them from the producer, so both slots' rate-window counters move by a
+    /// known amount between two sweeps.
+    fn drive_stats_traffic(
+        conn: &mut Connection,
+        consumer: ConsumerHandle,
+        producer: ProducerHandle,
+        count: u64,
+        at: Instant,
+    ) {
+        let meta = regular_metadata();
+        for _ in 0..count {
+            let frame = message_frame(consumer.0, &meta, b"payload");
+            conn.handle_bytes(at, &frame).expect("deliver message");
+            while conn.poll_event().is_some() {}
+        }
+        for seq in 0..count {
+            conn.send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"payload"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 7,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                seq,
+                at,
+            )
+            .expect("queue send");
+        }
+        let _ = drain_outbound_commands(conn);
+    }
+
+    /// `(msgs_per_sec, bytes_per_sec)` currently published by each slot.
+    fn stats_rates(
+        conn: &Connection,
+        consumer: ConsumerHandle,
+        producer: ProducerHandle,
+    ) -> ((f64, f64), (f64, f64)) {
+        let c = conn
+            .consumer(consumer)
+            .expect("consumer slot registered")
+            .state
+            .lock()
+            .stats();
+        let p = conn
+            .producer(producer)
+            .expect("producer slot registered")
+            .state
+            .lock()
+            .stats();
+        (
+            (c.msgs_per_sec, c.bytes_per_sec),
+            (p.msgs_per_sec, p.bytes_per_sec),
+        )
+    }
+
+    /// ADR-0089: `stats_interval: None` — the default this commit ships —
+    /// leaves sampling entirely caller-driven. No slot ever gets a baseline, no
+    /// rate ever moves off `0.0` however far the injected clock advances, and
+    /// (load-bearing for moonpool determinism) neither slot contributes a
+    /// deadline to `poll_timeout`, so the simulated wake schedule is
+    /// bit-for-bit what it was before this feature existed.
+    #[test]
+    fn stats_interval_none_arms_no_deadline_and_never_samples() {
+        let base = Instant::now();
+        let (mut conn, consumer, producer) = stats_interval_conn(None, base);
+
+        // `last_activity` is stamped by the subscribe / producer-ack frames the
+        // fixture feeds, so the keepalive deadline is at `>= base + keepalive`
+        // rather than exactly there. That lower bound is what makes this
+        // assertion load-bearing: any per-slot stats deadline would be armed off
+        // a baseline at `base` with an interval far below the 30 s keepalive, so
+        // it could only land BELOW the bound. The armed case in
+        // `stats_interval_seeds_then_samples_producer_and_consumer_rates` shows
+        // exactly that.
+        let deadline = conn
+            .poll_timeout()
+            .expect("keepalive is armed once connected");
+        assert!(
+            deadline >= base + ConnectionConfig::default().keepalive_interval,
+            "with the sweep disabled the only armed deadline is keepalive — a slot \
+             must contribute nothing"
+        );
+
+        drive_stats_traffic(&mut conn, consumer, producer, 4, base);
+        // An hour is far past any plausible interval: if the sweep were armed at
+        // all, this single tick would both seed and sample.
+        conn.handle_timeout(base + Duration::from_hours(1));
+
+        assert!(
+            conn.consumer(consumer)
+                .expect("consumer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .is_none(),
+            "a disabled sweep must never install a consumer baseline"
+        );
+        assert!(
+            conn.producer(producer)
+                .expect("producer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .is_none(),
+            "a disabled sweep must never install a producer baseline"
+        );
+        let ((c_msgs, c_bytes), (p_msgs, p_bytes)) = stats_rates(&conn, consumer, producer);
+        for (label, rate) in [
+            ("consumer msgs_per_sec", c_msgs),
+            ("consumer bytes_per_sec", c_bytes),
+            ("producer msgs_per_sec", p_msgs),
+            ("producer bytes_per_sec", p_bytes),
+        ] {
+            assert!(
+                rate.abs() < f64::EPSILON,
+                "{label} must stay 0.0 while stats_interval is None, got {rate}"
+            );
+        }
+    }
+
+    /// ADR-0089 headline behaviour: with the knob armed, each slot's baseline is
+    /// installed at creation, `poll_timeout` arms the next sample off it, and
+    /// the sweep at the deadline publishes the real per-second rates — with no
+    /// engine, task, or caller involvement.
+    #[test]
+    fn stats_interval_seeds_at_creation_then_samples_one_interval_later() {
+        /// One synthetic second per window, so a delta of N is exactly N/sec.
+        const INTERVAL: Duration = Duration::from_secs(1);
+        /// Messages per window. `7` bytes of payload each (`b"payload"`).
+        const COUNT: u64 = 4;
+        const PAYLOAD_LEN: u64 = 7;
+
+        let base = Instant::now();
+        let (mut conn, consumer, producer) = stats_interval_conn(Some(INTERVAL), base);
+
+        // Creation-time seeding, mirroring Java's recorder-per-producer. This is
+        // load-bearing rather than cosmetic: were the baseline installed by the
+        // first sweep instead, a slot on a continuously busy connection could go
+        // unswept indefinitely, because the only other deadline such a
+        // connection arms is keepalive and its base slides forward on every
+        // decoded frame (ADR-0058).
+        assert_eq!(
+            stats_baselines(&conn, consumer, producer),
+            (Some(base), Some(base)),
+            "both slots must carry a rate-window baseline the moment they are \
+             created, without waiting for a sweep"
+        );
+
+        // So the next sample is armed off that baseline — with no `handle_timeout`
+        // having run at all — and preempts the 30 s keepalive deadline.
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(base + INTERVAL),
+            "poll_timeout must arm the next sample at last_rate_snapshot + stats_interval"
+        );
+
+        drive_stats_traffic(&mut conn, consumer, producer, COUNT, base);
+        conn.handle_timeout(base + INTERVAL);
+
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "COUNT and PAYLOAD_LEN are single-digit test constants"
+        )]
+        let expected_msgs = COUNT as f64;
+        #[allow(clippy::cast_precision_loss, reason = "same as above")]
+        let expected_bytes = (COUNT * PAYLOAD_LEN) as f64;
+        let ((c_msgs, c_bytes), (p_msgs, p_bytes)) = stats_rates(&conn, consumer, producer);
+        for (label, got, want) in [
+            ("consumer msgs_per_sec", c_msgs, expected_msgs),
+            ("consumer bytes_per_sec", c_bytes, expected_bytes),
+            ("producer msgs_per_sec", p_msgs, expected_msgs),
+            ("producer bytes_per_sec", p_bytes, expected_bytes),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{label}: the sweep must publish the real delta over the window — \
+                 expected {want}, got {got}"
+            );
+        }
+    }
+
+    /// No-false-positive companion: a tick landing INSIDE the window must not
+    /// re-sample. Without the `rate_window_due` gate the sweep would re-seed on
+    /// every unrelated wake-up (keepalive, a nack redelivery, an ack-grouping
+    /// flush), which both shortens the window arbitrarily and makes the
+    /// published rate depend on traffic the client happens to be doing —
+    /// seed-divergent under moonpool.
+    #[test]
+    fn stats_interval_sub_window_tick_does_not_resample() {
+        const INTERVAL: Duration = Duration::from_secs(10);
+        const COUNT: u64 = 4;
+
+        let base = Instant::now();
+        let (mut conn, consumer, producer) = stats_interval_conn(Some(INTERVAL), base);
+
+        drive_stats_traffic(&mut conn, consumer, producer, COUNT, base);
+
+        // One second into a ten-second window: due only at `base + INTERVAL`.
+        conn.handle_timeout(base + Duration::from_secs(1));
+        let ((c_msgs, _), (p_msgs, _)) = stats_rates(&conn, consumer, producer);
+        assert!(
+            c_msgs.abs() < f64::EPSILON && p_msgs.abs() < f64::EPSILON,
+            "a sub-window tick must leave the published rate untouched"
+        );
+        assert_eq!(
+            conn.consumer(consumer)
+                .expect("consumer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .map(|(_, _, at)| at),
+            Some(base),
+            "a sub-window tick must not move the baseline either — otherwise the \
+             window silently restarts on every unrelated wake-up"
+        );
+
+        // At the deadline it samples, and the window is the full INTERVAL: the
+        // same COUNT messages now read as COUNT/10 per second, not COUNT/1.
+        conn.handle_timeout(base + INTERVAL);
+        let ((c_msgs, _), (p_msgs, _)) = stats_rates(&conn, consumer, producer);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "COUNT and INTERVAL are single-digit test constants"
+        )]
+        let expected = COUNT as f64 / INTERVAL.as_secs_f64();
+        assert!(
+            (c_msgs - expected).abs() < 1e-9 && (p_msgs - expected).abs() < 1e-9,
+            "the published rate must divide by the FULL window, expected {expected}, \
+             got consumer={c_msgs} producer={p_msgs}"
+        );
+    }
+
+    /// The one case creation-time seeding cannot cover: a slot opened BEFORE the
+    /// handshake response lands has no `last_activity` to anchor to, so it gets
+    /// no baseline at creation. `rate_window_due` treats an unseeded slot as due,
+    /// so the first sweep seeds it instead and the slot joins the cadence from
+    /// there — rather than being stranded at `0.0` forever.
+    #[test]
+    fn stats_interval_slot_opened_before_handshake_seeds_on_first_sweep() {
+        const INTERVAL: Duration = Duration::from_secs(1);
+
+        let base = Instant::now();
+        let mut conn = Connection::new(
+            ConnectionConfig {
+                stats_interval: Some(INTERVAL),
+                ..ConnectionConfig::default()
+            },
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        // Deliberately NO handshake response: `last_activity` is still `None`.
+        conn.begin_handshake().expect("handshake");
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/stats-interval-preconnect".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+
+        assert!(
+            conn.producer(producer)
+                .expect("producer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .is_none(),
+            "with no last_activity there is no instant to anchor a baseline to"
+        );
+
+        // The backstop: the first sweep seeds it, at the sweep's own `now`.
+        conn.handle_timeout(base);
+        assert_eq!(
+            conn.producer(producer)
+                .expect("producer slot registered")
+                .state
+                .lock()
+                .last_rate_snapshot
+                .map(|(_, _, at)| at),
+            Some(base),
+            "the first sweep must seed a slot that missed creation-time seeding, \
+             otherwise it would never publish a rate at all"
+        );
+        assert_eq!(
+            conn.poll_timeout(),
+            Some(base + INTERVAL),
+            "and the slot joins the normal cadence from that baseline"
         );
     }
 

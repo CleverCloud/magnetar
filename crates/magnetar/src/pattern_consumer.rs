@@ -343,9 +343,12 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
     /// until it has been sampled twice — the rate window needs a baseline first.
     /// Java's `MultiTopicConsumerStatsRecorderImpl` behaves identically.
     ///
-    /// Rate sampling is caller-driven; see the note on
-    /// [`magnetar_proto::consumer::ConsumerState::record_rate_window`] and
-    /// `docs/follow-ups.md` §2.
+    /// The rate fields are populated by the client-wide sweep armed with
+    /// [`crate::ClientBuilder::stats_interval`], which reaches every child of
+    /// this subscription because it ticks each slot on the connection rather
+    /// than fanning out from here (ADR-0089 — Java's wrappers have no fan-out
+    /// either). With that knob unset they stay caller-driven; see the note on
+    /// [`magnetar_proto::consumer::ConsumerState::record_rate_window`].
     #[must_use]
     pub fn aggregate_stats(&self) -> magnetar_proto::ConsumerStats {
         let children: Vec<_> = self
