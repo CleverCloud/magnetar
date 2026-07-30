@@ -10,12 +10,11 @@
 //!    `aggregate_stats()` totals equal the real send/receive counts, `pending_batch_acks` is
 //!    propagated (nonzero before any ack — the issue's headline symptom), and the latency
 //!    percentile ordering (`max >= p99 >= p50`) holds. The rolling `msgs_per_sec` / `bytes_per_sec`
-//!    rates are NOT asserted here: `PartitionedProducer` / `PartitionedConsumer` expose no way to
-//!    drive `record_rate_window` on their per-partition children through the public façade (only
-//!    the concrete `magnetar_runtime_tokio::{Producer, Consumer}` types expose that method), so a
-//!    real partitioned child's rate fields can never become nonzero today — see scenario 2 for the
-//!    rate-propagation proof and the report's "open concerns" for this reachability gap as a
-//!    follow-up candidate.
+//!    rates are NOT asserted here: rate sampling is caller-driven, no engine ticks it, and
+//!    `PartitionedConsumer` exposes no way to reach its per-partition children (only the concrete
+//!    `magnetar_runtime_tokio::{Producer, Consumer}` types carry `record_rate_window` at all), so a
+//!    partitioned child's rate fields are structurally zero today. Scenario 2 carries the
+//!    rate-propagation proof; closing the sampling gap is tracked as `docs/follow-ups.md` §2.
 //! 2. [`e2e_aggregate_stats_fold_propagates_real_rate`] — a single (non-partitioned) producer +
 //!    consumer pair, driven exactly like `e2e_rolling_stats.rs`, proves `ConsumerStats::fold` /
 //!    `ProducerStats::fold` propagate a REAL nonzero rolling rate (and every other field)
@@ -25,6 +24,9 @@
 //!    Every in-process layer of the ADR-0086 test set compares against a *scripted* delta, so a fix
 //!    that pinned `now` (e.g. `pop_message(msg.arrived_at)`) would zero the histogram forever and
 //!    still pass all of them. Only a real broker with a real queue dwell catches that.
+//! 4. [`e2e_pattern_consumer_aggregate_stats_folds_children`] — `PatternConsumer` is the third
+//!    wrapper over a child-consumer set but shipped without an `aggregate_stats` at all. Proves the
+//!    fold reaches every child of a live pattern subscription across two regex-matched topics.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires Docker.
 
@@ -110,6 +112,124 @@ async fn create_partitioned_topic(
         .timeout(Duration::from_secs(30))
         .build()?;
     admin.topic_create_partitioned(topic, PARTITIONS).await?;
+    Ok(())
+}
+
+/// Scenario 4: `PatternConsumer::aggregate_stats` folds across pattern children.
+///
+/// `PatternConsumer` is the third wrapper over a child-consumer set, alongside
+/// `MultiTopicsConsumer` and its `PartitionedConsumer` alias, but it shipped
+/// without an `aggregate_stats` at all — so a pattern subscription had no way to
+/// read its own totals. This proves the fold reaches every child of a live
+/// pattern subscription: two topics matched by one anchored regex, a known
+/// number of messages published to each, and the aggregate equal to their sum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::float_cmp,
+    reason = "the rate fields are never computed in this test — no \
+              record_rate_window call ever runs — so they hold the exact \
+              ConsumerStats::default() zero, and f64 += 0.0 across children \
+              preserves it bit-exactly. Exact zero IS the invariant: a \
+              tolerance would also accept a real rate having leaked in"
+)]
+async fn e2e_pattern_consumer_aggregate_stats_folds_children()
+-> Result<(), Box<dyn std::error::Error>> {
+    const PER_TOPIC: usize = 4;
+
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+
+    // One random tag shared by both topics so the regex is anchored on a prefix
+    // that cannot collide with anything else lingering on the broker.
+    //
+    // The tag is deliberately SHORT. This file's container runs a stock broker,
+    // which caps topic-list-watcher patterns at `subscriptionPatternMaxLength`
+    // (default 50) and rejects a longer one with `code=22 Unable to create topic
+    // list watcher: Pattern longer than maximum: 50`.
+    // `persistent://public/default/` alone is 28 characters, so a full 32-hex
+    // UUID plus a `-.*` suffix cannot fit; 8 hex characters keep the pattern at
+    // 49. Collisions do not matter — the container is per-test and thrown away.
+    //
+    // `e2e_pattern_auto_reconcile.rs` solves the same problem the other way, by
+    // raising the limit to 200 via `PULSAR_PREFIX_subscriptionPatternMaxLength`
+    // on its own container. Fitting the default is preferred here: it keeps this
+    // file's `start_pulsar` shared by all four tests and unmodified, and it
+    // exercises the pattern surface against a broker configured as shipped.
+    let suite = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let topic_a = format!("persistent://public/default/magpatagg-{suite}-aa");
+    let topic_b = format!("persistent://public/default/magpatagg-{suite}-bb");
+    let pattern = format!("persistent://public/default/magpatagg-{suite}-.*");
+    assert!(
+        pattern.len() <= 50,
+        "pattern must fit the broker's subscriptionPatternMaxLength=50, got {} chars: {pattern}",
+        pattern.len()
+    );
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    // Both topics must exist before the pattern consumer takes its initial
+    // snapshot, otherwise the namespace listing returns one child and the fold
+    // has nothing to prove.
+    let mut published_bytes = 0usize;
+    for topic in [&topic_a, &topic_b] {
+        let producer = client.producer(topic).create().await?;
+        for i in 0..PER_TOPIC {
+            let payload = format!("patagg-{i}").into_bytes();
+            published_bytes += payload.len();
+            producer
+                .send(OutgoingMessage::with_payload(payload).into())
+                .await?;
+        }
+        producer.close().await?;
+    }
+
+    let consumer = client
+        .pattern_consumer()
+        .namespace("public/default")
+        .pattern(&pattern)
+        .subscription(format!("magnetar-patagg-{suite}"))
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+    assert_eq!(
+        consumer.len(),
+        2,
+        "initial snapshot must contain both matched topics, got {:?}",
+        consumer.topics()
+    );
+
+    // Drain everything so both children have nonzero receive counters. Without
+    // this the fold would sum two zeroes and pass vacuously.
+    let total = PER_TOPIC * 2;
+    for _ in 0..total {
+        let msg = tokio::time::timeout(Duration::from_secs(15), consumer.receive())
+            .await
+            .map_err(|_| "timed out draining the pattern subscription")??;
+        consumer.ack(&msg.topic, msg.message.message_id).await?;
+    }
+
+    let stats = consumer.aggregate_stats();
+    assert_eq!(
+        stats.total_msgs_received, total as u64,
+        "aggregate_stats() must sum both children's receive counters"
+    );
+    assert_eq!(
+        stats.total_bytes_received, published_bytes as u64,
+        "aggregate_stats() must sum both children's byte counters"
+    );
+    // Percentile ordering must survive the histogram merge, exactly as it does
+    // for the MultiTopicsConsumer sibling.
+    assert!(stats.receive_latency_max_ms >= stats.receive_latency_p99_ms);
+    assert!(stats.receive_latency_p99_ms >= stats.receive_latency_p50_ms);
+    // Sampling is caller-driven and this test never ticks a rate window, so the
+    // rates are structurally zero here (docs/follow-ups.md §2). Scenario 2 is
+    // where a real nonzero rate is proven.
+    assert_eq!(stats.msgs_per_sec, 0.0);
+    assert_eq!(stats.bytes_per_sec, 0.0);
+
+    consumer.close().await?;
     Ok(())
 }
 
