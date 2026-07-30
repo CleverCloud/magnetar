@@ -17,7 +17,10 @@
 //!   `docs/testing.md` § "e2e container memory budget".
 //! - `check-sim-coverage`: assert that every line added relative to `git merge-base origin/main
 //!   HEAD` is executed by at least one moonpool test (`cargo-llvm-cov` patch-coverage style).
-//!   Mirrors ADR-0024.
+//!   Mirrors ADR-0024. Enforcement covers only the packages in the coverage run
+//!   (`magnetar-runtime-moonpool` + `magnetar-differential` and their dependencies); additions in
+//!   packages outside it — the `magnetar` façade above all — are reported as `not gated` rather
+//!   than silently passed (ADR-0088).
 //! - `check-runtime-test-parity`: assert `magnetar-runtime-tokio` and `magnetar-runtime-moonpool`
 //!   carry the same number of `#[test]` / `#[tokio::test]` / `#[moonpool::test]` items. Mirrors
 //!   ADR-0024.
@@ -124,6 +127,11 @@ enum Cmd {
     /// intersects the LCOV-equivalent JSON with `git diff
     /// merge-base...HEAD` line ranges. Any added line not executed under
     /// the moonpool runner fails the check. See ADR-0024.
+    ///
+    /// The `-p` filter restricts instrumentation as well as execution, so
+    /// packages outside that graph (notably the `magnetar` façade) are
+    /// never measured. Their additions are reported as `not gated`
+    /// instead of counting as covered — see ADR-0088.
     CheckSimCoverage {
         /// Base ref to diff against. Defaults to `origin/main`.
         #[arg(long, default_value = "origin/main")]
@@ -1815,10 +1823,16 @@ fn parse_lcov_coverage(
 /// Run `cargo llvm-cov` against the moonpool runtime + differential test
 /// crates and return the emitted LCOV report as a string.
 ///
-/// The whole workspace is instrumented (so coverage attributes to the
-/// originating crate, e.g. `magnetar-proto`), but only the moonpool /
-/// differential test binaries execute — that's the surface ADR-0024 demands
-/// patch coverage on.
+/// The emitted report covers ONLY the two `-p` packages' own sources — measured
+/// 2026-07-30: 16 `SF:` records, 12 under `magnetar-runtime-moonpool/src/` and 4
+/// under `magnetar-differential/src/`, and nothing else. It does NOT reach their
+/// dependencies, so `magnetar-proto`, `magnetar-runtime-tokio` and the `magnetar`
+/// façade emit no records at all and their additions cannot be gated here.
+/// Reproduce with `rg -o '^SF:.*' target/sim-coverage.lcov`.
+///
+/// [`uninstrumented_files`] turns that into an explicit `not gated` report rather
+/// than a silent pass (ADR-0088); broadening the scope is tracked as
+/// `docs/follow-ups.md` §10.
 fn run_moonpool_lcov(workspace_root: &Path) -> Result<String> {
     let lcov_path = workspace_root.join("target/sim-coverage.lcov");
     if let Some(parent) = lcov_path.parent() {
@@ -1885,6 +1899,62 @@ fn intersect_diff_with_coverage(
         }
     }
     uncovered
+}
+
+/// Partition off the tracked files that LCOV never mentions at all.
+///
+/// `run_moonpool_lcov` filters the run with `-p magnetar-runtime-moonpool -p
+/// magnetar-differential`, and the emitted report carries only those two
+/// packages' own sources — not their dependencies. Every other crate,
+/// `magnetar-proto` and the `magnetar` façade included, therefore emits no `DA:`
+/// records at all, and every added line in it reads as "not executable" to
+/// [`intersect_diff_with_coverage`].
+///
+/// That is a real scope limit on ADR-0024's patch-coverage gate, not a pass.
+/// Returning it separately lets the caller say so out loud instead of folding
+/// those files into a "100% covered" summary they were never measured against.
+///
+/// Returns `(relpath, added_line_count)` per uninstrumented file, sorted by path.
+fn uninstrumented_files(
+    workspace_root: &Path,
+    tracked: &[(String, std::collections::BTreeSet<u32>)],
+    covered: &std::collections::HashMap<
+        String,
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+    >,
+) -> Vec<(String, usize)> {
+    let mut ungated: Vec<(String, usize)> = tracked
+        .iter()
+        .filter(|(relpath, _)| {
+            let abs_key = workspace_root.join(relpath).to_string_lossy().into_owned();
+            !covered.contains_key(&abs_key)
+        })
+        .map(|(relpath, lines)| (relpath.clone(), lines.len()))
+        .collect();
+    ungated.sort_by(|a, b| a.0.cmp(&b.0));
+    ungated
+}
+
+/// Print the files ADR-0024's patch-coverage gate could not measure.
+///
+/// Deliberately does NOT fail the check: broadening the coverage run to reach
+/// them would pull the façade's Docker-dependent e2e suite (ADR-0046: no
+/// feature gate, no `#[ignore]`) into every invocation. Reporting keeps the
+/// limit visible instead of silent — see ADR-0088.
+fn report_ungated(ungated: &[(String, usize)]) {
+    for (path, count) in ungated {
+        eprintln!("not gated (outside the moonpool coverage run): {path}: {count} added line(s)");
+    }
+    eprintln!(
+        "xtask check-sim-coverage: {} file(s) above are outside the \
+         `-p magnetar-runtime-moonpool -p magnetar-differential` coverage run, so \
+         ADR-0024 patch coverage was NOT enforced on them (ADR-0088). Cover them \
+         from a moonpool or differential test if the added code is engine-visible.",
+        ungated.len()
+    );
 }
 
 /// Print per-file uncovered ranges and bail with a summary. Always returns
@@ -2008,14 +2078,25 @@ fn check_sim_coverage(base: &str) -> Result<()> {
     //    both to absolutes.
     let uncovered = intersect_diff_with_coverage(&workspace_root, &tracked, &covered);
 
+    // 4b. Separate the files the run never instrumented from the files it
+    //     measured and found wanting. Both were silently identical before —
+    //     an uninstrumented file has no `DA:` records, so every added line in
+    //     it looked "not executable" and passed. Report the scope limit first
+    //     so it survives the `?` below (ADR-0088).
+    let ungated = uninstrumented_files(&workspace_root, &tracked, &covered);
+    if !ungated.is_empty() {
+        report_ungated(&ungated);
+    }
+
     if !uncovered.is_empty() {
         report_uncovered(&workspace_root, &uncovered)?;
     }
 
+    let gated = tracked.len() - ungated.len();
     eprintln!(
-        "xtask check-sim-coverage: all added lines across {} file(s) are \
-         covered by the moonpool runner.",
-        tracked.len()
+        "xtask check-sim-coverage: all added lines across {gated} file(s) are \
+         covered by the moonpool runner ({} file(s) outside its scope).",
+        ungated.len()
     );
     Ok(())
 }
@@ -2928,6 +3009,119 @@ fn pop(now: Instant) {
         assert!(
             scan_clock_violations(src).is_empty(),
             "documentation that mentions a clock read is not a clock read"
+        );
+    }
+
+    // ── check-sim-coverage scope reporting (ADR-0088) ───────────────
+
+    /// Build the `(executable, hit)` map `intersect_diff_with_coverage` and
+    /// `uninstrumented_files` consume, keyed the way LCOV emits it: absolute
+    /// paths under the workspace root.
+    fn coverage_of(
+        root: &Path,
+        entries: &[(&str, &[u32], &[u32])],
+    ) -> std::collections::HashMap<
+        String,
+        (
+            std::collections::BTreeSet<u32>,
+            std::collections::BTreeSet<u32>,
+        ),
+    > {
+        entries
+            .iter()
+            .map(|(relpath, executable, hit)| {
+                (
+                    root.join(relpath).to_string_lossy().into_owned(),
+                    (
+                        executable.iter().copied().collect(),
+                        hit.iter().copied().collect(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn tracked_of(entries: &[(&str, &[u32])]) -> Vec<(String, std::collections::BTreeSet<u32>)> {
+        entries
+            .iter()
+            .map(|(relpath, lines)| ((*relpath).to_owned(), lines.iter().copied().collect()))
+            .collect()
+    }
+
+    /// The defect this reporting exists for: `run_moonpool_lcov` filters with
+    /// `-p magnetar-runtime-moonpool -p magnetar-differential`, and neither
+    /// depends on the `magnetar` façade, so façade files emit no LCOV records
+    /// at all. Before ADR-0088 those lines were indistinguishable from
+    /// non-executable ones and passed silently.
+    #[test]
+    fn sim_coverage_reports_a_facade_file_the_runner_never_instrumented() {
+        let root = Path::new("/ws");
+        let tracked = tracked_of(&[
+            ("crates/magnetar/src/pattern_consumer.rs", &[10, 11, 12]),
+            ("crates/magnetar-proto/src/conn.rs", &[40]),
+        ]);
+        let covered = coverage_of(root, &[("crates/magnetar-proto/src/conn.rs", &[40], &[40])]);
+
+        assert_eq!(
+            uninstrumented_files(root, &tracked, &covered),
+            vec![("crates/magnetar/src/pattern_consumer.rs".to_owned(), 3)],
+            "a file with no LCOV entry must be reported as ungated, not counted as covered"
+        );
+        assert!(
+            intersect_diff_with_coverage(root, &tracked, &covered).is_empty(),
+            "the instrumented file is fully hit, so nothing may fail"
+        );
+    }
+
+    /// An instrumented-but-unhit line is a genuine gate failure and must NOT
+    /// be reclassified as merely ungated — the two paths stay disjoint.
+    #[test]
+    fn sim_coverage_keeps_instrumented_misses_failing() {
+        let root = Path::new("/ws");
+        let tracked = tracked_of(&[("crates/magnetar-proto/src/conn.rs", &[40, 41])]);
+        let covered = coverage_of(
+            root,
+            &[("crates/magnetar-proto/src/conn.rs", &[40, 41], &[40])],
+        );
+
+        assert!(
+            uninstrumented_files(root, &tracked, &covered).is_empty(),
+            "the file WAS instrumented, so it is in scope"
+        );
+        assert_eq!(
+            intersect_diff_with_coverage(root, &tracked, &covered),
+            vec![("crates/magnetar-proto/src/conn.rs".to_owned(), 41)]
+        );
+    }
+
+    /// Both classes can occur in one diff; each must be routed to its own
+    /// report rather than one swallowing the other.
+    #[test]
+    fn sim_coverage_separates_ungated_files_from_uncovered_lines() {
+        let root = Path::new("/ws");
+        let tracked = tracked_of(&[
+            ("crates/magnetar/src/multi_topics.rs", &[7]),
+            ("crates/magnetar-runtime-moonpool/src/driver.rs", &[80, 81]),
+        ]);
+        let covered = coverage_of(
+            root,
+            &[(
+                "crates/magnetar-runtime-moonpool/src/driver.rs",
+                &[80, 81],
+                &[80],
+            )],
+        );
+
+        assert_eq!(
+            uninstrumented_files(root, &tracked, &covered),
+            vec![("crates/magnetar/src/multi_topics.rs".to_owned(), 1)]
+        );
+        assert_eq!(
+            intersect_diff_with_coverage(root, &tracked, &covered),
+            vec![(
+                "crates/magnetar-runtime-moonpool/src/driver.rs".to_owned(),
+                81
+            )]
         );
     }
 }

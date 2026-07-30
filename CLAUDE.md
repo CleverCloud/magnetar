@@ -58,10 +58,13 @@ These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C,
    ([ADR-0021](specs/adr/0021-no-silent-test-ignore-or-remove.md), [ADR-0046](specs/adr/0046-e2e-tests-as-casual-no-feature-flag-no-ignore.md))
 9. **Cross-runtime test + coverage policy.** Every behavioral change (runtime behavior, public API, wire format) and every change inside `magnetar-proto` ships with **all four** test layers in the same commit: (a) `magnetar-proto` unit test, (b) `magnetar-runtime-tokio` integration test, (c) `magnetar-runtime-moonpool` integration test, (d) `magnetar-differential` equivalence test asserting tokio ↔ moonpool `EventStream` parity, plus an end-to-end test under `crates/magnetar/tests/e2e_*.rs`.
    Moonpool sim coverage is **100% on the diff** (`cargo run -p xtask -- check-sim-coverage`, `cargo-llvm-cov` patch-coverage style).
+   **That gate is much narrower than the policy**: measured 2026-07-30, its LCOV report covers only `crates/magnetar-runtime-moonpool/src/**` and `crates/magnetar-differential/src/**` (16 files) — **not** their dependencies, so `magnetar-proto`, `magnetar-runtime-tokio` and the `magnetar` façade are never gated.
+   Additions there print as `not gated` and do **not** fail the check ([ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md)); broadening it is [`docs/follow-ups.md`](docs/follow-ups.md) §10.
+   So a green run means "covered wherever the gate can see" — read its `not gated` lines, and on a `magnetar-proto` change the four-layer test policy above is what actually carries the requirement.
    `magnetar-runtime-tokio` and `magnetar-runtime-moonpool` keep a **strict 1:1 test count** (`cargo run -p xtask -- check-runtime-test-parity`).
    Both checks are hard-failing in the local + CI validation chain.
    Exemptions: docs-only, comment-only, formatter-only, and dependency bumps with no functional impact — justify in the commit message.
-   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md))
+   ([ADR-0024](specs/adr/0024-cross-runtime-test-and-coverage-policy.md), [ADR-0088](specs/adr/0088-sim-coverage-gate-scope-report-ungated-additions.md))
 10. **Lock-ordering: global → per-slot, never the reverse.** `Connection` is wrapped in a `parking_lot::Mutex` by the runtime engines; every `ProducerSlot` / `ConsumerSlot` carries its own `parking_lot::Mutex`.
     A holder of `slot.state.lock()` MUST NOT then take the connection-wide mutex.
     The hot path (`Producer::send` → `ProducerSlot::queue_send`) takes only the per-slot mutex; the driver merges per-slot staged frames into the connection buffer under the global lock via `poll_transmit`.
@@ -151,7 +154,7 @@ cargo run -p xtask -- check-no-internal-clock   # no Instant::now() / SystemTime
 cargo run -p xtask -- check-log-fields          # error!/warn!/info! carry ≥1 structured field (ADR-0054)
 cargo run -p xtask -- check-e2e-container-memory # every Pulsar e2e container caps PULSAR_MEM (docs/testing.md)
 cargo run -p xtask -- codegen --check           # proto codegen drift
-cargo run -p xtask -- check-sim-coverage        # 100% moonpool coverage on diff (ADR-0024)
+cargo run -p xtask -- check-sim-coverage        # 100% moonpool coverage on diff, instrumented pkgs only (ADR-0024, ADR-0088)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)
 cargo run -p xtask -- check-crypto-matrix       # per-provider build matrix (ADR-0035)
 # (known-failing seed replay runs in CI via the per-PR `seed-replay` job; ADR-0047)
