@@ -223,9 +223,12 @@ impl Consumer {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(max.min(64));
+        // ADR-0011/ADR-0086: snapshot the host clock at the engine boundary, BEFORE taking the
+        // connection mutex (ADR-0038 lock discipline). One timestamp for the whole drain.
+        let now = std::time::Instant::now();
         let mut conn = self.shared.inner.lock();
         while out.len() < max {
-            match conn.pop_message(self.handle) {
+            match conn.pop_message(self.handle, now) {
                 Some(msg) => out.push(msg),
                 None => break,
             }
@@ -1250,9 +1253,12 @@ impl Consumer {
             if acc_bytes.saturating_add(next_size) > max_bytes {
                 break;
             }
+            // ADR-0011/ADR-0086: host-clock snapshot at the engine boundary, taken before the
+            // connection mutex (ADR-0038).
+            let now = std::time::Instant::now();
             let msg = {
                 let mut conn = self.shared.inner.lock();
-                conn.pop_message(self.handle)
+                conn.pop_message(self.handle, now)
             };
             let Some(mut msg) = msg else { break };
             // PIP-4: honor the per-consumer crypto failure action for any encrypted message
@@ -1434,8 +1440,11 @@ impl Future for ReceiveFut {
         let handle = this.handle;
         let shared = this.shared.clone();
         loop {
+            // ADR-0011/ADR-0086: host-clock snapshot at the engine boundary, taken before the
+            // connection mutex (ADR-0038).
+            let now = std::time::Instant::now();
             let mut conn = shared.inner.lock();
-            let Some(mut msg) = conn.pop_message(handle) else {
+            let Some(mut msg) = conn.pop_message(handle, now) else {
                 // No message ready. First, check whether this consumer handle
                 // has reached a GENUINELY-terminal state — a graceful close, a
                 // non-supervised `Failed`, a per-handle terminal subscribe

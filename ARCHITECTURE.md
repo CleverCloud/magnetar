@@ -84,8 +84,9 @@ The crate split is enforced, not aspirational. Each rule below is wired into a C
 | CRC32C verify-or-drop on frames                                      | (in-protocol; see §[Wire framing](#wire-framing))                                                                | `magnetar-proto::Connection::handle_bytes` drops mismatching frames; covered by codec tests         |
 | Sequence-id monotonicity                                             | (see §[Producer paths — batching vs chunking](#producer-paths--batching-vs-chunking))                            | Producer batch + chunk paths assert monotonic `SequenceId` on every send                            |
 
-The clock-injection check has two documented leak sites in [`crates/magnetar-proto`](crates/magnetar-proto): the PIP-37 chunk-set `uuid::Uuid::new_v4()` in [`producer.rs`](crates/magnetar-proto/src/producer.rs) and the one-shot `std::env::var()` bootstrap in [`auth/token.rs`](crates/magnetar-proto/src/auth/token.rs).
-Both are allowlisted in `xtask/src/main.rs::CLOCK_LEAK_ALLOWLIST` and called out in [§Known non-determinism leaks (documented)](#known-non-determinism-leaks-documented).
+The clock-injection check has **no** allowlist as of [ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md): `xtask/src/main.rs::CLOCK_LEAK_ALLOWLIST` is empty and should stay that way.
+Two documented **non-time** leak sites remain in [`crates/magnetar-proto`](crates/magnetar-proto) — the PIP-37 chunk-set `uuid::Uuid::new_v4()` in [`producer.rs`](crates/magnetar-proto/src/producer.rs) and the one-shot `std::env::var()` bootstrap in [`auth/token.rs`](crates/magnetar-proto/src/auth/token.rs) — but the gate has never scanned for either pattern, so they are tracked only by [§Known non-determinism leaks (documented)](#known-non-determinism-leaks-documented).
+They previously had allowlist entries on that rationale, which bought no enforcement and hid one of the two `.elapsed()` leaks ADR-0086 closed.
 
 ### Engine boundary
 
@@ -235,19 +236,22 @@ It has **no sockets, no `tokio`, no `async`, no threads**, and **never reads its
 The state machine takes the monotonic clock as a parameter at every user-driven entry, and reads the wall clock through an injected provider.
 Engines snapshot the host clocks at the call site (or, in moonpool simulation, the virtual clock); the protocol layer never calls `Instant::now()` or `SystemTime::now()` itself.
 
-| Entry                                                               | Clock parameter | Engine plumbing                                                                                     |
-| ------------------------------------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------- |
-| `handle_bytes(now, &[u8])`                                          | `now: Instant`  | `Instant::now()` at the read site.                                                                  |
-| `handle_timeout(now)`                                               | `now: Instant`  | Reused from the `select!` deadline.                                                                 |
-| `send(handle, msg, publish_time_ms, now)`                           | `now: Instant`  | Producer façade snapshots `Instant::now()` before locking the connection.                           |
-| `flush_producer(handle, publish_time_ms, now)`                      | `now: Instant`  | Same as `send`.                                                                                     |
-| `negative_ack(handle, ids, now)`                                    | `now: Instant`  | Consumer façade snapshots before locking.                                                           |
-| `negative_ack_with_delay(handle, msg, delay, now)`                  | `now: Instant`  | Same.                                                                                               |
-| `ack_grouped_individual(handle, msg, now)`                          | `now: Instant`  | Same.                                                                                               |
-| `ack_grouped_cumulative(handle, msg, now)`                          | `now: Instant`  | Same.                                                                                               |
-| `Connection::with_wall_clock_provider(Arc<dyn Fn() -> SystemTime>)` | constructor     | Wall-clock injection. Default `\|\| SystemTime::now()`; moonpool sim plugs in a virtual wall clock. |
+| Entry                                                               | Clock parameter | Engine plumbing                                                                                                                                     |
+| ------------------------------------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `handle_bytes(now, &[u8])`                                          | `now: Instant`  | `Instant::now()` at the read site.                                                                                                                  |
+| `handle_timeout(now)`                                               | `now: Instant`  | Reused from the `select!` deadline.                                                                                                                 |
+| `send(handle, msg, publish_time_ms, now)`                           | `now: Instant`  | Producer façade snapshots `Instant::now()` before locking the connection.                                                                           |
+| `flush_producer(handle, publish_time_ms, now)`                      | `now: Instant`  | Same as `send`.                                                                                                                                     |
+| `negative_ack(handle, ids, now)`                                    | `now: Instant`  | Consumer façade snapshots before locking.                                                                                                           |
+| `negative_ack_with_delay(handle, msg, delay, now)`                  | `now: Instant`  | Same.                                                                                                                                               |
+| `ack_grouped_individual(handle, msg, now)`                          | `now: Instant`  | Same.                                                                                                                                               |
+| `ack_grouped_cumulative(handle, msg, now)`                          | `now: Instant`  | Same.                                                                                                                                               |
+| `pop_message(handle, now)`                                          | `now: Instant`  | Consumer façade snapshots before locking; the sample is `now - arrived_at` ([ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md)). |
+| `Connection::with_wall_clock_provider(Arc<dyn Fn() -> SystemTime>)` | constructor     | Wall-clock injection. Default `\|\| SystemTime::now()`; moonpool sim plugs in a virtual wall clock.                                                 |
 
 Internal call paths inside the state machine propagate these parameters through their helpers (e.g. `ProducerState::queue_send` / `emit_single` / `emit_chunked` / `flush_batch` / `add_to_batch`, `ConsumerState::deliver` / `classify_and_queue`); no helper on the hot path reaches for the host's clock.
+The two latency-recording helpers are part of that propagation, not exceptions to it: `ConsumerState::pop_message(now)` records `now - msg.arrived_at` and `ProducerState::apply_receipt(receipt, now)` records `now - op.enqueued_at`, the latter receiving its instant from `handle_frame(now, …)` on the `CommandSendReceipt` path.
+Both use `saturating_duration_since`, never the `Sub` impl, which panics on underflow (invariant #6).
 
 The public surface mirrors [`quinn-proto`]:
 
@@ -263,7 +267,10 @@ Diagnostics are two-channel per [ADR-0054](specs/adr/0054-logging-policy.md): se
 
 ### Known non-determinism leaks (documented)
 
-Two non-time sources of host-environment dependency remain in `magnetar-proto`; both are accepted with rationale:
+Two non-time sources of host-environment dependency remain in `magnetar-proto`; both are accepted with rationale.
+A third, façade-level leak is listed after them for completeness — it is not a `magnetar-proto` leak and is not covered by the gate below.
+No **time** leaks remain: the last two (`Instant::elapsed()` in the latency-recording sites) were closed by [ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md), which also emptied the `xtask` clock allowlist.
+The `uuid` and `env::var` entries below were the allowlist's stated rationale even though the gate never scanned for either pattern; this section is now their sole inventory.
 
 1. **`uuid::Uuid::new_v4()` in `ProducerState::emit_chunked`** — PIP-37 chunked messages need a UUID per logical message so the broker can reassemble out-of-order chunk frames.
    Determinising this requires injecting an `Arc<dyn Fn() -> Uuid>` through the chunked-emit path; deferred until moonpool-sim chaos tests start exercising chunked publishes.
@@ -274,7 +281,9 @@ Two non-time sources of host-environment dependency remain in `magnetar-proto`; 
    This is a façade-level (not `magnetar-proto`) leak, gated on `feature = "opentelemetry"` + `feature = "tokio"`.
    The moonpool engine never calls `inject_context` on any path, keeping sim determinism intact (ADR-0053).
 
-A `cargo run -p xtask -- check-no-internal-clock` step treepunches the call graph for any new `Instant::now()` / `SystemTime::now()` / `uuid::new_v4` / `env::var` site introduced outside the documented leaks above.
+A `cargo run -p xtask -- check-no-internal-clock` step rejects any `Instant::now()`, `SystemTime::now()`, or `.elapsed()` occurrence in `crates/magnetar-proto/src/**` outside `#[cfg(test)]`, with **no** file allowlist ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md), [ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md)).
+`uuid::new_v4` and `env::var` are **not** mechanically enforced — the gate has never scanned for them, and the two leaks above are tracked by this inventory alone.
+The scanner skips `#[cfg(test)]` spans and lexically inert regions (comments, string / raw-string / char literals) via the same helpers `check-log-fields` uses, and is unit-tested in `xtask/src/main.rs`.
 
 ### Why we did it
 

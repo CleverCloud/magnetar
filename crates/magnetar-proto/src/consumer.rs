@@ -377,10 +377,12 @@ pub struct ConsumerState {
     /// to decide whether to propagate, drop, or surface the ciphertext.
     pub crypto_failure_action: crate::conn::CryptoFailureAction,
     /// Receive-latency histogram, in milliseconds. Recorded on each [`Self::pop_message`] call,
-    /// measuring the wall-clock interval between [`IncomingMessage::arrived_at`] (the moment
-    /// the consumer state machine queued the message) and the moment the user calls
-    /// `pop_message` / `receive`. Mirrors the latency percentiles surfaced by Java
-    /// `ConsumerStatsRecorder` (p50, p99, max). Three significant digits, auto-resizing.
+    /// measuring the interval between [`IncomingMessage::arrived_at`] (the moment the consumer
+    /// state machine queued the message) and the `now` the caller passes to `pop_message`.
+    /// Both ends are engine-injected instants, never host-clock reads (ADR-0011, ADR-0086), so
+    /// the distribution is reproducible per seed under the moonpool engine. Mirrors the latency
+    /// percentiles surfaced by Java `ConsumerStatsRecorder` (p50, p99, max). Three significant
+    /// digits, auto-resizing.
     ///
     /// `Option`-typed so the constructor never has to `.expect(...)` on a statically-valid
     /// `hdrhistogram::Histogram::new(3)` (invariant #6). `None` means the histogram could
@@ -1186,16 +1188,28 @@ impl ConsumerState {
     /// Pop the next available message for the user. Caller wakes its future when a new message
     /// is delivered (the [`Connection`](crate::Connection) does this automatically).
     ///
-    /// Records the wall-clock latency (`Instant::now() - msg.arrived_at`) into
-    /// [`Self::receive_latency_hist`] so [`ConsumerStats`] can surface p50/p99/max.
-    pub fn pop_message(&mut self) -> Option<IncomingMessage> {
+    /// Records the receive latency — `now - msg.arrived_at`, both ends of the subtraction being
+    /// engine-injected instants ([ADR-0011], [ADR-0086]) — into [`Self::receive_latency_hist`]
+    /// so [`ConsumerStats`] can surface p50/p99/max. The state machine never reads the host
+    /// clock, so under the moonpool engine the recorded sample is a pure function of the
+    /// virtual clock and reproduces bit-for-bit for a given seed.
+    ///
+    /// [ADR-0011]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
+    /// [ADR-0086]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0086-inject-now-into-proto-latency-recording.md
+    pub fn pop_message(&mut self, now: std::time::Instant) -> Option<IncomingMessage> {
         let msg = self.queue.pop_front()?;
         // Issue #301: keep the buffered-queue-bytes counter in lock-step with
         // the enqueue bump in `classify_and_queue`.
         self.queued_bytes = self.queued_bytes.saturating_sub(msg.payload.len() as u64);
         self.record_broker_permit_consumed();
-        let latency_ms = u64::try_from(msg.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(h) = self.receive_latency_hist.as_mut() {
+            // `saturating_duration_since`, never `-`: `Instant - Instant` panics on underflow
+            // and invariant #6 forbids panics outside `#[cfg(test)]`. A `now` behind
+            // `arrived_at` (a caller reusing a stale snapshot, or a virtual clock rewound
+            // across a reset) records 0 ms instead of aborting the process.
+            let latency_ms =
+                u64::try_from(now.saturating_duration_since(msg.arrived_at).as_millis())
+                    .unwrap_or(u64::MAX);
             h.saturating_record(latency_ms);
         }
         Some(msg)
@@ -1857,7 +1871,7 @@ mod tests {
                 std::time::Instant::now(),
             )
             .unwrap();
-            let _ = c.pop_message();
+            let _ = c.pop_message(std::time::Instant::now());
         }
         let flow = c.maybe_flow().expect("flow at half drain");
         assert_eq!(flow.message_permits, 2);
@@ -1877,7 +1891,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(outcome, DeliverOutcome::Delivered { .. }));
-        let msg = c.pop_message().unwrap();
+        let msg = c.pop_message(std::time::Instant::now()).unwrap();
         assert_eq!(msg.payload.as_ref(), b"hi");
     }
 
@@ -1912,8 +1926,8 @@ mod tests {
             DeliverOutcome::Delivered { count } => assert_eq!(count, 2),
             other => panic!("expected Delivered(2), got {other:?}"),
         }
-        let m1 = c.pop_message().unwrap();
-        let m2 = c.pop_message().unwrap();
+        let m1 = c.pop_message(std::time::Instant::now()).unwrap();
+        let m2 = c.pop_message(std::time::Instant::now()).unwrap();
         assert_eq!(m1.message_id.batch_index, 0);
         assert_eq!(m2.message_id.batch_index, 1);
         assert_eq!(m1.payload.as_ref(), b"a");
@@ -1953,7 +1967,9 @@ mod tests {
                 other => panic!("unexpected outcome: {other:?}"),
             }
         }
-        let msg = c.pop_message().expect("reassembled message");
+        let msg = c
+            .pop_message(std::time::Instant::now())
+            .expect("reassembled message");
         assert_eq!(msg.payload.as_ref(), b"aabbcc");
         assert_eq!(c.stats().total_chunked_msgs_received, 1);
     }
@@ -2267,10 +2283,21 @@ mod tests {
         assert_eq!(stats.receive_latency_max_ms, pmax);
     }
 
-    /// End-to-end: deliver a message, sleep briefly, pop it, observe the histogram now has one
-    /// sample whose max reflects the sleep duration.
+    /// Scripted receive dwell for the latency tests below. Kept `<= 2047`: at 3 significant
+    /// figures `hdrhistogram` only round-trips values below the 2048 sub-bucket boundary
+    /// exactly, so a larger constant would compare against a quantised neighbour.
+    const RECEIVE_DWELL_MS: u64 = 250;
+
+    /// Deterministic receive-latency stamping (ADR-0086): `pop_message` records exactly
+    /// `now - msg.arrived_at`, both instants injected, with no host-clock read. Every value
+    /// here is derived from one synthetic base, so the recorded sample is an exact constant
+    /// on every run and on every host.
     #[test]
     fn pop_message_records_receive_latency() {
+        let base = std::time::Instant::now();
+        let arrived = base + std::time::Duration::from_millis(100);
+        let popped = arrived + std::time::Duration::from_millis(RECEIVE_DWELL_MS);
+
         let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
         let _ = c.initial_flow();
         c.deliver(
@@ -2278,7 +2305,7 @@ mod tests {
             metadata(1),
             None,
             Bytes::from_static(b"x"),
-            std::time::Instant::now(),
+            arrived,
         )
         .unwrap();
         assert!(
@@ -2287,17 +2314,90 @@ mod tests {
                 .is_none_or(hdrhistogram::Histogram::is_empty)
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let _msg = c.pop_message().expect("queued message");
+        let _msg = c.pop_message(popped).expect("queued message");
         assert_eq!(
             c.receive_latency_hist
                 .as_ref()
                 .map_or(0, hdrhistogram::Histogram::len),
             1
         );
-        assert!(c.receive_latency_max_ms() >= 1);
+        assert_eq!(
+            c.receive_latency_max_ms(),
+            RECEIVE_DWELL_MS,
+            "the sample must be the injected `now - arrived_at`, not a host-clock elapsed"
+        );
         let stats = c.stats();
         assert_eq!(stats.receive_latency_max_ms, c.receive_latency_max_ms());
+    }
+
+    /// The leak assertion proper (ADR-0086): host-clock motion between delivery and pop must
+    /// not move the recorded sample. Before the fix, `pop_message` read
+    /// `msg.arrived_at.elapsed()`, so the `thread::sleep` below landed straight in the
+    /// histogram and the two runs disagreed.
+    #[test]
+    fn pop_message_latency_is_immune_to_host_clock_motion() {
+        let arrived = std::time::Instant::now();
+        let popped = arrived + std::time::Duration::from_millis(RECEIVE_DWELL_MS);
+
+        let sample = |host_sleep: std::time::Duration| -> u64 {
+            let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+            let _ = c.initial_flow();
+            c.deliver(
+                &message_cmd(0),
+                metadata(1),
+                None,
+                Bytes::from_static(b"x"),
+                arrived,
+            )
+            .unwrap();
+            // The host clock genuinely moves here; the injected instants do not.
+            std::thread::sleep(host_sleep);
+            let _ = c.pop_message(popped).expect("queued message");
+            c.receive_latency_max_ms()
+        };
+
+        let without_sleep = sample(std::time::Duration::ZERO);
+        let with_sleep = sample(std::time::Duration::from_millis(120));
+        assert_eq!(
+            without_sleep, with_sleep,
+            "the recorded latency moved with the HOST clock — the Instant::elapsed() leak is back"
+        );
+        assert_eq!(without_sleep, RECEIVE_DWELL_MS);
+    }
+
+    /// Invariant #6: a `now` that precedes `arrived_at` (a caller reusing a stale snapshot, or
+    /// a virtual clock rewound across a reset) records 0 — it must NOT panic. The naive fix
+    /// `now - msg.arrived_at` uses the `Sub` impl, which panics on underflow; this test is the
+    /// guard against that.
+    #[test]
+    fn pop_message_records_zero_when_now_precedes_arrival() {
+        let base = std::time::Instant::now();
+        // Arrival stamped "in the future" relative to the pop instant.
+        let arrived = base + std::time::Duration::from_mins(1);
+
+        let mut c = ConsumerState::new(ConsumerHandle(1), "t".to_owned(), "s".to_owned(), 100);
+        let _ = c.initial_flow();
+        c.deliver(
+            &message_cmd(0),
+            metadata(1),
+            None,
+            Bytes::from_static(b"x"),
+            arrived,
+        )
+        .unwrap();
+
+        let _msg = c.pop_message(base).expect("queued message");
+        assert_eq!(
+            c.receive_latency_hist
+                .as_ref()
+                .map_or(0, hdrhistogram::Histogram::len),
+            1
+        );
+        assert_eq!(
+            c.receive_latency_max_ms(),
+            0,
+            "a clock regression must clamp to 0, never saturate to u64::MAX"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -2536,7 +2636,9 @@ mod tests {
         // through the reassembly path — a 1-chunk message shouldn't bump it.
         assert_eq!(c.stats().total_chunked_msgs_received, 0);
 
-        let msg = c.pop_message().expect("immediate delivery");
+        let msg = c
+            .pop_message(std::time::Instant::now())
+            .expect("immediate delivery");
         assert_eq!(msg.payload.as_ref(), b"only-chunk");
         // Reassembly metadata must be cleared on the user-visible message: the
         // consumer never lies about a single-chunk message being chunked.
@@ -2588,7 +2690,9 @@ mod tests {
         // per-uuid buffer is cleaned up.
         assert_eq!(c.queue_len(), 1);
         assert!(c.chunk_reassembly.is_empty());
-        let msg = c.pop_message().expect("reassembled message");
+        let msg = c
+            .pop_message(std::time::Instant::now())
+            .expect("reassembled message");
         assert_eq!(msg.payload.as_ref(), b"aaabbbcccc");
         assert_eq!(c.stats().total_chunked_msgs_received, 1);
         // Reassembled message must not carry chunk markers downstream.
@@ -2631,7 +2735,9 @@ mod tests {
             let _ = outcome;
         }
         assert_eq!(c.queue_len(), 1, "all chunks present, one logical message");
-        let msg = c.pop_message().expect("reassembled");
+        let msg = c
+            .pop_message(std::time::Instant::now())
+            .expect("reassembled");
         // Reassembled in chunk-id order regardless of arrival order.
         assert_eq!(msg.payload.as_ref(), b"AAAABBBBZZZZ");
         assert!(c.chunk_reassembly.is_empty());
@@ -2719,8 +2825,8 @@ mod tests {
         assert_eq!(c.stats().total_chunked_msgs_received, 2);
 
         // First popped: message A (queued first when its last chunk arrived).
-        let a = c.pop_message().expect("A");
-        let b = c.pop_message().expect("B");
+        let a = c.pop_message(std::time::Instant::now()).expect("A");
+        let b = c.pop_message(std::time::Instant::now()).expect("B");
         assert_eq!(a.payload.as_ref(), b"A0A1");
         assert_eq!(b.payload.as_ref(), b"B0B1");
     }
@@ -3284,7 +3390,9 @@ mod tests {
             1,
             "chunked delivery must wake parked receivers"
         );
-        let msg = c.pop_message().expect("reassembled message");
+        let msg = c
+            .pop_message(std::time::Instant::now())
+            .expect("reassembled message");
         assert_eq!(msg.payload.as_ref(), b"aabb");
     }
 

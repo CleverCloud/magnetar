@@ -15,10 +15,11 @@
 //! wrapper methods are a one-line `self.slot.state.lock().<accessor>()`
 //! delegation with no engine-specific logic to exercise.
 //!
-//! Note: both `ConsumerState::pop_message` and `ProducerState::
-//! apply_receipt` record latency via `Instant::elapsed()` — real wall-clock
-//! time, not the synthetic `now` these tests inject at delivery — so this
-//! test asserts sample **counts**, never specific millisecond values.
+//! Since the ADR-0086 latency-clock fix, `ConsumerState::pop_message` and
+//! `ProducerState::apply_receipt` take the caller's `now` instead of reading
+//! the host clock via `Instant::elapsed()`, so the two `ConnectionShared`-
+//! level tests below assert both the sample **count** and the **exact**
+//! millisecond value derived from the synthetic instants injected here.
 //!
 //! The two `_via_live_facade` tests below are a second, deliberately
 //! different layer: they drive a real `Consumer` / `Producer` over a
@@ -27,14 +28,15 @@
 //! send_latency_histogram`, the one-line `self.slot.state.lock().
 //! <accessor>()` delegations) directly — the `ConnectionShared`-level tests
 //! above only exercise `ConsumerState`/`ProducerState`, never those
-//! delegating wrapper bodies. Moonpool sibling of these two:
-//! `crates/magnetar-runtime-moonpool/tests/stats_histogram_accessor.rs`.
+//! delegating wrapper bodies. Those two run against a real loopback broker
+//! on the host clock, so they stay count-only. Moonpool sibling of these
+//! two: `crates/magnetar-runtime-moonpool/tests/stats_histogram_accessor.rs`.
 
 #![allow(clippy::too_many_lines)]
 
 mod common;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use magnetar_proto::producer::OutgoingMessage;
@@ -55,6 +57,17 @@ const N: usize = 5;
 /// Producer sends this many messages; each applied `CommandSendReceipt`
 /// must stamp exactly one `send_latency_hist` sample.
 const SENDS: u64 = 3;
+
+/// Scripted receive dwell: messages arrive at `t0` and are popped at
+/// `t0 + RECEIVE_DWELL_MS`, so every `receive_latency_hist` sample must be
+/// exactly this value. Kept `<= 2047` because `hdrhistogram` at 3
+/// significant figures only round-trips values below the 2048 sub-bucket
+/// boundary exactly.
+const RECEIVE_DWELL_MS: u64 = 250;
+
+/// Scripted broker round-trip: sends are enqueued at `t0` and their
+/// receipts arrive at `t0 + SEND_RTT_MS`. Same `<= 2047` constraint.
+const SEND_RTT_MS: u64 = 250;
 
 fn deliver_message(conn: &mut Connection, t0: Instant, handle: ConsumerHandle, entry: u64) {
     let msg_cmd = pb::BaseCommand {
@@ -146,7 +159,8 @@ fn consumer_receive_latency_histogram_reflects_popped_messages() {
         deliver_message(&mut conn, t0, handle, entry);
     }
     for _ in 0..N {
-        conn.pop_message(handle).expect("queued message");
+        conn.pop_message(handle, t0 + Duration::from_millis(RECEIVE_DWELL_MS))
+            .expect("queued message");
     }
 
     let hist = conn
@@ -161,6 +175,13 @@ fn consumer_receive_latency_histogram_reflects_popped_messages() {
         N as u64,
         "one receive_latency_hist sample per popped message"
     );
+    assert_eq!(
+        hist.max(),
+        RECEIVE_DWELL_MS,
+        "every sample must be the injected `now - arrived_at` dwell exactly, \
+         not a host-clock elapsed (ADR-0086)"
+    );
+    assert_eq!(hist.value_at_quantile(0.50), RECEIVE_DWELL_MS);
 }
 
 #[test]
@@ -228,7 +249,10 @@ fn producer_send_latency_histogram_reflects_receipts() {
         };
         let mut buf = BytesMut::new();
         encode_command(&mut buf, &receipt).expect("encode CommandSendReceipt");
-        conn.handle_bytes(t0, &buf).expect("apply receipt");
+        // `handle_bytes(now, …)` -> `handle_frame(now, …)` -> `apply_receipt(&synth, now)`:
+        // the receipt clock reaches the producer state machine purely by injection.
+        conn.handle_bytes(t0 + Duration::from_millis(SEND_RTT_MS), &buf)
+            .expect("apply receipt");
         while conn.poll_event().is_some() {}
     }
 
@@ -244,6 +268,13 @@ fn producer_send_latency_histogram_reflects_receipts() {
         SENDS,
         "one send_latency_hist sample per applied CommandSendReceipt"
     );
+    assert_eq!(
+        hist.max(),
+        SEND_RTT_MS,
+        "every sample must be the injected `now - enqueued_at` round-trip exactly, \
+         not a host-clock elapsed (ADR-0086)"
+    );
+    assert_eq!(hist.value_at_quantile(0.50), SEND_RTT_MS);
 }
 
 /// Minimal broker for the consumer live-facade test: answers CONNECT /

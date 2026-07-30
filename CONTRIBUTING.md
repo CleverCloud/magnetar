@@ -28,7 +28,7 @@ RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --no-default-features --features "$FEATURES" --no-deps --locked
 cargo run -p xtask -- check-no-channels         # banned-channel grep (ADR-0003)
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps (ADR-0004)
-cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011)
+cargo run -p xtask -- check-no-internal-clock   # no host-clock reads in proto (ADR-0011, ADR-0086)
 cargo run -p xtask -- codegen --check           # proto codegen drift
 cargo run -p xtask -- check-sim-coverage        # 100% moonpool patch coverage (ADR-0024)
 cargo run -p xtask -- check-runtime-test-parity # tokio ↔ moonpool 1:1 test count (ADR-0024)

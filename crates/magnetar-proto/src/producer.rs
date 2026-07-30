@@ -251,8 +251,10 @@ pub struct ProducerState {
     /// [`crate::conn::CreateProducerRequest`].
     pub access_mode: pb::ProducerAccessMode,
     /// Send-latency histogram, in milliseconds. Recorded on each `CommandSendReceipt`,
-    /// measuring the wall-clock interval between the user's `send` enqueue
-    /// (`OpSend::enqueued_at`) and the broker's receipt acknowledgement. Mirrors the latency
+    /// measuring the interval between the user's `send` enqueue (`OpSend::enqueued_at`) and the
+    /// `now` carried into [`Self::apply_receipt`] by `handle_frame` when the receipt arrived.
+    /// Both ends are engine-injected instants, never host-clock reads (ADR-0011, ADR-0086), so
+    /// the distribution is reproducible per seed under the moonpool engine. Mirrors the latency
     /// percentiles surfaced by Java `ProducerStatsRecorder` (p50, p99, max). Three significant
     /// digits, default range — the typical broker round-trip is sub-second so the bucket layout
     /// fits comfortably within the default 1-bound..u64::MAX scale.
@@ -1408,9 +1410,17 @@ impl ProducerState {
 
     /// Apply a `CommandSendReceipt` to the pending queue. Returns the matching sequence id +
     /// message id if we had it pending.
+    ///
+    /// `now` is the engine-injected monotonic instant ([ADR-0011], [ADR-0086]); the broker
+    /// round-trip latency recorded into [`Self::send_latency_hist`] is `now - op.enqueued_at`,
+    /// both ends injected, so the histogram is deterministic under simulation.
+    ///
+    /// [ADR-0011]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
+    /// [ADR-0086]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0086-inject-now-into-proto-latency-recording.md
     pub fn apply_receipt(
         &mut self,
         receipt: &pb::CommandSendReceipt,
+        now: std::time::Instant,
     ) -> Option<(SequenceId, MessageId, Option<Waker>)> {
         let seq = SequenceId(receipt.sequence_id);
         let _idx = self.pending_index.remove(&seq)?;
@@ -1430,12 +1440,17 @@ impl ProducerState {
                 segment_id: None,
             });
         self.last_sequence_id_published = seq.0 as i64;
-        // Record the broker round-trip latency (enqueue → receipt). `saturating_record` keeps us
-        // safe if a future record landed above the histogram's current bound — auto-resize will
-        // grow but a saturating fallback is still cheaper than the panic path. Mirrors the Java
-        // `ProducerStatsRecorder#updateLatency(long latencyNanos)` call site.
-        let latency_ms = u64::try_from(op.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Record the broker round-trip latency (enqueue → receipt) against the INJECTED `now`,
+        // never the host clock. `saturating_duration_since`, not `-`: `Instant - Instant` panics
+        // on underflow and invariant #6 forbids panics outside `#[cfg(test)]`.
+        // `saturating_record` keeps us safe if a sample landed above the histogram's current
+        // bound — auto-resize will grow but a saturating fallback is still cheaper than the
+        // panic path. Mirrors the Java `ProducerStatsRecorder#updateLatency(long latencyNanos)`
+        // call site.
         if let Some(h) = self.send_latency_hist.as_mut() {
+            let latency_ms =
+                u64::try_from(now.saturating_duration_since(op.enqueued_at).as_millis())
+                    .unwrap_or(u64::MAX);
             h.saturating_record(latency_ms);
         }
         op.receipt = Some(mid);
@@ -1809,7 +1824,9 @@ mod tests {
             }),
             highest_sequence_id: None,
         };
-        let (seq, mid, _) = p.apply_receipt(&r).expect("receipt matched");
+        let (seq, mid, _) = p
+            .apply_receipt(&r, std::time::Instant::now())
+            .expect("receipt matched");
         assert_eq!(seq.0, 0);
         assert_eq!(mid.ledger_id, 5);
         assert_eq!(p.pending.len(), 0);
@@ -2507,28 +2524,14 @@ mod tests {
         assert_eq!(ChunkedMessageContext::compute_total_chunks(100, 0), 1);
     }
 
-    /// End-to-end check: enqueue a send, sleep briefly, apply the receipt, observe that the
-    /// histogram now has exactly one sample and the max is at least the sleep duration.
-    #[test]
-    fn apply_receipt_records_send_latency() {
-        let mut p = ProducerState::new(
-            ProducerHandle(1),
-            "t".to_owned(),
-            CompressionKind::None,
-            1024,
-        );
-        let _ = p
-            .queue_send(small_message(b"abc"), 100, std::time::Instant::now())
-            .unwrap();
-        let _ = p.next_outbound_frame();
-        assert!(
-            p.send_latency_hist
-                .as_ref()
-                .is_none_or(hdrhistogram::Histogram::is_empty)
-        );
+    /// Scripted broker round-trip for the latency tests below. Kept `<= 2047`: at 3
+    /// significant figures `hdrhistogram` only round-trips values below the 2048 sub-bucket
+    /// boundary exactly.
+    const SEND_RTT_MS: u64 = 250;
 
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let r = pb::CommandSendReceipt {
+    /// A `CommandSendReceipt` matching the single send queued by the latency tests.
+    fn latency_receipt() -> pb::CommandSendReceipt {
+        pb::CommandSendReceipt {
             producer_id: 1,
             sequence_id: 0,
             message_id: Some(pb::MessageIdData {
@@ -2537,18 +2540,115 @@ mod tests {
                 ..Default::default()
             }),
             highest_sequence_id: None,
-        };
-        let (_seq, _mid, _waker) = p.apply_receipt(&r).expect("receipt matched");
+        }
+    }
+
+    /// Deterministic send-latency stamping (ADR-0086): `apply_receipt` records exactly
+    /// `now - op.enqueued_at`, both instants injected, with no host-clock read.
+    #[test]
+    fn apply_receipt_records_send_latency() {
+        let enqueued = std::time::Instant::now();
+        let receipt_at = enqueued + std::time::Duration::from_millis(SEND_RTT_MS);
+
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let _ = p.queue_send(small_message(b"abc"), 100, enqueued).unwrap();
+        let _ = p.next_outbound_frame();
+        assert!(
+            p.send_latency_hist
+                .as_ref()
+                .is_none_or(hdrhistogram::Histogram::is_empty)
+        );
+
+        let (_seq, _mid, _waker) = p
+            .apply_receipt(&latency_receipt(), receipt_at)
+            .expect("receipt matched");
         assert_eq!(
             p.send_latency_hist
                 .as_ref()
                 .map_or(0, hdrhistogram::Histogram::len),
             1
         );
-        // We slept for at least 2 ms; the sample we recorded must reflect that.
-        assert!(p.send_latency_max_ms() >= 1);
+        assert_eq!(
+            p.send_latency_max_ms(),
+            SEND_RTT_MS,
+            "the sample must be the injected `now - enqueued_at`, not a host-clock elapsed"
+        );
         let stats = p.stats();
         assert_eq!(stats.send_latency_max_ms, p.send_latency_max_ms());
+    }
+
+    /// The leak assertion proper (ADR-0086): host-clock motion between enqueue and receipt
+    /// must not move the recorded sample. Before the fix, `apply_receipt` read
+    /// `op.enqueued_at.elapsed()`, so the `thread::sleep` below landed straight in the
+    /// histogram and the two runs disagreed.
+    #[test]
+    fn apply_receipt_latency_is_immune_to_host_clock_motion() {
+        let enqueued = std::time::Instant::now();
+        let receipt_at = enqueued + std::time::Duration::from_millis(SEND_RTT_MS);
+
+        let sample = |host_sleep: std::time::Duration| -> u64 {
+            let mut p = ProducerState::new(
+                ProducerHandle(1),
+                "t".to_owned(),
+                CompressionKind::None,
+                1024,
+            );
+            let _ = p.queue_send(small_message(b"abc"), 100, enqueued).unwrap();
+            let _ = p.next_outbound_frame();
+            // The host clock genuinely moves here; the injected instants do not.
+            std::thread::sleep(host_sleep);
+            let _ = p
+                .apply_receipt(&latency_receipt(), receipt_at)
+                .expect("receipt matched");
+            p.send_latency_max_ms()
+        };
+
+        let without_sleep = sample(std::time::Duration::ZERO);
+        let with_sleep = sample(std::time::Duration::from_millis(120));
+        assert_eq!(
+            without_sleep, with_sleep,
+            "the recorded latency moved with the HOST clock — the Instant::elapsed() leak is back"
+        );
+        assert_eq!(without_sleep, SEND_RTT_MS);
+    }
+
+    /// Invariant #6: a receipt instant that precedes `enqueued_at` records 0 — it must NOT
+    /// panic. The naive fix `now - op.enqueued_at` uses the `Sub` impl, which panics on
+    /// underflow; this test is the guard against that.
+    #[test]
+    fn apply_receipt_records_zero_when_receipt_precedes_enqueue() {
+        let base = std::time::Instant::now();
+        // Enqueue stamped "in the future" relative to the receipt instant.
+        let enqueued = base + std::time::Duration::from_mins(1);
+
+        let mut p = ProducerState::new(
+            ProducerHandle(1),
+            "t".to_owned(),
+            CompressionKind::None,
+            1024,
+        );
+        let _ = p.queue_send(small_message(b"abc"), 100, enqueued).unwrap();
+        let _ = p.next_outbound_frame();
+
+        let (_seq, _mid, _waker) = p
+            .apply_receipt(&latency_receipt(), base)
+            .expect("receipt matched");
+        assert_eq!(
+            p.send_latency_hist
+                .as_ref()
+                .map_or(0, hdrhistogram::Histogram::len),
+            1
+        );
+        assert_eq!(
+            p.send_latency_max_ms(),
+            0,
+            "a clock regression must clamp to 0, never saturate to u64::MAX"
+        );
     }
 
     /// Snapshot / replay round-trip — single-frame publish. Mirrors
@@ -2773,7 +2873,9 @@ mod tests {
             message_id: Some(source_id.to_pb()),
             highest_sequence_id: None,
         };
-        let outcome = p.apply_receipt(&receipt).expect("receipt resolves OpSend");
+        let outcome = p
+            .apply_receipt(&receipt, std::time::Instant::now())
+            .expect("receipt resolves OpSend");
         assert_eq!(outcome.0, seq);
         assert_eq!(outcome.1, source_id);
     }

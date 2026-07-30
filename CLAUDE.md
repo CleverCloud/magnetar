@@ -41,8 +41,9 @@ These are the **workspace-wide rules**. The protocol-correctness subset (CRC32C,
    ([ADR-0004](specs/adr/0004-sans-io-protocol-core.md))
 3. **Sans-io clock injection.** `Instant` is passed in via `now: Instant` parameters on every user-driven entry; `SystemTime` via the `wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>` provider.
    Engines snapshot the host clocks at the call site; moonpool plugs in virtual clocks.
-   Two documented leaks remain (uuid in chunked emit, env::var in `TokenAuth` bootstrap); both are listed in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-non-determinism-leaks-documented) and allowlisted in `xtask`.
-   ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md))
+   `Instant::now()`, `SystemTime::now()` and `.elapsed()` are all forbidden in `magnetar-proto/src/**` outside `#[cfg(test)]`, with **no** file allowlist; `Instant` arithmetic goes through `saturating_duration_since` / `crate::time::deadline_with_clamp` so it cannot panic (invariant #6).
+   Two documented **non-time** leaks remain (uuid in chunked emit, env::var in `TokenAuth` bootstrap); both are listed in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-non-determinism-leaks-documented), which is their sole inventory — the gate has never scanned for either.
+   ([ADR-0011](specs/adr/0011-clock-injection-sans-io.md), [ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md))
 4. **CRC32C verify or drop.** Frames with magic `0x0e01` must pass CRC32C; mismatch → `ChecksumMismatch` event + drop.
 5. **`rustls` only.** No `native-tls`.
    `openssl` / `openssl-sys` are admitted only as transitive deps of `rustls-openssl` under the `crypto-openssl` feature ([ADR-0035](specs/adr/0035-pluggable-crypto-provider.md)); the active rustls crypto provider is picked at compile time via the façade's mutually-pluggable `crypto-aws-lc-rs` (default) / `crypto-ring` / `crypto-openssl` / `crypto-fips` features.
@@ -146,7 +147,7 @@ RUSTDOCFLAGS="-D warnings" \
 # xtask gates — invoke via `cargo run -p xtask --` (there is no `cargo xtask` alias).
 cargo run -p xtask -- check-no-channels         # banned-channel grep
 cargo run -p xtask -- check-no-io-deps          # magnetar-proto = zero I/O deps
-cargo run -p xtask -- check-no-internal-clock   # Instant::now() / SystemTime::now() outside the allowlist
+cargo run -p xtask -- check-no-internal-clock   # no Instant::now() / SystemTime::now() / .elapsed() in proto
 cargo run -p xtask -- check-log-fields          # error!/warn!/info! carry ≥1 structured field (ADR-0054)
 cargo run -p xtask -- check-e2e-container-memory # every Pulsar e2e container caps PULSAR_MEM (docs/testing.md)
 cargo run -p xtask -- codegen --check           # proto codegen drift

@@ -7,8 +7,8 @@
 //! - `check-no-channels`: grep the workspace for banned channel paths.
 //! - `check-no-io-deps`: assert `magnetar-proto` has zero I/O dependencies.
 //! - `check-no-internal-clock`: assert `magnetar-proto/src/**` never reads the host clock
-//!   (`Instant::now()` / `SystemTime::now()`) outside the two documented leak files. Mirrors
-//!   ADR-0011.
+//!   (`Instant::now()` / `SystemTime::now()` / `.elapsed()`) outside `#[cfg(test)]`, with no file
+//!   allowlist. Mirrors ADR-0011 as amended by ADR-0086.
 //! - `check-log-fields`: assert every `error!` / `warn!` / `info!` tracing event in non-test
 //!   workspace code carries at least one structured field (`debug!` / `trace!` exempt). Mirrors
 //!   ADR-0054.
@@ -85,9 +85,10 @@ enum Cmd {
     CheckNoIoDeps,
     /// Assert that `magnetar-proto/src/**` does not read the host clock.
     ///
-    /// Greps for direct calls to [`std::time::Instant::now`] and
-    /// [`std::time::SystemTime::now`] outside `#[cfg(test)]` blocks and
-    /// outside the two documented leak files. See ADR-0011.
+    /// Greps for direct calls to [`std::time::Instant::now`],
+    /// [`std::time::SystemTime::now`], and `.elapsed()` outside
+    /// `#[cfg(test)]` blocks. There is no file allowlist. See ADR-0011 and
+    /// ADR-0086.
     CheckNoInternalClock,
     /// Assert every `error!` / `warn!` / `info!` tracing event carries at
     /// least one structured field.
@@ -414,58 +415,103 @@ fn check_no_io_deps() -> Result<()> {
     Ok(())
 }
 
-/// File paths inside `magnetar-proto/src/` that are *explicitly* allowed to
-/// touch the host clock, mirroring the "Known non-determinism leaks" list in
-/// the workspace `ARCHITECTURE.md` + ADR-0011. Every other file under
-/// `crates/magnetar-proto/src/` must drive time through the injected
-/// `now: Instant` / `wall_clock` parameters.
+/// Host-clock reads forbidden in `crates/magnetar-proto/src/**` outside
+/// `#[cfg(test)]` (ADR-0011, ADR-0086).
 ///
-/// Paths are workspace-relative and matched with [`Path::ends_with`] so the
-/// check is robust to symlinks and absolute prefixes. Keep this list in lockstep
-/// with the leak inventory in `ARCHITECTURE.md` (search for
-/// "Known non-determinism leaks").
-const CLOCK_LEAK_ALLOWLIST: &[&str] = &[
-    // PIP-37 chunked emit currently uses uuid::Uuid::new_v4() — no clock
-    // reads, but listed here so the file is visited by the inventory checker
-    // when leak categories are expanded.
-    "crates/magnetar-proto/src/producer.rs",
-    // TokenAuth bootstrap calls std::env::var() once at construction — no
-    // clock reads either, but same rationale: keeps the leak list in one
-    // place.
-    "crates/magnetar-proto/src/auth/token.rs",
-];
+/// `.elapsed()` carries its leading dot deliberately: a bare `elapsed()`
+/// needle would also match method *names* like
+/// `ConsumerState::batch_deadline_elapsed(now)` and the test
+/// `record_rate_window_safe_under_zero_elapsed`, neither of which reads a
+/// clock. Matching is plain substring over the code portion of the file, so
+/// each needle catches both its qualified (`std::time::Instant::now()`) and
+/// unqualified spelling.
+const CLOCK_NEEDLES: &[&str] = &["Instant::now()", "SystemTime::now()", ".elapsed()"];
+
+/// File paths inside `magnetar-proto/src/` explicitly allowed to touch the
+/// host clock. The list starts — and should stay — **empty**: as of ADR-0086
+/// no file in the sans-io core reads a clock it was not handed.
+///
+/// It previously carried `producer.rs` and `auth/token.rs`, whose rationale
+/// was the `uuid::Uuid::new_v4()` and `std::env::var()` leaks — neither of
+/// which this gate has ever scanned for. The entries bought no enforcement
+/// and cost real blindness: they whole-file-skipped `producer.rs`, which is
+/// where one of the two ADR-0086 `.elapsed()` leaks lived. Those two
+/// non-clock leaks remain documented in `ARCHITECTURE.md` under "Known
+/// non-determinism leaks", which is the inventory of record.
+///
+/// Add an entry only with a rationale documented in the same changeset AND a
+/// matching entry in that `ARCHITECTURE.md` section. Paths are
+/// workspace-relative and matched with [`Path::ends_with`] so the check is
+/// robust to symlinks and absolute prefixes.
+const CLOCK_LEAK_ALLOWLIST: &[&str] = &[];
+
+/// Scan one file's contents for forbidden host-clock reads, returning
+/// `(1-indexed line, needle)` per violation.
+///
+/// Skips two kinds of region:
+///
+/// - `#[cfg(test)]` spans, via the shared [`cfg_test_line_flags`] — tests legitimately materialise
+///   instants for their fixtures.
+/// - Lexically inert regions, via the shared [`skip_inert_region`] — line and (nested) block
+///   comments, string / raw-string / byte-string literals, and char literals. Prose that *mentions*
+///   `Instant::now()` in a doc comment is documentation, not a call.
+///
+/// This is the pure, unit-testable seam of [`check_no_internal_clock`],
+/// mirroring [`scan_log_field_violations`]. It replaced a hand-rolled
+/// line-level scanner that duplicated `cfg_test_line_flags`' brace-tracking
+/// heuristic and stripped comments with a naive `line.find("//")` — the
+/// latter silently exempted any line containing `//` inside a string literal
+/// (e.g. a `"pulsar://host"` URL on the same line as a clock read).
+fn scan_clock_violations(contents: &str) -> Vec<(usize, &'static str)> {
+    let in_cfg_test = cfg_test_line_flags(contents);
+    let bytes = contents.as_bytes();
+
+    // Byte offset of each line start, so a match offset maps to a line number
+    // with a binary search rather than a rescan.
+    let mut line_starts = vec![0usize];
+    line_starts.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .map(|(i, _)| i + 1),
+    );
+
+    let mut violations = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        for needle in CLOCK_NEEDLES {
+            if bytes[i..].starts_with(needle.as_bytes()) {
+                let line = line_starts.partition_point(|&start| start <= i);
+                if !in_cfg_test.get(line - 1).copied().unwrap_or(false) {
+                    violations.push((line, *needle));
+                }
+            }
+        }
+        i += 1;
+    }
+    violations
+}
 
 fn check_no_internal_clock() -> Result<()> {
-    // We want to flag direct host-clock reads in `magnetar-proto/src/**`. The
-    // patterns we treat as "host clock reads" are
-    //   - `Instant::now()`        (matches both `std::time::Instant::now()` and unqualified
-    //     `Instant::now()`)
-    //   - `SystemTime::now()`     (same logic)
-    //
-    // We must NOT flag occurrences inside `#[cfg(test)]` blocks (tests
-    // legitimately materialise instants for their fixtures) nor inside
-    // doc-comments / regular comments (those are documentation, not calls).
-    //
-    // The cheap implementation: a small line-level scanner that maintains an
-    // "inside cfg(test) block" depth counter. It's not a Rust parser, but the
-    // workspace style is consistent enough — `#[cfg(test)]` attributes sit on
-    // their own line, immediately followed by a `mod` or `fn` and a brace
-    // that opens on the same/next line. We follow the brace count from the
-    // first `{` after the attribute until we return to the surrounding depth.
-    //
-    // See ADR-0011 for the rationale; see ARCHITECTURE.md
-    // "Known non-determinism leaks (documented)" for the allowlist.
+    // Flag direct host-clock reads in `magnetar-proto/src/**`. See ADR-0011
+    // for the clock-injection rule, ADR-0086 for the `.elapsed()` extension
+    // and the emptied allowlist, and ARCHITECTURE.md "Known non-determinism
+    // leaks (documented)" for the leaks this gate does NOT mechanically
+    // enforce (uuid, env::var).
     let workspace_root = workspace_root()?;
     let proto_src = workspace_root.join("crates/magnetar-proto/src");
-
-    let needles: &[&str] = &["Instant::now()", "SystemTime::now()"];
 
     let mut offenders: Vec<String> = Vec::new();
     visit(&proto_src, &mut |path, contents| {
         if path.extension().is_none_or(|ext| ext != "rs") {
             return;
         }
-        // Allow the documented leak sites.
+        // Allow the documented leak sites (currently none).
         if CLOCK_LEAK_ALLOWLIST
             .iter()
             .any(|allowed| path.ends_with(allowed) || path.to_string_lossy().ends_with(allowed))
@@ -473,73 +519,36 @@ fn check_no_internal_clock() -> Result<()> {
             return;
         }
 
-        // Walk lines, tracking #[cfg(test)] brace depth so we can skip them.
-        let mut in_cfg_test = false;
-        let mut depth: i32 = 0;
-        let mut pending_cfg_test = false;
+        let relative = path
+            .strip_prefix(&workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
 
-        for (lineno_zero, line) in contents.lines().enumerate() {
-            let lineno = lineno_zero + 1;
-            let trimmed = line.trim_start();
-
-            // Detect a fresh `#[cfg(test)]` attribute. We mark it pending so
-            // the *next* `{` opens a test scope. We tolerate composite
-            // attributes like `#[cfg(all(test, feature = "x"))]`.
-            if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
-                pending_cfg_test = true;
-            }
-
-            // Count braces on this line so we can enter/leave the cfg(test)
-            // span as the source nests.
-            let opens = line.matches('{').count() as i32;
-            let closes = line.matches('}').count() as i32;
-
-            if pending_cfg_test && opens > 0 {
-                in_cfg_test = true;
-                pending_cfg_test = false;
-                depth = opens - closes;
-                continue;
-            }
-
-            if in_cfg_test {
-                depth += opens - closes;
-                if depth <= 0 {
-                    in_cfg_test = false;
-                    depth = 0;
-                }
-                continue;
-            }
-
-            // Strip the trailing "//" comment (if any) so we don't flag prose
-            // that *mentions* `Instant::now()` in a doc-string or comment.
-            let code = match line.find("//") {
-                Some(idx) => &line[..idx],
-                None => line,
-            };
-
-            for needle in needles {
-                if code.contains(needle) {
-                    offenders.push(format!(
-                        "{}:{}: contains {needle} outside #[cfg(test)] — see ADR-0011",
-                        path.display(),
-                        lineno
-                    ));
-                }
-            }
+        for (line, needle) in scan_clock_violations(contents) {
+            offenders.push(format!(
+                "{relative}:{line}: contains {needle} outside #[cfg(test)] — see ADR-0011/ADR-0086"
+            ));
         }
     })?;
 
     if !offenders.is_empty() {
+        offenders.sort();
         for line in &offenders {
             eprintln!("forbidden host-clock read — {line}");
         }
         bail!(
             "no-internal-clock check failed: {} offender(s). \
              magnetar-proto must take `now: Instant` / `wall_clock` providers \
-             through its API — see specs/adr/0011-clock-injection-sans-io.md.",
+             through its API — see specs/adr/0011-clock-injection-sans-io.md \
+             and specs/adr/0086-inject-now-into-proto-latency-recording.md.",
             offenders.len()
         );
     }
+    eprintln!(
+        "xtask check-no-internal-clock: no host-clock reads in magnetar-proto/src (needles: {}).",
+        CLOCK_NEEDLES.join(", ")
+    );
     Ok(())
 }
 
@@ -2820,5 +2829,105 @@ fn explain() {
 "#;
         let scan = scan_container_memory(src);
         assert_eq!(scan, ContainerMemoryScan::default());
+    }
+
+    // ── check-no-internal-clock scanner (ADR-0011, ADR-0086) ────────
+
+    #[test]
+    fn clock_flags_instant_now_and_system_time_now() {
+        let src = r"
+fn stamp() {
+    let a = Instant::now();
+    let b = std::time::SystemTime::now();
+}
+";
+        let hits = scan_clock_violations(src);
+        assert_eq!(
+            hits,
+            vec![(3, "Instant::now()"), (4, "SystemTime::now()")],
+            "both qualified and unqualified spellings must be flagged"
+        );
+    }
+
+    /// The ADR-0086 regression: the two leaks were `.elapsed()` calls, which
+    /// the pre-0084 needle list did not contain at all.
+    #[test]
+    fn clock_flags_dot_elapsed() {
+        let src = r"
+fn pop(msg: &Msg) -> u64 {
+    u64::try_from(msg.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+";
+        assert_eq!(scan_clock_violations(src), vec![(3, ".elapsed()")]);
+    }
+
+    /// The needle carries a leading dot for a reason: `elapsed` appears in
+    /// legitimate *method names* in this crate. Flagging those would make the
+    /// gate unusable.
+    #[test]
+    fn clock_ignores_elapsed_without_leading_dot() {
+        let src = r"
+fn record_rate_window_safe_under_zero_elapsed() {}
+
+fn check(&self, now: Instant) -> bool {
+    self.batch_deadline_elapsed(now)
+}
+";
+        assert!(
+            scan_clock_violations(src).is_empty(),
+            "a bare `elapsed(` must not match — only `.elapsed()` reads a clock"
+        );
+    }
+
+    #[test]
+    fn clock_skips_cfg_test_modules() {
+        let src = r"
+fn deliver(now: Instant) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture() {
+        let t0 = Instant::now();
+        let d = t0.elapsed();
+    }
+}
+";
+        assert!(
+            scan_clock_violations(src).is_empty(),
+            "tests legitimately materialise instants for their fixtures"
+        );
+    }
+
+    /// The concrete defect the pre-ADR-0086 `line.find("//")` comment strip
+    /// had: it truncated at the first `//` *anywhere* on the line, including
+    /// inside a string literal, silently exempting everything after it.
+    #[test]
+    fn clock_flags_read_after_a_url_string_literal_on_the_same_line() {
+        let src = r#"
+fn connect() {
+    let url = "pulsar://host:6650"; let t = Instant::now();
+}
+"#;
+        assert_eq!(
+            scan_clock_violations(src),
+            vec![(3, "Instant::now()")],
+            "a `//` inside a string literal must not exempt the rest of the line"
+        );
+    }
+
+    #[test]
+    fn clock_ignores_comment_and_doc_comment_mentions() {
+        let src = r"
+/// Records the latency (`Instant::now() - msg.arrived_at`) — prose only.
+fn pop(now: Instant) {
+    // Formerly `msg.arrived_at.elapsed()`; see ADR-0086.
+    /* Also SystemTime::now() in a block comment. */
+}
+";
+        assert!(
+            scan_clock_violations(src).is_empty(),
+            "documentation that mentions a clock read is not a clock read"
+        );
     }
 }

@@ -275,7 +275,9 @@ fn lock_and_run_chunk_flow(conn: &mut Connection, t0: Instant) -> ChunkFlowReact
     }
 
     let queue_len_before_pop = conn.consumer_queue_len(handle);
-    let message = conn.pop_message(handle).expect("reassembled message");
+    let message = conn
+        .pop_message(handle, std::time::Instant::now())
+        .expect("reassembled message");
     let payload = message.payload.to_vec();
     let grants_after_pop = drain_flow_grants(conn, handle);
 

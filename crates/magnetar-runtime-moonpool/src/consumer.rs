@@ -774,9 +774,13 @@ impl<P: Providers> Consumer<P> {
             if acc_bytes.saturating_add(next_size) > max_bytes {
                 break;
             }
+            // ADR-0011/ADR-0086: pull the instant through the INJECTED provider, never
+            // `Instant::now()`, and before the connection mutex (ADR-0038). This is what makes
+            // the receive-latency histogram reproducible per seed under simulation.
+            let now = self.shared.now_instant();
             let msg = {
                 let mut conn = self.shared.inner.lock();
-                conn.pop_message(self.handle)
+                conn.pop_message(self.handle, now)
             };
             let Some(mut msg) = msg else { break };
             // PIP-4: honor the per-consumer crypto failure action for every encrypted message
@@ -1701,8 +1705,10 @@ impl Future for ReceiveFut {
         // the next queued one without bouncing back to the executor. 1:1 mirror of
         // `magnetar_runtime_tokio::consumer::ReceiveFut::poll`.
         loop {
+            // ADR-0011/ADR-0086: injected provider, before the connection mutex (ADR-0038).
+            let now = shared.now_instant();
             let mut conn = shared.inner.lock();
-            if let Some(mut msg) = conn.pop_message(handle) {
+            if let Some(mut msg) = conn.pop_message(handle, now) {
                 // Clear any stale slab entry; we resolved successfully.
                 if let Some(key) = this.slab_key.take() {
                     conn.cancel_consumer_receive_waker(handle, key);

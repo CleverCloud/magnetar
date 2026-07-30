@@ -142,7 +142,7 @@ fn lock_and_run(conn: &mut Connection, t0: Instant) -> Vec<Delivered> {
     // topic-tagged identity) -> no ack.
     let mut out = Vec::new();
     for (handle, topic) in [(handle_a, TOPIC_A), (handle_b, TOPIC_B)] {
-        while let Some(msg) = conn.pop_message(handle) {
+        while let Some(msg) = conn.pop_message(handle, std::time::Instant::now()) {
             out.push(Delivered {
                 topic: topic.to_owned(),
                 ledger: msg.message_id.ledger_id,
