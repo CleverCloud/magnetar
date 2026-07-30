@@ -12,6 +12,9 @@
 //! - `check-log-fields`: assert every `error!` / `warn!` / `info!` tracing event in non-test
 //!   workspace code carries at least one structured field (`debug!` / `trace!` exempt). Mirrors
 //!   ADR-0054.
+//! - `check-e2e-container-memory`: assert every `pulsar standalone` container the e2e suite starts
+//!   caps its JVM with `.with_env_var("PULSAR_MEM", …)` before `.start()`. Mirrors
+//!   `docs/testing.md` § "e2e container memory budget".
 //! - `check-sim-coverage`: assert that every line added relative to `git merge-base origin/main
 //!   HEAD` is executed by at least one moonpool test (`cargo-llvm-cov` patch-coverage style).
 //!   Mirrors ADR-0024.
@@ -99,6 +102,20 @@ enum Cmd {
     /// ident-capture shorthand and passes as a field. `debug!` / `trace!`
     /// are exempt. See ADR-0054.
     CheckLogFields,
+    /// Assert every `pulsar standalone` container the e2e suite starts
+    /// caps its JVM heap.
+    ///
+    /// Walks each `GenericImage::new(…)` builder chain under
+    /// `crates/magnetar/tests/`, resolves the image repository the first
+    /// constructor argument denotes (string literal, `&str` const, or a
+    /// zero-argument accessor returning one), and requires every
+    /// `apachepulsar/…` chain to carry `.with_env_var("PULSAR_MEM", …)`
+    /// before `.start()`. Non-Pulsar containers — the Kerberos KDC and the
+    /// Athenz ZTS server — are out of scope; a chain whose image cannot be
+    /// resolved, or that never reaches `.start()`, is a violation rather
+    /// than a silent skip. Only the call's presence is checked: the budget
+    /// value lives in `docs/testing.md` § "e2e container memory budget".
+    CheckE2eContainerMemory,
     /// Assert that every line added relative to the merge base is covered
     /// by at least one `magnetar-runtime-moonpool` test.
     ///
@@ -156,6 +173,7 @@ fn dispatch() -> Result<()> {
         Cmd::CheckNoIoDeps => check_no_io_deps(),
         Cmd::CheckNoInternalClock => check_no_internal_clock(),
         Cmd::CheckLogFields => check_log_fields(),
+        Cmd::CheckE2eContainerMemory => check_e2e_container_memory(),
         Cmd::CheckSimCoverage { base } => check_sim_coverage(&base),
         Cmd::CheckRuntimeTestParity => check_runtime_test_parity(),
         Cmd::CheckCryptoMatrix => check_crypto_matrix(),
@@ -740,6 +758,19 @@ fn skip_char_literal(bytes: &[u8], i: usize) -> Option<usize> {
 /// inside the arguments do not perturb the balance. Returns the inner text
 /// plus the index just past the closing `)`.
 fn extract_balanced_parens(bytes: &[u8], open: usize) -> Option<(String, usize)> {
+    extract_balanced(bytes, open, b'(', b')')
+}
+
+/// Extract the text between a balanced `open_ch` / `close_ch` pair, with
+/// `bytes[open]` being the opening delimiter. Comments and string/char
+/// literals inside do not perturb the balance. Returns the inner text plus
+/// the index just past the closing delimiter.
+fn extract_balanced(
+    bytes: &[u8],
+    open: usize,
+    open_ch: u8,
+    close_ch: u8,
+) -> Option<(String, usize)> {
     let mut depth = 0usize;
     let mut j = open;
     let start = open + 1;
@@ -748,20 +779,23 @@ fn extract_balanced_parens(bytes: &[u8], open: usize) -> Option<(String, usize)>
             j = next.max(j + 1);
             continue;
         }
-        match bytes[j] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    let inner = String::from_utf8_lossy(&bytes[start..j]).into_owned();
-                    return Some((inner, j + 1));
-                }
+        if bytes[j] == open_ch {
+            depth += 1;
+        } else if bytes[j] == close_ch {
+            depth -= 1;
+            if depth == 0 {
+                let inner = String::from_utf8_lossy(&bytes[start..j]).into_owned();
+                return Some((inner, j + 1));
             }
-            _ => {}
         }
         j += 1;
     }
     None
+}
+
+/// True for bytes that can appear inside a Rust identifier.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Find every `error!(…)` / `warn!(…)` / `info!(…)` invocation in
@@ -1100,6 +1134,428 @@ fn check_log_fields() -> Result<()> {
         );
     }
     eprintln!("xtask check-log-fields: every error!/warn!/info! event carries structured fields.");
+    Ok(())
+}
+
+/// Workspace-relative directory the container-memory gate scans. Only the
+/// façade's e2e suite starts `testcontainers` images.
+const E2E_TESTS_DIR: &str = "crates/magnetar/tests";
+
+/// The `testcontainers` constructor every e2e container is built from.
+const CONTAINER_CTOR: &str = "GenericImage::new";
+
+/// A chain is governed by the container-memory budget iff its resolved
+/// image repository starts with this prefix. The suite also starts a
+/// Kerberos KDC (`gcavalcante8808/krb5-server`) and an Athenz ZTS server
+/// (`athenz/athenz-zts-server`); neither runs the Pulsar JVM, so neither
+/// is in scope.
+const PULSAR_IMAGE_PREFIX: &str = "apachepulsar/";
+
+/// The env var every Pulsar container must set. The gate asserts the
+/// *presence* of a `.with_env_var("PULSAR_MEM", …)` call; the budget value
+/// itself is governed by `docs/testing.md` § "e2e container memory
+/// budget", not by this check.
+const PULSAR_MEM_ENV: &str = "PULSAR_MEM";
+
+/// Violation reason: a Pulsar container reaches `.start()` uncapped.
+const CONTAINER_MEM_NO_ENV: &str =
+    "starts a Pulsar container without .with_env_var(\"PULSAR_MEM\", …)";
+
+/// Violation reason: the builder is stashed instead of started in the same
+/// chain, so the gate cannot see whether it is capped. Rejected outright
+/// rather than skipped — mirrors how [`LOG_FIELDS_NON_PAREN`] treats a
+/// macro form the field grammar cannot parse.
+const CONTAINER_MEM_NOT_STARTED: &str = "GenericImage builder does not reach .start() in the same chain; keep .start() on the chain \
+     so the memory cap can be verified";
+
+/// Violation reason: the image repository could not be resolved to a
+/// string, so the gate cannot tell whether the budget applies.
+const CONTAINER_MEM_UNRESOLVED: &str = "cannot resolve the image repository; pass a string literal, a `const …: &str`, or a \
+     zero-argument accessor returning one";
+
+/// One `GenericImage::new(…)` builder chain found in a file.
+struct ContainerChain {
+    /// 1-indexed line of the `GenericImage::new` token.
+    line: usize,
+    /// Every image-repository value the first constructor argument can
+    /// resolve to. Empty when unresolvable.
+    repos: Vec<String>,
+    /// True when the chain reaches `.start()`.
+    started: bool,
+    /// True when a `.with_env_var("PULSAR_MEM", …)` precedes `.start()`.
+    caps_memory: bool,
+}
+
+/// Inner text of a plain `"…"` string literal at the start of `part`.
+/// Returns `None` when `part` does not begin with one. Escapes come back
+/// raw — the gate only compares against escape-free literals (image
+/// repository names, `PULSAR_MEM`).
+fn leading_string_literal_value(part: &str) -> Option<&str> {
+    let part = part.trim_start();
+    let bytes = part.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let end = skip_string_literal(bytes, 0);
+    part.get(1..end.saturating_sub(1))
+}
+
+/// Every `const <NAME>: &str = "<literal>";` declared in plain code, as
+/// `(name, value)` pairs. Non-`&str` consts and non-literal initialisers
+/// (`&["a", "b"]`, `concat!(…)`) are skipped.
+fn const_str_table(contents: &str) -> Vec<(&str, &str)> {
+    let bytes = contents.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        if bytes[i..].starts_with(b"const")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && !bytes.get(i + 5).copied().is_some_and(is_ident_byte)
+        {
+            if let Some(decl) = parse_const_str_decl(&contents[i + 5..]) {
+                out.push(decl);
+            }
+            i += 5;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Parse the tail of a `const` declaration — everything after the `const`
+/// keyword — into `(name, literal value)`. Only `&str` consts initialised
+/// with a plain string literal are returned.
+fn parse_const_str_decl(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim_start();
+    let name_end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+    let name = &rest[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let after = rest[name_end..].trim_start().strip_prefix(':')?;
+    let (ty, value) = after.split_once('=')?;
+    if !ty.contains("str") {
+        return None;
+    }
+    leading_string_literal_value(value).map(|literal| (name, literal))
+}
+
+/// Body text of every zero-argument function in `contents`, as
+/// `(name, body)` pairs, so a call like `image_repo()` can be resolved to
+/// the const it falls back to.
+fn zero_arg_fn_bodies(contents: &str) -> Vec<(&str, String)> {
+    let bytes = contents.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        if !bytes[i..].starts_with(b"fn")
+            || (i > 0 && is_ident_byte(bytes[i - 1]))
+            || bytes.get(i + 2).copied().is_some_and(is_ident_byte)
+        {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let name_start = j;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        let name = &contents[name_start..j];
+        // Zero-arg only: `fn name()`. Anything taking parameters cannot be
+        // a bare `image_repo()`-style accessor.
+        if !name.is_empty()
+            && bytes.get(j) == Some(&b'(')
+            && bytes.get(j + 1) == Some(&b')')
+            && let Some(brace) = find_plain_brace(bytes, j + 2)
+            && let Some((body, end)) = extract_balanced(bytes, brace, b'{', b'}')
+        {
+            out.push((name, body));
+            i = end;
+            continue;
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
+/// Index of the `{` opening a function body, scanning from `from` past the
+/// return type. Returns `None` if a `;` (bodyless declaration) or another
+/// brace-closing token is reached first.
+fn find_plain_brace(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'{' => return Some(i),
+            b';' | b'}' => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Every image-repository value a `GenericImage::new` first argument can
+/// resolve to, using the file's `&str` const table and its zero-argument
+/// accessor bodies:
+///
+/// - a string literal resolves to itself;
+/// - a bare identifier resolves through the const table;
+/// - `accessor()` resolves to every `&str` const its body names — all of them, so a body mentioning
+///   more than one const cannot silently drop the chain out of scope.
+///
+/// An empty result means unresolvable, which the classifier treats as a
+/// violation rather than a skip.
+fn resolve_image_repos(arg: &str, consts: &[(&str, &str)], fns: &[(&str, String)]) -> Vec<String> {
+    let arg = arg.trim();
+    if let Some(literal) = leading_string_literal_value(arg) {
+        return vec![literal.to_owned()];
+    }
+    if let Some((_, value)) = consts.iter().find(|(name, _)| *name == arg) {
+        return vec![(*value).to_owned()];
+    }
+    let Some(callee) = arg.strip_suffix("()").map(str::trim) else {
+        return Vec::new();
+    };
+    let Some((_, body)) = fns.iter().find(|(name, _)| *name == callee) else {
+        return Vec::new();
+    };
+    consts
+        .iter()
+        .filter(|(name, _)| body_names_ident(body, name))
+        .map(|(_, value)| (*value).to_owned())
+        .collect()
+}
+
+/// True when `body` names `ident` in plain code (not inside a comment or
+/// string literal) as a whole identifier.
+fn body_names_ident(body: &str, ident: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        if bytes[i..].starts_with(ident.as_bytes())
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && !bytes
+                .get(i + ident.len())
+                .copied()
+                .is_some_and(is_ident_byte)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The next `.method(…)` link of a builder chain starting at `from`,
+/// as `(method name, argument text, index past the closing paren)`.
+/// Whitespace and comments between links — house style in the longer e2e
+/// chains — are skipped. Returns `None` at anything that is not a method
+/// call, which ends the chain (`.await`, `?`, `;`).
+fn next_chain_call(bytes: &[u8], from: usize) -> Option<(String, String, usize)> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'/' && matches!(bytes.get(i + 1), Some(&b'/' | &b'*')) {
+            i = skip_inert_region(bytes, i)?.max(i + 1);
+            continue;
+        }
+        break;
+    }
+    if bytes.get(i) != Some(&b'.') {
+        return None;
+    }
+    let name_start = i + 1;
+    let mut j = name_start;
+    while j < bytes.len() && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    if j == name_start || bytes.get(j) != Some(&b'(') {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&bytes[name_start..j]).into_owned();
+    let (args, end) = extract_balanced_parens(bytes, j)?;
+    Some((name, args, end))
+}
+
+/// Find every `GenericImage::new(…)` builder chain in `contents`,
+/// parenthesis-balanced so multi-line chains parse whole. Occurrences
+/// inside comments and string literals are ignored, which is what keeps
+/// prose mentioning `container.start()` from being read as a chain.
+fn find_container_chains(contents: &str) -> Vec<ContainerChain> {
+    let consts = const_str_table(contents);
+    let fns = zero_arg_fn_bodies(contents);
+    let bytes = contents.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_inert_region(bytes, i) {
+            i = next.max(i + 1);
+            continue;
+        }
+        if !bytes[i..].starts_with(CONTAINER_CTOR.as_bytes())
+            || (i > 0 && is_ident_byte(bytes[i - 1]))
+        {
+            i += 1;
+            continue;
+        }
+        let mut j = i + CONTAINER_CTOR.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let Some((ctor_args, mut cursor)) = (bytes.get(j) == Some(&b'('))
+            .then(|| extract_balanced_parens(bytes, j))
+            .flatten()
+        else {
+            i = j.max(i + 1);
+            continue;
+        };
+        let line = contents[..i].bytes().filter(|b| *b == b'\n').count() + 1;
+        let repos = split_top_level_args(&ctor_args)
+            .first()
+            .map(|arg| resolve_image_repos(arg, &consts, &fns))
+            .unwrap_or_default();
+
+        let mut started = false;
+        let mut caps_memory = false;
+        while let Some((method, args, next)) = next_chain_call(bytes, cursor) {
+            cursor = next;
+            if method == "with_env_var"
+                && split_top_level_args(&args)
+                    .first()
+                    .and_then(|arg| leading_string_literal_value(arg))
+                    == Some(PULSAR_MEM_ENV)
+            {
+                caps_memory = true;
+            }
+            if method == "start" {
+                started = true;
+                break;
+            }
+        }
+
+        out.push(ContainerChain {
+            line,
+            repos,
+            started,
+            caps_memory,
+        });
+        i = cursor;
+    }
+    out
+}
+
+/// Classify one chain: `Ok(true)` for an in-scope, capped container,
+/// `Ok(false)` for a container the budget does not govern, `Err(reason)`
+/// for a violation.
+fn classify_container_chain(chain: &ContainerChain) -> std::result::Result<bool, &'static str> {
+    if chain.repos.is_empty() {
+        return Err(CONTAINER_MEM_UNRESOLVED);
+    }
+    if !chain
+        .repos
+        .iter()
+        .any(|repo| repo.starts_with(PULSAR_IMAGE_PREFIX))
+    {
+        return Ok(false);
+    }
+    if !chain.started {
+        return Err(CONTAINER_MEM_NOT_STARTED);
+    }
+    if !chain.caps_memory {
+        return Err(CONTAINER_MEM_NO_ENV);
+    }
+    Ok(true)
+}
+
+/// Tally of one file's `GenericImage::new` chains.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContainerMemoryScan {
+    /// In-scope Pulsar chains that carry `PULSAR_MEM`.
+    capped: usize,
+    /// Chains the budget does not govern (non-Pulsar images).
+    out_of_scope: usize,
+    /// `(line, reason)` per violation.
+    violations: Vec<(usize, &'static str)>,
+}
+
+/// Scan one file's contents for uncapped Pulsar containers.
+fn scan_container_memory(contents: &str) -> ContainerMemoryScan {
+    let mut scan = ContainerMemoryScan::default();
+    for chain in find_container_chains(contents) {
+        match classify_container_chain(&chain) {
+            Ok(true) => scan.capped += 1,
+            Ok(false) => scan.out_of_scope += 1,
+            Err(reason) => scan.violations.push((chain.line, reason)),
+        }
+    }
+    scan
+}
+
+fn check_e2e_container_memory() -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let tests_dir = workspace_root.join(E2E_TESTS_DIR);
+    if !tests_dir.is_dir() {
+        bail!("e2e test directory not found: {}", tests_dir.display());
+    }
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut capped = 0usize;
+    let mut out_of_scope = 0usize;
+    visit(&tests_dir, &mut |path, contents| {
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            return;
+        }
+        let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let scan = scan_container_memory(contents);
+        capped += scan.capped;
+        out_of_scope += scan.out_of_scope;
+        for (line, reason) in scan.violations {
+            offenders.push(format!("{rel}:{line}: {reason}"));
+        }
+    })?;
+
+    if !offenders.is_empty() {
+        offenders.sort();
+        for line in &offenders {
+            eprintln!("uncapped e2e container — {line}");
+        }
+        bail!(
+            "e2e-container-memory check failed: {} offender(s). Every `pulsar standalone` \
+             container the e2e suite starts must chain \
+             `.with_env_var(\"PULSAR_MEM\", PULSAR_MEM_LIMIT)` before `.start()` — see \
+             docs/testing.md § \"e2e container memory budget\".",
+            offenders.len()
+        );
+    }
+    // Report the non-Pulsar chains too: a silent drop in the capped count
+    // is the regression this gate exists to make visible.
+    eprintln!(
+        "xtask check-e2e-container-memory: {capped} Pulsar container chain(s) carry PULSAR_MEM \
+         ({out_of_scope} non-Pulsar chain(s) out of scope)."
+    );
     Ok(())
 }
 
@@ -2160,5 +2616,209 @@ fn run() {
 }
 "#;
         assert!(scan_log_field_violations(src).is_empty());
+    }
+
+    // ── check-e2e-container-memory parser ───────────────────────────
+
+    /// The house e2e preamble: a Pulsar image const plus the accessor
+    /// pair every `e2e_*.rs` copies.
+    const PULSAR_PREAMBLE: &str = r#"
+const DEFAULT_IMAGE_REPO: &str = "apachepulsar/pulsar";
+const DEFAULT_IMAGE_TAG: &str = "4.0.4";
+const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
+
+fn image_repo() -> String {
+    std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
+}
+
+fn image_tag() -> String {
+    std::env::var("MAGNETAR_PULSAR_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_IMAGE_TAG.to_owned())
+}
+"#;
+
+    #[test]
+    fn container_memory_flags_uncapped_pulsar_chain() {
+        let src = format!(
+            "{PULSAR_PREAMBLE}
+async fn start_pulsar() {{
+    let container = GenericImage::new(image_repo(), image_tag())
+        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
+        .with_startup_timeout(Duration::from_mins(2))
+        .with_cmd(vec![\"bin/pulsar\".to_owned(), \"standalone\".to_owned()])
+        .start()
+        .await?;
+}}
+"
+        );
+        let scan = scan_container_memory(&src);
+        assert_eq!(scan.violations, vec![(15, CONTAINER_MEM_NO_ENV)]);
+        assert_eq!(scan.capped, 0);
+    }
+
+    #[test]
+    fn container_memory_accepts_capped_pulsar_chain() {
+        // Comments between chain links are house style in the longer
+        // suites (`e2e_handshake_error.rs`); they must not end the walk.
+        let src = format!(
+            "{PULSAR_PREAMBLE}
+async fn start_pulsar() {{
+    let container = GenericImage::new(image_repo(), image_tag())
+        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT))
+        .with_env_var(\"PULSAR_MEM\", PULSAR_MEM_LIMIT)
+        // Token-auth on, applied through `apply-config-from-env`.
+        .with_env_var(\"PULSAR_PREFIX_authenticationEnabled\", \"true\")
+        .with_cmd(vec![\"bin/pulsar\".to_owned(), \"standalone\".to_owned()])
+        .start()
+        .await?;
+}}
+"
+        );
+        let scan = scan_container_memory(&src);
+        assert!(scan.violations.is_empty());
+        assert_eq!(scan.capped, 1);
+    }
+
+    #[test]
+    fn container_memory_checks_every_chain_in_a_file() {
+        // `e2e_batch_chunk.rs` / `e2e_pulsar_proxy.rs` each build two.
+        let src = format!(
+            "{PULSAR_PREAMBLE}
+async fn start_standalone() {{
+    let a = GenericImage::new(image_repo(), image_tag())
+        .with_env_var(\"PULSAR_MEM\", PULSAR_MEM_LIMIT)
+        .start()
+        .await?;
+}}
+
+async fn start_proxy() {{
+    let b = GenericImage::new(image_repo(), image_tag())
+        .with_env_var(\"PULSAR_PREFIX_zookeeperServers\", &zk_servers)
+        .start()
+        .await?;
+}}
+"
+        );
+        let scan = scan_container_memory(&src);
+        assert_eq!(scan.violations, vec![(22, CONTAINER_MEM_NO_ENV)]);
+        assert_eq!(scan.capped, 1);
+    }
+
+    #[test]
+    fn container_memory_ignores_non_pulsar_images() {
+        // `e2e_sasl_kerberos.rs` shadows `image_repo()` with a KDC image
+        // and `e2e_athenz_zts.rs` builds a ZTS server. Neither runs the
+        // Pulsar JVM, so `PULSAR_MEM` does not apply.
+        let src = r#"
+const DEFAULT_KDC_IMAGE_REPO: &str = "gcavalcante8808/krb5-server";
+const DEFAULT_KDC_IMAGE_TAG: &str = "latest";
+const DEFAULT_ZTS_IMAGE_REPO: &str = "athenz/athenz-zts-server";
+
+fn image_repo() -> String {
+    std::env::var("MAGNETAR_KDC_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_KDC_IMAGE_REPO.to_owned())
+}
+
+fn image_tag() -> String {
+    std::env::var("MAGNETAR_KDC_IMAGE_TAG").unwrap_or_else(|_| DEFAULT_KDC_IMAGE_TAG.to_owned())
+}
+
+async fn start_kdc() {
+    let container = GenericImage::new(image_repo(), image_tag())
+        .with_env_var("KRB5_REALM", "EXAMPLE.COM")
+        .start()
+        .await?;
+}
+
+async fn start_zts() {
+    let container = GenericImage::new(DEFAULT_ZTS_IMAGE_REPO, "1.12.5")
+        .with_startup_timeout(Duration::from_secs(30))
+        .start()
+        .await;
+}
+"#;
+        let scan = scan_container_memory(src);
+        assert!(scan.violations.is_empty());
+        assert_eq!(scan.capped, 0);
+        assert_eq!(scan.out_of_scope, 2);
+    }
+
+    #[test]
+    fn container_memory_reads_an_inline_image_literal() {
+        // A file written from scratch rather than cloned still gets caught.
+        let uncapped = r#"
+async fn start_pulsar() {
+    let container = GenericImage::new("apachepulsar/pulsar", "4.0.4")
+        .start()
+        .await?;
+}
+"#;
+        assert_eq!(
+            scan_container_memory(uncapped).violations,
+            vec![(3, CONTAINER_MEM_NO_ENV)]
+        );
+
+        let capped = r#"
+async fn start_pulsar() {
+    let container = GenericImage::new("apachepulsar/pulsar", "4.0.4")
+        .with_env_var("PULSAR_MEM", "-Xms256m -Xmx1g")
+        .start()
+        .await?;
+}
+"#;
+        let scan = scan_container_memory(capped);
+        assert!(scan.violations.is_empty());
+        assert_eq!(scan.capped, 1);
+    }
+
+    #[test]
+    fn container_memory_flags_a_builder_that_never_starts() {
+        // Stashing the builder would put `.start()` out of the gate's
+        // reach — rejected rather than silently passed.
+        let src = format!(
+            "{PULSAR_PREAMBLE}
+async fn start_pulsar() {{
+    let builder = GenericImage::new(image_repo(), image_tag())
+        .with_exposed_port(ContainerPort::Tcp(BROKER_BINARY_PORT));
+    let container = builder.start().await?;
+}}
+"
+        );
+        assert_eq!(
+            scan_container_memory(&src).violations,
+            vec![(15, CONTAINER_MEM_NOT_STARTED)]
+        );
+    }
+
+    #[test]
+    fn container_memory_flags_an_unresolvable_image() {
+        let src = r#"
+async fn start_pulsar() {
+    let repo = format!("{registry}/pulsar");
+    let container = GenericImage::new(repo, "4.0.4")
+        .with_env_var("PULSAR_MEM", "-Xms256m -Xmx1g")
+        .start()
+        .await?;
+}
+"#;
+        assert_eq!(
+            scan_container_memory(src).violations,
+            vec![(4, CONTAINER_MEM_UNRESOLVED)]
+        );
+    }
+
+    #[test]
+    fn container_memory_ignores_comments_and_strings() {
+        // `e2e_reconnect.rs` discusses `container.start()` in prose, and
+        // the ctor name appears in doc comments.
+        let src = r#"
+/// `container.start()` only re-runs `docker start`, so
+/// `GenericImage::new(image_repo(), image_tag()).start()` is not re-executed.
+fn explain() {
+    // let c = GenericImage::new(image_repo(), image_tag()).start();
+    let doc = "GenericImage::new(image_repo(), image_tag()).start()";
+    let _ = MyGenericImage::new(image_repo(), image_tag());
+}
+"#;
+        let scan = scan_container_memory(src);
+        assert_eq!(scan, ContainerMemoryScan::default());
     }
 }

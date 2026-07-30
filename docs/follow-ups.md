@@ -24,7 +24,6 @@ Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocke
 | 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                                     | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
 | 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)                                   | 🧠 needs design decision on the fan-out surface                                                  |
 | 3   | [`Instant::elapsed()` clock leak in proto latency histograms](#3-latency-histogram-clock-leak)                                    | ⚡ ready to dispatch                                                                             |
-| 7   | [No gate keeps new e2e files on the container memory budget](#7-e2e-container-memory-gate)                                        | ⚡ ready to dispatch                                                                             |
 | 8   | [Broker-URL authority parsers are not unified on `probe_authority`](#8-broker-url-authority-parser-unification)                   | 🟡 deferred (not load-bearing)                                                                   |
 | 9   | [`e2e_transparent_inflight_publish_replay_across_broker_restart` races `send_timeout`](#9-inflight-replay-e2e-races-send_timeout) | ⚡ ready to dispatch                                                                             |
 
@@ -68,22 +67,6 @@ Surfaced during the #347 work; the differential test `aggregate_stats_equivalenc
 
 ```text
 /goal remove the Instant::elapsed() host-clock reads from magnetar-proto per docs/follow-ups.md §3: thread the injected `now: Instant` into ConsumerState::pop_message and ProducerState::apply_receipt, compute latencies against it, extend `cargo run -p xtask -- check-no-internal-clock` to also reject `.elapsed()` in magnetar-proto src, and ship the ADR-0024 four-layer test set proving moonpool latency histograms are deterministic per seed. Validation chain per CLAUDE.md.
-```
-
----
-
-## 7. e2e container memory gate
-
-**Gap.** Every `pulsar standalone` container in `crates/magnetar/tests/e2e_*.rs` now passes `PULSAR_MEM = PULSAR_MEM_LIMIT` (see [`docs/testing.md` § "e2e container memory budget"](testing.md#e2e-container-memory-budget)), but nothing enforces it.
-The e2e helpers are copy-paste duplicated per file — a new `e2e_*.rs` cloned from a pre-cap template, or a chain that drops the `.with_env_var` call, silently reintroduces a ~2.3 GiB stock-heap container and the CI runner memory pressure that makes brokers stall past `operation_timeout`.
-The failure mode is a flaky timeout in whichever unrelated test happens to be running, so a regression is expensive to diagnose and cheap to misread as "just a flake".
-
-**Why it stays open.** The gate itself is small — grep each `GenericImage::new(image_repo(), image_tag())` chain in `crates/magnetar/tests/` for a `.with_env_var("PULSAR_MEM", …)` before its `.start()` — but landing it means a new `xtask` subcommand plus wiring into [CLAUDE.md § Validation chain](../CLAUDE.md#validation-chain) and the CI workflow, which is wider than the container-budget fix that surfaced it.
-
-**`/goal`.**
-
-```text
-/goal add a `cargo run -p xtask -- check-e2e-container-memory` gate per docs/follow-ups.md §7: fail when any `GenericImage::new(image_repo(), image_tag())` chain under crates/magnetar/tests/ reaches `.start()` without a `.with_env_var("PULSAR_MEM", …)` call, model it on the existing check-no-channels/check-log-fields greps, and wire it into the CLAUDE.md validation chain plus .github/workflows/ci.yml alongside the other cheap per-PR gates. Validation chain per CLAUDE.md.
 ```
 
 ---
@@ -156,5 +139,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is a drift-prevention refactor with no behavioural bug behind it; §3, §7 and §9 are dispatch-ready.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is a drift-prevention refactor with no behavioural bug behind it; §3 and §9 are dispatch-ready.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.

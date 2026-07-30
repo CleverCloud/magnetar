@@ -139,7 +139,7 @@ This topology is the end-to-end verification contract for [ADR-0076](../specs/ad
 
 ### e2e container memory budget
 
-Every `pulsar standalone` container the suite starts is capped with `PULSAR_MEM = -Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g`, declared as the `PULSAR_MEM_LIMIT` const next to `image_repo()` / `image_tag()` in each `e2e_*.rs` file.
+Every `pulsar standalone` container the suite starts is capped with `PULSAR_MEM = -Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g`, declared as the `PULSAR_MEM_LIMIT` const next to `image_repo()` / `image_tag()` in each `e2e_*.rs` file that starts one.
 
 The image default is `-Xms2g -Xmx2g -XX:MaxDirectMemorySize=4g` ([`conf/pulsar_env.sh`](https://github.com/apache/pulsar/blob/master/conf/pulsar_env.sh)), which measures **~2.3 GiB RSS per idle standalone container** against **~0.95 GiB** at the capped budget.
 That difference is load-bearing on CI, not cosmetic: libtest runs up to `nproc` tests of a binary in parallel — 4 on a GitHub `ubuntu-latest` runner — and the PIP-33 two-cluster compose fixture (zookeeper + 2 bookkeepers + 2 brokers, itself capped at 256m–1g) stays up for the whole job.
@@ -147,6 +147,12 @@ At stock sizes four concurrent standalones alone reserve ~9 GiB of the runner's 
 
 The cap is a broker-side resource budget, never a client-side timeout adjustment: no test loosens an assertion or widens a deadline to accommodate a slow broker.
 Raise `PULSAR_MEM_LIMIT` in a specific file if that suite genuinely needs more heap (compaction and deep-partition topologies are the likely candidates), and say why in the const's doc comment.
+
+`cargo run -p xtask -- check-e2e-container-memory` enforces this, in the local validation chain and as a per-PR CI job.
+It walks every `GenericImage::new(…)` chain under `crates/magnetar/tests/`, resolves the image repository the first constructor argument denotes — a string literal, a `&str` const, or a zero-argument accessor returning one — and requires every `apachepulsar/…` chain to carry `.with_env_var("PULSAR_MEM", …)` before `.start()`.
+The gate checks that the call is present, not what budget it sets; this section governs the value.
+Containers running something other than the Pulsar JVM are out of scope by resolution rather than by exemption list: [`e2e_sasl_kerberos.rs`](../crates/magnetar/tests/e2e_sasl_kerberos.rs) starts a Kerberos KDC and [`e2e_athenz_zts.rs`](../crates/magnetar/tests/e2e_athenz_zts.rs) an Athenz ZTS server.
+A chain whose image cannot be resolved, or that stashes the builder instead of reaching `.start()` in the same chain, fails the gate rather than passing unverified — an unverifiable chain is the hole this check exists to close.
 
 Suites cover:
 
