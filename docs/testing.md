@@ -148,6 +148,11 @@ At stock sizes four concurrent standalones alone reserve ~9 GiB of the runner's 
 The cap is a broker-side resource budget, never a client-side timeout adjustment: no test loosens an assertion or widens a deadline to accommodate a slow broker.
 Raise `PULSAR_MEM_LIMIT` in a specific file if that suite genuinely needs more heap (compaction and deep-partition topologies are the likely candidates), and say why in the const's doc comment.
 
+That rule is about brokers **stalled** by memory pressure — it does not cover a test that deliberately drives a full container restart and then has to wait out the JVM boot it just triggered.
+There the client default is measuring the wrong thing: `send_timeout` defaults to 30 s for Java parity ([ADR-0072](../specs/adr/0072-java-parity-default-send-timeout.md)), a statement about production publish latency, while the send-timeout budget of a publish relocated across a reconnect runs from the op's original `enqueued_at` and so must also cover `docker restart` → JVM boot → namespace load → `rebuild_producers` → `CommandSendReceipt`.
+`BROKER_RESTART_SEND_TIMEOUT` in [`e2e_reconnect.rs`](../crates/magnetar/tests/e2e_reconnect.rs) sizes that window from a measurement recorded in its doc comment.
+The distinction that keeps this honest: the assertion is unchanged (every `SendFut` must still resolve `Ok`), the deadline stays finite so the test still proves replay completes in bounded time, and the number is measured rather than inflated until green.
+
 `cargo run -p xtask -- check-e2e-container-memory` enforces this, in the local validation chain and as a per-PR CI job.
 It walks every `GenericImage::new(…)` chain under `crates/magnetar/tests/`, resolves the image repository the first constructor argument denotes — a string literal, a `&str` const, or a zero-argument accessor returning one — and requires every `apachepulsar/…` chain to carry `.with_env_var("PULSAR_MEM", …)` before `.start()`.
 The gate checks that the call is present, not what budget it sets; this section governs the value.

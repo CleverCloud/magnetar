@@ -52,6 +52,85 @@ static BROKER_RESTART_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 /// into `operation_timeout` failures. See `docs/testing.md` § "e2e container memory budget".
 const PULSAR_MEM_LIMIT: &str = "-Xms256m -Xmx1g -XX:MaxDirectMemorySize=1g";
 
+/// Per-producer `send_timeout` for the broker-restart tests below.
+///
+/// The Java-parity default is 30 s ([ADR-0072], `CreateProducerRequest::send_timeout`), which is a
+/// statement about production publish latency — not about how long a `docker restart` of a
+/// `pulsar standalone` container takes. These tests publish *while the broker is down* and rely on
+/// transparent replay, and the send-timeout budget is measured from the op's ORIGINAL
+/// `enqueued_at`, preserved verbatim across `reset()` (`magnetar-proto/src/conn.rs`, the
+/// `in_flight_publish_snapshots` sweep). So the whole `docker restart` → JVM boot → namespace load
+/// → `rebuild_producers` → `CommandSendReceipt` cycle has to fit inside it. At the 30 s default it
+/// often does not, and the relocated publishes correctly time out with
+/// `SendRejected { code: -1, message: "send timeout" }` — a test-budget bug, not a client defect.
+///
+/// Measured 2026-07-30 on a 20-core / 62 GiB workstation, 33 runs of
+/// `e2e_transparent_inflight_publish_replay_across_broker_restart` across five escalating load
+/// profiles, timing enqueue → last `SendFut` resolution:
+///
+/// | Load profile                                            | Runs | Min    | Max    |
+/// | ------------------------------------------------------- | ---- | ------ | ------ |
+/// | 40 CPU busy loops                                       | 1    | 15.1 s | 15.1 s |
+/// | 40 CPU + 3 sibling Pulsar JVMs + rebuild loop           | 6    | 17.0 s | 19.0 s |
+/// | 160 CPU + 8 sibling Pulsar JVMs + rebuild loop          | 4    | 17.8 s | 19.1 s |
+/// | 80 CPU + 6 siblings + 8 fsync storms                    | 6    | 17.4 s | 24.0 s |
+/// | 80 CPU + 6 siblings + 24 fsync storms                   | 6    | 17.2 s | 21.6 s |
+/// | 80 CPU + 6 siblings + 8 fsync storms + a workspace test | 10   | 18.7 s | 25.7 s |
+///
+/// Worst case **25.7 s** — only 14 % under the 30 s default, which is why this flakes. Boot time is
+/// dominated by `ZooKeeper` + `BookKeeper` journal fsyncs, not CPU: saturating the disk moved the
+/// max far more than an 8× CPU oversubscription did.
+///
+/// That 25.7 s is a **lower bound**: no run on this workstation crossed 30 s, so the profile never
+/// reproduced the overrun this test hits on smaller machines. A GitHub `ubuntu-latest` runner has
+/// ~4 cores / 16 GiB (≈5× less CPU, ≈4× less RAM) and keeps the PIP-33 compose fixture resident all
+/// job, so its worst case is materially higher than anything measured here. 90 s is therefore 3.5×
+/// the measured worst case rather than the 2× a captured tail would justify.
+///
+/// A later run under a deliberately over-aggressive profile (11 Pulsar JVMs resident on the host at
+/// once) had a publish still unresolved **59.6 s** after enqueue. That one is NOT a
+/// successful-replay measurement — it ended in `PeerClosed` because the broker JVM itself died,
+/// which is a dead broker rather than a slow one, and no publish budget can or should absorb that.
+/// It is still the sharpest evidence for this number: the window demonstrably reaches well past 2×
+/// the table maximum above, and a 50 s budget (what the literal 2×-the-worst-case rule would have
+/// picked) would have fired a spurious `send timeout` there.
+///
+/// Only `e2e_transparent_inflight_publish_replay_across_broker_restart` actually holds a `SendFut`
+/// across the restart; the other broker-restart tests here wrap every publish in a 10 s
+/// `tokio::time::timeout` retry loop that tolerates `Err`, so the default can never fire on a live
+/// future in them today. They carry this const anyway, so that dropping one of those retry loops in
+/// a later refactor cannot silently reintroduce the flake.
+/// `e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint` is the one
+/// deliberate exclusion — it asserts a send *fails*.
+///
+/// Keep this **below** the 2-minute per-send guard in the in-flight-replay test — that guard is the
+/// no-hang backstop, and `send_timeout` must stay the binding deadline so the test still asserts
+/// replay completes in bounded time. Do not raise `operation_timeout` as a substitute: it bounds
+/// broker-operation resolution, not the publish-receipt round trip.
+///
+/// [ADR-0072]: ../../../specs/adr/0072-java-parity-default-send-timeout.md
+const BROKER_RESTART_SEND_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Open a producer carrying the broker-restart publish budget.
+///
+/// Every broker-restart test below opens through this, so [`BROKER_RESTART_SEND_TIMEOUT`] cannot
+/// drift per call site. The one deliberate exception is
+/// `e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoint`, which asserts a
+/// send *fails* and so keeps the 30 s default.
+async fn restart_producer<E: magnetar::Engine>(
+    client: &PulsarClient<E>,
+    topic: &str,
+) -> Result<<E::ClientState as magnetar::CreateProducerApi>::Producer, magnetar::PulsarError>
+where
+    E::ClientState: magnetar::BrokerMetadataApi + magnetar::CreateProducerApi,
+{
+    client
+        .producer(topic)
+        .send_timeout(BROKER_RESTART_SEND_TIMEOUT)
+        .create()
+        .await
+}
+
 fn image_repo() -> String {
     std::env::var("MAGNETAR_PULSAR_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_IMAGE_REPO.to_owned())
 }
@@ -154,7 +233,7 @@ async fn e2e_supervised_reconnect_across_broker_restart() -> Result<(), Box<dyn 
     );
     let subscription = format!("magnetar-e2e-reconnect-sub-{}", Uuid::new_v4());
 
-    let producer = client.producer(&topic).create().await?;
+    let producer = restart_producer(&client, &topic).await?;
     let consumer = client
         .consumer(&topic)
         .subscription(&subscription)
@@ -282,7 +361,7 @@ async fn e2e_receive_outstanding_across_broker_restart_resolves_not_closed()
     );
     let subscription = format!("magnetar-e2e-recv-across-sub-{}", Uuid::new_v4());
 
-    let producer = client.producer(&topic).create().await?;
+    let producer = restart_producer(&client, &topic).await?;
     let consumer = client
         .consumer(&topic)
         .subscription(&subscription)
@@ -415,7 +494,7 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     );
     let subscription = format!("magnetar-e2e-inflight-sub-{}", Uuid::new_v4());
 
-    let producer = client.producer(&topic).create().await?;
+    let producer = restart_producer(&client, &topic).await?;
     let consumer = client
         .consumer(&topic)
         .subscription(&subscription)
@@ -449,6 +528,9 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
     // broker returns + replays.
     let n: usize = 5;
     let mut send_futs = Vec::with_capacity(n);
+    // `send_timeout` is measured from the ORIGINAL `enqueued_at`, preserved across
+    // replay, so this instant is the base of the budget the assertion below depends on.
+    let replay_t0 = std::time::Instant::now();
     for i in 0..n {
         let p = producer.clone();
         let payload = format!("replay-{i}").into_bytes();
@@ -481,6 +563,15 @@ async fn e2e_transparent_inflight_publish_replay_across_broker_restart()
         let outcome = tokio::time::timeout(Duration::from_mins(2), fut)
             .await
             .unwrap_or_else(|_| panic!("send {i} did not resolve within 2 min"))?;
+        // Logged so a future recalibration of `BROKER_RESTART_SEND_TIMEOUT` can read the
+        // observed replay window straight off a CI run instead of re-instrumenting: this
+        // elapsed is exactly what the budget has to cover.
+        tracing::info!(
+            send = i,
+            elapsed_ms = replay_t0.elapsed().as_millis() as u64,
+            budget_ms = BROKER_RESTART_SEND_TIMEOUT.as_millis() as u64,
+            "in-flight replay resolved"
+        );
         if let Err(e) = outcome.as_ref() {
             panic!("send {i} failed after transparent replay: {e:?}");
         }
@@ -581,7 +672,7 @@ async fn e2e_moonpool_transient_producer_open_retry_across_broker_restart()
         "persistent://public/default/magnetar-e2e-mp-transient-{}",
         Uuid::new_v4()
     );
-    let producer = client.producer(&topic).create().await?;
+    let producer = restart_producer(&client, &topic).await?;
 
     // Sanity round-trip before the restart so we know the session is healthy.
     producer
@@ -700,7 +791,7 @@ async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
         "persistent://public/default/magnetar-e2e-reconnect-warmup-{}",
         Uuid::new_v4()
     );
-    let warmup = client.producer(&warmup_topic).create().await?;
+    let warmup = restart_producer(&client, &warmup_topic).await?;
     warmup
         .send(OutgoingMessage::with_payload(b"warmup".to_vec()).into())
         .await?;
@@ -769,7 +860,7 @@ async fn e2e_subscribe_during_reconnect_reissues_lookup_transparently()
             attempts <= 60,
             "producer create during reconnect did not complete within the attempt budget"
         );
-        match tokio::time::timeout(Duration::from_secs(10), client.producer(&topic).create()).await
+        match tokio::time::timeout(Duration::from_secs(10), restart_producer(&client, &topic)).await
         {
             Ok(Ok(p)) => break p,
             Ok(Err(e)) => {
@@ -873,6 +964,10 @@ async fn e2e_supervisor_gives_up_at_max_attempts_behind_handshake_failing_endpoi
         "persistent://public/default/magnetar-e2e-giveup-{}",
         Uuid::new_v4()
     );
+    // Deliberately NOT `BROKER_RESTART_SEND_TIMEOUT`: this test asserts a send FAILS once
+    // the supervisor exhausts `max_attempts`, so widening the publish budget would work
+    // against its own contract. It never restarts the broker into a live session either —
+    // `docker stop` keeps it down and the only reachable endpoint is the stub.
     let producer = client.producer(&topic).create().await?;
     producer
         .send(OutgoingMessage::with_payload(b"before-giveup".to_vec()).into())
