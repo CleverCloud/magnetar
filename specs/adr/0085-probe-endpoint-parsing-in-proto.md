@@ -1,6 +1,6 @@
 # ADR-0085 — Move health-probe endpoint parsing into `magnetar-proto`
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0087](0087-unify-broker-url-authority-parsers.md) — the accepted IPv6 limitation below is closed, and the scope boundary is lifted)
 - **Date**: 2026-07-29
 - **Decider**: Florentin Dubois
 - **Tags**: pip-121, ha, failover, sans-io, health-probe, bit-flip-survivability, robustness

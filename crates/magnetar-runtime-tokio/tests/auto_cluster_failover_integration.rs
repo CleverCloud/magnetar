@@ -274,6 +274,37 @@ fn tokio_probe_authority_rejects_empty_input() {
     assert!(!verdict, "empty endpoint must read unhealthy");
 }
 
+/// A recognised scheme with **no authority behind it** must read unhealthy at
+/// integration scope too.
+///
+/// This is the endpoint class ADR-0085's ordering fix covers: the
+/// empty-authority check has to run *before* default-port synthesis, or
+/// `"pulsar://"` yields the garbage authority `":6650"` and the probe dials it.
+/// ADR-0087 then made the same class an `Err` on moonpool's
+/// `proxy_broker_authority`, which had no such check and returned `Ok(":6650")`.
+///
+/// **The verdict is a weak witness here** — `":6650"` does not resolve either,
+/// so a pre-fix build also read unhealthy. What this adds over the in-src
+/// `tokio_probe_authority_rejects_empty_input` is integration scope: the
+/// contract holds through the crate's public re-export surface, and the probe
+/// resolves promptly rather than hanging. The witnesses that actually
+/// discriminate are the tracing assertions in `tests/probe_corrupted_scheme.rs`
+/// and `tests/probe_portless_ipv6.rs`.
+#[test]
+fn tokio_probe_authority_rejects_scheme_only_endpoint() {
+    let probe = TokioHealthProbe::new();
+    for endpoint in ["pulsar://", "pulsar+ssl://"] {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let verdict = futures_lite_block_on(async {
+            poll_fn(|cx| probe.poll_probe(endpoint, deadline, cx)).await
+        });
+        assert!(
+            !verdict,
+            "'{endpoint}' has no authority to dial and must read unhealthy",
+        );
+    }
+}
+
 /// Live-listener probe — confirms the integration of `poll_probe` + the
 /// internal tokio task slab against an OS-bound listener. Mirrors the
 /// in-module unit test of the same name; running it through the

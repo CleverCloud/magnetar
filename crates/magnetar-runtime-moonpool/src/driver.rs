@@ -1306,34 +1306,36 @@ where
     }
 }
 
-/// Parse a `pulsar://host:port` / `pulsar+ssl://host:port` URL into its
-/// `host:port` authority. Returns `None` for unrecognised schemes or
-/// malformed inputs. Kept inline (no `url` dep) since the moonpool engine
-/// otherwise doesn't pull in `url`; matches the level of robustness Java's
-/// `ServiceUrlProvider` requires (callers are trusted).
+/// Parse a `pulsar://host:port` / `pulsar+ssl://host:port` service URL into its
+/// `host:port` authority. Returns `None` for unrecognised schemes or malformed
+/// inputs.
+///
+/// # Stricter than [`magnetar_proto::probe_authority`], on purpose
+///
+/// A scheme is **mandatory** here: this parses a
+/// [`magnetar_proto::ServiceUrlProvider`] URL, which is configuration rather
+/// than a broker-advertised value, so a bare `host:port` is a configuration
+/// error and must stay `None`. `probe_authority` deliberately tolerates the
+/// bare form because a broker may advertise it.
+///
+/// So the scheme requirement and the query/fragment trim are enforced here,
+/// and only then is the scheme-strip + default-port decision delegated. That
+/// keeps this call site's contract intact while removing the last independent
+/// copy of the shared rule (ADR-0087): before, this function carried its own
+/// copy, and its comment conceded it could not "tell the schemes apart
+/// cheaply" so it re-derived the default port from a second `starts_with`
+/// pass. It also shared the port-less bracketed IPv6 gap — `pulsar://[::1]`
+/// got no port — which delegation closes here too.
+///
+/// [ADR-0087]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0087-unify-broker-url-authority-parsers.md
 fn strip_url_to_host_port(raw: &str) -> Option<String> {
-    let rest = raw
-        .strip_prefix("pulsar://")
-        .or_else(|| raw.strip_prefix("pulsar+ssl://"))?;
-    // Trim path / query / fragment if any.
-    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    if rest.is_empty() {
+    if !raw.starts_with("pulsar://") && !raw.starts_with("pulsar+ssl://") {
         return None;
     }
-    // Default ports when none provided (matches `Scheme::default_port` in the tokio
-    // engine — plain → 6650, tls → 6651). We can't tell the schemes apart cheaply
-    // here without re-parsing, so default to 6650 (plaintext); tests / production
-    // configs typically include the port.
-    if rest.contains(':') {
-        Some(rest.to_owned())
-    } else {
-        let default_port = if raw.starts_with("pulsar+ssl://") {
-            6651
-        } else {
-            6650
-        };
-        Some(format!("{rest}:{default_port}"))
-    }
+    // `probe_authority` trims trailing path segments but not query / fragment,
+    // which only service URLs carry — so that stays local.
+    let trimmed = raw.split(['?', '#']).next().unwrap_or(raw);
+    magnetar_proto::probe_authority(trimmed)
 }
 
 /// The driver loop.
@@ -2584,8 +2586,51 @@ mod tests {
         );
     }
 
+    /// The scheme requirement is this parser's whole reason for not being
+    /// `probe_authority` (ADR-0087): it reads a `ServiceUrlProvider` URL, which
+    /// is configuration, so a scheme-less authority is a config error rather
+    /// than something to tolerate. Delegating the scheme-strip must not relax
+    /// that — `probe_authority` on its own would happily accept every input
+    /// below.
     #[test]
     fn strip_url_to_host_port_rejects_unknown_scheme() {
         assert!(strip_url_to_host_port("http://broker:6650").is_none());
+        // Scheme-less forms `probe_authority` accepts and this parser must not.
+        assert!(
+            strip_url_to_host_port("broker:6650").is_none(),
+            "a bare host:port is a service-URL configuration error, not a value to dial",
+        );
+        assert!(strip_url_to_host_port("broker").is_none());
+        // Near-misses on the scheme word.
+        assert!(strip_url_to_host_port("ptlsar://broker:6650").is_none());
+        assert!(strip_url_to_host_port("pulsarx://broker:6650").is_none());
+        // Scheme present but no authority behind it.
+        assert!(strip_url_to_host_port("pulsar://").is_none());
+    }
+
+    /// Regression test for ADR-0087. This parser shared the port-less
+    /// bracketed-IPv6 gap with the three others: its `rest.contains(':')` test
+    /// saw the address colons of `[::1]` and skipped the default port, so the
+    /// supervisor got a port-less authority the transport could not dial.
+    #[test]
+    fn strip_url_to_host_port_defaults_port_for_portless_bracketed_ipv6() {
+        assert_eq!(
+            strip_url_to_host_port("pulsar://[::1]").as_deref(),
+            Some("[::1]:6650"),
+        );
+        assert_eq!(
+            strip_url_to_host_port("pulsar+ssl://[2001:db8::1]").as_deref(),
+            Some("[2001:db8::1]:6651"),
+        );
+        // An explicit port still wins, and the query trim this parser keeps
+        // locally still runs ahead of the port question.
+        assert_eq!(
+            strip_url_to_host_port("pulsar://[::1]:6700").as_deref(),
+            Some("[::1]:6700"),
+        );
+        assert_eq!(
+            strip_url_to_host_port("pulsar://[::1]?tls=false").as_deref(),
+            Some("[::1]:6650"),
+        );
     }
 }

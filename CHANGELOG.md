@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Port-less bracketed IPv6 broker URLs now get the scheme's default port, and an empty broker-advertised authority is rejected instead of reaching the wire:** the "strip `pulsar://` / `pulsar+ssl://`, trim the path, synthesise the default port" rule existed in four hand-rolled copies — `magnetar_proto::probe_authority`, `proxy_broker_authority` / `direct_broker_authority` (`magnetar-runtime-moonpool`), and `strip_url_to_host_port` (same crate's driver). They agreed only because each had been written to match, which is the arrangement that produced the ADR-0085 defect in the first place.
+  Two bugs followed from the duplication rather than from any one copy.
+  First, default-port synthesis triggered on "the authority contains no `:`" — never true of a bracketed IPv6 literal, whose colons belong to the address — so `pulsar://[::1]` yielded the port-less `"[::1]"` and every dialer rejected it. It now yields `[::1]:6650` (and `pulsar+ssl://[2001:db8::1]` yields `[2001:db8::1]:6651`), so a health probe, a `ServiceUrlProvider` service URL, and a broker-advertised lookup response carrying that shape all resolve correctly. ADR-0085 had recorded this as an accepted limitation, deliberately inherited so the copies could not diverge; `strip_url_to_host_port` shared it independently.
+  Second, `proxy_broker_authority` had no empty-authority check at all, so `""` returned `Ok("")` and `"pulsar://"` returned `Ok(":6650")` — fabricated authorities that went on to the wire in `CommandConnect.proxy_to_broker_url`. Both are now `Err`. This is the same class of defect as issue #364 and survived that fix because the reference sweep looked for scheme truncation rather than for a missing emptiness guard.
+  The three duplicates now delegate to `probe_authority`; `strip_url_to_host_port` keeps its stricter contract (a scheme is mandatory, so a bare `host:port` is still `None`) by gating locally before delegating. `magnetar_runtime_tokio::client::parse_direct_broker_url` keeps its own `url`-crate parse — a `ParsedUrl` struct return is a different seam — and instead gained a table-driven equivalence audit pinning where it agrees with `probe_authority` and where it deliberately diverges.
+  A bracketed authority with an unterminated bracket (`pulsar://[::1`) still gets no synthesised port; the unrecognised-scheme rejection, bare-`host:port` pass-through and trailing-path trimming are unchanged.
+  (docs/follow-ups.md §8; ADR-0087, amends ADR-0085)
+
 - **Latency histograms are now stamped from the injected clock, so moonpool's are reproducible per seed:** `ConsumerState::pop_message` recorded `msg.arrived_at.elapsed()` and `ProducerState::apply_receipt` recorded `op.enqueued_at.elapsed()` — host-clock reads inside the sans-io core, in violation of ADR-0011.
   Both _write_ ends were already injected (`arrived_at` from `ConsumerState::deliver`'s `now`, `enqueued_at` from `queue_send`'s), so only the read side leaked.
   The consequence under simulation was worse than noise: virtual time outruns host time in `SimProviders`, so `elapsed()` saturated to `0` on essentially every sample and the receive/send-latency percentiles were the one part of `ConsumerStats` / `ProducerStats` carrying no signal at all — three test files had grown explicit workarounds for it, including a `seed_deterministic_latency` helper in the differential suite that overwrote each histogram with a synthetic distribution before comparing.
@@ -41,6 +49,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   The write is now its own bounded, cancellation-safe `select!` arm (after read and the waker, before the timer), capped by both `DRIVER_WRITE_BUDGET_BYTES` and `Connection::operation_timeout()` (30s default; NOT `keepalive_interval`, which only detects read-side silence).
   Expiry is treated as an I/O failure routed through the same `mark_disconnected()` path every other write error already takes, so the auto-reconnect supervisor redials exactly as it does for any other write failure, instead of the connection wedging as still-connected forever.
   (#370; ADR-0083, amends ADR-0070 and ADR-0074)
+
+### Changed
+
+- **The moonpool engine's broker-URL rejection message now names the accepted shapes instead of asserting an unrecognised scheme.** `proxy_broker_authority` / `direct_broker_authority` previously emitted `broker-advertised URL '<url>' carries an unrecognised scheme (expected 'pulsar://' or 'pulsar+ssl://'); refusing to derive a proxy authority from it` for their single rejection case.
+  Delegating the parse to `magnetar_proto::probe_authority` folds three rejection classes into one — unrecognised scheme, empty input, and a scheme with no authority behind it — and the old wording would have been actively misleading on the two new ones (`''` does not carry an unrecognised scheme).
+  The message is now `broker-advertised URL '<url>' is not a usable authority (expected 'pulsar://host[:port]', 'pulsar+ssl://host[:port]', or a bare 'host:port'); refusing to derive a proxy authority from it`.
+  The error type is unchanged (`ClientError::Other`), so only log-scraping on the old string is affected; the tokio engine's own `parse_direct_broker_url` message is untouched.
+  (ADR-0087)
 
 ## [1.2.3] - 2026-07-20
 

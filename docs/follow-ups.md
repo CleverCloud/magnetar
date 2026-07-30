@@ -20,11 +20,11 @@ See [ADR-0086](../specs/adr/0086-inject-now-into-proto-latency-recording.md) for
 
 Status tags: ⚡ ready to dispatch · 🔗 blocked on external dep · ⏳ blocked on upstream PIP release · 🧠 needs design decision · 🟡 deferred (not load-bearing).
 
-| #   | Item                                                                                                            | Status                                                                                           |
-| --- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                                   | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
-| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)                 | 🧠 needs design decision on the fan-out surface                                                  |
-| 8   | [Broker-URL authority parsers are not unified on `probe_authority`](#8-broker-url-authority-parser-unification) | 🟡 deferred (not load-bearing)                                                                   |
+| #   | Item                                                                                                       | Status                                                                                           |
+| --- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1   | [PIP-460 scalable-topics e2e](#1-pip-460-scalable-topics-e2e)                                              | ⏳ scaffold in place; stub bodies trivially pass; flesh out once a Pulsar 5.0 RC carries PIP-460 |
+| 2   | [Wrapper consumers/producers cannot drive `record_rate_window`](#2-wrapper-rate-window-fan-out)            | 🧠 needs design decision on the fan-out surface                                                  |
+| 8   | [Broker-URL authority parser unification — residual](#8-broker-url-authority-parser-unification--residual) | 🟡 deferred (three of four parsers unified; `parse_direct_broker_url` audited, not unified)      |
 
 ---
 
@@ -54,34 +54,32 @@ Discovered while writing `crates/magnetar/tests/e2e_aggregate_stats.rs`; the sin
 
 ---
 
-## 8. Broker-URL authority parser unification
+## 8. Broker-URL authority parser unification — residual
 
-**Gap.** [ADR-0085](../specs/adr/0085-probe-endpoint-parsing-in-proto.md) single-sourced the **health-probe** endpoint parse into `magnetar_proto::probe_authority`, but two sibling parsers with the same arm-for-arm shape still live in `crates/magnetar-runtime-moonpool/src/client.rs`: `proxy_broker_authority` and `direct_broker_authority`.
-All three now agree on behaviour — reject an unrecognised `"://"` scheme, synthesise the scheme default port, pass a bare `host:port` through — but they agree by having been written to match, not by construction.
-That is exactly the arrangement that produced the ADR-0085 defect in the first place: two copies of one rule, drifting silently.
+**Closed.** The three parsers that re-implemented `magnetar_proto::probe_authority`'s rule arm-for-arm now delegate to it: `proxy_broker_authority` / `direct_broker_authority` (`crates/magnetar-runtime-moonpool/src/client.rs`) and `strip_url_to_host_port` (`crates/magnetar-runtime-moonpool/src/driver.rs`, which gates its mandatory scheme and its `?` / `#` trim locally, then delegates, so it keeps its stricter contract without keeping a copy of the rule).
+That also closed the shared port-less bracketed-IPv6 gap and an empty-authority hole in `proxy_broker_authority` that let `""` and `"pulsar://"` reach `CommandConnect.proxy_to_broker_url` as `""` and `":6650"`.
+See [ADR-0087](../specs/adr/0087-unify-broker-url-authority-parsers.md) for the post-implementation reference.
 
-Concretely, the shared limitation they must keep in lockstep is the port-less bracketed IPv6 case (`pulsar://[::1]` gets no synthesised port, because the synthesis triggers on "authority contains no `:`").
-Fixing it in one place without the other is precisely the drift this entry exists to prevent.
+**Remaining.** `magnetar_runtime_tokio::client::parse_direct_broker_url` is a fifth application of the same rule, and stays independent.
+It parses via the `url` crate into `ParsedUrl { host, port }` rather than producing a `host:port` string, so folding it in would mean either giving up the struct return or wrapping `probe_authority` and re-splitting its output — trading a real seam for a cosmetic one.
 
-**Full site inventory** (from the `strip_prefix("pulsar` sweep run while landing ADR-0085), so a unifier does not merge parsers that are deliberately different:
+It is **audited rather than unified**: `parse_direct_broker_url_agrees_with_probe_authority` is a table-driven test pinning, row by row, where the two agree and where they deliberately diverge (a scheme-less input takes the _bootstrap_ scheme's default port here but passes through port-less in `probe_authority`; a malformed bracket like `pulsar://[::1` is rejected by `url` but returned verbatim by `probe_authority`).
+So a divergence can still be introduced, but not without editing a table that states the rationale.
 
-| Site                                                                                           | Contract                                                                              | Unify?                                                                                                                                                                                                                                                                                          |
-| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `magnetar_proto::probe_authority`                                                              | scheme optional; bare `host:port` accepted; default port synthesised                  | canonical — the target                                                                                                                                                                                                                                                                          |
-| `magnetar-runtime-moonpool/src/client.rs` `proxy_broker_authority` / `direct_broker_authority` | same rules, `Result<_, ClientError>`                                                  | **yes** — this entry                                                                                                                                                                                                                                                                            |
-| `magnetar-runtime-moonpool/src/driver.rs` `strip_url_to_host_port`                             | scheme **required** (a bare `host:port` returns `None`); also trims `?` / `#`         | **no** — stricter on purpose (service URLs must carry a scheme). Already correct: it uses `?` on the `strip_prefix` chain, never `unwrap_or`, so it has never had the ADR-0085 defect.                                                                                                          |
-| `magnetar-proto/src/conn_types.rs` `extract_pulsar_host`                                       | returns the **host only**, no port; IPv6-bracket carve-out                            | **no** — different job (allow-list host matching, ADR-0044 redirect gate)                                                                                                                                                                                                                       |
-| `magnetar-runtime-tokio/src/client.rs` `parse_direct_broker_url`                               | returns `ParsedUrl { host, port }`, not an authority string; `Result<_, ClientError>` | **maybe** — it grew its own `broker_url.contains("://")` guard when the tokio DIRECT-path gap was closed, so the reject rule now has a fifth independent copy. Worth folding in, but it parses to a struct rather than a `host:port` string, so it needs a different seam than the other three. |
+One cosmetic residual inside it: its rejection message says an input "carries an unrecognised scheme" even for `"pulsar://"`, whose actual fault is the missing authority — the same imprecision ADR-0087 fixed on the moonpool side.
+Left alone deliberately, since changing it is a user-visible text change with no correctness content.
 
-**Why it stays open.** Not a behavioural bug — it is a duplication that is currently correct, so the payoff is drift prevention rather than a fix.
-The two client-side parsers return `Result<String, ClientError>` with caller-specific error text and sit on the lookup/routing path, whose blast radius (a corrupted value reaching `CommandConnect.proxy_to_broker_url` on the wire, per issue #364) differs from a probe verdict.
-Unifying them means either threading a proto-level error type into `ClientError` or having the callers map `None` to their own message, plus re-validating the routing path — wider than the probe hardening that surfaced it.
+**Why the residual stays open.** No behavioural bug and no drift that a test cannot see; closing it is an API-shape question (does the DIRECT path want an authority string or a parsed struct?) rather than a correctness one.
 
-**`/goal`.**
+**Site inventory**, kept so a future unifier does not merge parsers that are deliberately different:
 
-```text
-/goal unify the broker-URL authority parsers per docs/follow-ups.md §8: refactor proxy_broker_authority and direct_broker_authority in crates/magnetar-runtime-moonpool/src/client.rs to delegate their scheme/port parsing to magnetar_proto::probe_authority (added by ADR-0085) rather than each re-implementing the same arms, mapping None to the existing ClientError::Other messages so the caller-visible error text and the routing-path behaviour are unchanged. Prove equivalence with a table-driven test covering every input class both functions already pin (recognised schemes, unrecognised scheme, bare host:port, default-port synthesis, port-less bracketed IPv6), then close the shared port-less-IPv6 limitation in probe_authority so all three parsers gain the fix at once. Ship the ADR-0024 four-layer test set. Validation chain per CLAUDE.md.
-```
+| Site                                                                                           | Contract                                                                              | Status                                                                                                                                            |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `magnetar_proto::probe_authority`                                                              | scheme optional; bare `host:port` accepted; default port synthesised                  | canonical — the single implementation                                                                                                             |
+| `magnetar-runtime-moonpool/src/client.rs` `proxy_broker_authority` / `direct_broker_authority` | same rules, `Result<_, ClientError>`                                                  | **unified** (ADR-0087) — delegates, maps `None` to one `ClientError::Other`                                                                       |
+| `magnetar-runtime-moonpool/src/driver.rs` `strip_url_to_host_port`                             | scheme **required** (a bare `host:port` returns `None`); also trims `?` / `#`         | **unified** (ADR-0087) — gates its stricter contract locally, then delegates                                                                      |
+| `magnetar-proto/src/conn_types.rs` `extract_pulsar_host`                                       | returns the **host only**, no port; IPv6-bracket carve-out                            | **no** — different job (allow-list host matching, ADR-0044 redirect gate)                                                                         |
+| `magnetar-runtime-tokio/src/client.rs` `parse_direct_broker_url`                               | returns `ParsedUrl { host, port }`, not an authority string; `Result<_, ClientError>` | **audited, not unified** — this residual; equivalence pinned by `parse_direct_broker_url_agrees_with_probe_authority` rather than by construction |
 
 ---
 
@@ -94,5 +92,5 @@ The expected churn:
 2. Agent team picks up the `/goal …` block in a fresh session.
 3. PR merges → entry removed (the ADR / docs file carries the post-implementation reference); partially-closed items are trimmed to their remaining residual.
 
-§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is a drift-prevention refactor with no behavioural bug behind it.
+§1 is a fully external blocker (the PIP-460 e2e flesh-out waits on a Pulsar 5.0 RC carrying PIP-460); §2 waits on a fan-out API design call; §8 is trimmed to one audited-not-unified parser whose closure is an API-shape question.
 Numbering is stable, not contiguous: closed items are removed and their number is retired rather than reused, so a `§N` reference in a commit, ADR, or code comment keeps pointing at the same item forever.
