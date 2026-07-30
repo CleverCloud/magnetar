@@ -533,6 +533,10 @@ mod tests {
     #[test]
     fn tokio_probe_authority_rejects_empty_input() {
         assert_eq!(TokioHealthProbe::authority(""), None);
+        // A scheme with no authority behind it must reject too, NOT synthesise
+        // the garbage authority `":6650"` from an empty host.
+        assert_eq!(TokioHealthProbe::authority("pulsar://"), None);
+        assert_eq!(TokioHealthProbe::authority("pulsar+ssl://"), None);
     }
 
     /// Regression test for ADR-0085.
@@ -565,6 +569,28 @@ mod tests {
         assert_eq!(
             TokioHealthProbe::authority("pulsar+ssl://broker.local"),
             Some("broker.local:6651".to_owned()),
+        );
+    }
+
+    /// ADR-0087: the port-less bracketed IPv6 form gets its default port too,
+    /// closing the one limitation ADR-0085 accepted. 1:1 twin of moonpool's
+    /// `moonpool_probe_authority_synthesises_default_port_for_bracketed_ipv6` —
+    /// the point of both is that neither engine can gain or lose this
+    /// independently, since `authority()` is a delegation on both sides.
+    #[test]
+    fn tokio_probe_authority_synthesises_default_port_for_bracketed_ipv6() {
+        assert_eq!(
+            TokioHealthProbe::authority("pulsar://[::1]"),
+            Some("[::1]:6650".to_owned()),
+        );
+        assert_eq!(
+            TokioHealthProbe::authority("pulsar+ssl://[2001:db8::1]"),
+            Some("[2001:db8::1]:6651".to_owned()),
+        );
+        // The ported form was always correct and must stay so.
+        assert_eq!(
+            TokioHealthProbe::authority("pulsar://[::1]:6650"),
+            Some("[::1]:6650".to_owned()),
         );
     }
 

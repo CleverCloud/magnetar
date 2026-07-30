@@ -100,6 +100,7 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// | `host:port` (no scheme)            | `Some("host:port")`          |
 /// | `pulsar://host` (no port)          | `Some("host:6650")`          |
 /// | `pulsar+ssl://host` (no port)      | `Some("host:6651")`          |
+/// | `pulsar://[::1]` (no port)         | `Some("[::1]:6650")`         |
 /// | anything else containing `"://"`   | `None`                       |
 /// | empty authority                    | `None`                       |
 ///
@@ -118,15 +119,26 @@ pub trait HealthProbe: Send + Sync + Debug {
 /// endpoint that cannot be parsed is reported unhealthy, so a corrupted URL
 /// costs one probe verdict and zero I/O.
 ///
-/// # Known limitation — port-less bracketed IPv6
+/// # Bracketed IPv6 literals
 ///
-/// The default-port synthesis triggers on "the authority contains no `:`",
-/// so a bracketed IPv6 literal with no port (`pulsar://[::1]`) keeps its
-/// colons and gets NO synthesised port. This is inherited deliberately from
-/// `magnetar_runtime_moonpool`'s `proxy_broker_authority`, whose behaviour
-/// this function mirrors arm-for-arm; a one-sided divergence between the two
-/// would be worse than the shared gap. `pulsar://[::1]:6650` (the form that
-/// actually appears in deployments) round-trips correctly.
+/// A bracketed IPv6 literal is full of colons that belong to the *address*, so
+/// "does this authority already carry a port?" cannot be answered with
+/// `contains(':')` — that test reports "already ported" for `[::1]` and
+/// suppresses the synthesis. The private `authority_has_explicit_port` answers
+/// it properly: for a bracketed authority the port, when present, follows the
+/// closing `]`. (Named without an intra-doc link on purpose — it is private, and
+/// linking it from this public item trips `rustdoc::private_intra_doc_links`
+/// under the workspace's `RUSTDOCFLAGS="-D warnings"`.)
+///
+/// Until ADR-0087 this function (and the three parsers now delegating to it)
+/// shared the naive test, so `pulsar://[::1]` got no port and the dialer
+/// rejected it. That was ADR-0085's one documented limitation; closing it in
+/// one place closed it for every caller at once, which is the whole point of
+/// the parse living here.
+///
+/// An **unterminated** bracket (`pulsar://[::1`) is malformed and gets no
+/// synthesised port either — appending one to a string we cannot parse would
+/// only fabricate a different kind of garbage.
 ///
 /// # Sans-io
 ///
@@ -161,9 +173,39 @@ pub fn probe_authority(endpoint: &str) -> Option<String> {
     }
 
     Some(match default_port {
-        Some(port) if !host_port.contains(':') => format!("{host_port}:{port}"),
+        Some(port) if !authority_has_explicit_port(host_port) => format!("{host_port}:{port}"),
         _ => host_port.to_owned(),
     })
+}
+
+/// Does `authority` already carry an explicit `:port`?
+///
+/// The naive answer — `authority.contains(':')` — is wrong for a bracketed
+/// IPv6 literal, whose colons belong to the address: it reports `true` for
+/// `[::1]` and so suppresses [`probe_authority`]'s default-port synthesis,
+/// yielding a port-less authority every dialer rejects. In a bracketed
+/// authority the port, when present, always follows the closing `]`.
+///
+/// An unterminated bracket (`[::1`) is malformed; report `true` so no port is
+/// appended to a string we cannot parse. That keeps such input byte-identical
+/// to what this function returned before the bracket handling existed — the
+/// caller's dialer rejects it either way, and inventing `[::1:6650` would just
+/// swap one unusable authority for another.
+///
+/// Not a `Host`/`Authority` type: `magnetar-proto` parses this by hand to keep
+/// its zero-I/O dependency surface (see the [`probe_authority`] `# Sans-io`
+/// section).
+fn authority_has_explicit_port(authority: &str) -> bool {
+    if authority.starts_with('[') {
+        // `rfind` rather than `find`: the closing bracket of the literal is the
+        // LAST one, so a nested-looking `[[::1]]` still measures from the end.
+        match authority.rfind(']') {
+            Some(close) => authority[close + 1..].starts_with(':'),
+            None => true,
+        }
+    } else {
+        authority.contains(':')
+    }
 }
 
 #[cfg(test)]
@@ -402,11 +444,18 @@ mod tests {
         );
     }
 
-    /// Pins the documented limitation rather than leaving it to chance: a
-    /// bracketed IPv6 literal already contains `:`, so no default port is
-    /// synthesised for the port-less form. The ported form round-trips.
+    /// Regression test for ADR-0087, which closed the one limitation ADR-0085
+    /// accepted: a port-less bracketed IPv6 literal now gets the scheme's
+    /// default port like any other port-less host.
+    ///
+    /// The third assertion is the red/green witness. It previously read
+    /// `Some("[::1]")` — under the name
+    /// `probe_authority_leaves_bracketed_ipv6_untouched`, whose whole job was
+    /// to pin the gap as a recorded decision. Reverting
+    /// [`authority_has_explicit_port`] to `contains(':')` turns it red.
     #[test]
-    fn probe_authority_leaves_bracketed_ipv6_untouched() {
+    fn probe_authority_synthesises_default_port_for_bracketed_ipv6() {
+        // An explicit port still wins, on both schemes.
         assert_eq!(
             probe_authority("pulsar://[::1]:6650"),
             Some("[::1]:6650".to_owned()),
@@ -415,8 +464,28 @@ mod tests {
             probe_authority("pulsar+ssl://[2001:db8::1]:6651"),
             Some("[2001:db8::1]:6651".to_owned()),
         );
-        // Documented gap: no port is appended here (see the fn doc comment).
-        assert_eq!(probe_authority("pulsar://[::1]"), Some("[::1]".to_owned()));
+        // The closed gap: the port-less form now resolves to the scheme default
+        // instead of staying port-less and being rejected by the dialer.
+        assert_eq!(
+            probe_authority("pulsar://[::1]"),
+            Some("[::1]:6650".to_owned()),
+            "a port-less bracketed IPv6 literal must take the scheme default port",
+        );
+        assert_eq!(
+            probe_authority("pulsar+ssl://[2001:db8::1]"),
+            Some("[2001:db8::1]:6651".to_owned()),
+        );
+        // A trailing path is trimmed before the port question is asked.
+        assert_eq!(
+            probe_authority("pulsar://[::1]/admin/v2"),
+            Some("[::1]:6650".to_owned()),
+        );
+        // Malformed — unterminated bracket. No port is invented; the input is
+        // returned as-is, exactly as before the bracket handling existed.
+        assert_eq!(probe_authority("pulsar://[::1"), Some("[::1".to_owned()));
+        // Scheme-less: there is no scheme to take a default from, so the
+        // bracket handling must not start synthesising one here either.
+        assert_eq!(probe_authority("[::1]"), Some("[::1]".to_owned()));
     }
 
     #[test]

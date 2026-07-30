@@ -1507,41 +1507,49 @@ impl Drop for RequestFut {
 /// `ServerError.ServiceNotReady "Target broker cannot be validated"` (ADR-0039,
 /// parity with Java client + pulsar-rs + the tokio engine).
 ///
-/// Mirrors `magnetar_runtime_tokio::client::preferred_broker_url` in scheme-strip
-/// shape (moonpool prefers `broker_service_url` where tokio's TLS-posture pick
-/// differs — see [`Client::lookup_topic_target_with_operation_deadline`]) but
-/// **not** in error behaviour on an unrecognised scheme: `preferred_broker_url`
-/// warns and forwards the raw string unchanged (relying on the downstream proxy's
-/// `validateBrokerTarget()` to reject it), which this helper deliberately does
-/// NOT copy. A single-bit corruption of the `pulsar` scheme word (e.g.
-/// `"ptlsar://broker:6650"`, issue #364) previously matched NEITHER
-/// `strip_prefix` arm and fell through to the bare-`host:port` branch below,
-/// where naive `split('/')` truncated it into the nonsense authority
-/// `"ptlsar:"` — silently corrupting the value sent to the proxy on
-/// `CommandConnect.proxy_to_broker_url` instead of failing the lookup. Reject
-/// explicitly instead: any input containing `"://"` that isn't a recognised
-/// Pulsar scheme is a scheme error, not a bare-authority input, and must not
-/// reach the naive host:port split. A **bare** `host:port` with no `"://"` at
-/// all (no scheme prefix whatsoever) is still accepted unchanged — that shape
-/// is a legitimate, tested input (see
+/// # Where the parse lives
+///
+/// The scheme-strip / default-port rule is **not** implemented here. It lives
+/// in [`magnetar_proto::probe_authority`], which this function wraps with the
+/// caller-specific error type. Until ADR-0087 this body carried its own copy
+/// of that rule, arm for arm, agreeing with the other three copies only
+/// because each had been written to match — the arrangement that produced the
+/// ADR-0085 defect in the first place, where two copies of one rule rotted in
+/// lockstep and no cross-engine differential test could see it.
+///
+/// Consequences of delegating, beyond the drift itself:
+///
+/// - A port-less bracketed IPv6 literal (`pulsar://[::1]`) now gets the scheme default port. The
+///   local copy shared ADR-0085's documented gap here; closing it in `probe_authority` closed it
+///   for every caller at once.
+/// - `""` and `"pulsar://"` are now `Err`. The local copy had no empty-authority check, so they
+///   returned `Ok("")` and `Ok(":6650")` — values that went on to the wire in
+///   `CommandConnect.proxy_to_broker_url`.
+///
+/// Mirrors `magnetar_runtime_tokio::client::preferred_broker_url` in
+/// scheme-strip shape (moonpool prefers `broker_service_url` where tokio's
+/// TLS-posture pick differs — see
+/// [`Client::lookup_topic_target_with_operation_deadline`]) but **not** in
+/// error behaviour: `preferred_broker_url` warns and forwards an unrecognised
+/// scheme unchanged, relying on the downstream proxy's
+/// `validateBrokerTarget()` to reject it, which this helper deliberately does
+/// NOT copy. A **bare** `host:port` carrying no `"://"` at all stays accepted
+/// unchanged — a legitimate, tested input (see
 /// `proxy_broker_authority_passes_through_bare_host_port`), not a corruption.
+///
+/// [ADR-0085]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0085-probe-endpoint-parsing-in-proto.md
+/// [ADR-0087]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0087-unify-broker-url-authority-parsers.md
 fn proxy_broker_authority(input: &str) -> Result<String, ClientError> {
-    let (rest, default_port) = if let Some(rest) = input.strip_prefix("pulsar+ssl://") {
-        (rest, Some(6651u16))
-    } else if let Some(rest) = input.strip_prefix("pulsar://") {
-        (rest, Some(6650u16))
-    } else if input.contains("://") {
-        return Err(ClientError::Other(format!(
-            "broker-advertised URL '{input}' carries an unrecognised scheme (expected \
-             'pulsar://' or 'pulsar+ssl://'); refusing to derive a proxy authority from it"
-        )));
-    } else {
-        (input, None)
-    };
-    let host_port = rest.split('/').next().unwrap_or(rest);
-    Ok(match default_port {
-        Some(port) if !host_port.contains(':') => format!("{host_port}:{port}"),
-        _ => host_port.to_owned(),
+    magnetar_proto::probe_authority(input).ok_or_else(|| {
+        // One message for every rejection class `probe_authority` folds into
+        // `None` — unrecognised scheme, empty input, scheme with no authority.
+        // The text it replaced asserted "carries an unrecognised scheme", which
+        // is simply false for `""`.
+        ClientError::Other(format!(
+            "broker-advertised URL '{input}' is not a usable authority (expected \
+             'pulsar://host[:port]', 'pulsar+ssl://host[:port]', or a bare 'host:port'); \
+             refusing to derive a proxy authority from it"
+        ))
     })
 }
 
@@ -1874,6 +1882,136 @@ mod tests {
         assert_eq!(
             direct_broker_authority("pulsar+ssl://b-c3-n12").unwrap(),
             "b-c3-n12:6651"
+        );
+    }
+
+    /// Every input class the two helpers pin, in one table, asserted three ways:
+    /// `proxy_broker_authority` == `direct_broker_authority` ==
+    /// [`magnetar_proto::probe_authority`].
+    ///
+    /// This is the equivalence proof for ADR-0087's delegation. The individual
+    /// tests above each pin one arm and would stay green if a future edit
+    /// re-forked a *different* arm back into a local copy; this one goes red for
+    /// any divergence on any row, which is the property the unification is for.
+    ///
+    /// `None` means "rejected" — the helpers map it to `ClientError::Other`,
+    /// whose text this test deliberately does not assert (the mapping is the
+    /// contract; the wording is not).
+    #[test]
+    fn broker_authority_parsers_agree_with_probe_authority() {
+        // (input, expected authority or None for a rejection)
+        const CASES: &[(&str, Option<&str>)] = &[
+            // Recognised schemes, explicit port.
+            ("pulsar://b-c3-n12:6650", Some("b-c3-n12:6650")),
+            ("pulsar+ssl://b-c3-n12:6651", Some("b-c3-n12:6651")),
+            // Default-port synthesis, per scheme.
+            ("pulsar://b-c3-n12", Some("b-c3-n12:6650")),
+            ("pulsar+ssl://b-c3-n12", Some("b-c3-n12:6651")),
+            // An explicit port always wins over the scheme default.
+            ("pulsar://b-c3-n12:7000", Some("b-c3-n12:7000")),
+            // Trailing path segments are trimmed.
+            ("pulsar://b-c3-n12:6650/extra/path", Some("b-c3-n12:6650")),
+            ("pulsar://b-c3-n12/extra/path", Some("b-c3-n12:6650")),
+            // Bare `host:port` — no scheme at all — passes through, and a bare
+            // host has no scheme to take a default port from.
+            ("b-c3-n12:6650", Some("b-c3-n12:6650")),
+            ("b-c3-n12", Some("b-c3-n12")),
+            // Bracketed IPv6, with and without a port (ADR-0087).
+            ("pulsar://[::1]:6650", Some("[::1]:6650")),
+            ("pulsar://[::1]", Some("[::1]:6650")),
+            ("pulsar+ssl://[2001:db8::1]", Some("[2001:db8::1]:6651")),
+            ("[::1]:6650", Some("[::1]:6650")),
+            // Unrecognised schemes are refused, never truncated (ADR-0085).
+            // `ptlsar` is the single-bit corruption of the scheme word that
+            // moonpool-sim's chaos produced for issue #364.
+            ("ptlsar://broker-sim.proxy.internal:6650", None),
+            ("http://broker:8080", None),
+            ("https://broker:8443", None),
+            ("pulsarx://broker:6650", None),
+            // No authority to derive anything from.
+            ("", None),
+            ("pulsar://", None),
+            ("pulsar+ssl://", None),
+        ];
+
+        for (input, expected) in CASES {
+            let proxy = proxy_broker_authority(input);
+            let direct = direct_broker_authority(input);
+            let proto = magnetar_proto::probe_authority(input);
+
+            assert_eq!(
+                proto.as_deref(),
+                *expected,
+                "probe_authority disagrees with the table for {input:?}",
+            );
+            assert_eq!(
+                proxy.as_deref().ok(),
+                *expected,
+                "proxy_broker_authority({input:?}) diverged from probe_authority",
+            );
+            assert_eq!(
+                direct.as_deref().ok(),
+                *expected,
+                "direct_broker_authority({input:?}) diverged from probe_authority",
+            );
+            // Rejections must arrive as `ClientError::Other` on both helpers —
+            // the differential suite classifies on that variant.
+            if expected.is_none() {
+                assert!(
+                    matches!(proxy, Err(ClientError::Other(_))),
+                    "proxy_broker_authority({input:?}) must reject via ClientError::Other, \
+                     got {proxy:?}",
+                );
+                assert!(
+                    matches!(direct, Err(ClientError::Other(_))),
+                    "direct_broker_authority({input:?}) must reject via ClientError::Other, \
+                     got {direct:?}",
+                );
+            }
+        }
+    }
+
+    /// Regression test for ADR-0087: the local parser had **no**
+    /// empty-authority check, so these two returned `Ok("")` and `Ok(":6650")`
+    /// — authorities that went straight on to the wire in
+    /// `CommandConnect.proxy_to_broker_url`. `probe_authority` rejects both, so
+    /// delegating closed the hole.
+    #[test]
+    fn proxy_broker_authority_rejects_unusable_authority() {
+        for input in ["", "pulsar://", "pulsar+ssl://"] {
+            let err = proxy_broker_authority(input).expect_err(
+                "an input with no authority must not resolve to a proxy target — pre-ADR-0087 \
+                 this yielded Ok(\"\") / Ok(\":6650\")",
+            );
+            assert!(
+                matches!(err, ClientError::Other(_)),
+                "expected the authority rejection for {input:?}, got {err:?}",
+            );
+        }
+    }
+
+    /// Regression test for ADR-0087, the closed half of ADR-0085's documented
+    /// limitation: the synthesis used to trigger on "the authority contains no
+    /// `:`", which is never true of a bracketed IPv6 literal, so
+    /// `pulsar://[::1]` reached the transport port-less.
+    #[test]
+    fn proxy_broker_authority_synthesises_default_port_for_portless_bracketed_ipv6() {
+        assert_eq!(
+            proxy_broker_authority("pulsar://[::1]").unwrap(),
+            "[::1]:6650"
+        );
+        assert_eq!(
+            proxy_broker_authority("pulsar+ssl://[2001:db8::1]").unwrap(),
+            "[2001:db8::1]:6651"
+        );
+        // The ported form is unaffected, on both routing paths.
+        assert_eq!(
+            proxy_broker_authority("pulsar://[::1]:6650").unwrap(),
+            "[::1]:6650"
+        );
+        assert_eq!(
+            direct_broker_authority("pulsar://[::1]").unwrap(),
+            "[::1]:6650"
         );
     }
 }
