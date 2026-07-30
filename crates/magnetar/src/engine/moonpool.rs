@@ -61,11 +61,28 @@ impl<P: moonpool_core::Providers> Debug for MoonpoolEngine<P> {
 
 impl<P: moonpool_core::Providers> Engine for MoonpoolEngine<P> {
     type ClientState = magnetar_runtime_moonpool::Client<P>;
-    // Under both TokioProviders and moonpool-sim's SimProviders the
-    // moonpool engine ultimately schedules onto tokio (determinism comes
-    // from substituting the providers, not from replacing tokio). The
-    // task handle and interval types are therefore the same tokio shapes
-    // as the TokioEngine — see ADR-0025 §Decision.
+    // These are the same tokio shapes as the TokioEngine (ADR-0025
+    // §Decision), and that is a real constraint rather than a free
+    // abstraction: `spawn` is `tokio::spawn` and `new_interval` is
+    // `tokio::time::interval`, so both read the HOST executor and the HOST
+    // clock.
+    //
+    // That is fine under `TokioProviders`, but it is NOT usable on a
+    // `SimProviders` path. Since ADR-0078, `SimTaskProvider` schedules on
+    // Moonpool's own single-threaded seeded executor with no ambient tokio
+    // runtime, and that ADR lists code depending on `tokio::time` or ambient
+    // tokio task state as incompatible with the Moonpool engine. A ticker
+    // built on these primitives would therefore be paced by wall-clock time
+    // (or panic outright for want of a runtime) instead of replaying from a
+    // seed. ADR-0037's "engine-invariant, not a tokio carve-out" reading of
+    // these associated types predates ADR-0078 and no longer holds.
+    //
+    // Deterministic periodic work must go through the providers instead —
+    // `providers.task().spawn_task(...)` + `providers.time().sleep(...)`, as
+    // in `magnetar-runtime-moonpool`'s `AutoClusterFailover::start`. These
+    // four `Engine` methods are static and take no providers argument, so
+    // they cannot be retrofitted in place; they currently have no production
+    // call sites.
     type TaskHandle = tokio::task::JoinHandle<()>;
     type Interval = tokio::time::Interval;
 

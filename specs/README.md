@@ -111,6 +111,10 @@ ADR-0011's `check-no-internal-clock` gate scope and its file allowlist are amend
 
 ADR-0085's accepted port-less-bracketed-IPv6 limitation and its "`proxy_broker_authority` / `direct_broker_authority` are deliberately NOT refactored onto the helper" scope boundary are both amended by ADR-0087, which closes the limitation in `probe_authority` and folds those two plus `strip_url_to_host_port` onto it; ADR-0085's unrecognised-scheme rejection, its empty-authority-before-synthesis ordering, and its sans-io hand-rolled-scan constraint remain binding.
 
+ADR-0025's claim that `MoonpoolEngine`'s `spawn` / `new_interval` wrap the providers' `TaskProvider` / `TimeProvider`, and ADR-0037's reading of the resulting tokio associated types as "engine-invariant, not a tokio carve-out", are both amended by ADR-0078: `SimProviders` runs on Moonpool's own deterministic executor with no ambient tokio runtime, so those four `Engine` methods are host-executor + host-clock and must not be used on a simulation path.
+Deterministic periodic work goes through `TaskProvider::spawn_task` + `TimeProvider::sleep` instead.
+The rest of ADR-0025 and ADR-0037 remains binding.
+
 ## How to add an ADR
 
 1. Pick the next free number (highest existing + 1).
