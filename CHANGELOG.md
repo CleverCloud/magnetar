@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Latency histograms are now stamped from the injected clock, so moonpool's are reproducible per seed:** `ConsumerState::pop_message` recorded `msg.arrived_at.elapsed()` and `ProducerState::apply_receipt` recorded `op.enqueued_at.elapsed()` — host-clock reads inside the sans-io core, in violation of ADR-0011.
+  Both _write_ ends were already injected (`arrived_at` from `ConsumerState::deliver`'s `now`, `enqueued_at` from `queue_send`'s), so only the read side leaked.
+  The consequence under simulation was worse than noise: virtual time outruns host time in `SimProviders`, so `elapsed()` saturated to `0` on essentially every sample and the receive/send-latency percentiles were the one part of `ConsumerStats` / `ProducerStats` carrying no signal at all — three test files had grown explicit workarounds for it, including a `seed_deterministic_latency` helper in the differential suite that overwrote each histogram with a synthetic distribution before comparing.
+  `ConsumerState::pop_message`, `Connection::pop_message`, and `ProducerState::apply_receipt` now take `now: Instant` and derive the sample with `saturating_duration_since` (never the `Sub` impl, which panics on underflow); the engines snapshot at the call boundary before taking the connection mutex, tokio via `Instant::now()` and moonpool via its injected `now_instant_provider`.
+  `cargo run -p xtask -- check-no-internal-clock` now also rejects `.elapsed()` and no longer carries a file allowlist — `magnetar-proto/src/producer.rs` had been whole-file-skipped on a `uuid` rationale the gate never scanned for, which is why one of the two leaks was doubly invisible.
+  (docs/follow-ups.md §3; ADR-0086, amends ADR-0011)
+
+  BREAKING CHANGE: `ConsumerState::pop_message`, `Connection::pop_message`, and `ProducerState::apply_receipt` (`magnetar-proto`, re-exported as `magnetar::proto`) take an additional `now: Instant` parameter, passed last.
+  Any direct caller of these sans-io APIs outside the `magnetar-runtime-tokio` / `magnetar-runtime-moonpool` engines — both updated in this changeset — must pass the instant snapshotted at its call site.
+  The ergonomic façade surface is unchanged: `Consumer::{receive, receive_batch, drain_messages}`, `Producer::send`, `ConsumerApi`, `ProducerApi`, `aggregate_stats`, `receive_latency_histogram`, and `send_latency_histogram` all keep their signatures.
+
 - **Admin REST paths now percent-encode to RFC 3986 `pchar`, so `|` in a subscription or topic name no longer 400s:** `AdminClient::url_for` built paths with `Url::path_segments_mut().push()`, whose WHATWG encode set is laxer than RFC 3986 and leaves `[`, `]`, `^` and `|` raw.
   All four are illegal in a URI path, and Pulsar's Jetty front end rejects them at URI-parse time with `400 Illegal Path Character` — before routing, so the response carried no broker `reason` and the failure read as an unexplained empty-bodied 400.
   This hit every verb taking a subscription named `<consumer>|<app-id>` (a common convention): `magnetarctl admin subscriptions delete … 'name|app_id'` could never delete such a subscription, and `resetcursor` / `skip` / `skip_all` / `expireMessages` failed identically.

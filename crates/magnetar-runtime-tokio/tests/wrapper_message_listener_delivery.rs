@@ -213,7 +213,7 @@ fn wrapper_listener_drain_delivers_both_topics_without_auto_ack() {
         loop {
             let (msg, mut out) = {
                 let mut conn = shared.inner.lock();
-                let msg = conn.pop_message(handle);
+                let msg = conn.pop_message(handle, std::time::Instant::now());
                 (msg, conn.poll_transmit())
             };
             saw_ack |= outbound_has_ack(&mut out);
@@ -297,11 +297,19 @@ fn wrapper_listener_drain_stops_cleanly_on_child_close() {
         let _ = conn.poll_event();
     }
     assert!(
-        shared.inner.lock().pop_message(handle_a).is_some(),
+        shared
+            .inner
+            .lock()
+            .pop_message(handle_a, std::time::Instant::now())
+            .is_some(),
         "child A's single message pops once",
     );
     assert!(
-        shared.inner.lock().pop_message(handle_b).is_some(),
+        shared
+            .inner
+            .lock()
+            .pop_message(handle_b, std::time::Instant::now())
+            .is_some(),
         "child B's single message pops once",
     );
     assert!(
@@ -322,7 +330,8 @@ fn wrapper_listener_drain_stops_cleanly_on_child_close() {
         "child A reports closed after close_consumer",
     );
     assert!(
-        conn.pop_message(handle_a).is_none(),
+        conn.pop_message(handle_a, std::time::Instant::now())
+            .is_none(),
         "a closed child yields no further message to the wrapper drain",
     );
     // Child B is unaffected — the wrapper keeps serving its remaining children.

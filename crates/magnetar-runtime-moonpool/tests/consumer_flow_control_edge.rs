@@ -267,7 +267,7 @@ fn flow_control_replenishes_without_permit_underrun() {
     for _ in 0..RQ {
         let (msg, mut out) = {
             let mut conn = shared.inner.lock();
-            let msg = conn.pop_message(handle);
+            let msg = conn.pop_message(handle, std::time::Instant::now());
             (msg, conn.poll_transmit())
         };
         assert!(msg.is_some(), "every queued message must pop");
@@ -315,7 +315,7 @@ fn flow_control_replenishes_without_permit_underrun() {
     // empty path).
     let (empty_pop, leftover) = {
         let mut conn = shared.inner.lock();
-        let m = conn.pop_message(handle);
+        let m = conn.pop_message(handle, std::time::Instant::now());
         (m, conn.poll_transmit())
     };
     assert!(empty_pop.is_none(), "popping an empty queue yields None");
@@ -383,7 +383,7 @@ fn flow_control_single_permit_window_never_underruns() {
 
         let (msg, mut out) = {
             let mut conn = shared.inner.lock();
-            let msg = conn.pop_message(handle);
+            let msg = conn.pop_message(handle, std::time::Instant::now());
             (msg, conn.poll_transmit())
         };
         assert!(msg.is_some(), "window {w}: the single message must pop");
@@ -448,7 +448,8 @@ fn accepted_incomplete_chunks_replenish_flow_before_reassembly() {
     let (message, mut out) = {
         let mut conn = shared.inner.lock();
         (
-            conn.pop_message(handle).expect("reassembled message"),
+            conn.pop_message(handle, std::time::Instant::now())
+                .expect("reassembled message"),
             conn.poll_transmit(),
         )
     };

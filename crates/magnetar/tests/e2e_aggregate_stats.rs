@@ -20,6 +20,11 @@
 //!    consumer pair, driven exactly like `e2e_rolling_stats.rs`, proves `ConsumerStats::fold` /
 //!    `ProducerStats::fold` propagate a REAL nonzero rolling rate (and every other field)
 //!    end-to-end against a live broker.
+//! 3. [`e2e_receive_latency_reflects_real_queue_dwell`] — ADR-0086 layer (e): the injected clock
+//!    the state machine now stamps latency against must be a LIVE clock, not a pinned constant.
+//!    Every in-process layer of the ADR-0086 test set compares against a *scripted* delta, so a fix
+//!    that pinned `now` (e.g. `pop_message(msg.arrived_at)`) would zero the histogram forever and
+//!    still pass all of them. Only a real broker with a real queue dwell catches that.
 //!
 //! Runs as a regular test under `cargo test` (ADR-0046). Requires Docker.
 
@@ -374,6 +379,109 @@ async fn e2e_aggregate_stats_fold_propagates_real_rate() -> Result<(), Box<dyn s
     assert_eq!(
         folded_consumer.receive_latency_p99_ms,
         consumer_snapshot.receive_latency_p99_ms
+    );
+
+    Ok(())
+}
+
+/// Scenario 3 (ADR-0086, ADR-0024 layer (e)): the receive-latency histogram must reflect REAL
+/// queue-dwell time against a live broker.
+///
+/// Every in-process layer of the ADR-0086 test set compares the recorded sample against a
+/// *scripted* delta, so none of them can catch a fix that pins `now` to a constant — e.g.
+/// `pop_message(msg.arrived_at)`, or an engine snapshotting `now` once at subscribe time. Both
+/// silently zero the histogram forever. Publishing, letting the messages sit unread in the
+/// receiver queue, then draining is the only place that shows up.
+///
+/// This test is a characterization test, not a regression test: the fix is deliberately
+/// production-neutral on tokio (which passes a host `Instant::now()` at the call boundary either
+/// way), so it passed before ADR-0086 too. It is red against the plausible WRONG fixes named
+/// above, which is why it earns its container.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_receive_latency_reflects_real_queue_dwell() -> Result<(), Box<dyn std::error::Error>> {
+    const TOTAL_MSGS: usize = 8;
+    /// How long the messages sit in the receiver queue before anyone calls `receive()`.
+    const DWELL: Duration = Duration::from_millis(1_500);
+    /// Slack below `DWELL` so broker push latency and scheduling jitter cannot flake the test;
+    /// a pinned/zeroed clock reports 0 and misses this by three orders of magnitude.
+    const DWELL_SLACK_MS: u64 = 200;
+    /// Generous upper bound: catches a `u64::MAX` saturation and a ms/µs/ns unit confusion
+    /// without asserting anything about host scheduling speed.
+    const SANE_UPPER_MS: u64 = 60_000;
+
+    let (service_url, _admin_url, _container) = start_pulsar().await?;
+    let topic = fresh_topic("receive-latency-dwell");
+
+    let client = PulsarClient::builder()
+        .service_url(service_url)
+        .build()
+        .await?;
+
+    let producer = client.producer(&topic).create().await?;
+    let consumer = client
+        .consumer(&topic)
+        .subscription("magnetar-e2e-receive-latency-dwell")
+        .subscription_type(SubType::Exclusive)
+        .initial_position(InitialPosition::Earliest)
+        .subscribe()
+        .await?;
+
+    for i in 0..TOTAL_MSGS {
+        let payload = format!("dwell-msg-{i:04}").into_bytes();
+        producer
+            .send(OutgoingMessage::with_payload(payload).into())
+            .await?;
+    }
+    producer.flush().await?;
+
+    // Let the broker push the batch and the messages SIT in the receiver queue: this is the
+    // dwell the histogram must observe.
+    tokio::time::sleep(DWELL).await;
+
+    for _ in 0..TOTAL_MSGS {
+        let msg = tokio::time::timeout(Duration::from_secs(15), consumer.receive())
+            .await
+            .expect("consumer.receive timeout")
+            .expect("consumer.receive error");
+        consumer.ack(msg.message_id).await.ok();
+    }
+
+    let consumer_snapshot = consumer.stats();
+    let consumer_hist = consumer
+        .receive_latency_histogram()
+        .expect("receive_latency_hist initialised");
+    let producer_snapshot = producer.stats();
+
+    producer.close().await?;
+    consumer.close().await?;
+    client.close().await;
+
+    assert_eq!(
+        consumer_hist.len(),
+        TOTAL_MSGS as u64,
+        "one receive_latency_hist sample per received message"
+    );
+    // The load-bearing assertion: a pinned or constant `now` cannot produce this.
+    assert!(
+        consumer_snapshot.receive_latency_max_ms >= DWELL.as_millis() as u64 - DWELL_SLACK_MS,
+        "a real queue dwell of {DWELL:?} must be visible in receive_latency_max_ms, got {} \
+         (a pinned/constant `now` would report 0)",
+        consumer_snapshot.receive_latency_max_ms
+    );
+    assert!(
+        consumer_snapshot.receive_latency_max_ms < SANE_UPPER_MS,
+        "receive_latency_max_ms={} is not a plausible millisecond value",
+        consumer_snapshot.receive_latency_max_ms
+    );
+    assert!(consumer_snapshot.receive_latency_max_ms >= consumer_snapshot.receive_latency_p99_ms);
+    assert!(consumer_snapshot.receive_latency_p99_ms >= consumer_snapshot.receive_latency_p50_ms);
+    // The producer leg of the same fix: `apply_receipt` stamps `now - enqueued_at` from the
+    // instant `handle_frame` was given, so a real broker round-trip must land in a plausible
+    // millisecond range too.
+    assert!(
+        producer_snapshot.send_latency_max_ms < SANE_UPPER_MS,
+        "send_latency_max_ms={} is not a plausible millisecond value",
+        producer_snapshot.send_latency_max_ms
     );
 
     Ok(())

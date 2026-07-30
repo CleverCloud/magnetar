@@ -38,6 +38,17 @@ The driver dispatches wakers as events arrive.
 `magnetar-proto/Cargo.toml` may not depend on `tokio`, `mio`, `socket2`, `async-trait`, `futures-util` (executor pieces are ok if no actual I/O), or any runtime-bound crate.
 CI runs `cargo tree -p magnetar-proto -e features` and fails if forbidden names appear.
 
+## Sans-io clock injection
+
+The state machine never reads a clock it was not handed.
+
+- Monotonic time arrives as an explicit `now: Instant` parameter, placed **last** in the argument list (`queue_send(msg, publish_time_ms, now)`, `Connection::ack(handle, ack, now)`, `pop_message(handle, now)`). Wall-clock time arrives through the `wall_clock: Arc<dyn Fn() -> SystemTime + Send + Sync>` provider.
+- `Instant::now()`, `SystemTime::now()`, and `.elapsed()` are forbidden in `crates/magnetar-proto/src/**` outside `#[cfg(test)]`. There is no file allowlist. Engines snapshot the clock at the call boundary — and **before** taking the connection mutex, per the lock ordering below — so `magnetar-runtime-moonpool` can substitute a virtual clock and reproduce every derived value bit-for-bit per seed.
+- `Instant` arithmetic must not panic (invariant: no panics in `magnetar-proto`). Use `now.saturating_duration_since(base)` instead of `now - base`, and `crate::time::deadline_with_clamp(base, delta)` instead of `base + delta`.
+- Enforcement → `cargo run -p xtask -- check-no-internal-clock`, whose scanner skips `#[cfg(test)]` spans and comments / string literals and is unit-tested in `xtask/src/main.rs`.
+- Two documented non-time leaks (`uuid::Uuid::new_v4()` in chunked emit, `std::env::var()` in `TokenAuth` bootstrap) are tracked in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-non-determinism-leaks-documented) and are **not** mechanically enforced.
+- See [ADR-0011](specs/adr/0011-clock-injection-sans-io.md) and [ADR-0086](specs/adr/0086-inject-now-into-proto-latency-recording.md).
+
 ## TLS
 
 `rustls` is the only TLS implementation.

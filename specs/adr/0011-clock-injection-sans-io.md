@@ -1,9 +1,14 @@
 # ADR-0011 — Clock injection on `magnetar-proto` entries
 
-- **Status**: Accepted
+- **Status**: Accepted (amended by [ADR-0086](0086-inject-now-into-proto-latency-recording.md), latency-recording sites + `.elapsed()` ban)
 - **Date**: 2026-05-21
 - **Decider**: Florentin Dubois
 - **Tags**: sans-io, determinism, simulation
+
+> **Amendment (2026-07-29, [ADR-0086](0086-inject-now-into-proto-latency-recording.md)).** Two latency-recording sites escaped the original sweep because they read the clock via `Instant::elapsed()` rather than `Instant::now()`: `ConsumerState::pop_message` and `ProducerState::apply_receipt`.
+> Both now take the injected `now: Instant` (and `Connection::pop_message` threads it through), computing the sample with `saturating_duration_since` so a backwards clock records 0 instead of panicking.
+> The `check-no-internal-clock` gate scope described below widens from `Instant::now()` / `SystemTime::now()` to also reject `.elapsed()`, and its file allowlist is emptied — `producer.rs` and `auth/token.rs` no longer carry an exemption.
+> Everything else in this ADR stays in force: the clock-parameter convention, the `wall_clock` provider, and the two remaining non-time leaks (uuid, `env::var`), which the gate has never mechanically enforced and which remain tracked in `ARCHITECTURE.md`.
 
 ## Context
 

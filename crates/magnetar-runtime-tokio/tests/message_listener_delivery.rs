@@ -204,7 +204,7 @@ fn listener_drain_delivers_sequentially_without_auto_ack() {
     loop {
         let (msg, mut out) = {
             let mut conn = shared.inner.lock();
-            let msg = conn.pop_message(handle);
+            let msg = conn.pop_message(handle, std::time::Instant::now());
             (msg, conn.poll_transmit())
         };
         saw_ack |= outbound_has_ack(&mut out);
@@ -255,7 +255,11 @@ fn listener_drain_stops_cleanly_on_consumer_close() {
         let _ = conn.poll_event();
     }
     assert!(
-        shared.inner.lock().pop_message(handle).is_some(),
+        shared
+            .inner
+            .lock()
+            .pop_message(handle, std::time::Instant::now())
+            .is_some(),
         "the single pushed message pops once",
     );
     assert!(
@@ -279,7 +283,8 @@ fn listener_drain_stops_cleanly_on_consumer_close() {
         "consumer reports closed after close_consumer",
     );
     assert!(
-        conn.pop_message(handle).is_none(),
+        conn.pop_message(handle, std::time::Instant::now())
+            .is_none(),
         "a closed consumer yields no further message to the listener drain",
     );
 }

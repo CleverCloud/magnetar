@@ -292,9 +292,11 @@ jobs:
   no-internal-clock:
     name: no-internal-clock (magnetar-proto)
     # Asserts `magnetar-proto/src/**` never reads the host clock outside
-    # `#[cfg(test)]` blocks + the two documented leak files. Mirrors ADR-0011
-    # (clock-injection-sans-io). The sans-io state machine must receive
-    # `now: Instant` / `wall_clock` providers from the engine.
+    # `#[cfg(test)]` blocks: no `Instant::now()`, no `SystemTime::now()`, no
+    # `.elapsed()`, and no file allowlist. Mirrors ADR-0011
+    # (clock-injection-sans-io) as amended by ADR-0084. The sans-io state
+    # machine must receive `now: Instant` / `wall_clock` providers from the
+    # engine.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

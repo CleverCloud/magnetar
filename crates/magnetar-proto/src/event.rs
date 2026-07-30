@@ -570,9 +570,11 @@ pub struct IncomingMessage {
     /// Optional broker-entry metadata (PIP-90). Refcounted for the same
     /// batched-delivery-loop reason as `metadata`.
     pub broker_entry_metadata: Option<std::sync::Arc<pb::BrokerEntryMetadata>>,
-    /// Wall-clock instant at which the consumer state machine first saw this message (i.e. the
-    /// moment `ConsumerState::deliver` queued it). The consumer uses
-    /// `pop_message`-time `Instant::now() - arrived_at` to feed its
-    /// `receive_latency_hist`, mirroring Java `ConsumerStatsRecorder` p50/p99/max.
+    /// Engine-injected instant at which the consumer state machine first saw this message —
+    /// the `now` handed to `ConsumerState::deliver` when it queued the message, never a
+    /// host-clock read (ADR-0011). The consumer feeds `receive_latency_hist` with
+    /// `pop_message`-time `now - arrived_at`, both ends injected (ADR-0086), mirroring Java
+    /// `ConsumerStatsRecorder` p50/p99/max. Under the moonpool engine both instants come from
+    /// the virtual clock, so the resulting sample reproduces bit-for-bit for a given seed.
     pub arrived_at: std::time::Instant,
 }

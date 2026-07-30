@@ -2080,7 +2080,7 @@ impl Connection {
                             let mut synth = receipt.clone();
                             synth.sequence_id = seq;
                             synth.highest_sequence_id = None;
-                            if let Some(tuple) = producer.apply_receipt(&synth) {
+                            if let Some(tuple) = producer.apply_receipt(&synth, now) {
                                 resolved.push(tuple);
                             }
                         }
@@ -6191,12 +6191,13 @@ impl Connection {
             .pop_active_change()
     }
 
-    /// Drain a single message from the given consumer's queue.
-    pub fn pop_message(&mut self, handle: ConsumerHandle) -> Option<IncomingMessage> {
+    /// Drain a single message from the given consumer's queue, stamping its receive latency
+    /// against the engine-injected `now` (ADR-0011, ADR-0086).
+    pub fn pop_message(&mut self, handle: ConsumerHandle, now: Instant) -> Option<IncomingMessage> {
         let (msg, flow_cmd) = {
             let slot = self.consumers.get(&handle)?;
             let mut consumer = slot.state.lock();
-            let msg = consumer.pop_message();
+            let msg = consumer.pop_message(now);
             // After popping, opportunistically check whether we owe the broker a FLOW.
             let flow_cmd = consumer.maybe_flow();
             (msg, flow_cmd)
@@ -9544,6 +9545,124 @@ mod conn_state_tests {
         buf
     }
 
+    /// ADR-0086: `handle_frame(now, …)` must forward its injected `now` into
+    /// `ProducerState::apply_receipt`. This is the only test pinning the receipt fan-out call
+    /// at the `SendReceipt` arm — a local "fix" that reached for `Instant::now()` there would
+    /// pass every `ProducerState`-level test and fail only here.
+    #[test]
+    fn connection_handle_frame_threads_now_into_send_latency() {
+        /// Scripted broker round-trip; `<= 2047` keeps `hdrhistogram` sigfig-3 exact.
+        const RTT_MS: u64 = 250;
+
+        let base = Instant::now();
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(base, &handshake_response_bytes())
+            .expect("handle");
+
+        let create_rid = conn.peek_next_request_id_for_test();
+        let producer = conn.create_producer(CreateProducerRequest {
+            topic: "persistent://public/default/send-latency-injected-clock".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        ack_producer_success(&mut conn, create_rid);
+
+        // Enqueue at `base` …
+        let seq = conn
+            .send(
+                producer,
+                crate::producer::OutgoingMessage {
+                    payload: bytes::Bytes::from_static(b"x"),
+                    metadata: pb::MessageMetadata::default(),
+                    uncompressed_size: 1,
+                    num_messages: 1,
+                    txn_id: None,
+                    source_message_id: None,
+                },
+                0,
+                base,
+            )
+            .expect("queue");
+        let _ = drain_outbound_commands(&mut conn);
+
+        // … and land the receipt RTT_MS later, purely by injection.
+        let receipt_bytes = send_receipt_bytes(producer, seq);
+        conn.handle_bytes(base + Duration::from_millis(RTT_MS), &receipt_bytes)
+            .expect("apply receipt");
+        while conn.poll_event().is_some() {}
+
+        let hist = conn
+            .producer(producer)
+            .expect("producer slot registered")
+            .state
+            .lock()
+            .send_latency_histogram()
+            .expect("send_latency_hist initialised");
+        assert_eq!(hist.len(), 1, "one sample per applied CommandSendReceipt");
+        assert_eq!(
+            hist.max(),
+            RTT_MS,
+            "handle_frame must forward its injected `now` verbatim to apply_receipt"
+        );
+    }
+
+    /// ADR-0086 sibling of the producer test above: `Connection::pop_message` must forward its
+    /// `now` argument into `ConsumerState::pop_message` rather than reading the host clock.
+    #[test]
+    fn connection_pop_message_threads_now_into_receive_latency() {
+        /// Scripted receive dwell; `<= 2047` keeps `hdrhistogram` sigfig-3 exact.
+        const DWELL_MS: u64 = 250;
+
+        let base = Instant::now();
+        let mut conn = Connection::new(
+            ConnectionConfig::default(),
+            std::sync::Arc::new(std::time::SystemTime::now),
+        );
+        conn.begin_handshake().expect("handshake");
+        conn.handle_bytes(base, &handshake_response_bytes())
+            .expect("handle");
+
+        let sub_rid = conn.peek_next_request_id_for_test();
+        let handle = conn.subscribe(SubscribeRequest {
+            topic: "persistent://public/default/receive-latency-injected-clock".to_owned(),
+            subscription: "sub-receive-latency-injected-clock".to_owned(),
+            ..Default::default()
+        });
+        let _ = drain_outbound_commands(&mut conn);
+        feed_subscribe_success(&mut conn, sub_rid);
+        conn.initial_flow(handle, base);
+        let _ = drain_outbound_commands(&mut conn);
+
+        // Deliver at `base` …
+        let meta = regular_metadata();
+        let frame = message_frame(handle.0, &meta, b"payload");
+        conn.handle_bytes(base, &frame).expect("deliver message");
+        while conn.poll_event().is_some() {}
+
+        // … and pop DWELL_MS later.
+        let _msg = conn
+            .pop_message(handle, base + Duration::from_millis(DWELL_MS))
+            .expect("queued message");
+
+        let hist = conn
+            .consumer(handle)
+            .expect("consumer slot registered")
+            .state
+            .lock()
+            .receive_latency_histogram()
+            .expect("receive_latency_hist initialised");
+        assert_eq!(hist.len(), 1, "one sample per popped message");
+        assert_eq!(
+            hist.max(),
+            DWELL_MS,
+            "Connection::pop_message must forward `now` verbatim to ConsumerState::pop_message"
+        );
+    }
+
     /// (a) Snapshot formation: a publish in-flight at reset time is moved into
     /// `in_flight_publish_snapshots` and OUT of the producer's `pending` queue, with no
     /// `SessionLost` outcome installed on the publish key.
@@ -11524,7 +11643,9 @@ mod conn_state_tests {
         }
 
         assert_eq!(conn.consumer_queue_len(handle), 1);
-        let message = conn.pop_message(handle).expect("reassembled message");
+        let message = conn
+            .pop_message(handle, Instant::now())
+            .expect("reassembled message");
         assert_eq!(message.payload.as_ref(), b"aabbcc");
         assert_eq!(
             drain_command_flow(&mut conn, handle)
@@ -11840,7 +11961,7 @@ mod conn_state_tests {
             conn.handle_bytes(Instant::now(), &frame)
                 .expect("deliver message");
         }
-        while conn.pop_message(handle).is_some() {}
+        while conn.pop_message(handle, Instant::now()).is_some() {}
         // Drain any maybe_flow top-ups the consume path emitted.
         while drain_command_flow(&mut conn, handle).is_some() {}
 
