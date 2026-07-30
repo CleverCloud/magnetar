@@ -737,8 +737,12 @@ impl ProducerState {
     /// against the previous snapshot and writes them to [`Self::current_msgs_per_sec`] /
     /// [`Self::current_bytes_per_sec`].
     ///
-    /// Sans-io discipline: `now` is injected (see [ADR-0011]). Runtime engines wire this
-    /// to a `tokio::time::interval` ticker.
+    /// Sans-io discipline: `now` is injected (see [ADR-0011]).
+    ///
+    /// Sampling is **caller-driven**: no engine calls this, so a caller that never invokes it
+    /// leaves [`Self::current_msgs_per_sec`] / [`Self::current_bytes_per_sec`] at `0.0` forever.
+    /// Java instead self-ticks each recorder on the client-wide timer; wiring an equivalent to
+    /// the `poll_timeout` / `handle_timeout` sweep is tracked as `docs/follow-ups.md` §2.
     ///
     /// [ADR-0011]: https://github.com/CleverCloud/magnetar/blob/main/specs/adr/0011-clock-injection-sans-io.md
     pub fn record_rate_window(&mut self, now: std::time::Instant) {

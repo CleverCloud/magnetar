@@ -4663,10 +4663,14 @@ impl Connection {
             .map(|slot| slot.state.lock().stats())
     }
 
-    /// Take a rolling-window stats snapshot on the consumer identified by `handle`. Runtime
-    /// engines wire this to a `tokio::time::interval` ticker. Mirrors Java
+    /// Take a rolling-window stats snapshot on the consumer identified by `handle`. Mirrors Java
     /// `ConsumerStatsRecorder`'s rolling-window rate calculation. No-op if the handle is
     /// unknown.
+    ///
+    /// Sampling is **caller-driven**: no engine calls this, so a caller that never invokes it
+    /// leaves `ConsumerStats::msgs_per_sec` / `bytes_per_sec` at `0.0` forever. Java instead
+    /// self-ticks each recorder on the client-wide timer; wiring an equivalent to the
+    /// `poll_timeout` / `handle_timeout` sweep is tracked as `docs/follow-ups.md` §2.
     pub fn consumer_record_rate_window(&mut self, handle: ConsumerHandle, now: std::time::Instant) {
         if let Some(slot) = self.consumers.get(&handle) {
             slot.state.lock().record_rate_window(now);

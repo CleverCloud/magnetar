@@ -326,6 +326,38 @@ impl<C: ConsumerApi + Clone> PatternConsumer<C> {
         }
     }
 
+    /// Aggregate cumulative stats across every child consumer (issue #347).
+    /// Thin wrapper over [`magnetar_proto::ConsumerStats::fold`], and the exact
+    /// analogue of [`crate::MultiTopicsConsumer::aggregate_stats`] at the pattern
+    /// scope: collect each child's `(stats(), receive_latency_histogram())`
+    /// snapshot — taken under the same lock acquisition so the pair is mutually
+    /// consistent — and fold them per that function's documented per-field rule.
+    /// The six cumulative totals + `pending_batch_acks` sum; `msgs_per_sec` /
+    /// `bytes_per_sec` sum as f64 (fan-in throughput); `receive_latency_max_ms` is
+    /// the exact max; `receive_latency_p50_ms` / `receive_latency_p99_ms` are
+    /// recomputed from a REAL merge of every child's receive-latency histogram
+    /// rather than summed or maxed, which is not statistically sound.
+    ///
+    /// A child subscribed mid-window by [`PatternConsumer::update`] contributes a
+    /// full snapshot of its counters immediately, but `0.0` to the rate fields
+    /// until it has been sampled twice — the rate window needs a baseline first.
+    /// Java's `MultiTopicConsumerStatsRecorderImpl` behaves identically.
+    ///
+    /// Rate sampling is caller-driven; see the note on
+    /// [`magnetar_proto::consumer::ConsumerState::record_rate_window`] and
+    /// `docs/follow-ups.md` §2.
+    #[must_use]
+    pub fn aggregate_stats(&self) -> magnetar_proto::ConsumerStats {
+        let children: Vec<_> = self
+            .inner
+            .consumers
+            .lock()
+            .iter()
+            .map(|nc| (nc.consumer.stats(), nc.consumer.receive_latency_histogram()))
+            .collect();
+        magnetar_proto::ConsumerStats::fold(children)
+    }
+
     /// `true` while every child consumer reports the underlying connection is up.
     #[must_use]
     pub fn is_connected(&self) -> bool {
